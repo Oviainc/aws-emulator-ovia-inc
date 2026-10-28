@@ -171,12 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags.insert(key, value);
         }
         if tags.len() > crate::state::MAX_TAGS_PER_MONITOR {
+            // The documented per-monitor maximum is an input-validation rule, so a merge
+            // past it is refused with the wording this service carries for that class,
+            // the same one the boundary validator's refusals carry.
             return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "The merged tag set would hold {} tags; a monitor holds at most {}.",
-                    tags.len(),
-                    crate::state::MAX_TAGS_PER_MONITOR
-                )),
+                message: Some(crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string()),
             })
             .into());
         }

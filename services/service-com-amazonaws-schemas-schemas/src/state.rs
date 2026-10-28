@@ -215,6 +215,101 @@ impl ComAmazonawsSchemasSchemasState {
             .get_mut(name)
             .expect("the registry resolved just above is still present"))
     }
+
+    /// The registry a caller's READ names, or why the read reaches none.
+    ///
+    /// The first step of the resolution every read that names a resource INSIDE a
+    /// registry makes ([`Self::readable_schema_version`]), and the whole of it for a
+    /// read of the registry itself: the store must hold a registry of that name.
+    /// Unlike [`Self::writable_registry`] it asks nothing about who OWNS the registry —
+    /// what AWS owns, a caller may read.
+    pub fn readable_registry(&self, name: &str) -> Result<&Registry, ReadResolutionError> {
+        self.registries
+            .get(name)
+            .ok_or_else(|| ReadResolutionError::NoSuchRegistry(name.to_string()))
+    }
+
+    /// The schema a caller's read names, together with the registry holding it, or
+    /// which step of the resolution reaches nothing.
+    ///
+    /// The first two steps of [`Self::readable_schema_version`], for a read that names a
+    /// schema but no version of it.
+    pub fn readable_schema(
+        &self,
+        registry_name: &str,
+        schema_name: &str,
+    ) -> Result<(&Registry, &Schema), ReadResolutionError> {
+        let registry = self.readable_registry(registry_name)?;
+        let schema = registry.schema(schema_name)?;
+        Ok((registry, schema))
+    }
+
+    /// The schema VERSION a caller's read names, or which step of the resolution
+    /// reaches nothing.
+    ///
+    /// Every read this service serves that names a schema version — the stored
+    /// definition, its export, a code binding generated from it — takes the same three
+    /// steps before it answers anything: the store must hold a registry of that name,
+    /// that registry must hold a schema of that name, and the schema must hold the
+    /// version the request's `SchemaVersion` names, or its latest stored version when
+    /// the request names none ([`Schema::version_for`]). Resolving the three together,
+    /// in that order, is what keeps a handler from answering one step's refusal for
+    /// another step's failure.
+    ///
+    /// The refusals are RETURNED rather than worded here, because each operation answers
+    /// them through its own modelled error enum; the sentences are the service's
+    /// constants ([`ReadResolutionError::not_found`]), so every call site words them
+    /// alike. This is the read counterpart of [`Self::writable_registry`].
+    pub fn readable_schema_version(
+        &self,
+        registry_name: &str,
+        schema_name: &str,
+        requested: Option<&str>,
+    ) -> Result<ResolvedSchemaVersion<'_>, ReadResolutionError> {
+        let (registry, schema) = self.readable_schema(registry_name, schema_name)?;
+        let version = schema.version_for(requested).ok_or_else(|| {
+            ReadResolutionError::NoSuchSchemaVersion {
+                registry: registry_name.to_string(),
+                schema: schema_name.to_string(),
+                requested: requested.map(str::to_string),
+            }
+        })?;
+        Ok(ResolvedSchemaVersion {
+            registry,
+            schema,
+            version,
+        })
+    }
+
+    /// The same three-step resolution, for a call that then CHANGES something attached
+    /// to the resolved version (a code binding generated from it): the schema for
+    /// mutation, and the version number the request resolved to.
+    ///
+    /// The NUMBER is handed back rather than a borrow of the version, because the schema
+    /// is borrowed mutably; it is resolved before anything is written, so a version
+    /// added later cannot re-point what this call attaches.
+    ///
+    /// The second lookup below is how a shared resolution is reused under a mutable
+    /// borrow, not an assumption about the store: the caller holds the one state lock
+    /// across both, so nothing can have removed what the first lookup resolved — the
+    /// same reason [`Self::writable_registry`] re-fetches what it has just resolved.
+    pub fn schema_at_version_mut(
+        &mut self,
+        registry_name: &str,
+        schema_name: &str,
+        requested: Option<&str>,
+    ) -> Result<(&mut Schema, u64), ReadResolutionError> {
+        let version = self
+            .readable_schema_version(registry_name, schema_name, requested)?
+            .version
+            .version;
+        let schema = self
+            .registries
+            .get_mut(registry_name)
+            .and_then(|registry| registry.schemas.get_mut(schema_name))
+            .expect("the schema resolved just above is still present");
+        Ok((schema, version))
+    }
 }
 
 /// A fresh store already holds the service-owned registries: they exist in every
@@ -1083,6 +1178,26 @@ impl Registry {
     pub fn reported_schema_arn_in(&self, region: &str, schema: &Schema) -> String {
         self.schema_arn_in(region, schema).unwrap_or_default()
     }
+
+    /// The schema this registry holds under `name`, or the refusal for a name it holds
+    /// none for.
+    ///
+    /// The schema step of the one read resolution
+    /// ([`ComAmazonawsSchemasSchemasState::readable_schema_version`]), so a handler that
+    /// has already resolved the registry takes the same step with the same refusal.
+    pub fn schema(&self, name: &str) -> Result<&Schema, ReadResolutionError> {
+        self.schemas
+            .get(name)
+            .ok_or_else(|| ReadResolutionError::NoSuchSchema(name.to_string()))
+    }
+
+    /// The same step, for a caller that then changes the schema it resolved: a write to
+    /// a schema reaches it by the same name and is refused the same way.
+    pub fn schema_mut(&mut self, name: &str) -> Result<&mut Schema, ReadResolutionError> {
+        self.schemas
+            .get_mut(name)
+            .ok_or_else(|| ReadResolutionError::NoSuchSchema(name.to_string()))
+    }
 }
 
 /// A schema and all of its versions.
@@ -1140,6 +1255,20 @@ pub struct SchemaVersion {
     pub content: String,
     pub r#type: String,
     pub created_date: SystemTime,
+}
+
+/// What the one read resolution answers: the registry a read named, the schema it
+/// holds, and the version of it the request selected.
+///
+/// All three are handed back together because a read that names a version answers from
+/// all three — the version's content, the schema's metadata, and the ARN the registry
+/// reports for the schema — so resolving them once is what keeps a response from being
+/// assembled out of two separate lookups.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedSchemaVersion<'a> {
+    pub registry: &'a Registry,
+    pub schema: &'a Schema,
+    pub version: &'a SchemaVersion,
 }
 
 /// One code binding: the code generation `PutCodeBinding` started for one schema
@@ -2877,6 +3006,50 @@ pub enum RegistryWriteError {
     /// A service-owned registry — AWS owns what is in it, so a caller may read it but
     /// not write to it.
     ServiceOwned(String),
+}
+
+/// Which step of the registry → schema → schema-version resolution reached nothing.
+///
+/// The three refusals
+/// [`ComAmazonawsSchemasSchemasState::readable_schema_version`] resolves, each carrying
+/// the request members its sentence is built from, so the call site can word the
+/// service's sentence for it without repeating the choice of which refusal the step
+/// answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadResolutionError {
+    /// This store holds no registry of that name, so the request names nothing at all.
+    NoSuchRegistry(String),
+    /// The registry the request named holds no schema of that name.
+    NoSuchSchema(String),
+    /// The schema the request named holds no such version — including a `SchemaVersion`
+    /// that names no version at all, and a schema left holding none.
+    NoSuchSchemaVersion {
+        registry: String,
+        schema: String,
+        /// The request's `SchemaVersion`, absent where the request named none and the
+        /// schema holds no version to answer as its latest.
+        requested: Option<String>,
+    },
+}
+
+impl ReadResolutionError {
+    /// The service's sentence for this refusal.
+    ///
+    /// Every step of the resolution reaches a resource that does not exist, so each is
+    /// the `NotFoundException` that step's own message helper words — which is why a
+    /// handler maps the whole enum in one place and cannot answer one step's sentence
+    /// for another's.
+    pub fn not_found(&self) -> NotFoundException {
+        match self {
+            Self::NoSuchRegistry(registry) => registry_not_found(registry),
+            Self::NoSuchSchema(schema) => schema_not_found(schema),
+            Self::NoSuchSchemaVersion {
+                registry,
+                schema,
+                requested,
+            } => schema_version_not_found(registry, schema, requested.as_deref()),
+        }
+    }
 }
 
 /// A write meets every refusal a read of the same ARN meets, and words it the same

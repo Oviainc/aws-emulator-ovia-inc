@@ -263,8 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         (true, true) => resource_status::UPDATE_FAILED,
                     };
                     let operation_id = stack
-                        .last_operation
-                        .as_ref()
+                        .last_operation()
                         .map(|operation| operation.operation_id.clone());
                     let client_request_token = stack.client_request_token.clone();
                     stack.record_resource_event(

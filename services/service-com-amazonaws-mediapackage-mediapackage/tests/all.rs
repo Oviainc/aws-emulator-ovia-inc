@@ -15,6 +15,8 @@
 mod access_log_group_names;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/cmaf_child_manifest_ids_are_unique.rs"]
+mod cmaf_child_manifest_ids_are_unique;
 #[path = "all/cmaf_child_manifest_name.rs"]
 mod cmaf_child_manifest_name;
 #[path = "all/cmaf_child_manifest_name_follows_the_endpoint.rs"]

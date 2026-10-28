@@ -33,7 +33,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{call, emulator, Answer};
+use crate::import_and_assess::{call, emulator, emulator_holding, Answer};
 
 /// This service's message for a value that fails a rule the model declares.
 const INVALID_REQUEST_BODY: &str = "Invalid request body";
@@ -227,8 +227,6 @@ async fn a_declared_rule_is_refused_with_the_services_one_validation_message() {
 /// answers 200 — the round trip itself is pinned in `portfolio_preferences.rs`.)
 #[tokio::test]
 async fn a_value_at_a_published_bound_is_not_refused() {
-    let router = emulator();
-
     let mut at_bucket_max = valid_import();
     at_bucket_max["S3Bucket"] = json!(bucket_of_length(63));
     // The shortest name the SERVICE accepts, not the shortest `@pattern` admits: the
@@ -238,6 +236,15 @@ async fn a_value_at_a_published_bound_is_not_refused() {
     // bound — see `assessment_error_paths.rs`.
     let mut shortest_bucket = valid_import();
     shortest_bucket["S3Bucket"] = json!(bucket_of_length("migrationhub-strategy-".len() + 1));
+
+    // The account holds both of those buckets: a start call resolves its bucket members
+    // against object storage, and the rule this table is about is the BOUND — a name at the
+    // bound that no bucket answers to is refused for a different reason altogether
+    // (`start_call_bucket_existence.rs`).
+    let router = emulator_holding(&[
+        &bucket_of_length(63),
+        &bucket_of_length("migrationhub-strategy-".len() + 1),
+    ]);
 
     let accepted = vec![
         post(

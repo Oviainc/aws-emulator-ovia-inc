@@ -391,7 +391,10 @@ async fn walk(
                     page.last()
                         .and_then(|listed| listed.get("VersionId"))
                         .and_then(Value::as_i64)
-                        .map(|id| id.to_string()),
+                        .map(|id| state::listing_token(
+                            state::Listing::PolicyVersions { policy_arn },
+                            &id.to_string()
+                        )),
                     "case {case:?}: a NextToken must name the last version of its page, \
                      got {next:?}"
                 );

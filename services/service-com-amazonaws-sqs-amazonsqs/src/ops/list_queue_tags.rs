@@ -155,8 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // observable by a later one.
         let store = store.lock();
 
-        let queue = state::queue_name_from_url(&input.queue_url)
-            .and_then(|name| store.queues.get(name))
+        // A queue url resolves in the region the request addressed: this region's queue of
+        // that name, and nothing another region holds.
+        let region = state::request_region(ctx.parts());
+        let queue = store
+            .queue_by_url(&region, &input.queue_url)
             .ok_or_else(|| {
                 ListQueueTagsErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;

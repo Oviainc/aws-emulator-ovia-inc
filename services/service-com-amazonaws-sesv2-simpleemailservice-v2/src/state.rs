@@ -1850,6 +1850,29 @@ impl ContactRecord {
             .map(|preference| preference.subscription_status.as_str())
     }
 
+    /// Apply the topic preferences an update supplied.
+    ///
+    /// A preference is stated PER TOPIC — "the contact's preference for being opted-in
+    /// to or opted-out of a topic" — so a supplied preference sets the status for the
+    /// one topic it names, and a topic the request does not name keeps the preference
+    /// the contact already stated. A newly stated topic is appended, so the order the
+    /// preferences were first supplied in is kept.
+    pub fn merge_topic_preferences(
+        &mut self,
+        supplied: Vec<crate::ops::types::TopicPreference>,
+    ) {
+        for preference in supplied {
+            match self
+                .topic_preferences
+                .iter_mut()
+                .find(|stated| stated.topic_name == preference.topic_name)
+            {
+                Some(stated) => stated.subscription_status = preference.subscription_status,
+                None => self.topic_preferences.push(preference),
+            }
+        }
+    }
+
     /// The modelled `Contact` view of this record, as `ListContacts` reports it.
     ///
     /// `list` is the list this contact is on, which supplies the default preferences.
@@ -2098,10 +2121,39 @@ pub fn contact_list_not_found(contact_list_name: &str) -> String {
 
 /// How this service words `NotFoundException` for a contact the named list does not
 /// hold, stated once for every contact operation.
-pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String {
+///
+/// SES names the address it looked for and the kind of resource it looked in, not the
+/// list's own name, so the sentence is the same whichever list was asked.
+pub fn contact_not_found(email_address: &str) -> String {
+    format!("{email_address} doesn't exist in List.")
+}
+
+/// Characters of `AttributesData` one contact may carry.
+///
+/// The model declares no constraint on the member; SES states the bound in the
+/// sentence it refuses an unacceptable document with, "Attributes must be valid JSON
+/// and it can contain up to 1000 characters.", which is the sentence
+/// [`invalid_attributes_data`] builds from this constant.
+pub const MAX_ATTRIBUTES_DATA_CHARS: usize = 1_000;
+
+/// Whether `attributes_data` is something a contact may carry: "the attribute data
+/// attached to a contact" is a JSON document of at most
+/// [`MAX_ATTRIBUTES_DATA_CHARS`] characters.
+///
+/// The member carries no modelled constraint, so both halves are checked here —
+/// once, for every operation that accepts attribute data — and the document is held
+/// exactly as supplied once accepted.
+pub fn attributes_data_is_acceptable(attributes_data: &str) -> bool {
+    attributes_data.chars().count() <= MAX_ATTRIBUTES_DATA_CHARS
+        && ::serde_json::from_str::<::serde_json::Value>(attributes_data).is_ok()
+}
+
+/// How this service words `BadRequestException` for attribute data that is not a
+/// JSON document within the bound, stated once for every operation that takes one.
+pub fn invalid_attributes_data() -> String {
     format!(
-        "Contact with email address: {email_address} doesn't exist in list: \
-         {contact_list_name}."
+        "Attributes must be valid JSON and it can contain up to \
+         {MAX_ATTRIBUTES_DATA_CHARS} characters."
     )
 }
 
@@ -2110,9 +2162,9 @@ pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String
 /// One wording for every operation that names a `TopicName` within a list — the
 /// contact writes and the send that resolves its list-management options — so a
 /// client sees the same sentence whichever call first tells it the topic is not
-/// there.
+/// there. SES names the list first and the topic it does not contain second.
 pub fn contact_list_topic_not_found(contact_list_name: &str, topic_name: &str) -> String {
-    format!("Topic with name: {topic_name} doesn't exist in list: {contact_list_name}.")
+    format!("List: {contact_list_name} doesn't contain Topic: {topic_name}")
 }
 
 /// One email template in the account's template store.

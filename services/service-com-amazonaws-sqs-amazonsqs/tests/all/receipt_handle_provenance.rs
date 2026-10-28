@@ -32,12 +32,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sqs_amazonsqs::state::ComAmazonawsSqsAmazonsqsState;
+use service_com_amazonaws_sqs_amazonsqs::state::{queue_key, ComAmazonawsSqsAmazonsqsState};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
     call, create, create_ok, emulator_over_engine, error_code, fifo_attributes, message_counts,
-    messages, ok,
+    messages, ok, REGION,
 };
 
 /// The sentence Amazon SQS answers for a value supplied where a receipt handle was
@@ -142,7 +142,7 @@ fn deletion_propagated(engine: &engine::InMemoryEngine, name: &str) {
     let mut store = store.lock();
     let deleted_at = store
         .recently_deleted
-        .get_mut(name)
+        .get_mut(&queue_key(REGION, name))
         .unwrap_or_else(|| panic!("case the deletion of {name}: no deletion is pending"));
     *deleted_at = SystemTime::now()
         .checked_sub(PROPAGATED_BY)

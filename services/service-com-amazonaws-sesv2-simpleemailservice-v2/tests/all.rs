@@ -39,6 +39,8 @@ mod configuration_set_sns_event_destinations;
 mod configuration_sets;
 #[path = "all/contact_lists.rs"]
 mod contact_lists;
+#[path = "all/contact_updates.rs"]
+mod contact_updates;
 #[path = "all/dedicated_ip_pools.rs"]
 mod dedicated_ip_pools;
 #[path = "all/dedicated_ips.rs"]

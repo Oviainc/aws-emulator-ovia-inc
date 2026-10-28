@@ -67,6 +67,8 @@ mod recreate_and_tag_rules;
 mod refusal_message_reasons;
 #[path = "all/refusal_taxonomy.rs"]
 mod refusal_taxonomy;
+#[path = "all/regional_queue_namespace.rs"]
+mod regional_queue_namespace;
 #[path = "all/request_size_transport_bound.rs"]
 mod request_size_transport_bound;
 #[path = "all/scratch_probe.rs"]

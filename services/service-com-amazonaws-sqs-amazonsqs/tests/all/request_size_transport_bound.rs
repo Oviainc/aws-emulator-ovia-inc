@@ -35,7 +35,7 @@ async fn post(router: &MultiServiceRouter, operation: &str, body: Vec<u8>) -> (u
         .header("host", support::HOST)
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("AmazonSQS.{operation}"))
-        .header("authorization", support::AUTHORIZATION)
+        .header("authorization", support::authorization_in(support::REGION))
         .body(bytes::Bytes::from(body))
         .expect("a well-formed request");
     let response = router.dispatch(request).await;

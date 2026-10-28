@@ -177,8 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = store.lock();
 
         let now = ::std::time::SystemTime::now();
-        let queue = state::queue_name_from_url(&input.queue_url)
-            .and_then(|name| store.queues.get_mut(name))
+        // A queue url resolves in the region the request addressed: the same url against
+        // another region's endpoint names that region's queue of the same name, and
+        // nothing at all where it holds none.
+        let region = state::request_region(ctx.parts());
+        let queue = store
+            .queue_by_url_mut(&region, &input.queue_url)
             .ok_or_else(|| {
                 GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;
