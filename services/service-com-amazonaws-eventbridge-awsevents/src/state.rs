@@ -4710,35 +4710,55 @@ pub fn event_envelope(
 /// "The JSON must follow the format specified in Amazon Web Services Events, and
 /// the following fields are mandatory: id account source time region resources
 /// detail-type" (`TestEventPattern$Event`).
-pub const REQUIRED_EVENT_FIELDS: [&str; 7] = [
+///
+/// `resources` is the one member of that list whose ABSENCE the service does not
+/// refuse: an event carries no resource ARNs far more often than it carries some,
+/// so an envelope that omits the member is read as one listing none (the empty
+/// list a published event gets, see [`event_envelope`]) and a `resources` clause
+/// in the pattern matches nothing \u2014 which is the same verdict the member spelled
+/// out as `[]` gives. Every other member above decides a clause a pattern can
+/// name, so an envelope missing one of them could not be matched at all.
+pub const REQUIRED_EVENT_FIELDS: [&str; 6] = [
     "id",
     "account",
     "source",
     "time",
     "region",
-    "resources",
     "detail-type",
 ];
 
-/// An event envelope a caller supplied, parsed, or `Err(reason)` when the text is
-/// not an event EventBridge matches a pattern against.
+/// The whole message a refusal of an unreadable `Event` member states.
 ///
-/// The reason is the message of the `InvalidEventPatternException` a caller
-/// answers with, so it names what the envelope was missing. Checked here rather
-/// than in a handler so every path that takes an envelope FROM A CALLER reads the
-/// same rules: the mandatory fields ([`REQUIRED_EVENT_FIELDS`]) have to be
-/// present, and `time` has to be an instant that parses — an envelope whose time
-/// does not would match a pattern's `time` clause by luck rather than by
-/// comparison.
+/// EventBridge names the member and stops there for text it could not read as an
+/// event at all — a document that is not an envelope is not diagnosed further.
+pub const EVENT_NOT_VALID: &str = "Parameter Event is not valid.";
+
+/// What the refusal DOES state about an envelope whose `time` is not an instant.
+///
+/// `time` is the one envelope member whose VALUE the service reads rather than
+/// merely requires — a pattern's `time` clause is compared as an instant — so a
+/// value it cannot read as one is named for what it is.
+const EVENT_TIME_NOT_VALID: &str = "Invalid time.";
+
+/// An event envelope a caller supplied, parsed, or `Err(message)` when the text
+/// is not an event EventBridge matches a pattern against.
+///
+/// An envelope is not a pattern, so a caller refuses it as a bad request MEMBER
+/// rather than as a bad event pattern, and what comes back is the WHOLE message
+/// that refusal carries. Checked here rather than in a handler so every path that
+/// takes an envelope FROM A CALLER reads the same rules: the mandatory fields
+/// ([`REQUIRED_EVENT_FIELDS`]) have to be present, and `time` has to be an
+/// instant that parses — an envelope whose time does not would match a pattern's
+/// `time` clause by luck rather than by comparison.
 pub fn parse_event_envelope(event: &str) -> Result<::serde_json::Value, String> {
-    let parsed: ::serde_json::Value = ::serde_json::from_str(event)
-        .map_err(|error| format!("Event is not valid JSON: {error}"))?;
+    let parsed: ::serde_json::Value =
+        ::serde_json::from_str(event).map_err(|_| EVENT_NOT_VALID.to_string())?;
     let Some(fields) = parsed.as_object() else {
-        return Err("Event must be a JSON object".to_string());
+        return Err(EVENT_NOT_VALID.to_string());
     };
     for field in REQUIRED_EVENT_FIELDS {
         if !fields.contains_key(field) {
-            return Err(format!("Event is missing the required field {field}"));
+            return Err(EVENT_NOT_VALID.to_string());
         }
     }
     let parses = fields
@@ -4752,7 +4772,7 @@ pub fn parse_event_envelope(event: &str) -> Result<::serde_json::Value, String> 
             .is_ok()
         });
     if !parses {
-        return Err("Event field time is not an instant that parses".to_string());
+        return Err(parameter_violation("Event", EVENT_TIME_NOT_VALID));
     }
     Ok(parsed)
 }
@@ -4770,8 +4790,10 @@ pub fn parse_event_envelope(event: &str) -> Result<::serde_json::Value, String> 
 /// exact values, `prefix`, `suffix`, `equals-ignore-case`, `wildcard`,
 /// `anything-but`, `numeric`, `cidr`, `exists`, `$or`, and nested objects.
 pub mod event_pattern {
+    use std::collections::BTreeMap;
     use std::net::IpAddr;
 
+    use ::serde_json::value::RawValue;
     use ::serde_json::{Map, Value};
 
     /// The comparison operators `numeric` admits.
@@ -4815,6 +4837,15 @@ pub mod event_pattern {
     /// other argument.
     const EXISTS_NOT_BOOLEAN: &str = "exists match pattern must be either true or false.";
 
+    /// A `numeric` range whose bounds admit no number at all: the reason
+    /// EventBridge gives for it, in the service's own wording.
+    const BOTTOM_BELOW_TOP: &str = "Bottom must be less than top";
+
+    /// A pattern is a FILTER over an event's fields, so the pattern itself is an
+    /// object; this is the reason EventBridge gives for text that parses as
+    /// anything else.
+    const FILTER_NOT_AN_OBJECT: &str = "Filter is not an object";
+
     /// How many pattern objects an `$or` relationship relates.
     ///
     /// `$or` is a RELATIONSHIP between pattern objects, and a relationship needs
@@ -4854,10 +4885,11 @@ pub mod event_pattern {
     /// operation that stores a pattern, and routing itself, goes through.
     ///
     /// What comes back is the WHOLE message of the `InvalidEventPatternException`
-    /// a caller answers with: the opening ([`INVALID_PATTERN`]) and then the
-    /// reason. A reason the service words for the offending CONSTRUCT carries
-    /// that wording and no field path; one this module words for itself names the
-    /// field path, so a caller can find what to change.
+    /// a caller answers with: the opening ([`INVALID_PATTERN`]), the reason, and
+    /// the source location the reader had reached in the submitted text
+    /// ([`Refusal::message`]). A reason the service words for the offending
+    /// CONSTRUCT carries that wording and no field path; one this module words
+    /// for itself names the field path, so a caller can find what to change.
     pub fn parse(pattern: &str) -> Result<Map<String, Value>, String> {
         parse_as(pattern, Validator::Compiler)
     }
@@ -4865,21 +4897,300 @@ pub mod event_pattern {
     /// [`parse`], read by `validator`: the same parse, worded as that validator
     /// words it.
     pub fn parse_as(pattern: &str, validator: Validator) -> Result<Map<String, Value>, String> {
-        parse_reason(pattern, validator).map_err(|reason| format!("{INVALID_PATTERN} {reason}"))
+        parse_reason(pattern, validator).map_err(|refusal| refusal.message(pattern))
     }
 
-    /// The parse itself, reporting the bare reason the refusal states.
-    fn parse_reason(pattern: &str, validator: Validator) -> Result<Map<String, Value>, String> {
-        let value: Value = ::serde_json::from_str(pattern)
-            .map_err(|error| format!("Event pattern is not valid JSON: {error}"))?;
+    /// The parse itself, reporting the reason the refusal states and where in
+    /// the submitted text the reader stood when it stopped.
+    fn parse_reason(pattern: &str, validator: Validator) -> Result<Map<String, Value>, Refusal> {
+        let value: Value = ::serde_json::from_str(pattern).map_err(|error| Refusal {
+            reason: format!("Event pattern is not valid JSON: {error}"),
+            // The only position known about text that does not parse is the one
+            // the JSON reader itself stopped at.
+            spot: Some(Spot::Position {
+                line: error.line(),
+                column: error.column(),
+            }),
+        })?;
         let Value::Object(map) = value else {
-            return Err("Event pattern must be a JSON object".to_string());
+            return Err(At::root().refuse(Read::Opening, FILTER_NOT_AN_OBJECT));
         };
         if map.is_empty() {
-            return Err("Event pattern must name at least one field".to_string());
+            return Err(At::root().refuse(
+                Read::Whole,
+                "Event pattern must name at least one field",
+            ));
         }
-        validate_object(&map, "", 1, validator)?;
+        validate_object(&map, &At::root(), 1, validator)?;
         Ok(map)
+    }
+
+    /// A pattern the language does not admit: the reason, and where in the
+    /// submitted text the reader stood when it refused.
+    #[derive(Debug)]
+    struct Refusal {
+        /// What is wrong, in the wording the refusal states after
+        /// [`INVALID_PATTERN`].
+        reason: String,
+        /// Where the reader was when it found that out, and `None` for a reason
+        /// the reader did not itself produce ([`Refusal::unplaced`]).
+        spot: Option<Spot>,
+    }
+
+    impl Refusal {
+        /// A refusal the pattern READER did not state: the operand's own parser
+        /// did, so there is no reading position to report and the message is the
+        /// reason alone.
+        fn unplaced(reason: impl Into<String>) -> Self {
+            Self {
+                reason: reason.into(),
+                spot: None,
+            }
+        }
+
+        /// The whole message the refusal carries: the opening, the reason, and —
+        /// for a reason the reader stated — the source location, which is the
+        /// pattern exactly as it was submitted and the line and column of the
+        /// position the reader had reached in it.
+        ///
+        /// Every part of the location is derived from the request, so the
+        /// caller's own text is what it points into: a tool that reads the
+        /// location can show the offending character of the pattern its user
+        /// wrote. The pattern travels as part of a message VALUE, which the
+        /// protocol's own serializer encodes, so text carrying quotes or
+        /// newlines cannot break the error envelope it is rendered into.
+        fn message(&self, pattern: &str) -> String {
+            let opening = format!("{INVALID_PATTERN} {}", self.reason);
+            match &self.spot {
+                None => opening,
+                Some(spot) => {
+                    let (line, column) = spot.line_and_column(pattern);
+                    format!(
+                        "{opening}\n at [Source: (String)\"{pattern}\"; line: {line}, \
+                         column: {column}]"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Where in the submitted pattern text a refusal happened.
+    #[derive(Debug)]
+    enum Spot {
+        /// At the node `steps` names, with `read` of that node consumed: the
+        /// position is found by walking the submitted TEXT to it, so it is the
+        /// caller's own spelling — whitespace, key order and all — that decides
+        /// the line and column.
+        Node { steps: Vec<Step>, read: Read },
+        /// At a line and column already known, which is all there is to know
+        /// about text that does not parse as JSON at all.
+        Position { line: usize, column: usize },
+    }
+
+    impl Spot {
+        /// The line and column, both counted from 1, this spot is at in
+        /// `pattern`.
+        ///
+        /// A node the walk cannot follow leaves the position at the end of the
+        /// text: every node a refusal names comes from the parse of this very
+        /// text, so there is no such node — reporting the end of what was read
+        /// is the honest answer rather than an invented position.
+        fn line_and_column(&self, pattern: &str) -> (usize, usize) {
+            match self {
+                Self::Position { line, column } => (*line, *column),
+                Self::Node { steps, read } => {
+                    let offset = offset_of(pattern, steps, *read).unwrap_or(pattern.len());
+                    line_and_column(pattern, offset)
+                }
+            }
+        }
+    }
+
+    /// One step from the pattern's root to one of its nodes, as the walk over
+    /// the submitted text follows it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        /// The value of the member with this name.
+        Key(String),
+        /// The value of the member at this position, counted in the order the
+        /// TEXT writes the members: how a refusal about a SECOND member of an
+        /// object finds it.
+        KeyAt(usize),
+        /// The member of a list at this position.
+        Index(usize),
+    }
+
+    /// How much of the node a refusal names the reader had consumed when it
+    /// refused — which is what decides the position it reports.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Read {
+        /// Nothing of it yet: the reader stands at the node's first character,
+        /// which is where reading the member name that introduces it leaves it.
+        Pending,
+        /// Its opening token only — a string's opening quote, an object's or a
+        /// list's bracket, or the whole of any other scalar, which is one token.
+        /// What a refusal decided from the node's TYPE had read.
+        Opening,
+        /// All of it, up to and past its closing token: what a refusal that had
+        /// to read the node's CONTENT had read.
+        Whole,
+    }
+
+    /// Where one step of the validation is: the dotted field path the reasons
+    /// this module words itself name, and the steps that find the same node in
+    /// the submitted text.
+    #[derive(Debug, Clone)]
+    struct At {
+        /// The dotted path of event fields this node sits under.
+        field: String,
+        /// The steps from the pattern's root to this node.
+        steps: Vec<Step>,
+    }
+
+    impl At {
+        /// The pattern as a whole.
+        fn root() -> Self {
+            Self {
+                field: String::new(),
+                steps: Vec::new(),
+            }
+        }
+
+        /// The value of `key`, which names a FIELD of the event: the dotted
+        /// field path grows with it.
+        fn field(&self, key: &str) -> Self {
+            let field = if self.field.is_empty() {
+                key.to_string()
+            } else {
+                format!("{}.{key}", self.field)
+            };
+            Self {
+                field,
+                steps: self.then(Step::Key(key.to_string())),
+            }
+        }
+
+        /// The value of `key` of this node where `key` is NOT a field of the
+        /// event — an operator and its argument — so the field path stays the
+        /// one the operator was found under.
+        fn key(&self, key: &str) -> Self {
+            Self {
+                field: self.field.clone(),
+                steps: self.then(Step::Key(key.to_string())),
+            }
+        }
+
+        /// The value of the member this node writes at `nth`.
+        fn nth_key(&self, nth: usize) -> Self {
+            Self {
+                field: self.field.clone(),
+                steps: self.then(Step::KeyAt(nth)),
+            }
+        }
+
+        /// The member of this list at `index`.
+        fn index(&self, index: usize) -> Self {
+            Self {
+                field: self.field.clone(),
+                steps: self.then(Step::Index(index)),
+            }
+        }
+
+        /// This node's steps, with `step` appended.
+        fn then(&self, step: Step) -> Vec<Step> {
+            let mut steps = self.steps.clone();
+            steps.push(step);
+            steps
+        }
+
+        /// Refuse the pattern here, the reader having consumed `read` of this
+        /// node.
+        fn refuse(&self, read: Read, reason: impl Into<String>) -> Refusal {
+            Refusal {
+                reason: reason.into(),
+                spot: Some(Spot::Node {
+                    steps: self.steps.clone(),
+                    read,
+                }),
+            }
+        }
+    }
+
+    /// The offset in `pattern` the reader stands at, having walked to the node
+    /// `steps` names and consumed `read` of it.
+    ///
+    /// The position a refusal reports is a fact about the submitted TEXT rather
+    /// than about the parse tree — two patterns that parse to the same tree point
+    /// at different characters — so the walk needs each node's own characters,
+    /// which is exactly what `serde_json`'s `RawValue` is: a node read as a
+    /// WINDOW onto the text it came from, borrowed from it and never
+    /// re-interpreted, so where that window begins is where the node begins
+    /// ([`offset_in`]). The reading is `serde_json`'s throughout: nothing here
+    /// re-scans the document.
+    fn offset_of(pattern: &str, steps: &[Step], read: Read) -> Option<usize> {
+        let mut node: &RawValue = ::serde_json::from_str(pattern).ok()?;
+        for step in steps {
+            node = match step {
+                Step::Index(index) => ::serde_json::from_str::<Vec<&RawValue>>(node.get())
+                    .ok()?
+                    .get(*index)
+                    .copied()?,
+                Step::Key(key) => ::serde_json::from_str::<BTreeMap<String, &RawValue>>(node.get())
+                    .ok()?
+                    .remove(key.as_str())?,
+                // The nth member the TEXT writes, which is the nth by where it
+                // begins: a parsed object does not keep the order the caller
+                // wrote its members in.
+                Step::KeyAt(nth) => {
+                    let members =
+                        ::serde_json::from_str::<BTreeMap<String, &RawValue>>(node.get()).ok()?;
+                    let mut written: Vec<&RawValue> = members.into_values().collect();
+                    written.sort_by_key(|member| {
+                        offset_in(pattern, member.get()).unwrap_or(usize::MAX)
+                    });
+                    *written.get(*nth)?
+                }
+            };
+        }
+        let text = node.get();
+        let start = offset_in(pattern, text)?;
+        Some(match read {
+            Read::Pending => start,
+            // A string is read as far as its opening quote and an object or a
+            // list as far as its bracket; every other value is a single token,
+            // so reading it at all reads the whole of it.
+            Read::Opening => match text.as_bytes().first() {
+                Some(b'"' | b'{' | b'[') => start + 1,
+                _ => start + text.len(),
+            },
+            Read::Whole => start + text.len(),
+        })
+    }
+
+    /// The byte offset at which `window` sits inside `text`, or `None` when it is
+    /// not a slice of it.
+    ///
+    /// Both are slices of the one submitted string, so the offset is the distance
+    /// between where they start — read from the two slices' addresses, never
+    /// dereferenced — and the bound check is what keeps that an answer about this
+    /// text rather than about two unrelated strings.
+    fn offset_in(text: &str, window: &str) -> Option<usize> {
+        let offset = (window.as_ptr() as usize).checked_sub(text.as_ptr() as usize)?;
+        offset
+            .checked_add(window.len())
+            .filter(|end| *end <= text.len())
+            .map(|_| offset)
+    }
+
+    /// The line and column, both counted from 1, of `offset` in `text`.
+    ///
+    /// The column counts CHARACTERS from the start of the line, so a multi-byte
+    /// character before the position counts once.
+    fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+        let read = text.get(..offset).unwrap_or(text);
+        let line = 1 + read.matches('\n').count();
+        let last = read.rsplit_once('\n').map_or(read, |(_, after)| after);
+        (line, 1 + last.chars().count())
     }
 
     /// Whether `event` matches an ALREADY-PARSED pattern, spending `budget`.
@@ -5026,27 +5337,28 @@ pub mod event_pattern {
     /// sends.
     fn validate_object(
         pattern: &Map<String, Value>,
-        path: &str,
+        at: &At,
         depth: usize,
         validator: Validator,
-    ) -> Result<(), String> {
+    ) -> Result<(), Refusal> {
         if depth > MAX_PATTERN_DEPTH {
-            return Err(format!(
-                "Event pattern nests objects more than {MAX_PATTERN_DEPTH} levels deep"
+            return Err(at.refuse(
+                Read::Opening,
+                format!("Event pattern nests objects more than {MAX_PATTERN_DEPTH} levels deep"),
             ));
         }
         for (key, spec) in pattern {
-            let field = if path.is_empty() {
-                key.clone()
-            } else {
-                format!("{path}.{key}")
-            };
+            let at = at.field(key);
+            let field = at.field.clone();
             if key == "$or" {
                 let Some(branches) = spec.as_array() else {
-                    return Err(format!("\"{field}\" must be an array of patterns"));
+                    return Err(at.refuse(
+                        Read::Opening,
+                        format!("\"{field}\" must be an array of patterns"),
+                    ));
                 };
                 if branches.is_empty() {
-                    return Err(EMPTY_ARRAY.to_string());
+                    return Err(at.refuse(Read::Whole, EMPTY_ARRAY));
                 }
                 // `$or` relates pattern objects to one another, and a
                 // relationship needs [`OR_RELATED_OBJECTS`] sides: a list too
@@ -5057,51 +5369,64 @@ pub mod event_pattern {
                 // unrecognized match type rather than a branch of an `$or`.
                 if branches.len() < OR_RELATED_OBJECTS {
                     match validator {
-                        Validator::Checker => return Err(OR_NEEDS_TWO_OBJECTS.to_string()),
+                        Validator::Checker => {
+                            return Err(at.refuse(Read::Whole, OR_NEEDS_TWO_OBJECTS));
+                        }
                         Validator::Compiler => branches
                             .iter()
-                            .try_for_each(|term| validate_term(term, &field))?,
+                            .enumerate()
+                            .try_for_each(|(index, term)| validate_term(term, &at.index(index)))?,
                     }
                     continue;
                 }
-                for branch in branches {
+                for (index, branch) in branches.iter().enumerate() {
+                    let at = at.index(index);
                     let Some(object) = branch.as_object() else {
-                        return Err(format!("every branch of {field} must be a pattern object"));
+                        return Err(at.refuse(
+                            Read::Opening,
+                            format!("every branch of {field} must be a pattern object"),
+                        ));
                     };
                     if object.is_empty() {
-                        return Err(EMPTY_OBJECT.to_string());
+                        return Err(at.refuse(Read::Whole, EMPTY_OBJECT));
                     }
-                    validate_object(object, &field, depth + 1, validator)?;
+                    validate_object(object, &at, depth + 1, validator)?;
                 }
                 continue;
             }
             match spec {
                 Value::Array(terms) => {
                     if terms.is_empty() {
-                        return Err(EMPTY_ARRAY.to_string());
+                        return Err(at.refuse(Read::Whole, EMPTY_ARRAY));
                     }
-                    for term in terms {
-                        validate_term(term, &field)?;
+                    for (index, term) in terms.iter().enumerate() {
+                        validate_term(term, &at.index(index))?;
                     }
                 }
                 Value::Object(child) => {
                     if child.is_empty() {
-                        return Err(EMPTY_OBJECT.to_string());
+                        return Err(at.refuse(Read::Whole, EMPTY_OBJECT));
                     }
-                    validate_object(child, &field, depth + 1, validator)?;
+                    validate_object(child, &at, depth + 1, validator)?;
                 }
-                _ => return Err(format!("\"{field}\" must be an object or an array")),
+                _ => {
+                    return Err(at.refuse(
+                        Read::Opening,
+                        format!("\"{field}\" must be an object or an array"),
+                    ));
+                }
             }
         }
         Ok(())
     }
 
-    /// One match term: a literal value, or a single-key operator object.
+    /// One match term: a literal value, or a single-key operator object. `at`
+    /// locates the term itself in the submitted text.
     ///
     /// A term object is a MATCH EXPRESSION, which names one match type: an
     /// object carrying several keys names several ([`ONE_KEY_ONLY`]) and one
     /// carrying none names no match type at all ([`EMPTY_OBJECT`]).
-    fn validate_term(term: &Value, field: &str) -> Result<(), String> {
+    fn validate_term(term: &Value, at: &At) -> Result<(), Refusal> {
         match term {
             Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => Ok(()),
             Value::Object(map) if map.len() == 1 => {
@@ -5109,25 +5434,41 @@ pub mod event_pattern {
                     .iter()
                     .next()
                     .expect("a single-entry map has a first entry");
-                validate_operator(operator, argument, field)
+                validate_operator(operator, argument, &at.key(operator))
             }
-            Value::Object(map) if map.is_empty() => Err(EMPTY_OBJECT.to_string()),
-            Value::Object(_) => Err(ONE_KEY_ONLY.to_string()),
-            _ => Err(format!(
-                "\"{field}\" admits literal values and single-operator objects only"
+            Value::Object(map) if map.is_empty() => Err(at.refuse(Read::Whole, EMPTY_OBJECT)),
+            // The reader finds this out where the SECOND match type it names
+            // begins, which is as far as it had read.
+            Value::Object(_) => Err(at.nth_key(1).refuse(Read::Pending, ONE_KEY_ONLY)),
+            _ => Err(at.refuse(
+                Read::Opening,
+                format!(
+                    "\"{}\" admits literal values and single-operator objects only",
+                    at.field
+                ),
             )),
         }
     }
 
-    /// The argument an operator takes.
-    fn validate_operator(operator: &str, argument: &Value, field: &str) -> Result<(), String> {
-        let bad = |what: &str| Err(format!("{field}: {operator} takes {what}"));
+    /// The argument an operator takes. `at` locates that ARGUMENT in the
+    /// submitted text and carries the field path the reasons this module words
+    /// itself name.
+    fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Refusal> {
+        let field = at.field.clone();
+        // A type the operator does not take is decided from the argument's
+        // opening token alone, which is as much of it as the reader had read.
+        let bad = |what: &str| {
+            Err(at.refuse(
+                Read::Opening,
+                format!("{field}: {operator} takes {what}"),
+            ))
+        };
         match operator {
             "exists" => {
                 if argument.is_boolean() {
                     Ok(())
                 } else {
-                    Err(EXISTS_NOT_BOOLEAN.to_string())
+                    Err(at.refuse(Read::Opening, EXISTS_NOT_BOOLEAN))
                 }
             }
             "prefix" | "suffix" => match argument {
@@ -5155,16 +5496,25 @@ pub mod event_pattern {
             // A wildcard value is a string whose `*` stands for any run of
             // characters, and the language admits no two of them in a row.
             "wildcard" => match argument.as_str() {
-                Some(text) => wildcard_violation(text).map_or(Ok(()), Err),
+                // Read from the value's own text, so the whole of it had been
+                // read before the refusal.
+                Some(text) => wildcard_violation(text)
+                    .map_or(Ok(()), |reason| Err(at.refuse(Read::Whole, reason))),
                 None => bad("a string"),
             },
             "cidr" => match argument.as_str().map(parse_cidr) {
                 Some(Ok(_)) => Ok(()),
-                // The mask width is a rule of the CIDR notation itself, and the
-                // service words it for the notation; text that is no block at
-                // all is this operator's own argument check.
-                Some(Err(CidrRefusal::MaskNotNarrowerThanTheFamily(reason))) => Err(reason),
-                _ => bad("an IPv4 or IPv6 CIDR block"),
+                // The mask width is a rule of the CIDR NOTATION, which the
+                // address parser reads out of the block's own text and the
+                // service words for the notation, so what that parser says is
+                // the whole reason and there is no reading position to state.
+                Some(Err(CidrRefusal::MaskNotNarrowerThanTheFamily(reason))) => {
+                    Err(Refusal::unplaced(reason))
+                }
+                // Text that is no block at all is this operator's own argument
+                // check, worded and placed as every other one is — whether what
+                // was given is a string that names no block or no string at all.
+                Some(Err(CidrRefusal::NotABlock)) | None => bad("an IPv4 or IPv6 CIDR block"),
             },
             "anything-but" => match argument {
                 Value::String(_) | Value::Number(_) => Ok(()),
@@ -5183,17 +5533,26 @@ pub mod event_pattern {
                         .iter()
                         .next()
                         .expect("a single-entry map has a first entry");
-                    if !STRING_OPERATORS.contains(&nested.as_str()) {
-                        return bad("a value, a list of values, or one nested string operator");
-                    }
                     // A nested string operator may take a LIST of arguments,
                     // any one of which excludes the value: `anything-but` is the
-                    // one place the pattern language admits that form.
+                    // one place the pattern language admits that form. Any other
+                    // match type nested under it is one it does not negate, and
+                    // the reader has entered that operator's argument by the
+                    // time it can say so.
+                    let nested_at = at.key(nested);
+                    if !STRING_OPERATORS.contains(&nested.as_str()) {
+                        return Err(nested_at.refuse(
+                            Read::Opening,
+                            format!("Unsupported {operator} pattern: {nested}"),
+                        ));
+                    }
                     match nested_argument {
-                        Value::Array(arguments) if !arguments.is_empty() => arguments
-                            .iter()
-                            .try_for_each(|one| validate_operator(nested, one, field)),
-                        one => validate_operator(nested, one, field),
+                        Value::Array(arguments) if !arguments.is_empty() => {
+                            arguments.iter().enumerate().try_for_each(|(index, one)| {
+                                validate_operator(nested, one, &nested_at.index(index))
+                            })
+                        }
+                        one => validate_operator(nested, one, &nested_at),
                     }
                 }
                 _ => bad("a value, a list of values, or one nested string operator"),
@@ -5203,41 +5562,65 @@ pub mod event_pattern {
                     return bad("an array of operator/value pairs");
                 };
                 if terms.is_empty() {
-                    return Err(EMPTY_ARRAY.to_string());
+                    return Err(at.refuse(Read::Whole, EMPTY_ARRAY));
                 }
                 // The list is read as the operator/value PAIRS it is: an
                 // operator the comparison set does not hold, and a bound that
                 // is not a number (a bound the list stops short of included),
                 // are each named for what they are.
-                for pair in terms.chunks(2) {
+                for (pair_index, pair) in terms.chunks(2).enumerate() {
                     // `chunks` never yields an empty chunk; reading the
                     // operator as an OPTION keeps that a fact about this code
                     // rather than an assumption about a caller's list.
                     let Some(spelled) = pair.first() else {
                         continue;
                     };
+                    let spelled_at = pair_index * 2;
                     let Some(comparison) = spelled
                         .as_str()
                         .filter(|operator| NUMERIC_OPERATORS.contains(operator))
                     else {
-                        return Err(format!(
-                            "Unrecognized numeric range operator: {}",
-                            spelled_out(spelled)
+                        return Err(at.index(spelled_at).refuse(
+                            Read::Whole,
+                            format!(
+                                "Unrecognized numeric range operator: {}",
+                                spelled_out(spelled)
+                            ),
                         ));
                     };
-                    if !pair.get(1).is_some_and(Value::is_number) {
-                        return Err(format!("Value of {comparison} must be numeric"));
+                    match pair.get(1) {
+                        Some(bound) if bound.is_number() => {}
+                        Some(_) => {
+                            return Err(at
+                                .index(spelled_at + 1)
+                                .refuse(Read::Opening, format!("Value of {comparison} must be numeric")));
+                        }
+                        // The list stops short of the bound, so the reader has
+                        // read the whole of it before it can tell.
+                        None => {
+                            return Err(at.refuse(
+                                Read::Whole,
+                                format!("Value of {comparison} must be numeric"),
+                            ));
+                        }
                     }
                 }
                 // A range whose bottom is not below its top admits no number at
                 // all, so it is a pattern that can never match rather than a
-                // filter: refused instead of stored.
+                // filter: refused instead of stored, which the whole list had to
+                // be read to decide.
                 if let Some(reason) = degenerate_range(terms) {
-                    return Err(format!("{field}: {operator} {reason}"));
+                    return Err(at.refuse(Read::Whole, reason));
                 }
                 Ok(())
             }
-            _ => Err(format!("Unrecognized match type {operator}")),
+            // The reader has entered the argument this name introduces, which
+            // is as far as it gets before the name turns out to name no match
+            // type at all.
+            _ => Err(at.refuse(
+                Read::Opening,
+                format!("Unrecognized match type {operator}"),
+            )),
         }
     }
 
@@ -5314,7 +5697,7 @@ pub mod event_pattern {
             (Some((low, low_exclusive)), Some((high, high_exclusive)))
                 if low > high || (low == high && (low_exclusive || high_exclusive)) =>
             {
-                Some("names a range whose bottom is not below its top")
+                Some(BOTTOM_BELOW_TOP)
             }
             _ => None,
         }
@@ -5435,12 +5818,15 @@ pub mod event_pattern {
         })
     }
 
-    /// Whether `value` is a LEAF the `exists` operator sees: a string, a number or
-    /// a boolean, or an array carrying at least one such member.
+    /// Whether `value` is a LEAF the `exists` operator sees: any scalar — a
+    /// string, a number, a boolean, or `null` — or an array carrying at least
+    /// one such member.
     ///
-    /// `null`, an object and an empty array carry no leaf, so a field holding one
+    /// `null` IS such a leaf: a field whose value is `null` is one the event
+    /// carries, so `exists: true` holds for it and `exists: false` does not. An
+    /// object and an empty array are what carry no leaf, so a field holding one
     /// of them is absent for `exists` — which is what "exists only works on leaf
-    /// nodes" means.
+    /// nodes. It does not work on intermediate nodes" means.
     ///
     /// The search descends an EVENT's value, which nests as deep as
     /// [`super::MAX_DETAIL_DEPTH`] admits, so it descends on an explicit stack for
@@ -5449,7 +5835,7 @@ pub mod event_pattern {
         let mut pending: Vec<&Value> = ::std::vec![value];
         while let Some(value) = pending.pop() {
             match value {
-                Value::Null | Value::Object(_) => {}
+                Value::Object(_) => {}
                 Value::Array(members) => pending.extend(members.iter()),
                 _ => return true,
             }

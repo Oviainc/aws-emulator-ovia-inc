@@ -320,10 +320,10 @@ async fn test_event_pattern_answers_the_pattern_language_over_the_envelope() {
             true,
         ),
         (
-            "exists sees no leaf in a null-valued field",
+            "exists sees a leaf in a null-valued field, because null is a value",
             json!({ "detail": { "status": [{ "exists": true }] } }),
             event_with("detail", Some(json!({ "status": null }))),
-            false,
+            true,
         ),
         (
             "anything-but over a nested string operator",
@@ -374,81 +374,97 @@ async fn test_event_pattern_answers_the_pattern_language_over_the_envelope() {
     }
 }
 
-/// A pattern the language does not admit, and an event that is not an envelope,
-/// are both the operation's one modelled client error.
+/// A pattern the language does not admit is the operation's modelled
+/// `InvalidEventPatternException`; an `Event` that is not an envelope is a bad
+/// request MEMBER, so it is the refusal every unacceptable member of this service
+/// answers with (`ValidationException`) — the two members are two different things
+/// for the caller to fix.
 #[tokio::test]
 async fn test_event_pattern_refuses_a_pattern_or_an_event_it_cannot_read() {
     let router = emulator();
-    // (case, the pattern, the event)
-    let rows: Vec<(&str, Value, Value)> = vec![
+    // (case, the pattern, the event, the error code the refusal carries)
+    let rows: Vec<(&str, Value, Value, &str)> = vec![
         (
             "a leaf value not wrapped in an array",
             json!({ "source": "com.demo.orders" }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "a field listing no value at all",
             json!({ "source": [] }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "an operator the language does not have",
             json!({ "source": [{ "starts-with": "com." }] }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "numeric with an odd number of terms",
             json!({ "detail": { "amount": [{ "numeric": [">", 1, "<"] }] } }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "exists with something that is not a boolean",
             json!({ "detail": { "status": [{ "exists": "yes" }] } }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "numeric naming a range whose bottom is above its top",
             json!({ "detail": { "amount": [{ "numeric": [">", 100, "<", 10] }] } }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "numeric naming a range whose ends meet but exclude each other",
             json!({ "detail": { "amount": [{ "numeric": [">", 42, "<=", 42] }] } }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "cidr with a block that is not one",
             json!({ "detail": { "client-ip": [{ "cidr": "10.0.0.0/notanumber" }] } }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "cidr naming a host inside a block rather than the block itself",
             json!({ "detail": { "client-ip": [{ "cidr": "10.0.1.7/24" }] } }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "cidr with a prefix wider than the address family admits",
             json!({ "detail": { "client-ip": [{ "cidr": "10.0.0.0/33" }] } }),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "a pattern that is not a JSON object",
             json!(["com.demo.orders"]),
             base_event(),
+            "InvalidEventPatternException",
         ),
         (
             "an event missing a mandatory field",
             json!({ "source": ["com.demo.orders"] }),
             event_with("detail-type", None),
+            "ValidationException",
         ),
         (
             "an event whose time is not an instant that parses",
             json!({ "source": ["com.demo.orders"] }),
             event_with("time", Some(json!("the day before yesterday"))),
+            "ValidationException",
         ),
     ];
 
-    for (case, pattern, event) in rows {
+    for (case, pattern, event, code) in rows {
         let (status, body) = events(
             &router,
             "TestEventPattern",
@@ -461,20 +477,23 @@ async fn test_event_pattern_refuses_a_pattern_or_an_event_it_cannot_read() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidEventPatternException",
-            "case {case:?}: expected InvalidEventPatternException, got {body}"
+            code,
+            "case {case:?}: expected {code}, got {body}"
         );
     }
 
-    // Text that is not JSON at all, in either member.
-    for (case, request) in [
+    // Text that is not JSON at all, in either member: the pattern is the invalid
+    // pattern, the event the invalid member.
+    for (case, request, code) in [
         (
             "a pattern that is not JSON",
             json!({ "EventPattern": "{", "Event": base_event().to_string() }),
+            "InvalidEventPatternException",
         ),
         (
             "an event that is not JSON",
             json!({ "EventPattern": r#"{"source":["com.demo.orders"]}"#, "Event": "{" }),
+            "ValidationException",
         ),
     ] {
         let (status, body) = events(&router, "TestEventPattern", &request).await;
@@ -484,8 +503,8 @@ async fn test_event_pattern_refuses_a_pattern_or_an_event_it_cannot_read() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidEventPatternException",
-            "case {case:?}: expected InvalidEventPatternException, got {body}"
+            code,
+            "case {case:?}: expected {code}, got {body}"
         );
     }
 }

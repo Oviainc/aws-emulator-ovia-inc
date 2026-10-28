@@ -11,6 +11,8 @@
 //! * a pattern whose text uses the language's syntax in a way the language does
 //!   not admit is REFUSED — `InvalidEventPatternException`, HTTP 400 — and the
 //!   message is `Event pattern is not valid. Reason: <reason>` stated ONCE,
+//!   followed by the source location the validator reached in the pattern as
+//!   submitted (the position itself is `pattern_refusal_location`'s table),
 //!   where the reason names what is wrong in the service's own wording: an
 //!   unrecognized match type or numeric comparison, a non-numeric numeric
 //!   bound, a match expression carrying more than one key, a non-boolean
@@ -137,83 +139,135 @@ fn refusal(reason: &str) -> String {
     format!("Event pattern is not valid. Reason: {reason}")
 }
 
-/// Every malformed-pattern row: the case, the pattern text, and the reason the
-/// refusal states.
+/// Assert that `body` is the refusal of `pattern` for `reason`: the opening and
+/// the reason stated once, and then — for a reason the pattern READER states — the
+/// source location naming the pattern exactly as it was submitted and a position
+/// inside it (which character, row by row, is `pattern_refusal_location`'s
+/// table). A reason the operand's own parser states, like a CIDR block's, is the
+/// whole message.
+fn assert_refusal(case: &str, body: &Value, pattern: &str, reason: &str, located: bool) {
+    let message = error_message(body);
+    if !located {
+        assert_eq!(
+            message,
+            refusal(reason),
+            "case {case:?}: expected the refusal to state {:?} and nothing after it",
+            refusal(reason)
+        );
+        return;
+    }
+    // The patterns here are written on one line, so the position is a column of
+    // line 1 — and it names a character of the submitted pattern, or the one just
+    // past its end where the reader ran out of text.
+    let opening = format!(
+        "{}\n at [Source: (String)\"{pattern}\"; line: 1, column: ",
+        refusal(reason)
+    );
+    let column = message
+        .strip_prefix(&opening)
+        .and_then(|rest| rest.strip_suffix(']'))
+        .and_then(|column| column.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected {opening:?}<column>], got {message:?}")
+        });
+    assert!(
+        (1..=pattern.chars().count() + 1).contains(&column),
+        "case {case:?}: column {column} must name a character of the submitted pattern \
+         {pattern:?}"
+    );
+}
+
+/// Every malformed-pattern row: the case, the pattern text, the reason the
+/// refusal states, and whether the message carries the source location after it
+/// (see [`assert_refusal`]).
 ///
 /// The classes are the ones EventBridge names in its own wording; each is
 /// exercised on at least one entry beyond the first, and the positional ones on
 /// several positions.
-fn malformed_rows() -> Vec<(&'static str, String, String)> {
-    let rows: Vec<(&'static str, Value, String)> = vec![
+fn malformed_rows() -> Vec<(&'static str, String, String, bool)> {
+    let rows: Vec<(&'static str, Value, String, bool)> = vec![
         // A comparison the `numeric` operator set does not hold.
         (
             "numeric with an operator the set does not hold",
             json!({ "detail": { "n": [{ "numeric": ["!=", 1] }] } }),
             "Unrecognized numeric range operator: !=".to_string(),
+            true,
         ),
         (
             "numeric with another operator the set does not hold",
             json!({ "detail": { "n": [{ "numeric": ["=~", 1] }] } }),
             "Unrecognized numeric range operator: =~".to_string(),
+            true,
         ),
         (
             "numeric whose operator is not even text",
             json!({ "detail": { "n": [{ "numeric": [1, 1] }] } }),
             "Unrecognized numeric range operator: 1".to_string(),
+            true,
         ),
         // A bound that is not a number, including a list that stops short of one.
         (
             "numeric with a bound that is text",
             json!({ "detail": { "n": [{ "numeric": [">", "1"] }] } }),
             "Value of > must be numeric".to_string(),
+            true,
         ),
         (
             "numeric with a bound that is a boolean",
             json!({ "detail": { "n": [{ "numeric": ["<=", true] }] } }),
             "Value of <= must be numeric".to_string(),
+            true,
         ),
         (
             "numeric whose last pair carries no bound at all",
             json!({ "detail": { "n": [{ "numeric": [">", 1, ">="] }] } }),
             "Value of >= must be numeric".to_string(),
+            true,
         ),
         // A match expression names ONE match type.
         (
             "a match expression carrying two match types",
             json!({ "detail": { "k": [{ "prefix": "a", "suffix": "b" }] } }),
             "Only one key allowed in match expression".to_string(),
+            true,
         ),
         (
             "a match expression carrying three match types",
             json!({ "source": [{ "prefix": "a", "suffix": "b", "wildcard": "c*" }] }),
             "Only one key allowed in match expression".to_string(),
+            true,
         ),
         // `exists` compares against presence, so its argument is a boolean.
         (
             "exists given the text of a boolean",
             json!({ "detail": { "k": [{ "exists": "false" }] } }),
             "exists match pattern must be either true or false.".to_string(),
+            true,
         ),
         (
             "exists given a number",
             json!({ "detail": { "k": [{ "exists": 1 }] } }),
             "exists match pattern must be either true or false.".to_string(),
+            true,
         ),
         // Two wildcard characters in a row ask for nothing one does not.
         (
             "wildcard with two characters in a row inside the value",
             json!({ "detail": { "k": [{ "wildcard": "a**b" }] } }),
             "Consecutive wildcard characters at pos 2".to_string(),
+            true,
         ),
         (
             "wildcard that is nothing but two characters in a row",
             json!({ "detail": { "k": [{ "wildcard": "**" }] } }),
             "Consecutive wildcard characters at pos 1".to_string(),
+            true,
         ),
         (
             "wildcard whose run falls at the end of a longer value",
             json!({ "detail": { "k": [{ "wildcard": "a*b*c**" }] } }),
             "Consecutive wildcard characters at pos 6".to_string(),
+            true,
         ),
         (
             // The position is counted in CHARACTERS, so a multi-byte character
@@ -221,6 +275,7 @@ fn malformed_rows() -> Vec<(&'static str, String, String)> {
             "wildcard whose run follows a multi-byte character",
             json!({ "detail": { "k": [{ "wildcard": "é**" }] } }),
             "Consecutive wildcard characters at pos 2".to_string(),
+            true,
         ),
         (
             // The same rule wherever a wildcard value is given, including as the
@@ -228,64 +283,77 @@ fn malformed_rows() -> Vec<(&'static str, String, String)> {
             "a wildcard nested inside anything-but",
             json!({ "detail": { "k": [{ "anything-but": { "wildcard": "x**" } }] } }),
             "Consecutive wildcard characters at pos 2".to_string(),
+            true,
         ),
         // A mask as wide as the address family names one address, not a block.
+        // The block's text is read by the ADDRESS parser, so the reason it gives
+        // is the whole message.
         (
             "cidr whose mask is as wide as the IPv4 family",
             json!({ "detail": { "ip": [{ "cidr": "10.0.1.7/32" }] } }),
             "IPv4 mask bits must be < 32".to_string(),
+            false,
         ),
         (
             "cidr whose mask is wider than the IPv4 family",
             json!({ "detail": { "ip": [{ "cidr": "10.0.0.0/33" }] } }),
             "IPv4 mask bits must be < 32".to_string(),
+            false,
         ),
         (
             "cidr whose mask is as wide as the IPv6 family",
             json!({ "detail": { "ip": [{ "cidr": "2001:db8::1/128" }] } }),
             "IPv6 mask bits must be < 128".to_string(),
+            false,
         ),
         // A list with no member lists no value to match.
         (
             "a field whose term list is empty",
             json!({ "detail": { "k": [] } }),
             "Empty arrays are not allowed".to_string(),
+            true,
         ),
         (
             "numeric given an empty list",
             json!({ "detail": { "n": [{ "numeric": [] }] } }),
             "Empty arrays are not allowed".to_string(),
+            true,
         ),
         (
             "$or given an empty list",
             json!({ "$or": [] }),
             "Empty arrays are not allowed".to_string(),
+            true,
         ),
         // An object with no member names no match type, and no field.
         (
             "a match expression with no match type in it",
             json!({ "detail": { "k": [{}] } }),
             "Empty objects are not allowed".to_string(),
+            true,
         ),
         (
             "a nested pattern object naming no field",
             json!({ "detail": {} }),
             "Empty objects are not allowed".to_string(),
+            true,
         ),
         // A match type the language does not define.
         (
             "a match type spelled the way another language spells prefix",
             json!({ "detail": { "k": [{ "startswith": "ok" }] } }),
             "Unrecognized match type startswith".to_string(),
+            true,
         ),
         (
             "an envelope field name used where a match type belongs",
             json!({ "source": [{ "detail": "x" }] }),
             "Unrecognized match type detail".to_string(),
+            true,
         ),
     ];
     rows.into_iter()
-        .map(|(case, pattern, reason)| (case, pattern.to_string(), reason))
+        .map(|(case, pattern, reason, located)| (case, pattern.to_string(), reason, located))
         .collect()
 }
 
@@ -294,7 +362,7 @@ fn malformed_rows() -> Vec<(&'static str, String, String)> {
 #[tokio::test]
 async fn put_rule_refuses_a_malformed_pattern_with_the_reason_for_its_class() {
     let emulator = emulator();
-    for (case, pattern, reason) in malformed_rows() {
+    for (case, pattern, reason, located) in malformed_rows() {
         let (status, body) = events(
             &emulator,
             "PutRule",
@@ -310,12 +378,7 @@ async fn put_rule_refuses_a_malformed_pattern_with_the_reason_for_its_class() {
             "InvalidEventPatternException",
             "case {case:?}: expected InvalidEventPatternException, got {body}"
         );
-        assert_eq!(
-            error_message(&body),
-            refusal(&reason),
-            "case {case:?}: expected the refusal to state {:?}, got {body}",
-            refusal(&reason)
-        );
+        assert_refusal(case, &body, &pattern, &reason, located);
     }
 
     // Nothing was stored by any of them.
@@ -345,7 +408,7 @@ async fn test_event_pattern_refuses_a_malformed_pattern_with_the_same_message() 
         "detail": { "k": "ok-1", "n": 7, "ip": "10.0.1.7" },
     })
     .to_string();
-    for (case, pattern, reason) in malformed_rows() {
+    for (case, pattern, reason, located) in malformed_rows() {
         let (status, body) = events(
             &emulator,
             "TestEventPattern",
@@ -356,12 +419,7 @@ async fn test_event_pattern_refuses_a_malformed_pattern_with_the_same_message() 
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} {body}"
         );
-        assert_eq!(
-            error_message(&body),
-            refusal(&reason),
-            "case {case:?}: expected the refusal to state {:?}, got {body}",
-            refusal(&reason)
-        );
+        assert_refusal(case, &body, &pattern, &reason, located);
     }
 }
 
@@ -553,7 +611,7 @@ async fn a_refused_update_leaves_the_live_rule_matching_what_it_matched_before()
          {before:?}"
     );
 
-    for (case, pattern, reason) in malformed_rows() {
+    for (case, pattern, reason, located) in malformed_rows() {
         let (status, body) = events(
             &emulator,
             "PutRule",
@@ -568,12 +626,7 @@ async fn a_refused_update_leaves_the_live_rule_matching_what_it_matched_before()
             status, 400,
             "case {case:?}: the update must be refused, got {status} {body}"
         );
-        assert_eq!(
-            error_message(&body),
-            refusal(&reason),
-            "case {case:?}: expected the refusal to state {:?}, got {body}",
-            refusal(&reason)
-        );
+        assert_refusal(case, &body, &pattern, &reason, located);
         let (status, body) = events(
             &emulator,
             "DescribeRule",
