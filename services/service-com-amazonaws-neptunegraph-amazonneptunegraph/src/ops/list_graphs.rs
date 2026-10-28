@@ -69,6 +69,12 @@
 //! * `InternalServerException` (HTTP 500) — A failure occurred on the server.
 //! * `ResourceNotFoundException` (HTTP 404) — A specified resource could not be located.
 //! * `ThrottlingException` (HTTP 429) — The exception was interrupted by throttling.
+//!
+//! The service's own `ValidationException` (HTTP 400) is answered besides those: this
+//! listing takes a `nextToken` from the caller, and a token it cannot resolve to a
+//! position in the graph-id space is client input it has to refuse — reported through
+//! the service's own shape, which carries the `reason` the synthetic framework one does
+//! not (see [`crate::state::unissued_page_token`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -76,7 +82,7 @@ use super::types::*;
 // service shares, hosted once in `crate::state` beside the token codec and the id-space
 // predicates its decode half takes. Only the id space and the key an entry is ordered
 // by are this listing's own.
-use crate::state::{resolve_page_size, take_page};
+use crate::state::{resolve_page_size, take_page, unissued_page_token};
 // The token format itself is reached through `take_page`, so only this file's own
 // round-trip test names it.
 #[cfg(test)]
@@ -93,12 +99,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-neptunegraph-amazonnept
 // here — hence the `ListGraphsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.neptunegraph#ListGraphs")]
+// `ValidationException` is widened in from the SERVICE's own shapes, which this
+// operation's error list does not repeat: this listing still has client input of its
+// own to refuse — a `nextToken` naming no position in the graph-id space — and the
+// service's own shape is what carries the `reason` a client reads, which the synthetic
+// framework shape does not have.
+#[smithy_macros::operation_error(
+    "com.amazonaws.neptunegraph#ListGraphs",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListGraphsErrorModeled {
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,14 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A token this service did not issue cannot name a page. `ListGraphs` models no
-        // client-input error, so the refusal goes through the scaffold channel, which
-        // renders the same 400 `ValidationException` the boundary validator does.
+        // A token this service did not issue names no page, so it is refused rather
+        // than treated as the start of the listing. The refusal is the service's own
+        // modelled 400, worded and classified once in `crate::state`.
         let start_after = match input.next_token.as_deref() {
             Some(token) => Some(decode_page_token(token).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation(format!(
-                    "nextToken '{token}' is not a pagination token this service issued"
-                ))
+                ListGraphsErrorModeled::ValidationException(unissued_page_token(token))
             })?),
             None => None,
         };

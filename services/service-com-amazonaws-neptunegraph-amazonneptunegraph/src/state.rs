@@ -2355,6 +2355,25 @@ pub fn decode_page_token(token: &str, in_id_space: impl Fn(&str) -> bool) -> Opt
     in_id_space(&decoded).then_some(decoded)
 }
 
+/// The modelled `ValidationException` for a `nextToken` [`decode_page_token`] refuses:
+/// a value this service never issued for the id space the listing pages.
+///
+/// The service models its own `ValidationException`, which carries a `reason` beside
+/// `message` (`smithy_query(query="shape",shape="ValidationException")`), so every
+/// refusal of client input is reported through that shape and fills the member a client
+/// reads: a token the caller sent that this service cannot resolve to a position is an
+/// argument the operation does not accept, which is what `ILLEGAL_ARGUMENT` names among
+/// the modelled reasons (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`). The
+/// message names the member and the value, the way every other refusal of a sent value
+/// does. Written once here and reached by every paginated listing, so no two of them
+/// word — or classify — the same refusal differently.
+pub fn unissued_page_token(token: &str) -> ValidationException {
+    ValidationException {
+        message: format!("nextToken '{token}' is not a pagination token this service issued"),
+        reason: Some("ILLEGAL_ARGUMENT".to_string()),
+    }
+}
+
 /// The page size a listing serves when `maxResults` is absent: the largest the member
 /// allows (`smithy_query(query="operation",operation="ListGraphs,ListGraphSnapshots,ListImportTasks,ListExportTasks,ListPrivateGraphEndpoints")`
 /// -> `maxResults` range 1..100), so an unpaginated caller sees as much as one page can

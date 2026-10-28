@@ -87,3 +87,5 @@ mod resource_tagging;
 mod state_roundtrip;
 #[path = "all/task_namespace_refusals.rs"]
 mod task_namespace_refusals;
+#[path = "all/unissued_page_token_refusal.rs"]
+mod unissued_page_token_refusal;

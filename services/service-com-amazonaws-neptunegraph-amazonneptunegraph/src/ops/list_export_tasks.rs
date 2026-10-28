@@ -69,7 +69,7 @@ use super::types::*;
 // service shares, hosted once in `crate::state` beside the token codec and the id-space
 // predicates its decode half takes. Only the id space and the key an entry is ordered
 // by are this listing's own.
-use crate::state::{resolve_page_size, take_page};
+use crate::state::{resolve_page_size, take_page, unissued_page_token};
 // The token format itself is reached through `take_page`, so only this file's own
 // round-trip test names it.
 #[cfg(test)]
@@ -156,16 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A token this service did not issue names no page, so it is refused rather
-        // than treated as the start of the listing. This operation models
-        // `ValidationException`, so the refusal is that modelled 400.
+        // than treated as the start of the listing. The refusal is the service's own
+        // modelled 400, worded and classified once in `crate::state`.
         let start_after = match input.next_token.as_deref() {
             Some(token) => Some(decode_page_token(token).ok_or_else(|| {
-                ListExportTasksErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "nextToken '{token}' is not a pagination token this service issued"
-                    ),
-                    reason: Some("ILLEGAL_ARGUMENT".to_string()),
-                })
+                ListExportTasksErrorModeled::ValidationException(unissued_page_token(token))
             })?),
             None => None,
         };
