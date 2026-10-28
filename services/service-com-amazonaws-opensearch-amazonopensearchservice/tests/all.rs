@@ -143,6 +143,8 @@ mod unresolvable_package_id;
 mod upgrade_eligibility_checks;
 #[path = "all/upgrade_history.rs"]
 mod upgrade_history;
+#[path = "all/upgrade_progress_convergence.rs"]
+mod upgrade_progress_convergence;
 #[path = "all/upgrade_status.rs"]
 mod upgrade_status;
 #[path = "all/upgrade_status_reporting.rs"]
