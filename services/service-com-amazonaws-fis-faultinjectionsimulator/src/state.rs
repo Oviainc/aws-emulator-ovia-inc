@@ -2524,71 +2524,204 @@ pub fn target_account_page_token_account(token: &str) -> Option<&str> {
     .then_some(account_id)
 }
 
-/// The `accountId` a page of target account configurations resumes at, for the
-/// `nextToken` a request carried: `Ok(None)` when it carried none, and the
-/// `ValidationException` of [`invalid_next_token`] when it carried a token no page of
-/// target account configurations ever issued.
+/// The point a page of a paginated FIS list resumes at, for the `nextToken` a request
+/// carried: `Ok(None)` when it carried none, the value `decode` reads out of the token,
+/// and the `ValidationException` of [`invalid_next_token`] when `decode` does not
+/// recognise it — a token this list never issued.
 ///
-/// The decode is stated here rather than in each list handler, so the token a page mints
-/// ([`target_account_page_token`]) and the token the next page accepts cannot drift apart.
+/// The ONE statement of that rule for every paginated list this service serves: a list
+/// differs only in the CODEC that reads its token (which marker it carries, and which
+/// collection the value behind it names), never in what an unrecognised token answers.
 /// Only the LIFT of the refusal into one operation's error enum stays in the handler,
 /// which is also why the refusal is decided before the resource is looked up: a request
 /// carrying a token this service never issued is not a request about a resource.
-pub fn target_account_page_resume_point(
-    next_token: Option<&str>,
-) -> Result<Option<&str>, ValidationException> {
+pub fn page_resume_point<'token, Resume>(
+    next_token: Option<&'token str>,
+    decode: impl FnOnce(&'token str) -> Option<Resume>,
+) -> Result<Option<Resume>, ValidationException> {
     match next_token {
         None => Ok(None),
-        Some(token) => target_account_page_token_account(token)
-            .map(Some)
-            .ok_or_else(invalid_next_token),
+        Some(token) => decode(token).map(Some).ok_or_else(invalid_next_token),
     }
 }
 
-/// One page of a target-account-configuration list: the summaries it carries, and the
-/// `nextToken` that resumes after it.
+/// The `accountId` a page of target account configurations resumes at, for the `nextToken`
+/// a request carried — [`page_resume_point`] under this list's own codec, so the token a
+/// page mints ([`target_account_page_token`]) and the token the next page accepts cannot
+/// drift apart.
+pub fn target_account_page_resume_point(
+    next_token: Option<&str>,
+) -> Result<Option<&str>, ValidationException> {
+    page_resume_point(next_token, target_account_page_token_account)
+}
+
+/// The id a page of a list over minted ids resumes at, for the `nextToken` a request
+/// carried: such a list hands back the id the next page starts at as the token itself, so
+/// the codec is [`is_minted_id`] against that collection's `prefix` and anything else was
+/// never issued by it.
+pub fn minted_id_page_resume_point<'token>(
+    next_token: Option<&'token str>,
+    prefix: &str,
+) -> Result<Option<&'token str>, ValidationException> {
+    page_resume_point(next_token, |token| {
+        is_minted_id(token, prefix).then_some(token)
+    })
+}
+
+/// One page of a paginated FIS list: the summaries it carries, in the order the collection
+/// it walks is kept in, and the `nextToken` that resumes after it.
 #[derive(Debug)]
-pub struct TargetAccountConfigurationPage<Summary> {
-    /// The summaries this page reports, in `accountId` order.
-    pub configurations: Vec<Summary>,
-    /// The token the next page resumes at, present exactly when configurations remain.
+pub struct Page<Summary> {
+    /// The summaries this page reports, in the collection's own key order.
+    pub entries: Vec<Summary>,
+    /// The token the next page resumes at, present exactly when entries remain.
     pub next_token: Option<String>,
+}
+
+/// The ONE page walk every paginated FIS list of this service serves: `entries` is the
+/// collection as `(key, entry)` pairs in key order, and the page is the run of it that
+/// starts at `resume_at` and holds at most `page_size` summaries.
+///
+/// The rule, stated once: walk the keys in order, skip every one sorting before the
+/// resumed key (so a page is still served when the entry a token named is gone from the
+/// collection meanwhile), stop once the page is full, and mint the token the next page
+/// resumes at — as `token` writes it for this list — from the key of the first entry left
+/// over, which is why a token arrives only with a full page. What differs between two
+/// lists is the collection walked, what keys it in order (an id a caller names, or the
+/// position in a sequence nothing names), the page size the caller sized, how the list
+/// writes its token and the summary shape it reports; nothing about the paging does, so
+/// each list states those and this states the walk.
+///
+/// A list that reports only the entries a request asks for filters `entries` BEFORE the
+/// page is cut, so a page holds `page_size` matching entries and the token names one the
+/// filter admits.
+pub fn ordered_page<Key: PartialOrd + Copy, Entry, Summary>(
+    entries: impl IntoIterator<Item = (Key, Entry)>,
+    resume_at: Option<Key>,
+    page_size: usize,
+    token: impl Fn(Key) -> String,
+    mut summary: impl FnMut(Entry) -> Summary,
+) -> Page<Summary> {
+    let mut page = Vec::with_capacity(page_size);
+    let mut next_token = None;
+    for (key, entry) in entries {
+        if resume_at.is_some_and(|from| key < from) {
+            continue;
+        }
+        if page.len() >= page_size {
+            next_token = Some(token(key));
+            break;
+        }
+        page.push(summary(entry));
+    }
+    Page {
+        entries: page,
+        next_token,
+    }
+}
+
+/// A SERVICE-owned table this crate pages: the published actions ([`ACTION_CATALOG`]) and
+/// the published target resource types ([`TARGET_RESOURCE_TYPE_CATALOG`]).
+///
+/// Both are a static table kept in id order whose list hands back a token carrying that
+/// table's own marker, which is all [`catalog_page`] needs to walk either of them.
+pub trait CatalogEntry {
+    /// The id the table is kept in order by, and the one a page token names.
+    fn catalog_id(&self) -> &'static str;
+
+    /// The `nextToken` a page of this table hands back to resume at `id`: this table's own
+    /// marker, so a token one catalog's list issued is not one the other's accepts.
+    fn page_token(id: &str) -> String;
+}
+
+impl CatalogEntry for ActionCatalogEntry {
+    fn catalog_id(&self) -> &'static str {
+        self.id
+    }
+
+    fn page_token(id: &str) -> String {
+        action_page_token(id)
+    }
+}
+
+impl CatalogEntry for TargetResourceTypeCatalogEntry {
+    fn catalog_id(&self) -> &'static str {
+        self.id
+    }
+
+    fn page_token(id: &str) -> String {
+        target_resource_type_page_token(id)
+    }
+}
+
+/// The page of `catalog` that starts at `resume_at` and holds at most `page_size` entries,
+/// each reported as `summary` builds it: [`ordered_page`] over a service-owned table, whose
+/// id order the table is kept in and whose token marker the table's [`CatalogEntry`] impl
+/// names.
+pub fn catalog_page<Entry: CatalogEntry, Summary>(
+    catalog: &'static [Entry],
+    resume_at: Option<&str>,
+    page_size: usize,
+    summary: impl FnMut(&'static Entry) -> Summary,
+) -> Page<Summary> {
+    ordered_page(
+        catalog.iter().map(|entry| (entry.catalog_id(), entry)),
+        resume_at,
+        page_size,
+        Entry::page_token,
+        summary,
+    )
+}
+
+/// The page of `records` that starts at `resume_at` and holds at most `page_size` entries,
+/// each reported as `summary` builds it: [`ordered_page`] over a collection of records
+/// keyed by an id this service MINTED, whose token is that id itself.
+///
+/// `records` is an iterator rather than the map, so a list that reports only the records a
+/// request asks for filters BEFORE the page is cut — a page then holds `page_size` matching
+/// records and the token names one the filter admits.
+pub fn minted_id_page<'records, Record: 'records, Summary>(
+    records: impl IntoIterator<Item = (&'records String, &'records Record)>,
+    resume_at: Option<&str>,
+    page_size: usize,
+    summary: impl FnMut(&'records Record) -> Summary,
+) -> Page<Summary> {
+    ordered_page(
+        records
+            .into_iter()
+            .map(|(id, record)| (id.as_str(), record)),
+        resume_at,
+        page_size,
+        str::to_string,
+        summary,
+    )
 }
 
 /// The page of `configurations` that starts at `resume_at` and holds at most `page_size`
 /// entries, each entry reported as `summary` builds it.
 ///
-/// The ONE page walk over the target account configurations of a template or of an
-/// experiment: both are a [`BTreeMap`] keyed by `accountId`, so one and the same rule
-/// pages them — walk the keys in order, skip every one sorting before the resumed account
-/// id (so a page is still served when the configuration a token named was deleted
-/// meanwhile), stop once the page is full, and mint the token the next page resumes at
-/// from the first entry left over. `ListTargetAccountConfigurations` walks a template's
-/// map and `ListExperimentTargetAccountConfigurations` the snapshot its experiment holds,
-/// so stating the walk once is what keeps the two paging alike: which map, which page size
-/// and which summary shape differ between them, and nothing about the paging does.
-pub fn target_account_configuration_page<Summary>(
-    configurations: &BTreeMap<String, TargetAccountConfigurationRecord>,
+/// The target account configurations of a template and of an experiment are both a
+/// [`BTreeMap`] keyed by `accountId`, so one and the same rule pages them: [`ordered_page`]
+/// under the marker [`target_account_page_token`] writes.
+/// `ListTargetAccountConfigurations` walks a template's map and
+/// `ListExperimentTargetAccountConfigurations` the snapshot its experiment holds, so
+/// stating the walk once is what keeps the two paging alike: which map, which page size and
+/// which summary shape differ between them, and nothing about the paging does.
+pub fn target_account_configuration_page<'configurations, Summary>(
+    configurations: &'configurations BTreeMap<String, TargetAccountConfigurationRecord>,
     resume_at: Option<&str>,
     page_size: usize,
-    summary: impl Fn(&TargetAccountConfigurationRecord) -> Summary,
-) -> TargetAccountConfigurationPage<Summary> {
-    let mut page = Vec::with_capacity(page_size.min(configurations.len()));
-    let mut next_token = None;
-    for (account_id, record) in configurations {
-        if resume_at.is_some_and(|from| account_id.as_str() < from) {
-            continue;
-        }
-        if page.len() >= page_size {
-            next_token = Some(target_account_page_token(account_id));
-            break;
-        }
-        page.push(summary(record));
-    }
-    TargetAccountConfigurationPage {
-        configurations: page,
-        next_token,
-    }
+    summary: impl FnMut(&'configurations TargetAccountConfigurationRecord) -> Summary,
+) -> Page<Summary> {
+    ordered_page(
+        configurations
+            .iter()
+            .map(|(account_id, record)| (account_id.as_str(), record)),
+        resume_at,
+        page_size,
+        target_account_page_token,
+        summary,
+    )
 }
 
 /// The `nextToken` a page of `ListExperimentResolvedTargets` hands back when resolved

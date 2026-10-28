@@ -234,17 +234,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Each account can only have one active (RUNNING or PENDING) export task at a
         // time": the statuses the clock already owed are materialised first, so a task it has
-        // since completed does not block a new one.
+        // since completed does not block a new one. The slot is the ACCOUNT's, so what the
+        // create names — the log group, the window, the bucket or the prefix, and whether any
+        // of them overlaps the task holding the slot — does not enter into it; the refusal is
+        // the service's fixed limit sentence, which carries nothing of the request or of the
+        // task that holds the slot.
         let now = crate::state::now_ms();
         store.materialize_due_export_transitions(now);
-        if let Some(active) = store.active_export_task() {
+        if store.has_active_export_task() {
             return Err(CreateExportTaskErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "An account can only have one active export task at a time. Task {} is \
-                         {}.",
-                        active.task_id, active.status_code
-                    )),
+                    message: Some(crate::state::LIMIT_EXCEEDED_MESSAGE.to_string()),
                 },
             )
             .into());
