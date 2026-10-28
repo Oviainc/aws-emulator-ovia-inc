@@ -2,6 +2,12 @@
 
 //! @op UpdateTable
 //!
+//! This is the ONLY file to touch for this operation.
+//!
+//! An update that names a `VersionId` is an optimistic-concurrency write: it applies only
+//! while that version is the table's current one, and is refused with
+//! `ConcurrentModificationException` — writing nothing at all — when it is not.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -190,15 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // "The version ID at which to update the table contents": an update against one
-        // named version is an optimistic-concurrency write, which has to refuse a
-        // version that is no longer current rather than apply the write to the latest
-        // one, and that refusal is not written yet — so a request that names a version
-        // is refused instead of silently applied to the current version.
-        if input.version_id.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "UpdateTable with VersionId",
-            ));
-        }
+        // named version is an OPTIMISTIC-CONCURRENCY write, so it applies only while that
+        // version is still the table's current one. A version a later write has already
+        // replaced — or one the table never had — means this update lost the race, and it
+        // is refused with `ConcurrentModificationException` below, once the table it
+        // addresses has been resolved, without writing anything.
         // `ViewUpdateAction` is "the operation to be performed when updating the view",
         // over the view representations this slice does not store (`Table`'s
         // `ViewDefinition` is never reported), so asking for one is refused.
@@ -328,6 +330,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The optimistic-concurrency check, BEFORE anything is written: an update that
+        // names a version other than the one the table is under wrote nothing, so the live
+        // definition, the version pointer and the archived history are all left exactly as
+        // they were — which is what lets a client retry from a fresh read.
+        if let Some(version_id) = input.version_id.as_deref() {
+            if version_id != entry.version_id {
+                return Err(UpdateTableErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(
+                            crate::state::messages::TABLE_UPDATE_CONCURRENT_MODIFICATION
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
 
         // An update that would archive past either ceiling is refused rather than
         // applied, leaving the stored table and its history exactly as they are.

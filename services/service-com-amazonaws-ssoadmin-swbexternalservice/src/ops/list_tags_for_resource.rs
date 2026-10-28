@@ -196,38 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the account's ambient instance if nothing has enabled one yet.
         store.on_request(&region, ::std::time::SystemTime::now());
 
-        // When a caller sends the optional `InstanceArn`, it names the instance the
-        // resource is expected to live under: an ARN this account holds no instance for
-        // can hold no resource either.
-        if input
-            .instance_arn
-            .as_deref()
-            .is_some_and(|instance_arn| store.instance(instance_arn).is_none())
-        {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::instance_not_found_message(
-                        input.instance_arn.as_deref().unwrap_or_default(),
-                    )),
-                    reason: None,
-                },
-            )
-            .into());
-        }
-
-        // Never created, already deleted, gone with its instance, or held under another
-        // instance than the one the request named — the same answer either way: there is
-        // no such resource whose tags could be listed. A resource that exists and
-        // carries no tag is an EMPTY list, which is a different answer from this one.
+        // The resource a tag request names is resolved by the ONE rule the whole tag
+        // surface shares (`crate::state::...::tag_target`); this handler only maps the
+        // refusal it answers onto the not-found THIS operation models. A resource that
+        // exists and carries no tag is an EMPTY list, which is a different answer from
+        // that refusal.
         let ordered = store
-            .taggable_resource_tags(input.instance_arn.as_deref(), &input.resource_arn)
+            .tag_target(input.instance_arn.as_deref(), &input.resource_arn)
             .map(|tags| crate::state::tags_in_key_order(tags))
-            .ok_or_else(|| {
+            .map_err(|message| {
                 ListTagsForResourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::taggable_resource_not_found_message(
-                            &input.resource_arn,
-                        )),
+                        message: Some(message),
                         reason: None,
                     },
                 )

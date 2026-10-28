@@ -232,6 +232,8 @@ use crate::ops::types::{
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput,
     CreateIntegrationResourcePropertyInput, CreateIntegrationTablePropertiesInput, CreateJobInput,
+    CreateIcebergTableInput, IcebergSchema, JobBookmarkEntry, TableOptimizer,
+    TableOptimizerConfiguration,
     CreateMLTransformInput, CsvClassifier,
     CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakeAccessPropertiesOutput, DataLakePrincipal,
@@ -1039,6 +1041,116 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// case fold for a blueprint name, whose pattern (`^[\.\-_A-Za-z0-9]+$`) admits both
     /// cases and so distinguishes them.
     pub blueprints: BTreeMap<String, BlueprintEntry>,
+    /// The Glue IDENTITY CENTER CONFIGURATION of this account, or `None` while the account
+    /// has none.
+    ///
+    /// An ACCOUNT SINGLETON: `GetGlueIdentityCenterConfiguration`,
+    /// `DeleteGlueIdentityCenterConfiguration` and
+    /// `UpdateGlueIdentityCenterConfiguration` take no input at all, so the account is the
+    /// whole address of the configuration and there is at most one of it. A create while
+    /// one is stored is therefore a duplicate rather than an overwrite, and a read or a
+    /// delete while none is stored is a miss.
+    pub identity_center_configuration: Option<IdentityCenterConfigurationEntry>,
+}
+
+/// The Glue Identity Center configuration of one account: the Identity Center instance the
+/// account's Glue services authenticate against, plus the application Glue registered with
+/// that instance.
+#[derive(Debug, Clone)]
+pub struct IdentityCenterConfigurationEntry {
+    /// "The Amazon Resource Name (ARN) of the Identity Center application associated with
+    /// the Glue configuration" — minted by the create
+    /// ([`new_identity_center_application_arn`]) and stored, so every later read reports
+    /// the same application.
+    pub application_arn: String,
+    /// "The Amazon Resource Name (ARN) of the Identity Center instance", as the create
+    /// named it.
+    pub instance_arn: String,
+    /// "A list of Identity Center scopes that define the permissions and access levels for
+    /// the Glue configuration", as the last write set them.
+    pub scopes: Option<Vec<String>>,
+    /// "Indicates whether users can run background sessions when using Identity Center
+    /// authentication with Glue services", as the last write set it.
+    pub user_background_sessions_enabled: Option<bool>,
+}
+
+impl IdentityCenterConfigurationEntry {
+    /// Register the configuration a `CreateGlueIdentityCenterConfiguration` asks for,
+    /// against the Identity Center instance `instance_arn` names.
+    pub fn new(
+        instance_arn: &str,
+        scopes: Option<&Vec<String>>,
+        user_background_sessions_enabled: Option<bool>,
+    ) -> Self {
+        Self {
+            application_arn: new_identity_center_application_arn(instance_arn),
+            instance_arn: instance_arn.to_string(),
+            scopes: scopes.cloned(),
+            user_background_sessions_enabled,
+        }
+    }
+}
+
+/// How many Identity Center application ids this process has minted. A nonce source for
+/// [`new_identity_center_application_arn`], exactly as [`MINTED_DATABASE_IDS`] is for a
+/// database id.
+static MINTED_IDENTITY_CENTER_APPLICATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// How many 64-bit words an Identity Center application id carries: one, i.e. 64 bits
+/// rendered as 16 lowercase hexadecimal characters, which is the width Identity Center
+/// spells the id part of an application id (`apl-<16 hex>`) in.
+const IDENTITY_CENTER_APPLICATION_ID_WORDS: usize = 1;
+/// The prefix Identity Center gives an application id, as it appears in the resource part
+/// of an application ARN (`application/<instance id>/apl-<id>`).
+const IDENTITY_CENTER_APPLICATION_PREFIX: &str = "apl-";
+/// The service namespace an Identity Center ARN is spelled under, which is the namespace of
+/// both the instance ARN a create names and the application ARN it mints.
+const IDENTITY_CENTER_SERVICE: &str = "sso";
+/// The resource segment an Identity Center INSTANCE ARN carries
+/// (`arn:aws:sso:::instance/<instance id>`), which is what makes the ARN a create names an
+/// instance rather than some other Identity Center resource.
+pub const IDENTITY_CENTER_INSTANCE_SEGMENT: &str = "instance/";
+
+/// The `ApplicationArn` of the Glue application registered with the Identity Center
+/// instance `instance_arn` names.
+///
+/// An Identity Center application is a resource OF its instance, so its ARN carries the
+/// instance's own id before the application id
+/// (`arn:aws:sso::<account>:application/<instance id>/apl-<id>`) — the instance id read off
+/// the ARN the create named, and the application id minted here from [`mint_hex_id`], so
+/// two configurations created in the same nanosecond cannot be given the same application.
+/// Minted once, at create, and stored on the entry, so every later read reports the same
+/// ARN.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_identity_center_application_arn(instance_arn: &str) -> String {
+    let instance_id = identity_center_instance_id(instance_arn).unwrap_or_default();
+    let application_id = mint_hex_id(
+        &MINTED_IDENTITY_CENTER_APPLICATIONS,
+        IDENTITY_CENTER_APPLICATION_ID_WORDS,
+    );
+    ::engine::emulator_arn(
+        IDENTITY_CENTER_SERVICE,
+        "",
+        &format!(
+            "application/{instance_id}/{IDENTITY_CENTER_APPLICATION_PREFIX}{application_id}"
+        ),
+    )
+}
+
+/// The instance id inside an Identity Center INSTANCE ARN
+/// (`arn:aws:sso:::instance/ssoins-…`), or `None` when the value names no such instance.
+///
+/// That is what a create's `InstanceArn` has to be: the ARN of the instance Glue registers
+/// its application with, so a value carrying no instance resource segment names no instance
+/// to register against.
+pub fn identity_center_instance_id(instance_arn: &str) -> Option<&str> {
+    let (prefix, instance_id) = instance_arn.split_once(IDENTITY_CENTER_INSTANCE_SEGMENT)?;
+    if !prefix.starts_with("arn:") || instance_id.is_empty() || instance_id.contains('/') {
+        return None;
+    }
+    Some(instance_id)
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -2898,6 +3010,247 @@ pub struct TableEntry {
     /// [`messages::COLUMN_STATISTICS_TASK_SETTINGS_ALREADY_EXIST`] reports rather than an
     /// overwrite, and why dropping the table drops its settings with it.
     pub column_statistics_task_settings: Option<ColumnStatisticsTaskSettingsEntry>,
+    /// The TABLE OPTIMIZERS of this table — "an optimizer associated with a table"
+    /// (`TableOptimizer`) — keyed by the `TableOptimizerType` each one is of.
+    ///
+    /// On the table rather than beside the catalog tree, exactly as its column statistics
+    /// settings are: every operation that addresses an optimizer names its catalog, its
+    /// database, its table and then the TYPE (`GetTableOptimizerRequest$Type`), so there is
+    /// at most one optimizer of each type per table — which is why a second create of the
+    /// same type is a duplicate rather than an overwrite, and why dropping the table drops
+    /// its optimizers with it. Ordered by type, so a reader has one deterministic order.
+    pub optimizers: BTreeMap<String, TableOptimizerEntry>,
+}
+
+/// One stored table optimizer: the configuration a create or update wrote for one
+/// `TableOptimizerType` of one table.
+///
+/// `lastRun` is absent on every stored optimizer: a run is work an optimizer performs over
+/// the table's data files, and nothing in this emulator performs it, so there is no run to
+/// report ([`TableOptimizerEntry::to_table_optimizer`]).
+#[derive(Debug, Clone)]
+pub struct TableOptimizerEntry {
+    /// The optimizer's type, which is also this entry's key in [`TableEntry::optimizers`].
+    pub r#type: String,
+    /// "A `TableOptimizerConfiguration` object that was specified when creating or
+    /// updating a table optimizer" (`TableOptimizer$configuration`), stored exactly as
+    /// sent so a read reports the configuration this write recorded.
+    pub configuration: TableOptimizerConfiguration,
+}
+
+impl TableOptimizerEntry {
+    /// Build a stored optimizer from the configuration a create submitted for `r#type`.
+    pub fn new(r#type: &str, configuration: &TableOptimizerConfiguration) -> Self {
+        Self {
+            r#type: r#type.to_string(),
+            configuration: configuration.clone(),
+        }
+    }
+
+    /// This optimizer in the `TableOptimizer` shape every read of one answers with.
+    pub fn to_table_optimizer(&self) -> TableOptimizer {
+        TableOptimizer {
+            r#type: Some(self.r#type.clone()),
+            configuration: Some(self.configuration.clone()),
+            // No run: nothing here compacts data files, expires snapshots or deletes
+            // orphan files, so reporting a run would report work nothing did.
+            last_run: None,
+            // `configurationSource` "indicates how the table optimizer was configured and
+            // which entity or service initiated the configuration"; the service publishes
+            // no rule mapping a create to one of its two values, so none is reported.
+            configuration_source: None,
+        }
+    }
+}
+
+/// The table parameter whose value marks a stored table as an open table format, and the
+/// value an Iceberg table carries in it. Set by a `CreateTable` that names an
+/// `OpenTableFormatInput`, and read back by every later read of the table, which is how a
+/// client — and a service that consumes Glue tables — tells an Iceberg table from a
+/// Hive-style one.
+pub const ICEBERG_TABLE_TYPE_PARAMETER: &str = "table_type";
+/// See [`ICEBERG_TABLE_TYPE_PARAMETER`]: the value an Iceberg table carries in it.
+pub const ICEBERG_TABLE_TYPE: &str = "ICEBERG";
+/// The table parameter carrying the location of an Iceberg table's current metadata file,
+/// which is what an Iceberg client reads a table's schema and snapshots from.
+pub const ICEBERG_METADATA_LOCATION_PARAMETER: &str = "metadata_location";
+/// The table parameter carrying an Iceberg table's format version — the property Iceberg
+/// itself names that version under, which is where the version a create asked for
+/// (`IcebergInput$Version`) is observable afterwards.
+pub const ICEBERG_FORMAT_VERSION_PARAMETER: &str = "format-version";
+/// The Iceberg format version a create that names none asks for: "The table version for
+/// the Iceberg table. Defaults to 2" (`IcebergInput$Version`).
+pub const DEFAULT_ICEBERG_FORMAT_VERSION: &str = "2";
+/// The directory, under an Iceberg table's own location, that its metadata files live in,
+/// as Iceberg lays a table out.
+const ICEBERG_METADATA_DIRECTORY: &str = "metadata";
+/// How many 64-bit words the random part of an Iceberg metadata file name carries: two,
+/// i.e. the 128 bits a UUID is, which is what Iceberg names a metadata file with.
+const ICEBERG_METADATA_ID_WORDS: usize = 2;
+
+/// How many Iceberg metadata file names this process has minted. A nonce source for
+/// [`new_iceberg_metadata_location`], exactly as [`MINTED_DATABASE_IDS`] is for a database
+/// id.
+static MINTED_ICEBERG_METADATA_FILES: AtomicU64 = AtomicU64::new(0);
+
+/// The Iceberg metadata a create of an open-table-format table mints for it, and records
+/// on the stored table so every later read serves the same metadata location.
+///
+/// A create "mints the Iceberg metadata" for the table: the first metadata file of a table
+/// whose history is one commit long, under the table's own location.
+#[derive(Debug, Clone)]
+pub struct IcebergTableMarker {
+    /// Where the table's current metadata file lives
+    /// ([`new_iceberg_metadata_location`]).
+    pub metadata_location: String,
+    /// The Iceberg format version the create asked for, else
+    /// [`DEFAULT_ICEBERG_FORMAT_VERSION`].
+    pub format_version: String,
+}
+
+impl IcebergTableMarker {
+    /// Mint the metadata of an Iceberg table stored at `location`, at the format `version`
+    /// the create named.
+    pub fn mint(location: &str, version: Option<&str>) -> Self {
+        Self {
+            metadata_location: new_iceberg_metadata_location(location),
+            format_version: version
+                .unwrap_or(DEFAULT_ICEBERG_FORMAT_VERSION)
+                .to_string(),
+        }
+    }
+
+    /// Record this metadata on the `TableInput` about to be stored, so the stored table —
+    /// and every read of it — carries the three parameters that make it an Iceberg table.
+    ///
+    /// The client's own parameters are kept: only the three the service sets are written
+    /// over, because they describe what the create minted rather than what it asked for.
+    pub fn apply(&self, input: &mut TableInput) {
+        let parameters = input.parameters.get_or_insert_with(HashMap::new);
+        parameters.insert(
+            ICEBERG_TABLE_TYPE_PARAMETER.to_string(),
+            ICEBERG_TABLE_TYPE.to_string(),
+        );
+        parameters.insert(
+            ICEBERG_METADATA_LOCATION_PARAMETER.to_string(),
+            self.metadata_location.clone(),
+        );
+        parameters.insert(
+            ICEBERG_FORMAT_VERSION_PARAMETER.to_string(),
+            self.format_version.clone(),
+        );
+    }
+}
+
+/// The location of the FIRST metadata file of an Iceberg table stored at `location`.
+///
+/// Iceberg lays a table's metadata out under the table's own location, in a file named by
+/// the commit it records and a random id —
+/// `<location>/metadata/00000-<id>.metadata.json` for the first commit, which is the one a
+/// create records. The id is 128 bits from [`mint_hex_id`], spelled the way a UUID is, so
+/// two tables created in the same nanosecond cannot be given the same metadata file.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_iceberg_metadata_location(location: &str) -> String {
+    let base = location.trim_end_matches('/');
+    let digits = mint_hex_id(&MINTED_ICEBERG_METADATA_FILES, ICEBERG_METADATA_ID_WORDS);
+    // The 32 hexadecimal characters grouped 8-4-4-4-12, the way a UUID is spelled. Built
+    // by walking the characters rather than by slicing, so the spelling cannot depend on
+    // the id's width.
+    let mut id = String::with_capacity(digits.len() + 4);
+    for (position, character) in digits.chars().enumerate() {
+        if matches!(position, 8 | 12 | 16 | 20) {
+            id.push('-');
+        }
+        id.push(character);
+    }
+    format!("{base}/{ICEBERG_METADATA_DIRECTORY}/00000-{id}.metadata.json")
+}
+
+/// The Hive-style table definition an Iceberg create describes, for a request that carries
+/// no `TableInput` of its own.
+///
+/// `CreateIcebergTableInput` is "the configuration parameters required to create a new
+/// Iceberg table": it names the table's location, its schema and its table properties,
+/// which with the request's `Name` is everything a stored table needs.
+pub fn iceberg_table_definition(name: &str, create: &CreateIcebergTableInput) -> TableInput {
+    TableInput {
+        name: name.to_string(),
+        storage_descriptor: Some(StorageDescriptor {
+            columns: Some(iceberg_schema_columns(&create.schema)),
+            location: Some(create.location.clone()),
+            ..StorageDescriptor::default()
+        }),
+        parameters: create.properties.clone(),
+        ..TableInput::default()
+    }
+}
+
+/// One catalog `Column` per field of an Iceberg schema, in the order the schema declares
+/// them: a field's `Name` is the column's name, its `Doc` the column's comment.
+///
+/// A field's `Type` is an Iceberg type document. A PRIMITIVE Iceberg type is spelled as a
+/// string (`"long"`, `"string"`), which is the column type; a nested one is an object, and
+/// this slice maps no nested Iceberg type onto a Hive column type, so such a column is
+/// reported with its name and no type rather than with a type nothing produced.
+fn iceberg_schema_columns(schema: &IcebergSchema) -> Vec<Column> {
+    schema
+        .fields
+        .iter()
+        .map(|field| Column {
+            name: field.name.clone(),
+            r#type: match &field.r#type {
+                ::aws_smithy_types::Document::String(spelling) => Some(spelling.clone()),
+                _ => None,
+            },
+            comment: field.doc.clone(),
+            parameters: None,
+        })
+        .collect()
+}
+
+/// Where an Iceberg table being created stores its data: the location its `TableInput`
+/// names, else the one its `CreateIcebergTableInput` names, and `None` when neither does.
+///
+/// The table's metadata is minted UNDER that location
+/// ([`new_iceberg_metadata_location`]), so a create that names none has nowhere to put the
+/// metadata the table is read through.
+pub fn iceberg_table_location(
+    definition: &TableInput,
+    create: Option<&CreateIcebergTableInput>,
+) -> Option<String> {
+    definition
+        .storage_descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.location.clone())
+        .or_else(|| create.map(|create| create.location.clone()))
+        .filter(|location| !location.is_empty())
+}
+
+/// Why a read that has to resolve a table's metadata through the source a FEDERATED
+/// database points at cannot be served, as the message of the modelled
+/// `FederationSourceRetryableException` — or `None` for a database whose metadata the
+/// catalog itself holds.
+///
+/// "A database that points to an entity outside the Glue Data Catalog"
+/// (`FederatedDatabase`) keeps its tables in that entity, reached through the connection
+/// its registration names, so a read of one of its tables is answered by the SOURCE and not
+/// out of the catalog. This emulator connects to no such source — a registration is
+/// accepted, and nothing can reach what it points at — so that read fails the way a source
+/// that is there but unreachable fails: retryably, which is the code that tells a client to
+/// retry rather than give up.
+pub fn federated_source_refusal(database: &DatabaseEntry) -> Option<String> {
+    let federated = database.federated_database.as_ref()?;
+    let source = federated
+        .connection_name
+        .clone()
+        .or_else(|| federated.identifier.clone())
+        .unwrap_or_default();
+    Some(messages::federated_source_unreachable(
+        &database.name,
+        &source,
+    ))
 }
 
 /// Why a partition could not be created on a table.
@@ -3175,6 +3528,9 @@ impl TableEntry {
             // `TableInput` carries no column statistics task settings either: they arrive
             // through `CreateColumnStatisticsTaskSettings`.
             column_statistics_task_settings: None,
+            // Nor any optimizer: an optimizer of a table arrives through
+            // `CreateTableOptimizer`, which addresses a table that already exists.
+            optimizers: BTreeMap::new(),
         }
     }
 
@@ -6622,6 +6978,90 @@ pub struct JobEntry {
     /// addresses a run names its job as well (`GetJobRun`/`GetJobRuns`/`BatchStopJobRun`
     /// all take `JobName`), so a run is reclaimed with the definition it belongs to.
     pub runs: Vec<JobRunEntry>,
+    /// This job's BOOKMARK — "a point that a job can resume processing"
+    /// (`JobBookmarkEntry`) — or `None` while the job has none.
+    ///
+    /// A bookmark is state a RUN leaves behind, so a job definition nothing has run yet
+    /// has none and every operation that addresses one (`GetJobBookmark`,
+    /// `ResetJobBookmark`) answers that job with a miss. It lives on the job rather than
+    /// beside it because both operations address it by `JobName` alone, so the bookmark is
+    /// reclaimed with the definition it belongs to.
+    pub bookmark: Option<JobBookmarkState>,
+}
+
+/// The bookmark of one job: the point a further run of it would resume processing from.
+///
+/// The members are `JobBookmarkEntry`'s own, minus the job name, which is the key this is
+/// stored under ([`JobEntry::bookmark`]).
+#[derive(Debug, Clone, Default)]
+pub struct JobBookmarkState {
+    /// "The version of the job" the bookmark is of: 1 for the bookmark a job's first run
+    /// wrote, advanced by each reset, which starts a new version of the bookmark the next
+    /// run continues.
+    pub version: i32,
+    /// "The run ID number": how many runs of the job have written into this version of the
+    /// bookmark.
+    pub run: i32,
+    /// "The attempt ID number" of the run that last wrote the bookmark.
+    pub attempt: i32,
+    /// "The unique run identifier associated with the previous job run".
+    pub previous_run_id: Option<String>,
+    /// "The run ID number" of the run that last wrote the bookmark, as that run's `Id`.
+    pub run_id: Option<String>,
+    /// "The bookmark itself" — the position a resumed run reads from — and `None` for a
+    /// bookmark no run has written a position into, which is the state a reset leaves.
+    pub job_bookmark: Option<String>,
+}
+
+impl JobBookmarkState {
+    /// The bookmark version a job's first run writes. Advanced by each reset, so a reset
+    /// leaves the next run continuing a version of its own.
+    pub const FIRST_VERSION: i32 = 1;
+
+    /// Record that `run_id` ran: the bookmark advances to that run, keeping the run it
+    /// followed as its `PreviousRunId`.
+    ///
+    /// Called by the only thing that writes a bookmark, the START of a run — a bookmark
+    /// never moves because something was read.
+    pub fn record_run(&mut self, run_id: &str, attempt: i32) {
+        self.previous_run_id = self.run_id.take();
+        self.run_id = Some(run_id.to_string());
+        self.attempt = attempt;
+        self.run = self.run.saturating_add(1);
+        if self.version < Self::FIRST_VERSION {
+            self.version = Self::FIRST_VERSION;
+        }
+    }
+
+    /// Reset this bookmark: "Resets a bookmark entry" (`ResetJobBookmark`), so the
+    /// position a further run would resume from is dropped and the run counter starts
+    /// again, under the next version of the bookmark.
+    ///
+    /// NOT recorded: what is pinned is that the reset clears the position the next run
+    /// would have resumed from and that the entry stays readable afterwards, which is what
+    /// a client resets a bookmark to achieve.
+    pub fn reset(&mut self) {
+        self.version = self.version.saturating_add(1);
+        self.run = 0;
+        self.attempt = 0;
+        self.previous_run_id = None;
+        self.run_id = None;
+        self.job_bookmark = None;
+    }
+
+    /// This bookmark in the `JobBookmarkEntry` shape every operation that answers one
+    /// reports it in, attributed to the job it belongs to.
+    pub fn to_job_bookmark_entry(&self, job_name: &str) -> JobBookmarkEntry {
+        JobBookmarkEntry {
+            job_name: Some(job_name.to_string()),
+            version: self.version,
+            run: self.run,
+            attempt: self.attempt,
+            previous_run_id: self.previous_run_id.clone(),
+            run_id: self.run_id.clone(),
+            job_bookmark: self.job_bookmark.clone(),
+        }
+    }
 }
 
 impl JobEntry {
@@ -6679,6 +7119,8 @@ impl JobEntry {
             tags: input.tags.clone().unwrap_or_default(),
             // A job definition has no runs until `StartJobRun` starts one.
             runs: Vec::new(),
+            // And no bookmark until one of those runs writes it.
+            bookmark: None,
         }
     }
 
@@ -6718,6 +7160,9 @@ impl JobEntry {
         let created_on = self.created_on;
         let tags = std::mem::take(&mut self.tags);
         let runs = std::mem::take(&mut self.runs);
+        // Carried over for the same reason as the runs: `JobUpdate` has no member for the
+        // bookmark, and an update of the definition does not undo the runs that wrote it.
+        let bookmark = self.bookmark.take();
         *self = Self {
             name,
             job_mode: update
@@ -6753,6 +7198,7 @@ impl JobEntry {
             last_modified_on: now,
             tags,
             runs,
+            bookmark,
         };
     }
 
@@ -6797,7 +7243,16 @@ impl JobEntry {
     }
 
     /// Append a run, keeping at most [`MAX_RUNS_PER_JOB`] of them.
+    ///
+    /// This is also where the job's BOOKMARK is written: a bookmark is the point a job
+    /// resumes processing at, which a run is what establishes — so the first run of a job
+    /// gives it one ([`JobBookmarkState::record_run`]) and every later run advances it.
+    /// Nothing else writes it except a reset, so a bookmark never moves because something
+    /// was read.
     pub fn record_run(&mut self, run: JobRunEntry) {
+        self.bookmark
+            .get_or_insert_with(JobBookmarkState::default)
+            .record_run(&run.id, run.attempt);
         self.runs.push(run);
         if self.runs.len() > MAX_RUNS_PER_JOB {
             let overflow = self.runs.len() - MAX_RUNS_PER_JOB;
@@ -8441,6 +8896,129 @@ pub mod messages {
     /// another's.
     pub const JOB_RUN_NOT_FOUND: &str = "Job run not found for the given job name and runId.";
 
+    /// A bookmark operation (`GetJobBookmark`, `ResetJobBookmark`) addressing a job that
+    /// has no bookmark: one no run of it has written yet, or one whose run the request's
+    /// `RunId` names no run of.
+    ///
+    /// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+    /// `EntityNotFoundException` — and a sentence following the per-resource template of
+    /// [`database_not_found`], built from the job the request addressed, which with the
+    /// account and Region is the whole address of a bookmark.
+    pub fn job_bookmark_not_found(job_name: &str) -> String {
+        format!("Job bookmark for job {job_name} not found.")
+    }
+
+    /// `GetDashboardUrl` for a `ResourceType` the operation does not serve a dashboard
+    /// for. Recorded template: the refusal names the operation and the resource type the
+    /// request asked for, which is the member it is refused over.
+    pub fn dashboard_url_not_supported(resource_type: &str) -> String {
+        format!("GetDashboardUrl operation is not supported for {resource_type}")
+    }
+
+    /// Any operation whose `ResourceId`/`Id` names no session of this account
+    /// (`GetDashboardUrl` for a `ResourceType` of `SESSION`). NOT recorded: the sentence
+    /// follows the per-resource template of [`database_not_found`], built from the id the
+    /// request addressed, which is the whole address of a session.
+    pub fn session_not_found(id: &str) -> String {
+        format!("Session {id} not found.")
+    }
+
+    /// A read of the Glue Identity Center configuration of an account that has none
+    /// (`GetGlueIdentityCenterConfiguration`), and the delete of the same absent
+    /// singleton.
+    ///
+    /// Recorded constant: the refusal names the Identity Center application Glue could not
+    /// find and states what has to happen first; it has no variable part, because the
+    /// account is the whole address of the configuration.
+    pub const IDENTITY_CENTER_CONFIGURATION_NOT_FOUND: &str =
+        "Idc application not found. Need to create glue application first.";
+
+    /// `CreateGlueIdentityCenterConfiguration` for an account that already has one. NOT
+    /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and a sentence naming
+    /// the resource kind alone, which here is the whole address of the singleton.
+    pub const IDENTITY_CENTER_CONFIGURATION_ALREADY_EXISTS: &str =
+        "Glue Identity Center configuration already exists.";
+
+    /// `CreateGlueIdentityCenterConfiguration` whose `InstanceArn` is not the ARN of an
+    /// Identity Center instance ([`super::identity_center_instance_id`]). NOT recorded:
+    /// what is pinned is the behaviour — 400 with the operation's modelled
+    /// `InvalidInputException` — and a sentence carrying the value the request sent plus
+    /// the form the member has to take, as [`malformed_version_id`] does for its own.
+    pub fn malformed_identity_center_instance_arn(instance_arn: &str) -> String {
+        let segment = super::IDENTITY_CENTER_INSTANCE_SEGMENT;
+        format!(
+            "InstanceArn {instance_arn} is not the ARN of an Identity Center instance, \
+             which names its instance as arn:aws:sso:::{segment}<instance id>"
+        )
+    }
+
+    /// A table-optimizer lookup (`GetTableOptimizer`, and the `DeleteTableOptimizer` that
+    /// addresses one the same way) for a type the addressed table has no optimizer of.
+    ///
+    /// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+    /// `EntityNotFoundException` — and a sentence following the per-resource template of
+    /// [`database_not_found`], built from the table and the optimizer type the request
+    /// addressed, which together are the whole address of an optimizer.
+    pub fn table_optimizer_not_found(table_name: &str, optimizer_type: &str) -> String {
+        format!("Table optimizer of type {optimizer_type} for table {table_name} not found.")
+    }
+
+    /// `CreateTableOptimizer` for a type the addressed table already has an optimizer of.
+    /// NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
+    /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
+    /// what the request addressed.
+    pub const TABLE_OPTIMIZER_ALREADY_EXISTS: &str = "Table optimizer already exists.";
+
+    /// A read that has to resolve a table's metadata through the source a FEDERATED
+    /// database points at ([`super::federated_source_refusal`]).
+    ///
+    /// NOT recorded as a sentence: what is pinned is the behaviour — 400 with the modelled
+    /// `FederationSourceRetryableException`, the code that tells a client to retry rather
+    /// than give up — and a sentence naming the database the request addressed and the
+    /// connection its registration points the source at, both read off the stored
+    /// registration.
+    pub fn federated_source_unreachable(database_name: &str, source: &str) -> String {
+        format!(
+            "Federated database {database_name} could not be reached through its source \
+             {source}."
+        )
+    }
+
+    /// A `CreateTable` whose `OpenTableFormatInput` names an open table format with no
+    /// input of its own. The member carries exactly one format
+    /// (`OpenTableFormatInput$IcebergInput`), so a value carrying none asks for no table.
+    /// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+    /// `InvalidInputException` — and a sentence naming the member that has to be there.
+    pub const OPEN_TABLE_FORMAT_REQUIRES_ICEBERG: &str =
+        "OpenTableFormatInput must specify IcebergInput.";
+
+    /// A `CreateTable` of an open-table-format table that names no location for it. An
+    /// Iceberg table's metadata is written under the table's own location, so a create
+    /// that names none has nowhere to mint it. NOT recorded: what is pinned is the
+    /// behaviour — 400 with the operation's modelled `InvalidInputException` — and a
+    /// sentence naming the two members the location may come from.
+    pub const ICEBERG_TABLE_REQUIRES_LOCATION: &str =
+        "An Iceberg table requires a location, in TableInput.StorageDescriptor.Location \
+         or in IcebergInput.CreateIcebergTableInput.Location.";
+
+    /// A `CreateTable` of an open-table-format table that carries neither a `TableInput`
+    /// nor the Iceberg input that would define one. NOT recorded: what is pinned is the
+    /// behaviour — 400 with the operation's modelled `InvalidInputException` — and a
+    /// sentence naming the members the table definition may come from.
+    pub const ICEBERG_TABLE_REQUIRES_DEFINITION: &str =
+        "An Iceberg table requires a TableInput, or an \
+         IcebergInput.CreateIcebergTableInput defining the table.";
+
+    /// `UpdateTable` whose `VersionId` is not the version the table is currently under —
+    /// one a later write has replaced, or one the table never had.
+    ///
+    /// Recorded constant: the refusal states that the update lost a race and names neither
+    /// the version the request carried nor the one the table is under, so a client sees the
+    /// same sentence whichever stale version it sent.
+    pub const TABLE_UPDATE_CONCURRENT_MODIFICATION: &str =
+        "Update table failed due to concurrent modifications.";
+
     /// `StartJobRun` for a `JobName` the endpoint's Region holds no job definition for —
     /// a name nothing created, or one created through ANOTHER Region's endpoint.
     /// Recorded constant: the start's refusal names the metadata it could not read rather
@@ -8459,6 +9037,15 @@ pub mod messages {
     /// the cross-service tag projection's own suite pins it to. Only a recording of the
     /// read's refusal settles whether the two are one sentence.
     pub const ARN_WRONG_REGION: &str = "Arn passed doesn't belong to this region.";
+
+    /// A listing whose `MaxResults` asks for a page smaller than one entry
+    /// (`crate::ops::get_tables`). NOT recorded: what is pinned is the behaviour — 400
+    /// with the operation's modelled `InvalidInputException` rather than the cross-service
+    /// `ValidationException` — and a sentence carrying the value the request sent and the
+    /// smallest page the member admits, which the model declares for it.
+    pub fn page_size_below_minimum(requested: i32, minimum: i32) -> String {
+        format!("MaxResults {requested} is below the minimum page size of {minimum}")
+    }
 
     /// Any Data Catalog operation whose `DatabaseName`/`Name` names no database
     /// (`GetDatabase`, `DeleteDatabase`, `UpdateDatabase`, and the parent-database miss
