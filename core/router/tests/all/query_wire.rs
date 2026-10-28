@@ -153,6 +153,20 @@ pub(crate) fn pairs_of(xml: &str, key: &str, value: &str) -> BTreeMap<String, St
         .collect()
 }
 
+/// An awsQuery answer's MAP as the map a client reads it as: each entry's key paired with
+/// its own value, with the escaped entities decoded — so a value that is itself a document
+/// (a topic's access policy, a queue's redrive policy) compares as the service wrote it.
+///
+/// The decoding counterpart of [`entries_of`], and built on it rather than by zipping a list
+/// of keys against a list of values, for the reason that reader records: an entry carrying
+/// only one half would misalign every pair after it instead of being left out.
+pub(crate) fn decoded_entries(xml: &str) -> BTreeMap<String, String> {
+    entries_of(xml)
+        .into_iter()
+        .map(|(key, value)| (key, unescape(value)))
+        .collect()
+}
+
 /// Each `<entry>` block of an awsQuery answer's MAP, as `(key, the value block)`.
 ///
 /// The serializer writes a map as `<entry><key>…</key><value>…</value></entry>`, with the

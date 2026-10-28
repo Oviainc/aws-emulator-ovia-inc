@@ -558,6 +558,11 @@ mod servicecatalog_signing_name_routing;
 // to all of them, while these neighbouring lines are stable.
 #[path = "all/ses_family_pre_dispatch_refusals.rs"]
 mod ses_family_pre_dispatch_refusals;
+// Declared HERE, beside the sibling SES suite above in this quiet span, rather than with the
+// other SES suites at the head of this file or in its appended tail: both of those are where
+// every concurrently landing suite puts its line.
+#[path = "all/sesv2_sns_event_destination_topic_policy.rs"]
+mod sesv2_sns_event_destination_topic_policy;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
 #[path = "all/ssm_contacts_replication_set.rs"]

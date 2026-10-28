@@ -49,7 +49,12 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The region every row signs for and addresses.
-const REGION: &str = "us-east-1";
+///
+/// Shared with the sibling suites named on [`BOOT_STACK_SIZE`] and with
+/// `sesv2_sns_event_destination_topic_policy`, which addresses the same endpoint host
+/// ([`email_host`]) alongside another service's: one Region behind one name, so no suite can
+/// address this family in a Region its peers do not.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The two refusals the ROUTER itself produces, which name no AWS shape: a request that
 /// addresses one service must provoke neither — `AmbiguousService` when several services
