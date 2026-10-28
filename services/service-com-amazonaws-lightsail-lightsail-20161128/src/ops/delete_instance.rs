@@ -5,6 +5,11 @@
 //! attachment and access grant another stored resource held to it, and appends
 //! the operations that record the removal and each release.
 //!
+//! The delete is refused while a distribution of this account still pulls its
+//! content from the instance: a distribution's origin names a resource the
+//! account holds, so a delete that would leave one pulling from an instance that
+//! is gone is not served — this operation carries no force flag for it.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -173,6 +178,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
+            // The name has to address an instance this account holds. An
+            // instance is held by name alone, and its own `location` is what
+            // says which Region it is in — which is the Region a distribution's
+            // origin resolved the name in, so it is what the origin condition
+            // below is asked about.
+            let Some(region) = store
+                .instance(&name)
+                .map(|instance| instance.location.region_name.clone())
+            else {
+                return Err(not_found(&name));
+            };
+            // A distribution of this account pulls its content from ONE origin
+            // resource and both distribution write paths refuse an origin that
+            // addresses nothing, so an instance a distribution names is in use
+            // by it: the delete is refused while that reference exists, rather
+            // than leaving the distribution pulling from an instance the account
+            // no longer holds. `forceDeleteAddOns` asks about the instance's
+            // add-ons, not about this, so nothing overrides the condition here.
+            if let Some(message) = store.in_use_as_distribution_origin(
+                &region,
+                &name,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+            ) {
+                return Err(invalid(message));
+            }
             // Removing the instance also releases every live reference another
             // stored resource holds to it — a block storage disk, a static IP,
             // a load balancer's registration, a bucket's access grant — because
@@ -221,6 +251,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// cannot serve in the state the account is in: the modelled
+/// `InvalidInputException`, whose message names what stands in the way.
+fn invalid(message: String) -> DeleteInstanceError {
+    DeleteInstanceErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// No instance of that name is stored: Lightsail's `DoesNotExist` rejection —

@@ -4,6 +4,11 @@
 //! Deletes one of this store's container services, with everything the record it
 //! lives on carries.
 //!
+//! The delete is refused while a distribution of this account still pulls its
+//! content from the service: a distribution's origin names a resource the
+//! account holds, so a delete that would leave one pulling from a service that
+//! is gone is not served — this operation carries no force flag to override it.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -157,6 +162,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // express: the name has to address a container service this account
         // holds in this region.
         crate::state::with_state(&*self.engine, |store| {
+            // The name has to address a container service this account holds in
+            // this region. The lookup comes BEFORE the condition below, so a
+            // name that addresses nothing is this service's `DoesNotExist`
+            // rejection rather than a refusal about a resource that is not
+            // there.
+            if store
+                .container_service(&region, &input.service_name)
+                .is_none()
+            {
+                return Err(not_found(&input.service_name));
+            }
+            // A distribution of this account pulls its content from ONE origin
+            // resource and both distribution write paths refuse an origin that
+            // addresses nothing, so a container service a distribution names is
+            // in use by it: the delete is refused while that reference exists,
+            // rather than leaving the distribution pulling from a service the
+            // account no longer holds. `DeleteContainerService` carries no
+            // `forceDelete`, so nothing overrides the condition here — the
+            // caller deletes the distribution, or points it at another origin,
+            // first.
+            if let Some(message) = store.in_use_as_distribution_origin(
+                &region,
+                &input.service_name,
+                crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+            ) {
+                return Err(invalid(message));
+            }
             // "Deletes your Amazon Lightsail container service": the whole
             // record goes, and with it everything that lives on it — the
             // current and next deployments, the container images registered to
@@ -164,11 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // image puller role held — so no later read reports any of them,
             // the published public URL stops answering, and the name is free
             // for a service that inherits nothing from this one. The removal IS
-            // the lookup, so a name that addresses nothing (never created,
-            // created in another region, or deleted a moment ago) is this
-            // service's `DoesNotExist` rejection rather than a reported
-            // deletion that did not happen, and two deletes of one service
-            // cannot both report having removed it.
+            // the lookup once more, so two deletes of one service racing each
+            // other cannot both report having removed it.
             store
                 .remove_container_service(&region, &input.service_name)
                 .ok_or_else(|| not_found(&input.service_name))?;
@@ -179,6 +208,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// cannot serve in the state the account is in: the modelled
+/// `InvalidInputException`, whose message names what stands in the way.
+fn invalid(message: String) -> DeleteContainerServiceError {
+    DeleteContainerServiceErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// No container service of that name is stored in that region: Lightsail's

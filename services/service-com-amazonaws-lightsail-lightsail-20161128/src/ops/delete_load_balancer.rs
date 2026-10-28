@@ -5,6 +5,11 @@
 //! every SSL/TLS certificate it held, so no later read reports it and its name is
 //! free again, and appends the operation that records the removal.
 //!
+//! The delete is refused while a distribution of this account still pulls its
+//! content from the load balancer: a distribution's origin names a resource the
+//! account holds, so a delete that would leave one pulling from a load balancer
+//! that is gone is not served — this operation carries no force flag for it.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -178,6 +183,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
+            // The name has to address a load balancer this account holds in this
+            // Region. The lookup comes BEFORE the condition below, so a name
+            // that addresses nothing is this service's `DoesNotExist` rejection
+            // rather than a refusal about a resource that is not there.
+            if store.load_balancer(&region, &name).is_none() {
+                return Err(not_found(&name));
+            }
+            // A distribution of this account pulls its content from ONE origin
+            // resource and both distribution write paths refuse an origin that
+            // addresses nothing, so a load balancer a distribution names is in
+            // use by it: the delete is refused while that reference exists,
+            // rather than leaving the distribution pulling from a load balancer
+            // the account no longer holds. This operation carries no force flag,
+            // so nothing overrides the condition here — the caller deletes the
+            // distribution, or points it at another origin, first.
+            if let Some(message) = store.in_use_as_distribution_origin(
+                &region,
+                &name,
+                crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+            ) {
+                return Err(invalid(message));
+            }
             // Removing the record removes everything that lives on it: "Deletes
             // a Lightsail load balancer and all its associated SSL/TLS
             // certificates", together with the registrations of the instances
@@ -213,6 +240,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// cannot serve in the state the account is in: the modelled
+/// `InvalidInputException`, whose message names what stands in the way.
+fn invalid(message: String) -> DeleteLoadBalancerError {
+    DeleteLoadBalancerErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// No load balancer of that name is stored in this Region: Lightsail's

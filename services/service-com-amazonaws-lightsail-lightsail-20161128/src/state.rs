@@ -13538,6 +13538,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// nothing" next to `in-use`; for a bucket, one fewer resource receiving
     /// access.
     ///
+    /// A DISTRIBUTION's origin is not among them: a distribution cannot be left
+    /// holding none, so the reference is not released here but stands in the
+    /// delete's way instead — see
+    /// [`Self::in_use_as_distribution_origin`].
+    ///
     /// Every walk is bounded: the disks by [`MAX_DISKS`], the static IPs by
     /// [`MAX_STATIC_IPS`], the load balancers by
     /// [`MAX_LOAD_BALANCERS_PER_REGION`] per region, and the buckets by
@@ -13791,6 +13796,40 @@ impl ComAmazonawsLightsailLightsail20161128State {
                     && distribution.origin.resource_type.as_deref() == Some(resource_type)
             })
             .count()
+    }
+
+    /// Why a delete of the resource `name` names in `region`, which this store
+    /// holds as `resource_type`, cannot be served while distributions of this
+    /// account still pull their content from it — or `None` when none does, so
+    /// nothing stands in the delete's way.
+    ///
+    /// A distribution pulls its content from ONE origin resource of this
+    /// account, and both write paths refuse an origin that addresses nothing
+    /// ([`Self::resolve_origin`]), so a resource a distribution names is in use
+    /// by it and a delete that would leave that distribution pulling from a
+    /// resource the account no longer holds is refused. The condition is the one
+    /// the modelled `DeleteBucketRequest$forceDelete` documents ("You must force
+    /// delete the bucket if it has one of the following conditions: The bucket
+    /// is the origin of a distribution"), counted from the distribution records
+    /// that name the resource ([`Self::distributions_with_origin`]) — so it is
+    /// the same condition whichever of the four kinds of origin resource the
+    /// delete names, and a delete that offers a force (`DeleteBucket` is the
+    /// only one that does) is what overrides it.
+    pub fn in_use_as_distribution_origin(
+        &self,
+        region: &str,
+        name: &str,
+        resource_type: &str,
+    ) -> Option<String> {
+        let condition = origin_of_distributions_condition(self.distributions_with_origin(
+            region,
+            name,
+            resource_type,
+        ))?;
+        Some(format!(
+            "{resource_type} is in use: {name} ({condition}); delete the distribution, or \
+             point it at another origin, before deleting the {resource_type}"
+        ))
     }
 
     /// The managed relational database `name` names, for a reporting operation.
@@ -16255,6 +16294,25 @@ pub fn static_ip_arn(region: &str, id: &str) -> String {
 /// from the value alone.
 pub fn support_code(id: &str) -> String {
     format!("{}/{id}", ::engine::emulator_account_id())
+}
+
+/// How a refusal words the condition "the resource is the origin of a
+/// distribution", given how many of this account's distributions pull their
+/// content from it, and `None` when none does.
+///
+/// The ONE owner of that wording: every delete that can remove a resource a
+/// distribution pulls from reports the same condition, so it cannot drift
+/// between the kinds of origin resource — the bucket delete, which offers a
+/// force that overrides it, names it beside the other conditions that member
+/// documents, and the deletes that offer none name it on its own (see
+/// [`ComAmazonawsLightsailLightsail20161128State::in_use_as_distribution_origin`]).
+pub fn origin_of_distributions_condition(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        format!(
+            "it is the origin of {count} distribution{}",
+            if count == 1 { "" } else { "s" }
+        )
+    })
 }
 
 /// The region a request is scoped to: the one its SigV4 credential scope names,

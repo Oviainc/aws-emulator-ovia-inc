@@ -233,12 +233,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     plural(held.resources_receiving_access)
                 ));
             }
-            if held.origin_of_distributions > 0 {
-                blocked_by.push(format!(
-                    "it is the origin of {} distribution{}",
-                    held.origin_of_distributions,
-                    plural(held.origin_of_distributions)
-                ));
+            // The origin condition is worded by the ONE owner of it, so this
+            // delete and the deletes of the other kinds of origin resource
+            // report the same condition.
+            if let Some(condition) =
+                crate::state::origin_of_distributions_condition(held.origin_of_distributions)
+            {
+                blocked_by.push(condition);
             }
             if !blocked_by.is_empty() {
                 // The headline names the bucket and the condition, the way AWS words

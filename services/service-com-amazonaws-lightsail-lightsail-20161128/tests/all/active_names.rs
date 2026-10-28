@@ -387,13 +387,13 @@ impl Kind {
 
     /// The delete that removes this kind's resource, or `None` for a kind whose
     /// delete this service has not implemented yet (the instance snapshot, the
-    /// database snapshot, the certificate, the CDN distribution, the container
-    /// service and the static IP, each still a 501 scaffold with an issue of its
-    /// own).
+    /// database snapshot, the certificate, the container service and the static
+    /// IP, each still a 501 scaffold with an issue of its own).
     fn delete_request(self) -> Option<(&'static str, Value)> {
         let name = self.name();
         Some(match self {
             Kind::Instance => ("DeleteInstance", json!({"instanceName": name})),
+            Kind::Distribution => ("DeleteDistribution", json!({"distributionName": name})),
             Kind::Disk => ("DeleteDisk", json!({"diskName": name})),
             Kind::DiskSnapshot => ("DeleteDiskSnapshot", json!({"diskSnapshotName": name})),
             Kind::Domain => ("DeleteDomain", json!({"domainName": name})),
@@ -767,11 +767,16 @@ async fn a_deleted_resources_name_is_no_longer_active() {
 
     // Each certificate the load balancer holds is deleted BEFORE the load
     // balancer, so each delete is observed on its own: deleting the load
-    // balancer takes the certificates it holds with it.
+    // balancer takes the certificates it holds with it. The DISTRIBUTION goes
+    // before the instance it pulls its content from, for the same reason the
+    // other way round: a resource a distribution of the account names is in use
+    // by it, so the delete of that resource is refused while the distribution
+    // still pulls from it.
     let deletable = [
         Kind::AddedLoadBalancerCertificate,
         Kind::LoadBalancerCertificate,
         Kind::LoadBalancer,
+        Kind::Distribution,
         Kind::Instance,
         Kind::Disk,
         Kind::DiskSnapshot,

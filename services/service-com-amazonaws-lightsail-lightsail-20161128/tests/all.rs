@@ -137,6 +137,8 @@ mod distribution_delete;
 mod distribution_listing;
 #[path = "all/distribution_metric_data.rs"]
 mod distribution_metric_data;
+#[path = "all/distribution_origin_resource_delete.rs"]
+mod distribution_origin_resource_delete;
 #[path = "all/distribution_update.rs"]
 mod distribution_update;
 #[path = "all/domain_delete.rs"]
