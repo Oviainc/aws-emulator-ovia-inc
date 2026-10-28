@@ -686,7 +686,10 @@ pub mod ssml {
 /// SSML document is read with a real XML parser and every element it carries is
 /// checked against the published vocabulary ([`ssml`]), so `Err` here means the SSML
 /// is not well-formed, or not the SSML Amazon Polly accepts — both of which are
-/// `InvalidSsmlException`.
+/// `InvalidSsmlException`. Well-formed means one whole XML document: exactly one
+/// document element, every element closed, and nothing but whitespace outside the
+/// document element, so a second root element or character data before or after it is
+/// refused rather than billed.
 pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
     if text_type != "ssml" {
         return Ok(text.chars().count());
@@ -700,11 +703,28 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
         match reader.read_event().map_err(|e| e.to_string())? {
             Event::Eof => break,
             Event::Start(ref e) => {
+                check_document_element_is_the_only_one(depth, root_seen)?;
                 check_ssml_element(e, &mut root_seen)?;
                 depth += 1;
             }
-            Event::Empty(ref e) => check_ssml_element(e, &mut root_seen)?,
+            Event::Empty(ref e) => {
+                check_document_element_is_the_only_one(depth, root_seen)?;
+                check_ssml_element(e, &mut root_seen)?;
+            }
             Event::End(_) => depth -= 1,
+            Event::Text(ref t) if depth == 0 => {
+                // Character data belongs to no document before the document element
+                // opens or after it closes; XML admits only whitespace there, so what
+                // is left once the whitespace is trimmed off is not well-formed.
+                if !String::from_utf8_lossy(t.as_ref()).trim().is_empty() {
+                    return Err(CHARACTER_DATA_OUTSIDE_THE_DOCUMENT.to_string());
+                }
+            }
+            // A CDATA section and a reference are character data too, and neither has
+            // a whitespace-only form XML admits outside the document element.
+            Event::CData(_) | Event::GeneralRef(_) if depth == 0 => {
+                return Err(CHARACTER_DATA_OUTSIDE_THE_DOCUMENT.to_string());
+            }
             Event::Text(ref t) => {
                 // Entities count as the character they stand for, so the raw bytes
                 // are unescaped before counting.
@@ -741,6 +761,20 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
         return Err("an SSML element is left unclosed".to_string());
     }
     Ok(billed)
+}
+
+/// Why a document carrying character data outside its document element is refused.
+const CHARACTER_DATA_OUTSIDE_THE_DOCUMENT: &str =
+    "the text carries character data outside the document element";
+
+/// Check that an element opening here is not a SECOND document element: XML admits
+/// exactly one, so an element that opens outside every other one once the document
+/// element has been read makes the text two documents rather than one.
+fn check_document_element_is_the_only_one(depth: i32, root_seen: bool) -> Result<(), String> {
+    if depth == 0 && root_seen {
+        return Err("a second document element follows the SSML document".to_string());
+    }
+    Ok(())
 }
 
 /// Check one element of an SSML document: that the document element is `<speak>`, as

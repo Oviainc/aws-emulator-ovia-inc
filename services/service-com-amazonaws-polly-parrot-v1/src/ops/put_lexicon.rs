@@ -336,13 +336,27 @@ fn read_document_element(
     })
 }
 
+/// The refusal for character data — text, a CDATA section or a reference — found
+/// outside the document element, where XML admits nothing but whitespace.
+fn character_data_outside_the_document() -> PlsRejection {
+    PlsRejection::NotALexicon(
+        "the content carries character data outside the document element".to_string(),
+    )
+}
+
 /// Read a PLS lexicon document.
 ///
 /// The reader is a real, NAMESPACE-AWARE XML parser, so any well-formed PLS document
 /// is accepted whatever prefix it spells its elements with, and any malformed one is
 /// refused — the shape of the examples this emulator has seen does not enter into it.
 /// The document element is checked by [`read_document_element`] before anything in
-/// the document is read. Each `<lexeme>`'s replacement elements are measured as they
+/// the document is read, and the WHOLE content has to be one XML document around it:
+/// XML admits exactly one document element and nothing but whitespace outside it, so
+/// a second root element, character data before or after the lexicon, or an element
+/// the content never closes, is refused however well-formed the lexicon element
+/// itself is.
+///
+/// Each `<lexeme>`'s replacement elements are measured as they
 /// close, so an oversized one is refused without the document being stored; what is
 /// measured is the WHOLE character content of the element — every text node under it,
 /// whatever elements that text is nested in and whatever follows them, with a
@@ -367,6 +381,10 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
     // another adds a counter rather than displacing one; a count rather than the text
     // itself, because the quota is the only thing the content is read for.
     let mut replacements: Vec<usize> = Vec::new();
+    // How many elements are open, counting the document element. Zero means the read
+    // is OUTSIDE every element, where XML admits no character data and — once the
+    // document element has been seen — no further element either.
+    let mut open_elements: usize = 0;
 
     loop {
         let (resolved, event) = reader
@@ -381,6 +399,19 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
             Event::Start(ref element) | Event::Empty(ref element) => {
                 let local_name =
                     String::from_utf8_lossy(element.local_name().as_ref()).to_string();
+                // An element opening outside every other one, after the document
+                // element has been read, is a SECOND root: XML admits one document
+                // element, so the content is not one XML document and not a lexicon.
+                if open_elements == 0 && document_element.is_some() {
+                    return Err(PlsRejection::NotALexicon(format!(
+                        "<{local_name}> is a second document element, outside the lexicon"
+                    )));
+                }
+                // Counted before the document element is read, so the element it opens
+                // encloses what follows it whether it is the document element or not.
+                if matches!(event, Event::Start(_)) {
+                    open_elements = open_elements.saturating_add(1);
+                }
                 if document_element.is_none() {
                     document_element = Some(read_document_element(
                         element,
@@ -414,6 +445,7 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                 }
             }
             Event::End(ref element) => {
+                open_elements = open_elements.saturating_sub(1);
                 let local_name =
                     String::from_utf8_lossy(element.local_name().as_ref()).to_string();
                 match local_name.as_str() {
@@ -436,6 +468,14 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                     _ => {}
                 }
             }
+            Event::Text(ref text) if open_elements == 0 => {
+                // Character data belongs to no document once every element has
+                // closed, and to none before the first one opens; only WHITESPACE may
+                // sit around a document element, which is what XML allows there.
+                if !String::from_utf8_lossy(text.as_ref()).trim().is_empty() {
+                    return Err(character_data_outside_the_document());
+                }
+            }
             Event::Text(ref text) => {
                 // The innermost open replacement counts the text; the elements around
                 // it count it when that one closes.
@@ -447,6 +487,12 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                         .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
                     *open = open.saturating_add(unescaped.chars().count());
                 }
+            }
+            // A CDATA section and a reference are character data too, so outside
+            // every element they are the same refusal as text there — whatever they
+            // hold, since neither has a whitespace-only form XML admits there.
+            Event::CData(_) | Event::GeneralRef(_) if open_elements == 0 => {
+                return Err(character_data_outside_the_document());
             }
             Event::CData(ref text) => {
                 // CDATA carries the characters it holds verbatim: that is what it is
@@ -480,6 +526,13 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
     let document_element = document_element.ok_or_else(|| {
         PlsRejection::NotALexicon("the content carries no XML element".to_string())
     })?;
+    // An element the document never closes leaves the document unfinished, so what was
+    // read is not a whole XML document.
+    if open_elements != 0 {
+        return Err(PlsRejection::NotALexicon(
+            "the content leaves an element unclosed".to_string(),
+        ));
+    }
     if let Some(alphabet) = &document_element.alphabet {
         if !SUPPORTED_PLS_ALPHABETS.contains(&alphabet.as_str()) {
             return Err(PlsRejection::UnsupportedAlphabet(alphabet.clone()));
