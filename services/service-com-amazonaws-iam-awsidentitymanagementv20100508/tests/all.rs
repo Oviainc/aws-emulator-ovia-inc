@@ -95,6 +95,8 @@ mod login_profile_updates;
 mod login_profiles;
 #[path = "all/managed_policies.rs"]
 mod managed_policies;
+#[path = "all/open_id_connect_client_id_registration.rs"]
+mod open_id_connect_client_id_registration;
 #[path = "all/open_id_connect_client_ids.rs"]
 mod open_id_connect_client_ids;
 #[path = "all/open_id_connect_provider_listing.rs"]

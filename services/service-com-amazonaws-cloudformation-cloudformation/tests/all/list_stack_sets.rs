@@ -18,8 +18,8 @@
 //! execution on and off, and the three drift aggregates a StackSet's instances can add up to
 //! (never checked, every instance in sync, one instance drifted).
 //!
-//! `CreateStackSet` is the store's only WRITER a wire call can drive today — `UpdateStackSet`
-//! and `DeleteStackSet` are still scaffolds with stub issues of their own — so the rows
+//! `CreateStackSet` and `UpdateStackSet` are the store's WRITERS a wire call can drive —
+//! `DeleteStackSet` is still a scaffold with a stub issue of its own — so the rows
 //! below, which span StackSet shapes no single call sequence produces, are seeded straight
 //! into the store through
 //! `state::ComAmazonawsCloudformationCloudformationState::record_stack_set`, the same device

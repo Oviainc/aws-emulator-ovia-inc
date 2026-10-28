@@ -67,6 +67,8 @@ mod distribution_lifecycle;
 mod distribution_tags;
 #[path = "all/distribution_tenant_delete.rs"]
 mod distribution_tenant_delete;
+#[path = "all/distribution_tenant_delete_scope.rs"]
+mod distribution_tenant_delete_scope;
 #[path = "all/distribution_tenant_filter_matches_nothing.rs"]
 mod distribution_tenant_filter_matches_nothing;
 #[path = "all/distribution_tenant_lifecycle.rs"]

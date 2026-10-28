@@ -29,6 +29,10 @@ hex = { workspace = true }
 # `ipnet`: the ONE reading of an IP address or range in CIDR notation, which a
 # receipt IP address filter's `Cidr` is documented as carrying.
 ipnet = "2"
+# `mailparse`: the ONE reading of an RFC 5322 / MIME message, which
+# `SendRawEmail`'s `RawMessage` carries — its header block, the address lists on
+# its From:, To:, Cc: and Bcc: lines, and its textual part.
+mailparse = "0.16"
 # `email_address`: the ONE reading of a caller-supplied email address and domain name,
 # shared with every other service whose model documents a member as one — the form this
 # service documents (`UserName@[SubDomain.]Domain.TopLevelDomain`) is read through it

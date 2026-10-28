@@ -97,6 +97,8 @@ mod metric_read_identity;
 mod metric_storage_resolution;
 #[path = "all/metric_stream_additional_statistics.rs"]
 mod metric_stream_additional_statistics;
+#[path = "all/metric_stream_scope.rs"]
+mod metric_stream_scope;
 #[path = "all/metric_stream_unknown_names.rs"]
 mod metric_stream_unknown_names;
 #[path = "all/metric_streams.rs"]
