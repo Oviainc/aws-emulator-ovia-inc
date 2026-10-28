@@ -705,8 +705,11 @@ async fn describe_selects_connections_by_their_routes_and_ids() {
 /// rather than only in the handler. Two of them are stored for no connection of this
 /// store: `transit-gateway-id` on a connection attached to a virtual private gateway, and
 /// `bgp-asn`, which is a fact of the CUSTOMER GATEWAY — the modelled `VpnConnection` shape
-/// carries no member for it and this crate has no customer gateway store to resolve
-/// `CustomerGatewayId` against yet, so it selects nothing until that store exists.
+/// carries no member for it, so the handler resolves the connection's `CustomerGatewayId` in
+/// the customer gateway store, and this suite seeds no gateway there, which makes it an
+/// attribute the connection carries no value for. The gateway that DOES carry one is seeded
+/// by `tests/all/customer_gateways.rs::the_bgp_asn_filter_of_a_vpn_connection_resolves_its_
+/// customer_gateway`.
 #[tokio::test]
 async fn describe_answers_every_documented_filter_name() {
     let (router, engine) = super::ec2_query::emulator();
