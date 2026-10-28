@@ -43,3 +43,35 @@ Actual (emulator): the alarm stays in its initial state; DescribeAlarmHistory re
 4. sqs: CreateQueue, read its QueueArn, SetQueueAttributes with a Policy allowing sns.amazonaws.com sqs:SendMessage from both topic ARNs, then sns:Subscribe the queue ARN to BOTH topics (Protocol=sqs, ReturnSubscriptionArn=true).
 5. cloudwatch: PutMetricAlarm(AlarmName=<alarm>, Namespace="AWS/RDS", MetricName="DatabaseConnections", Dimensions=[{Name: DBInstanceIdentifier, Value: <ghost-id>}], Statistic="Maximum", Period=60, EvaluationPeriods=1, Threshold=1.0, ComparisonOperator="GreaterThanOrEqualToThreshold", TreatMissingData="breaching", AlarmActions=[<allowed>, <denied>]).
 6. Poll DescribeAlarms(AlarmNames=[<alarm>]) for StateValue, DescribeAlarmHistory(AlarmName=<alarm>, HistoryItemType="Action", AlarmTypes=["MetricAlarm"]) for Action items, and ReceiveMessage on the queue: the alarm never transitions to ALARM, no Action history item is ever recorded for either topic, and no notification is ever delivered — the poll runs until the harness cap.
+
+## Resolution
+
+The cause this report names is fixed. The evaluation grades an alarm whose series holds no
+datapoint at all by its `TreatMissingData` arm, so `breaching` makes every missing period breach
+and the alarm's own m-of-n predicate moves it out of `INSUFFICIENT_DATA`
+(`src/state/alarm_evaluation.rs`); the transition is materialised by the clock this service
+leaves running rather than by a client call, and each action ARN of the state it moved to is
+executed as a cross-service publish authorized by the TARGET topic's own access policy, an
+explicit deny suppressing it, with one `Action` history item per action recording the target,
+the outcome, the published message on success and the `SNS:Publish` authorization failure on a
+deny (`src/state/alarm_actions.rs`).
+
+What this change adds is the coverage the path had nowhere: CloudWatch's publish is an
+in-process `sns`-scoped call, so which mounted model claims it is only decidable with every
+service mounted, and the only router-level alarm-action suite drove transitions a client FORCES
+with `SetAlarmState`. `core/router/tests/all/cloudwatch_breaching_alarm_fires_through_the_whole_router.rs`
+now drives the whole recorded shape — the RDS read that confirms the watched dimension names no
+DB instance, two topics on one queue with the deny appended to the policy the denied topic
+reports, the alarm written and then nothing but SQS read until the notification arrives, the two
+`Action` items, the `StateUpdate` item, the settled alarm publishing nothing again, and the
+repair leg — over the service set `core/router/src/lib.rs` assembles for the binary, with rows
+spanning the Region, the namespace, the statistic, the m-of-n counts, the period's resolution
+and the comparison's direction.
+
+Replay note: the behavioural corpus no longer lists this check's unit
+(`replay_issue_units` answers `inconclusive`, "not listed"), so the tests above and the
+crate-local suites (`tests/all/rds_alarm_action_delivery.rs`,
+`tests/all/sns_action_topic_policy.rs`, `tests/all/replay_probe.rs`) are the evidence. The
+open report `20261024T030130Z-cloudwatch-rds-cloudwatch-metric-alarms-never-evaluate-or-fire-their.md`
+describes the same gap on the same trace and is left where it is for its own fixer rather than
+being moved from under this one.
