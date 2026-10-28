@@ -145,6 +145,8 @@ mod organization_admin_accounts;
 mod organization_admin_removal;
 #[path = "all/organization_configuration.rs"]
 mod organization_configuration;
+#[path = "all/organization_managed_administrator_disassociation.rs"]
+mod organization_managed_administrator_disassociation;
 #[path = "all/organization_managed_members.rs"]
 mod organization_managed_members;
 #[path = "all/organization_statistics.rs"]

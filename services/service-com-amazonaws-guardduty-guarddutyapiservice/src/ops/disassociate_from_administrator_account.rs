@@ -25,12 +25,18 @@
 //! `DetectorId` this account/Region does not own is refused the same way.
 //!
 //! The contract below also refuses a disassociation "with autoEnableOrganizationMembers
-//! configuration for your organization set to ALL". That configuration belongs to the
-//! ADMINISTRATOR's detector, not to the member detector this operation names, and the
-//! administrator of a relationship this emulator can hold is another account — one it
-//! holds no detector, and so no organization configuration, for. So the refusal lives
-//! on the administrator-side operations that read it (`DisassociateMembers`,
-//! `StopMonitoringMembers`) and no request here can reach it.
+//! configuration for your organization set to ALL": while the organization
+//! configuration stored for the named detector auto-enables GuardDuty for every
+//! account of the organization, the organization owns that account's GuardDuty
+//! relationship, so the call is refused with HTTP 400 under the
+//! `InvalidInputException` class
+//! ([`crate::state::organization_managed_administrator_message`]) and the
+//! relationship stays. It is the same precondition the administrator-side
+//! operations that take a relationship away enforce (`DisassociateMembers`,
+//! `StopMonitoringMembers`, `DeleteMembers`), read from the configuration
+//! `UpdateOrganizationConfiguration` writes and `DescribeOrganizationConfiguration`
+//! reports, and it is checked before the relationship is looked up: it holds for
+//! the whole call.
 //!
 //! The deprecated twin `DisassociateFromMasterAccount` ("this operation is deprecated,
 //! use DisassociateFromAdministratorAccount instead",
@@ -181,20 +187,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         let mut state = state.lock();
-        // One lookup, in the store: only the Region's endpoint that serves the
+        // One walk, in the store: only the Region's endpoint that serves the
         // detector holds the relationship, and only the account that owns it can
         // leave that relationship. The seam advances the mutation clock ONLY on the
-        // path that writes, so neither refusal below moves it.
+        // path that writes, so no refusal below moves it.
         match state.disassociate_detector_from_administrator(&region, &input.detector_id) {
             // The detector is not one this account/Region holds.
-            None => Err(not_owned(&input.detector_id)),
-            // It is, but its account has accepted no invitation, so there is no
-            // relationship to leave. Reported as the absence rather than as a hollow
-            // success: this operation models no per-account result.
-            Some(false) => Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::NO_ADMINISTRATOR_MESSAGE,
-            )),
-            Some(true) => Ok(DisassociateFromAdministratorAccountOutput {}),
+            crate::state::AdministratorDisassociation::DetectorNotHeld => {
+                Err(not_owned(&input.detector_id))
+            }
+            // The organization auto-enables GuardDuty for every one of its accounts,
+            // so GuardDuty cannot be disabled in a member account until that account
+            // leaves the organization (the modelled contract above).
+            crate::state::AdministratorDisassociation::OrganizationManaged => {
+                Err(crate::scaffolded::Scaffolded::invalid_input(
+                    crate::state::organization_managed_administrator_message(),
+                ))
+            }
+            // The detector is held, but its account has accepted no invitation, so
+            // there is no relationship to leave. Reported as the absence rather than
+            // as a hollow success: this operation models no per-account result.
+            crate::state::AdministratorDisassociation::NoAdministrator => {
+                Err(crate::scaffolded::Scaffolded::invalid_input(
+                    crate::state::NO_ADMINISTRATOR_MESSAGE,
+                ))
+            }
+            crate::state::AdministratorDisassociation::Disassociated => {
+                Ok(DisassociateFromAdministratorAccountOutput {})
+            }
         }
     }
 }

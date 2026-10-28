@@ -178,6 +178,30 @@ pub struct ComAmazonawsGuarddutyGuarddutyapiserviceState {
     seq: u64,
 }
 
+/// What a member account's request to LEAVE the administrator relationship it
+/// accepted an invitation into found, as
+/// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::disassociate_detector_from_administrator`]
+/// reports it to the two operations bound to that behaviour.
+///
+/// Only [`Self::Disassociated`] is a success; each other variant is a refusal with
+/// its own message, and none of them writes anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdministratorDisassociation {
+    /// The Region's endpoint holds no detector under that id, so this account
+    /// cannot leave anything through it.
+    DetectorNotHeld,
+    /// The organization this detector's stored configuration describes auto-enables
+    /// GuardDuty for every one of its accounts, so the organization — not this call
+    /// — owns the relationship (see
+    /// [`organization_managed_administrator_message`]).
+    OrganizationManaged,
+    /// The detector is held, but its account has accepted no invitation, so there is
+    /// no relationship to leave.
+    NoAdministrator,
+    /// This call dropped the relationship.
+    Disassociated,
+}
+
 impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// The current instant in epoch milliseconds, strictly greater than every
     /// instant this state handed out before.
@@ -234,28 +258,45 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// Drop the administrator relationship the account that owns the detector
     /// `region`'s endpoint serves for `id` is monitored by.
     ///
-    /// `None` when that endpoint holds no such detector at all; `Some(false)` when it
-    /// does and the account has accepted no invitation, so there is no relationship
-    /// to leave; `Some(true)` when this call dropped one. The caller needs all three,
-    /// because only the last is a success.
+    /// Every outcome a caller has to tell apart is a variant of
+    /// [`AdministratorDisassociation`]: only the last of them is a success, and the
+    /// two names bound to this behaviour both read it here, so neither can refuse
+    /// what the other accepts.
+    ///
+    /// The ORGANIZATION precondition is checked before the relationship is read,
+    /// the way the administrator-side operations check it before they match any
+    /// account: it holds for the whole call rather than for one relationship (see
+    /// [`organization_managed_administrator_message`]).
     ///
     /// The mutation clock ([`Self::tick_millis`]) is read ONLY on the path that
-    /// writes, so neither refusal advances it — which is what lets this be one lookup
-    /// in the handler instead of a resolve-then-tick-then-resolve-again walk. The
-    /// write itself is [`Detector::disassociate_from_administrator`].
+    /// writes, so no refusal advances it — which is what lets this be one walk in
+    /// the handler instead of a resolve-then-tick-then-resolve-again one. The write
+    /// itself is [`Detector::disassociate_from_administrator`].
     pub fn disassociate_detector_from_administrator(
         &mut self,
         region: &str,
         id: &str,
-    ) -> Option<bool> {
-        if self.detector_in(region, id)?.administrator.is_none() {
-            return Some(false);
+    ) -> AdministratorDisassociation {
+        let Some(detector) = self.detector_in(region, id) else {
+            return AdministratorDisassociation::DetectorNotHeld;
+        };
+        if detector.organization.auto_enables_all_members() {
+            return AdministratorDisassociation::OrganizationManaged;
+        }
+        if detector.administrator.is_none() {
+            return AdministratorDisassociation::NoAdministrator;
         }
         let now = self.tick_millis();
-        Some(
-            self.detector_in_mut(region, id)
-                .is_some_and(|detector| detector.disassociate_from_administrator(now)),
-        )
+        if self
+            .detector_in_mut(region, id)
+            .is_some_and(|detector| detector.disassociate_from_administrator(now))
+        {
+            AdministratorDisassociation::Disassociated
+        } else {
+            // Unreachable: the relationship was read above under this same borrow of
+            // the store. Reported as the absence it would be rather than panicked.
+            AdministratorDisassociation::NoAdministrator
+        }
     }
 
     /// The detector `region`'s endpoint minted under `token`, if a create recorded
@@ -959,8 +1000,8 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
     /// `Some(false)` when the one it holds is a different account than
     /// `admin_account_id`, which is not a removal this call may make; `Some(true)`
     /// when the removal was accepted. The mutation clock is read only on the path
-    /// that writes, so neither refusal advances it — the shape
-    /// [`Self::disassociate_detector_from_administrator`] uses.
+    /// that writes, so neither refusal advances it — the discipline
+    /// [`Self::disassociate_detector_from_administrator`] keeps too.
     pub fn disable_organization_admin_account(
         &mut self,
         region: &str,
@@ -6420,9 +6461,10 @@ impl OrganizationConfiguration {
     /// The administrator that configured this keeps GuardDuty on for each of its
     /// organization's accounts, so the organization — not a single API call — owns
     /// each member relationship: an account has to leave the organization before
-    /// its relationship can end or its monitoring stop. The operations that would
-    /// do either read this before they write anything (see
-    /// [`organization_managed_members_message`]).
+    /// its relationship can end or its monitoring stop. Every operation that would
+    /// do either reads this before it writes anything, on the administrator's side
+    /// of the relationship (see [`organization_managed_members_message`]) and on
+    /// the member's own (see [`organization_managed_administrator_message`]).
     pub fn auto_enables_all_members(&self) -> bool {
         self.auto_enable_members == AUTO_ENABLE_ALL
     }
@@ -6511,6 +6553,23 @@ pub const DELETE_MEMBER_ACTION: &str = "delete";
 pub fn organization_managed_members_message(action: &str) -> String {
     format!(
         "The request is rejected because the current account cannot {action} the given member account ID while {AUTO_ENABLE_ORGANIZATION_MEMBERS_MEMBER} is set to {AUTO_ENABLE_ALL} for the organization. Remove the account from the organization first."
+    )
+}
+
+/// The message a MEMBER account's own request to leave the administrator
+/// relationship the ORGANIZATION manages is refused with.
+///
+/// The same precondition [`organization_managed_members_message`] states, worded
+/// for the side of the relationship that names no member account — the caller is
+/// the member: "with `autoEnableOrganizationMembers` configuration for your
+/// organization set to `ALL`, you'll receive an error if you attempt to disable
+/// GuardDuty in a member account"
+/// (`smithy_query(query="doc",shape="DisassociateFromAdministratorAccount")`). It
+/// names the same remedy the documentation gives for the administrator-side calls,
+/// because it is the same one: the account leaves the organization first.
+pub fn organization_managed_administrator_message() -> String {
+    format!(
+        "The request is rejected because the current account cannot disassociate from its administrator account while {AUTO_ENABLE_ORGANIZATION_MEMBERS_MEMBER} is set to {AUTO_ENABLE_ALL} for the organization. Remove the account from the organization first."
     )
 }
 
