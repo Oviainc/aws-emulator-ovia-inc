@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFirewallRuleGroupAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFirewallRuleGroupAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFirewallRuleGroupAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Applies the change to the association record
+//! the associate wrote ([`crate::state::FirewallRuleGroupAssociationRecord`]), so
+//! every later read of it reports the changed values. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFirewallRuleGroupAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFirewallRuleGroupAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFirewallRuleGroupAssociation"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN — the record keeps the one it was made with — so
+        // it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateFirewallRuleGroupAssociationErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Name`'s pattern carries a negative lookahead, outside what the
+        // boundary validator's regex engine accepts, so it is enforced here —
+        // before the store is locked, so nothing is written.
+        if let Some(name) = &input.name {
+            if !crate::state::name_satisfies_pattern(name) {
+                return Err(
+                    UpdateFirewallRuleGroupAssociationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::name_pattern_violation(name)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The allowed values for Priority are between 100 and 9900", the same
+        // bounds the associate enforces: "you can change the priority setting
+        // for a rule group association after you create it", not the values it
+        // may take.
+        if let Some(priority) = input.priority {
+            if !crate::state::ASSOCIATION_PRIORITY_RANGE.contains(&priority) {
+                return Err(
+                    UpdateFirewallRuleGroupAssociationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "Priority {priority} is outside the allowed values, which are between {} and {}",
+                                crate::state::ASSOCIATION_PRIORITY_RANGE.start(),
+                                crate::state::ASSOCIATION_PRIORITY_RANGE.end()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        if let Some(mutation_protection) = &input.mutation_protection {
+            if !crate::ops::types::MUTATION_PROTECTION_STATUS_VALUES
+                .contains(&mutation_protection.as_str())
+            {
+                return Err(
+                    UpdateFirewallRuleGroupAssociationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "MutationProtection must be one of {:?}",
+                                crate::ops::types::MUTATION_PROTECTION_STATUS_VALUES
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let now = ::std::time::Instant::now();
+        let timestamp = crate::state::now_rfc3339();
+        let mut store = state.lock();
+
+        // The association as it stands, read out as owned values so the record is
+        // no longer borrowed while the rest of the store is consulted below.
+        let Some((status, mutation_protection, vpc_id)) = store
+            .firewall_rule_group_associations
+            .get(&input.firewall_rule_group_association_id)
+            .map(|record| {
+                (
+                    record.status_at(now).to_string(),
+                    record.mutation_protection.clone(),
+                    record.vpc_id.clone(),
+                )
+            })
+        else {
+            return Err(
+                UpdateFirewallRuleGroupAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_rule_group_association_not_found(
+                        &input.firewall_rule_group_association_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // An association whose last change has not settled yet still has one in
+        // flight, so this one is refused with the sentence the model states for
+        // that class and the record is left exactly as it is.
+        if status != crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE {
+            return Err(
+                UpdateFirewallRuleGroupAssociationErrorModeled::ConflictException(
+                    crate::state::state_transition_conflict(),
+                )
+                .into(),
+            );
+        }
+
+        // Mutation protection "disallows modification or removal of the
+        // association": while it is in force, the only change it admits is the
+        // one that lifts it — otherwise an association could never be changed
+        // again.
+        let changes_more_than_protection = input.priority.is_some() || input.name.is_some();
+        if mutation_protection == crate::state::MUTATION_PROTECTION_ENABLED
+            && (changes_more_than_protection
+                || input.mutation_protection.as_deref()
+                    != Some(crate::state::MUTATION_PROTECTION_DISABLED))
+        {
+            return Err(
+                UpdateFirewallRuleGroupAssociationErrorModeled::ValidationException(
+                    crate::state::mutation_protection_forbids_change(
+                        &input.firewall_rule_group_association_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // "You must specify a unique priority for each rule group that you
+        // associate with a single VPC": a priority another association of the
+        // same VPC already holds is refused and nothing is written.
+        if let Some(priority) = input.priority {
+            if store.firewall_rule_group_associations.values().any(|record| {
+                record.vpc_id == vpc_id
+                    && record.priority == priority
+                    && record.id != input.firewall_rule_group_association_id
+            }) {
+                return Err(
+                    UpdateFirewallRuleGroupAssociationErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "Priority {priority} is already in use by another rule group associated with VPC {vpc_id}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let Some(record) = store
+            .firewall_rule_group_associations
+            .get_mut(&input.firewall_rule_group_association_id)
+        else {
+            return Err(
+                UpdateFirewallRuleGroupAssociationErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_rule_group_association_not_found(
+                        &input.firewall_rule_group_association_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // Only the members the request names are changed; the rest keep the
+        // values the association already has.
+        if let Some(priority) = input.priority {
+            record.priority = priority;
+        }
+        if let Some(name) = &input.name {
+            record.name = name.clone();
+        }
+        if let Some(mutation_protection) = &input.mutation_protection {
+            record.mutation_protection = mutation_protection.clone();
+        }
+        record.modification_time = timestamp;
+        // The change is applied to the record at once and the association
+        // reports `UPDATING` while it settles: the move back to `COMPLETE` is
+        // the one the clock owes, so a caller reading it straight after this
+        // call still observes the transient status.
+        record.status =
+            crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING.to_string();
+        record.settled_at = Some(now + crate::state::PROVISIONING_DELAY);
+
+        Ok(UpdateFirewallRuleGroupAssociationOutput {
+            firewall_rule_group_association: Some(record.to_association(now)),
+        })
     }
 }

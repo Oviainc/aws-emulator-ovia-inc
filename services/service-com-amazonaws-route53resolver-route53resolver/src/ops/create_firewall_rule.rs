@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFirewallRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFirewallRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFirewallRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. A rule is stored ON the rule group it belongs
+//! to ([`crate::state::FirewallRuleRecord`]), so the group's `RuleCount` and
+//! `ListFirewallRules` report the same rules. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -246,18 +241,394 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFirewallRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFirewallRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFirewallRule"))
+        // The engine is reachable from `&self` (constructor-injected); a rule is
+        // not an ARN-bearing resource of its own, so this operation takes
+        // nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFirewallRuleErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `Name`'s pattern carries a negative lookahead, which is outside what
+        // the boundary validator's regex engine accepts, so the rule is enforced
+        // here — before the store is locked, so nothing is written.
+        if !crate::state::name_satisfies_pattern(&input.name) {
+            return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::name_pattern_violation(&input.name)),
+                },
+            )
+            .into());
+        }
+
+        // Each enum member admits exactly the values its modelled enum declares;
+        // a value outside one is refused rather than stored as if the service
+        // understood it.
+        for (member, value, values) in [
+            (
+                "Action",
+                Some(input.action.as_str()),
+                crate::ops::types::ACTION_VALUES,
+            ),
+            (
+                "BlockResponse",
+                input.block_response.as_deref(),
+                crate::ops::types::BLOCK_RESPONSE_VALUES,
+            ),
+            (
+                "BlockOverrideDnsType",
+                input.block_override_dns_type.as_deref(),
+                crate::ops::types::BLOCK_OVERRIDE_DNS_TYPE_VALUES,
+            ),
+            (
+                "FirewallDomainRedirectionAction",
+                input.firewall_domain_redirection_action.as_deref(),
+                crate::ops::types::FIREWALL_DOMAIN_REDIRECTION_ACTION_VALUES,
+            ),
+            (
+                "DnsThreatProtection",
+                input.dns_threat_protection.as_deref(),
+                crate::ops::types::DNS_THREAT_PROTECTION_VALUES,
+            ),
+            (
+                "ConfidenceThreshold",
+                input.confidence_threshold.as_deref(),
+                crate::ops::types::CONFIDENCE_THRESHOLD_VALUES,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !values.contains(&value) {
+                    return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!("{member} must be one of {values:?}")),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // "The rule can use any one of the following match sources, and the
+        // chosen source must be supplied through the matching request field —
+        // they are mutually exclusive": `FirewallDomainListId`,
+        // `DnsThreatProtection` and `FirewallRuleType`.
+        let sources = [
+            input.firewall_domain_list_id.is_some(),
+            input.dns_threat_protection.is_some(),
+            input.firewall_rule_type.is_some(),
+        ]
+        .into_iter()
+        .filter(|named| *named)
+        .count();
+        if sources != 1 {
+            return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "Exactly one of FirewallDomainListId, DnsThreatProtection and \
+                         FirewallRuleType identifies the rule's match source"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "`FirewallRuleType` is a tagged union — exactly one member must be set
+        // per rule, and the member determines what the rule matches against."
+        if let Some(rule_type) = &input.firewall_rule_type {
+            let variants = [
+                rule_type.partner_threat_protection.is_some(),
+                rule_type.firewall_advanced_content_category.is_some(),
+                rule_type.firewall_advanced_threat_category.is_some(),
+                rule_type.dns_threat_protection.is_some(),
+            ]
+            .into_iter()
+            .filter(|set| *set)
+            .count();
+            if variants != 1 {
+                return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "FirewallRuleType carries exactly one of \
+                             PartnerThreatProtection, FirewallAdvancedContentCategory, \
+                             FirewallAdvancedThreatCategory and DnsThreatProtection"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(detector) = &rule_type.dns_threat_protection {
+                for (member, value, values) in [
+                    (
+                        "FirewallRuleType.DnsThreatProtection.Value",
+                        detector.value.as_str(),
+                        crate::ops::types::DNS_THREAT_PROTECTION_VALUES,
+                    ),
+                    (
+                        "FirewallRuleType.DnsThreatProtection.ConfidenceThreshold",
+                        detector.confidence_threshold.as_str(),
+                        crate::ops::types::CONFIDENCE_THRESHOLD_VALUES,
+                    ),
+                ] {
+                    if !values.contains(&value) {
+                        return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(format!("{member} must be one of {values:?}")),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
+        // A rule whose match source is one of the DNS Firewall Advanced kinds:
+        // `ALLOW` is "not available for DNS Firewall Advanced rules", and a
+        // `DnsThreatProtection` rule needs the confidence threshold — "you must
+        // provide this value when you create a DNS Firewall Advanced rule".
+        let advanced =
+            input.dns_threat_protection.is_some() || input.firewall_rule_type.is_some();
+        if advanced && input.action == crate::state::FIREWALL_RULE_ACTION_ALLOW {
+            return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Action {} is not available for DNS Firewall Advanced rules",
+                        crate::state::FIREWALL_RULE_ACTION_ALLOW
+                    )),
+                },
+            )
+            .into());
+        }
+        if input.dns_threat_protection.is_some() && input.confidence_threshold.is_none() {
+            return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "ConfidenceThreshold is required for a rule that matches a \
+                         DnsThreatProtection detector"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "`BlockResponse` … This setting is required if the rule action setting
+        // is BLOCK", and each `BlockOverride*` member "is required if the
+        // BlockResponse setting is OVERRIDE".
+        if input.action == crate::state::FIREWALL_RULE_ACTION_BLOCK
+            && input.block_response.is_none()
+        {
+            return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "BlockResponse is required when Action is {}",
+                        crate::state::FIREWALL_RULE_ACTION_BLOCK
+                    )),
+                },
+            )
+            .into());
+        }
+        if input.block_response.as_deref()
+            == Some(crate::state::FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE)
+        {
+            let missing = [
+                ("BlockOverrideDomain", input.block_override_domain.is_none()),
+                (
+                    "BlockOverrideDnsType",
+                    input.block_override_dns_type.is_none(),
+                ),
+                ("BlockOverrideTtl", input.block_override_ttl.is_none()),
+            ]
+            .into_iter()
+            .find_map(|(member, absent)| absent.then_some(member));
+            if let Some(member) = missing {
+                return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "{member} is required when BlockResponse is {}",
+                            crate::state::FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::Instant::now();
+        let timestamp = crate::state::now_rfc3339();
+        let mut store = state.lock();
+
+        // The rule group the rule is created in has to exist, and so does the
+        // domain list a domain-list rule matches against — including one DNS
+        // Firewall publishes itself, which such a rule may name.
+        let Some(group) = store.firewall_rule_groups.get(&input.firewall_rule_group_id) else {
+            return Err(CreateFirewallRuleErrorModeled::ResourceNotFoundException(
+                crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+            )
+            .into());
+        };
+
+        // `CreatorRequestId` is "a unique string that identifies the request and
+        // that allows you to retry failed requests without the risk of running
+        // the operation twice": a repeat resolves to the rule it already made.
+        if let Some(record) = group.rules.iter().find(|record| {
+            record.rule.creator_request_id.as_deref() == Some(input.creator_request_id.as_str())
+        }) {
+            return Ok(CreateFirewallRuleOutput {
+                firewall_rule: Some(record.to_rule(now)),
+            });
+        }
+
+        // "You must specify a unique priority for each rule in a rule group."
+        if group
+            .rules
+            .iter()
+            .any(|record| record.rule.priority == Some(input.priority))
+        {
+            return Err(CreateFirewallRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Priority {} is already in use by another rule in rule group {}",
+                        input.priority, input.firewall_rule_group_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The group's rules are bounded: a create past the bound is refused and
+        // the stored rules are left exactly as they were.
+        if group.rules.len() >= crate::state::MAX_RULES_PER_FIREWALL_RULE_GROUP {
+            return Err(CreateFirewallRuleErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} rules per firewall rule group; delete one before creating another",
+                        crate::state::MAX_RULES_PER_FIREWALL_RULE_GROUP
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_FIREWALL_RULE_GROUP.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        if let Some(firewall_domain_list_id) = &input.firewall_domain_list_id {
+            if !store
+                .firewall_domain_lists
+                .contains_key(firewall_domain_list_id)
+                && crate::state::managed_firewall_domain_list(firewall_domain_list_id).is_none()
+            {
+                return Err(CreateFirewallRuleErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_domain_list_not_found(firewall_domain_list_id),
+                )
+                .into());
+            }
+        }
+
+        // A DNS Firewall Advanced rule carries an id of its own, which
+        // `FirewallRule$FirewallThreatProtectionId` reports; a domain-list rule
+        // is not one and carries none.
+        let firewall_threat_protection_id = if advanced {
+            let seq = store.next_seq();
+            Some(crate::state::mint_firewall_threat_protection_id(seq))
+        } else {
+            None
+        };
+
+        // "Rules created with the PartnerThreatProtection rule type begin in
+        // [CREATING] while DNS Firewall verifies the calling account's Amazon Web
+        // Services Marketplace entitlement" — the one match source whose
+        // provisioning is asynchronous. This emulator holds no Marketplace
+        // subscription, so that verification is what the clock owes the rule, and
+        // it settles on the documented failure.
+        let partner = input
+            .firewall_rule_type
+            .as_ref()
+            .and_then(|rule_type| rule_type.partner_threat_protection.as_ref())
+            .map(|config| config.partner.clone());
+
+        let rule = FirewallRule {
+            firewall_rule_group_id: Some(input.firewall_rule_group_id.clone()),
+            firewall_domain_list_id: input.firewall_domain_list_id.clone(),
+            firewall_threat_protection_id,
+            name: Some(input.name.clone()),
+            priority: Some(input.priority),
+            action: Some(input.action.clone()),
+            block_response: input.block_response.clone(),
+            block_override_domain: input.block_override_domain.clone(),
+            block_override_dns_type: input.block_override_dns_type.clone(),
+            block_override_ttl: input.block_override_ttl,
+            creator_request_id: Some(input.creator_request_id.clone()),
+            creation_time: Some(timestamp.clone()),
+            modification_time: Some(timestamp),
+            // The redirection action applies to the redirection chain of a
+            // domain the rule matched in its domain list, so it is reported —
+            // with its documented default when the request names none — for a
+            // domain-list rule alone.
+            firewall_domain_redirection_action: input
+                .firewall_domain_redirection_action
+                .clone()
+                .or_else(|| {
+                    input.firewall_domain_list_id.as_ref().map(|_| {
+                        crate::state::FIREWALL_DOMAIN_REDIRECTION_INSPECT.to_string()
+                    })
+                }),
+            qtype: input.qtype.clone(),
+            dns_threat_protection: input.dns_threat_protection.clone(),
+            confidence_threshold: input.confidence_threshold.clone(),
+            firewall_rule_type: input.firewall_rule_type.clone(),
+            // The lifecycle state is the record's, not the rule's: it is decided
+            // from the clock by `FirewallRuleRecord::to_rule`.
+            status: None,
+            status_message: None,
+        };
+
+        let record = match &partner {
+            Some(partner) => crate::state::FirewallRuleRecord {
+                rule,
+                status: Some(crate::state::FIREWALL_RULE_STATUS_CREATING.to_string()),
+                settled_status: Some(
+                    crate::state::FIREWALL_RULE_STATUS_CREATION_FAILED.to_string(),
+                ),
+                settled_status_message: Some(crate::state::partner_subscription_missing(partner)),
+                settled_at: Some(now + crate::state::PROVISIONING_DELAY),
+            },
+            // Every other match source is in force the moment the rule exists,
+            // so the rule needs no asynchronous provisioning and reports no
+            // `Status` at all.
+            None => crate::state::FirewallRuleRecord {
+                rule,
+                status: None,
+                settled_status: None,
+                settled_status_message: None,
+                settled_at: None,
+            },
+        };
+
+        let reported = record.to_rule(now);
+        let Some(group) = store
+            .firewall_rule_groups
+            .get_mut(&input.firewall_rule_group_id)
+        else {
+            return Err(CreateFirewallRuleErrorModeled::ResourceNotFoundException(
+                crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+            )
+            .into());
+        };
+        group.rules.push(record);
+        // The group's own `ModificationTime` moves with the rules it holds: a
+        // group a rule was just added to has changed.
+        group.modification_time = crate::state::now_rfc3339();
+
+        Ok(CreateFirewallRuleOutput {
+            firewall_rule: Some(reported),
+        })
     }
 }
