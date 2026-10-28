@@ -361,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.clusters.insert(input.identifier.clone(), cluster);
         // Configuring one side of a peering can complete the OTHER side's wait, so
         // the clock now owes `ACTIVE` to every cluster this call finished peering.
-        state.owe_active_to_completed_peerings(now);
+        state.owe_active_to_clusters_done_waiting(now);
         if let Some(token) = input.client_token {
             state
                 .tokens(crate::state::TokenScope::UpdateCluster)

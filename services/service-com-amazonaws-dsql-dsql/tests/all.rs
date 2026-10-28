@@ -51,6 +51,8 @@ mod multi_region_witness;
 mod nested_arn_not_found;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
+#[path = "all/peering_unwound_by_deletion.rs"]
+mod peering_unwound_by_deletion;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
 #[path = "all/policy_version_conflict_and_lockout.rs"]

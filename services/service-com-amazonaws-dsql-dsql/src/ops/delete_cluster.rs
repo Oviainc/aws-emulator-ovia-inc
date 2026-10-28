@@ -6,7 +6,11 @@
 //! `DELETING` — or `PENDING_DELETE` for a multi-Region cluster, whose peering is
 //! unwound before the removal starts — and the clock removes it, so a later
 //! `GetCluster` answers
-//! `ResourceNotFoundException` and `ListClusters` stops listing it. A cluster with
+//! `ResourceNotFoundException` and `ListClusters` stops listing it. Starting the
+//! removal also unwinds the OTHER side of every peering this cluster was part of:
+//! each surviving cluster's `multiRegionProperties` stops naming it, and a survivor
+//! left naming no peer at all keeps no multi-Region configuration
+//! ([`crate::state::ComAmazonawsDsqlDsqlState::unwind_peerings_with`]). A cluster with
 //! deletion protection enabled is refused with `ValidationException` (400) — the
 //! condition is permanent until the caller changes the cluster, not a transient
 //! conflict; an unknown identifier with `ResourceNotFoundException` (404).
@@ -263,7 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the call lands in ([`crate::state::Cluster::deletion_in_flight`]), so a
         // retry is served the same way for a cluster whose peering is being
         // unwound first as for one whose removal started straight away.
-        if !cluster.deletion_in_flight() {
+        let starting = !cluster.deletion_in_flight();
+        if starting {
             if let Some(conflict) = cluster.mutation_conflict("be deleted") {
                 return Err(DeleteClusterErrorModeled::ConflictException(conflict).into());
             }
@@ -293,6 +298,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let creation_time = cluster.creation_time;
         let deleted = delete_cluster_output(cluster);
+
+        // A peering is a relationship BOTH clusters carry, so the call that starts
+        // this cluster's removal takes its half out of every OTHER cluster's
+        // configuration, before the removal itself: no surviving cluster is left
+        // naming a cluster this service is retiring, and none has its status
+        // recomputed from such a reference. Whether THIS cluster had a
+        // configuration of its own does not decide it — a cluster named by a peer
+        // is peered with it either way — so the unwinding runs for every deletion
+        // that starts, and for a cluster no other names there is nothing to unwind.
+        if starting {
+            state.unwind_peerings_with(&deleted.arn, now);
+        }
+
         if let Some(token) = input.client_token {
             // Recorded whichever branch answered: a delete of a cluster already
             // on its way out succeeded just as much as the one that started the

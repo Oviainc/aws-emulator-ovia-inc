@@ -905,54 +905,107 @@ impl ComAmazonawsDsqlDsqlState {
     /// through: a deletion's peering tear-down ([`STATUS_PENDING_DELETE`]) is
     /// followed by the removal ([`STATUS_DELETING`]) and that by the cluster
     /// going away ([`STATUS_DELETED`]). A cluster waiting for its peering
-    /// ([`STATUS_PENDING_SETUP`]) is owed nothing until that peering is
-    /// established on both sides, which a request against the OTHER cluster is
-    /// what brings about ([`Self::owe_active_to_completed_peerings`]).
+    /// ([`STATUS_PENDING_SETUP`]) is owed nothing while its configuration still
+    /// leaves it waiting, which a request against ANOTHER cluster is what ends
+    /// ([`Self::owe_active_to_clusters_done_waiting`]).
     fn owed_after(&self, identifier: &str) -> Option<&'static str> {
         let cluster = self.clusters.get(identifier)?;
         match cluster.status.as_str() {
             STATUS_PENDING_DELETE => Some(STATUS_DELETING),
             STATUS_DELETING => Some(STATUS_DELETED),
             STATUS_PENDING_SETUP => {
-                multi_region_setup_complete(cluster, &self.clusters).then_some(STATUS_ACTIVE)
+                (settled_cluster_status(cluster, &self.clusters) == STATUS_ACTIVE)
+                    .then_some(STATUS_ACTIVE)
             }
             _ => None,
         }
     }
 
-    /// Owe [`STATUS_ACTIVE`] to every cluster whose multi-Region peering has just
-    /// become established.
+    /// Owe [`STATUS_ACTIVE`] to every cluster whose wait for its multi-Region
+    /// peering is over.
     ///
-    /// A cluster waiting in [`STATUS_PENDING_SETUP`] waits for the OTHER side of
-    /// its peering to be configured, and that is a request against that other
-    /// cluster — so the call which configures one side is what ends the wait of
-    /// every cluster now named by both, and the clock carries each of them to
-    /// `ACTIVE` a settle span later. Called by the operations that WRITE a
-    /// cluster's multi-Region configuration; a cluster whose peering is still
-    /// outstanding is owed nothing.
+    /// A cluster waiting in [`STATUS_PENDING_SETUP`] waits for a configuration it
+    /// does not own: the OTHER side of its peering. A request against that other
+    /// cluster is what ends the wait — by configuring the peering, so that every
+    /// peer this cluster names names it back, or by taking the other cluster away,
+    /// so that the configuration asking for the peering is unwound with it
+    /// ([`Self::unwind_peerings_with`]) — and the clock carries each cluster whose
+    /// own configuration no longer leaves it waiting
+    /// ([`settled_cluster_status`]) to `ACTIVE` a settle span later. Called by the
+    /// operations that WRITE a cluster's multi-Region configuration and by the one
+    /// that unwinds it; a cluster still waiting is owed nothing.
     ///
     /// The scan is over [`Self::clusters`], capped at [`MAX_CLUSTERS`], and reads
     /// a cluster's peers — capped at [`MAX_MULTI_REGION_PEERS`] — only once the
     /// cheap status test has selected it, so the per-request cost is bounded by a
     /// constant the way [`Self::settle_once`]'s is.
-    pub fn owe_active_to_completed_peerings(&mut self, now: SystemTime) {
-        let completed: Vec<String> = self
+    pub fn owe_active_to_clusters_done_waiting(&mut self, now: SystemTime) {
+        let done: Vec<String> = self
             .clusters
             .values()
             .filter(|cluster| {
                 cluster.status == STATUS_PENDING_SETUP
                     && cluster.pending.is_none()
-                    && multi_region_setup_complete(cluster, &self.clusters)
+                    && settled_cluster_status(cluster, &self.clusters) == STATUS_ACTIVE
             })
             .map(|cluster| cluster.identifier.clone())
             .collect();
-        for identifier in completed {
+        for identifier in done {
             if let Some(cluster) = self.clusters.get_mut(&identifier) {
                 cluster.pending = Some(PendingTransition {
                     due_at: now + SETTLE_AFTER,
                     next_status: STATUS_ACTIVE,
                 });
             }
+        }
+    }
+
+    /// Unwind the multi-Region peering of the cluster `arn` names, taking its half
+    /// of the relationship out of every OTHER cluster's configuration.
+    ///
+    /// The tear-down counterpart of
+    /// [`Self::owe_active_to_clusters_done_waiting`]: a peering is a relationship
+    /// BOTH clusters carry, so a cluster leaving this service has to stop being
+    /// named by the clusters that stay — otherwise a survivor reports a peer that
+    /// no longer exists, and the next call that recomputes its status reads that
+    /// reference as a peering still waiting to be established. Called by the
+    /// operation that starts a cluster's removal, which is what retires the
+    /// relationship; a cluster no other names is nothing to unwind.
+    ///
+    /// A survivor the unwinding leaves naming NO peer at all is no longer part of a
+    /// multi-Region cluster, so its whole `multiRegionProperties` goes with the
+    /// peering — the peer list and the witness Region that held the quorum vote for
+    /// it — leaving the single-Region cluster it now is; a survivor that still names
+    /// other peers keeps its configuration, minus the one entry. Either way the
+    /// clock then owes `ACTIVE` to a survivor whose remaining configuration no
+    /// longer leaves it waiting.
+    ///
+    /// The scan is over [`Self::clusters`], capped at [`MAX_CLUSTERS`], and each
+    /// cluster's peers, capped at [`MAX_MULTI_REGION_PEERS`], so the cost is
+    /// bounded by a constant the way [`Self::settle_once`]'s is.
+    pub fn unwind_peerings_with(&mut self, arn: &str, now: SystemTime) {
+        let mut unwound = false;
+        for cluster in self.clusters.values_mut() {
+            if !cluster.names_peer(arn) {
+                continue;
+            }
+            unwound = true;
+            let remaining: Vec<String> = cluster
+                .multi_region_peers()
+                .iter()
+                .filter(|peer| peer.as_str() != arn)
+                .cloned()
+                .collect();
+            cluster.multi_region_properties = match cluster.multi_region_properties.take() {
+                Some(properties) if !remaining.is_empty() => Some(MultiRegionProperties {
+                    clusters: Some(remaining),
+                    ..properties
+                }),
+                _ => None,
+            };
+        }
+        if unwound {
+            self.owe_active_to_clusters_done_waiting(now);
         }
     }
 
