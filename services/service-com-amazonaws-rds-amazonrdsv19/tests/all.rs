@@ -55,6 +55,8 @@ mod db_parameter_groups;
 mod db_parameter_metadata;
 #[path = "all/db_parameters.rs"]
 mod db_parameters;
+#[path = "all/db_security_group_deletion.rs"]
+mod db_security_group_deletion;
 #[path = "all/db_security_group_ingress.rs"]
 mod db_security_group_ingress;
 #[path = "all/db_security_groups.rs"]

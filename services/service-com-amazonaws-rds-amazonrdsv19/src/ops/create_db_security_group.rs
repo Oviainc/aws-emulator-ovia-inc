@@ -162,10 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the identifier members of this service share, at this member's own length bound.
         crate::state::check_identifier("DBSecurityGroupName", &name, MAX_NAME_LEN)
             .map_err(CreateDBSecurityGroupError::invalid_parameter_value)?;
-        if name == RESERVED_NAME {
+        if name == crate::state::DEFAULT_DB_SECURITY_GROUP {
             return Err(CreateDBSecurityGroupError::invalid_parameter_value(format!(
-                "DBSecurityGroupName must not be {RESERVED_NAME}: that name is reserved for \
-                 the account's own default DB security group"
+                "DBSecurityGroupName must not be {}: that name is reserved for the account's \
+                 own default DB security group",
+                crate::state::DEFAULT_DB_SECURITY_GROUP
             )));
         }
         // Nothing caller-sized reaches the store unchecked: the description is
@@ -245,9 +246,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The longest `DBSecurityGroupName` this operation accepts, as its member documents
 /// ("Must be 1 to 255 letters, numbers, or hyphens").
 const MAX_NAME_LEN: usize = 255;
-
-/// The name `DBSecurityGroupName` refuses ("Must not be `Default`"), compared after the
-/// value is folded the way that member documents it is stored. Amazon RDS keeps the name
-/// for the account's own default DB security group, so a request naming it is refused
-/// rather than shadowing that group.
-const RESERVED_NAME: &str = "default";
