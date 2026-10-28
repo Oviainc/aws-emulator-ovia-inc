@@ -49,6 +49,8 @@ mod metadata_sync;
 mod metadata_sync_is_not_gated_on_property_mappings;
 #[path = "all/metadata_sync_over_the_wire.rs"]
 mod metadata_sync_over_the_wire;
+#[path = "all/metadata_sync_restart_supersedes_the_pending_sync.rs"]
+mod metadata_sync_restart_supersedes_the_pending_sync;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
 #[path = "all/put_bandwidth_rate_limit_schedule.rs"]

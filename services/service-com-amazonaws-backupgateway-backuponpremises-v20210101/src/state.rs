@@ -113,7 +113,8 @@
 //! on where it has got to. That one sync is also what records the hypervisor's
 //! virtual-machine inventory, dated at the instant the sync falls due — so the machines a
 //! listing reports and the `SUCCEEDED` a read of the hypervisor reports become true
-//! together.
+//! together, and a sync started before the previous one fell due supersedes it on both
+//! halves of that fact at once.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -957,11 +958,15 @@ pub struct StoredVirtualMachine {
     pub vmware_tags: Vec<VmwareTag>,
     /// When the sync that discovered this machine REPORTED it — the instant that sync
     /// fell due, which is also the instant it is reported as having succeeded at. Kept
-    /// across a re-sync of the same machine, so re-reporting an unchanged inventory is
-    /// visible as the one record it is. No member of the modelled `VirtualMachine` carries
-    /// it: it is the record's own provenance, and what a read compares the clock against
-    /// to decide whether the machine is part of the inventory yet
-    /// ([`Self::discovered_as_of`]).
+    /// across a re-sync of the same machine ONCE it has fallen due, so re-reporting an
+    /// unchanged inventory is visible as the one record it is; a machine whose reporting
+    /// sync was superseded before that instant is dated by the sync that supersedes it
+    /// instead
+    /// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::start_metadata_sync`]),
+    /// because the superseded sync never succeeds. No member of the modelled
+    /// `VirtualMachine` carries it: it is the record's own provenance, and what a read
+    /// compares the clock against to decide whether the machine is part of the inventory
+    /// yet ([`Self::discovered_as_of`]).
     pub discovered_time: SystemTime,
 }
 
@@ -1746,6 +1751,13 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// API can reach a non-empty `ListVirtualMachines`. A machine the previous sync already
     /// reported keeps the record and the ARN it has, so a re-sync neither re-dates it nor
     /// mints a second machine for it.
+    ///
+    /// A sync that had NOT fallen due when this one was started is superseded by it, on
+    /// both halves of that one fact: its success is not folded onto the record above, and
+    /// the machines it had not published yet are published by THIS sync instead
+    /// ([`StoredVirtualMachine::discovered_time`]) rather than at the abandoned sync's due
+    /// instant. So the inventory a listing reports never gets ahead of the successful sync
+    /// a read of the hypervisor reports.
     pub fn start_metadata_sync(&mut self, arn: &str, now: SystemTime) -> Option<StoredHypervisor> {
         let record = self.hypervisors.get_mut(arn)?;
         // A sync the clock had already finished is MATERIALISED before the new one
@@ -1764,6 +1776,17 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             .map(|parts| parts.region.to_string())
             .unwrap_or_else(|| DEFAULT_REGION.to_string());
         let discovered = now + METADATA_SYNC_SUCCEEDS_AFTER;
+        // The machines a superseded sync had not published yet are published by this one:
+        // the sync they were dated by no longer succeeds at any instant, and a reader
+        // decides whether a machine is part of the inventory with the same predicate this
+        // writer asks it with ([`StoredVirtualMachine::discovered_as_of`]). A machine an
+        // earlier sync already published keeps the instant it became visible at — that is
+        // a fact about an inventory a reader could already see.
+        for machine in self.virtual_machines.values_mut() {
+            if machine.hypervisor_arn == arn && !machine.discovered_as_of(now) {
+                machine.discovered_time = discovered;
+            }
+        }
         for machine in synced_inventory(arn) {
             self.record_virtual_machine(&region, arn, machine, discovered);
         }
@@ -1784,7 +1807,9 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// A machine is identified on its hypervisor by its [`StoredVirtualMachine::path`] —
     /// where it sits in that hypervisor's inventory — so reporting the same path again
     /// UPDATES the record under the ARN the machine already has (keeping its
-    /// `discovered_time`) rather than minting a second machine for it.
+    /// `discovered_time`) rather than minting a second machine for it. Re-dating a record
+    /// whose publication has not fallen due yet is the caller's business, and
+    /// [`Self::start_metadata_sync`] is where it happens.
     ///
     /// `None` — nothing written — when this store holds no hypervisor under
     /// `hypervisor_arn` (a machine cannot be on a hypervisor the service does not have),
