@@ -236,6 +236,56 @@ pub(crate) fn create_network(
     }
 }
 
+/// Remove `subnets` and `security_groups` from the account's own Amazon EC2 store: the
+/// counterpart of [`create_network`], written through the same store for the same reason —
+/// a suite that deletes a resource a registration already resolved names that specific id.
+pub(crate) fn delete_network(
+    engine: &Arc<engine::InMemoryEngine>,
+    subnets: &[&str],
+    security_groups: &[&str],
+) {
+    let store = ec2::state::service_state(&**engine)
+        .expect("the in-memory engine carries the account's EC2 store");
+    let mut store = store.lock();
+    for subnet_id in subnets {
+        store.subnets.remove(*subnet_id);
+    }
+    for group_id in security_groups {
+        store.security_groups.remove(*group_id);
+    }
+}
+
+/// The `UpdateSettings` payload of an `UpdateIdentityProviderSettings` request, as the
+/// suites that exercise that operation spell one.
+///
+/// One builder for the whole crate, so two suites cannot disagree about what a client
+/// sends: leaving `security_group_id` out of the payload is what keeps the stored group.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct UpdateSettingsPayload {
+    pub(crate) add_subnets: &'static [&'static str],
+    pub(crate) remove_subnets: &'static [&'static str],
+    pub(crate) security_group_id: Option<&'static str>,
+}
+
+impl UpdateSettingsPayload {
+    /// The `UpdateSettings` member on its own.
+    pub(crate) fn settings(self) -> Value {
+        let mut settings = json!({
+            "AddSubnets": self.add_subnets,
+            "RemoveSubnets": self.remove_subnets,
+        });
+        if let Some(security_group_id) = self.security_group_id {
+            settings["SecurityGroupId"] = json!(security_group_id);
+        }
+        settings
+    }
+
+    /// The whole request body, addressing the registration `provider_arn` names.
+    pub(crate) fn request(self, provider_arn: &str) -> Value {
+        json!({ "IdentityProviderArn": provider_arn, "UpdateSettings": self.settings() })
+    }
+}
+
 /// What a call answered: the HTTP status, the wire error code (if any) and the body.
 #[derive(Debug)]
 pub(crate) struct Reply {
