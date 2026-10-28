@@ -259,8 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut identity: Option<crate::state::token::TokenIdentity> = None;
         for token in presented {
-            let verified =
-                crate::state::token::verify(&*self.engine, store, token, now).map_err(refused)?;
+            let verified = crate::state::token::verify(&*self.engine, store, token, now)
+                .map_err(|refusal| refused(&input.policy_store_id, refusal))?;
             identity = Some(match identity {
                 None => verified,
                 Some(first) => first.merged_with(verified).ok_or_else(|| {
@@ -413,17 +413,19 @@ fn invalid_members(
 /// that reads it.
 ///
 /// A token whose issuer is no identity source of the store is the other kind of answer:
-/// nothing about the token is wrong, and what the call referenced — an identity source
-/// for that issuer — does not exist, so it is the modelled not-found, worded the way every
-/// AUTHORIZATION call of this service words one: the kind of resource that was not found
-/// and the id the request referenced it by, which for a token-based call is the ISSUER its
-/// token claims, with that same identity in the exception's own `resourceId` /
-/// `resourceType` members.
+/// nothing about the token is wrong, and what the call referenced — an identity source for
+/// that issuer IN this policy store — does not exist, so it is the modelled not-found,
+/// worded as the reference it was: the ISSUER the token claims and the policy store the
+/// request addressed, which `policy_store_id` carries. The exception's own `resourceId` /
+/// `resourceType` members still name the missing identity source.
 ///
 /// A token whose signature could not be CHECKED is the third: nothing about the request is
 /// wrong and this service cannot say whether the signature is good, which is the modelled
 /// server fault rather than a refusal of the token.
-fn refused(refusal: crate::state::token::TokenRefusal) -> IsAuthorizedWithTokenError {
+fn refused(
+    policy_store_id: &str,
+    refusal: crate::state::token::TokenRefusal,
+) -> IsAuthorizedWithTokenError {
     match refusal {
         crate::state::token::TokenRefusal::NotVerified { kind, reason } => {
             IsAuthorizedWithTokenErrorModeled::ValidationException(ValidationException {
@@ -437,10 +439,7 @@ fn refused(refusal: crate::state::token::TokenRefusal) -> IsAuthorizedWithTokenE
         }
         crate::state::token::TokenRefusal::NoIdentitySource(issuer) => {
             IsAuthorizedWithTokenErrorModeled::ResourceNotFoundException(
-                crate::ops::resource_not_found_naming_the_resource(
-                    &issuer,
-                    crate::state::RESOURCE_TYPE_IDENTITY_SOURCE,
-                ),
+                crate::ops::identity_source_not_found_for_issuer(&issuer, policy_store_id),
             )
             .into()
         }

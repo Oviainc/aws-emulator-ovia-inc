@@ -209,6 +209,28 @@ pub fn resource_not_found_naming_the_resource(
     }
 }
 
+/// The modelled `ResourceNotFoundException` a TOKEN-based authorization call
+/// answers when the token's issuer is no identity source of the policy store the
+/// request addressed.
+///
+/// Such a reference is a PAIR — an issuer, within one policy store — so the
+/// message names both ([`crate::state::identity_source_not_found_for_issuer`])
+/// rather than reporting the issuer as an identity source id that was not found.
+/// The exception's required members still carry the identity of what was missing:
+/// `resourceId` is the issuer, which is how the request referenced the identity
+/// source, and `resourceType` is `IDENTITY_SOURCE`, the kind of resource the
+/// store does not hold.
+pub fn identity_source_not_found_for_issuer(
+    issuer: &str,
+    policy_store_id: &str,
+) -> self::types::ResourceNotFoundException {
+    self::types::ResourceNotFoundException {
+        message: crate::state::identity_source_not_found_for_issuer(issuer, policy_store_id),
+        resource_id: issuer.to_string(),
+        resource_type: crate::state::RESOURCE_TYPE_IDENTITY_SOURCE.to_string(),
+    }
+}
+
 /// The modelled `ResourceNotFoundException` a CONTROL-PLANE call answers for a
 /// reference that names no live resource: the constant
 /// [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`], with the

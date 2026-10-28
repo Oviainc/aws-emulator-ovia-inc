@@ -161,6 +161,23 @@ pub fn resource_not_found_naming(resource_type: &str, resource_id: &str) -> Stri
     )
 }
 
+/// The message an authorization call's `ResourceNotFoundException` carries when
+/// the token it was given claims an ISSUER that no identity source of the
+/// addressed policy store is configured for.
+///
+/// This refusal is about a pair, not about one resource: an identity source is
+/// looked up by the issuer a token claims WITHIN one policy store, so the same
+/// issuer is unknown in one store and known in the next. The sentence therefore
+/// names both halves of the reference — the issuer the token claimed and the
+/// policy store that was searched — which is what distinguishes it from a request
+/// that named an identity source by an id the store does not hold
+/// ([`resource_not_found_naming`]). Both are the caller's own values echoed back:
+/// the `iss` claim of the submitted token and the `policyStoreId` the request
+/// addressed; nothing this call generated enters the text.
+pub fn identity_source_not_found_for_issuer(issuer: &str, policy_store_id: &str) -> String {
+    format!("Identity Source does not exist for issuer {issuer} in policy store {policy_store_id}")
+}
+
 /// A `ResourceType` value as the words it names, for a sentence that reports it:
 /// `POLICY_STORE` is a policy store. The enum's own spelling is
 /// SCREAMING_SNAKE_CASE, so the words are its value lowercased with the

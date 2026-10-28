@@ -228,14 +228,14 @@ async fn reauthenticate(
 }
 
 /// Create an identity source for `pool` in `store`, accepting `client_ids` and mapping
-/// groups to `group_entity_type` when one is given.
+/// groups to `group_entity_type` when one is given, and return its `identitySourceId`.
 async fn identity_source(
     router: &MultiServiceRouter,
     store: &str,
     pool: &str,
     client_ids: &[&str],
     group_entity_type: Option<&str>,
-) {
+) -> String {
     let mut cognito = json!({
         "userPoolArn": harness::user_pool_arn(harness::SIGNING_REGION, pool),
         "clientIds": client_ids,
@@ -252,7 +252,26 @@ async fn identity_source(
             "configuration": { "cognitoUserPoolConfiguration": cognito },
         }),
     )
-    .await;
+    .await["identitySourceId"]
+        .as_str()
+        .expect("a minted identitySourceId")
+        .to_string()
+}
+
+/// The issuer a user pool's tokens claim, in the form the model documents for
+/// `CognitoUserPoolConfigurationDetail$issuer`:
+/// `https://cognito-idp.<region>.amazonaws.com/<user pool id>`.
+fn pool_issuer(pool: &str) -> String {
+    format!(
+        "https://cognito-idp.{}.amazonaws.com/{pool}",
+        harness::SIGNING_REGION
+    )
+}
+
+/// The refusal a token-based authorization call answers when the policy store it addressed
+/// has no identity source for the issuer the token claims.
+fn no_identity_source_message(issuer: &str, store: &str) -> String {
+    format!("Identity Source does not exist for issuer {issuer} in policy store {store}")
 }
 
 /// Store a static policy and return its `policyId`.
@@ -437,10 +456,7 @@ async fn a_decision_follows_the_claims_of_a_token_the_issuer_signed() {
             request(&store, json!({ "identityToken": foreign.id_token })),
             Expected::NotFound {
                 resource_type: "IDENTITY_SOURCE",
-                resource_id: format!(
-                    "https://cognito-idp.{}.amazonaws.com/{foreign_pool}",
-                    harness::SIGNING_REGION
-                ),
+                resource_id: pool_issuer(&foreign_pool),
             },
         ),
         (
@@ -650,9 +666,9 @@ async fn a_decision_follows_the_claims_of_a_token_the_issuer_signed() {
                 );
                 assert_eq!(
                     fault_message(&answered),
-                    format!("Identity source with id '{resource_id}' not found"),
-                    "case {case:?}: an authorization call's not-found names the kind of \
-                     resource and the id the request referenced it by"
+                    no_identity_source_message(&resource_id, &store),
+                    "case {case:?}: a token whose issuer the addressed policy store has no \
+                     identity source for is refused naming that issuer and that store"
                 );
             }
         }
@@ -867,4 +883,193 @@ async fn a_policy_over_a_claim_reads_it_from_the_principals_attributes() {
              nothing errors: {answered}"
         );
     }
+}
+
+/// A token's issuer is matched against the identity sources of the policy store the request
+/// ADDRESSED, so a store holding no source for that issuer refuses the call as a missing
+/// identity source and names BOTH halves of that reference: the issuer the token claims and
+/// the store that was searched. The store itself stays usable — a token from an issuer it
+/// does cover decides as it did before the refusal and as it does after.
+#[tokio::test]
+async fn an_issuer_with_no_identity_source_is_refused_naming_the_issuer_and_the_store() {
+    let (router, _engine) = harness::router_with_user_pools();
+
+    // One pool a store's identity source names, and two pools no store references — so a
+    // row below differs from the covered call in the `iss` claim alone.
+    let home_pool = user_pool(&router, "home-pool").await;
+    let home_client = app_client(&router, &home_pool, "home-client").await;
+    let home = sign_in(
+        &router,
+        &home_pool,
+        &home_client,
+        "member",
+        &[PERMITTED_GROUP],
+        &json!([]),
+    )
+    .await;
+    let second_pool = user_pool(&router, "second-pool").await;
+    let second_client = app_client(&router, &second_pool, "second-client").await;
+    let second = sign_in(
+        &router,
+        &second_pool,
+        &second_client,
+        "member",
+        &[PERMITTED_GROUP],
+        &json!([]),
+    )
+    .await;
+    let third_pool = user_pool(&router, "third-pool").await;
+    let third_client = app_client(&router, &third_pool, "third-client").await;
+    let third = sign_in(
+        &router,
+        &third_pool,
+        &third_client,
+        "member",
+        &[PERMITTED_GROUP],
+        &json!([]),
+    )
+    .await;
+
+    // Three stores, each with its own minted id: one covering the home pool, one holding
+    // no identity source at all, and one whose source for the home pool was deleted.
+    let covered = harness::store_with_validation_off(&router).await;
+    identity_source(
+        &router,
+        &covered,
+        &home_pool,
+        &[&home_client],
+        Some(GROUP_TYPE),
+    )
+    .await;
+    let permit = policy(&router, &covered, group_permit(GROUP_TYPE, &home_pool)).await;
+    let sourceless = harness::store_with_validation_off(&router).await;
+    let emptied = harness::store_with_validation_off(&router).await;
+    let deleted_source = identity_source(
+        &router,
+        &emptied,
+        &home_pool,
+        &[&home_client],
+        Some(GROUP_TYPE),
+    )
+    .await;
+    harness::ok(
+        &router,
+        "DeleteIdentitySource",
+        &json!({ "policyStoreId": emptied, "identitySourceId": deleted_source }),
+    )
+    .await;
+
+    let covered_decision = |token: String| {
+        let router = &router;
+        let store = covered.clone();
+        async move {
+            harness::ok(
+                router,
+                "IsAuthorizedWithToken",
+                &request(&store, json!({ "identityToken": token })),
+            )
+            .await
+        }
+    };
+
+    // The control, before any refusal: the store decides for the issuer it does hold.
+    let before = covered_decision(home.id_token.clone()).await;
+    assert_eq!(
+        (
+            before["decision"].as_str(),
+            before["determiningPolicies"][0]["policyId"].as_str()
+        ),
+        (Some("ALLOW"), Some(permit.as_str())),
+        "case the covered issuer before the refusals: expected ALLOW on {permit}, got {before}"
+    );
+
+    // The rows differ along what the rule generalises over: which member carried the token,
+    // which issuer minted it, and WHY the addressed store holds no source for that issuer —
+    // it covers another pool, it holds no source at all, or the source it held was deleted.
+    let rows: Vec<(&str, &String, Value, String)> = vec![
+        (
+            "an identity token from a pool the store does not cover",
+            &covered,
+            json!({ "identityToken": second.id_token }),
+            pool_issuer(&second_pool),
+        ),
+        (
+            "the same identity's access token from that pool",
+            &covered,
+            json!({ "accessToken": second.access_token }),
+            pool_issuer(&second_pool),
+        ),
+        (
+            "both tokens from that pool",
+            &covered,
+            json!({
+                "accessToken": second.access_token,
+                "identityToken": second.id_token,
+            }),
+            pool_issuer(&second_pool),
+        ),
+        (
+            "an identity token from a third pool, naming a different issuer",
+            &covered,
+            json!({ "identityToken": third.id_token }),
+            pool_issuer(&third_pool),
+        ),
+        (
+            "the covered pool's own token against a store holding no identity source",
+            &sourceless,
+            json!({ "identityToken": home.id_token }),
+            pool_issuer(&home_pool),
+        ),
+        (
+            "an access token against a store holding no identity source",
+            &sourceless,
+            json!({ "accessToken": third.access_token }),
+            pool_issuer(&third_pool),
+        ),
+        (
+            "a token whose issuer's identity source was deleted from the store",
+            &emptied,
+            json!({ "identityToken": home.id_token }),
+            pool_issuer(&home_pool),
+        ),
+    ];
+
+    for (case, store, tokens, issuer) in rows {
+        let (status, answered) =
+            harness::call(&router, "IsAuthorizedWithToken", &request(store, tokens)).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected a 404 ResourceNotFoundException, got {status} with \
+             {answered}"
+        );
+        let message = fault_message(&answered);
+        assert_eq!(
+            message,
+            no_identity_source_message(&issuer, store),
+            "case {case:?}: expected the issuer and the addressed store to be named, got \
+             {message:?}"
+        );
+        assert_eq!(
+            (
+                answered["resourceType"].as_str(),
+                answered["resourceId"].as_str()
+            ),
+            (Some("IDENTITY_SOURCE"), Some(issuer.as_str())),
+            "case {case:?}: expected the missing identity source to be reported as the \
+             issuer, got {answered}"
+        );
+    }
+
+    // The control again: a refusal decided nothing and consumed nothing, so the store still
+    // decides for the issuer it holds a source for.
+    let after = covered_decision(home.id_token.clone()).await;
+    assert_eq!(
+        (
+            after["decision"].as_str(),
+            after["determiningPolicies"][0]["policyId"].as_str()
+        ),
+        (Some("ALLOW"), Some(permit.as_str())),
+        "case the covered issuer after the refusals: expected ALLOW on {permit}, got {after}"
+    );
 }
