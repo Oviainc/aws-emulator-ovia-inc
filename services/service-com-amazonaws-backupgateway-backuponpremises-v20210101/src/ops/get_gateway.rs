@@ -152,16 +152,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the store — the same answer for both, which is what the real service
         // gives.
         let Some(gateway) = state.gateway(&input.gateway_arn) else {
-            return Err(GetGatewayErrorModeled::ResourceNotFoundException(
+            // The refusal is not composed here: the status, the `ErrorCode` and the
+            // sentence are all read off `crate::state::MissingResource`, the one place
+            // this service chooses how it refuses an ARN it holds no record under, so
+            // this operation and the tagging operations cannot word the same condition
+            // two different ways. This operation resolves exactly one resource type, so
+            // the resource that is missing is the gateway it was asked for, whatever the
+            // ARN's resource type reads.
+            let missing = crate::state::MissingResource::Other;
+            let error = GetGatewayErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    error_code: None,
-                    message: Some(format!(
-                        "The gateway '{}' was not found.",
-                        input.gateway_arn
-                    )),
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.gateway_arn)),
                 },
-            )
-            .into());
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
         };
 
         Ok(GetGatewayOutput {

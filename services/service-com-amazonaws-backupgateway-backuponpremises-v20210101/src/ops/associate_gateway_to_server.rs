@@ -182,14 +182,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .associate_gateway_to_server(&input.gateway_arn, &input.server_arn)
             .map_err(|refusal| match refusal {
                 crate::state::AssociationRefusal::NoSuchGateway => {
+                    // This operation declares no `ResourceNotFoundException`, so the
+                    // condition is carried by the modelled `ValidationException` whose
+                    // `ErrorCode` names which end of the link is missing — but the
+                    // SENTENCE is the one this service states for an ARN it holds no
+                    // record under, so the same condition reads the same way whichever
+                    // shape carries it.
                     AssociateGatewayToServerErrorModeled::ValidationException(
                         ValidationException {
                             error_code: Some(crate::state::GATEWAY_NOT_FOUND.to_string()),
-                            message: Some(crate::state::GATEWAY_NOT_FOUND_MESSAGE.to_string()),
+                            message: Some(crate::state::resource_not_found_message(
+                                &input.gateway_arn,
+                            )),
                         },
                     )
                 }
                 crate::state::AssociationRefusal::NoSuchServer => {
+                    // The hypervisor is the one resource type this service is recorded
+                    // refusing in its own words, so that sentence stays the recorded one
+                    // (`crate::state::MissingResource::Hypervisor`).
                     AssociateGatewayToServerErrorModeled::ValidationException(
                         ValidationException {
                             error_code: Some(crate::state::HYPERVISOR_NOT_FOUND.to_string()),

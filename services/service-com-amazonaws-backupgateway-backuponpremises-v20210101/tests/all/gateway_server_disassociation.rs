@@ -554,8 +554,9 @@ async fn a_disassociation_naming_nothing_to_clear_is_refused() {
         );
         assert_eq!(
             message_of(&refused),
-            format!("The gateway '{arn}' was not found."),
-            "case {case:?}: the refusal must name the gateway it did not find, got {:?}",
+            format!("The resource '{arn}' was not found."),
+            "case {case:?}: the refusal must state the one sentence this service words an \
+             ARN it holds no record under with, got {:?}",
             refused.body
         );
         assert!(

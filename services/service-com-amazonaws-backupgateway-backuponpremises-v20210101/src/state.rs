@@ -203,16 +203,16 @@ pub const HYPERVISOR_NOT_FOUND: &str = "HypervisorNotFound";
 pub const HYPERVISOR_NOT_FOUND_MESSAGE: &str = "The hypervisor is not found.";
 
 /// `ValidationException$ErrorCode` for a well-formed gateway ARN that names no gateway,
-/// on an operation whose model declares no `ResourceNotFoundException` to answer with,
-/// and the sentence that states it.
+/// on an operation whose model declares no `ResourceNotFoundException` to answer with.
 ///
 /// Phrased like [`HYPERVISOR_NOT_FOUND`], so the two resources this service resolves are
 /// named the same way; AWS publishes no vocabulary for the member, so the requirement is
 /// the error shape, its status and a code that names the missing resource.
+///
+/// The SENTENCE such a refusal states is NOT a second constant beside this one: a gateway
+/// ARN this service holds no record under is worded by [`resource_not_found_message`]
+/// whichever modelled shape carries it, so one condition reads as one sentence.
 pub const GATEWAY_NOT_FOUND: &str = "GatewayNotFound";
-
-/// See [`GATEWAY_NOT_FOUND`].
-pub const GATEWAY_NOT_FOUND_MESSAGE: &str = "The gateway is not found.";
 
 /// `ConflictException$ErrorCode` for associating a gateway that is already associated
 /// with a DIFFERENT server, and the sentence that states it.
@@ -2698,9 +2698,10 @@ pub enum DisassociationRefusal {
 /// Every such refusal is the modelled `ResourceNotFoundException`, but this service does
 /// not answer alike for all resource types: a missing HYPERVISOR is answered at HTTP 400
 /// with `ErrorCode` [`HYPERVISOR_NOT_FOUND`], where every other resource type takes the
-/// 404 that shape's `@httpError` declares and states no `ErrorCode`. Both halves of a
-/// refusal — the status and the code — are read off this one value, so they cannot be
-/// chosen apart.
+/// 404 that shape's `@httpError` declares and states no `ErrorCode`. All three parts of a
+/// refusal — the status, the code and the sentence ([`Self::message`]) — are read off this
+/// one value, so they cannot be chosen apart, and no handler composes a sentence of its
+/// own for an ARN it could not resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingResource {
     /// A `hypervisor/<id>` ARN with no hypervisor behind it.
@@ -2718,6 +2719,12 @@ pub enum MissingResource {
     PropertyMappings,
     /// Every other resource type, including a `gateway/<id>` ARN with no gateway
     /// behind it.
+    ///
+    /// Named directly by an operation that resolves exactly ONE resource type other than
+    /// the hypervisor — a gateway operation, or the virtual-machine read — because the
+    /// resource that is missing is then the one that operation resolves, whatever type the
+    /// ARN happens to spell; [`Self::for_arn`] reaches it for the tagging operations,
+    /// which take any of this service's resources in one member.
     Other,
 }
 
@@ -2764,8 +2771,11 @@ impl MissingResource {
     }
 }
 
-/// The sentence `ResourceNotFoundException` states for an ARN this service holds no
-/// record for. One wording for every operation that resolves an ARN.
+/// The sentence this service states for an ARN it holds no record for. One wording for
+/// every operation that resolves an ARN, reached through [`MissingResource::message`] by
+/// the operations whose model carries `ResourceNotFoundException` and directly by the one
+/// that has to state the same condition inside another modelled shape
+/// ([`GATEWAY_NOT_FOUND`]).
 pub fn resource_not_found_message(arn: &str) -> String {
     format!("The resource '{arn}' was not found.")
 }

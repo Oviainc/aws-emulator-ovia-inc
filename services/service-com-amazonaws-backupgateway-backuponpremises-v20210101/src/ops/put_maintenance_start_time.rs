@@ -225,22 +225,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A gateway that was never created, and one already deleted, are both simply
         // absent from the store — the same refusal for both, and nothing is written for
         // either. The member asked for is a `GatewayArn`, so the resource that is missing
-        // is the GATEWAY whatever the ARN's resource type reads: the refusal is the one
-        // every other gateway operation of this service gives — the 404 the shape's
-        // `@httpError` declares, and no `ErrorCode`.
+        // is the GATEWAY whatever the ARN's resource type reads, and the refusal itself —
+        // its status, its `ErrorCode` and its sentence — is read off
+        // `crate::state::MissingResource`, the one place this service chooses how it
+        // refuses an ARN it holds no record under, rather than composed here.
         let Some(updated) = store.set_maintenance_start_time(&input.gateway_arn, window) else {
-            return Err(
-                PutMaintenanceStartTimeErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        error_code: None,
-                        message: Some(format!(
-                            "The gateway '{}' was not found.",
-                            input.gateway_arn
-                        )),
-                    },
-                )
-                .into(),
+            let missing = crate::state::MissingResource::Other;
+            let error = PutMaintenanceStartTimeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.gateway_arn)),
+                },
             );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
         };
 
         // The ARN comes back off the record the store now holds, not off the request.

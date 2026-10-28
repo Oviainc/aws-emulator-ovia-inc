@@ -55,6 +55,8 @@ mod metadata_sync_is_not_gated_on_property_mappings;
 mod metadata_sync_over_the_wire;
 #[path = "all/metadata_sync_restart_supersedes_the_pending_sync.rs"]
 mod metadata_sync_restart_supersedes_the_pending_sync;
+#[path = "all/missing_resource_refusal_is_one_answer.rs"]
+mod missing_resource_refusal_is_one_answer;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
 #[path = "all/page_token_provenance.rs"]

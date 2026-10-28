@@ -189,22 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // STORE, which is what this lookup asks. A gateway that was never created and one
         // already deleted are both simply absent, and the member asked for is a
         // `GatewayArn`, so the resource that is missing is the GATEWAY whatever the ARN's
-        // resource type reads — refused the way every other gateway operation of this
-        // service refuses it: the 404 `ResourceNotFoundException`'s `@httpError` declares,
-        // and no `ErrorCode`.
+        // resource type reads — refused the way every other operation of this service
+        // refuses an ARN it holds no record under, its status, its `ErrorCode` and its
+        // sentence all read off `crate::state::MissingResource` rather than composed here.
         if store.gateway(&input.gateway_arn).is_none() {
-            return Err(
-                TestHypervisorConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        error_code: None,
-                        message: Some(format!(
-                            "The gateway '{}' was not found.",
-                            input.gateway_arn
-                        )),
-                    },
-                )
-                .into(),
+            let missing = crate::state::MissingResource::Other;
+            let error = TestHypervisorConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.gateway_arn)),
+                },
             );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
         }
 
         // The hypervisor this test is to reach is named by its HOST and not by an ARN, so

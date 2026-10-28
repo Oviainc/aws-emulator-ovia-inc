@@ -172,27 +172,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One guard spans resolving the record and clearing the link, so two concurrent
         // disassociations of one gateway cannot both pass the associated check.
         let mut store = state.lock();
-        let disassociated = store
-            .disassociate_gateway_from_server(&input.gateway_arn)
-            .map_err(|refusal| match refusal {
-                // A gateway that was never created, or one already deleted, is simply
-                // absent from the store — the `ResourceNotFoundException` this operation
-                // models, worded the way every other gateway operation of this service
-                // words it.
-                crate::state::DisassociationRefusal::NoSuchGateway => {
-                    DisassociateGatewayFromServerErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            error_code: None,
-                            message: Some(format!(
-                                "The gateway '{}' was not found.",
-                                input.gateway_arn
-                            )),
-                        },
-                    )
-                }
-                // Nothing to disassociate: the server this operation names is the one the
-                // gateway's stored link points at, and there is none.
-                crate::state::DisassociationRefusal::NotAssociated => {
+        let disassociated = match store.disassociate_gateway_from_server(&input.gateway_arn) {
+            Ok(disassociated) => disassociated,
+            // A gateway that was never created, or one already deleted, is simply absent
+            // from the store — the `ResourceNotFoundException` this operation models,
+            // refused the way every other operation of this service refuses an ARN it
+            // holds no record under: the status, the `ErrorCode` and the sentence are all
+            // read off `crate::state::MissingResource`, the one place this service chooses
+            // that refusal, rather than composed here.
+            Err(crate::state::DisassociationRefusal::NoSuchGateway) => {
+                let missing = crate::state::MissingResource::Other;
+                let error = DisassociateGatewayFromServerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        error_code: missing.error_code().map(str::to_string),
+                        message: Some(missing.message(&input.gateway_arn)),
+                    },
+                );
+                return Err(match missing.status_override() {
+                    Some(status) => {
+                        crate::scaffolded::Scaffolded::modeled_with_status(error, status)
+                    }
+                    None => error.into(),
+                });
+            }
+            // Nothing to disassociate: the server this operation names is the one the
+            // gateway's stored link points at, and there is none.
+            Err(crate::state::DisassociationRefusal::NotAssociated) => {
+                return Err(
                     DisassociateGatewayFromServerErrorModeled::ConflictException(
                         ConflictException {
                             error_code: crate::state::GATEWAY_NOT_ASSOCIATED.to_string(),
@@ -201,8 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ),
                         },
                     )
-                }
-            })?;
+                    .into(),
+                );
+            }
+        };
 
         // The ARN comes back OUT of the store after the write, so the response describes
         // the record this service now holds rather than the string the request spelled.

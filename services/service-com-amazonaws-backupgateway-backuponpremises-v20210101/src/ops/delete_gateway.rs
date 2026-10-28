@@ -152,16 +152,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // @idempotent describes the effect of repeating the call, not a success for a
         // resource that is not there.
         let Some(removed) = state.lock().remove_gateway(&input.gateway_arn) else {
-            return Err(DeleteGatewayErrorModeled::ResourceNotFoundException(
+            // The status, the `ErrorCode` and the sentence come from
+            // `crate::state::MissingResource`, the one place this service chooses how it
+            // refuses an ARN it holds no record under — not from this handler, so every
+            // operation that resolves such an ARN answers the condition alike.
+            let missing = crate::state::MissingResource::Other;
+            let error = DeleteGatewayErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    error_code: None,
-                    message: Some(format!(
-                        "The gateway '{}' was not found.",
-                        input.gateway_arn
-                    )),
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.gateway_arn)),
                 },
-            )
-            .into());
+            );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
         };
 
         Ok(DeleteGatewayOutput {

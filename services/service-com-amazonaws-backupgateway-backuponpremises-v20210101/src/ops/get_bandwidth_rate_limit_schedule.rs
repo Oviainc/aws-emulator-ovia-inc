@@ -172,18 +172,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleted, is simply absent — refused the way every other gateway operation of
         // this service refuses one.
         let Some(gateway) = state.gateway(&input.gateway_arn) else {
-            return Err(
-                GetBandwidthRateLimitScheduleErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        error_code: None,
-                        message: Some(format!(
-                            "The gateway '{}' was not found.",
-                            input.gateway_arn
-                        )),
-                    },
-                )
-                .into(),
+            // The status, the `ErrorCode` and the sentence come from
+            // `crate::state::MissingResource`, the one place this service chooses how it
+            // refuses an ARN it holds no record under — not from this handler, so every
+            // operation that resolves such an ARN answers the condition alike.
+            let missing = crate::state::MissingResource::Other;
+            let error = GetBandwidthRateLimitScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: missing.error_code().map(str::to_string),
+                    message: Some(missing.message(&input.gateway_arn)),
+                },
             );
+            return Err(match missing.status_override() {
+                Some(status) => crate::scaffolded::Scaffolded::modeled_with_status(error, status),
+                None => error.into(),
+            });
         };
 
         // Both members come off the record the store holds: the ARN is the store's own key
