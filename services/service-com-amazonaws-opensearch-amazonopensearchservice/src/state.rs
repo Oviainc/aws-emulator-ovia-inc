@@ -6236,20 +6236,30 @@ pub fn instance_type_limits(
         .collect()
 }
 
-/// Whether `ebs` sizes a volume the instance type publishes, and the refusal naming
-/// the member and the bound otherwise.
+/// Whether `ebs` sizes a volume the instance type publishes, and the refusal naming the
+/// bounds it publishes otherwise.
 ///
 /// A volume size is one the SERVICE publishes for that instance type and volume
-/// sub-type — [`MINIMUM_VOLUME_SIZE_GIB`] up to [`maximum_volume_size`], the same range
-/// the limit catalog reports — so a configuration outside it describes storage the
-/// service cannot provision and is refused rather than stored. Options with no volume
+/// sub-type — [`MINIMUM_VOLUME_SIZE_GIB`] up to [`maximum_volume_size`], the
+/// `MinimumVolumeSize`/`MaximumVolumeSize` pair `DescribeInstanceTypeLimits` reports
+/// for the pairing — so a size outside it asks for storage the service does not offer
+/// for that instance type at all. That is a STORAGE LIMIT of the instance type and not
+/// a malformed request, so the refusal is the modelled `LimitExceededException`, which
+/// the model classifies `client` with HTTP 409 — the class a caller branches on to tell
+/// a capacity condition from a bad request.
+///
+/// The sentence names the bounds, the instance type the volume would attach to and the
+/// engine release the domain runs, each taken from the request (or, on an update, from
+/// the merged record): the pairing the bounds are published FOR. Options with no volume
 /// (EBS not enabled) and options carrying no size at all size nothing, so there is
 /// nothing to check; without an instance type there is no instance to size the volume
-/// against, and only the floor every instance type publishes applies.
+/// against, and only the floor every instance type publishes applies, so the sentence
+/// names that bound alone.
 pub fn ebs_volume_size_refusal(
     ebs: Option<&EBSOptions>,
     instance_type: Option<&str>,
-) -> Option<ValidationException> {
+    engine_version: &str,
+) -> Option<LimitExceededException> {
     let ebs = ebs?;
     if !ebs.ebs_enabled.unwrap_or(false) {
         return None;
@@ -6263,14 +6273,21 @@ pub fn ebs_volume_size_refusal(
     if size >= MINIMUM_VOLUME_SIZE_GIB && maximum.is_none_or(|maximum| size <= maximum) {
         return None;
     }
-    let bound = match maximum {
-        Some(maximum) => format!("between {MINIMUM_VOLUME_SIZE_GIB} and {maximum}"),
-        None => format!("at least {MINIMUM_VOLUME_SIZE_GIB}"),
+    let message = match (instance_type, maximum) {
+        (Some(instance_type), Some(maximum)) => format!(
+            "Volume size must be between {MINIMUM_VOLUME_SIZE_GIB} and {maximum} for \
+             {instance_type} instance type and version {engine_version}"
+        ),
+        // A request naming no instance type pairs the volume with no instance, so the
+        // only bound published for it is the floor, and the sentence names no instance
+        // type it has no value for.
+        _ => format!(
+            "Volume size must be at least {MINIMUM_VOLUME_SIZE_GIB} for version \
+             {engine_version}"
+        ),
     };
-    Some(ValidationException {
-        message: Some(format!(
-            "EBSOptions.VolumeSize must be {bound} GiB for volume type {sub_type}: {size}"
-        )),
+    Some(LimitExceededException {
+        message: Some(message),
     })
 }
 

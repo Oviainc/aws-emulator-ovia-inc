@@ -25,6 +25,10 @@ use crate::ops::types::{
     TargetTrackingScalingPolicyConfiguration,
 };
 
+/// Executing a scaling policy whose CloudWatch alarm is in `ALARM`: the capacity it computes,
+/// the resource it moves and the activity it records.
+pub mod policy_execution;
+
 /// The natural AWS identity of a scalable target, and the prefix of a scaling policy's
 /// and a scheduled action's identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,6 +104,17 @@ pub struct ScalingPolicyRecord {
     pub predictive_config: Option<PredictiveScalingPolicyConfiguration>,
     pub alarms: Vec<Alarm>,
     pub creation_time: SystemTime,
+    /// The alarm transitions this policy has already been EXECUTED for: the instant, in epoch
+    /// seconds, each alarm last moved into `ALARM` for an execution this service performed,
+    /// by alarm name.
+    ///
+    /// One transition fires one execution, so this is what makes a breach idempotent: a later
+    /// pass performs an alarm's transition only when it is newer than the one recorded here
+    /// (see [`policy_execution`]).
+    pub executed_transitions: BTreeMap<String, f64>,
+    /// When this policy last moved the capacity of the resource it scales, which is the
+    /// instant its `Cooldown` is measured from.
+    pub last_executed: Option<SystemTime>,
 }
 
 /// One entry of the scaling-activity log: a capacity movement this service performed,
@@ -137,12 +152,15 @@ pub struct ScalingActivityRecord {
     /// what makes this a "not scaled activity", which a `Describe` hides unless the
     /// caller asks for it.
     ///
-    /// Only [`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::record_capacity_change`]
-    /// writes records today and a movement it records WAS scaled, so no stored activity
-    /// carries reasons yet: the writer that will is the one that evaluates a scaling
-    /// policy or fires a scheduled action and declines to move capacity
-    /// (`AlreadyAtMaxCapacity` and the other codes the model's `NotScaledReason$Code`
-    /// lists). Same for `details`.
+    /// Still empty on every stored activity: the only writer is
+    /// [`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::record_capacity_change`],
+    /// and a movement it records WAS scaled. A breach a policy declines to act on — the
+    /// capacity is already at the bound the adjustment asks past, so
+    /// [`policy_execution`] moves nothing — records no activity at all rather than one
+    /// carrying `AlreadyAtMaxCapacity` or another of the codes the model's
+    /// `NotScaledReason$Code` lists: this emulator has no recording of what AWS reports as
+    /// such an activity's `StatusCode` and `StatusMessage`, and would have to invent both.
+    /// Same for `details`.
     pub not_scaled_reasons: Vec<NotScaledReason>,
 }
 
@@ -181,6 +199,25 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// Entered and left by [`Self::begin_target_update`] / [`Self::end_target_update`];
     /// a span, never a stored status, so nothing has to be cleaned up by a later caller.
     pub updating: BTreeSet<TargetKey>,
+    /// Capacity movements this service has made that the service OWNING the scaled resource
+    /// has not been told about yet, as the capacity each target was last moved to.
+    ///
+    /// Application Auto Scaling moves a resource's capacity through the owning service, whose
+    /// store cannot be written under this service's lock, so a movement is queued here by the
+    /// call that made it and delivered with the lock released
+    /// ([`policy_execution::settle_policy_executions`]). One entry per target: the capacity a
+    /// target was last moved to is the capacity it holds, so a second movement of the same
+    /// target replaces the first rather than queueing behind it.
+    pub pending_capacity: BTreeMap<TargetKey, i32>,
+    /// Whether one in-process scaling clock is claimed for this store
+    /// ([`policy_execution::drive_scaling_clock`]), which is what keeps a second from
+    /// starting beside it.
+    pub scaling_clock_running: bool,
+    /// Which claim that is, so a clock that stands down releases only its own.
+    pub scaling_clock_generation: u64,
+    /// The running clock's task, kept so the claim can tell a clock that is still running
+    /// from one whose task has ended without releasing it.
+    pub scaling_clock: Option<::tokio::task::JoinHandle<()>>,
 }
 
 impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
@@ -200,6 +237,9 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
         let sequence = self.activities_recorded;
         self.activities_recorded += 1;
         let activity_id = scaling_activity_id(sequence, target);
+        // The resource the target scales is owed this capacity: queued here, because the
+        // owning service's store cannot be written under this service's lock.
+        self.pending_capacity.insert(target.clone(), capacity);
         self.activities.push(ScalingActivityRecord {
             activity_id: activity_id.clone(),
             sequence,
@@ -1074,6 +1114,16 @@ pub fn split_dynamodb_resource_id(resource_id: &str) -> Option<(&str, Option<&st
     }
 }
 
+/// The ECS cluster and service an `ecs` `ResourceId` names: "The resource type is `service`
+/// and the unique identifier is the cluster name and service name. Example:
+/// `service/my-cluster/my-service`" (the model's own `ResourceId` documentation).
+pub fn split_ecs_resource_id(resource_id: &str) -> Option<(&str, &str)> {
+    let rest = resource_id.strip_prefix("service/")?;
+    let (cluster, service) = rest.split_once('/')?;
+    (!cluster.is_empty() && !service.is_empty() && !service.contains('/'))
+        .then_some((cluster, service))
+}
+
 /// The provisioned capacity the DynamoDB store holds for what a `dynamodb` scalable target
 /// names, or the `ValidationException` message for a resource that cannot carry that target.
 ///
@@ -1785,12 +1835,12 @@ fn metric_dimensions(
             ],
             _ => Vec::new(),
         },
-        ("ecs", "service") => match segments.as_slice() {
-            ["service", cluster, service] => vec![
-                ("ClusterName".to_string(), (*cluster).to_string()),
-                ("ServiceName".to_string(), (*service).to_string()),
+        ("ecs", "service") => match split_ecs_resource_id(resource_id) {
+            Some((cluster, service)) => vec![
+                ("ClusterName".to_string(), cluster.to_string()),
+                ("ServiceName".to_string(), service.to_string()),
             ],
-            _ => Vec::new(),
+            None => Vec::new(),
         },
         ("cassandra", "table") => match segments.as_slice() {
             ["keyspace", keyspace, "table", table] => vec![
@@ -2457,6 +2507,19 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                         None if store.policies.len() >= MAX_SCALING_POLICIES => None,
                         None => Some((scaling_policy_arn(region, &policy_key), now)),
                     };
+                    // What the policy has already been executed for survives a re-write of
+                    // it too: this is the same policy, so a breach it has performed must not
+                    // be performed again.
+                    let (executed_transitions, last_executed) = store
+                        .policies
+                        .get(&policy_key)
+                        .map(|existing| {
+                            (
+                                existing.executed_transitions.clone(),
+                                existing.last_executed,
+                            )
+                        })
+                        .unwrap_or_default();
                     if let Some((policy_arn, creation_time)) = identity {
                         store.policies.insert(
                             policy_key,
@@ -2470,6 +2533,8 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                                 // them in CloudWatch.
                                 alarms: Vec::new(),
                                 creation_time,
+                                executed_transitions,
+                                last_executed,
                             },
                         );
                     }

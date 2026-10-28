@@ -1,0 +1,797 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! EXECUTING a scaling policy: what happens when the CloudWatch alarm a policy is wired to
+//! is in `ALARM`.
+//!
+//! A step scaling policy is not evaluated by this service's API at all — it is driven by an
+//! alarm, and the wiring is the alarm's own action list: "The actions to execute when this
+//! alarm transitions to the ALARM state from any other state. Each action is specified as an
+//! Amazon Resource Name (ARN)" (`PutMetricAlarmInput$AlarmActions`). So a policy fires when an
+//! alarm that names its `PolicyARN` among those actions moves into `ALARM`, whoever created
+//! that alarm.
+//!
+//! The policy type this module executes is `StepScaling`, the one whose CONFIGURATION states
+//! the adjustment to make: "A set of adjustments that enable you to scale based on the size of
+//! the alarm breach" (`StepScalingPolicyConfiguration$StepAdjustments`), interpreted by its
+//! `AdjustmentType`. A target-tracking policy states a target value for a metric instead, so
+//! what it would move the capacity to is the answer of a control loop over that metric rather
+//! than a number its document carries; this module computes no such answer and executes no such
+//! policy.
+//!
+//! What an execution does, in order:
+//!
+//! 1. pick the step adjustment the breach falls in — the interval is of the DIFFERENCE between
+//!    the metric and the alarm's threshold, and which end is inclusive follows the direction
+//!    of the breach ("If the metric value is above the breach threshold, the lower bound is
+//!    inclusive […] Otherwise, it's exclusive", and the mirror of that for the upper bound);
+//! 2. compute the capacity that adjustment asks for, as its `AdjustmentType` interprets it;
+//! 3. CLAMP that capacity into the `MinCapacity`/`MaxCapacity` the scalable target carries at
+//!    this instant — "Application Auto Scaling will not scale capacity to values that are
+//!    outside of the minimum and maximum range" — which is a re-read of the registered
+//!    window, not of the window that was in force when the policy was put. An adjustment that
+//!    overshoots a bound is still PERFORMED, at the bound;
+//! 4. set the capacity of the resource the target scales, in the service that owns it; and
+//! 5. record the movement as a scaling activity, which `DescribeScalingActivities` reports.
+//!
+//! The pass is owed by the CLOCK and not by any request: the alarm transitioned at an instant
+//! in the past, so the execution was due then, whether or not anybody called this service
+//! afterwards. That is what lets a reporting operation materialise it
+//! ([`settle_policy_executions`]) — and, because a client that breaches an alarm watches the
+//! SCALED RESOURCE rather than this service, what the one bounded in-process task
+//! ([`drive_scaling_clock`]) exists for: without it nothing would execute for a client that
+//! makes no further Application Auto Scaling call.
+//!
+//! One transition fires one execution: the instant the alarm last moved into `ALARM` is
+//! recorded on the policy, so no later pass performs the same breach twice. A breach the
+//! policy's `Cooldown` makes WAIT is the exception — the alarm is still breaching, so it is
+//! left unperformed rather than consumed, and the first pass after the wait performs it.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
+
+use super::{
+    service_state, ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState, PolicyKey,
+    TargetKey,
+};
+use crate::ops::types::StepScalingPolicyConfiguration;
+
+/// The policy type whose own configuration states the arithmetic of its adjustment, and so the
+/// one an alarm breach can be executed from on the policy document alone.
+pub const STEP_SCALING_POLICY_TYPE: &str = "StepScaling";
+
+/// `Cooldown`'s documented default: "The amount of time, in seconds, to wait for a previous
+/// scaling activity to take effect. If not specified, the default value is 300."
+pub const DEFAULT_COOLDOWN_SECS: i64 = 300;
+
+/// How many policy executions ONE pass performs.
+///
+/// The pass's OWN bound, not a limit AWS publishes: the number of stored policies and the
+/// number of alarms wired to them are each bounded by a store bound, but their product is
+/// what a pass walks, and every execution of it writes an activity and a resource. What the
+/// budget does not reach is not dropped — the transitions it leaves unrecorded are still
+/// newer than what the policy remembers, so the next pass performs them.
+const MAX_EXECUTIONS_PER_PASS: usize = 32;
+
+/// How many alarms ONE policy remembers a transition instant for.
+///
+/// A policy is the action of as many alarms as a client wires it to, and an alarm that is
+/// deleted leaves its entry behind, so the memory is bounded: past this many the OLDEST
+/// transition is forgotten, which at worst performs one extra execution for an alarm nothing
+/// has fired in that long.
+const MAX_REMEMBERED_ALARMS_PER_POLICY: usize = 32;
+
+/// How long one scaling-clock wake-up waits before looking for breaches again.
+///
+/// A breach is not an instant this store can compute: it happens in CloudWatch, whenever a
+/// datapoint or a forced state moves an alarm, so the clock re-reads rather than waiting for a
+/// due instant of its own. The wait is what keeps that a yield rather than a spin.
+const SCALING_CLOCK_WAIT: Duration = Duration::from_millis(250);
+
+/// How many times one scaling clock wakes up before it stands down.
+///
+/// A backstop, not a schedule: it bounds the work one request can start, and whatever the
+/// clock has not reached when it is spent is executed by the next clock (every call that
+/// settles starts one if none is running) or by the next call that settles.
+const MAX_SCALING_CLOCK_WAKE_UPS: usize = 2_400;
+
+/// One alarm breach that has not been executed yet: which alarm, when it moved into `ALARM`,
+/// and how far past its threshold the metric was.
+#[derive(Debug, Clone)]
+struct Breach {
+    /// The alarm whose transition fires the policy, as its `AlarmName`.
+    alarm_name: String,
+    /// The instant it moved into `ALARM`, in epoch seconds — the identity of the transition,
+    /// so the same one is executed once.
+    transitioned_secs: f64,
+    /// The difference between the metric and the alarm's `Threshold`, which is what a step
+    /// adjustment's interval is an interval OF.
+    difference: f64,
+    /// Whether the metric was above the threshold rather than below it, which is what decides
+    /// which end of a step's interval is inclusive.
+    above: bool,
+}
+
+/// One policy an alarm breach is to be executed on: the snapshot a pass takes under this
+/// service's lock, so the CloudWatch read below happens with it released.
+#[derive(Debug, Clone)]
+struct FiringPolicy {
+    key: PolicyKey,
+    policy_arn: String,
+    config: StepScalingPolicyConfiguration,
+    /// The transitions this policy has already been executed for, by alarm name.
+    executed: BTreeMap<String, f64>,
+}
+
+/// Perform every policy execution the clock has already made due.
+///
+/// Call it with NO store lock held: the pass reads this service's store, then CloudWatch's,
+/// then the store of the service that owns a scaled resource, each on its own, so no request
+/// holds two at once.
+pub fn settle_policy_executions<Eng: Send + Sync + 'static>(engine: &Eng, region: &str) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    // A capacity movement another call made and the owning service has not been told about
+    // yet goes first: it is older than anything this pass is about to perform.
+    deliver_pending_capacity(engine, region, &state);
+    // STEP 1, under this service's lock: which policies an alarm could be firing, and what
+    // each of them has already been executed for.
+    let candidates = { firing_candidates(&state.lock()) };
+    if candidates.is_empty() {
+        return;
+    }
+    // STEP 2, with every lock released but CloudWatch's: the breaches those policies' alarms
+    // are reporting right now.
+    let fired = unexecuted_breaches(engine, &candidates);
+    if fired.is_empty() {
+        return;
+    }
+    // STEP 3, in the service that OWNS each scaled resource: the capacity that resource holds
+    // right now, which is the capacity an adjustment is computed from — "Application Auto
+    // Scaling retrieves the current capacity of the resource".
+    let targets: BTreeSet<TargetKey> = fired
+        .iter()
+        .map(|(policy, _)| policy.key.target.clone())
+        .collect();
+    let resolved: BTreeMap<TargetKey, i32> = targets
+        .iter()
+        .filter_map(|target| {
+            resource_capacity(engine, region, target).map(|capacity| (target.clone(), capacity))
+        })
+        .collect();
+    // STEP 4, under this service's lock again: the arithmetic, the clamp into the window the
+    // target carries NOW, and the activity each movement is recorded as — which is also what
+    // queues the capacity the resource is owed.
+    {
+        let mut store = state.lock();
+        apply_breaches(&mut store, &fired, &resolved, SystemTime::now());
+    }
+    // STEP 5, with this service's lock released: the capacity each movement owes the resource
+    // it scales, written in the service that owns it.
+    deliver_pending_capacity(engine, region, &state);
+}
+
+/// Write every queued capacity movement into the service that owns the resource it moved.
+///
+/// Application Auto Scaling moves a resource's capacity through the owning service, and that
+/// write cannot happen under this service's lock, so a movement is QUEUED by the call that made
+/// it (`record_capacity_change`) and delivered here. Delivery is at-most-once: a taken movement
+/// is gone from the queue, and the capacity delivered for a target is the last one queued for
+/// it, which is the capacity that target holds.
+fn deliver_pending_capacity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    state: &::engine::ServiceState<ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState>,
+) {
+    let pending = {
+        let mut store = state.lock();
+        ::std::mem::take(&mut store.pending_capacity)
+    };
+    for (target, capacity) in pending {
+        set_resource_capacity(engine, region, &target, capacity);
+    }
+}
+
+/// Start the one in-process task that looks for alarm breaches this store's policies are wired
+/// to, executes the ones the clock has made due, and stands down once the store holds no
+/// policy an alarm could fire or the wake-up cap is reached.
+///
+/// A client drives an alarm into `ALARM` in CloudWatch and then watches the resource the
+/// policy scales — it makes no further Application Auto Scaling call — so an execution that
+/// only the next call to this service could perform would never happen at all. This is what
+/// makes the path observable without one. It does not change WHEN an execution happens: the
+/// task calls the same settle every handler calls, which performs what the stored alarm states
+/// have already made due.
+///
+/// At most one clock runs per store (the store carries the claim, which a clock whose task has
+/// ended without releasing it does not keep), and with no async runtime to spawn onto there is
+/// no clock — the breaches are then executed by the next operation instead.
+pub fn drive_scaling_clock<Eng: Send + Sync + 'static>(
+    engine: &::std::sync::Arc<Eng>,
+    region: &str,
+) {
+    let Some(state) = service_state(&**engine) else {
+        return;
+    };
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(generation) = claim_scaling_clock(&mut state.lock()) else {
+        return;
+    };
+    let engine = ::std::sync::Arc::clone(engine);
+    let region = region.to_string();
+    let claimed = ::engine::ServiceState::clone(&state);
+    let handle = runtime.spawn(async move {
+        // `true` only if the wake-up cap is what ended the loop; a clock that ran out of work
+        // has already released its claim inside the one critical section that observed it.
+        let mut capped = true;
+        for _ in 0..MAX_SCALING_CLOCK_WAKE_UPS {
+            if !still_wanted_or_release(&mut state.lock(), generation) {
+                capped = false;
+                break;
+            }
+            // Every wake-up waits, which hands the runtime back between passes.
+            ::tokio::time::sleep(SCALING_CLOCK_WAIT).await;
+            settle_policy_executions(&*engine, &region);
+        }
+        if capped {
+            // Only THIS clock's claim, so a clock started since is left holding its own.
+            release_scaling_clock(&mut state.lock(), generation);
+        }
+    });
+    set_scaling_clock(&mut claimed.lock(), generation, handle);
+}
+
+/// Claim the single scaling clock for this store: the claim's GENERATION when the caller may
+/// start one, `None` when one is really running.
+///
+/// The claim is taken over from a clock whose TASK HAS ALREADY ENDED while still holding it: a
+/// clock releases its claim itself on the two ends it can see coming — nothing left to watch,
+/// and the wake-up cap — so a claim still held by a task that is over belongs to a clock that
+/// ended on neither. Without the take-over no later call could ever start one again, and every
+/// breach would wait for a caller to execute it.
+fn claim_scaling_clock(
+    store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+) -> Option<u64> {
+    let ended = store
+        .scaling_clock
+        .as_ref()
+        .is_some_and(::tokio::task::JoinHandle::is_finished);
+    if store.scaling_clock_running && !ended {
+        return None;
+    }
+    if ended {
+        ::tracing::warn!(
+            "the scaling clock this store holds the claim for has ended without releasing it; \
+             the claim is taken over so the breaches it owes are still executed"
+        );
+    }
+    store.scaling_clock_running = true;
+    store.scaling_clock_generation = store.scaling_clock_generation.wrapping_add(1);
+    Some(store.scaling_clock_generation)
+}
+
+/// Release the claim `generation` took — and ONLY that one, so a clock that ended on the
+/// wake-up cap cannot clear a claim a clock started since is holding.
+fn release_scaling_clock(
+    store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    generation: u64,
+) {
+    if store.scaling_clock_generation == generation {
+        store.scaling_clock_running = false;
+    }
+}
+
+/// Keep the running clock's task handle, aborting the one it replaces — and only while
+/// `generation` is still the CURRENT claim, so a starter whose own task has already stood down
+/// installs nothing and aborts nothing.
+fn set_scaling_clock(
+    store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    generation: u64,
+    handle: ::tokio::task::JoinHandle<()>,
+) {
+    if store.scaling_clock_generation != generation {
+        handle.abort();
+        return;
+    }
+    if let Some(previous) = store.scaling_clock.replace(handle) {
+        previous.abort();
+    }
+}
+
+/// Whether this store still holds a policy an alarm could fire — and, when it does not,
+/// RELEASES the clock's claim.
+///
+/// Observing "nothing is wanted" and standing down happen in ONE critical section, which is
+/// what makes the hand-over race-free: a write holds this same lock to store the policy BEFORE
+/// it tries to claim the clock, so either this call sees that policy and the running clock
+/// keeps it, or the write's claim finds the flag cleared and starts a clock of its own.
+fn still_wanted_or_release(
+    store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    generation: u64,
+) -> bool {
+    let wanted = store
+        .policies
+        .values()
+        .any(|record| record.policy_type == STEP_SCALING_POLICY_TYPE);
+    if !wanted {
+        release_scaling_clock(store, generation);
+    }
+    wanted
+}
+
+/// Every policy of this store an alarm breach can be executed on, with what it has already
+/// been executed for.
+///
+/// A policy whose scalable target is gone is left out: the target is what carries the window a
+/// movement is clamped into and the capacity it moves, so there is nothing to execute against.
+fn firing_candidates(
+    store: &ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+) -> Vec<FiringPolicy> {
+    store
+        .policies
+        .iter()
+        .filter(|(_, record)| record.policy_type == STEP_SCALING_POLICY_TYPE)
+        .filter(|(key, _)| store.targets.contains_key(&key.target))
+        .filter_map(|(key, record)| {
+            Some(FiringPolicy {
+                key: key.clone(),
+                policy_arn: record.policy_arn.clone(),
+                config: record.step_config.clone()?,
+                executed: record.executed_transitions.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The breaches `candidates` have not been executed for yet, read from the CloudWatch alarm
+/// store.
+///
+/// An alarm fires a policy when it is IN `ALARM`, its actions are enabled ("Indicates whether
+/// actions should be executed during any changes to the alarm state",
+/// `MetricAlarm$ActionsEnabled`) and the policy's ARN is one of the actions that state
+/// executes. Only a METRIC alarm can fire one: a step adjustment's interval is an interval of
+/// the difference between the metric and the alarm's `Threshold`, and a composite alarm has
+/// neither.
+fn unexecuted_breaches<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    candidates: &[FiringPolicy],
+) -> Vec<(FiringPolicy, Breach)> {
+    use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
+
+    let Some(store) = cloudwatch::state::service_state(engine) else {
+        return Vec::new();
+    };
+    let wired: BTreeMap<&str, &FiringPolicy> = candidates
+        .iter()
+        .map(|policy| (policy.policy_arn.as_str(), policy))
+        .collect();
+    let store = store.lock();
+    let mut fired: Vec<(FiringPolicy, Breach)> = Vec::new();
+    for stored in store.alarms.values() {
+        let alarm = &stored.alarm;
+        if alarm.state_value.as_deref() != Some(cloudwatch::state::ALARM_STATE_ALARM) {
+            continue;
+        }
+        if alarm.actions_enabled == Some(false) {
+            continue;
+        }
+        let Some(alarm_name) = alarm.alarm_name.clone() else {
+            continue;
+        };
+        let transitioned_secs = alarm
+            .state_transitioned_timestamp
+            .as_ref()
+            .or(alarm.state_updated_timestamp.as_ref())
+            .map_or(0.0, ::aws_smithy_types::DateTime::as_secs_f64);
+        let Some((difference, above)) = breach_of(alarm) else {
+            continue;
+        };
+        for action in alarm.alarm_actions.iter().flatten() {
+            let Some(policy) = wired.get(action.as_str()) else {
+                continue;
+            };
+            // The transition this policy was last executed for; a newer one is a breach it
+            // owes, and the same one is a breach it has already performed.
+            if policy
+                .executed
+                .get(&alarm_name)
+                .is_some_and(|executed| *executed >= transitioned_secs)
+            {
+                continue;
+            }
+            fired.push((
+                (*policy).clone(),
+                Breach {
+                    alarm_name: alarm_name.clone(),
+                    transitioned_secs,
+                    difference,
+                    above,
+                },
+            ));
+        }
+    }
+    // A total order, so what the pass's budget reaches does not depend on how the alarm store
+    // happens to enumerate.
+    fired.sort_by(|(left_policy, left), (right_policy, right)| {
+        left_policy
+            .key
+            .cmp(&right_policy.key)
+            .then_with(|| left.alarm_name.cmp(&right.alarm_name))
+    });
+    fired.truncate(MAX_EXECUTIONS_PER_PASS);
+    fired
+}
+
+/// How far past its threshold the metric an alarm watches was, and whether it was ABOVE the
+/// threshold rather than below it.
+///
+/// The size of a breach is a measurement, so it is read from the alarm's own explanation of the
+/// state it is in — "An explanation for the alarm state, in JSON format"
+/// (`MetricAlarm$StateReasonData`), whose `recentDatapoints` are the values the evaluation
+/// graded, newest last. An alarm whose state was forced rather than evaluated reports no such
+/// datapoint: the breach is then the SMALLEST one in the direction the alarm breached, the
+/// threshold itself, which the alarm's `ComparisonOperator` names. An alarm with no static
+/// threshold at all (one that compares against an anomaly-detection band) has no difference to
+/// take, and so fires no step.
+fn breach_of(
+    alarm: &::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::ops::types::MetricAlarm,
+) -> Option<(f64, bool)> {
+    let threshold = alarm.threshold?;
+    let measured = alarm
+        .state_reason_data
+        .as_deref()
+        .and_then(|data| ::serde_json::from_str::<::serde_json::Value>(data).ok())
+        .and_then(|document| {
+            document
+                .get("recentDatapoints")?
+                .as_array()?
+                .last()?
+                .as_f64()
+        });
+    match measured {
+        // The metric itself: which side of the threshold it is on is what the measurement
+        // says, whichever comparison put the alarm in ALARM.
+        Some(value) => {
+            let difference = value - threshold;
+            Some((difference, difference >= 0.0))
+        }
+        None => Some((0.0, breaches_above(alarm.comparison_operator.as_deref()?)?)),
+    }
+}
+
+/// Whether a `ComparisonOperator` puts the alarm in `ALARM` for a metric ABOVE its threshold,
+/// or `None` for one that breaches on either side (a band), which names no direction.
+///
+/// The operators are the model's own `ComparisonOperator` values, read as the comparison each
+/// makes between the datapoint and the threshold.
+fn breaches_above(comparison_operator: &str) -> Option<bool> {
+    match comparison_operator {
+        "GreaterThanOrEqualToThreshold" | "GreaterThanThreshold" | "GreaterThanUpperThreshold" => {
+            Some(true)
+        }
+        "LessThanThreshold" | "LessThanOrEqualToThreshold" | "LessThanLowerThreshold" => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Perform each fired breach: the adjustment, the clamp and the activity, which is also what
+/// queues the capacity each movement owes the resource it scales.
+///
+/// Everything here is read UNDER this service's lock at the instant the execution happens, so
+/// the window a movement is clamped into is the one the target carries now.
+fn apply_breaches(
+    store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    fired: &[(FiringPolicy, Breach)],
+    resolved: &BTreeMap<TargetKey, i32>,
+    now: SystemTime,
+) {
+    for (policy, breach) in fired {
+        // The policy may have been deleted, and the target deregistered, since the snapshot.
+        let Some(record) = store.policies.get(&policy.key) else {
+            continue;
+        };
+        // What this policy has been executed for is read AGAIN under this lock: a pass that
+        // overlapped this one may have performed the same breach between the snapshot and
+        // here, and one transition is ONE execution.
+        if record
+            .executed_transitions
+            .get(&breach.alarm_name)
+            .is_some_and(|executed| *executed >= breach.transitioned_secs)
+        {
+            continue;
+        }
+        // "The amount of time, in seconds, to wait for a previous scaling activity to take
+        // effect": a breach inside that span of this policy's own last execution WAITS — the
+        // alarm is still breaching, so the breach is left unperformed rather than consumed,
+        // and the first pass after the wait is over performs it.
+        let cooldown = Duration::from_secs(
+            record
+                .step_config
+                .as_ref()
+                .and_then(|config| config.cooldown)
+                .map_or(DEFAULT_COOLDOWN_SECS, i64::from)
+                .max(0)
+                .unsigned_abs(),
+        );
+        let waiting = record
+            .last_executed
+            .and_then(|last| last.checked_add(cooldown))
+            .is_some_and(|due| now < due);
+        if waiting {
+            continue;
+        }
+        let Some(target) = store.targets.get(&policy.key.target) else {
+            continue;
+        };
+        // The window as a WINDOW, whichever order the two bounds are stored in: the capacity
+        // is placed "inside of this range", and a floor above the ceiling is no range at all,
+        // so it is read as the point the two meet at rather than asserted against. Nothing in
+        // this pass may depend on a stored invariant it did not establish itself.
+        let (min_capacity, max_capacity) = (
+            target.min_capacity.min(target.max_capacity),
+            target.max_capacity.max(target.min_capacity),
+        );
+        let current = resolved
+            .get(&policy.key.target)
+            .copied()
+            .unwrap_or(target.current_capacity);
+        let suspended = target.suspended_state.clone();
+        // This transition has now been evaluated, whether or not it moved anything, so no
+        // later pass performs it again.
+        remember_transition(store, &policy.key, &breach.alarm_name, breach.transitioned_secs);
+
+        let Some(wanted) = adjusted_capacity(&policy.config, breach, current) else {
+            continue;
+        };
+        let capacity = wanted.max(min_capacity).min(max_capacity);
+        if capacity == current {
+            // Nothing moved, so there is no capacity movement to record: the adjustment asked
+            // for the capacity the resource already holds, or for one past a bound it already
+            // sits at.
+            continue;
+        }
+        // "DynamicScalingInSuspended […] Whether scale in by a target tracking scaling policy
+        // or a step scaling policy is suspended" — and the same for scale out: a suspended
+        // direction performs no movement at all.
+        let scaling_out = capacity > current;
+        let direction_suspended = suspended.is_some_and(|suspended| {
+            if scaling_out {
+                suspended.dynamic_scaling_out_suspended == Some(true)
+            } else {
+                suspended.dynamic_scaling_in_suspended == Some(true)
+            }
+        });
+        if direction_suspended {
+            continue;
+        }
+        let cause = format!(
+            "monitor alarm {} in state ALARM triggered policy {}",
+            breach.alarm_name, policy.key.policy_name
+        );
+        store.record_capacity_change(&policy.key.target, capacity, cause, now);
+        if let Some(target) = store.targets.get_mut(&policy.key.target) {
+            target.current_capacity = capacity;
+        }
+        if let Some(record) = store.policies.get_mut(&policy.key) {
+            record.last_executed = Some(now);
+        }
+    }
+}
+
+/// Record on a policy that it has been executed for the transition of `alarm_name` at
+/// `transitioned_secs`, forgetting the oldest transition it remembers once the memory is full.
+fn remember_transition(
+    store: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
+    key: &PolicyKey,
+    alarm_name: &str,
+    transitioned_secs: f64,
+) {
+    let Some(record) = store.policies.get_mut(key) else {
+        return;
+    };
+    record
+        .executed_transitions
+        .insert(alarm_name.to_string(), transitioned_secs);
+    while record.executed_transitions.len() > MAX_REMEMBERED_ALARMS_PER_POLICY {
+        let Some(oldest) = record
+            .executed_transitions
+            .iter()
+            .min_by(|(left_name, left), (right_name, right)| {
+                left.total_cmp(right).then_with(|| left_name.cmp(right_name))
+            })
+            .map(|(name, _)| name.clone())
+        else {
+            break;
+        };
+        record.executed_transitions.remove(&oldest);
+    }
+}
+
+/// The capacity a step scaling policy's configuration asks for, from the capacity the resource
+/// holds now and the breach that fired it — before the registered window is applied to it.
+///
+/// `None` when the configuration names no adjustment for this breach: no step whose interval
+/// holds it, or no `AdjustmentType` to interpret the step by ("AdjustmentType is required if
+/// you are adding a new step scaling policy configuration").
+fn adjusted_capacity(
+    config: &StepScalingPolicyConfiguration,
+    breach: &Breach,
+    current: i32,
+) -> Option<i32> {
+    let adjustment_type = config.adjustment_type.as_deref()?;
+    let adjustment = applicable_adjustment(config, breach)?;
+    let capacity = match adjustment_type {
+        // "A positive value adds to the current capacity while a negative number removes from
+        // the current capacity."
+        "ChangeInCapacity" => i64::from(current) + i64::from(adjustment),
+        // "For exact capacity, you must specify a non-negative value" — the adjustment IS the
+        // capacity.
+        "ExactCapacity" => i64::from(adjustment),
+        "PercentChangeInCapacity" => {
+            i64::from(current) + percentage_magnitude(config, current, adjustment)
+        }
+        // Not one of the modelled `AdjustmentType` values, so it interprets no step.
+        _ => return None,
+    };
+    Some(capacity.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+}
+
+/// The `ScalingAdjustment` of the step whose interval the breach falls in.
+///
+/// A step's interval is of the DIFFERENCE between the metric and the alarm's threshold, and
+/// which end is inclusive follows the direction of the breach: above the threshold "the lower
+/// bound is inclusive (the metric must be greater than or equal to the threshold plus the lower
+/// bound)" and the upper bound is exclusive; below it the lower bound is exclusive and the
+/// upper bound inclusive. A null bound is unbounded in that direction, and so is one that is
+/// not a finite number — nothing can be compared against it.
+fn applicable_adjustment(
+    config: &StepScalingPolicyConfiguration,
+    breach: &Breach,
+) -> Option<i32> {
+    let finite = |bound: Option<f64>| bound.filter(|value| value.is_finite());
+    config
+        .step_adjustments
+        .iter()
+        .flatten()
+        .find(|step| {
+            let lower = finite(step.metric_interval_lower_bound).unwrap_or(f64::NEG_INFINITY);
+            let upper = finite(step.metric_interval_upper_bound).unwrap_or(f64::INFINITY);
+            if breach.above {
+                breach.difference >= lower && breach.difference < upper
+            } else {
+                breach.difference > lower && breach.difference <= upper
+            }
+        })
+        .map(|step| step.scaling_adjustment)
+}
+
+/// How much a `PercentChangeInCapacity` step moves the capacity by.
+///
+/// The percentage is OF the capacity the resource holds, so the number of units it comes to is
+/// a fraction: it is taken toward zero, and never to nothing — a non-zero percentage moves the
+/// capacity by at least one unit in the direction it names, or the policy would report a
+/// movement it never made. `MinAdjustmentMagnitude` raises that floor: "The minimum value to
+/// scale by when the adjustment type is PercentChangeInCapacity. For example, suppose that you
+/// create a step scaling policy to scale out an Amazon ECS service by 25 percent and you
+/// specify a MinAdjustmentMagnitude of 2. If the service has 4 tasks and the scaling policy is
+/// performed, 25 percent of 4 is 1. However, because you specified a MinAdjustmentMagnitude of
+/// 2, Application Auto Scaling scales out the service by 2 tasks."
+fn percentage_magnitude(
+    config: &StepScalingPolicyConfiguration,
+    current: i32,
+    adjustment: i32,
+) -> i64 {
+    if adjustment == 0 {
+        return 0;
+    }
+    let exact = f64::from(current) * f64::from(adjustment) / 100.0;
+    let floor = i64::from(config.min_adjustment_magnitude.unwrap_or(1).max(1));
+    let magnitude = (exact.abs().trunc() as i64).max(floor);
+    magnitude * i64::from(adjustment.signum())
+}
+
+/// The capacity the service that OWNS the scaled resource holds for the property a scalable
+/// dimension names, or `None` when this emulator cannot read it.
+///
+/// "Application Auto Scaling retrieves the current capacity of the resource": an adjustment is
+/// computed from the resource's OWN capacity, not from what this service last set. One arm per
+/// namespace whose resource store this emulator holds; for any other namespace there is
+/// nothing to read, and the capacity this service tracks for the target is what the adjustment
+/// is computed from instead.
+pub fn resource_capacity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    target: &TargetKey,
+) -> Option<i32> {
+    match target.service_namespace.as_str() {
+        "ecs" => ecs_desired_count(engine, &target.resource_id),
+        // Every other namespace this emulator can resolve a resource for reports its capacity
+        // through the same resolver a registration validates it with.
+        _ => super::resolve_target_resource(engine, region, target)
+            .ok()
+            .flatten()
+            .and_then(|capacity| i32::try_from(capacity).ok()),
+    }
+}
+
+/// Set the capacity of the resource a scalable target scales, in the service that owns it, and
+/// answer whether that service holds the resource at all.
+///
+/// Application Auto Scaling does not hold the capacity of anything: it moves the resource's own
+/// capacity through the owning service ("Application Auto Scaling scales […] the ECS service's
+/// desired count"), which is what a client reads back there. One arm per namespace whose
+/// resource store this emulator holds AND whose resources a policy of this kind can move; for
+/// any other namespace the movement is recorded as the scaling activity it is and the capacity
+/// this service tracks for the target is all there is to move.
+fn set_resource_capacity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    target: &TargetKey,
+    capacity: i32,
+) -> bool {
+    match target.service_namespace.as_str() {
+        "ecs" => set_ecs_desired_count(engine, region, &target.resource_id, capacity),
+        _ => false,
+    }
+}
+
+/// The `desiredCount` the ECS store holds for the service an `ecs` `ResourceId` names.
+fn ecs_desired_count<Eng: Send + Sync + 'static>(engine: &Eng, resource_id: &str) -> Option<i32> {
+    use ::service_com_amazonaws_ecs_amazonec2containerservicev20141113 as ecs;
+
+    let (cluster, service_name) = super::split_ecs_resource_id(resource_id)?;
+    let store = ecs::state::service_state(engine)?;
+    let store = store.lock();
+    let service = store
+        .services
+        .get(&(cluster.to_string(), service_name.to_string()))?;
+    service.is_active().then_some(service.desired_count)
+}
+
+/// Set the `desiredCount` of the ECS service an `ecs` `ResourceId` names, and put the ECS
+/// scheduler to work on the task count it now wants.
+///
+/// This is what `ecs:service:DesiredCount` scales: "The task count of an ECS service". The
+/// bookkeeping a count change owes is the ECS scheduler's own, so it is the ECS store's own
+/// helper that does it ([`ecs::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::scale_service_to`]),
+/// the one a client's `UpdateService` calls for a request that changes that count.
+///
+/// Where this differs from `UpdateService`, and why: that handler REFUSES the whole request and
+/// restores the service when the placement would push this emulator past its own task ceiling,
+/// because it has a caller to answer. An alarm breach has none — the capacity was already
+/// decided by the policy and recorded as a scaling activity — so the count stands and the
+/// ceiling bounds only what the scheduler places, which the service's own event stream records.
+fn set_ecs_desired_count<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    resource_id: &str,
+    capacity: i32,
+) -> bool {
+    use ::service_com_amazonaws_ecs_amazonec2containerservicev20141113 as ecs;
+
+    let Some((cluster, service_name)) = super::split_ecs_resource_id(resource_id) else {
+        return false;
+    };
+    let Some(store) = ecs::state::service_state(engine) else {
+        return false;
+    };
+    let mut guard = store.lock();
+    let key = (cluster.to_string(), service_name.to_string());
+    match guard.scale_service_to(&key, capacity, region, SystemTime::now()) {
+        Ok(moved) => moved,
+        Err(_) => {
+            ::tracing::warn!(
+                cluster = %cluster,
+                service = %service_name,
+                desired_count = capacity,
+                "the ECS service's desired count was set, but this emulator's task ceiling \
+                 left the scheduler nothing to place it with"
+            );
+            true
+        }
+    }
+}

@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_dimension_namespace, check_dimension_requires_resource_id, check_enum,
@@ -244,6 +244,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Specifies whether to include activities that aren't scaled (not scaled
         // activities) in the response" — so by default they are left out.
         let include_not_scaled = input.include_not_scaled_activities.unwrap_or(false);
+
+        // A scaling policy whose alarm is in ALARM was owed its execution from the instant
+        // that alarm transitioned, and the activity it records is one this log already held
+        // at that instant — so what the clock has made due is performed before the log is
+        // read, and the clock is left watching for the next breach.
+        let region = crate::state::request_region(ctx.parts());
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+        crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();

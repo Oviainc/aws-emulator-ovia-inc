@@ -102,5 +102,7 @@ mod validation_message_rendering;
 mod vcf_hostname_uniqueness;
 #[path = "all/versions_catalog.rs"]
 mod versions_catalog;
+#[path = "all/vlan_cidr_reading.rs"]
+mod vlan_cidr_reading;
 #[path = "all/vlan_subnet_propagation.rs"]
 mod vlan_subnet_propagation;

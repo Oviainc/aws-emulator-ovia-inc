@@ -147,10 +147,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // Opened before any work, so EVERY path below — the refusals included — leaves
+        // exactly one audit record for this attempt; a create names no definition of its
+        // own, so the record names the collection it creates into until the minted ARN
+        // replaces it.
+        let mut trail = crate::state::AuditedCall::attempt(
+            Self::NAME,
+            ctx.parts(),
+            &region,
+            &crate::state::definition_collection_arn(&region),
+        );
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
-            })
+            trail.refused(CreateSuiteDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            ))
         })?;
 
         let config = input.suite_definition_configuration;
@@ -160,15 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // each device under test — shared with every other operation that accepts a
         // configuration; see `crate::state::definition_configuration_violation`.
         if let Some(violation) = crate::state::definition_configuration_violation(&config) {
-            return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
-                ValidationException {
+            return Err(trail.refused(
+                CreateSuiteDefinitionErrorModeled::ValidationException(ValidationException {
                     message: Some(violation),
-                },
-            )
-            .into());
+                })
+                .into(),
+            ));
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
@@ -185,25 +198,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|token| store.create_definition_tokens.get(token).cloned());
         if let Some(accepted) = accepted {
             if accepted.fingerprint != fingerprint {
-                return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
-                    ValidationException {
+                return Err(trail.refused(
+                    CreateSuiteDefinitionErrorModeled::ValidationException(ValidationException {
                         message: Some(
                             "clientToken was already used to create a suite definition with \
                              different parameters"
                                 .to_string(),
                         ),
-                    },
-                )
-                .into());
+                    })
+                    .into(),
+                ));
             }
             if let Some(existing) = store.definitions.get(&accepted.suite_definition_id) {
-                crate::state::audit(
-                    Self::NAME,
-                    ctx.parts(),
-                    &region,
-                    &existing.arn,
-                    "idempotent-replay",
-                );
+                trail.acted_on(&existing.arn);
+                trail.ended("idempotent-replay");
                 return Ok(CreateSuiteDefinitionOutput {
                     suite_definition_id: Some(existing.id.clone()),
                     suite_definition_arn: Some(existing.arn.clone()),
@@ -216,15 +224,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store's occupancy bound: refuse a creation past it with the modelled
         // client-input error, rather than letting caller requests grow it without limit.
         if store.definitions.len() >= crate::state::MAX_SUITE_DEFINITIONS {
-            return Err(CreateSuiteDefinitionErrorModeled::ValidationException(
-                ValidationException {
+            return Err(trail.refused(
+                CreateSuiteDefinitionErrorModeled::ValidationException(ValidationException {
                     message: Some(format!(
                         "Cannot create more than {} suite definitions for this account",
                         crate::state::MAX_SUITE_DEFINITIONS
                     )),
-                },
-            )
-            .into());
+                })
+                .into(),
+            ));
         }
 
         let id = crate::state::new_uuid();
@@ -256,12 +264,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.definitions.insert(id.clone(), definition);
 
         // Every member is read back off the STORED record, never off the request.
-        let stored = store.definitions.get(&id).ok_or_else(|| {
-            CreateSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the created suite definition could not be read back".to_string()),
-            })
-        })?;
-        crate::state::audit(Self::NAME, ctx.parts(), &region, &stored.arn, "created");
+        let stored = store
+            .definitions
+            .get(&id)
+            .ok_or_else(|| {
+                trail.refused(CreateSuiteDefinitionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the created suite definition could not be read back".to_string(),
+                        ),
+                    },
+                ))
+            })?;
+        trail.acted_on(&stored.arn);
+        trail.ended("created");
         Ok(CreateSuiteDefinitionOutput {
             suite_definition_id: Some(stored.id.clone()),
             suite_definition_arn: Some(stored.arn.clone()),

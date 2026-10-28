@@ -789,7 +789,9 @@ pub fn version_ordinal(label: &str) -> Option<usize> {
 ///
 /// An ATTEMPTED mutation is recorded too, with the outcome that refused it (an update of
 /// an id the store does not hold, say): `resource` is then the ARN the request NAMED, not
-/// a claim that such a resource is stored.
+/// a claim that such a resource is stored. A handler reaches this through [`AuditedCall`]
+/// rather than calling it directly, because that is what makes the record happen on the
+/// paths that return early as well as on the one that completes.
 ///
 /// Request-derived values are written with `Debug`, so a newline inside one cannot forge a
 /// second record. Nothing secret is written: the presented ACCESS KEY ID identifies the
@@ -811,6 +813,98 @@ pub fn audit(
         outcome = %outcome,
         "state-changing iotdeviceadvisor request"
     );
+}
+
+/// The outcome a record carries for a call that returned without naming one.
+///
+/// Only a call that got as far as changing something has an outcome of its own to report,
+/// so a record left with this is a call that ended in a refusal whose error did not go
+/// through [`AuditedCall::refused`]: the attempt is still recorded rather than dropped.
+const UNREPORTED_OUTCOME: &str = "refused";
+
+/// The one audit record a mutating call owes [`audit`], written when the handler returns —
+/// WHICHEVER way it returns.
+///
+/// [`audit`] writes its record where it is called, so a handler that returns an error
+/// before reaching it leaves none and the ATTEMPTED mutation the rule above promises goes
+/// unrecorded. A handler opens this value with the resource the request NAMES before it
+/// does any work, says how the call ended ([`AuditedCall::ended`]) or what refused it
+/// ([`AuditedCall::refused`]), and the record is written when the value goes out of scope
+/// — so "exactly one record per mutating call" holds on every path out of the handler,
+/// the early returns and the ones `?` takes included.
+#[derive(Debug)]
+pub struct AuditedCall<'a> {
+    operation: &'static str,
+    parts: &'a ::http::request::Parts,
+    region: String,
+    resource: String,
+    outcome: String,
+}
+
+impl<'a> AuditedCall<'a> {
+    /// Open the record of an ATTEMPT to mutate `resource` through `operation`.
+    ///
+    /// `resource` is the ARN the request NAMED, which the store need not hold; a call that
+    /// mints its resource names the collection it creates into instead
+    /// ([`definition_collection_arn`]) until [`AuditedCall::acted_on`] replaces it with the
+    /// ARN the call resolved.
+    pub fn attempt(
+        operation: &'static str,
+        parts: &'a ::http::request::Parts,
+        region: &str,
+        resource: &str,
+    ) -> Self {
+        Self {
+            operation,
+            parts,
+            region: region.to_string(),
+            resource: resource.to_string(),
+            outcome: UNREPORTED_OUTCOME.to_string(),
+        }
+    }
+
+    /// Name the resource the call turned out to act on: the ARN a create minted, or the
+    /// stored ARN a lookup resolved for the id the request named.
+    pub fn acted_on(&mut self, resource: &str) {
+        self.resource = resource.to_string();
+    }
+
+    /// How a call that was NOT refused ended — what it changed, or the no-op it was.
+    pub fn ended(&mut self, outcome: impl Into<String>) {
+        self.outcome = outcome.into();
+    }
+
+    /// Refuse the call with `error`: the record keeps the wire error code the caller is
+    /// answered with, and the error is handed back for the handler to return.
+    ///
+    /// The code is read off the error rather than named a second time here, so a record of
+    /// a refusal cannot drift from the refusal the client saw.
+    pub fn refused<E: ::smithy_server_runtime::OperationError>(&mut self, error: E) -> E {
+        self.outcome = format!("refused-{}", error.shape_name());
+        error
+    }
+}
+
+impl Drop for AuditedCall<'_> {
+    fn drop(&mut self) {
+        audit(
+            self.operation,
+            self.parts,
+            &self.region,
+            &self.resource,
+            &self.outcome,
+        );
+    }
+}
+
+/// The resource an audit record names for a call that names no resource of its own: this
+/// account's suite-definition COLLECTION in `region`.
+///
+/// `CreateSuiteDefinition` identifies no definition — the one it mints does not exist
+/// until the call succeeds — so a refused create names the resource TYPE it creates into,
+/// an ARN that carries no id and so is never one a stored definition answers to.
+pub fn definition_collection_arn(region: &str) -> String {
+    arn(region, "suitedefinition")
 }
 
 /// A freshly minted `UUID`-shaped id: a random v4 UUID, 36 characters, inside the

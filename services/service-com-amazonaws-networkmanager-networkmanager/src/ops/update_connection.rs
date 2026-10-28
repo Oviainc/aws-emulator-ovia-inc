@@ -205,7 +205,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this global network does not hold. The empty string is the documented REMOVAL of
         // the information the member held ("To remove information for any of the
         // parameters, specify an empty string", `smithy_query query="doc"
-        // shape="UpdateConnection"`), so it names no link and resolves nothing.
+        // shape="UpdateConnection"`), so it names no link and resolves nothing
+        // ([`crate::state::optional_reference`]).
         for (member, link_id) in [
             (crate::state::FIELD_LINK_ID, input.link_id.as_deref()),
             (
@@ -213,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.connected_link_id.as_deref(),
             ),
         ] {
-            let Some(link_id) = link_id.filter(|supplied| !supplied.is_empty()) else {
+            let Some(link_id) = crate::state::optional_reference(link_id) else {
                 continue;
             };
             let resolves = store

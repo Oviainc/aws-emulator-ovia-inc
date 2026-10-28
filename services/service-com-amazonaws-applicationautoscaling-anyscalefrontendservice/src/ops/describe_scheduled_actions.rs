@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_dimension_namespace, check_dimension_requires_resource_id, check_enum,
@@ -284,6 +284,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &action.scheduled_action_name,
             ])
         });
+        drop(state);
+
+        // A movement an occurrence just made is one the scaled resource is owed, and a policy
+        // whose alarm is in ALARM was owed its execution from the instant that alarm
+        // transitioned: both are settled here, with this service's lock released.
+        let region = crate::state::request_region(ctx.parts());
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+        crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 
         Ok(DescribeScheduledActionsOutput {
             scheduled_actions: Some(scheduled_actions),

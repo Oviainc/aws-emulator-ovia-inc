@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TakeRouterInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TakeRouterInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TakeRouterInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ASSOCIATES the router input the request names with the router output its `@httpLabel`
+//! `RouterOutputArn` addresses, by recording the association on the STORED router output
+//! (`RouterOutput$RoutedInputArn`) and answering the routed state that association puts it
+//! in. A request that names NO router input clears the association, which is what the
+//! optional request member and the optional `RouterInputArn` / `RouterInputName` of the
+//! response describe.
+//!
+//! The call answers `202 Accepted`, so the association is not carrying content the instant
+//! it answers: the output is reported in the non-terminal `ROUTING` routed state and the
+//! clock settles it into the state the association owes it — `ROUTED`, or `UNROUTED` for an
+//! association that was cleared — one [`crate::state::TRANSITION_SPAN`] later
+//! ([`crate::state::StoredRouterOutput::begin_route`]).
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +174,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TakeRouterInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TakeRouterInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TakeRouterInputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router output store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Everything the clock already made due is materialised before the take is judged:
+        // the state changes it owes, an association it has already settled, and the removal
+        // of a router input or output whose deletion has finished, which is what makes such
+        // a resource a not-found rather than one this call can still associate.
+        store.settle_due_transitions(now);
+
+        // BOTH resources the request names are resolved against the store:
+        // `NotFoundException` is "one or more of the resources in the request does not exist
+        // in the system", and this request names two. The output the `@httpLabel` ADDRESSES
+        // is judged to exist first, so a request whose path names no router output is a
+        // not-found about that output rather than a refusal about the input it also named;
+        // the input is then resolved before anything is written, so a request pointing at an
+        // input the account does not hold changes nothing, and the borrow that lookup needs
+        // is released before the output is taken mutably below.
+        if !store.router_outputs.contains_key(&input.router_output_arn) {
+            return Err(TakeRouterInputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.router_output_arn),
+                },
+            )
+            .into());
+        }
+        let routed_input = match &input.router_input_arn {
+            Some(router_input_arn) => {
+                let Some(router_input) = store.router_inputs.get(router_input_arn) else {
+                    return Err(TakeRouterInputErrorModeled::NotFoundException(
+                        NotFoundException {
+                            message: crate::state::not_found_message(router_input_arn),
+                        },
+                    )
+                    .into());
+                };
+                // An input whose delete has been accepted is on its way out of the store, so
+                // it is not one an output can be routed to: the association would be dropped
+                // again the moment the clock completed the deletion. That is the conflict
+                // `ConflictException` describes ("would cause a conflict with the current
+                // state of a service resource associated with the request", 409 and
+                // retryable). The status and the error code are the contract; the sentence
+                // states the precondition.
+                if router_input.is_deleting() {
+                    return Err(TakeRouterInputErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "Router input {} is in state {}, so it cannot be routed to a \
+                                 router output.",
+                                router_input.arn, router_input.state
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                Some((router_input.arn.clone(), router_input.name.clone()))
+            }
+            // A request that names no router input asks for the output to carry nothing.
+            None => None,
+        };
+
+        let Some(router_output) = store.router_outputs.get_mut(&input.router_output_arn) else {
+            return Err(TakeRouterInputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.router_output_arn),
+                },
+            )
+            .into());
+        };
+
+        // A take CHANGES what the output carries, so it cannot be accepted for an output
+        // that is on its way out, or one the clock already owes a state change (a create, a
+        // start, a stop or a reconfiguration still settling): the output is leaving or
+        // between two states, which is the conflict the other router output operations
+        // refuse on, judged the same way.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TakeRouterInput"))
+        // An association the clock has not settled yet is NOT such a state: the routed state
+        // is not the output's lifecycle state, and re-pointing an output at another input is
+        // what this operation is for — so a take that arrives while a previous one is still
+        // `ROUTING` is accepted and the clock owes the new association instead.
+        if router_output.is_transitioning() {
+            return Err(TakeRouterInputErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Router output {} is in state {} and a state change is already in \
+                         progress, so a router input cannot be taken yet.",
+                        router_output.arn, router_output.state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The association the request asks for, against the one the record already holds: an
+        // `@idempotent` take that asks for the association the output is already in persists
+        // nothing and reports the routed state it is in, rather than putting the output
+        // through `ROUTING` a second time.
+        let requested = routed_input
+            .as_ref()
+            .map(|(router_input_arn, _)| router_input_arn.clone());
+        if router_output.routed_input_arn != requested {
+            router_output.begin_route(requested, now);
+        }
+
+        // The response is the STORED record: the association it now holds, and the routed
+        // state that association puts it in.
+        Ok(TakeRouterInputOutput {
+            routed_state: router_output.routed_state().to_string(),
+            router_output_arn: router_output.arn.clone(),
+            router_output_name: router_output.name.clone(),
+            router_input_arn: router_output.routed_input_arn.clone(),
+            // The name of the input the association names, which is the input the store
+            // resolved above: the record now holds exactly the association the request
+            // asked for, so the two members of the response report one association rather
+            // than two readings of it.
+            router_input_name: routed_input.map(|(_, router_input_name)| router_input_name),
+        })
     }
 }

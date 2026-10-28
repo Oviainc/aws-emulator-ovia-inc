@@ -1483,7 +1483,8 @@ const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 const SDK_SERVICE_NAMES: &[(&str, &str)] = &[("es", "OpenSearch")];
 
 /// The diagnostic an AWS SDK appends to the message of the exception it raises for a refused
-/// call: which service refused it, the HTTP status it answered with and the id of the call.
+/// call: which service refused it, the HTTP status it answered with, the id of the call and
+/// how many attempts the SDK made at it.
 ///
 /// `None` for a service [`SDK_SERVICE_NAMES`] does not name, which leaves the message as
 /// that service worded it.
@@ -1491,22 +1492,49 @@ const SDK_SERVICE_NAMES: &[(&str, &str)] = &[("es", "OpenSearch")];
 /// The request id is this call's own, minted per call as every identifier this service hands
 /// out is: the in-process answer carries none of its own, and the id identifies the CALL
 /// rather than anything about the resource.
-fn sdk_diagnostic(signing_name: &str, status: u16) -> Option<String> {
+fn sdk_diagnostic(signing_name: &str, status: u16, code: &str) -> Option<String> {
     let service = SDK_SERVICE_NAMES
         .iter()
         .find(|(name, _)| *name == signing_name)
         .map(|(_, service)| *service)?;
     Some(format!(
-        "(Service: {service}, Status Code: {status}, Request ID: {})",
-        super::new_request_id()
+        "(Service: {service}, Status Code: {status}, Request ID: {}) \
+         (SDK Attempt Count: {})",
+        super::new_request_id(),
+        sdk_attempt_count(code),
     ))
+}
+
+/// How many attempts an AWS SDK makes at a call whose refusal it classifies as worth
+/// retrying: its default maximum, reached because every attempt was refused the same way.
+const SDK_RETRIED_ATTEMPTS: u32 = 3;
+
+/// How many it makes at a refusal it does not retry: the one call it was asked for.
+const SDK_SINGLE_ATTEMPT: u32 = 1;
+
+/// The classes of refusal an SDK retries, as [`HANDLER_ERROR_CLASSES`] names them: a
+/// throttled call, an exhausted service limit and a service that failed are conditions that
+/// can clear on their own, where a refusal of the REQUEST cannot and is raised on the first
+/// attempt.
+const SDK_RETRIED_CLASSES: [&str; 3] =
+    ["Throttling", "ServiceLimitExceeded", "GeneralServiceException"];
+
+/// The attempt count the diagnostic reports for a refusal carrying `code`, from the class
+/// that code falls in ([`handler_error_code`]) — never from the message, which a request can
+/// influence.
+fn sdk_attempt_count(code: &str) -> u32 {
+    if SDK_RETRIED_CLASSES.contains(&handler_error_code(code)) {
+        SDK_RETRIED_ATTEMPTS
+    } else {
+        SDK_SINGLE_ATTEMPT
+    }
 }
 
 /// One refused answer's message as the SDK of the called service raises it: the message that
 /// service worded, then that SDK's diagnostic of the call where this crate words one
 /// ([`sdk_diagnostic`]).
-fn sdk_message(signing_name: &str, status: u16, message: &str) -> String {
-    match sdk_diagnostic(signing_name, status) {
+fn sdk_message(signing_name: &str, status: u16, code: &str, message: &str) -> String {
+    match sdk_diagnostic(signing_name, status, code) {
         Some(diagnostic) if message.is_empty() => diagnostic,
         Some(diagnostic) => format!("{message} {diagnostic}"),
         None => message.to_string(),
@@ -1716,14 +1744,16 @@ pub(super) async fn call_query(
     // An awsQuery error answer is `<ErrorResponse><Error><Code/><Message/></Error>…`, and
     // the code is the one the model's `awsQueryError` trait fixes for that error shape
     // (`NotFoundException` -> `NotFound`), which is what a client branches on.
+    let code = xml_element(&document, "Code")
+        .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
     Err(Refusal {
-        code: xml_element(&document, "Code")
-            .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}")),
         message: sdk_message(
             signing_name,
             status,
+            &code,
             &xml_element(&document, "Message").unwrap_or_default(),
         ),
+        code,
     })
 }
 
@@ -1816,14 +1846,16 @@ pub(super) async fn call_rest_xml(
     // A restXml error answer is `<ErrorResponse><Error><Type/><Code/><Message/></Error>…`,
     // and the code is the one the model's error shape carries (`NoSuchHostedZone`), which is
     // what a client branches on.
+    let code = xml_element(&document, "Code")
+        .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
     Err(Refusal {
-        code: xml_element(&document, "Code")
-            .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}")),
         message: sdk_message(
             signing_name,
             status,
+            &code,
             &xml_element(&document, "Message").unwrap_or_default(),
         ),
+        code,
     })
 }
 
@@ -2091,8 +2123,8 @@ fn refusal_of(signing_name: &str, status: u16, document: &Value) -> Refusal {
         .and_then(Value::as_str)
         .unwrap_or_default();
     Refusal {
+        message: sdk_message(signing_name, status, &code, message),
         code,
-        message: sdk_message(signing_name, status, message),
     }
 }
 
@@ -2243,10 +2275,47 @@ async fn callback_credentials(
 #[cfg(test)]
 mod handler_error_class_tests {
     use super::{
-        handler_error_code, HANDLER_ERROR_CLASSES, HANDLER_ERROR_INVALID_REQUEST,
-        HANDLER_ERROR_SERVICE_FAILED,
+        handler_error_code, sdk_attempt_count, HANDLER_ERROR_CLASSES, HANDLER_ERROR_INVALID_REQUEST,
+        HANDLER_ERROR_SERVICE_FAILED, SDK_RETRIED_ATTEMPTS, SDK_RETRIED_CLASSES,
+        SDK_SINGLE_ATTEMPT,
     };
     use crate::ops::types::HANDLER_ERROR_CODE_VALUES;
+
+    /// Every class the SDK diagnostic counts attempts for is one the classification above
+    /// can actually answer, so the retried set cannot drift from the class table.
+    #[test]
+    fn every_retried_class_is_one_the_classification_answers() {
+        for class in SDK_RETRIED_CLASSES {
+            assert!(
+                HANDLER_ERROR_CLASSES.iter().any(|(named, _)| *named == class),
+                "case {class:?}: not a class the refusal classification answers, which are \
+                 {HANDLER_ERROR_CLASSES:?}"
+            );
+        }
+    }
+
+    /// The attempt count follows the CLASS of the refusal: the SDK's default maximum for a
+    /// condition that can clear on its own, one attempt for a refusal of the request itself.
+    #[test]
+    fn the_attempt_count_follows_the_class() {
+        for (code, expected) in [
+            ("LimitExceededException", SDK_RETRIED_ATTEMPTS),
+            ("ThrottlingException", SDK_RETRIED_ATTEMPTS),
+            ("ServiceUnavailable", SDK_RETRIED_ATTEMPTS),
+            ("HTTP 503", SDK_RETRIED_ATTEMPTS),
+            ("ValidationException", SDK_SINGLE_ATTEMPT),
+            ("InvalidTypeException", SDK_SINGLE_ATTEMPT),
+            ("ResourceNotFoundException", SDK_SINGLE_ATTEMPT),
+            ("HTTP 400", SDK_SINGLE_ATTEMPT),
+        ] {
+            let actual = sdk_attempt_count(code);
+            assert_eq!(
+                actual, expected,
+                "case {code:?} ({}): expected {expected} attempt(s), got {actual}",
+                handler_error_code(code)
+            );
+        }
+    }
 
     /// Every class this module reports is one the MODEL declares: the classification is a
     /// mapping onto `HandlerErrorCode`, so a class spelled any other way would put a value

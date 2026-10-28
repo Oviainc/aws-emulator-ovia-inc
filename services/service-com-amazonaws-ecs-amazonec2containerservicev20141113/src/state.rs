@@ -6498,6 +6498,52 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
     }
 
+    /// Set a service's `desiredCount` to `capacity` and put the scheduler to work on it,
+    /// answering whether the service was there to move at all.
+    ///
+    /// The bookkeeping a count change owes, in ONE place: `Service$desiredCount` is "The
+    /// desired number of instantiations of the task definition to keep running on the
+    /// service", so changing it gives the scheduler work to do — the service leaves its
+    /// steady state and its deployment is STABILIZING again until the clock confirms it
+    /// ([`TRANSITION_SPAN`]) — and then [`Self::scale_service`] brings the task set in line.
+    /// A count that is already the one the service holds, and a service that is not active,
+    /// move nothing.
+    ///
+    /// `Err` is [`Self::scale_service`]'s: the placement would push this emulator past
+    /// [`MAX_TASKS`], so the task set is unchanged. The desired count is still the one that
+    /// was asked for, and it is the CALLER that decides whether to keep it — `UpdateService`
+    /// answers its requester with a refusal and restores the service it snapshotted.
+    pub fn scale_service_to(
+        &mut self,
+        key: &(String, String),
+        capacity: i32,
+        region: &str,
+        now: SystemTime,
+    ) -> Result<bool, TaskCapacityExceeded> {
+        let Some(service) = self.services.get(key) else {
+            return Ok(false);
+        };
+        if !service.is_active() || service.desired_count == capacity {
+            return Ok(false);
+        }
+        let definition = service
+            .task_definition
+            .clone()
+            .and_then(|revision| self.task_definitions.get(&revision).cloned());
+        let updated_at = DateTime::from(now);
+        let Some(service) = self.services.get_mut(key) else {
+            return Ok(false);
+        };
+        service.desired_count = capacity;
+        service.deployment_updated_at = updated_at;
+        service.deployment_steady_due_at = Some(now + TRANSITION_SPAN);
+        service.deployment_stable_due_at = Some(now + TRANSITION_SPAN);
+        if let Some(definition) = definition {
+            self.scale_service(key, &definition, region, now)?;
+        }
+        Ok(true)
+    }
+
     /// Place or stop tasks so the service holds exactly the `desiredCount` tasks it
     /// wants, from `definition`.
     ///

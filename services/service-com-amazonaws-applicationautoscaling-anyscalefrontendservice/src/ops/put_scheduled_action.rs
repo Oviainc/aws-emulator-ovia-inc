@@ -391,6 +391,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_applied: Some(now),
             },
         );
+        drop(state);
+
+        // An occurrence this call materialised moved the target's capacity, which the scaled
+        // resource is owed; delivered with this service's lock released.
+        let region = crate::state::request_region(ctx.parts());
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+        crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 
         // The audit record for a state-changing call.
         ::tracing::info!(

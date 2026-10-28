@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_dimension_namespace, check_enum, decode_next_token, encode_next_token, page_size,
@@ -225,6 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // A scaling policy whose alarm is in ALARM was owed its execution from the instant
+        // that alarm transitioned, so it is performed BEFORE this report is built: the
+        // capacity it moved is part of what the target reports now, not of the next read.
+        let region = crate::state::request_region(ctx.parts());
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+
         let mut state = state.lock();
         // A scheduled action's occurrence moves the target's capacity bounds, and it was
         // due at its scheduled instant whether or not anybody called, so what this report
@@ -258,6 +264,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &target.scalable_dimension,
             ])
         });
+        drop(state);
+
+        // A movement an occurrence just made is one the scaled resource is owed: delivered
+        // with this service's lock released, and the clock is left watching for the next
+        // breach of the target's policies.
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+        crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 
         Ok(DescribeScalableTargetsOutput {
             scalable_targets: Some(scalable_targets),

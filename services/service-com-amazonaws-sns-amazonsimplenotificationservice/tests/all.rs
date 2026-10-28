@@ -77,6 +77,9 @@ mod platform_applications;
 #[path = "all/platform_endpoint_deletion.rs"]
 mod platform_endpoint_deletion;
 
+#[path = "all/platform_endpoint_registration_lifecycle.rs"]
+mod platform_endpoint_registration_lifecycle;
+
 #[path = "all/publish_batch.rs"]
 mod publish_batch;
 

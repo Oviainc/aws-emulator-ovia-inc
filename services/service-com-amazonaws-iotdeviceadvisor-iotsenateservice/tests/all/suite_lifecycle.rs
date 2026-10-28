@@ -28,6 +28,9 @@ pub(crate) fn thing_arn(n: usize) -> String {
     format!("arn:aws:iot:us-east-1:000000000000:thing/device-under-test-{n}")
 }
 
+/// The access key id a call presents unless the caller names another.
+pub(crate) const DEFAULT_AKID: &str = "AKIDEXAMPLE";
+
 /// The emulator, assembled in-process with authentication off: this suite asserts
 /// behaviour, and signature verification is the framework's own concern.
 pub(crate) struct Emulator {
@@ -147,6 +150,23 @@ impl Emulator {
         region: &str,
         body: Option<Value>,
     ) -> Answer {
+        self.call_as(DEFAULT_AKID, method, path_and_query, region, body)
+            .await
+    }
+
+    /// The same request, presenting `akid` as the caller's access key id.
+    ///
+    /// Which caller made the call is observable — the service records it — so a suite that
+    /// reads its own records back signs with an access key id no other suite uses rather
+    /// than sharing [`DEFAULT_AKID`].
+    pub(crate) async fn call_as(
+        &self,
+        akid: &str,
+        method: &str,
+        path_and_query: &str,
+        region: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = body.map_or_else(bytes::Bytes::new, |value| {
             bytes::Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
         });
@@ -158,7 +178,7 @@ impl Emulator {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/iotdeviceadvisor/\
+                    "AWS4-HMAC-SHA256 Credential={akid}/20260101/{region}/iotdeviceadvisor/\
                      aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
                 ),
             )
