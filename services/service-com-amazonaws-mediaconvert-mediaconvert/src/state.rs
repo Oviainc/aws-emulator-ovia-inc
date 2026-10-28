@@ -31,7 +31,10 @@
 //!   `DeletePreset` a `SYSTEM` preset, with the modelled
 //!   `ForbiddenException`. `idempotency` holds at most one entry per stored job, so it is
 //!   bounded by `MAX_JOBS` too, and `endpoints` (one account endpoint per region a request
-//!   was signed for) is capped at [`MAX_ENDPOINTS`] the same way.
+//!   was signed for) is capped at [`MAX_ENDPOINTS`] the same way. `certificates` — the ACM
+//!   certificate ARNs `AssociateCertificate` has added to the account and
+//!   `DisassociateCertificate` removes from it — is a SET, so associating the same
+//!   certificate over and over adds nothing, and it is capped at [`MAX_CERTIFICATES`].
 //! * A record's `tags` are capped at [`MAX_TAGS_PER_RESOURCE`], so no door onto a record's
 //!   tag set — the four `Create*` paths or `TagResource` — can grow one record without
 //!   limit either; past the cap each answers the same quota error, out of the one rule in
@@ -466,6 +469,25 @@ pub const MIN_RESERVED_SLOTS: i32 = 1;
 /// The `arn:` service/resource namespace for this service's ARNs
 /// (`awsService.arnNamespace` is `mediaconvert`).
 const ARN_NAMESPACE: &str = "mediaconvert";
+
+/// The `arn:` service namespace of an AWS Certificate Manager ARN, the only kind of ARN
+/// `AssociateCertificate` and `DisassociateCertificate` accept: both members are "the ARN
+/// of the ACM certificate that you want to associate with" (or disassociate from) "your
+/// MediaConvert resource".
+const ACM_ARN_NAMESPACE: &str = "acm";
+
+/// The resource type an ACM certificate's ARN carries,
+/// `arn:<partition>:acm:<region>:<account>:certificate/<id>`.
+const ACM_CERTIFICATE_RESOURCE_TYPE: &str = "certificate";
+
+/// How many ACM certificates the account associates before `AssociateCertificate`
+/// refuses to add another.
+///
+/// A CHOSEN capacity bound, as [`MAX_ENDPOINTS`] is, not a documented AWS quota: the set
+/// is caller-driven — every `AssociateCertificate` names an ARN of the caller's choosing —
+/// so it needs a ceiling. Past it the refusal uses the error the model already declares
+/// for growing past a quota, `ServiceQuotaExceededException` (HTTP 402).
+pub const MAX_CERTIFICATES: usize = 100;
 
 /// The region used when a request carries no SigV4 credential scope to read one from
 /// (an unsigned request to an emulator with authentication switched off).
@@ -1546,6 +1568,28 @@ impl TaggedResource {
     }
 }
 
+/// The service namespace and the resource id of an ARN, or `None` when the value is not
+/// an ARN at all.
+///
+/// `arn:<partition>:<service>:<region>:<account>:<resource id>` — the ONE place this
+/// module takes an ARN apart, so the two kinds of ARN its request paths accept (this
+/// service's own resources, and the ACM certificate the certificate operations name)
+/// cannot disagree about what an ARN is. The partition and the ARN's own region and
+/// account are not part of a record's identity here, but they must be present for the
+/// value to be an ARN at all. Total over any input: every field is taken with `?`, so a
+/// value with too few of them is `None` rather than a panic.
+fn arn_namespace_and_resource(arn: &str) -> Option<(&str, &str)> {
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    let namespace = fields.next()?;
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    Some((namespace, fields.next()?))
+}
+
 /// The resource an ARN names, or `None` when the value is not a MediaConvert resource
 /// ARN at all.
 ///
@@ -1556,19 +1600,11 @@ impl TaggedResource {
 /// value — the handlers answer it with the modelled `BadRequestException`. Whether the
 /// named resource EXISTS is a separate question, answered by [`ComAmazonawsMediaconvertMediaconvertState::tags`].
 pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
-    let mut fields = arn.splitn(6, ':');
-    if fields.next()? != "arn" {
+    let (namespace, resource_id) = arn_namespace_and_resource(arn)?;
+    if namespace != ARN_NAMESPACE {
         return None;
     }
-    // The partition and the ARN's own region/account are not part of a record's
-    // identity here, but they must be present for the value to be an ARN at all.
-    let _partition = fields.next()?;
-    if fields.next()? != ARN_NAMESPACE {
-        return None;
-    }
-    let _region = fields.next()?;
-    let _account = fields.next()?;
-    let (kind, name) = fields.next()?.split_once('/')?;
+    let (kind, name) = resource_id.split_once('/')?;
     if name.is_empty() {
         return None;
     }
@@ -1579,6 +1615,47 @@ pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
         RESOURCE_TYPE_JOB_TEMPLATES => Some(TaggedResource::JobTemplate(name.to_string())),
         _ => None,
     }
+}
+
+/// Whether a value is the ARN of an ACM certificate.
+///
+/// True for `arn:<partition>:acm:<region>:<account>:certificate/<id>` with a non-empty
+/// id, and nothing else. Both certificate operations document their `Arn` as "the ARN of
+/// the ACM certificate", so a value that is not an ARN, an ARN of another service, or an
+/// ACM ARN naming something other than a certificate is a problem in the REQUEST, which a
+/// caller fixes by sending a different value — the handlers answer it with the modelled
+/// `BadRequestException`, exactly as [`parse_resource_arn`]'s callers do. The certificate
+/// id is not taken apart any further: the account's set is keyed by the whole ARN the
+/// caller sent. Whether the account has ASSOCIATED that certificate is a separate
+/// question, answered by
+/// [`ComAmazonawsMediaconvertMediaconvertState::disassociate_certificate`].
+pub fn is_acm_certificate_arn(arn: &str) -> bool {
+    let Some((namespace, resource_id)) = arn_namespace_and_resource(arn) else {
+        return false;
+    };
+    if namespace != ACM_ARN_NAMESPACE {
+        return false;
+    }
+    let Some((kind, id)) = resource_id.split_once('/') else {
+        return false;
+    };
+    kind == ACM_CERTIFICATE_RESOURCE_TYPE && !id.is_empty()
+}
+
+/// How this service words the refusal of an `Arn` that is not an ACM certificate ARN.
+///
+/// Built from the value the request carried, as [`not_found_message`] is built from the
+/// member it arrived in, and worded like the ARN refusal `TagResource` already answers: it
+/// names the member, the value, and the kind of ARN the operation accepts.
+pub fn certificate_arn_message(arn: &str) -> String {
+    format!("Arn {arn} is not the ARN of an ACM certificate.")
+}
+
+/// How this service words the refusal of an association that would carry the account past
+/// [`MAX_CERTIFICATES`] certificates; the bound comes from the constant, never a second
+/// hand-written number.
+pub fn certificates_past_cap_message() -> String {
+    format!("An account associates at most {MAX_CERTIFICATES} ACM certificates.")
 }
 
 /// The `AccelerationSettings` a job or job template created without the member carries.
@@ -3803,6 +3880,21 @@ pub enum DeleteNamedOutcome {
     SystemResource,
 }
 
+/// What the store did when asked to associate an ACM certificate with the account.
+#[derive(Debug)]
+pub enum AssociateCertificateOutcome {
+    /// The account now has that certificate associated.
+    Associated,
+    /// The account ALREADY had it associated, so the request asks for the state the
+    /// account is in and nothing was added — membership of a set is reached once. The
+    /// repeat is a no-op success, exactly as a repeated create of a resource that is
+    /// already there is (see [`CreateOutcome`]).
+    AlreadyAssociated,
+    /// The account already has [`MAX_CERTIFICATES`] certificates associated and this one
+    /// is not among them.
+    AtCapacity,
+}
+
 /// Remove the record stored under `name`, idempotently.
 ///
 /// ONE rule for every named resource this service deletes, so no two delete paths can
@@ -3978,6 +4070,13 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// Only `DescribeEndpoints` in `DEFAULT` mode adds one; nothing ever rewrites one,
     /// which is what makes the URL a caller reads back stable.
     pub endpoints: BTreeMap<String, String>,
+    /// The ARNs of the ACM certificates the account has associated, as
+    /// `AssociateCertificate` added them and `DisassociateCertificate` removes them.
+    ///
+    /// A SET keyed by the ARN the caller sent: an account either has a certificate
+    /// associated or it has not, so associating one twice adds nothing and the account
+    /// cannot hold the same certificate twice. At most [`MAX_CERTIFICATES`] entries.
+    pub certificates: BTreeSet<String>,
     /// Jobs queries by `Id`, as `StartJobsQuery` stored them and
     /// `GetJobsQueryResults` reads them back. At most [`MAX_JOBS_QUERIES`] entries.
     pub jobs_queries: BTreeMap<String, JobsQueryRecord>,
@@ -4076,6 +4175,9 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             // No account endpoint exists until a `DescribeEndpoints` in `DEFAULT` mode
             // creates one, so `GET_ONLY` on a fresh account answers an empty list.
             endpoints: BTreeMap::new(),
+            // No certificate is associated until a caller associates one: an account's
+            // ACM certificates are entirely caller-driven, so nothing is seeded.
+            certificates: BTreeSet::new(),
             // No jobs query exists until a caller starts one.
             jobs_queries: BTreeMap::new(),
             // The service's own Job engine versions: the newest released now and the rest
@@ -4672,6 +4774,37 @@ impl ComAmazonawsMediaconvertMediaconvertState {
                 .or_insert_with(|| account_endpoint_url(region))
                 .as_str(),
         )
+    }
+
+    /// Add `arn` to the ACM certificates the account has associated.
+    ///
+    /// `AssociateCertificate` "associates an AWS Certificate Manager (ACM) Amazon
+    /// Resource Name (ARN) with AWS Elemental MediaConvert", so what it changes is the
+    /// account's SET of associated certificates: an ARN the account already holds is
+    /// reached state and adds nothing, and the set is held to [`MAX_CERTIFICATES`]. The
+    /// probe and the insert happen under the one `&mut` borrow the caller holds the state
+    /// lock for, so two concurrent associations of the same ARN cannot both insert.
+    pub fn associate_certificate(&mut self, arn: String) -> AssociateCertificateOutcome {
+        if self.certificates.contains(&arn) {
+            return AssociateCertificateOutcome::AlreadyAssociated;
+        }
+        if self.certificates.len() >= MAX_CERTIFICATES {
+            return AssociateCertificateOutcome::AtCapacity;
+        }
+        self.certificates.insert(arn);
+        AssociateCertificateOutcome::Associated
+    }
+
+    /// Remove `arn` from the ACM certificates the account has associated, answering
+    /// whether the account held that association at all.
+    ///
+    /// `DisassociateCertificate` "removes an association between the Amazon Resource Name
+    /// (ARN) of an AWS Certificate Manager (ACM) certificate and an AWS Elemental
+    /// MediaConvert resource": the association is what the request addresses, so an ARN
+    /// this set does not hold addresses nothing to remove — `false`, which the handler
+    /// answers with the modelled `NotFoundException`.
+    pub fn disassociate_certificate(&mut self, arn: &str) -> bool {
+        self.certificates.remove(arn)
     }
 
     /// Store a queue `CreateQueue` asked for, idempotently on its `Name`.

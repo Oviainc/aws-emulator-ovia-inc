@@ -161,6 +161,8 @@ mod table_version_listing;
 mod table_versions;
 #[path = "all/trigger_starts.rs"]
 mod trigger_starts;
+#[path = "all/trigger_stops.rs"]
+mod trigger_stops;
 #[path = "all/triggers.rs"]
 mod triggers;
 #[path = "all/unfiltered_metadata.rs"]

@@ -159,11 +159,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = store.lock();
 
-        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
-            DescribeRegistryError::from(DescribeRegistryErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&input.registry_name),
-            ))
-        })?;
+        // The registry step of the one read resolution — the whole of it for a read of
+        // the registry itself. See `crate::state::readable_registry`.
+        let registry = state
+            .readable_registry(&input.registry_name)
+            .map_err(|refusal| {
+                DescribeRegistryError::from(DescribeRegistryErrorModeled::NotFoundException(
+                    refusal.not_found(),
+                ))
+            })?;
 
         Ok(DescribeRegistryOutput {
             description: registry.description.clone(),

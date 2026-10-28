@@ -1,0 +1,57 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: kinesis__logs.log-cwl-plumbing-sixth-subscription-filter-rejected-while-five-deliver
+Issue-Key: kinesis__logs.log-cwl-plumbing-sixth-subscription-filter-rejected-while-five-deliver|_poll_until#24|Timeout|time.sleep(interval_s)
+Issue-Commit: 89b9ca4b685f6ae9a714db90fb8f95ad9a86cf49
+
+# kinesis__logs: with the per-log-group filter quota repaired, five accepted subscription filters still deliver nothing to their Kinesis stream, so the limit/repair check cannot be graded (1 cause)
+
+> _Note: this issue was identified against the code base at commit `89b9ca4b685f6ae9a714db90fb8f95ad9a86cf49`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutSubscriptionFilter
+
+## Description
+One net-new root cause, grounded in the one failing `kinesis__logs` check that the replay report marks neither ALREADY FILED nor OWNED. Cause count: 1.
+
+SERVICE ATTRIBUTION: the check id carries the compound leading token `kinesis__logs.`, which is the token used for this group throughout the repo's issue set; the diverging operation is `logs:PutSubscriptionFilter` and Kinesis supplies the destination streams. Both underlying services are stood up in this checkout.
+
+RELATED OPEN / FIXED ISSUES:
+- FIXED 20261025T100129Z-logs-cloudwatch-logs-subscription-destination-plumbing-a-logical-destination.md carried this exact check id for its cause 3 (the per-group quota was 2 instead of 5 and LimitExceededException did not carry AWS's fixed message). That refusal is gone — the check no longer dies with LimitExceededException while attaching filter #3, it now runs on into its delivery legs — so this issue does NOT reopen it; what is reported here is the next, independent gap the check reaches.
+- OPEN 20261026T102156Z-kinesis-logs-a-cloudwatch-logs-subscription-filter-delivers.md records the same delivery gap for three sibling `kinesis__logs` checks and EXPLICITLY EXCLUDED this fourth check because it was then owned by the issue above. It does not carry this check's replay key, and it does not grade the attached-filter-quota semantics (five concurrent filters each delivering in their own envelope, the refused filter's destination staying free of DATA_MESSAGEs, and a freed slot letting the previously refused filter in and start delivering) that only this check exercises.
+
+=== Cause 1 of 1: a log group carrying five accepted subscription filters produces no record on their Kinesis destination, so neither the fan-out legs nor the quota-repair legs can run ===
+Failing check: kinesis__logs.log-cwl-plumbing-sixth-subscription-filter-rejected-while-five-deliver
+AWS: Smithy (com.amazonaws.cloudwatchlogs#Logs_20140328) PutSubscriptionFilter requires logGroupName, filterName, filterPattern and destinationArn, takes optional roleArn, returns Unit (empty 200), and models LimitExceededException among its 400 client errors — so the quota refusal is modeled, but the delivered payload is recorded behavior only. Recorded behavior: a log group accepts FIVE attached subscription filters (Service Quotas L-87E7D306, "Subscription filters per log group" = 5, non-adjustable; the operation's own prose "up to two" is stale) and refuses the SIXTH with LimitExceededException whose message is the fixed, request-independent text "Resource limit exceeded.". With five filters attached to one group and all five pointed at one Kinesis stream, a single PutLogEvents line is delivered once PER FILTER: five separate gzip records (magic 0x1f 0x8b), each a JSON envelope with messageType "DATA_MESSAGE" and subscriptionFilters naming exactly ONE filter, together covering all five filter names, with logEvents carrying the written message. The refused sixth filter's own destination stream receives no DATA_MESSAGE at all (CONTROL_MESSAGE health-check records may appear there, because destination validation runs before the limit check). The limit counts ATTACHED filters, not calls: after DeleteSubscriptionFilter frees one slot the identical previously-refused call is accepted, delivery moves to its destination, and the deleted filter stops delivering. Every value in those envelopes (filter names, group/stream names, message text, timestamps) comes from the request and the emulator's state.
+Emulator: the check is killed at the harness cap (`Error: Check timed out after 60.0s`) before it can produce any assertion. It gets past the quota refusal that previously stopped it, and its first blocking wait after setup is the shard-reader poll that waits (budget 240 s) for the written line to arrive once per accepted filter on the destination stream — the same poll in which the three sibling `kinesis__logs` checks hang with an empty shard. The Kinesis read path answers in this checkout (GetShardIterator/GetRecords are implemented; no check in this run reports NotImplemented for them), so the reads succeed and return nothing: no record is produced for any of the five attached filters.
+Why: a client that fans one log group out to the supported maximum of five destinations gets five green PutSubscriptionFilter calls and then nothing on the wire — the subscriptions exist only as control-plane rows. Because no delivery ever occurs, the whole quota contract is also ungraded: a client cannot observe that the refused sixth filter delivered nothing, that freeing a slot makes the previously refused filter live, or that a deleted filter stops delivering while its siblings keep going. Each of those is a decision real client code makes (retry the refused filter after freeing a slot, confirm a rotated destination is receiving) and none of them can be validated here.
+Fix: the subscription-filter delivery path in the cloudwatch-logs crate — on the ingest path in services/service-com-amazonaws-cloudwatchlogs-logs-20140328/src/ops/put_log_events.rs, evaluate each stored event against EVERY live filter on the group and put one gzip DATA_MESSAGE envelope per matching filter into the Kinesis shard state named by that filter's destinationArn, with subscriptionFilters naming exactly that one filter; and in services/service-com-amazonaws-cloudwatchlogs-logs-20140328/src/ops/put_subscription_filter.rs / delete_subscription_filter.rs drive delivery from the live filter set so a filter refused by the quota never delivers, a filter attached after a slot is freed starts delivering, and a deleted filter stops without retroactive replay.
+Traces: kinesis__logs.log-cwl-plumbing-sixth-subscription-filter-rejected-while-five-deliver.
+
+## Evidence
+kinesis__logs.log-cwl-plumbing-sixth-subscription-filter-rejected-while-five-deliver (verdict: mismatch)
+  Error: Check timed out after 60.0s
+
+Sequence exercised by the check: kinesis CreateStream x2 (ok-side and refused-side, ShardCount=1), each polled to ACTIVE and tagged; iam CreateRole trusted by logs.amazonaws.com + PutRolePolicy allowing kinesis:PutRecord/PutRecords on both stream ARNs; logs CreateLogGroup + CreateLogStream; then five logs PutSubscriptionFilter calls (filterPattern='', destinationArn=<ok stream arn>, roleArn=<role>) with distinct filter names.
+  Leg 1 expects a sixth PutSubscriptionFilter (destinationArn=<refused stream arn>) to be refused with code LimitExceededException and the exact message "Resource limit exceeded.", with DescribeSubscriptionFilters still listing exactly the five accepted filters. (This is the leg a now-FIXED issue, 20261025T100129Z, covered; the check previously died earlier than this, raising LimitExceededException 'a log group can have up to 2 subscription filters associated with it' while attaching filter #3. That no longer happens.)
+  Leg 2 writes one line via logs PutLogEvents and polls the ok-side shard (kinesis GetShardIterator TRIM_HORIZON + GetRecords, budget 240 s, 5 s interval) until the set of filter names carrying that line equals all five accepted filter names, asserting each record starts with the gzip magic 0x1f 0x8b and that each envelope's subscriptionFilters names exactly one filter. It then writes a second line as a differential barrier and asserts the refused filter's stream holds NO DATA_MESSAGE.
+  Leg 3 deletes one accepted filter, re-issues the identical previously-refused PutSubscriptionFilter, asserts DescribeSubscriptionFilters now shows the four survivors plus the new filter on the refused-side stream, and then re-writes uniquely marked lines until one arrives through the new filter — asserting also that no line written while it was refused leaks to it and that the deleted filter no longer delivers.
+
+Actual: the check never reaches any of its assertions' failure messages — it is killed at the 60 s harness cap while blocked in leg 2's shard poll, which is the same poll in which the three sibling kinesis__logs checks (OWNED by 20261026T102156Z) hang with a permanently empty shard. The Kinesis read path answers (services/service-com-amazonaws-kinesis-kinesis-20131202/src/ops/get_records.rs is implemented in this checkout and no check in this run reports NotImplemented for GetRecords or GetShardIterator), so the reads succeed and return no records: the five attached subscription filters deliver nothing.
+
+## Steps to Reproduce
+Boot the emulator from this checkout and replay kinesis__logs.log-cwl-plumbing-sixth-subscription-filter-rejected-while-five-deliver.
+
+  1. kinesis CreateStream(StreamName=OK, ShardCount=1) and CreateStream(StreamName=NO, ShardCount=1); poll DescribeStream on each until ACTIVE; note both StreamARNs.
+  2. iam CreateRole(R) with a trust policy for logs.amazonaws.com; iam PutRolePolicy(R, allow kinesis:PutRecord/PutRecords on both stream ARNs).
+  3. logs CreateLogGroup(G) + logs CreateLogStream(G, LS).
+  4. logs PutSubscriptionFilter(logGroupName=G, filterName=F1..F5, filterPattern='', destinationArn=<OK arn>, roleArn=<R arn>) — five distinct names; all five must be accepted.
+  5. logs PutSubscriptionFilter(logGroupName=G, filterName=F6, filterPattern='', destinationArn=<NO arn>, roleArn=<R arn>)
+     -> expected 400 LimitExceededException with the exact message "Resource limit exceeded."; logs DescribeSubscriptionFilters(logGroupName=G) must still list exactly F1..F5 with destinationArn=<OK arn>.
+  6. logs PutLogEvents(G, LS, [{timestamp: now_ms, message: '<marker> first'}]); then kinesis GetShardIterator(OK, TRIM_HORIZON) + GetRecords, draining for up to 240 s.
+     -> observe no records at all; the check hangs here and is killed at the 60 s cap.
+     -> expected five gzip records (magic 0x1f 0x8b), each a DATA_MESSAGE envelope whose subscriptionFilters names exactly one of F1..F5, together covering all five, each carrying the written line.
+  7. Write a second line and drain OK again (all five must carry it), then drain NO: it must hold NO DATA_MESSAGE record (CONTROL_MESSAGE records there are not asserted either way).
+  8. logs DeleteSubscriptionFilter(logGroupName=G, filterName=F5); re-issue the step-5 call for F6 -> it must now be ACCEPTED, and DescribeSubscriptionFilters must show F1..F4 on <OK arn> plus F6 on <NO arn>.
+  9. Write uniquely marked lines until one arrives on NO under F6; assert no line written while F6 was refused appears there, and that the same line arrives on OK under F1..F4 only (F5, deleted, must not deliver it).

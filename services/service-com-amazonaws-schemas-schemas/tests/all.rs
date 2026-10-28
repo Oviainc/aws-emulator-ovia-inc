@@ -65,6 +65,8 @@ mod resource_tag_removal;
 mod resource_tags;
 #[path = "all/schema_name_collation.rs"]
 mod schema_name_collation;
+#[path = "all/schema_read_resolution.rs"]
+mod schema_read_resolution;
 #[path = "all/schema_version_deletion.rs"]
 mod schema_version_deletion;
 #[path = "all/search_keyword_index.rs"]

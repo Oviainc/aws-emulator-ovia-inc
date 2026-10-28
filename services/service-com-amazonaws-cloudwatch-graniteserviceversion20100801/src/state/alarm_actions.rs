@@ -367,8 +367,11 @@ async fn settle<Eng: Send + Sync + 'static>(
         // work it may do is bounded per request by the budget below, so what the budget does
         // not reach stays due for the next call.
         crate::service::off_the_async_worker(|| {
-            let mut budget = super::alarm_evaluation::EvaluationBudget::for_one_request();
             let mut store = state.lock();
+            // The budget is started once the store is HELD: a wall clock that began before
+            // the wait for the lock would bound that wait instead of the pass it is here to
+            // bound ([`super::alarm_evaluation::EvaluationBudget::spent`]).
+            let mut budget = super::alarm_evaluation::EvaluationBudget::for_one_request();
             store.evaluate_metric_alarms(now, &mut budget);
             // A metric alarm's new state is an input to every composite alarm whose rule
             // references it, so the composite alarms are evaluated after it, in the same pass

@@ -24,7 +24,7 @@ use crate::ops::types::{
 };
 use crate::scaffolded::ServiceError;
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 /// This service's SigV4 signing name and ARN namespace (`OPERATIONS.md`, "Wire protocol").
@@ -952,6 +952,62 @@ pub fn require_cmaf_hls_manifests(
     Ok(())
 }
 
+/// The requirement a list of child configurations failed by naming the same child id more
+/// than once: the rule, and how many entries shared the repeated id.
+///
+/// Built here rather than written at the call site, so the sentence and the rule cannot
+/// disagree and the suite asserting it reads the service's own words.
+pub fn unique_child_id_requirement(id: &str, count: usize) -> String {
+    format!("may carry each id only once, got {count} entries with an id of {id:?}")
+}
+
+/// Refuse a caller-supplied list of child configurations that names the same child id more
+/// than once, keyed by the member path the wire names.
+///
+/// A child id the model documents as unique within its parent resource is what a client
+/// addresses that child by and what this service derives the child's own server-supplied
+/// values from, so a list repeating an id names two children nothing can tell apart. The
+/// one function every such list is judged by, so no list of children can be stored with a
+/// repeated id while another is refused for it. The refusal names the FIRST id that
+/// repeats, in the order the request sent them, so the same request is always answered the
+/// same way.
+pub fn require_unique_child_ids<'a, I>(member: &str, ids: I) -> Result<(), ServiceError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let ids: Vec<&str> = ids.into_iter().collect();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(ids.len());
+    for id in &ids {
+        if !seen.insert(id) {
+            let count = ids.iter().filter(|other| *other == id).count();
+            return Err(member_invalid(member, unique_child_id_requirement(id, count)));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a `CmafPackage` that publishes two child manifests under one id.
+///
+/// `HlsManifestCreateOrUpdateParameters$Id` is "the ID of the manifest. The ID must be
+/// unique within the OriginEndpoint", so the child ids of one package are a SET; judged by
+/// [`require_unique_child_ids`] like every other documented-unique child id, and only when
+/// the request names a CMAF package at all.
+pub fn require_unique_cmaf_hls_manifest_ids(
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+) -> Result<(), ServiceError> {
+    let Some(package) = cmaf_package else {
+        return Ok(());
+    };
+    require_unique_child_ids(
+        CMAF_HLS_MANIFESTS_MEMBER,
+        package
+            .hls_manifests
+            .iter()
+            .flatten()
+            .map(|manifest| manifest.id.as_str()),
+    )
+}
+
 /// Refuse an OriginEndpoint create or update whose access-control or packaging members name
 /// something this service could not act on.
 ///
@@ -977,7 +1033,8 @@ pub fn check_origin_endpoint_members(
     ) {
         check_arn_member(&member, value, requirement)?;
     }
-    require_cmaf_hls_manifests(cmaf_package)
+    require_cmaf_hls_manifests(cmaf_package)?;
+    require_unique_cmaf_hls_manifest_ids(cmaf_package)
 }
 
 /// Every IAM role an OriginEndpoint create or update asks MediaPackage to ASSUME, by the

@@ -2831,6 +2831,19 @@ pub const EXECUTION_STATE_COMPLETED: &str = "COMPLETED";
 /// [`EXECUTION_STATE_RUNNING`] for the source of the set.
 pub const EXECUTION_STATE_FAILED: &str = "FAILED";
 
+/// Every `ExecutionState` an execution can report, in the order the modelled enum
+/// declares them.
+///
+/// Source: `smithy_query(query="shape", shape="ExecutionState")` — RUNNING |
+/// COMPLETED | FAILED. This is the catalog the execution summary of a computation
+/// model is keyed by, so a summary reports every state the model declares rather
+/// than only those some execution happens to be in.
+pub const EXECUTION_STATES: [&str; 3] = [
+    EXECUTION_STATE_RUNNING,
+    EXECUTION_STATE_COMPLETED,
+    EXECUTION_STATE_FAILED,
+];
+
 /// How long after the call that starts it an execution of an action takes to
 /// settle: until then it reports [`EXECUTION_STATE_RUNNING`], and its outcome
 /// from then on.
@@ -2967,6 +2980,52 @@ impl ExecutionRecord {
             },
             execution_entity_version: self.execution_entity_version.clone(),
         }
+    }
+}
+
+impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
+    /// The execution summary of the computation model `computation_model_id`, as
+    /// of `now`: how many of the executions this store holds against that model
+    /// are in each `ExecutionState`, as the decimal counts the modelled summary
+    /// values are strings of.
+    ///
+    /// `resolved_asset_id` narrows the summary to the executions that resolve to
+    /// ONE asset, which is what a request naming a resolved resource asks the
+    /// summary to cover.
+    ///
+    /// The counts are DERIVED from the stored executions on every read, through
+    /// the one [`ExecutionRecord::state`] rule a listing reports an execution by,
+    /// so a summary follows what the clock has made of each run — an execution
+    /// counts as running until its run is due to end and under its outcome from
+    /// then on — and reading one writes nothing.
+    ///
+    /// The keys are [`EXECUTION_STATES`] and the values decimal counts, both of
+    /// which the modelled `ComputationModelExecutionSummaryKey` and
+    /// `ComputationModelExecutionSummaryValue` patterns admit.
+    pub fn computation_model_execution_summary(
+        &self,
+        computation_model_id: &str,
+        resolved_asset_id: Option<&str>,
+        now: SystemTime,
+    ) -> HashMap<String, String> {
+        let mut counts: HashMap<&str, u64> =
+            EXECUTION_STATES.iter().map(|state| (*state, 0)).collect();
+        let covered = self.executions.values().filter(|record| {
+            record.targets(TARGET_RESOURCE_TYPE_COMPUTATION_MODEL, computation_model_id)
+                && resolved_asset_id.is_none_or(|asset_id| {
+                    record
+                        .resolve_to
+                        .as_ref()
+                        .is_some_and(|resolve_to| resolve_to.asset_id == asset_id)
+                })
+        });
+        for record in covered {
+            *counts.entry(record.state(now)).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(state, count)| (state.to_string(), count.to_string()))
+            .collect()
     }
 }
 

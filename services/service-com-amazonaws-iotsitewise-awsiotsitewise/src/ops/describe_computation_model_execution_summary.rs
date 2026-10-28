@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeComputationModelExecutionSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeComputationModelExecutionSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeComputationModelExecutionSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below reports, for the computation model the request
+//! names, how many of the executions this service holds against that model are in
+//! each `ExecutionState` — narrowed to the executions resolving to one asset when
+//! the request names a resolved resource — so the summary follows the executions
+//! `ExecuteAction` recorded and what the clock has since made of each run.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeComputationModelExecutionSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeComputationModelExecutionSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeComputationModelExecutionSummary"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable"))?;
+        // Nothing this summary reports is scoped to the caller's region: it counts
+        // stored executions and echoes the references the request itself carries.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let store = state.lock();
+
+        // The summary is OF one computation model, so an id naming none is the
+        // modelled 404 rather than a summary of nothing, which would report an
+        // absent model as an idle one.
+        if !store
+            .computation_models
+            .contains_key(&input.computation_model_id)
+        {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_COMPUTATION_MODEL,
+                &input.computation_model_id,
+            )));
+        }
+
+        // The resolved resource is a reference: a type and an id that together name
+        // ONE resource, so half of the pair identifies nothing and is refused as the
+        // bad request it is. `ResolveToResourceType` models the single value `ASSET`,
+        // which the runtime has already checked, so the id names an asset — and one
+        // this store does not hold draws the same refusal the model does.
+        let resolved_asset = match (
+            input.resolve_to_resource_type.as_deref(),
+            input.resolve_to_resource_id.as_deref(),
+        ) {
+            (Some(_), Some(asset_id)) => {
+                if !store.assets.contains_key(asset_id) {
+                    return Err(not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET,
+                        asset_id,
+                    )));
+                }
+                Some(asset_id)
+            }
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(invalid_request(
+                    "resolveToResourceId is required when resolveToResourceType is specified.",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(invalid_request(
+                    "resolveToResourceType is required when resolveToResourceId is specified.",
+                ))
+            }
+        };
+
+        Ok(DescribeComputationModelExecutionSummaryOutput {
+            computation_model_id: input.computation_model_id.clone(),
+            // "The detailed resource this execution summary resolves to": the
+            // resource the summary was narrowed to, which only a request that named
+            // one has.
+            resolve_to: resolved_asset.map(|asset_id| ResolveTo {
+                asset_id: asset_id.to_string(),
+            }),
+            // Derived from the stored executions, through the one rule every view of
+            // an execution of this service reports its state by.
+            computation_model_execution_summary: store.computation_model_execution_summary(
+                &input.computation_model_id,
+                resolved_asset,
+                now,
+            ),
+        })
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: &str) -> DescribeComputationModelExecutionSummaryError {
+    DescribeComputationModelExecutionSummaryErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: message.to_string(),
+        },
+    )
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeComputationModelExecutionSummaryError {
+    DescribeComputationModelExecutionSummaryErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    )
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: &str) -> DescribeComputationModelExecutionSummaryError {
+    DescribeComputationModelExecutionSummaryErrorModeled::InternalFailureException(
+        InternalFailureException {
+            message: message.to_string(),
+        },
+    )
+    .into()
 }
