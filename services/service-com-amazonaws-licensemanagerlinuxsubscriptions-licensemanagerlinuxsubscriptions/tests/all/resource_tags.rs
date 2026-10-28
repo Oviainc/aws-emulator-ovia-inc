@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::harness::{
-    deregister, get_provider, harness, list_tags, provider_arn_for, seed_provider,
+    deregister, get_provider, harness, list_tags, provider_arn_for, reported_tags, seed_provider,
     stored_provider_count, tag, Harness, Reply, ACCOUNT, RED_HAT, REGION, SIGNING_NAME,
 };
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState as ServiceState;
@@ -136,28 +136,6 @@ fn secret_arn(index: usize) -> String {
 
 async fn tag_resource(h: &Harness, arn: &str, tags: &[(String, String)]) -> Reply {
     tag(h, arn, &tag_map(tags)).await
-}
-
-/// The tag set a `ListTagsForResource` body reports, as a sorted map so two sets compare
-/// independently of iteration order.
-fn reported_tags(reply: &Reply, case: &str) -> BTreeMap<String, String> {
-    let body = reply.ok(case);
-    let tags = body
-        .get("tags")
-        .unwrap_or_else(|| panic!("case {case:?}: no tags member in {body:?}"));
-    tags.as_object()
-        .unwrap_or_else(|| panic!("case {case:?}: tags is not a map in {body:?}"))
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("case {case:?}: tag {key:?} is not a string"))
-                    .to_string(),
-            )
-        })
-        .collect()
 }
 
 /// The expected set, as the same sorted map.

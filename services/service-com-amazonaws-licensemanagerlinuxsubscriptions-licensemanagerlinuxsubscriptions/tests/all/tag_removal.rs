@@ -30,8 +30,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::harness::{
-    deregister, get_provider, harness, list_tags, provider_arn_for, seed_provider, stored_provider_count,
-    tag, untag, Harness, Reply, ACCOUNT, ACTIVE, RED_HAT,
+    deregister, get_provider, harness, provider_arn_for, reported_tags_of, seed_provider,
+    stored_provider_count, tag, untag, Harness, Reply, ACCOUNT, ACTIVE, RED_HAT,
 };
 
 /// The largest number of keys one removal may name: the modelled `tagKeys` list is
@@ -91,27 +91,6 @@ fn seed(h: &Harness, index: usize, tags: &[(String, String)]) -> String {
 async fn remove(h: &Harness, arn: &str, keys: &[String]) -> Reply {
     let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
     untag(h, arn, &borrowed).await
-}
-
-/// The tag set a `ListTagsForResource` body reports, as a sorted map so two sets compare
-/// independently of iteration order.
-async fn reported_tags(h: &Harness, arn: &str, case: &str) -> BTreeMap<String, String> {
-    let reply = list_tags(h, arn).await;
-    let body = reply.ok(case);
-    body.get("tags")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("case {case:?}: no tags map in {body:?}"))
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("case {case:?}: tag {key:?} is not a string"))
-                    .to_string(),
-            )
-        })
-        .collect()
 }
 
 /// The expected set, as the same sorted map.
@@ -244,7 +223,7 @@ async fn a_removal_deletes_exactly_the_named_keys_and_nothing_else() {
         let arn = seed(&h, index, &row.stored);
 
         remove(&h, &arn, &row.removed).await.ok(&case);
-        let got = reported_tags(&h, &arn, &case).await;
+        let got = reported_tags_of(&h, &arn, &case).await;
         assert_eq!(
             got,
             expected(&row.want),
@@ -255,7 +234,7 @@ async fn a_removal_deletes_exactly_the_named_keys_and_nothing_else() {
         // `@idempotent`: a key that is no longer there is nothing to remove, so the same
         // removal again answers 200 and leaves the same set.
         remove(&h, &arn, &row.removed).await.ok(&case);
-        let again = reported_tags(&h, &arn, &case).await;
+        let again = reported_tags_of(&h, &arn, &case).await;
         assert_eq!(
             again, got,
             "case {case:?}: a repeated removal changed the set to {again:?}"
@@ -267,7 +246,7 @@ async fn a_removal_deletes_exactly_the_named_keys_and_nothing_else() {
     // Per resource: every earlier row still reports its OWN set after every later
     // removal, so a removal addressed to one provider touches no other.
     for (case, arn, want) in &resources {
-        let got = reported_tags(&h, arn, case).await;
+        let got = reported_tags_of(&h, arn, case).await;
         assert_eq!(
             got,
             expected(want),
@@ -284,7 +263,7 @@ async fn a_removed_key_can_be_written_again_and_the_record_is_otherwise_untouche
 
     // A removed key is gone from what the reader reports...
     remove(&h, &arn, &owned(&["env"])).await.ok(case);
-    let after_removal = reported_tags(&h, &arn, case).await;
+    let after_removal = reported_tags_of(&h, &arn, case).await;
     assert_eq!(
         after_removal,
         BTreeMap::new(),
@@ -300,7 +279,7 @@ async fn a_removed_key_can_be_written_again_and_the_record_is_otherwise_untouche
     )
     .await
     .ok(case);
-    let after_rewrite = reported_tags(&h, &arn, case).await;
+    let after_rewrite = reported_tags_of(&h, &arn, case).await;
     let want = expected(&pairs(&[("env", "dev"), ("owner", "platform")]));
     assert_eq!(
         after_rewrite, want,
@@ -362,7 +341,7 @@ async fn a_refused_removal_leaves_every_stored_set_as_it_was() {
     }
 
     // The refused removals removed nothing.
-    let got = reported_tags(&h, &live, "the live provider").await;
+    let got = reported_tags_of(&h, &live, "the live provider").await;
     assert_eq!(
         got,
         expected(&stored),

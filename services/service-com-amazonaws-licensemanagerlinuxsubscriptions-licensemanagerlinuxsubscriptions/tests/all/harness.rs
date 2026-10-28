@@ -17,7 +17,7 @@
 //! suite uses only the part of it that its rules need.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -308,6 +308,37 @@ pub async fn list_tags(h: &Harness, resource_arn: &str) -> Reply {
         None,
     )
     .await
+}
+
+/// The tag set a `ListTagsForResource` body reports, as a sorted map so two sets compare
+/// independently of iteration order.
+///
+/// The ONE projection of that reply in this crate: a suite asserting a tag set states the
+/// set it expects and reads the stored one through here, so the same malformed reply is
+/// reported the same way whichever suite observed it.
+pub fn reported_tags(reply: &Reply, case: &str) -> BTreeMap<String, String> {
+    let body = reply.ok(case);
+    body.get("tags")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("case {case:?}: no tags map in {body:?}"))
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: tag {key:?} is not a string"))
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The tag set the resource `arn` carries, read back over the wire through [`list_tags`]
+/// and projected by [`reported_tags`] — the form a suite holding an ARN rather than a
+/// reply uses.
+pub async fn reported_tags_of(h: &Harness, arn: &str, case: &str) -> BTreeMap<String, String> {
+    reported_tags(&list_tags(h, arn).await, case)
 }
 
 /// `TagResource`: `PUT /tags/{resourceArn}`, whose body carries the `tags` map.

@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::harness::{
-    call, enable_discovery, harness, list_tags, provider_arn_for, seed_discovered_instance,
-    seed_provider, tag, Harness, Reply,
+    call, enable_discovery, harness, list_tags, provider_arn_for, reported_tags,
+    seed_discovered_instance, seed_provider, tag, Harness, Reply,
 };
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::DiscoveredInstanceRecord;
 
@@ -125,26 +125,6 @@ fn expected_tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-/// The tag set a `ListTagsForResource` body reports, as the same sorted map.
-fn reported_tags(reply: &Reply, case: &str) -> BTreeMap<String, String> {
-    reply
-        .ok(case)
-        .get("tags")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("case {case:?}: no tags map in {:?}", reply.body))
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("case {case:?}: tag {key:?} is not a string"))
-                    .to_string(),
-            )
-        })
         .collect()
 }
 

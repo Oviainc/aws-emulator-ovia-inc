@@ -33,6 +33,8 @@ mod shared_discovery_report;
 mod shared_harness;
 #[path = "all/shared_tag_merge.rs"]
 mod shared_tag_merge;
+#[path = "all/shared_tag_projection.rs"]
+mod shared_tag_projection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscription_provider_registration.rs"]

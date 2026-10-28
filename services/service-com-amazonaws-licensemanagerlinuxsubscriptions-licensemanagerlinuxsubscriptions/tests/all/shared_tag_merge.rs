@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::harness::{
-    harness, list_tags, provider_arn, register, seed_provider, tag, Harness, Reply, RED_HAT,
+    harness, provider_arn, register, reported_tags_of, seed_provider, tag, Reply, RED_HAT,
 };
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::MAX_TAGS_PER_RESOURCE as MAX_TAGS;
 
@@ -154,28 +154,6 @@ fn expected_set(row: &Row) -> BTreeMap<String, String> {
     want
 }
 
-/// The tag set the resource `arn` carries, read back over the wire through
-/// `ListTagsForResource`.
-async fn reported_set(h: &Harness, arn: &str, case: &str) -> BTreeMap<String, String> {
-    let reply = list_tags(h, arn).await;
-    reply
-        .ok(case)
-        .get("tags")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("case {case:?}: no tags map in {:?}", reply.body))
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("case {case:?}: tag {key:?} is not a string"))
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
 /// A Secrets Manager ARN satisfying the modelled `SecretArn` pattern.
 fn secret_arn() -> String {
     "arn:aws:secretsmanager:us-west-2:000000000000:secret:rhel-token-shared".to_string()
@@ -197,7 +175,7 @@ async fn through_tag_resource(row: &Row, case: &str) -> (Reply, BTreeMap<String,
         &stored_refs,
     );
     let reply = tag(&h, &arn, &tag_map(&requested_pairs(row.overwrites, row.added))).await;
-    let carried = reported_set(&h, &arn, case).await;
+    let carried = reported_tags_of(&h, &arn, case).await;
     (reply, carried)
 }
 
@@ -225,7 +203,7 @@ async fn through_registration_repeat(row: &Row, case: &str) -> (Reply, BTreeMap<
         }),
     )
     .await;
-    let carried = reported_set(&h, &arn, case).await;
+    let carried = reported_tags_of(&h, &arn, case).await;
     (reply, carried)
 }
 

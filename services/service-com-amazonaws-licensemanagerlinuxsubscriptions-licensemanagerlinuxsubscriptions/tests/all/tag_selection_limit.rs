@@ -34,8 +34,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::harness::{
-    harness, list_tags, provider_arn_for, register, seed_provider, stored_provider_count, tag,
-    untag, Harness, Reply, ACCOUNT, RED_HAT,
+    harness, provider_arn_for, register, reported_tags_of, seed_provider, stored_provider_count,
+    tag, untag, Harness, Reply, ACCOUNT, RED_HAT,
 };
 
 /// The most tags one request may select: the `@length` maximum the model gives every
@@ -180,27 +180,6 @@ impl Selection {
     }
 }
 
-/// The tag set `arn` reports, as a sorted map so two sets compare independently of
-/// iteration order.
-async fn reported_tags(h: &Harness, arn: &str, case: &str) -> BTreeMap<String, String> {
-    let reply = list_tags(h, arn).await;
-    let body = reply.ok(case);
-    body.get("tags")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("case {case:?}: no tags map in {body:?}"))
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value
-                    .as_str()
-                    .unwrap_or_else(|| panic!("case {case:?}: tag {key:?} is not a string"))
-                    .to_string(),
-            )
-        })
-        .collect()
-}
-
 /// Assert `reply` is the surface's size refusal, and that it states nothing of the
 /// request beyond the limit.
 fn assert_tag_limit(reply: &Reply, case: &str) {
@@ -264,7 +243,7 @@ async fn a_tag_selection_past_the_modelled_maximum_is_refused_by_the_tag_surface
                 assert_tag_limit(&reply, &case);
 
                 // Nothing the refused request named was written, removed or registered.
-                let left = reported_tags(&h, &live, &case).await;
+                let left = reported_tags_of(&h, &live, &case).await;
                 assert_eq!(
                     left,
                     expected(3),
@@ -299,7 +278,7 @@ async fn a_tag_selection_within_the_modelled_maximum_is_accepted() {
             .send(&h, &arn, "", count)
             .await
             .ok(&case);
-        let left = reported_tags(&h, &arn, &case).await;
+        let left = reported_tags_of(&h, &arn, &case).await;
         assert_eq!(
             left,
             BTreeMap::new(),
@@ -314,7 +293,7 @@ async fn a_tag_selection_within_the_modelled_maximum_is_accepted() {
         let label = format!("write-{count}");
         let arn = seed(&h, &label, 0);
         Selection::WriteMap.send(&h, &arn, "", count).await.ok(&case);
-        let got = reported_tags(&h, &arn, &case).await;
+        let got = reported_tags_of(&h, &arn, &case).await;
         assert_eq!(
             got,
             expected(count),
@@ -335,7 +314,7 @@ async fn a_tag_selection_within_the_modelled_maximum_is_accepted() {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: no ARN in {:?}", reply.body))
         .to_string();
-    let got = reported_tags(&h, &arn, &case).await;
+    let got = reported_tags_of(&h, &arn, &case).await;
     assert_eq!(
         got,
         expected(MAX_TAG_SELECTION),
