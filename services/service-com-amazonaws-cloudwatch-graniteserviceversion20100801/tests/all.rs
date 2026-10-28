@@ -17,6 +17,8 @@ mod actions_disabled_evaluation_delivery;
 mod alarm_action_dispatch;
 #[path = "all/alarm_action_failures.rs"]
 mod alarm_action_failures;
+#[path = "all/alarm_action_record_order.rs"]
+mod alarm_action_record_order;
 #[path = "all/alarm_action_region.rs"]
 mod alarm_action_region;
 #[path = "all/alarm_actions_switch.rs"]

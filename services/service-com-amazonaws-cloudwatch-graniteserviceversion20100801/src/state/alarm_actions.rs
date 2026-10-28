@@ -326,8 +326,9 @@ impl Transition<'_> {
 /// notifications the resulting transitions owe.
 ///
 /// The one entry point every handler that touches alarms calls: it holds the store's lock
-/// only to evaluate and to take the queue, so the deliveries happen with the lock released
-/// and one request's fan-out cannot block another's read. Delivery is at-most-once: a taken
+/// only to evaluate, to take the queue and to record each execution it has made
+/// ([`record_action`]), so the deliveries themselves happen with the lock released and one
+/// request's fan-out cannot block another's read. Delivery is at-most-once: a taken
 /// notification is gone from the queue, so no later call can publish it twice.
 ///
 /// ONE request's fan-out is bounded by [`MAX_NOTIFICATIONS_PER_REQUEST`]: that many
@@ -384,7 +385,6 @@ async fn settle<Eng: Send + Sync + 'static>(
         return;
     }
 
-    let mut executed: Vec<(String, AlarmHistoryItem)> = Vec::new();
     let mut client: Option<(String, ::aws_sdk_sns::Client)> = None;
     // Every authorization decision this request has already taken. One pass settles the
     // notifications of SEVERAL alarms, and two of them may fire the same topic, so the pair is
@@ -439,10 +439,7 @@ async fn settle<Eng: Send + Sync + 'static>(
                     "this alarm action's topic denies this service the publish, so the \
                      notification is withheld"
                 );
-                executed.push((
-                    notification.alarm_name.clone(),
-                    action_history_item(&notification, action, Some(&failure), now),
-                ));
+                record_action(&state, &notification, action, Some(&failure), now);
                 continue;
             }
             let published = client
@@ -461,22 +458,33 @@ async fn settle<Eng: Send + Sync + 'static>(
                     "an alarm action could not be executed"
                 );
             }
-            executed.push((
-                notification.alarm_name.clone(),
-                action_history_item(&notification, action, failure.as_deref(), now),
-            ));
+            record_action(&state, &notification, action, failure.as_deref(), now);
         }
     }
+}
 
-    if executed.is_empty() {
-        return;
-    }
-    // "Action" is one of the modelled `HistoryItemType` values: the record that the alarm
-    // executed an action, which is where a caller sees that the notification went out.
-    let mut store = state.lock();
-    for (alarm_name, item) in executed {
-        store.record_history(&alarm_name, now, item);
-    }
+/// Record ONE action execution in the history of the alarm that fired it, in its own critical
+/// section — as that execution completes, before the pass goes on to the next one.
+///
+/// "Action" is one of the modelled `HistoryItemType` values: the record that the alarm executed
+/// an action, which is where a caller sees that the notification went out. That record is what
+/// accounts for a delivery, so it is written as the delivery is made and never held back behind
+/// the actions the pass has still to execute: one pass settles the notifications of SEVERAL
+/// alarms, each action a cross-service publish that fans out again inside SNS, so a record
+/// deferred to the end of the pass is a delivery a client can already have received while the
+/// firing alarm's history accounts for nothing — and a pass cut short before its end loses the
+/// record of every delivery it had already made.
+fn record_action(
+    state: &::engine::ServiceState<super::ComAmazonawsCloudwatchGraniteserviceversion20100801State>,
+    notification: &AlarmNotification,
+    action: &str,
+    failure: Option<&str>,
+    now_secs: f64,
+) {
+    let item = action_history_item(notification, action, failure, now_secs);
+    state
+        .lock()
+        .record_history(&notification.alarm_name, now_secs, item);
 }
 
 /// One authorization decision taken in this pass, remembered so the same question is not
