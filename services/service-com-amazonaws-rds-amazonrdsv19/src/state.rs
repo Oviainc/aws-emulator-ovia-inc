@@ -3913,6 +3913,20 @@ pub fn db_cluster_not_found_colon_message(named: &str) -> String {
     format!("DBCluster not found: {named}")
 }
 
+/// The message `ModifyDBCluster` answers an `InvalidDBClusterStateFault` with: the one
+/// FIXED sentence Amazon RDS words for a modification it will not take because the cluster
+/// is not in a state the operation can be performed in — the case a second modification
+/// arriving while the first is still applying lands in.
+///
+/// Unlike the not-found wordings above it has NO variable parts: RDS interpolates neither
+/// the cluster identifier the request carried nor the status the cluster is in, and its
+/// retry hint is the part that tells the caller the refusal is transient and the call can
+/// be made again. So it is a constant rather than a `format!` over the request and the
+/// store, and a caller matching on the text to tell a concurrency collision from a
+/// different refusal of the same fault sees exactly what the real service sends.
+pub const MODIFY_DB_CLUSTER_INVALID_STATE_MESSAGE: &str =
+    "This cluster could not be modified. Please try again";
+
 /// The name AWS gives the DB subnet group it creates alongside an account's default
 /// VPC. `CreateDBSubnetGroup$DBSubnetGroupName` refuses it ("Must not be default")
 /// because the service owns that name, and `CreateDBInstance$PubliclyAccessible`
