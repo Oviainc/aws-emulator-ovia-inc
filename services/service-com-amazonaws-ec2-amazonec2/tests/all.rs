@@ -806,3 +806,9 @@ mod customer_gateways;
 // `GetAssociatedEnclaveCertificateIamRoles` reports back out of that store.
 #[path = "all/enclave_certificate_iam_roles.rs"]
 mod enclave_certificate_iam_roles;
+// Appended at the END of this file, for the reason the header gives. The CREATE side of the
+// network ACL slice: what `CreateNetworkAcl` mints and persists for the VPC it names, what it
+// refuses, and what a created ACL reads back as (the describe's own cover is
+// `describe_network_acls`).
+#[path = "all/network_acls.rs"]
+mod network_acls;

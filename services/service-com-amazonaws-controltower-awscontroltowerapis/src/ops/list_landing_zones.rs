@@ -169,36 +169,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut arns: Vec<String> = store.landing_zones.keys().cloned().collect();
         arns.sort();
 
-        // The token this operation hands out is the index of the next unreturned entry,
-        // so it is only meaningful against this same list.
-        let start = match input.next_token.as_deref() {
-            None | Some("") => 0usize,
-            Some(token) => match token.parse::<usize>() {
-                Ok(index) if index <= arns.len() => index,
-                _ => {
-                    return Err(ListLandingZonesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token} was not returned by a previous \
-                                 ListLandingZones call"
-                            ),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
-
+        // The page the call asks for, cut out by this crate's one pagination rule: the
+        // token is the index of the next unreturned entry, and this operation lists the
+        // whole collection, so the token means the same to every call.
         // `maxResults` is modelled `range 1..1`, so the boundary validator has already
-        // refused anything else; absent, every remaining entry is returned. The floor of
-        // 1 keeps a page from being empty-but-tokened should the model ever widen the
-        // range downwards.
-        let limit = input
-            .max_results
-            .map_or(arns.len(), |max| max.max(1) as usize);
-        let end = start.saturating_add(limit).min(arns.len());
+        // refused anything else.
+        let (page, next_token) = crate::state::page(
+            Self::NAME,
+            crate::state::TokenScope::WholeListing,
+            input.next_token.as_deref(),
+            input.max_results,
+            &arns,
+        )
+        .map_err(|message| {
+            ListLandingZonesErrorModeled::ValidationException(ValidationException { message })
+        })?;
 
-        let landing_zones: Vec<LandingZoneSummary> = arns[start..end]
+        let landing_zones: Vec<LandingZoneSummary> = page
             .iter()
             .map(|arn| LandingZoneSummary {
                 arn: Some(arn.clone()),
@@ -207,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListLandingZonesOutput {
             landing_zones,
-            next_token: (end < arns.len()).then(|| end.to_string()),
+            next_token,
         })
     }
 }
