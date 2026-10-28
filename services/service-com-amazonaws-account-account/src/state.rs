@@ -690,7 +690,9 @@ pub struct PrimaryEmailUpdate {
     /// Held so the transition is owed by the CLOCK rather than by whoever
     /// happens to call next: [`settled_status`](Self::settled_status) reports
     /// the terminal status from that instant on, whether or not anybody read or
-    /// wrote in between.
+    /// wrote in between. When the completion it names counts as OWED is decided
+    /// in one place, by this type's own `due_completion`, which every reader and
+    /// every writer of the status goes through.
     pub completes_at: Option<SystemTime>,
 }
 
@@ -739,12 +741,29 @@ impl PrimaryEmailUpdate {
         self.completes_at = Some(now + PRIMARY_EMAIL_UPDATE_COMPLETION);
     }
 
+    /// The instant this update's completion came DUE, once it is owed as of
+    /// `now`, and `None` while nothing is owed — either because no completion
+    /// is pending ([`completes_at`](Self::completes_at) is unset) or because
+    /// its due instant is still ahead of `now`.
+    ///
+    /// The ONE statement of that rule. The status read, the address read and
+    /// the two mutating primary-email operations all decide through it — via
+    /// [`settled_status`](Self::settled_status),
+    /// [`settled_address`](Self::settled_address),
+    /// [`settled_updated_at`](Self::settled_updated_at) and
+    /// [`settle`](Self::settle) — so when a completion counts as owed changes
+    /// here alone and cannot drift between the answers those operations give
+    /// about one stored instant.
+    fn due_completion(&self, now: SystemTime) -> Option<SystemTime> {
+        self.completes_at.filter(|due| now >= *due)
+    }
+
     /// This update's status as of `now`: an accepted update whose due instant
     /// has passed IS `COMPLETED` from that instant on, and every other status
     /// is the stored one. A pure function of the record and the clock, so a
     /// reader reports the settled status without writing anything.
     pub fn settled_status(&self, now: SystemTime) -> &str {
-        if self.completes_at.is_some_and(|due| now >= due) {
+        if self.due_completion(now).is_some() {
             COMPLETED_PRIMARY_EMAIL_UPDATE_STATUS
         } else {
             &self.status
@@ -758,8 +777,8 @@ impl PrimaryEmailUpdate {
     /// without writing anything — the counterpart of
     /// [`settled_status`](Self::settled_status).
     pub fn settled_address(&self, now: SystemTime) -> Option<&str> {
-        self.completes_at
-            .is_some_and(|due| now >= due)
+        self.due_completion(now)
+            .is_some()
             .then_some(self.requested_email.as_str())
     }
 
@@ -767,10 +786,7 @@ impl PrimaryEmailUpdate {
     /// the due instant for a completion the clock already owes, else the instant
     /// the stored status was written.
     pub fn settled_updated_at(&self, now: SystemTime) -> SystemTime {
-        match self.completes_at {
-            Some(due) if now >= due => due,
-            _ => self.updated_at,
-        }
+        self.due_completion(now).unwrap_or(self.updated_at)
     }
 
     /// Materialise the completion the clock already owes: an `ACCEPTED` update
@@ -782,10 +798,7 @@ impl PrimaryEmailUpdate {
     /// see ([`settled_status`](Self::settled_status) reports the same status
     /// from the same instant without writing), and it is idempotent.
     pub fn settle(&mut self, now: SystemTime) -> Option<String> {
-        let due = self.completes_at?;
-        if now < due {
-            return None;
-        }
+        let due = self.due_completion(now)?;
         self.status = COMPLETED_PRIMARY_EMAIL_UPDATE_STATUS.to_string();
         self.updated_at = due;
         self.completes_at = None;

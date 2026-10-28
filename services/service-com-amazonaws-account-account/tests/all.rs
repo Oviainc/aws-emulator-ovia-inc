@@ -41,6 +41,8 @@ mod phone_number_verification;
 mod primary_contact_address_rules;
 #[path = "all/primary_email_address_syntax.rs"]
 mod primary_email_address_syntax;
+#[path = "all/primary_email_completion_due_rule.rs"]
+mod primary_email_completion_due_rule;
 #[path = "all/primary_email_read.rs"]
 mod primary_email_read;
 #[path = "all/primary_email_update.rs"]
