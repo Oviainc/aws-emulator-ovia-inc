@@ -26,8 +26,11 @@
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::organizations_access_report_generation::record_organization;
 use crate::role_lifecycle::{borrowed, param};
-use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
+use crate::user_lifecycle::{
+    account_id, call, element, elements, error_code, router, router_with_engine,
+};
 
 /// A managed policy document with a single statement.
 const POLICY_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#;
@@ -827,7 +830,14 @@ async fn moving_a_user_onto_a_held_name_is_refused() {
 /// the modelled not-found.
 #[tokio::test]
 async fn an_access_report_job_is_recorded_and_reported_until_the_clock_completes_it() {
-    let router = router();
+    // The generate is served only to the management account of the organization the entity
+    // path names ("to call this operation, you must be signed in using your Organizations
+    // management account credentials"), so the fixture records this account as the
+    // management account of the organization every row below asks about;
+    // `tests/all/organizations_access_report_generation.rs` owns the refusal every other
+    // caller gets.
+    let (router, engine) = router_with_engine();
+    record_organization(&engine, "o-abcdefghij", account_id());
     let case = "the report fixtures";
 
     // Rows spanning the Organizations entities a report can be asked for, as
@@ -964,7 +974,10 @@ async fn an_access_report_job_is_recorded_and_reported_until_the_clock_completes
 /// the next generate is served again.
 #[tokio::test]
 async fn one_access_report_generation_too_many_is_refused_while_the_others_run() {
-    let router = router();
+    // The management account of the organization the rows ask about, for the reason
+    // `an_access_report_job_is_recorded_and_reported_until_the_clock_completes_it` states.
+    let (router, engine) = router_with_engine();
+    record_organization(&engine, "o-abcdefghij", account_id());
     let limit = state::MAX_CONCURRENT_ACCESS_REPORT_JOBS;
     for index in 0..limit {
         let body = expect_ok(

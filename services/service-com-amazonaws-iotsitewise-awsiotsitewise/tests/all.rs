@@ -50,6 +50,14 @@ mod execute_action;
 #[path = "all/describe_action_reads.rs"]
 mod describe_action_reads;
 
+// `composition_relationships` is declared HERE, after the action suites, rather
+// than at the head of the file, in the sorted list or at the END: all three are
+// stretches a concurrent iotsitewise change puts a declaration of its own in, and
+// two attempts to land this one at the head collided with a branch that had just
+// inserted beside it. Fold it into the list once the churn settles.
+#[path = "all/composition_relationships.rs"]
+mod composition_relationships;
+
 // `reserved_tag_keys` is declared here too, at the head of the file, for the
 // reason the note above gives: the sorted list and the tail of the file are both
 // where every concurrent iotsitewise change puts a declaration of its own, and

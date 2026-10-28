@@ -1098,6 +1098,29 @@ impl DomainNameEntry {
     pub fn key(&self) -> String {
         domain_name_key(&self.domain_name, self.domain_name_id.as_deref())
     }
+
+    /// The base paths of this domain name's mappings in creation order: the stable
+    /// sequence a `position` cursor walks and [`page_of`] cuts a `GetBasePathMappings`
+    /// page out of.
+    ///
+    /// The rank is the [`BasePathMappingEntry::sequence`] the create stamped on each
+    /// mapping — the same rank every other collection of this service is ordered by — so
+    /// the listing reports the order the mappings were created in rather than the
+    /// base-path order [`Self::base_path_mappings`] happens to hold them in; the base path
+    /// breaks a tie no create can actually produce, which keeps the order total. A base
+    /// path IS the key of the mapping it names, so the sequence is also what
+    /// `GetBasePathMapping` addresses each listed record by.
+    pub fn base_paths_in_creation_order(&self) -> Vec<String> {
+        let mut ordered: Vec<&BasePathMappingEntry> = self.base_path_mappings.values().collect();
+        ordered.sort_by(|left, right| {
+            (left.sequence, left.base_path.as_str())
+                .cmp(&(right.sequence, right.base_path.as_str()))
+        });
+        ordered
+            .into_iter()
+            .map(|mapping| mapping.base_path.clone())
+            .collect()
+    }
 }
 
 /// One stored `BasePathMapping`: the base path of a custom domain name, and the REST API

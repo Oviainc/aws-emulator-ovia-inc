@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCompositionRelationships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCompositionRelationships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCompositionRelationships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation enumerates, as a page, the composite models stored
+//! in the shared engine store (`crate::state`) that reuse the named asset model as
+//! their component model; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +150,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // A listing needs no request metadata: the enumeration is a function of the
+        // store and the query parameters alone.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCompositionRelationships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCompositionRelationshipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+
+        // A pure read: nothing below writes, so two callers listing the same asset
+        // model in either order are answered identically.
+        let store = state.lock();
+        // The modelled `assetModelId` pattern admits the raw UUID alone, and the
+        // documentation also names the `externalId:` form, so the label is resolved
+        // through the shared resolver that accepts either.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| not_found(&input.asset_model_id))?;
+
+        // A composition relationship is what naming `composedAssetModelId` on
+        // `CreateAssetModelCompositeModel` establishes: the composite model that
+        // names it REUSES the asset model it names, which only a `COMPONENT_MODEL`
+        // can be. So the relationships OF an asset model are every composite model,
+        // on any stored asset model, whose component model is this one; an asset
+        // model nothing reuses, including one of a type nothing may reuse, is in no
+        // relationship and is answered with the empty page rather than refused.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCompositionRelationships"))
+        // A stable order is what makes `nextToken` resumable: the asset models
+        // holding the composite models oldest first, ties broken by id so two
+        // created in the same instant still order deterministically — the order
+        // `ListAssetModels` enumerates in — and within one holder the stored order
+        // of its composite models.
+        let mut holders: Vec<&crate::state::AssetModelRecord> =
+            store.asset_models.values().collect();
+        holders.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut summaries: Vec<CompositionRelationshipSummary> = Vec::new();
+        for holder in holders {
+            for composite in &holder.composite_models {
+                // A composite model's link — the component model it reuses — is
+                // keyed by its id, so one carrying no id holds no link and is in no
+                // relationship to report here.
+                let Some(composite_id) = composite.id.as_deref() else {
+                    continue;
+                };
+                if holder.composed_asset_model_id(composite_id) != Some(asset_model_id.as_str()) {
+                    continue;
+                }
+                // Every member is read from the stored composite model and from the
+                // asset model holding it, so a listed relationship reports the same
+                // composite model `DescribeAssetModelCompositeModel` reads back.
+                summaries.push(CompositionRelationshipSummary {
+                    asset_model_id: holder.id.clone(),
+                    asset_model_composite_model_id: composite_id.to_string(),
+                    asset_model_composite_model_type: composite.r#type.clone(),
+                });
+            }
+        }
+
+        // This enumeration's resume point is a composite model's id — globally
+        // unique across the stored asset models — and the page walk every paginated
+        // listing of this service shares takes it from there: it resumes at the
+        // token's relationship, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page, which would report
+        // absence as success; it cuts the page at `maxResults`, defaulting to the
+        // size AWS documents for this operation; and it mints the next token from
+        // the relationship that follows the page.
+        let page = crate::state::page_of(
+            &summaries,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |summary| summary.asset_model_composite_model_id.clone(),
+        )
+        .ok_or_else(invalid_token)?;
+
+        Ok(ListCompositionRelationshipsOutput {
+            composition_relationship_summaries: summaries[page.start..page.end].to_vec(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> ListCompositionRelationshipsError {
+    ListCompositionRelationshipsErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+fn invalid_token() -> ListCompositionRelationshipsError {
+    ListCompositionRelationshipsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the asset model label that
+/// resolved to nothing.
+fn not_found(label: &str) -> ListCompositionRelationshipsError {
+    ListCompositionRelationshipsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_ASSET_MODEL, label),
+        },
+    )
+    .into()
 }
