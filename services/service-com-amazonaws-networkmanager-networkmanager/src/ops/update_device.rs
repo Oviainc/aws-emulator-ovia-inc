@@ -239,26 +239,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one its input carries. An unresolvable reference is therefore the same FIELD
         // failure that create answers, not the missing-resource answer this operation gives
         // for the resources its PATH addresses.
-        let requested_site: Option<Option<String>> = match input.site_id.as_deref() {
-            None => None,
-            Some("") => Some(None),
-            Some(site_id) => {
-                let site_resolves = store
-                    .sites
-                    .get(site_id)
-                    .is_some_and(|site| site.global_network_id == input.global_network_id);
-                if !site_resolves {
-                    return Err(UpdateDeviceErrorModeled::ValidationException(
-                        crate::state::unknown_reference(
-                            crate::state::FIELD_SITE_ID,
-                            crate::state::SITE_KIND,
-                        ),
-                    )
-                    .into());
+        let requested_site: Option<Option<String>> =
+            match crate::state::requested_reference(input.site_id.as_deref()) {
+                None => None,
+                Some(None) => Some(None),
+                Some(Some(site_id)) => {
+                    let site_resolves = store
+                        .sites
+                        .get(site_id)
+                        .is_some_and(|site| site.global_network_id == input.global_network_id);
+                    if !site_resolves {
+                        return Err(UpdateDeviceErrorModeled::ValidationException(
+                            crate::state::unknown_reference(
+                                crate::state::FIELD_SITE_ID,
+                                crate::state::SITE_KIND,
+                            ),
+                        )
+                        .into());
+                    }
+                    Some(Some(site_id.to_string()))
                 }
-                Some(Some(site_id.to_string()))
-            }
-        };
+            };
 
         // A link association exists only while its device and its link sit at the SAME site
         // ("The device and link must be in the same global network and the same site",

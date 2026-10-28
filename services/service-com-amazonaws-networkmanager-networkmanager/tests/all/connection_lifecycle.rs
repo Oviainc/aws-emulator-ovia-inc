@@ -7,7 +7,9 @@
 //! the members the request carries — an absent member leaves the stored value as it was, a
 //! supplied one replaces it (an empty string included, which is how the service documents
 //! removing information: "To remove information for any of the parameters, specify an
-//! empty string", `smithy_query query="doc" shape="UpdateConnection"`) — and rewrites
+//! empty string", `smithy_query query="doc" shape="UpdateConnection"`, which on a link
+//! REFERENCE means the record names no link afterwards — see
+//! `update_empty_optional_reference`) — and rewrites
 //! nothing else: ids, ARN, the two devices, `CreatedAt`, tags, the clock-derived lifecycle
 //! state and every other record stay as they were. Addressing a resource the store does
 //! not hold under the path's parent is the missing-resource answer (404
@@ -521,10 +523,12 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             connected_link: json!(connected_link),
         },
         UpdateCase {
+            // An emptied link REFERENCE names no link, so the member is absent from the
+            // record afterwards — the state a create with the same spelling stores.
             case: "an empty LinkId removes the link it held",
             body: json!({ "LinkId": "" }),
             description: json!(BASE_DESCRIPTION),
-            link: json!(""),
+            link: Value::Null,
             connected_link: json!(connected_link),
         },
         UpdateCase {
@@ -532,14 +536,14 @@ fn update_cases(seed: &Fixture) -> Vec<UpdateCase> {
             body: json!({ "ConnectedLinkId": "" }),
             description: json!(BASE_DESCRIPTION),
             link: json!(link),
-            connected_link: json!(""),
+            connected_link: Value::Null,
         },
         UpdateCase {
             case: "both links removed at once",
             body: json!({ "LinkId": "", "ConnectedLinkId": "" }),
             description: json!(BASE_DESCRIPTION),
-            link: json!(""),
-            connected_link: json!(""),
+            link: Value::Null,
+            connected_link: Value::Null,
         },
         UpdateCase {
             case: "a Description at the modelled maximum of 256 characters",
@@ -766,7 +770,7 @@ async fn successive_updates_accumulate_on_the_stored_record() {
             }),
             description: json!("second"),
             link: json!(seed.link),
-            connected_link: json!(""),
+            connected_link: Value::Null,
         },
     ];
 

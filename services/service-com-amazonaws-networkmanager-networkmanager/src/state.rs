@@ -477,6 +477,20 @@ pub fn optional_reference<Id: AsRef<str>>(supplied: Option<Id>) -> Option<Id> {
     supplied.filter(|id| !id.as_ref().is_empty())
 }
 
+/// What an UPDATE writes for an OPTIONAL reference member: the outer `Option` says whether
+/// the request spoke about the member at all, the inner one what the member names.
+///
+/// `None` is the member the request does not carry, which leaves the stored value where it
+/// is. `Some(inner)` is a member the request supplies, and `inner` is what it names under
+/// the one reading this service gives these members ([`optional_reference`]): `Some(id)` for
+/// an id to resolve, `None` for the empty string, which names no resource and is therefore
+/// written as none rather than stored verbatim. So an update that empties a reference leaves
+/// the record in the state a create with the same spelling leaves it in, and no stored
+/// reference ever names an id nothing can be stored under.
+pub fn requested_reference(supplied: Option<&str>) -> Option<Option<&str>> {
+    supplied.map(|id| optional_reference(Some(id)))
+}
+
 /// The modelled `ValidationException` (HTTP 400) a create answers when one of the
 /// references its input carries — the parent the new resource must hang off — names no
 /// stored resource.

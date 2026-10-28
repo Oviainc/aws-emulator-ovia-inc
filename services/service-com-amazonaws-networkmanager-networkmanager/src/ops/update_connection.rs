@@ -12,8 +12,9 @@
 //! removing information ("To remove information for any of the parameters, specify an
 //! empty string"). A link reference the request supplies is resolved within the same
 //! global network first, so no update can leave the record pointing at a link that is not
-//! there. The record's identity (ids, ARN, the two devices, `CreatedAt`, tags and the
-//! clock-derived lifecycle state) is never rewritten here.
+//! there, and the empty string names no link at all, so it is stored as none — the state a
+//! create with the same spelling stores. The record's identity (ids, ARN, the two devices,
+//! `CreatedAt`, tags and the clock-derived lifecycle state) is never rewritten here.
 //!
 //! ## Shape of an operation
 //!
@@ -205,16 +206,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this global network does not hold. The empty string is the documented REMOVAL of
         // the information the member held ("To remove information for any of the
         // parameters, specify an empty string", `smithy_query query="doc"
-        // shape="UpdateConnection"`), so it names no link and resolves nothing
-        // ([`crate::state::optional_reference`]).
-        for (member, link_id) in [
-            (crate::state::FIELD_LINK_ID, input.link_id.as_deref()),
+        // shape="UpdateConnection"`), so it names no link: it resolves nothing here and is
+        // what gets WRITTEN below — as none, not as the id of a link nothing can be stored
+        // under ([`crate::state::requested_reference`]).
+        let requested_link = crate::state::requested_reference(input.link_id.as_deref());
+        let requested_connected_link =
+            crate::state::requested_reference(input.connected_link_id.as_deref());
+        for (member, requested) in [
+            (crate::state::FIELD_LINK_ID, requested_link),
             (
                 crate::state::FIELD_CONNECTED_LINK_ID,
-                input.connected_link_id.as_deref(),
+                requested_connected_link,
             ),
         ] {
-            let Some(link_id) = crate::state::optional_reference(link_id) else {
+            let Some(Some(link_id)) = requested else {
                 continue;
             };
             let resolves = store
@@ -246,16 +251,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only the members the request supplied are changed; an absent member leaves the
         // stored value alone, and a supplied one replaces it — an empty string is how the
-        // caller removes the information it holds. The two devices, the ids, the ARN,
-        // `CreatedAt` and tags are never rewritten.
+        // caller removes the information it holds, which for a link REFERENCE means the
+        // record names no link at all rather than naming the empty id. The two devices, the
+        // ids, the ARN, `CreatedAt` and tags are never rewritten.
         if input.description.is_some() {
             record.description = input.description;
         }
-        if input.link_id.is_some() {
-            record.link_id = input.link_id;
+        if let Some(link_id) = requested_link {
+            record.link_id = link_id.map(str::to_string);
         }
-        if input.connected_link_id.is_some() {
-            record.connected_link_id = input.connected_link_id;
+        if let Some(connected_link_id) = requested_connected_link {
+            record.connected_link_id = connected_link_id.map(str::to_string);
         }
         // An update is not applied instantly: AWS answers the reconfigured connection in
         // the non-terminal `UPDATING` state, so the clock owes the `UPDATING` ->

@@ -187,6 +187,8 @@ mod unknown_parent_reference;
 mod update_core_network;
 #[path = "all/update_device.rs"]
 mod update_device;
+#[path = "all/update_empty_optional_reference.rs"]
+mod update_empty_optional_reference;
 #[path = "all/update_link.rs"]
 mod update_link;
 #[path = "all/update_site.rs"]
