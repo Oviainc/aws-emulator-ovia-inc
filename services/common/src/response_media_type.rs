@@ -54,23 +54,22 @@
 //! producer wrote it rather than relabelled.
 //!
 //! This rule is CALLED by
-//! `service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator` and
-//! `service-com-amazonaws-freetier-awsfreetierservice`, and it lives here
-//! rather than in that crate because it is not that service's rule alone: the sibling
+//! `service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator`,
+//! `service-com-amazonaws-freetier-awsfreetierservice` and
 //! `service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice` — the same AWS billing
-//! front door, the same `1.1` framing over an `awsJson1_0` model — states it inline today
-//! (`src/service/response_media_type.rs`), as do
-//! `service-com-amazonaws-amp-amazonprometheusservice` (`RESPONSE_CONTENT_TYPE` in its
-//! `src/state.rs`, with the rewrite in its `src/service.rs`) and
+//! front door, the same `1.1` framing over an `awsJson1_0` model — each of which states
+//! only its own pair (`RESPONSE_MEDIA_TYPE`) and takes the mechanism, including
+//! [`ResponseMediaTypeOperation`], from here.
+//!
+//! STILL TO MIGRATE onto this module: `service-com-amazonaws-amp-amazonprometheusservice`
+//! (`RESPONSE_CONTENT_TYPE` in its `src/state.rs`, with the rewrite in its
+//! `src/service.rs`) and
 //! `service-com-amazonaws-bcmrecommendedactions-awsbillingandcostmanagementrecommendedactions`
 //! (which takes `override_protocol` alone, so the responses its framework renders still
-//! announce the protocol-implied value).
-//!
-//! STILL TO MIGRATE: those three onto this module — `bcmdashboards` including its own copy
-//! of [`ResponseMediaTypeOperation`]. Each is a change of its own rather than a side effect
-//! of the fix that hoisted the rule — two of them need a path dependency their crate does
-//! not carry yet, and none of their issues or recordings is owned here — but nothing new
-//! should state the rule a fourth time.
+//! announce the protocol-implied value). Each is a change of its own rather than a side
+//! effect of the fix that hoisted the rule — both need a path dependency their crate does
+//! not carry yet, and neither's issues or recordings is owned here — but nothing new
+//! should state the rule again.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{

@@ -46,7 +46,11 @@
 //! Five of those seams are taken here. Four of them are taken for the one reason named in
 //! [`response_media_type`]: every response this service answers announces the media type
 //! the real service stamps (`application/x-amz-json-1.1`) rather than the one the model's
-//! `awsJson1_0` protocol trait implies.
+//! `awsJson1_0` protocol trait implies. The rule itself, the one function that applies it
+//! and the operation-seam wrapper that carries it to the framework's refusal tail live in
+//! [`service_common::response_media_type`];
+//! [`RESPONSE_MEDIA_TYPE`](response_media_type::RESPONSE_MEDIA_TYPE) is this service's
+//! pair.
 //!
 //! - `override_protocol` serves the awsJson `1.1` codec, which is the one place the media
 //!   type of a response this SERVICE produces — a success, and any error its handler
@@ -55,7 +59,9 @@
 //! - `override_operation`, `override_routing_error` and `override_framework_error`
 //!   re-announce the responses the FRAMEWORK renders in front of the service, which
 //!   `override_protocol` does not reach: a refusal of a modelled constraint, an unroutable
-//!   request, and a transport-level failure.
+//!   request, and a transport-level failure. The first hands back the shared
+//!   [`ResponseMediaTypeOperation`], which serves the modelled operation the generated
+//!   routing table names and re-announces what that walk answered.
 //!
 //! The fifth, `override_refusal`, is taken for a different reason: a boundary refusal of a
 //! `@pattern`-constrained member quotes the expression the service publishes rather than
@@ -64,6 +70,8 @@
 
 pub mod response_media_type;
 
+use response_media_type::RESPONSE_MEDIA_TYPE;
+use service_common::response_media_type::ResponseMediaTypeOperation;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -84,7 +92,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The wrapper every routable request is served through, which re-announces the one
     /// response `override_protocol` cannot reach. Held in a field, built once, because
     /// `override_operation` hands back a reference to it.
-    media_type: response_media_type::ResponseMediaTypeOperation,
+    media_type: ResponseMediaTypeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -95,7 +103,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             protocol: aws_smithy_schema_server::rpc::AwsJson11(),
-            media_type: response_media_type::ResponseMediaTypeOperation,
+            media_type: ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
         }
     }
 }
@@ -129,7 +137,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modelled constraint, rendered inside the centralized walk. The routing stays the
         // model's: a request the table cannot serve is declined here, so the framework
         // answers it as the unroutable request it is — through `override_routing_error`.
-        response_media_type::routes(&self.entry, req).then_some(&self.media_type as _)
+        service_common::response_media_type::routes(&self.entry, req)
+            .then_some(&self.media_type as _)
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
@@ -169,9 +178,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for word, status, code and body alike; only the media type is re-announced, so an
         // unroutable request is answered under the same media type as a routed one (see
         // [`response_media_type`]).
-        Some(response_media_type::with_response_media_type(
-            self.entry.routing_error_response(req),
-        ))
+        Some(RESPONSE_MEDIA_TYPE.announce(self.entry.routing_error_response(req)))
     }
 
     fn override_framework_error(
@@ -192,9 +199,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             aws_smithy_schema_server::ProtocolError::Malformed(message) => {
                 let rebuilt =
                     aws_smithy_schema_server::ProtocolError::Malformed(message.clone());
-                Some(response_media_type::with_response_media_type(
-                    self.entry.framework_error_response(rebuilt),
-                ))
+                Some(RESPONSE_MEDIA_TYPE.announce(self.entry.framework_error_response(rebuilt)))
             }
             _ => None,
         }

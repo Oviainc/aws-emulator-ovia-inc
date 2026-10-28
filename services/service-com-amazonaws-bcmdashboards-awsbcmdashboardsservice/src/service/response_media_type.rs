@@ -20,137 +20,36 @@
 //! real service fronts its awsJson1_0 API with a dispatcher that stamps the 1.1 media type
 //! on what it sends back — and the wire record is what a client sees.
 //!
-//! # Where it is decided
+//! # Where the rule lives
 //!
-//! Two places, because one seam cannot reach every response:
-//!
-//! * `Service::override_protocol` returns the awsJson `1.1` server protocol
-//!   ([`aws_smithy_schema_server::rpc::AwsJson11`]), which is the codec the centralized
-//!   walk serializes this service's own responses with — every success and every error a
-//!   handler raises (a modelled exception, the handler's own `ValidationException`, the
-//!   scaffold's 501). That is the one place a serializer's media type is chosen, and no
-//!   operation handler is involved.
-//! * The responses the FRAMEWORK renders in front of the service keep the model-derived
-//!   envelope, which `override_protocol` deliberately does not reach (see its contract in
-//!   `vendor/smithy-server-runtime/src/service.rs`): the refusal tail that answers a
-//!   constraint the model declares, the routing failure, and a transport failure. Those
-//!   are re-announced with [`with_response_media_type`], which replaces the
-//!   protocol-implied media type and nothing else. [`ResponseMediaTypeOperation`] is what
-//!   reaches the refusal tail: it is the wrapper the service hands back from
-//!   `Service::override_operation`, it serves the modelled operation the generated routing
-//!   table names for the request — so the framework still owns the whole
-//!   deserialize → validate → handle → serialize walk and every status, code, message and
-//!   body it answers with — and then re-announces the response. The service's
-//!   `override_routing_error` and `override_framework_error` seams re-announce the other
-//!   two.
-//!
-//! Nothing else about a response is touched: the status, the headers and every body byte
-//! stay with the framework renderer that owns them, and a response whose media type is NOT
-//! the one the protocol trait implies — an event-stream frame, say — is left exactly as its
-//! producer wrote it rather than relabelled.
-//!
-//! One response is still announced by the framework alone, because no author seam reaches
-//! it: the authentication refusal, which the router renders through
-//! `definition().refusal_response(..)` before this service is asked anything
-//! (`vendor/smithy-server-runtime/src/multi_service_router.rs`). It is pinned by
-//! `tests/all/response_media_type.rs` so the gap is recorded rather than hidden.
+//! Not here. The rule, the one function that applies it
+//! ([`ResponseMediaType::announce`]) and the operation-seam wrapper that carries it to the
+//! framework's refusal tail
+//! ([`ResponseMediaTypeOperation`](service_common::response_media_type::ResponseMediaTypeOperation))
+//! are [`service_common::response_media_type`], the tree's one statement of them. This
+//! module holds only what is this SERVICE's: the pair its responses are re-announced
+//! across, named once so every seam in [`crate::service`] reads the same two values. Which
+//! seams those are, and the one response no author seam reaches — the authentication
+//! refusal, which the router renders before this service is asked anything — are in that
+//! file's header and pinned by `tests/all/response_media_type.rs`.
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
+use service_common::response_media_type::{ResponseMediaType, AWS_JSON_1_0, AWS_JSON_1_1};
 
-/// The response header carrying the media type.
-const CONTENT_TYPE: &str = "content-type";
-
-/// The media type the model's `awsJson1_0` protocol trait implies for a response, stamped
-/// verbatim by the framework's own renderers — `AwsJson10()` in
-/// `vendor/smithy-schema-server/src/rpc.rs` for a serialized body, and the macro's
-/// per-protocol pre-dispatch declaration for a framework-rendered one. This exact value is
-/// the ONLY one re-announced: anything else on a response was chosen by its producer.
-pub const PROTOCOL_MEDIA_TYPE: &str = "application/x-amz-json-1.0";
-
-/// The media type this service answers under, on every response, as the wire record shows.
-pub const RESPONSE_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
-
-/// `resp` as this service announces it: the protocol-implied media type replaced by the one
-/// it answers under. Any other `content-type`, and a response carrying none, is returned
-/// untouched.
-pub fn with_response_media_type(mut resp: RtResponse) -> RtResponse {
-    if resp.headers().get(CONTENT_TYPE) == Some(PROTOCOL_MEDIA_TYPE) {
-        resp.headers_mut().insert(CONTENT_TYPE, RESPONSE_MEDIA_TYPE);
-    }
-    resp
-}
-
-/// Whether the generated routing table can serve this request — the condition under which
-/// this service claims it for [`ResponseMediaTypeOperation`].
-///
-/// A request the table cannot serve is declined rather than claimed, so the router answers
-/// it as the unroutable request it is (through `Service::override_routing_error`) instead of
-/// authenticating a request that names no operation first.
-pub fn routes<Eng: Send + Sync + 'static>(
-    entry: &crate::ServiceDefinition<Eng>,
-    req: &RtRequest,
-) -> bool {
-    entry
-        .protocol()
-        .routing_key(req)
-        .ok()
-        .and_then(|key| entry.routing_table().get(key))
-        .is_some()
-}
-
-/// Serves a modelled operation through the framework exactly as the routing table would,
-/// then announces the response as this service announces it.
-///
-/// This wrapper exists for ONE response: the framework-level refusal tail, which renders a
-/// constraint the model declares in the model-derived envelope INSIDE the centralized walk
-/// (`run_operation_http`), where `Service::override_protocol` explicitly does not reach.
-/// Every other response of a routed request is already serialized by the protocol that seam
-/// returns, so [`with_response_media_type`] finds nothing to change on it.
-///
-/// It stores no operation of its own: the one it delegates to is the one the service's
-/// routing table names for the request, resolved from the `svc` the framework passes into
-/// [`ErasedOperation::run`] — a wrapper held on the service cannot borrow from the entry it
-/// is held beside, which is why the key is resolved here rather than carried in.
-pub struct ResponseMediaTypeOperation;
-
-impl ErasedOperation for ResponseMediaTypeOperation {
-    fn run<'r>(
-        &'r self,
-        svc: &'r dyn Service,
-        req: &'r RtRequest,
-        ctx: &'r OperationContext<'r>,
-    ) -> BoxFuture<'r, RtResponse> {
-        Box::pin(async move {
-            let definition = svc.definition();
-            let modeled = definition
-                .protocol()
-                .routing_key(req)
-                .ok()
-                .and_then(|key| definition.routing_table().get(key));
-            let resp = match modeled {
-                Some(op) => op.run(svc, req, ctx).await,
-                // Unreachable through `Service::override_operation`, which claims a
-                // request only when the routing table holds its key; answered as the
-                // framework answers an unroutable request rather than guessed at.
-                None => definition.routing_error_response(req),
-            };
-            with_response_media_type(resp)
-        })
-    }
-
-    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        // `None` is "defer to the modelled operation the routing key names" — which is
-        // the operation this wrapper delegates to, so its model-declared schemes decide
-        // and this wrapper cannot weaken them.
-        None
-    }
-}
+/// The pair this service's responses are re-announced across: the media type its model's
+/// `awsJson1_0` protocol trait implies — stamped verbatim by the framework's own renderers,
+/// and the ONLY value replaced — and the `application/x-amz-json-1.1` its recorded wire
+/// announces.
+pub const RESPONSE_MEDIA_TYPE: ResponseMediaType =
+    ResponseMediaType::new(AWS_JSON_1_0, AWS_JSON_1_1);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_runtime_api::http::Response as RtResponse;
     use aws_smithy_types::body::SdkBody;
+
+    /// The response header carrying the media type.
+    const CONTENT_TYPE: &str = "content-type";
 
     /// A response carrying `content_type`, or none at all when it is `None`.
     fn response(content_type: Option<&str>) -> RtResponse {
@@ -196,7 +95,7 @@ mod tests {
         ];
 
         for (given, expected) in cases {
-            let actual = media_type(&with_response_media_type(response(given)));
+            let actual = media_type(&RESPONSE_MEDIA_TYPE.announce(response(given)));
             assert_eq!(
                 actual.as_deref(),
                 expected,
