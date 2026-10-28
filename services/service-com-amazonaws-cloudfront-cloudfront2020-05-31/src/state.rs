@@ -5113,6 +5113,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             return Err(CreateRefusal::InvalidViewerCertificate(message));
         }
 
+        // A Lambda@Edge association invokes ONE published version of a function, so a
+        // configuration whose association names no version is refused before any
+        // distribution is created carrying it.
+        if let Some(message) = lambda_association_without_version(&config) {
+            return Err(CreateRefusal::InvalidLambdaFunctionAssociation(message));
+        }
+
         // An origin signs its requests to the bucket with the credentials of the origin
         // access control it names, so a configuration can only be stored while every
         // control it names exists: a reference to one this account does not hold is
@@ -6214,6 +6221,10 @@ pub enum CreateRefusal {
     /// access control this account does not hold (see
     /// [`ComAmazonawsCloudfrontCloudfront20200531State::unknown_origin_access_control`]).
     InvalidOriginAccessControl(String),
+    /// `InvalidLambdaFunctionAssociation` — a cache behaviour of the configuration carries
+    /// an edge association naming no published function version (see
+    /// [`lambda_association_without_version`]).
+    InvalidLambdaFunctionAssociation(String),
 }
 
 /// What a create hands back: the new record's id and version token, and the
@@ -8235,6 +8246,73 @@ pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<String>
     }
 }
 
+/// The `InvalidLambdaFunctionAssociation` message for a configuration carrying a
+/// Lambda@Edge association whose ARN names no published function version, or `None` when
+/// every association it carries names one.
+///
+/// `LambdaFunctionAssociation$LambdaFunctionARN` states the rule: "You must specify the ARN
+/// of a function version; you can't specify an alias or $LATEST." A function version is
+/// addressed by the function's ARN carrying that version's NUMBER as its qualifier, so an
+/// association whose value is no Lambda function ARN, carries no qualifier at all, or
+/// carries one that is not a published version number — the `$LATEST` of a function nobody
+/// published, or an alias name — names no version at all.
+///
+/// Checked on the way IN, on every path that stores a `DistributionConfig`, and for EVERY
+/// cache behaviour of it (the default one and each ordered one), so no stored distribution
+/// ever carries an edge association that names nothing invocable: the condition is a
+/// property of the submitted configuration alone, which is why it lives here beside
+/// [`alias_certificate_mismatch`] rather than in one handler.
+pub fn lambda_association_without_version(config: &DistributionConfig) -> Option<String> {
+    behavior_views(config)
+        .iter()
+        .filter_map(|behavior| behavior.lambda_function_associations)
+        .flat_map(|associations| associations.items.as_deref().unwrap_or_default())
+        .any(|association| !names_lambda_function_version(&association.lambda_function_arn))
+        .then(|| INVALID_LAMBDA_FUNCTION_ASSOCIATION_MESSAGE.to_string())
+}
+
+/// Whether `arn` names a PUBLISHED Lambda function version.
+///
+/// A version is addressed by the function's own ARN —
+/// `arn:<partition>:lambda:<region>:<account>:function:<name>` — qualified with the version,
+/// and a published version's qualifier is the number that was assigned when it was
+/// published, counting from 1. So every other value names no version: one that is not a
+/// Lambda function ARN at all, the unqualified function ARN, the `$LATEST` qualifier of the
+/// unpublished function, and an alias name.
+fn names_lambda_function_version(arn: &str) -> bool {
+    // The eight segments of a function-version ARN, read in order and without collecting
+    // them: a value with fewer segments leaves a `None` behind, and one with more is
+    // refused by the final `is_none`.
+    let mut segments = arn.split(':');
+    let prefix = segments.next();
+    let partition = segments.next();
+    let service = segments.next();
+    let region = segments.next();
+    let account = segments.next();
+    let resource = segments.next();
+    let name = segments.next();
+    let qualifier = segments.next();
+    let named = |segment: Option<&str>| segment.is_some_and(|segment| !segment.is_empty());
+    prefix == Some("arn")
+        && service == Some("lambda")
+        && resource == Some("function")
+        && named(partition)
+        && named(region)
+        && named(account)
+        && named(name)
+        && qualifier.is_some_and(is_published_version)
+        && segments.next().is_none()
+}
+
+/// Whether `qualifier` is a published version number: a decimal number counting from 1,
+/// so an empty qualifier, one carrying any non-digit (`$LATEST` and every alias name do)
+/// and one written with a leading zero are all not one.
+fn is_published_version(qualifier: &str) -> bool {
+    !qualifier.is_empty()
+        && !qualifier.starts_with('0')
+        && qualifier.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Which of the two CUSTOM certificate members a `ViewerCertificate` names: the ACM
 /// certificate ARN and the IAM certificate id, in that order.
 ///
@@ -9740,6 +9818,20 @@ pub fn invalid_origin_access_control() -> crate::ops::types::InvalidOriginAccess
 /// is served. Do not "correct" this constant to the documentation sentence.
 pub const INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE: &str =
     "The specified origin access control does not exist or is not valid.";
+
+/// The message `InvalidLambdaFunctionAssociation` carries for an association whose ARN
+/// names no published function version.
+///
+/// Fixed text: what the association broke is the FORM the ARN has to have — the function
+/// ARN qualified with the number of a published version — and the sentence states that
+/// requirement, so no value out of the request belongs in it. Like
+/// [`INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE`] it is the SERVED sentence, which differs from
+/// the one the model's documentation of the error shape uses for the same rule ("The
+/// specified Lambda@Edge function association is invalid."): that one describes the
+/// condition, this one is sent.
+pub const INVALID_LAMBDA_FUNCTION_ASSOCIATION_MESSAGE: &str =
+    "The function ARN must reference a specific function version. (The ARN must end with \
+     the version number.)";
 
 /// The sentence `OriginAccessControlAlreadyExists` carries, up to the control that
 /// already holds the submitted parameters, which it names at the end — the one piece of

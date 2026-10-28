@@ -368,6 +368,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CopyDistributionError
                 message: Some(message),
             })
         }
+        crate::state::CreateRefusal::InvalidLambdaFunctionAssociation(message) => {
+            CopyDistributionErrorModeled::InvalidLambdaFunctionAssociation(
+                InvalidLambdaFunctionAssociation {
+                    message: Some(message),
+                },
+            )
+        }
     }
     .into()
 }
