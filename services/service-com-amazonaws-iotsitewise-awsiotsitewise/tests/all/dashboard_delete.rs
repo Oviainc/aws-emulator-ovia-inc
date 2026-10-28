@@ -19,7 +19,8 @@
 //!   request already served under a token is a RETRY of that call, answered from
 //!   it rather than from a store that no longer holds what it removed, and it
 //!   removes nothing further; a repeat carrying no token, or a token of its own, is
-//!   a new call and draws the not-found refusal.
+//!   a new call and draws the not-found refusal; and a request naming ANOTHER
+//!   dashboard under that spent token is a different delete, which is carried out.
 //!
 //! The rows differ along what the rule generalises over: whether the dashboard
 //! carried tags, whether it had a description, the size of its definition literal,
@@ -572,7 +573,7 @@ async fn a_client_token_serves_one_delete_and_replays_its_retry() {
             &router,
             case.label,
             &project,
-            "the-dashboard-the-spent-token-must-not-delete",
+            "the-dashboard-the-spent-token-deletes",
             None,
             64,
             None,
@@ -616,25 +617,34 @@ async fn a_client_token_serves_one_delete_and_replays_its_retry() {
             case.label
         );
 
-        // A DIFFERENT request reusing that spent token belongs to the call the token
-        // names: this operation declares no conflict error (its errors are
-        // InternalFailureException, InvalidRequestException, ResourceNotFoundException
-        // and ThrottlingException — smithy_query query="operation"
-        // operation="DeleteDashboard"), so the token alone identifies its call and
-        // that call's answer is replayed. The dashboard this request addressed stays.
+        // A DIFFERENT request reusing that spent token — another dashboard's id — is
+        // a DIFFERENT delete, not a repeat of the one the token names, and this
+        // operation's answer carries no member of that call to replay (its output is
+        // empty, and it declares no conflict error either — smithy_query
+        // query="operation" operation="DeleteDashboard"), so the success it gives can
+        // state only that THIS dashboard was removed. The dashboard it addresses goes.
         let (status, reused) = delete_dashboard(&router, &neighbour, Some(&token)).await;
         assert_eq!(
             (status, &reused),
             (204, &first),
-            "case {:?}: a request reusing a spent token must be answered from the call \
-             that spent it, got {status} {reused} after {first}",
+            "case {:?}: a request reusing a spent token must be served as the delete it \
+             is, got {status} {reused} after {first}",
             case.label
         );
-        let (status, still_there) = describe_dashboard(&router, &neighbour).await;
+        let (status, removed) = describe_dashboard(&router, &neighbour).await;
         assert_eq!(
-            status, 200,
-            "case {:?}: a request reusing a spent token must remove nothing, \
-             got {status} {still_there}",
+            (status, error_code(&removed)),
+            (404, "ResourceNotFoundException"),
+            "case {:?}: the dashboard that request addressed must be removed, \
+             got {status} {removed}",
+            case.label
+        );
+        let mut only_bystanders = bystanders.clone();
+        only_bystanders.sort();
+        assert_eq!(
+            stored_dashboard_ids(&engine),
+            only_bystanders,
+            "case {:?}: the store must hold exactly the dashboards no delete named",
             case.label
         );
 
@@ -655,20 +665,28 @@ async fn a_client_token_serves_one_delete_and_replays_its_retry() {
             );
         }
 
-        // That refusal spent nothing, so the fresh token still serves the request the
-        // spent one would not: the neighbour goes under it.
-        let (status, accepted) = delete_dashboard(&router, &neighbour, Some(&fresh)).await;
+        // Those refusals spent nothing, so the token they carried still serves a
+        // delete of its own: a dashboard created after them goes under it.
+        let (spare, _) = create_dashboard(
+            &router,
+            case.label,
+            &project,
+            "the-dashboard-the-unspent-token-deletes",
+            None,
+            64,
+            None,
+        )
+        .await;
+        let (status, accepted) = delete_dashboard(&router, &spare, Some(&fresh)).await;
         assert_eq!(
             status, 204,
             "case {:?}: the delete under the token no served call spent expected 204, \
              got {status} {accepted}",
             case.label
         );
-        let mut left = bystanders.clone();
-        left.sort();
         assert_eq!(
             stored_dashboard_ids(&engine),
-            left,
+            only_bystanders,
             "case {:?}: the store must hold exactly the dashboards no delete named",
             case.label
         );

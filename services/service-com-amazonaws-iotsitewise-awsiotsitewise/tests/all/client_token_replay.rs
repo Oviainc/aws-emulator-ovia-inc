@@ -13,9 +13,13 @@
 //! call removed what it addressed. A token already spent on a DIFFERENT request is
 //! refused `ConflictingOperationException` (409) naming the resource the first
 //! call acted on, where the operation declares that error; where it declares no
-//! conflict error at all, the token alone names the call it repeats and that
-//! call's answer is replayed. A request carrying NO token is a new call every
-//! time.
+//! conflict error at all, a CREATE answers from the resource its token was spent
+//! on, because that minted resource is the whole of what its answer carries. A
+//! request carrying NO token is a new call every time.
+//!
+//! What a token spent on a different request means for the operations whose
+//! answer carries nothing of the call the token names is pinned by the
+//! `client_token_spent_on_another_request` suite beside this one.
 //!
 //! The rows span what the rule generalises over: the operation kind (create,
 //! update, delete, batch association, batch data-segment write), the resource kind
@@ -60,7 +64,7 @@ const SAMPLES: &[i64] = &[0, 5, 10, 15];
 /// `^\S{36,64}$` admits no whitespace (smithy_query query="operation"
 /// operation="CreatePortal"), so every character outside that pattern becomes a
 /// hyphen before the shared helper pads the seed out to the modelled minimum.
-fn token_for(case: &str) -> String {
+pub(crate) fn token_for(case: &str) -> String {
     let seed: String = case
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
@@ -527,7 +531,7 @@ impl DeleteRow {
 /// The request `uri`/`body` carrying `token`, where `in_query` says whether
 /// `clientToken` travels on the query string (`@httpQuery`) rather than in the
 /// payload.
-fn carrying(
+pub(crate) fn carrying(
     uri: &str,
     body: Option<&Value>,
     token: &str,

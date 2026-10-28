@@ -166,22 +166,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `clientToken` makes this delete idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the
-        // idempotency of the request." A retry carries the token of the call it
-        // repeats, so it replays that call's success rather than the not-found refusal
-        // the removal itself would now produce, and removes nothing further. This
-        // operation's error list declares no conflict error, so the token alone names
-        // the call it repeats: a request reusing it is answered from that call rather
-        // than refused with an error this operation does not model, exactly as
-        // `DeleteProject` answers a reused token.
+        // idempotency of the request." A RETRY carries the token of the call it
+        // repeats AND repeats that call's request, so it replays that call's success
+        // rather than the not-found refusal the removal itself would now produce, and
+        // removes nothing further.
+        //
+        // A token already spent on a DIFFERENT request — another dashboard's id —
+        // names no answer this operation could replay: its output carries no member of
+        // that earlier call, so the success it would give states only that THIS
+        // dashboard was removed. Such a request is therefore served as the fresh
+        // delete it is, and the token's record moves to it.
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
 
         let fingerprint = crate::state::request_fingerprint(&[&input.dashboard_id], None);
         match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
-            crate::state::TokenVerdict::Replay(_) | crate::state::TokenVerdict::Spent(_) => {
+            crate::state::TokenVerdict::Replay(_) => {
                 return Ok(DeleteDashboardOutput {});
             }
-            crate::state::TokenVerdict::Serve => {}
+            // A request that differs from the call its token was spent on addresses
+            // another dashboard, served below exactly like one carrying no token.
+            crate::state::TokenVerdict::Spent(_) | crate::state::TokenVerdict::Serve => {}
         }
 
         if store.dashboards.remove(&input.dashboard_id).is_none() {

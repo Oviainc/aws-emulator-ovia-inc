@@ -164,13 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` makes this update idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the
-        // idempotency of the request." A retry carries the token of the call it
-        // repeats, so it succeeds and writes nothing — it does not write the dashboard
-        // a second time. This operation's error list declares no conflict error, so
-        // the token alone names the call it repeats: a request reusing it is answered
-        // from that call rather than refused with an error this operation does not
-        // model, exactly as `CreateDashboard` answers a reused token. It is the FIRST
-        // thing decided, because the call it repeats was already served.
+        // idempotency of the request." A RETRY carries the token of the call it
+        // repeats AND repeats that call's request, so it succeeds and writes nothing —
+        // it does not write the dashboard a second time. It is the FIRST thing
+        // decided, because the call it repeats was already served.
+        //
+        // A token already spent on a DIFFERENT request names no answer this operation
+        // could replay: its output carries no member of that earlier call, so the 200
+        // it would give states only that THIS request was applied. Such a request is
+        // therefore served as the fresh update it is, and the token's record moves to
+        // it — the token stops a repeat from being applied twice, it never turns
+        // another request into a success that wrote nothing.
         let mut store = state.lock();
 
         let fingerprint = crate::state::request_fingerprint(
@@ -183,8 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None,
         );
         match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
-            crate::state::TokenVerdict::Replay(replayed)
-            | crate::state::TokenVerdict::Spent(replayed) => {
+            crate::state::TokenVerdict::Replay(replayed) => {
                 // A dashboard deleted since leaves the retry nothing to answer from,
                 // so that retry is served as the fresh update it now is — which is the
                 // not-found refusal below.
@@ -192,7 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Ok(UpdateDashboardOutput {});
                 }
             }
-            crate::state::TokenVerdict::Serve => {}
+            // A request that differs from the call its token was spent on is a
+            // different update, served below exactly like one carrying no token.
+            crate::state::TokenVerdict::Spent(_) | crate::state::TokenVerdict::Serve => {}
         }
 
         let dashboard = store

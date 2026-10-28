@@ -180,20 +180,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` makes this disassociation idempotent, as the member documents:
         // "A unique case-sensitive identifier that you can provide to ensure the
-        // idempotency of the request." A retry carries the token of the call it
-        // repeats, so it replays that call's answer and writes nothing. This
-        // operation's error list declares no conflict error, so the token alone names
-        // the call it repeats: a request reusing it is answered from that call rather
-        // than refused with an error this operation does not model, exactly as
-        // `CreateDashboard` answers a reused token. It is the FIRST thing decided,
-        // because the call it repeats was already served.
+        // idempotency of the request." A RETRY carries the token of the call it
+        // repeats AND repeats that call's request, so it replays that call's answer and
+        // writes nothing. It is the FIRST thing decided, because the call it repeats
+        // was already served.
+        //
+        // A token already spent on a DIFFERENT request — another project, another set
+        // of assets — names no answer this operation could replay: the answer it would
+        // give reports no member of that earlier call, so it states only that THIS
+        // request was applied. Such a request is therefore served as the fresh
+        // disassociation it is, and the token's record moves to it.
         let mut store = state.lock();
 
         let fingerprint =
             crate::state::request_fingerprint(&[&input.project_id, &input.asset_ids], None);
         match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
-            crate::state::TokenVerdict::Replay(replayed)
-            | crate::state::TokenVerdict::Spent(replayed) => {
+            crate::state::TokenVerdict::Replay(replayed) => {
                 // A project deleted since leaves the retry nothing to answer from, so
                 // that retry is served as the fresh disassociation it now is — which
                 // is the not-found refusal below.
@@ -203,7 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     });
                 }
             }
-            crate::state::TokenVerdict::Serve => {}
+            // A request that differs from the call its token was spent on is a
+            // different disassociation, served below exactly like one carrying no
+            // token.
+            crate::state::TokenVerdict::Spent(_) | crate::state::TokenVerdict::Serve => {}
         }
 
         // The project is what the membership is held ON, so an id that resolves to no

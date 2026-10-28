@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `client_token_spent_on_another_request` is declared HERE, beside the note
+// above, for the reason it gives: the sorted list and the END of this file are
+// both stretches every concurrent iotsitewise change puts a declaration of its
+// own in. Fold it into the list once the churn settles.
+#[path = "all/client_token_spent_on_another_request.rs"]
+mod client_token_spent_on_another_request;
+
 // `workspace_scoped_path_resolution` is declared HERE, beside the note above,
 // for the reason it gives: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold

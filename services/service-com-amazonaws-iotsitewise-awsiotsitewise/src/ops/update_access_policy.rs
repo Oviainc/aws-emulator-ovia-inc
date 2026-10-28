@@ -178,13 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` makes this update idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the
-        // idempotency of the request." A retry carries the token of the call it
-        // repeats, so it succeeds and writes nothing — it does not write the policy a
-        // second time. This operation's error list declares no conflict error, so the
-        // token alone names the call it repeats: a request reusing it is answered from
-        // that call rather than refused with an error this operation does not model,
-        // exactly as `CreateDashboard` answers a reused token. It is the FIRST thing
-        // decided against the store, because the call it repeats was already served.
+        // idempotency of the request." A RETRY carries the token of the call it
+        // repeats AND repeats that call's request, so it succeeds and writes nothing —
+        // it does not write the policy a second time. It is the FIRST thing decided
+        // against the store, because the call it repeats was already served.
+        //
+        // A token already spent on a DIFFERENT request names no answer this operation
+        // could replay: its output carries no member of that earlier call, so the 200
+        // it would give states only that THIS request was applied — a privilege change
+        // answered that way would be silently dropped. Such a request is therefore
+        // served as the fresh update it is, and the token's record moves to it.
         let mut store = state.lock();
 
         let fingerprint = crate::state::request_fingerprint(
@@ -197,8 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None,
         );
         match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
-            crate::state::TokenVerdict::Replay(replayed)
-            | crate::state::TokenVerdict::Spent(replayed) => {
+            crate::state::TokenVerdict::Replay(replayed) => {
                 // A policy deleted since leaves the retry nothing to answer from, so
                 // that retry is served as the fresh update it now is — which is the
                 // not-found refusal below.
@@ -206,7 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Ok(UpdateAccessPolicyOutput {});
                 }
             }
-            crate::state::TokenVerdict::Serve => {}
+            // A request that differs from the call its token was spent on is a
+            // different update, served below exactly like one carrying no token.
+            crate::state::TokenVerdict::Spent(_) | crate::state::TokenVerdict::Serve => {}
         }
 
         // The policy is about a Monitor resource, so a resource this store does not
