@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteComputationModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteComputationModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteComputationModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below removes the computation model the request
+//! addresses, together with the actions taken on it and the executions those
+//! actions started, and reports the `DELETING` status the accepted call owes — so
+//! a later `DescribeComputationModel` of that model, and a listing that held it,
+//! resolve to nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteComputationModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteComputationModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteComputationModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteComputationModelError::Modeled(
+                DeleteComputationModelErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // `clientToken` makes this delete idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it replays that call's answer — the model it removed, reported
+        // DELETING — rather than the not-found refusal the removal itself would now
+        // produce, and removes nothing further; a token already spent on a DIFFERENT
+        // request belongs to another call, which is the modelled conflict. It is the
+        // FIRST thing decided, because the call it repeats was already served.
+        let fingerprint = crate::state::request_fingerprint(&[&input.computation_model_id], None);
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(_) => {
+                return Ok(DeleteComputationModelOutput {
+                    computation_model_status: deleting(),
+                });
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
+        // A computation model is addressed by its own id, so an id this store holds no
+        // model under is the modelled 404 rather than a silent success — the rule every
+        // operation on one computation model is answered by.
+        if !store
+            .computation_models
+            .contains_key(&input.computation_model_id)
+        {
+            return Err(not_found(&input.computation_model_id));
+        }
+
+        // "Deletes a computation model. This action can't be undone": the model and
+        // everything this store holds only as a record of it go away, so no later read
+        // can still see it — a describe resolves to nothing, a listing no longer holds
+        // it, its actions and executions are gone with it, and its tags stop resolving
+        // by ARN. A delete states no precondition on the state the model is settling
+        // in: it is accepted whatever that state is, and reports DELETING, exactly as
+        // this service's other deletes answer one.
+        store.forget_computation_model(&input.computation_model_id);
+
+        // The token is spent only now that the delete has succeeded: a refused request
+        // removed nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.computation_model_id,
+            now,
+        );
+
+        Ok(DeleteComputationModelOutput {
+            computation_model_status: deleting(),
+        })
     }
+}
+
+/// The status an accepted delete reports: "a state (DELETING after successfully
+/// calling this operation) and any error messages" — and no error, because
+/// nothing in this emulator fails to remove a computation model.
+///
+/// One function, so the accepted call and the replay of its retry report one
+/// status.
+fn deleting() -> ComputationModelStatus {
+    ComputationModelStatus {
+        state: crate::state::STATE_DELETING.to_string(),
+        error: None,
+    }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the computation model the request
+/// addressed, worded by this service's one not-found rule rather than by a
+/// template of this handler's own.
+fn not_found(requested: &str) -> DeleteComputationModelError {
+    DeleteComputationModelError::Modeled(
+        DeleteComputationModelErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_COMPUTATION_MODEL,
+                    requested,
+                ),
+            },
+        ),
+    )
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the computation model that request
+/// removed, so `resourceId`/`resourceArn` name it — built from this request's
+/// region, because the model that call deleted no longer carries an ARN of its
+/// own.
+fn token_spent(region: &str, computation_model_id: &str) -> DeleteComputationModelError {
+    DeleteComputationModelError::Modeled(
+        DeleteComputationModelErrorModeled::ConflictingOperationException(
+            ConflictingOperationException {
+                message: crate::state::already_using_message("computation model", "clientToken"),
+                resource_id: computation_model_id.to_string(),
+                resource_arn: crate::state::computation_model_arn(region, computation_model_id),
+            },
+        ),
+    )
 }

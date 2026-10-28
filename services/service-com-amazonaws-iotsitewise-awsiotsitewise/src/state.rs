@@ -5514,6 +5514,39 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
+    /// Forget a computation model and everything this store holds only as a
+    /// record OF it: the actions taken on it and the executions those actions
+    /// started.
+    ///
+    /// An action and an execution each NAME the target resource they were taken
+    /// on, and a computation model is one of the two kinds a target resource can
+    /// be, so a model this service no longer holds can leave none of them behind
+    /// for a listing to report or for the [`MAX_ACTIONS`] budget to count — the
+    /// same reason [`Self::forget_asset`] drops what is keyed off an asset. They
+    /// are addressed through the one
+    /// [`target_resource_addresses`] rule the listings resolve a target by, so
+    /// what goes with the model is exactly what was reported for it. The model's
+    /// tags live on its record, which owns them, so they go with it.
+    pub fn forget_computation_model(
+        &mut self,
+        computation_model_id: &str,
+    ) -> Option<ComputationModelRecord> {
+        let record = self.computation_models.remove(computation_model_id)?;
+        self.actions.retain(|_, action| {
+            !action.targets(
+                TARGET_RESOURCE_TYPE_COMPUTATION_MODEL,
+                computation_model_id,
+            )
+        });
+        self.executions.retain(|_, execution| {
+            !execution.targets(
+                TARGET_RESOURCE_TYPE_COMPUTATION_MODEL,
+                computation_model_id,
+            )
+        });
+        Some(record)
+    }
+
     /// The resources `workspace_name` CONTAINS, as `(resource kind, how many)`
     /// pairs in one fixed order, listing only the kinds that hold at least one.
     ///
