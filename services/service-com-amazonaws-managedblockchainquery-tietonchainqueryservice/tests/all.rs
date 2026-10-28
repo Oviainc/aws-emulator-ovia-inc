@@ -45,3 +45,5 @@ mod native_token_denomination;
 mod response_fidelity;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/transaction_fee_denomination.rs"]
+mod transaction_fee_denomination;

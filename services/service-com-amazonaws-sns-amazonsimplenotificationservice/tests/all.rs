@@ -65,6 +65,9 @@ mod phone_number_opt_in;
 #[path = "all/phone_number_opt_out_listing.rs"]
 mod phone_number_opt_out_listing;
 
+#[path = "all/platform_application_deletion.rs"]
+mod platform_application_deletion;
+
 #[path = "all/platform_application_reads.rs"]
 mod platform_application_reads;
 

@@ -11,7 +11,10 @@
 //! modelled `ResourceNotFoundException` (HTTP 404), which is what makes the delete
 //! observable — and the response reports the removed record in `DELETING`, the state of a
 //! peer on its way out, with the configuration it was stored with. A Connect peer owns no
-//! resource of its own, so nothing blocks its delete.
+//! resource of its own, so nothing blocks its delete; the records that exist only as TIES
+//! to it — the association `AssociateConnectPeer` keyed by the peer and the telemetry
+//! registration it made under the peer's ARN — go with the record it removes
+//! (`crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::untie_connect_peer`).
 //!
 //! ## Reaching this service's state
 //!
@@ -156,6 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 )
             })?;
+
+        // A peer owns no resource of its own, so nothing blocks the delete — but the
+        // records that exist only as ties TO it do not outlive it: the association keyed by
+        // the peer and the telemetry registration that association made under the peer's
+        // ARN are dropped with the peer, the same way the ties a core network holds are
+        // dropped with it rather than outliving the resource they name. Untying goes
+        // through the one place of the store that unties a peer, so the listing of the ties
+        // and the telemetry of a global network stop reporting a peer this delete removed,
+        // and no registration is left behind with nothing able to remove it.
+        store.untie_connect_peer(&input.connect_peer_id);
 
         // The removed record has no state of its own any more, so the response reports the
         // state a peer on its way out is in rather than the one the clock would compute.

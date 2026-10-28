@@ -33,6 +33,8 @@ mod interval_validation;
 mod invalid_request_parameter_lists;
 #[path = "all/lifecycle_policy_crud.rs"]
 mod lifecycle_policy_crud;
+#[path = "all/materialized_create_interval_round_trip.rs"]
+mod materialized_create_interval_round_trip;
 #[path = "all/policy_configuration_validation.rs"]
 mod policy_configuration_validation;
 #[path = "all/policy_identity_immutability.rs"]

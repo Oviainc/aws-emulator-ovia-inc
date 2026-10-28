@@ -545,6 +545,21 @@ pub const MAX_STORED_CLUSTERS: usize = MAX_CLUSTERS * 10;
 /// `TagResource` calls grow the record without limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The sentence a tag request earns when the tags it would leave on the resource
+/// exceed the number one resource may carry.
+///
+/// FIXED TEXT with `limit` as its only variable part: it names neither the resource
+/// nor how many tags the request asked for, because the ceiling is a property of the
+/// API and not of the request that happened to reach it. The one place this wording
+/// lives, so the two paths that can reach it cannot disagree — the bound the model
+/// declares on a single request's collection, refused before dispatch
+/// (`crate::service::tag_contract`), and the ACCUMULATED map's own ceiling, refused
+/// by the `TagResource` handler, which is the same ceiling counted after the merge.
+#[must_use]
+pub fn tag_ceiling_message(limit: usize) -> String {
+    format!("The resultant tag set must not have more than {limit} user tags.")
+}
+
 /// The `CancellationStatus` member a cancellation this emulator performed
 /// carries. The model's enum is `InProgress | Failed | Successful`
 /// (`smithy_query query="shape" shape="CancellationStatus"`); the other two

@@ -210,11 +210,13 @@ fn cases() -> Vec<Case> {
             environment: "b",
             location: json!({
                 "Language": "Java",
+                "ClassName": "Ship",
                 "FilePath": "src/main/java/com/example/Ship.java",
                 "LineNumber": 1,
             }),
             other_location: json!({
                 "Language": "Java",
+                "ClassName": "Ship",
                 "FilePath": "src/main/java/com/example/Ship.java",
                 "LineNumber": 2,
             }),

@@ -19,6 +19,8 @@ mod child_listing_absent_parent_walk;
 mod child_listing_cursor_scope;
 #[path = "all/child_listing_error_set.rs"]
 mod child_listing_error_set;
+#[path = "all/definition_declared_schedule_trigger.rs"]
+mod definition_declared_schedule_trigger;
 #[path = "all/deleted_workflow_run_cleanup.rs"]
 mod deleted_workflow_run_cleanup;
 #[path = "all/idempotency_token_ledger.rs"]

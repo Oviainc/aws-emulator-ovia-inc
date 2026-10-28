@@ -1134,9 +1134,13 @@ impl Diagnostic {
 
     /// This diagnostic as the SUBJECT of an `InvalidDefinition` message: the code
     /// that classifies it, the detail describing it, and where it was found.
+    ///
+    /// The place is joined to the detail by the bare word ` at ` and nothing else, so
+    /// the subject reads as one sentence and a client that parses the location out of
+    /// a refusal finds it unwrapped.
     fn stated(&self) -> String {
         match &self.location {
-            Some(location) => format!("{}: {} (at {location})", self.code, self.message),
+            Some(location) => format!("{}: {} at {location}", self.code, self.message),
             None => format!("{}: {}", self.code, self.message),
         }
     }
@@ -1206,20 +1210,34 @@ pub struct Diagnosis {
     /// budget.
     errors: usize,
     warnings: usize,
-    /// Whether this walk is a [`validate`] — which reads the FIRST error and
-    /// nothing else, so there is no reason to build a warning it would discard or
+    /// Whether this walk reports no WARNING at all — what reads it ([`validate`],
+    /// [`validate_single_state`]) refuses a definition for its ERRORS, so a warning
+    /// would be built only to be discarded.
+    errors_only: bool,
+    /// Whether this walk reads the FIRST error and nothing else, so there is no reason
     /// to keep walking past that error.
     first_error_only: bool,
 }
 
 impl Diagnosis {
-    /// A walk that stops at the first ERROR, for [`validate`]: no warning is built
-    /// and nothing past that error is looked at. What it reports about a definition
-    /// is the same verdict a full walk reports, because an error is an error
+    /// A walk that stops at the first ERROR, for [`validate_single_state`]: no warning
+    /// is built and nothing past that error is looked at. What it reports about a
+    /// definition is the same verdict a full walk reports, because an error is an error
     /// wherever in the definition it was found.
     fn until_first_error() -> Self {
         Self {
+            errors_only: true,
             first_error_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// A walk that reports every ERROR and no warning, for [`validate`]: the refusal it
+    /// words states one subject per error the definition carries, and a warning is not
+    /// one of them.
+    fn errors_only() -> Self {
+        Self {
+            errors_only: true,
             ..Self::default()
         }
     }
@@ -1244,7 +1262,7 @@ impl Diagnosis {
         } else {
             (&mut self.warnings, &mut self.warnings_dropped)
         };
-        if *reported >= MAX_DIAGNOSTICS || (self.first_error_only && !found.is_error()) {
+        if *reported >= MAX_DIAGNOSTICS || (self.errors_only && !found.is_error()) {
             *dropped = true;
             return;
         }
@@ -1253,13 +1271,18 @@ impl Diagnosis {
     }
 
     /// Whether the walk keeps looking: it stops once it can report no further ERROR
-    /// — its error budget spent, or, for a [`validate`], the one error it reads
-    /// already found. Every error past that point would change neither the result
+    /// — its error budget spent, or, for a [`validate_single_state`], the one error it
+    /// reads already found. Every error past that point would change neither the result
     /// nor the reported list.
     fn looking(&self) -> bool {
         !(self.errors_dropped || (self.first_error_only && self.errors > 0))
     }
 }
+
+/// What separates the subjects of an `InvalidDefinition` message: a definition
+/// carrying several problems is refused with one subject per problem, written one
+/// after another in the order the walk found them.
+const SUBJECT_SEPARATOR: &str = ", ";
 
 /// Why `definition` is not a definition this service accepts, or `Ok` when it is.
 ///
@@ -1270,25 +1293,34 @@ impl Diagnosis {
 /// declared state, a terminal state carries no `Next`, and a continuing state carries
 /// `Next` or `"End": true`.
 ///
-/// The `Err` is the SUBJECT of that error's message — one diagnostic, `<code>:
-/// <detail>` — which the operation states through
-/// [`crate::state::resource_error_message`] with
-/// [`crate::state::INVALID_STATE_MACHINE_DEFINITION`]. It is the FIRST error
-/// [`diagnose`] found, so what a create refuses a definition for and what
-/// `ValidateStateMachineDefinition` reports `FAIL` for cannot disagree.
+/// The `Err` is the SUBJECT of that error's message, which the operation states
+/// through [`crate::state::resource_error_message`] with
+/// [`crate::state::INVALID_STATE_MACHINE_DEFINITION`]: ONE subject per error
+/// [`diagnose`] found, each `<code>: <detail> at <location>` ([`Diagnostic::stated`]),
+/// separated by [`SUBJECT_SEPARATOR`]. Every error the definition carries is stated,
+/// so a caller fixing a definition is told all of them rather than one per attempt,
+/// and what a create refuses a definition for cannot disagree with what
+/// `ValidateStateMachineDefinition` reports `FAIL` for.
+///
+/// The message is bounded by the walk itself rather than by the definition: the walk
+/// reports at most [`MAX_DIAGNOSTICS`] errors, each one's quoted value is capped by
+/// [`MAX_ECHOED_CHARS`] and its location by [`MAX_LOCATION_CHARS`], so a caller-sized
+/// definition cannot be amplified into a larger refusal.
 ///
 /// A definition may use states this emulator does not EXECUTE and still be valid,
 /// because it is valid ASL: what cannot be run surfaces at execution time, as a
 /// `FAILED` execution, not as a rejected create.
 pub fn validate(definition: &str) -> Result<(), String> {
-    match collect(definition, Diagnosis::until_first_error())
+    let stated: Vec<String> = collect(definition, Diagnosis::errors_only())
         .diagnostics
         .iter()
-        .find(|found| found.is_error())
-    {
-        Some(found) => Err(found.stated()),
-        None => Ok(()),
+        .filter(|found| found.is_error())
+        .map(Diagnostic::stated)
+        .collect();
+    if stated.is_empty() {
+        return Ok(());
     }
+    Err(stated.join(SUBJECT_SEPARATOR))
 }
 
 /// Every problem `definition` carries: the errors that would prevent creating or
@@ -1315,8 +1347,8 @@ pub fn diagnose(definition: &str) -> Diagnosis {
     collect(definition, Diagnosis::default())
 }
 
-/// [`diagnose`] into the walk `found` describes: every problem, or — for
-/// [`validate`] — the first error and nothing else.
+/// [`diagnose`] into the walk `found` describes: every problem, only the errors — or,
+/// for [`validate_single_state`], the first error and nothing else.
 fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
     if definition.trim().is_empty() {
         found.push(error(
@@ -1572,13 +1604,15 @@ fn diagnose_state(
             if declared == JSONPATH && inherited == JSONATA {
                 // The service blames the overriding STATE rather than the member it
                 // declares the override in: the state is the thing a state machine of
-                // this query language may not hold.
+                // this query language may not hold. Which state that is, is reported
+                // by `location` alone — the sentence is about the member and is the
+                // same for every state that carries it.
                 into.push(error(
                     SCHEMA_VALIDATION_FAILED,
                     at(&here, ""),
                     format!(
-                        "state '{name}' selects '{JSONPATH}', which a state of a '{JSONATA}' \
-                         state machine must not do"
+                        "'QueryLanguage' can not be '{JSONPATH}' if set to '{JSONATA}' \
+                         for whole state machine"
                     ),
                 ));
             }
@@ -1704,8 +1738,12 @@ const RESULT_STATE_TYPES: &[&str] = &["Map", "Parallel", "Task"];
 
 /// How the service states a field an expression reads that the expression's scope does
 /// not bind: the field is not there to read, so it is reported as the field it named.
-fn field_does_not_exist(term: &str) -> String {
-    format!("Field '{term}' does not exist.")
+///
+/// `field` is the whole field expression as the definition wrote it — the reserved term
+/// together with the member accessors written after it ([`field_read`]) — because that,
+/// and not the term it starts with, is what the caller has to change.
+fn field_does_not_exist(field: &str) -> String {
+    format!("Field '{field}' does not exist.")
 }
 
 /// The reserved terms of the state's own outcome that a `member` of a state of this
@@ -1774,11 +1812,11 @@ fn diagnose_jsonata_state(
             // `location` documents (`/States/<StateName>/<FieldName>`): a member
             // carrying several such fields is several problems to fix, each at its own
             // place in the caller's document.
-            for field in fields_reading(value, term) {
+            for (field, read) in fields_reading(value, term) {
                 into.push(error(
                     UNSUPPORTED_JSONATA_EXPRESSION,
                     at(here, &format!("/{shown}{field}")),
-                    field_does_not_exist(term),
+                    field_does_not_exist(&read),
                 ));
             }
         }
@@ -1835,25 +1873,29 @@ fn diagnose_jsonata_rule(
     }
 }
 
-/// Every FIELD inside `value` whose JSONata expression reads `term`, as the path
-/// from the member that carries `value` down to that field — the empty path for a
-/// member that is itself such an expression.
+/// Every FIELD inside `value` whose JSONata expression reads `term`: the path from the
+/// member that carries `value` down to that field — the empty path for a member that is
+/// itself such an expression — paired with the field expression that read the term
+/// there ([`field_read`]).
 ///
 /// The walk is ITERATIVE: `value` is a caller-shaped document, so it carries its own
 /// stack rather than the thread's. Each path is built through [`nested_at`], so it is
 /// bounded as it grows, and the list is sorted lexicographically, which is what makes
 /// the per-field list of one member deterministic whatever shape the document has.
-fn fields_reading(value: &Value, term: &str) -> Vec<String> {
+fn fields_reading(value: &Value, term: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let mut pending = vec![(String::new(), value)];
     while let Some((path, value)) = pending.pop() {
         match value {
             Value::String(text) => {
-                if jsonata_expressions(text)
+                // One field is one problem to fix, so it is reported once: the field
+                // expression reported for it is the FIRST its expressions read the
+                // term through.
+                if let Some(read) = jsonata_expressions(text)
                     .iter()
-                    .any(|expression| expression.contains(term))
+                    .find_map(|expression| field_read(expression, term))
                 {
-                    found.push(path);
+                    found.push((path, read));
                 }
             }
             Value::Array(items) => {
@@ -1871,6 +1913,44 @@ fn fields_reading(value: &Value, term: &str) -> Vec<String> {
     }
     found.sort();
     found
+}
+
+/// The FIELD a JSONata `expression` reads `term` through, or `None` when it reads it
+/// nowhere.
+///
+/// A field expression is the term together with the member accessors written after it:
+/// the language reads a member of a value by a `.` followed by that member's name, so
+/// the field runs from the term through every such step that follows it and ends at the
+/// first character that can be part of neither. A term that is itself only the start of
+/// a longer name is read to the end of that name, since what was written there is a
+/// different field and not the term at all.
+///
+/// The result is [`echoed`]: the accessors are the caller's own text.
+fn field_read(expression: &str, term: &str) -> Option<String> {
+    let read = &expression[expression.find(term)?..];
+    let bytes = read.as_bytes();
+    let mut end = term.len();
+    while bytes.get(end).is_some_and(|byte| is_member_byte(*byte)) {
+        end += 1;
+    }
+    while bytes.get(end) == Some(&b'.') {
+        let mut step = end + 1;
+        let name = step;
+        while bytes.get(step).is_some_and(|byte| is_member_byte(*byte)) {
+            step += 1;
+        }
+        if step == name {
+            break;
+        }
+        end = step;
+    }
+    Some(echoed(&read[..end]))
+}
+
+/// Whether `byte` can be part of a name written without quoting: what bounds the field
+/// expression [`field_read`] reads, and the `$name` term [`scan_expression`] reads.
+fn is_member_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// The payload templates a JSONPath state renders: every member of one is a LITERAL
@@ -2156,7 +2236,7 @@ fn about_the_single_state(found: &Diagnostic) -> String {
         .and_then(|location| location.strip_prefix(inside.as_str()))
         .filter(|member| !member.is_empty());
     match member {
-        Some(member) => format!("{}: {message} (at {member})", found.code),
+        Some(member) => format!("{}: {message} at {member}", found.code),
         None => format!("{}: {message}", found.code),
     }
 }
@@ -2310,10 +2390,7 @@ fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
     while let Some(offset) = expression[index..].find('$') {
         let start = index + offset;
         let mut end = start + 1;
-        while bytes
-            .get(end)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
+        while bytes.get(end).is_some_and(|byte| is_member_byte(*byte)) {
             end += 1;
         }
         index = end.max(start + 1);

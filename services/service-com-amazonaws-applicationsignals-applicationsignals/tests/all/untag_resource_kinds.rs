@@ -302,6 +302,7 @@ async fn an_arn_naming_no_stored_resource_is_refused_and_detaches_nothing() {
     removed.label = "a deleted configuration";
     removed.location = json!({
         "Language": "Java",
+        "ClassName": "CartService",
         "FilePath": "src/main/java/com/example/CartService.java",
         "LineNumber": 7,
     });
@@ -319,6 +320,7 @@ async fn an_arn_naming_no_stored_resource_is_refused_and_detaches_nothing() {
     lapsing.label = "a lapsed configuration";
     lapsing.location = json!({
         "Language": "Java",
+        "ClassName": "CartService",
         "FilePath": "src/main/java/com/example/CartService.java",
         "LineNumber": 4242,
     });

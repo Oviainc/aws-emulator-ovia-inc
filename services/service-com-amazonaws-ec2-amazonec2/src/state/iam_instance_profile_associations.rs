@@ -34,6 +34,11 @@
 //!   "associating | associated | disassociating"), so a fully disassociated profile is
 //!   reported as no association rather than as a terminal row.
 //!
+//! Replacing the profile an instance runs as is neither of those moves: the association
+//! named is swapped for a new one over the same instance
+//! ([`ComAmazonawsEc2Amazonec2State::replace_iam_instance_profile_association`]), so the old
+//! association is gone at once and the new one starts its own `associating` span.
+//!
 //! [`ComAmazonawsEc2Amazonec2State::iam_instance_profile_association_due_at`] is when that
 //! move falls due, on the same monotonic clock as
 //! [`ComAmazonawsEc2Amazonec2State::vpc_available_at`], and
@@ -99,6 +104,20 @@ pub fn iam_instance_profile_association_payload_bytes(profile: &IamInstanceProfi
         .as_ref()
         .map_or(0, String::len)
         .saturating_add(profile.id.as_ref().map_or(0, String::len))
+}
+
+/// What replacing the profile one association is over did: the outcomes a caller has to
+/// tell apart, so a replacement that found nothing to act on is never reported as one the
+/// store had no room for.
+#[derive(Debug, Clone)]
+pub enum IamInstanceProfileAssociationReplacement {
+    /// The swap was recorded: the association named is gone and this is the one that took
+    /// its place, over the same instance and with the new profile.
+    Replaced(IamInstanceProfileAssociation),
+    /// The store holds no association under the id named, so nothing was replaced.
+    NoSuchAssociation,
+    /// The store has no room for the replacement, so the association named still stands.
+    NoRoom,
 }
 
 /// What the store needs to record one association, so the id, the state and the byte charge
@@ -198,6 +217,59 @@ impl ComAmazonawsEc2Amazonec2State {
         self.iam_instance_profile_associations
             .insert(association_id, association.clone());
         Some(association)
+    }
+
+    /// Swap the profile the association `association_id` is over for `iam_instance_profile`,
+    /// over the SAME instance, and answer the association that took its place.
+    ///
+    /// "You can use this action to change the IAM instance profile that's associated with an
+    /// instance without having to disassociate the existing IAM instance profile first"
+    /// (`ReplaceIamInstanceProfileAssociation`): the association named is GONE when this
+    /// answers — not left `disassociating` — and what replaces it is a new association of
+    /// [`Self::insert_iam_instance_profile_association`], so the replacement carries its own
+    /// id, its own timestamp and the `associating` state the clock then moves to
+    /// `associated`, exactly as a first association does. At most one association names any
+    /// one instance either way.
+    ///
+    /// Done HERE rather than as a remove and an insert in a handler so the swap is ATOMIC:
+    /// the store's byte budget is asked about the NET change first
+    /// ([`Self::would_exceed_stored_bytes_after_refund`]), so a replacement that will not fit
+    /// leaves the association that is there exactly as it stands.
+    pub fn replace_iam_instance_profile_association(
+        &mut self,
+        association_id: &str,
+        iam_instance_profile: IamInstanceProfile,
+    ) -> IamInstanceProfileAssociationReplacement {
+        let Some(replaced) = self.iam_instance_profile_associations.get(association_id) else {
+            return IamInstanceProfileAssociationReplacement::NoSuchAssociation;
+        };
+        // "The ID of the instance" the replaced association is over: the replacement is over
+        // the same one, which is the whole point of replacing rather than associating.
+        let Some(instance_id) = replaced.instance_id.clone() else {
+            return IamInstanceProfileAssociationReplacement::NoSuchAssociation;
+        };
+        let refund = replaced
+            .iam_instance_profile
+            .as_ref()
+            .map_or(0, iam_instance_profile_association_payload_bytes)
+            .saturating_add(STORED_RECORD_OVERHEAD_BYTES);
+        let charge = iam_instance_profile_association_payload_bytes(&iam_instance_profile)
+            .saturating_add(STORED_RECORD_OVERHEAD_BYTES);
+        if self.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return IamInstanceProfileAssociationReplacement::NoRoom;
+        }
+        self.remove_iam_instance_profile_association(association_id);
+        match self.insert_iam_instance_profile_association(IamInstanceProfileAssociationSpec {
+            instance_id,
+            iam_instance_profile,
+        }) {
+            Some(association) => IamInstanceProfileAssociationReplacement::Replaced(association),
+            // The removal above gave back a record and its bytes, and the budget was asked
+            // about the net change before anything moved, so the insert cannot refuse the
+            // replacement — answered rather than asserted, so a store that somehow has no
+            // room says so instead of panicking.
+            None => IamInstanceProfileAssociationReplacement::NoRoom,
+        }
     }
 
     /// Start taking the association `association_id` away and answer it as the caller will

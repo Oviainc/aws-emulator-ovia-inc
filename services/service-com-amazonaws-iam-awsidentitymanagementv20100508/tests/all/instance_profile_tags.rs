@@ -37,7 +37,7 @@ use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::user_lifecycle::{call, error_code, elements, router};
 
 /// Own one row's tag list, which a table row builds from literals.
-fn tags(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn tags(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -61,7 +61,7 @@ fn with_tag_params(
 
 /// Create the instance profile `profile_name` carrying `initial`, asserting the
 /// create succeeded.
-async fn create_instance_profile(
+pub(crate) async fn create_instance_profile(
     router: &MultiServiceRouter,
     profile_name: &str,
     initial: &[(String, String)],
@@ -76,7 +76,7 @@ async fn create_instance_profile(
 }
 
 /// One `TagInstanceProfile` call: the HTTP status and the XML body.
-async fn tag_instance_profile(
+pub(crate) async fn tag_instance_profile(
     router: &MultiServiceRouter,
     profile_name: &str,
     list: &[(String, String)],
@@ -88,7 +88,7 @@ async fn tag_instance_profile(
 /// The tag set `GetInstanceProfile` reports for `profile_name`, as a map, plus how
 /// many `<Key>` elements the response carried — so a duplicated key cannot hide
 /// inside a map.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     profile_name: &str,
 ) -> (BTreeMap<String, String>, usize) {
@@ -107,7 +107,7 @@ async fn stored_tags(
 }
 
 /// `expected` as the map `GetInstanceProfile` must report.
-fn expected_map(expected: &[(String, String)]) -> BTreeMap<String, String> {
+pub(crate) fn expected_map(expected: &[(String, String)]) -> BTreeMap<String, String> {
     expected.iter().cloned().collect()
 }
 

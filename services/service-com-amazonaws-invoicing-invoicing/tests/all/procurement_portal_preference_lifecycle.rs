@@ -23,10 +23,10 @@
 //! * once a delete succeeds the resource is gone: every reader answers the modelled
 //!   not-found, the listing omits it, its tags go with it and the identity it held is
 //!   free again — asserted over several portals and identities;
-//! * a start call whose outcome this emulator cannot produce (confirming delivery of a
-//!   test e-invoice to a procurement portal outside it) is refused with the operation's
-//!   modelled error and persists nothing — asserted over preferences differing in which
-//!   portal endpoints they configure;
+//! * `SendProcurementPortalValidation` ISSUES a validation code for the preference and
+//!   answers with its ARN, writing none of its configuration — asserted over preferences
+//!   differing in which portal endpoints they configure, and over the codes a caller that
+//!   never received the issued one could submit;
 //! * repeating an update lands the same configuration, and a delete's `ClientToken`
 //!   replay answers with the ARN it removed.
 
@@ -119,15 +119,6 @@ fn error_code(body: &Value) -> String {
         .unwrap_or_default()
         .rsplit('#')
         .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The explanatory text of a failure body, under either case of the member's wire key.
-fn error_message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
 }
@@ -676,18 +667,21 @@ async fn a_delete_removes_the_preference_from_every_reader() {
     }
 }
 
-/// RULE: a start call whose success would assert work this emulator cannot perform — here
-/// confirming delivery of a test e-invoice to a procurement portal that lives outside it —
-/// is refused at that call with the operation's own modelled error (`ValidationException`,
-/// HTTP 400) instead of reporting an outcome nothing produced. The refusal persists
-/// nothing: the preference reports the same `Version` and `LastUpdateDate` a reader saw
-/// before it, no plane's status moves and no code becomes submittable.
+/// RULE: the call that starts a validation ISSUES the validation code the flow runs on
+/// — the model documents it as initiating the validation process by issuing a validation
+/// code — so it answers the modelled 200 with the ARN it was asked about, whatever the
+/// preference configures. The code never travels on the wire (the modelled output carries
+/// only the ARN, because the real service delivers it through the portal), and issuing it
+/// writes no CONFIGURATION: the preference reports the same `Version` and
+/// `LastUpdateDate` a reader saw before it, and a code the caller did not receive still
+/// completes nothing.
 ///
 /// The rows differ along which portal endpoints the preference configures (none, the
 /// portal instance endpoint, the test environment's endpoint, both), because the endpoint
-/// is what a delivery would be owed to.
+/// is where the real service delivers the code — and none of them is a reason to answer
+/// differently.
 #[tokio::test]
-async fn a_send_that_cannot_confirm_delivery_refuses_and_verifies_nothing() {
+async fn a_send_issues_a_validation_code_and_writes_no_configuration() {
     let router = emulator();
 
     let rows: Vec<(&str, Option<&str>, Option<&str>)> = vec![
@@ -730,50 +724,47 @@ async fn a_send_that_cannot_confirm_delivery_refuses_and_verifies_nothing() {
         let arn = arn_of(&ok(&router, "CreateProcurementPortalPreference", &create).await);
         let before = get_preference(&router, &arn).await;
 
-        // The refusal is the same on a first call and on a repeat, with or without a
-        // `ClientToken`: there is no success for a replay to answer with.
-        for attempt in ["no token", "with a token"] {
+        // The answer is the same on a first call, on a repeat, and on the `ClientToken`
+        // replay of that repeat — which answers with the ARN the call it replays returned.
+        for attempt in ["no token", "with a token", "the token replayed"] {
             let mut request = json!({"ProcurementPortalPreferenceArn": arn});
-            if attempt == "with a token" {
+            if attempt != "no token" {
                 request["ClientToken"] = json!("send-token-1");
             }
             let (status, body) = call(&router, "SendProcurementPortalValidation", &request).await;
             assert_eq!(
-                status, 400,
-                "case {label} ({attempt}): expected HTTP 400, got {status} {body}"
+                status, 200,
+                "case {label} ({attempt}): expected HTTP 200, got {status} {body}"
             );
             assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {label} ({attempt}): expected the modelled validation error, got {body}"
+                body.get("ProcurementPortalPreferenceArn")
+                    .and_then(Value::as_str),
+                Some(arn.as_str()),
+                "case {label} ({attempt}): the answer names the preference it was asked \
+                 about, got {body}"
             );
-            let message = error_message(&body);
-            // The text is built from the preference asked about: it reports the endpoint
-            // the delivery was owed to, so a client can tell WHERE it was not confirmed.
-            let owed_to = test_endpoint.or(*endpoint);
-            match owed_to {
-                Some(owed_to) => assert!(
-                    message.contains(owed_to),
-                    "case {label} ({attempt}): the refusal names the endpoint {owed_to}, got {message:?}"
-                ),
-                None => assert!(
-                    !message.is_empty(),
-                    "case {label} ({attempt}): the refusal states why, got {message:?}"
-                ),
-            }
+            // The code is delivered out of band: no member of the answer carries it.
+            assert_eq!(
+                body.as_object().map(|members| members.len()),
+                Some(1),
+                "case {label} ({attempt}): the answer carries the ARN alone, got {body}"
+            );
         }
 
-        // The refusal wrote nothing a reader can observe: `Version` is the version
-        // number of the CONFIGURATION, so it stays where the last successful write left
-        // it however many sends were refused, `LastUpdateDate` is untouched, and nothing
-        // claims a verified portal connection — no plane's status moved and no submitted
-        // code can complete a validation, because none was issued.
+        // Issuing a code wrote no configuration: `Version` is the version number of the
+        // CONFIGURATION, so it stays where the last successful configuration write left
+        // it however many codes were issued, `LastUpdateDate` is untouched, and no plane's
+        // status moved — nothing has verified the connection until a code comes back.
         let after = get_preference(&router, &arn).await;
         assert_eq!(
             after, before,
-            "case {label}: two refused sends must leave the preference exactly as it was, got {after}"
+            "case {label}: issuing a code must leave every reported member as it was, got {after}"
         );
-        for code in ["000000", "123456", "not-a-code"] {
+
+        // A caller that never received the issued code completes nothing: these rows are
+        // outside the six-decimal-digit form the issued code takes, so none of them can be
+        // the outstanding one.
+        for code in ["not-a-code", "1234567", "7", "00000a"] {
             let (status, body) = call(
                 &router,
                 "VerifyProcurementPortalValidation",
@@ -782,8 +773,8 @@ async fn a_send_that_cannot_confirm_delivery_refuses_and_verifies_nothing() {
             .await;
             assert_eq!(
                 status, 400,
-                "case {label} verify {code}: no code is outstanding, so the verify refuses: \
-                 got {status} {body}"
+                "case {label} verify {code}: a code the service did not issue completes \
+                 nothing: got {status} {body}"
             );
             assert_eq!(
                 error_code(&body),

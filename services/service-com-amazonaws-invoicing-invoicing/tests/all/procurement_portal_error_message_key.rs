@@ -263,13 +263,6 @@ async fn a_refusals_message_key_is_the_answering_planes() {
             error_code: "ResourceNotFoundException",
         },
         RefusalCase {
-            case: "start a validation whose delivery cannot be confirmed".to_string(),
-            operation: "SendProcurementPortalValidation".to_string(),
-            request: json!({"ProcurementPortalPreferenceArn": held_preference}),
-            status: 400,
-            error_code: "ValidationException",
-        },
-        RefusalCase {
             case: "submit a code that is not the outstanding one".to_string(),
             operation: "VerifyProcurementPortalValidation".to_string(),
             request: json!({

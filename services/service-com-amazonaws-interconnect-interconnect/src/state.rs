@@ -426,30 +426,37 @@ impl ComAmazonawsInterconnectInterconnectState {
             .filter(move |(_, stored)| visible_in(stored, region))
     }
 
-    /// The stored connection an `AmazonResourceName` names, for the tagging
-    /// operations that identify a resource by its ARN rather than by its id.
+    /// The stored connection an `AmazonResourceName` names IN `region`, for every
+    /// input that identifies a connection by its ARN rather than by its id.
     ///
     /// The ARN identifies the resource in FULL — partition, region and account
     /// included — so an ARN whose fields differ from the stored one names a
-    /// resource this store does not hold, exactly as an unknown id does. The
-    /// Region a record belongs to is one of those fields, so matching the stored
-    /// ARN is what scopes these operations to the Region the caller addressed
-    /// (the handlers refuse an ARN from another scope before getting here). A
-    /// connection that has reached the terminal `deleted` state is gone too: the
-    /// store keeps the record readable so a caller polling a delete sees the
-    /// terminal state, but a deleted resource has no tag set to read or change.
-    pub fn connection_by_arn(&self, arn: &str) -> Option<&StoredConnection> {
+    /// resource this store does not hold, exactly as an unknown id does. And the
+    /// store is scoped by the SAME predicate every other resolution here uses
+    /// ([`visible_in`]): a connection belongs to the Region it was created in, so
+    /// an ARN naming one created through another Region's endpoint resolves to
+    /// nothing, whatever that ARN carries. A connection that has reached the
+    /// terminal `deleted` state is gone too: the store keeps the record readable so
+    /// a caller polling a delete sees the terminal state, but a deleted resource is
+    /// no longer one this account holds.
+    pub fn connection_in_by_arn(&self, region: &str, arn: &str) -> Option<&StoredConnection> {
         let id = connection_id_from_arn(arn)?;
-        self.connections.get(id).filter(|stored| holds_arn(stored, arn))
+        self.connections
+            .get(id)
+            .filter(|stored| visible_in(stored, region) && holds_arn(stored, arn))
     }
 
-    /// [`Self::connection_by_arn`] for the tagging operations that WRITE the tag
-    /// set, resolving the same resource under the same rule.
-    pub fn connection_by_arn_mut(&mut self, arn: &str) -> Option<&mut StoredConnection> {
+    /// [`Self::connection_in_by_arn`] for the operations that MUTATE the record they
+    /// resolve, resolving the same resource under the same rule.
+    pub fn connection_in_by_arn_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut StoredConnection> {
         let id = connection_id_from_arn(arn)?;
         self.connections
             .get_mut(id)
-            .filter(|stored| holds_arn(stored, arn))
+            .filter(|stored| visible_in(stored, region) && holds_arn(stored, arn))
     }
 
     /// Make room for one more record: while the store is at [`MAX_STORED_RECORDS`],

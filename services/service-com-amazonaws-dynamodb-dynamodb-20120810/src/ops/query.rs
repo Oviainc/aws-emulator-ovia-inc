@@ -423,6 +423,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => None,
         };
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid, however
+        // well-formed the expressions that ignore it are.
+        crate::state::Substitutions::new(
+            input.expression_attribute_names.as_ref(),
+            input.expression_attribute_values.as_ref(),
+        )
+        .check_all_referenced(&[
+            input.key_condition_expression.as_deref(),
+            input.filter_expression.as_deref(),
+            input.projection_expression.as_deref(),
+        ])
+        .map_err(lift)?;
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
@@ -431,8 +444,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // denial, not its items.
         if let Some(denial) = crate::state::policy_denial(table, "dynamodb:Query", now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
-        }
-        let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
+        }        let condition = KeyCondition::resolve(table, comparisons).map_err(lift)?;
         // "A FilterExpression does not allow key attributes. You cannot define a
         // filter expression based on a partition key or a sort key": which attributes
         // the expression reads comes from the parsed tree, judged against the table's

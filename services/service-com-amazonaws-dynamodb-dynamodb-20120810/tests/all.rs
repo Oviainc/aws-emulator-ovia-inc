@@ -39,6 +39,8 @@ mod disable_kinesis_streaming_destination;
 mod emulator;
 #[path = "all/endpoint_discovery.rs"]
 mod endpoint_discovery;
+#[path = "all/expression_rules_and_write_admission.rs"]
+mod expression_rules_and_write_admission;
 #[path = "all/global_secondary_indexes.rs"]
 mod global_secondary_indexes;
 #[path = "all/global_tables.rs"]

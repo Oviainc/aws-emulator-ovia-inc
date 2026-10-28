@@ -178,6 +178,7 @@ pub(crate) fn cases() -> Vec<Case> {
             environment: "eks:cluster-prod/namespace",
             location: json!({
                 "Language": "Java",
+                "ClassName": "CartService",
                 "FilePath": "src/main/java/com/example/CartService.java",
                 "LineNumber": 142,
             }),
@@ -220,6 +221,7 @@ pub(crate) fn cases() -> Vec<Case> {
             environment: "lambda:ship-order/live",
             location: json!({
                 "Language": "Java",
+                "ClassName": "Ship",
                 "FilePath": "src/main/java/com/example/Ship.java",
             }),
             tags: None,
@@ -251,6 +253,7 @@ pub(crate) fn cases() -> Vec<Case> {
             environment: "eks:cluster-dev/inventory",
             location: json!({
                 "Language": "Java",
+                "ClassName": "Stock",
                 "FilePath": "src/main/java/com/example/Stock.java",
                 "LineNumber": 1,
             }),
@@ -415,6 +418,7 @@ async fn each_configuration_carries_its_own_tag_set() {
     second.label = "the same scope at another location";
     second.location = json!({
         "Language": "Java",
+        "ClassName": "CartService",
         "FilePath": "src/main/java/com/example/CartService.java",
         "LineNumber": 900,
     });
@@ -480,6 +484,7 @@ async fn an_arn_naming_no_stored_configuration_is_not_found() {
     deleted_case.label = "a deleted configuration";
     deleted_case.location = json!({
         "Language": "Java",
+        "ClassName": "CartService",
         "FilePath": "src/main/java/com/example/CartService.java",
         "LineNumber": 7,
     });
@@ -553,6 +558,7 @@ async fn a_lapsed_configurations_tags_are_no_longer_reported() {
     let environment = "eks:cluster-prod/namespace";
     let location = json!({
         "Language": "Java",
+        "ClassName": "CartService",
         "FilePath": "src/main/java/com/example/CartService.java",
         "LineNumber": 142,
     });
@@ -574,6 +580,7 @@ async fn a_lapsed_configurations_tags_are_no_longer_reported() {
         tags: Some(vec![tag("team", "pricing")]),
         location: json!({
             "Language": "Java",
+            "ClassName": "CartService",
             "FilePath": "src/main/java/com/example/CartService.java",
             "LineNumber": 900,
         }),

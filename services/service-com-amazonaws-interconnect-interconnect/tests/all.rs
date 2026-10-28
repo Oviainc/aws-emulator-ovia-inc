@@ -17,6 +17,8 @@ mod accept_connection_proposal;
 mod arn_scope_refusals;
 #[path = "all/arn_scope_is_relative_to_the_request.rs"]
 mod arn_scope_is_relative_to_the_request;
+#[path = "all/attach_point_arn_is_scoped_to_the_request.rs"]
+mod attach_point_arn_is_scoped_to_the_request;
 #[path = "all/attach_points.rs"]
 mod attach_points;
 #[path = "all/bandwidth_availability.rs"]

@@ -173,9 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invalid input, and a DIFFERENT code from an in-scope ARN that merely names
         // nothing (below), which is what lets a caller tell "wrong account" from "no
         // such resource".
-        if let Some(message) =
-            crate::state::arn_scope_violation(&parsed, &crate::state::request_region(ctx))
-        {
+        let region = crate::state::request_region(ctx);
+        if let Some(message) = crate::state::arn_scope_violation(&parsed, &region) {
             return Err(UntagResourceErrorModeled::InterconnectValidationException(
                 InterconnectValidationException { message },
             )
@@ -203,11 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose delete has completed is seen as `deleted` here.
         guard.materialise_due_transitions(::std::time::Instant::now());
 
-        // The same ARN resolution every tagging operation uses: full-ARN match, and
-        // a connection in the terminal deleted state no longer has a tag set. In
-        // scope and well-formed but naming no connection this account holds is this
-        // service's own CLIENT fault, the modelled 400, not a 404.
-        let Some(stored) = guard.connection_by_arn_mut(&input.arn) else {
+        // The same ARN resolution every ARN-identified input here uses: full-ARN
+        // match inside the Region the request addressed, and a connection in the
+        // terminal deleted state no longer has a tag set. In scope and well-formed
+        // but naming no connection this account holds is this service's own CLIENT
+        // fault, the modelled 400, not a 404.
+        let Some(stored) = guard.connection_in_by_arn_mut(&region, &input.arn) else {
             return Err(UntagResourceErrorModeled::InterconnectClientException(
                 InterconnectClientException {
                     message: crate::state::connection_not_retrievable_message(&input.arn),

@@ -23,6 +23,8 @@ mod invoice_summaries;
 mod invoice_unit_lifecycle;
 #[path = "all/own_account_and_request_derived_refusals.rs"]
 mod own_account_and_request_derived_refusals;
+#[path = "all/portal_validation_code_issue.rs"]
+mod portal_validation_code_issue;
 #[path = "all/procurement_portal_error_message_key.rs"]
 mod procurement_portal_error_message_key;
 #[path = "all/procurement_portal_preference_lifecycle.rs"]
