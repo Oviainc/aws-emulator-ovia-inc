@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDomainControllers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDomainControllers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDomainControllers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the domain controllers of one directory: the servers this service placed in
+//! the directory's subnets, as [`crate::state::DomainControllerRecord`] holds them, in
+//! placement order and paged through the opaque `NextToken` every listing of this service
+//! shares.
+//!
+//! A REPORTING operation — "provides information about any domain controllers in your
+//! directory" — so the only write it performs is
+//! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`],
+//! which materialises the status transitions the clock already owed (a controller leaving
+//! `Creating` for `Active`).
+//!
+//! Domain controllers are a Managed Microsoft AD resource
+//! ([`crate::state::DOMAIN_CONTROLLER_DIRECTORY_TYPES`]), so a directory of another type
+//! is refused with the modelled `UnsupportedOperationException` rather than served as an
+//! empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +87,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The separator between the placement rank a cursor resumes after and the filter it was
+// issued under: the one `crate::state::CURSOR_SEPARATOR` every listing of this service
+// agrees on, so a token means one thing.
+use crate::state::CURSOR_SEPARATOR;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +165,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDomainControllers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDomainControllersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDomainControllers"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the
+        // filter is bounded here — before anything is allocated from it and before
+        // `state.lock()` is taken — by a guard set well above any list a caller has
+        // reason to send.
+        if let Some(requested) = input.domain_controller_ids.as_ref() {
+            if requested.len() > crate::state::MAX_DOMAIN_CONTROLLER_IDS_PER_REQUEST {
+                return Err(invalid_parameter(format!(
+                    "DomainControllerIds may carry at most {max} entries, got {got}",
+                    max = crate::state::MAX_DOMAIN_CONTROLLER_IDS_PER_REQUEST,
+                    got = requested.len()
+                )));
+            }
+        }
+
+        // `DomainControllerIds` narrows the listing to particular controllers; a request
+        // that carries none — or an empty list, which asks for no particular controller —
+        // is an unfiltered listing of the directory's own controllers.
+        let requested_ids: Option<::std::collections::BTreeSet<&String>> = input
+            .domain_controller_ids
+            .as_ref()
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| ids.iter().collect());
+
+        // The cursor a previous page handed back: the placement rank this page resumes
+        // after, together with the filter it was issued under. A token this service did
+        // not issue, or one issued for a different listing, is refused rather than served
+        // as a page of another listing.
+        let filter = cursor_filter(&input.directory_id, input.domain_controller_ids.as_ref());
+        let after_seq = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_cursor(CURSOR_KIND, token)
+                .and_then(|value| {
+                    let (seq, issued_for) = value.split_once(CURSOR_SEPARATOR)?;
+                    if issued_for != filter.as_str() {
+                        return None;
+                    }
+                    seq.parse::<u64>().ok()
+                })
+                .ok_or_else(|| {
+                    DescribeDomainControllersErrorModeled::InvalidNextTokenException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+        let page_size = crate::state::page_size(input.limit);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            entity_does_not_exist(crate::state::no_such_directory(&input.directory_id))
+        })?;
+
+        // A domain controller is a server of the directory's own domain, which only the
+        // types in `DOMAIN_CONTROLLER_DIRECTORY_TYPES` run for the caller — the modelled
+        // refusal for a request a directory type does not support. NOT dead code:
+        // `CreateDirectory` persists a Simple AD directory today, so this branch is
+        // reachable from the wire.
+        if !directory.manages_domain_controllers() {
+            return Err(
+                DescribeDomainControllersErrorModeled::UnsupportedOperationException(
+                    crate::state::refusal(format!(
+                        "DirectoryId {id} names a {directory_type} directory; domain \
+                         controllers are reported for {supported} directories only",
+                        id = input.directory_id,
+                        directory_type = directory.directory_type,
+                        supported = crate::state::DOMAIN_CONTROLLER_DIRECTORY_TYPES.join(" and ")
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // An id in the filter that names no controller OF THIS DIRECTORY is reported
+        // rather than silently dropped from the page: a caller asking about a controller
+        // by id learns it is gone instead of reading an empty list as "no information".
+        if let Some(requested) = requested_ids.as_ref() {
+            for domain_controller_id in requested {
+                if !directory
+                    .domain_controllers
+                    .contains_key(*domain_controller_id)
+                {
+                    return Err(entity_does_not_exist(
+                        crate::state::no_such_domain_controller(domain_controller_id),
+                    ));
+                }
+            }
+        }
+
+        // Every controller the request asks for, in placement order, from the cursor on.
+        let vpc_id = directory.vpc_id().map(str::to_string);
+        let mut selected: Vec<(u64, DomainController)> = directory
+            .domain_controllers_in_placement_order()
+            .into_iter()
+            .filter(|controller| controller.seq > after_seq)
+            .filter(|controller| {
+                requested_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&controller.domain_controller_id))
+            })
+            .map(|controller| {
+                (
+                    controller.seq,
+                    controller.to_domain_controller(&input.directory_id, vpc_id.as_deref()),
+                )
+            })
+            .collect();
+        drop(store);
+
+        let truncated = selected.len() > page_size;
+        selected.truncate(page_size);
+        let page_ended_after = selected.last().map(|(seq, _)| *seq);
+        let domain_controllers: Vec<DomainController> = selected
+            .into_iter()
+            .map(|(_, controller)| controller)
+            .collect();
+
+        Ok(DescribeDomainControllersOutput {
+            domain_controllers: Some(domain_controllers),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(|seq| {
+                    crate::state::encode_cursor(
+                        CURSOR_KIND,
+                        &format!("{seq}{CURSOR_SEPARATOR}{filter}"),
+                    )
+                })
+            } else {
+                None
+            },
+        })
     }
+}
+
+/// Which listing this operation's `NextToken` belongs to, so a token issued by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "domain-controllers";
+
+/// How this operation's filter is recorded in a cursor: the `DirectoryId` and the
+/// `DomainControllerIds` as the request listed them, through the one shared
+/// [`crate::state::cursor_filter`] encoding. A later page must be asked for with the same
+/// filter, so a token cannot silently resume a different listing.
+fn cursor_filter(directory_id: &str, domain_controller_ids: Option<&Vec<String>>) -> String {
+    let controllers = domain_controller_ids
+        .map(|requested| requested.join(","))
+        .unwrap_or_default();
+    crate::state::cursor_filter(&[directory_id, &controllers])
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> DescribeDomainControllersError {
+    DescribeDomainControllersErrorModeled::InvalidParameterException(crate::state::refusal(message))
+        .into()
+}
+
+/// Report that an id in the request names nothing this service holds — the modelled
+/// `EntityDoesNotExistException`, "The specified entity could not be found".
+fn entity_does_not_exist(message: String) -> DescribeDomainControllersError {
+    DescribeDomainControllersErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+        message,
+    ))
+    .into()
 }

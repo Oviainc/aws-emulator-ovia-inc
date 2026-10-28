@@ -16,7 +16,10 @@
 //! * an absent `ShortName` defaults to the first label of the directory's DNS name, as
 //!   the member's own documentation describes;
 //! * it is created with [`crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS`] domain
-//!   controllers, the only directory type for which that member is reported.
+//!   controllers, the only directory type for which that member is reported, and those
+//!   controllers are PLACED \u2014 one per subnet of the requested VPC settings, each still
+//!   `Creating` until the transition this create owes falls due, which is what
+//!   `DescribeDomainControllers` then reports.
 //!
 //! The directory is persisted in the modelled `Requested` stage with the move to
 //! `Active` owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller
@@ -288,6 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             desired_number_of_domain_controllers: Some(
                 crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS,
             ),
+            // The controllers themselves are placed in the directory's subnets below,
+            // once the record they belong to is in the store.
+            domain_controllers: ::std::collections::BTreeMap::new(),
             tags,
             // The Region this directory is created in — its `Primary` one — is the one
             // the request was signed for.
@@ -324,6 +330,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             seq,
         };
         store.directories.insert(directory_id.clone(), record);
+
+        // Managed Microsoft AD runs the directory's domain controllers for the caller, so
+        // the create that mints the directory is what places them: one per subnet of the
+        // requested VPC settings, each still `Creating` until the transition this create
+        // owes falls due. `DescribeDomainControllers` reports them, and
+        // `DesiredNumberOfDomainControllers` above is how many there are.
+        let desired = usize::try_from(crate::state::MICROSOFT_AD_DOMAIN_CONTROLLERS).unwrap_or(0);
+        store.place_domain_controllers(&directory_id, desired, now);
 
         // Read the id back out of the store, so the response cannot name a directory
         // the insert did not persist.

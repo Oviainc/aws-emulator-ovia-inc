@@ -8,7 +8,8 @@
 //! Amazon SNS topics `RegisterEventTopic` associates, the log subscriptions
 //! `CreateLogSubscription` creates, the trust relationships
 //! `CreateTrust` establishes, the directory shares `ShareDirectory` creates, the schema
-//! extensions `StartSchemaExtension` applies, the
+//! extensions `StartSchemaExtension` applies, the domain controllers `CreateMicrosoftAD`
+//! places, the
 //! assessments
 //! `StartADAssessment` starts and the tags `AddTagsToResource` merges — plus
 //! the pieces of behaviour that cannot live in any single operation file:
@@ -22,7 +23,7 @@
 //!   directory's LDAP security leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
-//!   leaving `Initializing`).
+//!   leaving `Initializing`, a domain controller leaving `Creating`).
 //!   Every handler calls it before reading or writing, so a reporting operation reports
 //!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
@@ -60,8 +61,8 @@ use crate::ops::types::{
     Assessment, AssessmentSummary, Attribute, Certificate, CertificateInfo,
     ClientAuthenticationSettingInfo,
     ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryDescription, DirectoryLimits,
-    DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo, LDAPSSettingInfo, LogSubscription,
-    SchemaExtensionInfo, SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust,
+    DirectoryVpcSettingsDescription, DomainController, EventTopic, IpRouteInfo, LDAPSSettingInfo,
+    LogSubscription, SchemaExtensionInfo, SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -163,6 +164,50 @@ pub const DEFAULT_MICROSOFT_AD_EDITION: &str = "Enterprise";
 /// has exactly the modelled minimum of two. `UpdateNumberOfDomainControllers` is what
 /// changes it afterwards.
 pub const MICROSOFT_AD_DOMAIN_CONTROLLERS: i32 = 2;
+
+/// The directory types whose domain controllers this service manages and reports.
+///
+/// A domain controller is a server of the directory's own domain, which only AWS Managed
+/// Microsoft AD runs for the caller: `DirectoryDescription$DesiredNumberOfDomainControllers`
+/// is documented as "the desired number of domain controllers in the directory IF the
+/// directory is Microsoft AD", and `UpdateNumberOfDomainControllers` is what changes that
+/// number. So a directory of any other type has no domain controller for
+/// `DescribeDomainControllers` to report, and the call is refused with the modelled
+/// `UnsupportedOperationException` rather than served as an empty page.
+pub const DOMAIN_CONTROLLER_DIRECTORY_TYPES: [&str; 1] = [TYPE_MICROSOFT_AD];
+
+/// The `DomainControllerStatus` a controller carries between its placement and
+/// [`TRANSITION_SPAN`]: the first value of the modelled `DomainControllerStatus` enum
+/// (`smithy_query(query="shape",shape="DomainControllerStatus")`).
+///
+/// A create answers before the controllers it places are in service, so the move to
+/// [`DOMAIN_CONTROLLER_STATUS_ACTIVE`] is owed by the clock rather than by any later
+/// call.
+pub const DOMAIN_CONTROLLER_STATUS_CREATING: &str = "Creating";
+
+/// The `DomainControllerStatus` a placed controller reaches once the transition its
+/// placement owes falls due: the second value of the same modelled enum, the one a
+/// controller in service carries.
+pub const DOMAIN_CONTROLLER_STATUS_ACTIVE: &str = "Active";
+
+/// The most `DomainControllerIds` entries a single `DescribeDomainControllers` will
+/// resolve.
+///
+/// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
+/// reason to send — a directory holds a handful of controllers, so a longer list can only
+/// repeat ids — and it is what keeps the caller-chosen filter from being allocated and
+/// scanned unbounded.
+pub const MAX_DOMAIN_CONTROLLER_IDS_PER_REQUEST: usize = 100;
+
+/// The most domain controllers this emulator will hold for one directory.
+///
+/// NOT an AWS quota: a resource guard, the same construction as
+/// [`MAX_COMPUTERS_PER_DIRECTORY`]. It is well above the
+/// [`MICROSOFT_AD_DOMAIN_CONTROLLERS`] a create places, and
+/// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::place_domain_controllers`]
+/// clamps what it places to it, so no number a later caller asks for can grow the store
+/// without end.
+pub const MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY: usize = 20;
 
 /// The `DirectoryType` of an AD Connector: the `ADConnector` value of the modelled
 /// `DirectoryType` enum, which `ConnectDirectory` (still scaffolded) is what persists.
@@ -1117,6 +1162,67 @@ impl ConditionalForwarderRecord {
     }
 }
 
+/// One domain controller of a directory: a server this service placed in one of the
+/// directory's subnets, as `DescribeDomainControllers` reports it.
+///
+/// Named `DomainControllerRecord` rather than `DomainController` so it does not collide
+/// with the modelled `DomainController` shape [`Self::to_domain_controller`] renders it
+/// into.
+#[derive(Debug, Clone)]
+pub struct DomainControllerRecord {
+    /// The id of the shape the model declares, `^dc-[0-9a-f]{10}$`, minted by
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::mint_domain_controller_id`].
+    pub domain_controller_id: String,
+    /// The subnet of the directory's VPC settings this controller was placed in; `None`
+    /// only for a directory stored without VPC settings, which has no subnet to name.
+    pub subnet_id: Option<String>,
+    /// One of the modelled `DomainControllerStatus` values.
+    pub status: String,
+    /// When the status transition the placement owes falls due; `None` once there is
+    /// none left to make. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
+    pub launch_time: SystemTime,
+    pub status_last_updated: SystemTime,
+    /// Placement rank, from
+    /// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::next_seq`].
+    /// `DescribeDomainControllers` pages over a directory's controllers sorted by this,
+    /// and its opaque `NextToken` carries the rank the next page resumes after, so a page
+    /// boundary survives a controller leaving the directory between pages.
+    pub seq: u64,
+}
+
+impl DomainControllerRecord {
+    /// This controller as the modelled `DomainController`, reported for the directory it
+    /// resides in.
+    ///
+    /// The members this slice has no record behind are left absent rather than invented:
+    /// `DnsIpAddr` / `DnsIpv6Addr` ("the IP address of the domain controller") and
+    /// `AvailabilityZone` are allocated by the VPC data plane this emulator does not
+    /// have — the same reason `DirectoryVpcSettingsDescription$AvailabilityZones` stays
+    /// absent — and `StatusReason` ("a description of the domain controller state")
+    /// describes a controller whose status needs explaining, which no status this
+    /// emulator records does.
+    pub fn to_domain_controller(
+        &self,
+        directory_id: &str,
+        vpc_id: Option<&str>,
+    ) -> DomainController {
+        DomainController {
+            directory_id: Some(directory_id.to_string()),
+            domain_controller_id: Some(self.domain_controller_id.clone()),
+            dns_ip_addr: None,
+            dns_ipv6_addr: None,
+            vpc_id: vpc_id.map(str::to_string),
+            subnet_id: self.subnet_id.clone(),
+            availability_zone: None,
+            status: Some(self.status.clone()),
+            status_reason: None,
+            launch_time: Some(as_timestamp(self.launch_time)),
+            status_last_updated_date_time: Some(as_timestamp(self.status_last_updated)),
+        }
+    }
+}
+
 /// One stored directory: what `CreateDirectory` persisted and `DescribeDirectories`
 /// reports.
 #[derive(Debug, Clone)]
@@ -1153,6 +1259,12 @@ pub struct Directory {
     /// `CreateMicrosoftAD` sets it to [`MICROSOFT_AD_DOMAIN_CONTROLLERS`] and
     /// `UpdateNumberOfDomainControllers` (still scaffolded) is what changes it.
     pub desired_number_of_domain_controllers: Option<i32>,
+    /// The domain controllers this service placed in the directory, keyed by
+    /// `DomainControllerId`; `DescribeDomainControllers` reports them. Only a directory
+    /// of a type in [`DOMAIN_CONTROLLER_DIRECTORY_TYPES`] has any: `CreateMicrosoftAD`
+    /// places [`Directory::desired_number_of_domain_controllers`] of them, so the records
+    /// live on the directory record and deleting the directory takes them with it.
+    pub domain_controllers: BTreeMap<String, DomainControllerRecord>,
     /// This directory's tags, keyed by tag key: a second `AddTagsToResource` with a key
     /// already present overwrites that key's value.
     pub tags: BTreeMap<String, String>,
@@ -1291,6 +1403,37 @@ impl Directory {
             certificate.certificate_type == certificate_type
                 && certificate.state == CERTIFICATE_STATE_REGISTERED
         })
+    }
+
+    /// Whether this directory's domain controllers are this service's to report at all:
+    /// whether its type is one of [`DOMAIN_CONTROLLER_DIRECTORY_TYPES`].
+    pub fn manages_domain_controllers(&self) -> bool {
+        DOMAIN_CONTROLLER_DIRECTORY_TYPES.contains(&self.directory_type.as_str())
+    }
+
+    /// The VPC this directory's servers were placed in, from its stored VPC settings.
+    pub fn vpc_id(&self) -> Option<&str> {
+        self.vpc_settings
+            .as_ref()
+            .and_then(|settings| settings.vpc_id.as_deref())
+    }
+
+    /// The subnets this directory's servers are placed across, from its stored VPC
+    /// settings: the `SubnetIds` the create named, in the order it named them.
+    pub fn subnet_ids(&self) -> Vec<String> {
+        self.vpc_settings
+            .as_ref()
+            .and_then(|settings| settings.subnet_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// This directory's domain controllers in the order they were placed — the order
+    /// `DescribeDomainControllers` pages over, which the records' placement rank gives,
+    /// since they are keyed by id rather than by rank.
+    pub fn domain_controllers_in_placement_order(&self) -> Vec<&DomainControllerRecord> {
+        let mut ordered: Vec<&DomainControllerRecord> = self.domain_controllers.values().collect();
+        ordered.sort_by_key(|controller| controller.seq);
+        ordered
     }
 
     /// Whether LDAP secure calls can be activated for this directory's type at all:
@@ -1821,6 +1964,8 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     trust_id_seed: u64,
     /// Drives [`Self::mint_schema_extension_id`], its own id space for the same reason.
     schema_extension_id_seed: u64,
+    /// Drives [`Self::mint_domain_controller_id`], its own id space for the same reason.
+    domain_controller_id_seed: u64,
     /// Drives [`Self::next_seq`]: the creation rank stamped on each directory.
     seq_counter: u64,
 }
@@ -1860,7 +2005,7 @@ const ASSESSMENT_ID_OFFSET: u128 = 9_876_543_210_987;
 /// `seed` is the id space's own counter, advanced here and mapped through the bijection
 /// described on [`ID_MULTIPLIER`], so an id looks unpredictable yet never repeats within
 /// a process. One function, so the derivation cannot drift between the id spaces.
-fn mint_id(seed: &mut u64, prefix: char) -> String {
+fn mint_id(seed: &mut u64, prefix: &str) -> String {
     *seed = seed.wrapping_add(1);
     let scrambled = seed
         .wrapping_mul(ID_MULTIPLIER)
@@ -1877,34 +2022,94 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// [`ID_MULTIPLIER`], so it is unpredictable-looking yet never repeats within a
     /// process.
     pub fn mint_directory_id(&mut self) -> String {
-        mint_id(&mut self.id_seed, 'd')
+        mint_id(&mut self.id_seed, "d")
     }
 
     /// Mint a fresh `SnapshotId` of the shape the model declares,
     /// `^s-[0-9a-f]{10}$`, through the same bijection as
     /// [`Self::mint_directory_id`] over its own seed.
     pub fn mint_snapshot_id(&mut self) -> String {
-        mint_id(&mut self.snapshot_id_seed, 's')
+        mint_id(&mut self.snapshot_id_seed, "s")
     }
 
     /// Mint a fresh `CertificateId` of the shape the model declares,
     /// `^c-[0-9a-f]{10}$`, through the same bijection as [`Self::mint_directory_id`]
     /// over its own seed.
     pub fn mint_certificate_id(&mut self) -> String {
-        mint_id(&mut self.certificate_id_seed, 'c')
+        mint_id(&mut self.certificate_id_seed, "c")
     }
 
     /// Mint a fresh `TrustId` of the shape the model declares, `^t-[0-9a-f]{10}$`,
     /// through the same bijection as [`Self::mint_directory_id`] over its own seed.
     pub fn mint_trust_id(&mut self) -> String {
-        mint_id(&mut self.trust_id_seed, 't')
+        mint_id(&mut self.trust_id_seed, "t")
     }
 
     /// Mint a fresh `SchemaExtensionId` of the shape the model declares,
     /// `^e-[0-9a-f]{10}$`, through the same bijection as [`Self::mint_directory_id`]
     /// over its own seed.
     pub fn mint_schema_extension_id(&mut self) -> String {
-        mint_id(&mut self.schema_extension_id_seed, 'e')
+        mint_id(&mut self.schema_extension_id_seed, "e")
+    }
+
+    /// Mint a fresh `DomainControllerId` of the shape the model declares,
+    /// `^dc-[0-9a-f]{10}$`, through the same bijection as [`Self::mint_directory_id`]
+    /// over its own seed.
+    pub fn mint_domain_controller_id(&mut self) -> String {
+        mint_id(&mut self.domain_controller_id_seed, "dc")
+    }
+
+    /// Place `count` domain controllers in the directory `directory_id`, as of `now`.
+    ///
+    /// One controller per subnet of the directory's VPC settings, taken in the order the
+    /// create named them and wrapping round when more controllers are asked for than
+    /// there are subnets: `DirectoryVpcSettings$SubnetIds`' own documentation says
+    /// "Directory Service creates a directory server and a DNS server in each of these
+    /// subnets", so a controller resides in a subnet of the directory rather than
+    /// nowhere. Each one is placed in [`DOMAIN_CONTROLLER_STATUS_CREATING`] with the move
+    /// to [`DOMAIN_CONTROLLER_STATUS_ACTIVE`] owed by the clock one [`TRANSITION_SPAN`]
+    /// later, so a caller that describes them immediately still sees the transient
+    /// status.
+    ///
+    /// `count` is clamped to [`MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY`], and nothing is
+    /// placed for an id that names no stored directory — there is nothing to place
+    /// controllers in.
+    pub fn place_domain_controllers(&mut self, directory_id: &str, count: usize, now: SystemTime) {
+        let Some(subnets) = self
+            .directories
+            .get(directory_id)
+            .map(|directory| directory.subnet_ids())
+        else {
+            return;
+        };
+        // The number of controllers to place is clamped BEFORE anything is allocated from
+        // it, so a count that reaches here from a caller-supplied number cannot size the
+        // placement.
+        let count = count.min(MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY);
+        // The ids and the placement ranks come from the service-wide seeds, so they are
+        // minted before the directory is borrowed mutably below.
+        let mut placed: Vec<DomainControllerRecord> = Vec::with_capacity(count);
+        for index in 0..count {
+            let domain_controller_id = self.mint_domain_controller_id();
+            let seq = self.next_seq();
+            placed.push(DomainControllerRecord {
+                domain_controller_id,
+                subnet_id: subnets.get(index % subnets.len().max(1)).cloned(),
+                status: DOMAIN_CONTROLLER_STATUS_CREATING.to_string(),
+                status_due_at: Some(now + TRANSITION_SPAN),
+                launch_time: now,
+                status_last_updated: now,
+                seq,
+            });
+        }
+        let Some(directory) = self.directories.get_mut(directory_id) else {
+            return;
+        };
+        for record in placed {
+            directory
+                .domain_controllers
+                .insert(record.domain_controller_id.clone(), record);
+        }
     }
 
     /// The next creation rank. Stamped on a directory or an assessment when it is
@@ -1941,7 +2146,7 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// status when
     /// `StartADAssessment` ran, a directory's data-access status when
     /// `EnableDirectoryDataAccess` ran, a directory's LDAPS status when `EnableLDAPS`
-    /// ran.
+    /// ran, a domain controller's status when the create that placed it ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
             if let Some(due) = directory.stage_due_at {
@@ -2023,6 +2228,22 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                     extension.status = SCHEMA_EXTENSION_STATUS_COMPLETED.to_string();
                     extension.end_date_time = Some(due);
                     extension.status_due_at = None;
+                }
+            }
+            // The status transition placing a domain controller owes: the transient
+            // `Creating` settles on `Active`, the status a controller in service carries.
+            // The statuses a controller being removed or rebuilt passes through belong to
+            // `UpdateNumberOfDomainControllers` / `RestoreFromSnapshot`, both still
+            // scaffolded, so they land with those handlers rather than as branches
+            // nothing can reach.
+            for controller in directory.domain_controllers.values_mut() {
+                let Some(due) = controller.status_due_at else {
+                    continue;
+                };
+                if now >= due && controller.status == DOMAIN_CONTROLLER_STATUS_CREATING {
+                    controller.status = DOMAIN_CONTROLLER_STATUS_ACTIVE.to_string();
+                    controller.status_last_updated = due;
+                    controller.status_due_at = None;
                 }
             }
         }
@@ -2699,6 +2920,17 @@ pub fn no_such_snapshot(snapshot_id: &str) -> String {
 /// id.
 pub fn no_such_trust(trust_id: &str) -> String {
     format!("Trust: '{trust_id}' does not exist.")
+}
+
+/// The `EntityDoesNotExistException` message for an id that names no domain controller of
+/// the directory the request asked about.
+///
+/// Worded the way this service's lookup family is ([`no_such_directory`],
+/// [`no_such_trust`]): the kind of entity, the quoted id the request sent and "does not
+/// exist.", so the message is built from the request and names what the caller has to fix.
+/// [`refusal`] appends the request id.
+pub fn no_such_domain_controller(domain_controller_id: &str) -> String {
+    format!("DomainController: '{domain_controller_id}' does not exist.")
 }
 
 /// The `EntityDoesNotExistException` message for an id that names no stored assessment.
