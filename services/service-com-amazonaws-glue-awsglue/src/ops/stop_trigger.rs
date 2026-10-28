@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopTrigger
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopTrigger`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopTrigger::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the trigger its `Name` addresses in the Region the request is served in: the
+//! stored trigger moves into the one `TriggerState` of a stopped trigger
+//! ([`crate::state::TRIGGER_STATE_DEACTIVATED`]), which a later `GetTrigger` reports, and
+//! the stop answers with the name it stopped.
+//!
+//! A stop is refused with `EntityNotFoundException` when this Region holds no trigger
+//! under that name, because a trigger is served only through the endpoint that created
+//! it.
+//!
+//! Stopping takes no account of the state the trigger was in and is idempotent: whatever
+//! that state was, the trigger is stopped once the call returns, and the definition it
+//! holds — its type, schedule, predicate and actions — is untouched, so a later start
+//! moves the same trigger back to [`crate::state::TRIGGER_STATE_ACTIVATED`]. A stop ends
+//! no run already begun: what a firing recorded is a run of a workflow, which has its own
+//! lifecycle.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +154,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopTrigger` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopTriggerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopTrigger"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on — the same way
+            // `StartTrigger` reports it.
+            return Err(StopTriggerErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` with `length 1..255` and the model constrains nothing else
+        // this stop carries, so every check left is one the STORE answers.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A trigger is served only through the endpoint that created it, so a name no
+        // trigger of THIS Region has addresses no trigger this endpoint can stop.
+        let Some(trigger) = store.trigger_mut(&region, &input.name) else {
+            return Err(StopTriggerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::trigger_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // "Stops a specified trigger": the trigger this call stopped is in the modelled
+        // state of a stopped trigger, which every later read of it reports. A steady
+        // state, so the clock owes it nothing further, and the write leaves the rest of
+        // the definition — type, schedule, predicate, actions — exactly as it was, so a
+        // later start activates the same trigger again.
+        let was = ::std::mem::replace(
+            &mut trigger.state,
+            crate::state::TRIGGER_STATE_DEACTIVATED.to_string(),
+        );
+        ::tracing::info!(
+            operation = "StopTrigger",
+            trigger = %input.name,
+            region = %region,
+            previous_state = %was,
+            "stopped a Glue trigger"
+        );
+
+        Ok(StopTriggerOutput {
+            // "The name of the trigger that was stopped."
+            name: Some(input.name),
+        })
     }
 }

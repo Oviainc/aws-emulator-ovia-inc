@@ -598,9 +598,9 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                 );
 
                 // A refusal is not a one-shot: the same call is refused the same way
-                // again, and still reports nothing. It reads the same except for the
-                // authorization id, which is minted per REFUSED REQUEST — so the second
-                // denial hands the caller its own, readable on its own.
+                // again, and still reports nothing. Every part of the message is a fact
+                // of the request and of the documents in force, so the second denial
+                // reads identically.
                 let (again_status, again) =
                     call_signed_by(&router, Some(&access_key_id), "ListOpenIDConnectProviders", &[])
                         .await;
@@ -617,11 +617,11 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                     &provider_collection(),
                     &reason,
                 );
-                assert_ne!(
+                assert_eq!(
                     element(&again, "Message"),
                     element(&body, "Message"),
-                    "case {case_name:?}: every refused request carries its OWN authorization \
-                     id, so two denials cannot read identically, got {again}"
+                    "case {case_name:?}: the same refused call must be worded alike every \
+                     time, got {again}"
                 );
                 assert!(
                     listed_arns(&again).is_empty(),

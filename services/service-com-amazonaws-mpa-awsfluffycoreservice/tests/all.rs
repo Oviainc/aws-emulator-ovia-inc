@@ -39,6 +39,8 @@ mod identity_sources;
 mod inactive_team_version_deletion;
 #[path = "all/management_account_gate_order.rs"]
 mod management_account_gate_order;
+#[path = "all/pagination_token_provenance.rs"]
+mod pagination_token_provenance;
 #[path = "all/pending_team_update.rs"]
 mod pending_team_update;
 #[path = "all/policy_catalog.rs"]

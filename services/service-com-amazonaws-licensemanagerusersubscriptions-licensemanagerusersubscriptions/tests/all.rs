@@ -53,6 +53,8 @@ mod refusals;
 mod registration_pair_resolution_is_shared;
 #[path = "all/resource_resolution_refusals.rs"]
 mod resource_resolution_refusals;
+#[path = "all/settings_network_resolution.rs"]
+mod settings_network_resolution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_validation.rs"]

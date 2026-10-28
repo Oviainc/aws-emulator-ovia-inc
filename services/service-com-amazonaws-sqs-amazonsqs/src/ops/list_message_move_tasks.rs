@@ -194,11 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ARN is classified BEFORE the store is reached, as every operation taking one
         // does: a value that names no queue in any account is not an address this service
         // can resolve, which is what the modelled `InvalidAddress` ("The specified ID is
-        // invalid.") refuses, while a well-formed ARN of another account or another
-        // service names a resource that simply does not exist here.
-        let source_name = match sqs::parse_queue_arn(&input.source_arn) {
-            sqs::QueueArn::OfThisAccount(name) => name.to_string(),
-            sqs::QueueArn::Elsewhere => {
+        // invalid.") refuses, while a well-formed ARN of another account, another service
+        // or another region names a resource that simply does not exist here.
+        let source_name = match sqs::parse_queue_arn(&input.source_arn, &region) {
+            sqs::QueueArn::OfThisRegion(name) => name.to_string(),
+            sqs::QueueArn::OfAnotherRegion { .. } | sqs::QueueArn::Elsewhere => {
                 return Err(ListMessageMoveTasksErrorModeled::ResourceNotFoundException(
                     sqs::resource_not_found("SourceArn"),
                 )
@@ -219,16 +219,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "One or more specified resources don't exist" (`ResourceNotFoundException`): the
         // queue whose message movement tasks are to be listed has to be one of this
-        // account's.
-        if !state.queues.contains_key(&source_name) {
+        // account's, in the region this call addressed.
+        if !state.holds_queue(&region, &source_name) {
             return Err(ListMessageMoveTasksErrorModeled::ResourceNotFoundException(
                 sqs::resource_not_found("SourceArn"),
             )
             .into());
         }
 
-        let results =
-            state.reported_message_move_tasks(&source_name, SystemTime::now(), &region, max_results);
+        let results = state.reported_message_move_tasks(
+            &region,
+            &source_name,
+            SystemTime::now(),
+            max_results,
+        );
 
         // A source queue with no task recorded under it answers with the member absent,
         // which is how every listing in this service reports an empty result.

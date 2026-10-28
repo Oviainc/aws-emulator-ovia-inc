@@ -8,6 +8,22 @@
 //! [`Queue`] record in [`ComAmazonawsSqsAmazonsqsState::queues`], so a create is
 //! observable by every later read and an attribute change by every later report.
 //!
+//! # One namespace per region
+//!
+//! A queue belongs to the region the call that created it addressed ([`Queue::region`],
+//! taken from the request's SigV4 credential scope by [`request_region`]), and the store
+//! is keyed by that region together with the queue's name: a queue name "is unique within
+//! the scope of your queues" of one region, so the same name created against a second
+//! region is a second, independent queue and each delivers only its own messages.
+//! Everything that resolves a queue takes that region —
+//! [`ComAmazonawsSqsAmazonsqsState::queue`], [`ComAmazonawsSqsAmazonsqsState::queue_mut`],
+//! [`ComAmazonawsSqsAmazonsqsState::queue_by_url`] and
+//! [`ComAmazonawsSqsAmazonsqsState::queues_in`] — so a call signed for one region resolves
+//! nothing another region holds, and the region the queue lives in is the one its ARN
+//! carries ([`queue_arn`]). An ARN a request supplies is read the same way
+//! ([`parse_queue_arn`]): one naming another region names no queue here, which is why
+//! neither a dead-letter target nor a message movement task can span two regions.
+//!
 //! The record is the stored half; the wire half (the `Attributes` map
 //! `GetQueueAttributes` returns) is PROJECTED from it by
 //! [`Queue::reported_attributes`], so no handler assembles a response member by hand.
@@ -886,20 +902,28 @@ pub struct ReceiveAttempt {
 
 /// Per-service state for com-amazonaws-sqs-amazonsqs. A handler reaches it through [`service_state`].
 ///
-/// `queues` is a `BTreeMap` rather than a `HashMap` so iteration is in name order:
-/// the order a listing pages over has to be the same on every call.
+/// Every resource here belongs to ONE region — see "One namespace per region" in this
+/// module's documentation — so each map is keyed by that region and every read takes it.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSqsAmazonsqsState {
-    /// Every queue that exists, keyed by `QueueName`.
-    pub queues: BTreeMap<String, Queue>,
+    /// Every queue that exists, keyed by the `(region, QueueName)` pair that identifies
+    /// one: a name is unique within one region's queues, so the same name in a second
+    /// region is a second queue and both coexist here. Reached through
+    /// [`Self::queue`] / [`Self::queue_mut`] / [`Self::queues_in`] rather than by
+    /// indexing, so no caller can read one region's queue for another's.
+    ///
+    /// A `BTreeMap` rather than a `HashMap` so iteration is in region-and-name order:
+    /// the order a listing pages over has to be the same on every call.
+    pub queues: BTreeMap<(String, String), Queue>,
     /// The message movement tasks `StartMessageMoveTask` has started, oldest first.
     /// Bounded per source queue by [`MAX_MESSAGE_MOVE_TASKS_PER_QUEUE`].
     pub message_move_tasks: Vec<MessageMoveTask>,
-    /// The names `DeleteQueue` has removed, each with the instant it was removed: a name
-    /// stays unavailable to `CreateQueue` for [`QUEUE_DELETED_RECENTLY_INTERVAL`] after
-    /// its queue was deleted. Entries lapse with that interval and are bounded by
+    /// The queues `DeleteQueue` has removed, each keyed by the `(region, QueueName)` pair
+    /// it was held under and carrying the instant it was removed: a name stays unavailable
+    /// to `CreateQueue` in THAT region for [`QUEUE_DELETED_RECENTLY_INTERVAL`] after its
+    /// queue was deleted. Entries lapse with that interval and are bounded by
     /// [`MAX_RECENTLY_DELETED_NAMES`].
-    pub recently_deleted: BTreeMap<String, SystemTime>,
+    pub recently_deleted: BTreeMap<(String, String), SystemTime>,
 }
 
 /// A stored queue: the state the reported `Attributes` map is rebuilt from, plus the
@@ -907,6 +931,10 @@ pub struct ComAmazonawsSqsAmazonsqsState {
 #[derive(Debug, Clone)]
 pub struct Queue {
     pub name: String,
+    /// The region the `CreateQueue` call that made this queue addressed, as its SigV4
+    /// credential scope named it: the region whose namespace holds the queue, the one its
+    /// [`arn`](Self::arn) carries, and the only one a later call can reach it through.
+    pub region: String,
     /// What identifies THIS incarnation of the queue: minted when the queue was created,
     /// so a queue created again under a name a delete removed is a different incarnation
     /// of that name. Every receipt handle this queue mints carries it
@@ -1689,15 +1717,69 @@ impl ComAmazonawsSqsAmazonsqsState {
         }
     }
 
-    /// The queue a `QueueUrl` addresses, for reading.
-    pub fn queue_by_url(&self, queue_url: &str) -> Option<&Queue> {
-        self.queues.get(queue_name_from_url(queue_url)?)
+    /// The queue called `name` in `region`, for reading: the one record every call signed
+    /// for that region resolves, and nothing another region holds.
+    pub fn queue(&self, region: &str, name: &str) -> Option<&Queue> {
+        self.queues.get(&queue_key(region, name))
     }
 
-    /// The queue a `QueueUrl` addresses, for writing.
-    pub fn queue_by_url_mut(&mut self, queue_url: &str) -> Option<&mut Queue> {
+    /// The same queue, for writing.
+    pub fn queue_mut(&mut self, region: &str, name: &str) -> Option<&mut Queue> {
+        self.queues.get_mut(&queue_key(region, name))
+    }
+
+    /// Whether `region` holds a queue called `name`.
+    pub fn holds_queue(&self, region: &str, name: &str) -> bool {
+        self.queues.contains_key(&queue_key(region, name))
+    }
+
+    /// Every queue of ONE region, in name order: the set a listing of that region pages
+    /// over, since a queue belongs to the region its create addressed and nothing outside
+    /// it is addressable.
+    pub fn queues_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Queue> {
+        self.queues
+            .range(queue_key(region, "")..)
+            .take_while(move |((held, _), _)| held == region)
+            .map(|(_, queue)| queue)
+    }
+
+    /// Hold `queue` under the region and name it carries.
+    pub fn insert_queue(&mut self, queue: Queue) {
+        self.queues
+            .insert(queue_key(&queue.region, &queue.name), queue);
+    }
+
+    /// The queue a queue ARN names, resolved in the region the ARN itself carries.
+    ///
+    /// For a reader that holds an ARN and no request region of its own — another service
+    /// resolving the queue a configuration of its own names. A request-borne reference is
+    /// resolved through [`Self::queue`] / [`Self::queue_by_url`] in the region the request
+    /// addressed instead.
+    pub fn queue_by_arn(&self, arn: &str) -> Option<&Queue> {
+        self.queues.get(&queue_key_from_arn(arn)?)
+    }
+
+    /// The same queue, for writing: the one reader that CHANGES a queue it holds only an
+    /// ARN for (another service's tagging API) resolves it the same way.
+    pub fn queue_by_arn_mut(&mut self, arn: &str) -> Option<&mut Queue> {
+        let key = queue_key_from_arn(arn)?;
+        self.queues.get_mut(&key)
+    }
+
+    /// The queue a `QueueUrl` addresses in `region`, for reading.
+    ///
+    /// The url names the account and the queue ([`queue_name_from_url`]); which region's
+    /// queue it resolves is the region the REQUEST addressed, exactly as the real service
+    /// serves a url against the endpoint the call reached — so a url minted in another
+    /// region resolves only where that region holds a queue of the same name too.
+    pub fn queue_by_url(&self, region: &str, queue_url: &str) -> Option<&Queue> {
+        self.queue(region, queue_name_from_url(queue_url)?)
+    }
+
+    /// The queue a `QueueUrl` addresses in `region`, for writing.
+    pub fn queue_by_url_mut(&mut self, region: &str, queue_url: &str) -> Option<&mut Queue> {
         let name = queue_name_from_url(queue_url)?.to_string();
-        self.queues.get_mut(&name)
+        self.queue_mut(region, &name)
     }
 
     /// Which queue minted `receipt_handle`, as the queue at `queue_url` that cannot
@@ -1710,6 +1792,7 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// the incarnation that issued it, and a value this service never minted names none.
     pub fn receipt_handle_origin<'a>(
         &self,
+        region: &str,
         queue_url: &str,
         receipt_handle: &'a str,
     ) -> ReceiptHandleOrigin<'a> {
@@ -1717,7 +1800,7 @@ impl ComAmazonawsSqsAmazonsqsState {
             return ReceiptHandleOrigin::Unrecognised;
         };
         if self
-            .queue_by_url(queue_url)
+            .queue_by_url(region, queue_url)
             .is_some_and(|queue| queue.incarnation == minted_by)
         {
             // The queue addressed is the one that minted it, so what the refusal is about
@@ -1735,14 +1818,20 @@ impl ComAmazonawsSqsAmazonsqsState {
         }
     }
 
-    /// Remove the queue a `QueueUrl` addresses, with every message and handle it held,
-    /// and remember that its NAME was deleted at `at` — which is what makes a re-create
-    /// of the same name inside [`QUEUE_DELETED_RECENTLY_INTERVAL`] refusable.
-    pub fn remove_queue_by_url(&mut self, queue_url: &str, at: SystemTime) -> Option<Queue> {
-        let name = queue_name_from_url(queue_url)?.to_string();
-        let removed = self.queues.remove(&name)?;
+    /// Remove the queue a `QueueUrl` addresses in `region`, with every message and handle
+    /// it held, and remember that its NAME was deleted at `at` — which is what makes a
+    /// re-create of the same name in that region inside
+    /// [`QUEUE_DELETED_RECENTLY_INTERVAL`] refusable.
+    pub fn remove_queue_by_url(
+        &mut self,
+        region: &str,
+        queue_url: &str,
+        at: SystemTime,
+    ) -> Option<Queue> {
+        let key = queue_key(region, queue_name_from_url(queue_url)?);
+        let removed = self.queues.remove(&key)?;
         self.forget_lapsed_deletions(at);
-        self.recently_deleted.insert(name, at);
+        self.recently_deleted.insert(key, at);
         // The ledger is bounded; the oldest record goes first, so the names deleted most
         // recently — the ones a re-create is most likely to name — are the ones kept.
         while self.recently_deleted.len() > MAX_RECENTLY_DELETED_NAMES {
@@ -1750,7 +1839,7 @@ impl ComAmazonawsSqsAmazonsqsState {
                 .recently_deleted
                 .iter()
                 .min_by_key(|(_, deleted_at)| **deleted_at)
-                .map(|(name, _)| name.clone())
+                .map(|(key, _)| key.clone())
             {
                 self.recently_deleted.remove(&oldest);
             }
@@ -1766,34 +1855,45 @@ impl ComAmazonawsSqsAmazonsqsState {
             .retain(|_, deleted_at| !lapsed(*deleted_at, QUEUE_DELETED_RECENTLY_INTERVAL, now));
     }
 
-    /// When the name `name` was deleted, if a delete removed it inside
+    /// When the name `name` was deleted in `region`, if a delete removed it there inside
     /// [`QUEUE_DELETED_RECENTLY_INTERVAL`] of `now`.
     ///
-    /// The ledger is keyed by name and says nothing about whether a queue carries that
-    /// name again, so a caller that needs both — `CreateQueue` — resolves the live queue
-    /// first and reaches here only for a name no queue answers to.
-    pub fn deleted_recently(&self, name: &str, now: SystemTime) -> Option<SystemTime> {
+    /// The ledger is keyed by region and name and says nothing about whether a queue
+    /// carries that name again, so a caller that needs both — `CreateQueue` — resolves the
+    /// live queue first and reaches here only for a name no queue of that region answers
+    /// to.
+    pub fn deleted_recently(
+        &self,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<SystemTime> {
         self.recently_deleted
-            .get(name)
+            .get(&queue_key(region, name))
             .copied()
             .filter(|deleted_at| !lapsed(*deleted_at, QUEUE_DELETED_RECENTLY_INTERVAL, now))
     }
 
-    /// The names of the queues whose `RedrivePolicy` names the queue called
+    /// The names of the queues of `region` whose `RedrivePolicy` names the queue called
     /// `dead_letter_queue_name` as their dead-letter target, in queue-name order.
     ///
     /// These are that queue's dead-letter SOURCE queues, and having at least one is
     /// what makes it "configured as a dead-letter queue (DLQ) of other Amazon SQS
-    /// queues" — the only kind of source `StartMessageMoveTask` supports.
-    pub fn dead_letter_source_queue_names(&self, dead_letter_queue_name: &str) -> Vec<String> {
-        self.queues
-            .values()
+    /// queues" — the only kind of source `StartMessageMoveTask` supports. A redrive link
+    /// never crosses a region: a target ARN is read in the region the policy's own queue
+    /// lives in, so only that region's queues can be sources of it.
+    pub fn dead_letter_source_queue_names(
+        &self,
+        region: &str,
+        dead_letter_queue_name: &str,
+    ) -> Vec<String> {
+        self.queues_in(region)
             .filter(|queue| {
                 queue
                     .attributes
                     .get(REDRIVE_POLICY)
                     .and_then(|policy| dead_letter_target_arn(policy))
-                    .and_then(|arn| queue_name_from_arn(&arn).map(str::to_string))
+                    .and_then(|arn| queue_name_from_arn(&arn, region).map(str::to_string))
                     .is_some_and(|target| target == dead_letter_queue_name)
             })
             .map(|queue| queue.name.clone())
@@ -1801,24 +1901,30 @@ impl ComAmazonawsSqsAmazonsqsState {
     }
 
     /// The message movement task that is still running for the queue called
-    /// `source_queue_name` at `now`, if any: "Only one active message movement task is
-    /// supported per queue at any given time" (`StartMessageMoveTask`).
+    /// `source_queue_name` in `region` at `now`, if any: "Only one active message movement
+    /// task is supported per queue at any given time" (`StartMessageMoveTask`) — and the
+    /// queue a task is per is one region's queue, so two regions' same-named queues each
+    /// have an allowance of their own.
     pub fn active_message_move_task(
         &self,
+        region: &str,
         source_queue_name: &str,
         now: SystemTime,
     ) -> Option<&MessageMoveTask> {
         self.message_move_tasks.iter().find(|task| {
-            task.source_queue_name == source_queue_name && task.status(now) == MESSAGE_MOVE_RUNNING
+            task.region == region
+                && task.source_queue_name == source_queue_name
+                && task.status(now) == MESSAGE_MOVE_RUNNING
         })
     }
 
-    /// The message movement task the handle a start call returned names, if this store
-    /// still holds its record.
-    pub fn message_move_task(&self, task_handle: &str) -> Option<&MessageMoveTask> {
+    /// The message movement task the handle a start call returned names, if `region` holds
+    /// its record: a task moves one region's messages between that region's queues, so a
+    /// handle minted in another region names no task here.
+    pub fn message_move_task(&self, region: &str, task_handle: &str) -> Option<&MessageMoveTask> {
         self.message_move_tasks
             .iter()
-            .find(|task| task.task_handle == task_handle)
+            .find(|task| task.region == region && task.task_handle == task_handle)
     }
 
     /// Stop the message movement task called `task_handle` at `now`, and answer how many
@@ -1837,15 +1943,20 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// the destination queue, which still leaves the pair holding every message.
     ///
     /// `None` when no task answers to the handle.
-    pub fn cancel_message_move_task(&mut self, task_handle: &str, now: SystemTime) -> Option<u64> {
+    pub fn cancel_message_move_task(
+        &mut self,
+        region: &str,
+        task_handle: &str,
+        now: SystemTime,
+    ) -> Option<u64> {
         let task = self
             .message_move_tasks
             .iter_mut()
-            .find(|task| task.task_handle == task_handle)?;
+            .find(|task| task.region == region && task.task_handle == task_handle)?;
         task.cancelled_at = Some(now);
         let moved = task.messages_moved(now);
-        let source_queue_name = task.source_queue_name.clone();
-        let destination_queue_name = task.destination_queue_name.clone();
+        let source_key = queue_key(region, &task.source_queue_name);
+        let destination_key = queue_key(region, &task.destination_queue_name);
 
         // What the task has not moved yet is exactly what still carries its handle and
         // whose delivery slot is still ahead; a message not yet deliverable has never
@@ -1862,7 +1973,7 @@ impl ComAmazonawsSqsAmazonsqsState {
         let store_bytes = self.retained_message_bytes();
         let stopped: Vec<(String, usize)> = self
             .queues
-            .get(&destination_queue_name)
+            .get(&destination_key)
             .map(|destination| {
                 destination
                     .messages
@@ -1876,7 +1987,7 @@ impl ComAmazonawsSqsAmazonsqsState {
             })
             .unwrap_or_default();
         let mut returning: BTreeSet<String> = BTreeSet::new();
-        if let Some(source) = self.queues.get(&source_queue_name) {
+        if let Some(source) = self.queues.get(&source_key) {
             let mut taken_bytes = 0usize;
             for (message_id, message_bytes) in &stopped {
                 let bytes = taken_bytes.saturating_add(*message_bytes);
@@ -1897,7 +2008,7 @@ impl ComAmazonawsSqsAmazonsqsState {
         }
 
         let mut moving: Vec<StoredMessage> = Vec::with_capacity(returning.len());
-        if let Some(destination) = self.queues.get_mut(&destination_queue_name) {
+        if let Some(destination) = self.queues.get_mut(&destination_key) {
             let mut staying: VecDeque<StoredMessage> = VecDeque::new();
             for message in std::mem::take(&mut destination.messages) {
                 if returning.contains(&message.message_id) {
@@ -1924,7 +2035,7 @@ impl ComAmazonawsSqsAmazonsqsState {
         // keeping the order it held them in: their sends preceded all of those. Retention
         // runs from the return, which is when that queue took the message back, exactly as
         // it runs from the move for a message the task delivers.
-        if let Some(source) = self.queues.get_mut(&source_queue_name) {
+        if let Some(source) = self.queues.get_mut(&source_key) {
             for message in moving.into_iter().rev() {
                 source.messages.push_front(StoredMessage {
                     sent_at: now,
@@ -1947,25 +2058,26 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// under a specific source queue", so nothing a caller can still list is lost, and a
     /// caller looping on `StartMessageMoveTask` cannot grow this store without end.
     ///
-    /// The per-queue bound is counted on [`MessageMoveTask::source_queue_name`] — the
-    /// queue the start call RESOLVED, never a string the request supplied — so every
-    /// request naming one queue shares one allowance. The store-wide bound is the
-    /// backstop for the names of queues that no longer exist, which no per-queue count
-    /// can limit.
+    /// The per-queue bound is counted on the task's region and
+    /// [`MessageMoveTask::source_queue_name`] — the queue the start call RESOLVED, never a
+    /// string the request supplied — so every request naming one queue shares one
+    /// allowance. The store-wide bound is the backstop for the names of queues that no
+    /// longer exist, and for the regions a caller can invent by signing for them, neither
+    /// of which a per-queue count can limit.
     pub fn record_message_move_task(&mut self, task: MessageMoveTask) {
-        let source_queue_name = task.source_queue_name.clone();
+        let source = queue_key(&task.region, &task.source_queue_name);
         self.message_move_tasks.push(task);
         while self
             .message_move_tasks
             .iter()
-            .filter(|recorded| recorded.source_queue_name == source_queue_name)
+            .filter(|recorded| recorded.is_of(&source))
             .count()
             > MAX_MESSAGE_MOVE_TASKS_PER_QUEUE
         {
             let Some(oldest) = self
                 .message_move_tasks
                 .iter()
-                .position(|recorded| recorded.source_queue_name == source_queue_name)
+                .position(|recorded| recorded.is_of(&source))
             else {
                 break;
             };
@@ -1976,9 +2088,10 @@ impl ComAmazonawsSqsAmazonsqsState {
         }
     }
 
-    /// The message movement tasks to report for the queue called `source_queue_name`:
-    /// "the most recent message movement tasks (up to 10) under a specific source queue"
-    /// (`ListMessageMoveTasks`), most recent FIRST and at most `max_results` of them.
+    /// The message movement tasks to report for the queue called `source_queue_name` in
+    /// `region`: "the most recent message movement tasks (up to 10) under a specific source
+    /// queue" (`ListMessageMoveTasks`), most recent FIRST and at most `max_results` of
+    /// them.
     ///
     /// Every member is PROJECTED from the task record and `now`, the way
     /// [`Queue::reported_attributes`] projects a queue's reported attributes: the status
@@ -1990,9 +2103,9 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// no reason.
     pub fn reported_message_move_tasks(
         &self,
+        region: &str,
         source_queue_name: &str,
         now: SystemTime,
-        region: &str,
         max_results: usize,
     ) -> Vec<ListMessageMoveTasksResultEntry> {
         // `message_move_tasks` is append-ordered, so reversing it is start-time order,
@@ -2000,14 +2113,14 @@ impl ComAmazonawsSqsAmazonsqsState {
         self.message_move_tasks
             .iter()
             .rev()
-            .filter(|task| task.source_queue_name == source_queue_name)
+            .filter(|task| task.region == region && task.source_queue_name == source_queue_name)
             .take(max_results)
             .map(|task| ListMessageMoveTasksResultEntry {
                 task_handle: Some(task.task_handle.clone()),
                 status: Some(task.status(now).to_string()),
-                source_arn: Some(self.reported_queue_arn(&task.source_queue_name, region)),
+                source_arn: Some(self.reported_queue_arn(region, &task.source_queue_name)),
                 destination_arn: Some(
-                    self.reported_queue_arn(&task.destination_queue_name, region),
+                    self.reported_queue_arn(region, &task.destination_queue_name),
                 ),
                 max_number_of_messages_per_second: task.max_number_of_messages_per_second,
                 approximate_number_of_messages_moved: count_as_i64(task.messages_moved(now)),
@@ -2020,12 +2133,11 @@ impl ComAmazonawsSqsAmazonsqsState {
             .collect()
     }
 
-    /// The ARN to report for the queue called `name`: the one the queue record carries,
-    /// or the ARN that name resolves to in `region` when no queue answers to it any more
-    /// — a task record outlives the queues it names.
-    fn reported_queue_arn(&self, name: &str, region: &str) -> String {
-        self.queues
-            .get(name)
+    /// The ARN to report for the queue called `name` in `region`: the one the queue record
+    /// carries, or the ARN that name resolves to in `region` when no queue answers to it
+    /// any more — a task record outlives the queues it names.
+    fn reported_queue_arn(&self, region: &str, name: &str) -> String {
+        self.queue(region, name)
             .map(|queue| queue.arn.clone())
             .unwrap_or_else(|| queue_arn(region, name))
     }
@@ -2112,6 +2224,10 @@ pub const MESSAGE_MOVE_CANCELLATION_SPAN: Duration = Duration::from_millis(500);
 pub struct MessageMoveTask {
     /// The opaque handle the start call returned, which `CancelMessageMoveTask` names.
     pub task_handle: String,
+    /// The region the start call addressed, which is the region both its queues live in: a
+    /// task moves messages between two queues of one region, so every reader resolves a
+    /// task in the region it was started in and nowhere else.
+    pub region: String,
     /// The name of the dead-letter queue the messages were taken from.
     pub source_queue_name: String,
     /// The name of the queue they are being delivered to.
@@ -2130,6 +2246,11 @@ pub struct MessageMoveTask {
 }
 
 impl MessageMoveTask {
+    /// Whether this task's source queue is the one `key` identifies — the `(region, name)`
+    /// pair the store holds a queue under — which is what the per-queue bound counts on.
+    fn is_of(&self, key: &(String, String)) -> bool {
+        self.region == key.0 && self.source_queue_name == key.1
+    }
     /// When the `index`-th message of this task becomes deliverable: the start delay,
     /// then one message per rate slot. With no rate fixed, every message is deliverable
     /// at the end of the start delay.
@@ -2226,6 +2347,52 @@ pub fn dead_letter_target_arn(policy: &str) -> Option<String> {
         .get("deadLetterTargetArn")?
         .as_str()
         .map(ToString::to_string)
+}
+
+/// The reason a refusal gives for a `deadLetterTargetArn` that is not a queue of the
+/// SOURCE queue's own account and region.
+///
+/// The sentence is the rule as this service's own model states it, in the model's words:
+/// the `Attributes` member of `CreateQueue`/`SetQueueAttributes` documents the dead-letter
+/// redrive permission's default as "`allowAll` – (Default) Any source queues in this
+/// Amazon Web Services account in the same Region can specify this queue as the
+/// dead-letter queue"
+/// (`smithy_query(query="doc", shape="SetQueueAttributesRequest", member="Attributes",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
+/// so a source queue of one account and region can name a dead-letter target of that
+/// account and region and of no other: redrive moves a message from the source queue to
+/// the target queue, and that delivery never crosses either boundary.
+pub const DEAD_LETTER_TARGET_NAMESPACE_REASON: &str =
+    "Only source queues in this Amazon Web Services account in the same Region can specify \
+     this queue as the dead-letter queue.";
+
+/// Why the `RedrivePolicy` value `policy` cannot be stored on a queue of `region`, as the
+/// text of the refusal a caller has to fix the request from, or `None` when it can.
+///
+/// A redrive link is between two queues of ONE account and region
+/// ([`DEAD_LETTER_TARGET_NAMESPACE_REASON`]): the target a policy names is read in the
+/// region the queue carrying the policy lives in, so a `deadLetterTargetArn` naming
+/// another region or another account names a queue no redrive from this queue could ever
+/// deliver to, and the policy is refused rather than stored — otherwise the wiring looks
+/// configured and black-holes.
+///
+/// The refusal is worded in the one template this service answers a refused parameter
+/// VALUE in ([`invalid_parameter_message`]), with the value taken from the request: the
+/// `RedrivePolicy` the caller supplied, exactly as supplied.
+///
+/// What this judges is only which account and region a target ARN names: a policy naming
+/// no target, or one whose target is not an ARN at all, is left to the attribute's own
+/// value rules.
+pub fn redrive_policy_refusal(region: &str, policy: &str) -> Option<String> {
+    let target = dead_letter_target_arn(policy)?;
+    match parse_queue_arn(&target, region) {
+        QueueArn::OfThisRegion(_) | QueueArn::Malformed => None,
+        QueueArn::OfAnotherRegion { .. } | QueueArn::Elsewhere => Some(invalid_parameter_message(
+            policy,
+            REDRIVE_POLICY,
+            DEAD_LETTER_TARGET_NAMESPACE_REASON,
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2555,6 +2722,16 @@ pub fn epoch_millis_number(at: SystemTime) -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+/// The key one queue is held under: the region whose namespace holds it and its
+/// `QueueName`.
+///
+/// Every read and every write of [`ComAmazonawsSqsAmazonsqsState::queues`] and
+/// [`ComAmazonawsSqsAmazonsqsState::recently_deleted`] goes through this, so no path can
+/// key one of those maps by the name alone and reach another region's queue.
+pub fn queue_key(region: &str, name: &str) -> (String, String) {
+    (region.to_string(), name.to_string())
+}
+
 /// The ARN of the queue named `name` in `region`:
 /// `arn:aws:sqs:<region>:<account>:<QueueName>`.
 ///
@@ -2649,8 +2826,17 @@ pub fn unknown_message_move_task() -> ResourceNotFoundException {
 /// What a `SourceArn` or `DestinationArn` value names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueArn<'a> {
-    /// An Amazon SQS queue ARN of this account, naming the queue called this.
-    OfThisAccount(&'a str),
+    /// An Amazon SQS queue ARN of this account in the region the request addressed,
+    /// naming the queue called this.
+    OfThisRegion(&'a str),
+    /// An Amazon SQS queue ARN of this account naming ANOTHER region's namespace: a queue
+    /// called this may exist there, but no call served in this region can reach it.
+    OfAnotherRegion {
+        /// The region the ARN names.
+        region: &'a str,
+        /// The queue name it names in that region.
+        name: &'a str,
+    },
     /// A well-formed ARN, but not one of this account's Amazon SQS queues: no resource
     /// this emulator holds can answer to it.
     Elsewhere,
@@ -2658,19 +2844,44 @@ pub enum QueueArn<'a> {
     Malformed,
 }
 
-/// Classify the ARN a request supplied.
+/// Classify the ARN a request supplied, as the region the request addressed sees it.
 ///
 /// A queue ARN is `arn:<partition>:sqs:<region>:<accountId>:<QueueName>`, and a queue
 /// name "can have up to 80 characters" (`CreateQueueRequest$QueueName`), so a value with
 /// another segment count, an empty segment or a longer last segment names no queue in any
-/// account. The service and account segments are what single out this account's queues;
-/// the region segment is deliberately NOT matched, exactly as [`queue_name_from_url`]
-/// does not match the endpoint, so a client whose SigV4 scope names one region still
-/// reaches the queue it created under another.
-pub fn parse_queue_arn(arn: &str) -> QueueArn<'_> {
+/// account. The service and account segments are what single out this account's queues,
+/// and the REGION segment is what says which namespace they are in: a queue belongs to the
+/// region its create addressed, so an ARN naming another region names a queue no call
+/// served here can resolve — which is what keeps a dead-letter link and a message movement
+/// task inside one region.
+pub fn parse_queue_arn<'a>(arn: &'a str, region: &str) -> QueueArn<'a> {
+    let Some((service, named_region, account, name)) = queue_arn_fields(arn) else {
+        return QueueArn::Malformed;
+    };
+    if service != ARN_SERVICE || account != ::engine::emulator_account_id() {
+        return QueueArn::Elsewhere;
+    }
+    if named_region != region {
+        return QueueArn::OfAnotherRegion {
+            region: named_region,
+            name,
+        };
+    }
+    QueueArn::OfThisRegion(name)
+}
+
+/// The `(service, region, account, resource)` fields of `arn` when it has the SHAPE of a
+/// queue ARN, and `None` when it has not.
+///
+/// A queue ARN is `arn:<partition>:sqs:<region>:<accountId>:<QueueName>`, and a queue name
+/// "can have up to 80 characters" (`CreateQueueRequest$QueueName`), so a value with another
+/// segment count, an empty segment or a longer last segment names no queue in any account.
+/// The one place those segments are read, so every reader of a queue ARN agrees on what
+/// one is.
+fn queue_arn_fields(arn: &str) -> Option<(&str, &str, &str, &str)> {
     let segments: Vec<&str> = arn.split(':').collect();
     let [prefix, partition, service, region, account, name] = segments[..] else {
-        return QueueArn::Malformed;
+        return None;
     };
     if prefix != "arn"
         || partition.is_empty()
@@ -2680,19 +2891,30 @@ pub fn parse_queue_arn(arn: &str) -> QueueArn<'_> {
         || name.is_empty()
         || name.chars().count() > MAX_QUEUE_NAME_LENGTH
     {
-        return QueueArn::Malformed;
+        return None;
     }
-    if service != ARN_SERVICE || account != ::engine::emulator_account_id() {
-        return QueueArn::Elsewhere;
-    }
-    QueueArn::OfThisAccount(name)
+    Some((service, region, account, name))
 }
 
-/// The `QueueName` a queue ARN of this account addresses, or `None` for any other value.
-pub fn queue_name_from_arn(arn: &str) -> Option<&str> {
-    match parse_queue_arn(arn) {
-        QueueArn::OfThisAccount(name) => Some(name),
-        QueueArn::Elsewhere | QueueArn::Malformed => None,
+/// The key the store holds the queue a queue ARN of this account names under — the
+/// `(region, QueueName)` pair the ARN itself carries — or `None` for any other value.
+///
+/// For a reader holding only an ARN and no request of its own (another service resolving a
+/// queue a configuration names): an ARN names the region its queue lives in, so it is
+/// resolved THERE rather than in some caller's region.
+pub fn queue_key_from_arn(arn: &str) -> Option<(String, String)> {
+    let (service, region, account, name) = queue_arn_fields(arn)?;
+    (service == ARN_SERVICE && account == ::engine::emulator_account_id())
+        .then(|| queue_key(region, name))
+}
+
+/// The `QueueName` a queue ARN of this account addresses in `region`, or `None` for any
+/// other value — another account's, another service's, another region's, or one that is
+/// no queue ARN at all.
+pub fn queue_name_from_arn<'a>(arn: &'a str, region: &str) -> Option<&'a str> {
+    match parse_queue_arn(arn, region) {
+        QueueArn::OfThisRegion(name) => Some(name),
+        QueueArn::OfAnotherRegion { .. } | QueueArn::Elsewhere | QueueArn::Malformed => None,
     }
 }
 

@@ -291,6 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal("the KMS state store is unavailable"));
         };
 
+        // The encryption context is INPUT: a context that is not a legal encryption
+        // context is a malformed request, refused by the validation every operation
+        // taking one shares — before any key is resolved and before anything is sealed
+        // under it.
+        crate::state::check_encryption_context(input.encryption_context.as_ref())?;
+
         // Who the request speaks for, resolved BEFORE this service's store is locked, so
         // the IAM and STS stores the resolution reads are never reached while this
         // service's guard is held.

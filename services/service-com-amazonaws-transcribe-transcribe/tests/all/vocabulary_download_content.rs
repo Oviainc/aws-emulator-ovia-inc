@@ -41,15 +41,20 @@ const POLLS_FOR_SETTLED: usize = 40;
 
 /// The state whose documentation makes a custom vocabulary usable, and the only one
 /// that reports a `DownloadUri`.
-const READY: &str = "READY";
+pub(crate) const READY: &str = "READY";
 
 /// One emulator: Transcribe and Amazon S3 on a single shared engine behind the router.
-struct Emulator {
+///
+/// `pub(crate)`, like the two [`Family`] constants and the helpers below it: the suite
+/// that asserts WHOSE content a reported location serves
+/// (`crate::vocabulary_download_isolation`) drives its calls and its fetches through
+/// this harness instead of standing up a second one.
+pub(crate) struct Emulator {
     router: Arc<MultiServiceRouter>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite asserts on service behaviour, not on signature verification, and
@@ -67,7 +72,7 @@ impl Emulator {
     }
 
     /// One Transcribe call, signed for `region`.
-    async fn call(&self, operation: &str, input: Value, region: &str) -> Reply {
+    pub(crate) async fn call(&self, operation: &str, input: Value, region: &str) -> Reply {
         dispatch(&self.router, operation, input, Some(region)).await
     }
 
@@ -78,7 +83,7 @@ impl Emulator {
     /// what a client resolves to a request line is everything from the host's first
     /// slash. S3 is a REST service: the bucket and the key live in the URI, which is
     /// why this is a raw request rather than an `x-amz-target` call.
-    async fn fetch(&self, uri: &str, region: &str) -> (u16, Vec<u8>) {
+    pub(crate) async fn fetch(&self, uri: &str, region: &str) -> (u16, Vec<u8>) {
         let path = uri
             .split_once("://")
             .and_then(|(_, rest)| rest.find('/').map(|at| rest[at..].to_string()))
@@ -105,7 +110,7 @@ impl Emulator {
     /// Poll the family's reader until the build of `name` has FINISHED, and answer the
     /// `VocabularyState` it settled in. A family with no build state answers [`READY`]
     /// at once.
-    async fn settled_state(&self, family: &Family, name: &str, region: &str) -> String {
+    pub(crate) async fn settled_state(&self, family: &Family, name: &str, region: &str) -> String {
         if !family.has_build_state {
             return READY.to_string();
         }
@@ -124,7 +129,12 @@ impl Emulator {
     }
 
     /// The `DownloadUri` the family's reader reports for `name`, if it reports one.
-    async fn download_uri(&self, family: &Family, name: &str, region: &str) -> Option<String> {
+    pub(crate) async fn download_uri(
+        &self,
+        family: &Family,
+        name: &str,
+        region: &str,
+    ) -> Option<String> {
         let reply = self
             .call(family.get, json!({family.name_member: name}), region)
             .await;
@@ -139,25 +149,25 @@ impl Emulator {
 
 /// One of the two families that report a `DownloadUri` for content a request supplies
 /// inline, with the member names its operations spell that content with.
-struct Family {
+pub(crate) struct Family {
     /// The operation that builds the resource.
-    create: &'static str,
+    pub(crate) create: &'static str,
     /// The operation that rebuilds it from new content.
-    update: &'static str,
+    pub(crate) update: &'static str,
     /// The family's own reader, the one that reports `DownloadUri`.
     get: &'static str,
     /// The operation that removes it.
-    delete: &'static str,
+    pub(crate) delete: &'static str,
     /// The member naming the resource in every one of those.
-    name_member: &'static str,
+    pub(crate) name_member: &'static str,
     /// The member carrying the content inline (`Phrases` / `Words`).
-    terms_member: &'static str,
+    pub(crate) terms_member: &'static str,
     /// The member naming a file to read the content from instead.
     file_member: &'static str,
     /// Whether the update takes a `LanguageCode`: `UpdateVocabulary` models it
     /// `@required`, `UpdateVocabularyFilter` has no such member at all
     /// (`smithy_query(query="operation",operation="UpdateVocabulary,UpdateVocabularyFilter")`).
-    update_takes_language_code: bool,
+    pub(crate) update_takes_language_code: bool,
     /// Whether the family models a build state, so a reader reports the location only
     /// once the build has settled. A vocabulary has `VocabularyState`; a vocabulary
     /// filter models none, so it is usable — and downloadable — from the create.
@@ -165,7 +175,7 @@ struct Family {
 }
 
 /// The custom-vocabulary family.
-const VOCABULARY: Family = Family {
+pub(crate) const VOCABULARY: Family = Family {
     create: "CreateVocabulary",
     update: "UpdateVocabulary",
     get: "GetVocabulary",
@@ -178,7 +188,7 @@ const VOCABULARY: Family = Family {
 };
 
 /// The custom-vocabulary-FILTER family.
-const VOCABULARY_FILTER: Family = Family {
+pub(crate) const VOCABULARY_FILTER: Family = Family {
     create: "CreateVocabularyFilter",
     update: "UpdateVocabularyFilter",
     get: "GetVocabularyFilter",
@@ -192,19 +202,24 @@ const VOCABULARY_FILTER: Family = Family {
 
 /// One resource built from content a request lists inline, and the content a rebuild
 /// replaces it with.
-struct Row {
+///
+/// `pub(crate)` with the request shaping below it ([`create_request`],
+/// [`update_request`]): the suite that asserts WHOSE content a reported location serves
+/// (`crate::vocabulary_download_isolation`) describes its resources with this same row,
+/// so the two families' request shapes live in one place.
+pub(crate) struct Row {
     /// What this row is, named in every assertion it fails.
-    case: &'static str,
-    family: &'static Family,
+    pub(crate) case: &'static str,
+    pub(crate) family: &'static Family,
     /// The Region the row's calls are signed for — which is the Region the reported
     /// location lives in.
-    region: &'static str,
-    name: &'static str,
-    language_code: &'static str,
+    pub(crate) region: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) language_code: &'static str,
     /// The content the create supplies.
-    terms: Vec<String>,
+    pub(crate) terms: Vec<String>,
     /// The content the update supplies instead.
-    rebuilt: Vec<String>,
+    pub(crate) rebuilt: Vec<String>,
 }
 
 /// The class of content this rule generalises over: how MANY terms there are, how long
@@ -285,7 +300,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// The create request of a row.
-fn create_request(row: &Row) -> Value {
+pub(crate) fn create_request(row: &Row) -> Value {
     json!({
         row.family.name_member: row.name,
         "LanguageCode": row.language_code,
@@ -294,7 +309,7 @@ fn create_request(row: &Row) -> Value {
 }
 
 /// The update request of a row, carrying `terms` as its new content.
-fn update_request(row: &Row, terms: &[String]) -> Value {
+pub(crate) fn update_request(row: &Row, terms: &[String]) -> Value {
     let mut request = json!({
         row.family.name_member: row.name,
         row.family.terms_member: terms,
@@ -306,7 +321,7 @@ fn update_request(row: &Row, terms: &[String]) -> Value {
 }
 
 /// The terms a fetched location served, in the order the file lists them.
-fn served_terms(case: &str, body: &[u8]) -> Vec<String> {
+pub(crate) fn served_terms(case: &str, body: &[u8]) -> Vec<String> {
     let text = std::str::from_utf8(body)
         .unwrap_or_else(|error| panic!("case {case:?}: the served file is not UTF-8: {error}"));
     text.lines().map(str::to_string).collect()

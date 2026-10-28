@@ -459,10 +459,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // "The namespace configuration for the addon. If specified, this will
+        // override the DEFAULT namespace for the addon": the default namespace of an
+        // add-on is the one the catalog publishes for it
+        // (`AddonInfo$defaultNamespace`, `DescribeAddonVersions`), so a request that
+        // names no namespace installs the add-on where the catalog says it goes.
+        // [`ADDON_DEFAULT_NAMESPACE`] stands in only for a name the catalog does not
+        // publish, which this handler still accepts (see LAYER 4 above).
         let namespace = input
             .namespace_config
             .as_ref()
             .and_then(|config| config.namespace.clone())
+            .or_else(|| {
+                guard
+                    .published_addon(&input.addon_name, now)
+                    .map(|published| published.default_namespace.clone())
+            })
             .unwrap_or_else(|| ADDON_DEFAULT_NAMESPACE.to_string());
 
         // LAYER 5 — the add-on itself. One add-on name installs at most once per

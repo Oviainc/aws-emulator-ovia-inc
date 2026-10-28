@@ -276,8 +276,15 @@ async fn an_active_identity_source_reports_the_portal_of_its_instance() {
         again, page,
         "ListIdentitySources is a read: two calls must agree"
     );
+    // Each page is asked for with the token the page before handed out: a `NextToken` is
+    // this service's own and a client has none to pass until the service issues one.
+    let mut token: Option<String> = None;
     for (case, (arn, portal)) in cases.iter().zip(arns.iter().zip(portals.iter())) {
-        let single = list(&harness, &format!("MaxResults=1&NextToken={}", page_token(arn))).await;
+        let query = match &token {
+            None => "MaxResults=1".to_string(),
+            Some(next) => format!("MaxResults=1&NextToken={next}"),
+        };
+        let single = list(&harness, &query).await;
         let entry = entry_for(&single, arn);
         assert_eq!(
             reported_portal(&entry).as_deref(),
@@ -285,6 +292,10 @@ async fn an_active_identity_source_reports_the_portal_of_its_instance() {
             "case {:?}: a paged read must report the same portal, got {entry:?}",
             case.case
         );
+        token = single
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
     }
 
     // One portal per instance: rows naming different instances are told apart, and two
@@ -305,18 +316,6 @@ async fn an_active_identity_source_reports_the_portal_of_its_instance() {
          {page:?}",
         cases[0].case
     );
-}
-
-/// The `NextToken` that makes the next page start at `arn`: the creation-order sequence
-/// number of the source BEFORE it, which this service's token is.
-fn page_token(arn: &str) -> String {
-    let seq: u64 = arn
-        .rsplit_once("/ids-")
-        .expect("an identity-source ARN carries its creation-order id")
-        .1
-        .parse()
-        .expect("a numeric identity-source id");
-    (seq - 1).to_string()
 }
 
 /// A source whose association with its instance is not established yet reports no

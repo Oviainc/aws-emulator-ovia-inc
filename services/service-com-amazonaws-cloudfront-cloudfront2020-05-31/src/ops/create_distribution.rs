@@ -377,6 +377,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionErr
                 },
             )
         }
+        crate::state::CreateRefusal::InvalidLambdaFunctionAssociation(message) => {
+            CreateDistributionErrorModeled::InvalidLambdaFunctionAssociation(
+                InvalidLambdaFunctionAssociation {
+                    message: Some(message),
+                },
+            )
+        }
     }
     .into()
 }

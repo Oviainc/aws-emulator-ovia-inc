@@ -207,11 +207,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both ARNs are classified BEFORE the store is reached: a value that names no
         // queue in any account is not an address this service can resolve, which is what
         // the modelled `InvalidAddress` ("The specified ID is invalid.") refuses, while a
-        // well-formed ARN of another account or another service names a resource that
-        // simply does not exist here.
-        let source_name = match sqs::parse_queue_arn(&input.source_arn) {
-            sqs::QueueArn::OfThisAccount(name) => name.to_string(),
-            sqs::QueueArn::Elsewhere => {
+        // well-formed ARN of another account, another service or ANOTHER REGION names a
+        // resource that simply does not exist here — a task moves messages between two
+        // queues of the region the call addressed, so an ARN of another region names no
+        // queue this call can reach.
+        let region = sqs::request_region(ctx.parts());
+        let source_name = match sqs::parse_queue_arn(&input.source_arn, &region) {
+            sqs::QueueArn::OfThisRegion(name) => name.to_string(),
+            sqs::QueueArn::OfAnotherRegion { .. } | sqs::QueueArn::Elsewhere => {
                 return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
                     sqs::resource_not_found("SourceArn"),
                 )
@@ -232,10 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .map(str::trim)
             .filter(|arn| !arn.is_empty())
-            .map(sqs::parse_queue_arn)
+            .map(|arn| sqs::parse_queue_arn(arn, &region))
         {
-            Some(sqs::QueueArn::OfThisAccount(name)) => Some(name.to_string()),
-            Some(sqs::QueueArn::Elsewhere) => {
+            Some(sqs::QueueArn::OfThisRegion(name)) => Some(name.to_string()),
+            Some(sqs::QueueArn::OfAnotherRegion { .. }) | Some(sqs::QueueArn::Elsewhere) => {
                 return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
                     sqs::resource_not_found("DestinationArn"),
                 )
@@ -261,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // everything already due has been applied.
         state.materialise_due(now);
 
-        if !state.queues.contains_key(&source_name) {
+        if !state.holds_queue(&region, &source_name) {
             return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
                 sqs::resource_not_found("SourceArn"),
             )
@@ -272,7 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that queue's own policy and the caller's identity-based policies, before any
         // task is recorded.
         let (queue_arn, policy) = {
-            let queue = &state.queues[&source_name];
+            let queue = state
+                .queue(&region, &source_name)
+                .expect("the queue was resolved out of this same store");
             (queue.arn.clone(), queue.policy().map(str::to_string))
         };
         if let Some(denied) = sqs::authorization::denied(
@@ -292,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not satisfy the rule, so the fault is in that parameter's value, and the
         // refusal states that pre-condition in its own sentence rather than borrowing
         // the documentation sentence of the `UnsupportedOperation` class above.
-        let dead_letter_sources = state.dead_letter_source_queue_names(&source_name);
+        let dead_letter_sources = state.dead_letter_source_queue_names(&region, &source_name);
         if dead_letter_sources.is_empty() {
             return Err(Scaffolded::invalid_parameter_value(
                 sqs::DEAD_LETTER_SOURCE_REQUIRED,
@@ -305,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // single source queue; with several of them the task cannot say which queue a
         // given message came from, so the call is refused rather than guessing one.
         let destination_name = match named_destination {
-            Some(name) if state.queues.contains_key(&name) => name,
+            Some(name) if state.holds_queue(&region, &name) => name,
             Some(_) => {
                 return Err(StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
                     sqs::resource_not_found("DestinationArn"),
@@ -332,7 +337,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // time." A source whose task is still running is a PARAMETER this call cannot be
         // served for — the condition clears on its own, so the caller is told to wait
         // rather than told the source is unsupported.
-        if state.active_message_move_task(&source_name, now).is_some() {
+        if state
+            .active_message_move_task(&region, &source_name, now)
+            .is_some()
+        {
             return Err(Scaffolded::invalid_parameter_value(
                 sqs::TASK_ALREADY_RUNNING,
             ));
@@ -341,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The task takes the messages the source queue can hand out at the instant it
         // starts. A message still delayed, or in flight with a consumer, is not the
         // queue's to give away, so it stays where it is.
-        let source = state.queues.get(&source_name).ok_or_else(|| {
+        let source = state.queue(&region, &source_name).ok_or_else(|| {
             StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
                 "SourceArn",
             ))
@@ -362,7 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is measured without the bytes already accounted for in the source queue; the
         // destination queue's own bounds still apply to what it is handed.
         let store_bytes = state.retained_message_bytes().saturating_sub(moving_bytes);
-        let destination = state.queues.get(&destination_name).ok_or_else(|| {
+        let destination = state.queue(&region, &destination_name).ok_or_else(|| {
             StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
                 "DestinationArn",
             ))
@@ -381,6 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let task = sqs::MessageMoveTask {
             task_handle: sqs::new_identifier(),
+            region: region.clone(),
             source_queue_name: source_name.clone(),
             destination_queue_name: destination_name.clone(),
             max_number_of_messages_per_second: input.max_number_of_messages_per_second,
@@ -393,7 +402,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for them: a receipt handle is only ever valid for the queue that minted it.
         let mut taken: Vec<sqs::StoredMessage> = Vec::with_capacity(moving_count);
         {
-            let source = state.queues.get_mut(&source_name).ok_or_else(|| {
+            let source = state.queue_mut(&region, &source_name).ok_or_else(|| {
                 StartMessageMoveTaskErrorModeled::ResourceNotFoundException(
                     sqs::resource_not_found("SourceArn"),
                 )
@@ -415,7 +424,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // id, body and attributes — it is the same message in another queue — and its
         // receive count, which counts receives "across all queues"; retention in the
         // destination runs from the move, which is when that queue took it.
-        let destination = state.queues.get_mut(&destination_name).ok_or_else(|| {
+        let destination = state.queue_mut(&region, &destination_name).ok_or_else(|| {
             StartMessageMoveTaskErrorModeled::ResourceNotFoundException(sqs::resource_not_found(
                 "DestinationArn",
             ))

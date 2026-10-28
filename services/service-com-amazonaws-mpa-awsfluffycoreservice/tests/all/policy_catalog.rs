@@ -269,7 +269,10 @@ async fn paging_walks_every_policy_exactly_once() {
                     Some(next) => {
                         assert_eq!(
                             Some(next.to_string()),
-                            page.last().map(|listed| text(listed, "Arn")),
+                            page.last().map(|listed| state::listing_token(
+                                state::Listing::Policies,
+                                &text(listed, "Arn")
+                            )),
                             "case {case:?}: a NextToken must name the last entry of its page"
                         );
                         token = Some(next.to_string());

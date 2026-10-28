@@ -135,13 +135,23 @@
 //!
 //! Every paginated listing of this service pages the same way, so the rule lives here
 //! rather than once per handler: [`list_page_size`] is the width one `MaxResults` asks
-//! for, and [`page_by_seq_token`] is the whole seq-token rule the RECORD listings
-//! (`ListApprovalTeams`, `ListIdentitySources`, `ListSessions`) share — the token is the
-//! position ([`SeqOrdered`]) of the last record the previous page reported, the page is
-//! the records ordered after it, and the next token is the last of them while records
-//! remain ([`SeqPage`]). The catalog listings page over a key the catalog itself orders
-//! (a policy ARN, a version id) and so carry their own token, but take their page width
-//! from [`list_page_size`] too.
+//! for, and [`page_after_position`] is the whole position-token rule the listings that
+//! page over a position share (`ListApprovalTeams`, `ListIdentitySources`,
+//! `ListSessions` over a record's stored position [`SeqOrdered`], `ListResourcePolicies`
+//! over an attachment's place in the resource's attachment list) — the page is the
+//! records ordered after the position the request's token names, at most one page of
+//! them, and the next token names the last of them while records remain
+//! ([`PositionPage`]).
+//!
+//! A token is ONE listing's, so it carries the listing that issued it — the operation,
+//! and the resource it pages over where it pages over one ([`Listing`],
+//! [`listing_token`]) — and is only resumable there: a token this listing cannot read, a
+//! token another listing issued, and a token naming a record this listing does not hold
+//! are all refused ([`token_key`], [`page_after_position`], and for a catalog listing
+//! the catalog lookup of the key it read) rather than answered with a page. The catalog
+//! listings page over a key the catalog itself orders (a policy ARN, a version id) and
+//! so read their token's key with [`token_key`] rather than [`token_position`], but take
+//! their page width from [`list_page_size`] too.
 //!
 //! # Authorization
 //!
@@ -375,7 +385,8 @@ pub fn list_page_size(max_results: i32) -> usize {
 }
 
 /// A record a listing pages over in SEQUENCE order: the stable position this store gave
-/// the record when it was written, which is also the `NextToken` the listing hands back.
+/// the record when it was written, which is the position its listing's `NextToken`
+/// names.
 pub trait SeqOrdered {
     /// This record's position in the order its listing reports.
     fn seq(&self) -> u64;
@@ -399,76 +410,225 @@ impl SeqOrdered for Session {
     }
 }
 
-/// One page of a seq-token listing: the records it reports, and the token the NEXT page
-/// resumes after — absent once nothing is left, which is how a client knows the listing
-/// is over.
+/// One page of a position-token listing: the records it reports, and the token the NEXT
+/// page resumes after — absent once nothing is left, which is how a client knows the
+/// listing is over.
 #[derive(Debug)]
-pub struct SeqPage<'a, T> {
+pub struct PositionPage<'a, T> {
     /// The records this page reports, in the order `ordered` held them.
     pub records: Vec<&'a T>,
-    /// `NextToken`: the position of the last record on this page, when records remain.
+    /// `NextToken`: the token for the position of the last record on this page, when
+    /// records remain.
     pub next_token: Option<String>,
 }
 
-/// The position a seq-token listing resumes AFTER, read out of the request's `NextToken`.
+/// Which listing a pagination token belongs to — the operation, and the resource that
+/// operation pages over where it pages over one.
 ///
-/// This is the ONE place the token grammar of this service's record listings lives: an
-/// absent or empty token starts at the beginning, and any other token is the decimal
-/// position a page of this service handed out. A token that is not one is refused with
-/// [`foreign_next_token`]; the caller lifts that into its own operation's
-/// `ValidationException` (400).
-pub fn seq_token_position(next_token: Option<&str>) -> Result<u64, ValidationException> {
-    match next_token.filter(|token| !token.is_empty()) {
-        None => Ok(0),
-        Some(token) => token.parse::<u64>().map_err(|_| foreign_next_token()),
+/// A resume key is one listing's: the same creation-order position names a different
+/// record in each listing, and in a listing of one resource's records a different record
+/// for each resource. So the listing is part of the token and a token is resumable only
+/// where it was issued ([`listing_token`], [`token_key`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listing<'a> {
+    /// `ListApprovalTeams`, over the stored teams in creation order.
+    ApprovalTeams,
+    /// `ListIdentitySources`, over the stored identity sources in creation order.
+    IdentitySources,
+    /// `ListSessions`, over ONE team's sessions in initiation order.
+    Sessions {
+        /// The team whose sessions are paged.
+        approval_team_arn: &'a str,
+    },
+    /// `ListResourcePolicies`, over ONE resource's attached policies in attachment
+    /// order.
+    ResourcePolicies {
+        /// The resource whose attached policies are paged.
+        resource_arn: &'a str,
+    },
+    /// `ListPolicies`, over the policy catalog in ARN order.
+    Policies,
+    /// `ListPolicyVersions`, over ONE catalog policy's versions in version-id order.
+    PolicyVersions {
+        /// The policy whose versions are paged.
+        policy_arn: &'a str,
+    },
+}
+
+impl Listing<'_> {
+    /// How this listing's own tokens name it.
+    fn scope(self) -> String {
+        match self {
+            Self::ApprovalTeams => "approval-teams".to_string(),
+            Self::IdentitySources => "identity-sources".to_string(),
+            Self::Sessions { approval_team_arn } => format!("sessions/{approval_team_arn}"),
+            Self::ResourcePolicies { resource_arn } => {
+                format!("resource-policies/{resource_arn}")
+            }
+            Self::Policies => "policies".to_string(),
+            Self::PolicyVersions { policy_arn } => format!("policy-versions/{policy_arn}"),
+        }
+    }
+}
+
+/// What separates a token's scope from the key it names. It is the FIRST such character
+/// of a token that ends the scope, and the key keeps every later one, so a key that is
+/// itself an ARN travels whole.
+const TOKEN_SEPARATOR: char = ':';
+
+/// The `NextToken` `listing` hands out to resume after the record `key` names — the
+/// position of a record in a listing that pages over positions, the ordering key the
+/// catalog itself holds in one that pages over a catalog key.
+///
+/// A `NextToken` is a value the client passes back UNREAD — "use this value in the
+/// `NextToken` request parameter in a next call", nothing more — so what it is made of is
+/// this service's own business: the listing it belongs to and the key it names, which is
+/// what lets [`token_key`] tell a token of this listing's from every other. A scope is an
+/// operation name or an ARN and a key is a position or an ARN, so a token stays far
+/// inside `Token`'s `@length(max: 4096)`, and it carries no character that is special in
+/// a query string or a JSON string, which is where the listings bind `NextToken`.
+///
+/// The form proves nothing by itself: what makes a token resumable is that the listing
+/// reading it HOLDS the record its key names, which [`page_after_position`] and the
+/// catalog listings' own lookup decide.
+#[must_use]
+pub fn listing_token(listing: Listing<'_>, key: &str) -> String {
+    format!("{}{TOKEN_SEPARATOR}{key}", listing.scope())
+}
+
+/// The key `listing` resumes AFTER, read out of the request's `NextToken` — `None` when
+/// the request carries no token, which starts the listing at the beginning.
+///
+/// This is the ONE place the token grammar of this service's listings lives: a token is
+/// read only by the listing that issued it ([`listing_token`]), so anything else — a
+/// value in no grammar of this service's, or a token another listing (or the same
+/// listing of another resource) handed out — is refused with [`foreign_next_token`] and
+/// the caller lifts that into its own operation's `ValidationException` (400). That the
+/// key was also HANDED OUT by this listing is decided against the records themselves:
+/// [`page_after_position`] for a position, and the catalog lookup of the listing that
+/// pages over a catalog key.
+pub fn token_key(
+    listing: Listing<'_>,
+    next_token: Option<&str>,
+) -> Result<Option<String>, ValidationException> {
+    let Some(token) = next_token.filter(|token| !token.is_empty()) else {
+        return Ok(None);
+    };
+    // The scope is matched as a WHOLE: a key can carry an ARN, whose own separators are
+    // no part of this grammar.
+    let key = token
+        .strip_prefix(&listing_token(listing, ""))
+        .ok_or_else(foreign_next_token)?;
+    Ok(Some(key.to_string()))
+}
+
+/// The `NextToken` a listing that pages over POSITIONS hands out to resume after
+/// `position`: [`listing_token`] over the position.
+#[must_use]
+pub fn position_token(listing: Listing<'_>, position: u64) -> String {
+    listing_token(listing, &position.to_string())
+}
+
+/// The position `listing` resumes AFTER, read out of the request's `NextToken` — `None`
+/// when the request carries no token: [`token_key`] read as a position.
+pub fn token_position(
+    listing: Listing<'_>,
+    next_token: Option<&str>,
+) -> Result<Option<u64>, ValidationException> {
+    match token_key(listing, next_token)? {
+        None => Ok(None),
+        Some(key) => key.parse::<u64>().map(Some).map_err(|_| foreign_next_token()),
     }
 }
 
 /// One page of `ordered`, resuming after the position `after` names.
 ///
-/// This is the ONE place the page of a seq-token listing is cut, so the slice width and
-/// the next-token condition cannot drift between the listings: `ordered` is the records
-/// in the order the listing reports them, the page is the records ordered after `after`,
-/// at most [`list_page_size`] of them, and the token for the page after is the position
-/// of the last record reported — absent once the page reached the end of `ordered`,
-/// which is how a client knows the listing is over.
-pub fn page_after_seq<'a, T, I>(ordered: I, after: u64, max_results: i32) -> SeqPage<'a, T>
+/// This is the ONE place the page of a position listing is cut, so the slice width, the
+/// resume rule and the next-token condition cannot drift between the listings: `ordered`
+/// is the records in the order the listing reports them, each with its position; the
+/// page is the records ordered after `after`, at most [`list_page_size`] of them; and
+/// the token for the page after names the last record reported — absent once the page
+/// reached the end of `ordered`, which is how a client knows the listing is over.
+///
+/// A position is RESUMABLE only where this listing handed it out, and this listing hands
+/// out the position of a record it reported, so `after` has to be the position of a
+/// record `ordered` still holds. Any other position — one past the end, one before the
+/// first, one of a record that has since gone — is a position no page of this listing
+/// handed out, so it is refused with [`foreign_next_token`] rather than answered with a
+/// page the client would read as the end of the listing. Holding the record is the whole
+/// test, so the position of the LAST record — which no page hands out, since a token is
+/// issued only while records remain — is accepted and answers an empty final page.
+pub fn page_after_position<'a, T, I>(
+    listing: Listing<'_>,
+    ordered: I,
+    after: Option<u64>,
+    max_results: i32,
+) -> Result<PositionPage<'a, T>, ValidationException>
 where
-    T: SeqOrdered + 'a,
-    I: IntoIterator<Item = &'a T>,
+    T: 'a,
+    I: IntoIterator<Item = (u64, &'a T)>,
 {
     let page_size = list_page_size(max_results);
-    let mut records: Vec<&'a T> = ordered
-        .into_iter()
-        .filter(|record| record.seq() > after)
-        .collect();
+    let mut handed_out = after.is_none();
+    let mut records: Vec<(u64, &'a T)> = Vec::new();
+    for (position, record) in ordered {
+        match after {
+            Some(after) if position <= after => handed_out |= position == after,
+            _ => records.push((position, record)),
+        }
+    }
+    if !handed_out {
+        return Err(foreign_next_token());
+    }
     let more_remain = records.len() > page_size;
     records.truncate(page_size);
     let next_token = records
         .last()
         .filter(|_| more_remain)
-        .map(|record| record.seq().to_string());
-    SeqPage {
-        records,
+        .map(|(position, _)| position_token(listing, *position));
+    Ok(PositionPage {
+        records: records.into_iter().map(|(_, record)| record).collect(),
         next_token,
-    }
+    })
 }
 
-/// One page of `ordered`, the page width and the resume position read off the request's
-/// `MaxResults` and `NextToken`: [`seq_token_position`] then [`page_after_seq`], the
-/// whole seq-token paging rule in one call for a listing that decides nothing between
-/// reading the token and cutting the page.
-pub fn page_by_seq_token<'a, T, I>(
+/// One page of `ordered`, resuming after the position `after` names, for a listing whose
+/// records carry their own position ([`SeqOrdered`]): [`page_after_position`] over the
+/// stored positions.
+pub fn page_after_seq<'a, T, I>(
+    listing: Listing<'_>,
     ordered: I,
-    next_token: Option<&str>,
+    after: Option<u64>,
     max_results: i32,
-) -> Result<SeqPage<'a, T>, ValidationException>
+) -> Result<PositionPage<'a, T>, ValidationException>
 where
     T: SeqOrdered + 'a,
     I: IntoIterator<Item = &'a T>,
 {
-    let after = seq_token_position(next_token)?;
-    Ok(page_after_seq(ordered, after, max_results))
+    page_after_position(
+        listing,
+        ordered.into_iter().map(|record| (record.seq(), record)),
+        after,
+        max_results,
+    )
+}
+
+/// One page of `ordered`, the page width and the resume position read off the request's
+/// `MaxResults` and `NextToken`: [`token_position`] then [`page_after_seq`], the whole
+/// seq-token paging rule in one call for a listing that decides nothing between reading
+/// the token and cutting the page.
+pub fn page_by_seq_token<'a, T, I>(
+    listing: Listing<'_>,
+    ordered: I,
+    next_token: Option<&str>,
+    max_results: i32,
+) -> Result<PositionPage<'a, T>, ValidationException>
+where
+    T: SeqOrdered + 'a,
+    I: IntoIterator<Item = &'a T>,
+{
+    let after = token_position(listing, next_token)?;
+    page_after_seq(listing, ordered, after, max_results)
 }
 
 /// Largest number of tags one resource holds.

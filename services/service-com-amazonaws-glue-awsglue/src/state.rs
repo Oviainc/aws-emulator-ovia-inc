@@ -524,6 +524,17 @@ pub const TRIGGER_STATE_CREATED: &str = "CREATED";
 /// true to start SCHEDULED and CONDITIONAL triggers when created").
 pub const TRIGGER_STATE_ACTIVATED: &str = "ACTIVATED";
 
+/// The `TriggerState` of a trigger that has been stopped: the one modelled state of a
+/// trigger that was asked to stop ("Stops a specified trigger" — `StopTrigger`), which
+/// every later read of that trigger reports until a start moves it back to
+/// [`TRIGGER_STATE_ACTIVATED`]. Another of the modelled `TriggerState` values.
+///
+/// A stop leaves the trigger in this STEADY state rather than in the enum's
+/// `DEACTIVATING`, exactly as a start leaves it in [`TRIGGER_STATE_ACTIVATED`] rather than
+/// in `ACTIVATING`: nothing in this emulator keeps a trigger's schedule or predicate
+/// running, so the clock owes a stopped trigger no further transition.
+pub const TRIGGER_STATE_DEACTIVATED: &str = "DEACTIVATED";
+
 /// The `TriggerType` of a trigger that fires only when a caller starts it: the one type
 /// `StartOnCreation` cannot be set for ("True is not supported for ON_DEMAND triggers" —
 /// `CreateTriggerRequest$StartOnCreation`). One of the modelled `TriggerType` values,

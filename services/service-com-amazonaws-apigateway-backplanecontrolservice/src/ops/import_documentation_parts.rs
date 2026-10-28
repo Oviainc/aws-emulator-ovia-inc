@@ -8,9 +8,12 @@
 //!
 //! The import is ALL-OR-NOTHING: an entry this service cannot store refuses the whole
 //! body with the modelled 400 and leaves the API's documentation set exactly as it was.
-//! This emulator therefore recognises no warning-level condition on an import it DOES
-//! carry out: every entry of an accepted body is applied, so `warnings` is always absent
-//! and `failOnWarnings` has nothing to roll back.
+//! This emulator recognises no warning-level condition on an import it DOES carry out:
+//! every entry of an accepted body is applied, so `warnings` is always absent and
+//! `failOnWarnings` has nothing to roll back. What AWS warns about here — and the sentence
+//! it words that warning with, which decides the refusal `failOnWarnings` answers — is the
+//! subject of its own open issue report; see
+//! `issues/things-that-do-not-work/20261027T101902Z-apigateway-2-causes-of-the-request-validator-issue-remain-open.md`.
 //!
 //! ## Shape of an operation
 //!
@@ -367,7 +370,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an import this service carries out applies every entry its body declares, so
         // there is no entry left over to warn about and nothing for the rollback to undo.
         // An entry that cannot be stored has already refused the whole request above,
-        // whichever way this parameter is set.
+        // whichever way this parameter is set. What AWS warns about instead, and how it
+        // words that warning, is the open issue report the module docs name.
 
         let mut store = state.lock();
 
@@ -411,7 +415,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             minted.len()
         };
-
         // One id and one creation rank per entity this import CREATES: an entry that
         // lands on the part already documenting its entity keeps that part's id and
         // rank instead.

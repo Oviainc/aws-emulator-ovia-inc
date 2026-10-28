@@ -118,8 +118,9 @@ fn expected_status(now: f64, end_of_standard: f64, end_of_extended: f64) -> (&'s
 }
 
 /// A Kubernetes version `"1.31"` as the pair `(1, 31)`, so ordering is compared
-/// numerically rather than lexically.
-fn version_key(version: &str) -> (u32, u32) {
+/// numerically rather than lexically. `pub(crate)` so every suite that has to
+/// order the published calendar's versions reads them the same way.
+pub(crate) fn version_key(version: &str) -> (u32, u32) {
     let (major, minor) = version
         .split_once('.')
         .unwrap_or_else(|| panic!("expected a <major>.<minor> version, got {version:?}"));

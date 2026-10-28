@@ -17,7 +17,10 @@
 //! The rows differ along what the rule generalises over: which members the create carried
 //! (none beyond the required four, a worker configuration, a DPU figure of its own, an
 //! explicit version and timeout, every optional member, and input tables the catalog holds
-//! a schema for), and — for the refusal — the form of the id that addresses no transform.
+//! a schema for), and — for the refusals — the form of the id that addresses no transform,
+//! and the way an id can fall outside the modelled constraints on it (one step past each
+//! published length bound, and the required member absent), which the boundary refuses
+//! before the lookup.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
@@ -296,6 +299,61 @@ async fn an_id_this_account_holds_no_transform_under_is_refused() {
         listed(&ok(&router, "GetMLTransforms", &json!({})).await).len(),
         1,
         "case a refused read: a missed read must register no transform"
+    );
+}
+
+#[tokio::test]
+async fn a_transform_id_outside_the_modelled_length_is_refused_at_the_boundary() {
+    let router = emulator();
+    let stored = given_transform(&router, "bounded", Value::Null).await;
+    let before = get_transform(&router, &stored).await;
+
+    // `TransformId` is `HashString`, `length 1..255` (and `@required`), so an id outside
+    // that is refused by the modelled constraint rather than looked up and reported
+    // missing. One step past each published bound, and the absent member.
+    // (case, the body the read sends)
+    let rows: &[(&str, Value)] = &[
+        (
+            "an empty id, one short of the published minimum length",
+            json!({ "TransformId": "" }),
+        ),
+        (
+            "an id one character past the published maximum length",
+            json!({ "TransformId": "z".repeat(256) }),
+        ),
+        (
+            "an id far past the published maximum length",
+            json!({ "TransformId": "z".repeat(4096) }),
+        ),
+        ("no id at all, where the member is required", json!({})),
+    ];
+
+    for (case, body) in rows {
+        let (status, answered) = call(&router, "GetMLTransform", body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a request outside the modelled constraints is refused at the \
+             boundary with 400, got {status} with {answered}"
+        );
+        assert!(
+            error_code(&answered).ends_with("ValidationException"),
+            "case {case:?}: expected the boundary's ValidationException, got {} with {}",
+            error_code(&answered),
+            error_message(&answered)
+        );
+    }
+
+    // A refused read stored nothing: the one transform this account holds still reads back
+    // exactly as it was, and no transform was registered for the ids that addressed none.
+    let after = get_transform(&router, &stored).await;
+    assert_eq!(
+        after, before,
+        "case a refused read: the stored transform must be unchanged"
+    );
+    assert_eq!(
+        listed(&ok(&router, "GetMLTransforms", &json!({})).await).len(),
+        1,
+        "case a refused read: a refused read must register no transform"
     );
 }
 

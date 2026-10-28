@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
     all_attributes, as_map, attribute_count, call, create, create_ok, emulator,
-    emulator_over_engine, error_code, fifo_attributes as fifo, messages, ok,
+    emulator_over_engine, error_code, fifo_attributes as fifo, messages, ok, REGION,
 };
 
 /// What one receive handed over, as the tuple a retry must reproduce exactly: the
@@ -159,8 +159,7 @@ fn rewind_receive_attempts(engine: &Arc<engine::InMemoryEngine>, name: &str, by:
     let store = state::service_state(&**engine).expect("this service's store");
     let mut store = store.lock();
     let queue = store
-        .queues
-        .get_mut(name)
+        .queue_mut(REGION, name)
         .unwrap_or_else(|| panic!("case rewind: no queue called {name}"));
     for attempt in queue.receive_attempts.values_mut() {
         attempt.served_at = attempt
@@ -175,8 +174,7 @@ fn rewind_deduplication(engine: &Arc<engine::InMemoryEngine>, name: &str, by: Du
     let store = state::service_state(&**engine).expect("this service's store");
     let mut store = store.lock();
     let queue = store
-        .queues
-        .get_mut(name)
+        .queue_mut(REGION, name)
         .unwrap_or_else(|| panic!("case rewind: no queue called {name}"));
     for remembered in queue.deduplication.values_mut() {
         remembered.accepted_at = remembered

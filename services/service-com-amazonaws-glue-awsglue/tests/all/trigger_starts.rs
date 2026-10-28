@@ -41,18 +41,18 @@ use crate::wire::{call_in_region, ok, REGION};
 
 /// The job a trigger action names. An action names a job of the Region the create is
 /// served in, and which job it is is not an axis of the rule under test.
-const JOB: &str = "trigger-start-target-job";
+pub(crate) const JOB: &str = "trigger-start-target-job";
 
 /// A second job, so a row can initiate more than one action.
 const OTHER_JOB: &str = "trigger-start-other-job";
 
 /// The crawler an action can name instead of a job, so a row can carry two actions of
 /// different kinds.
-const CRAWLER: &str = "trigger-start-target-crawler";
+pub(crate) const CRAWLER: &str = "trigger-start-target-crawler";
 
 /// Register the jobs and the crawler the trigger definitions below name, so their actions
 /// resolve.
-async fn register_targets(router: &MultiServiceRouter) {
+pub(crate) async fn register_targets(router: &MultiServiceRouter) {
     for job in [JOB, OTHER_JOB] {
         ok(
             router,
@@ -222,7 +222,7 @@ async fn start_trigger(router: &MultiServiceRouter, trigger: &str) -> (u16, Valu
 }
 
 /// The `State` `GetTrigger` reports for `trigger`.
-async fn trigger_state(router: &MultiServiceRouter, trigger: &str) -> String {
+pub(crate) async fn trigger_state(router: &MultiServiceRouter, trigger: &str) -> String {
     let body = ok(router, "GetTrigger", &json!({ "Name": trigger })).await;
     body["Trigger"]
         .get("State")
@@ -242,7 +242,10 @@ async fn last_run(router: &MultiServiceRouter, workflow: &str) -> Value {
 }
 
 /// The ids of the runs `workflow` holds, as the store holds them.
-fn stored_run_ids(engine: &Arc<engine::InMemoryEngine>, workflow: &str) -> Vec<String> {
+pub(crate) fn stored_run_ids(
+    engine: &Arc<engine::InMemoryEngine>,
+    workflow: &str,
+) -> Vec<String> {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let store = state.lock();
     store
@@ -253,7 +256,11 @@ fn stored_run_ids(engine: &Arc<engine::InMemoryEngine>, workflow: &str) -> Vec<S
 
 /// Move the due instant of every unsettled run of `workflow` to `at`, so a test can hold
 /// the transient window open or make the owed transition due without sleeping.
-fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, workflow: &str, at: SystemTime) {
+pub(crate) fn set_due_instant(
+    engine: &Arc<engine::InMemoryEngine>,
+    workflow: &str,
+    at: SystemTime,
+) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let entry = store

@@ -19,6 +19,8 @@ mod aliases;
 mod aws_managed_keys;
 #[path = "all/client_error_status.rs"]
 mod client_error_status;
+#[path = "all/cross_region_material.rs"]
+mod cross_region_material;
 #[path = "all/custom_key_store_connection.rs"]
 mod custom_key_store_connection;
 #[path = "all/custom_key_stores.rs"]
@@ -33,6 +35,8 @@ mod data_key_pair_without_plaintext;
 mod data_key_without_plaintext;
 #[path = "all/decrypt_key_origin.rs"]
 mod decrypt_key_origin;
+#[path = "all/encryption_context_validation.rs"]
+mod encryption_context_validation;
 #[path = "all/error_semantics.rs"]
 mod error_semantics;
 #[path = "all/get_key_policy_reads.rs"]
@@ -75,6 +79,8 @@ mod message_authentication_codes;
 mod multi_region_primary;
 #[path = "all/multi_region_primary_serialization.rs"]
 mod multi_region_primary_serialization;
+#[path = "all/multi_region_rotation_sharing.rs"]
+mod multi_region_rotation_sharing;
 #[path = "all/public_key.rs"]
 mod public_key;
 #[path = "all/random_bytes.rs"]

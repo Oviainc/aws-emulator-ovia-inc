@@ -64,6 +64,21 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// The account-level settings `UpdateAccount` writes and `GetAccount` reports.
     /// There is exactly one per account, so it is a field rather than a map.
     pub account: AccountEntry,
+    /// The token bucket each API key that has invoked a stage is metered against, keyed
+    /// by [`metering_key`]: one bucket per `(usage plan, API key)` pair, because a usage
+    /// plan's throttle is the request rate it admits FOR EACH of its keys
+    /// (`ThrottleSettings$rateLimit`, "the API target request rate limit" of the plan the
+    /// key is metered by).
+    ///
+    /// Written by the `execute-api` data plane while METERING a request (see
+    /// [`crate::service::invoke`]), which is what a usage plan's throttle is: the rate a
+    /// key's requests are admitted at cannot be computed without recording the ones
+    /// already admitted. Bounded by the stores it joins — at most
+    /// [`MAX_USAGE_PLANS`] x [`MAX_API_KEYS`] pairs can ever exist — and reclaimed with
+    /// the key it meters
+    /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]), so it
+    /// never grows with the request count.
+    pub throttle_buckets: BTreeMap<String, ThrottleBucket>,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`]; see there for how an id is derived from it.
     pub id_seed: u64,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`]: the creation rank stamped on each
@@ -339,18 +354,86 @@ impl RestApiEntry {
             .collect()
     }
 
-    /// Whether any method of this API names `authorizer_id` in its `authorizerId`.
+    /// The method of this API that names `authorizer_id` in its `authorizerId`, or `None`
+    /// when none does.
     ///
     /// A method names its authorizer in `Method$authorizerId`, so a method carrying that
     /// identifier is a reference to the authorizer; one walk, so every operation that has
     /// to know whether an authorizer is referenced reads the same records.
-    pub fn authorizer_is_referenced(&self, authorizer_id: &str) -> bool {
-        self.resources.values().any(|resource| {
-            resource
-                .methods
+    pub fn method_referencing_authorizer(&self, authorizer_id: &str) -> Option<MethodReference> {
+        self.referencing_method(|method| method.authorizer_id.as_deref() == Some(authorizer_id))
+    }
+
+    /// The method of this API that names `model_name` in its `requestModels`, or `None`
+    /// when none does.
+    ///
+    /// `Method$requestModels` is "a key-value map specifying data schemas ... the value is
+    /// a `Model` name", so a method carrying that name is a reference to the model, the
+    /// same kind of reference [`Self::method_referencing_authorizer`] finds.
+    pub fn method_referencing_model(&self, model_name: &str) -> Option<MethodReference> {
+        self.referencing_method(|method| {
+            method
+                .request_models
                 .values()
-                .any(|method| method.authorizer_id.as_deref() == Some(authorizer_id))
+                .any(|named| named == model_name)
         })
+    }
+
+    /// The first method of this API, in resource-path then verb order, that `names`
+    /// something — the one walk both reference lookups above share.
+    ///
+    /// The order is the stored one (`resources` is keyed by id, so the paths are sorted
+    /// here), which is what makes the method a refusal NAMES the same one on every call
+    /// for one set of records rather than whichever the map yielded first.
+    fn referencing_method(
+        &self,
+        mut names: impl FnMut(&MethodEntry) -> bool,
+    ) -> Option<MethodReference> {
+        let mut referencing: Vec<MethodReference> = Vec::new();
+        for resource in self.resources.values() {
+            for (verb, method) in &resource.methods {
+                if names(method) {
+                    referencing.push(MethodReference {
+                        http_method: verb.clone(),
+                        resource_path: resource.path.clone(),
+                    });
+                }
+            }
+        }
+        referencing.sort_by(|left, right| {
+            (&left.resource_path, &left.http_method)
+                .cmp(&(&right.resource_path, &right.http_method))
+        });
+        referencing.into_iter().next()
+    }
+}
+
+/// One method of an API, as a refusal that is BLOCKED BY it names it: the verb and the
+/// resource path, which is how API Gateway identifies a method in such a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodReference {
+    /// The method's uppercase HTTP verb.
+    pub http_method: String,
+    /// The materialised path of the resource the method sits on, leading `/` included.
+    pub resource_path: String,
+}
+
+impl ::std::fmt::Display for MethodReference {
+    /// `<HTTP-METHOD>/<resource-path>`, the spelling a refusal naming the blocked
+    /// AUTHORIZER carries. The resource path keeps its own leading `/`, so the method on
+    /// `/pets` is `GET//pets` and the one on the root resource is `GET//`.
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(formatter, "{}/{}", self.http_method, self.resource_path)
+    }
+}
+
+impl MethodReference {
+    /// `<resource-path>/<HTTP-METHOD>`, the spelling a refusal naming the method REQUEST
+    /// that references a blocked model carries — the resource path first, so the method on
+    /// the root resource reads `//POST`. The two spellings are each what API Gateway states
+    /// for its own refusal, which is why this is not the `Display` one.
+    pub fn in_method_request(&self) -> String {
+        format!("{}/{}", self.resource_path, self.http_method)
     }
 }
 
@@ -784,6 +867,85 @@ pub struct UsagePlanKeyEntry {
 /// The one key type a `UsagePlanKey` takes: from `UsagePlanKey$type`'s own documentation,
 /// "Currently, the valid key type is `API_KEY`."
 pub const USAGE_PLAN_KEY_TYPE: &str = "API_KEY";
+
+/// The key one `(usage plan, API key)` pair's throttle accounting is held under in
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::throttle_buckets`].
+///
+/// Both identifiers, because the limits belong to the PLAN and are applied to EACH of its
+/// keys: two keys of one plan are admitted independently, and one key metered by two plans
+/// is metered against each plan's own limits.
+pub fn metering_key(usage_plan_id: &str, key_id: &str) -> String {
+    format!("{usage_plan_id}/{key_id}")
+}
+
+/// The request rate a usage plan's `throttle` admits, as the token bucket that meters it
+/// reads the pair: the bucket's capacity and the rate it refills at.
+///
+/// `ThrottleSettings` documents the pair as "the API request rate limits" —
+/// `rateLimit` "the API request steady-state rate limit" and `burstLimit` "the API request
+/// burst limit", which is the capacity "provided by the token bucket algorithm" the
+/// account-level limits ([`DEFAULT_ACCOUNT_THROTTLE`]) are published as. A limit that is
+/// not POSITIVE is no limit: both "must be numeric and greater than zero"
+/// ([`INVALID_THROTTLE_SETTINGS`]), so a plan whose throttle sets neither (the structure's
+/// own zeroes) throttles nothing rather than refusing everything.
+#[derive(Debug, Clone, Copy)]
+pub struct ThrottleLimits {
+    /// The most requests admissible at once — the bucket's capacity.
+    pub burst: f64,
+    /// The requests per second the bucket refills at.
+    pub rate: f64,
+}
+
+impl ThrottleLimits {
+    /// The limits `throttle` declares, or `None` when it declares none that limits
+    /// anything.
+    pub fn declared(throttle: Option<&ThrottleSettings>) -> Option<Self> {
+        let throttle = throttle?;
+        let burst = f64::from(throttle.burst_limit);
+        let rate = throttle.rate_limit;
+        (burst > 0.0 && rate.is_finite() && rate > 0.0).then_some(Self { burst, rate })
+    }
+}
+
+/// The token bucket one metered `(usage plan, API key)` pair's requests are admitted
+/// through.
+///
+/// A bucket starts FULL — a key that has sent nothing may burst up to the plan's burst
+/// limit — and refills at the plan's rate, so the limits a plan is updated to take effect
+/// on the next request rather than on a bucket frozen at the old ones.
+#[derive(Debug, Clone)]
+pub struct ThrottleBucket {
+    /// The requests still admissible as of [`Self::refilled_at`].
+    tokens: f64,
+    /// The instant `tokens` was last computed at.
+    refilled_at: ::std::time::Instant,
+}
+
+impl ThrottleBucket {
+    /// A bucket holding `limits.burst` requests as of `now`.
+    fn full(limits: ThrottleLimits, now: ::std::time::Instant) -> Self {
+        Self {
+            tokens: limits.burst,
+            refilled_at: now,
+        }
+    }
+
+    /// Admit one request and record it, or report that `limits` admit none at `now`.
+    ///
+    /// The refill is the time since the last request times the rate, capped at the burst
+    /// limit: the bucket cannot hold more than the capacity however long a key has been
+    /// idle, which is what makes the steady-state rate the rate.
+    fn admits(&mut self, limits: ThrottleLimits, now: ::std::time::Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.refilled_at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * limits.rate).min(limits.burst);
+        self.refilled_at = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
 
 /// The `BadRequestException` message for a `keyType` that is not [`USAGE_PLAN_KEY_TYPE`].
 ///
@@ -2723,7 +2885,31 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 unmetered += 1;
             }
         }
+        // The throttle accounting goes with the association: a key no plan meters has no
+        // request rate to keep, and a key created later must not inherit this one's.
+        self.throttle_buckets
+            .retain(|key, _| !key.ends_with(&format!("/{key_id}")));
         unmetered
+    }
+
+    /// Whether the usage plan `usage_plan_id`'s throttle admits one more request from the
+    /// API key `key_id` at `now`, RECORDING the request it admits.
+    ///
+    /// This is the one place a usage plan's throttle is accounted, so the data plane and
+    /// anything else that meters a request share one bucket per pair; a plan whose
+    /// `throttle` declares no positive limit ([`ThrottleLimits::declared`]) is not metered
+    /// at all and admits every request.
+    pub fn throttle_admits(
+        &mut self,
+        usage_plan_id: &str,
+        key_id: &str,
+        limits: ThrottleLimits,
+        now: ::std::time::Instant,
+    ) -> bool {
+        self.throttle_buckets
+            .entry(metering_key(usage_plan_id, key_id))
+            .or_insert_with(|| ThrottleBucket::full(limits, now))
+            .admits(limits, now)
     }
 
     /// The `UsagePlanKey` a `(usagePlanId, keyId)` pair addresses: the association held
@@ -3237,15 +3423,14 @@ pub const NO_SUCH_AUTHORIZER: &str = "Invalid Authorizer identifier specified";
 
 /// The `ConflictException` message for an authorizer a `Method` of the same API still
 /// names in its `authorizerId`, which is what `DeleteAuthorizer` refuses while the
-/// reference stands (see [`RestApiEntry::authorizer_is_referenced`]).
+/// reference stands (see [`RestApiEntry::method_referencing_authorizer`]).
 ///
-/// AWS publishes no fixed sentence for this condition, so the message takes the shape of
-/// the sibling refusal for the same class — a dependent record blocking a delete
-/// ([`crate::ops::delete_deployment::DEPLOYMENT_IN_USE`]) — and names the two ways a
-/// caller clears the reference: re-point the method at another authorizer, or delete the
-/// method.
-pub const AUTHORIZER_IN_USE: &str =
-    "Active methods pointing to this authorizer must be updated or deleted";
+/// BUILT FROM STATE: the fixed text names the condition and the variable parts are the
+/// authorizer's own name and the referencing method, so tooling parsing the refusal can
+/// find which method still has to be updated or deleted.
+pub fn authorizer_in_use(authorizer_name: &str, referencing: &MethodReference) -> String {
+    format!("Cannot delete authorizer '{authorizer_name}', is referenced in method: {referencing}")
+}
 
 /// The `NotFoundException` message for a `modelName` that names no stored model of the
 /// API.
@@ -3269,6 +3454,21 @@ pub fn no_such_model(model_name: &str) -> String {
 /// to, in the shape of the sibling collision sentences this service answers with
 /// ([`BASE_PATH_MAPPING_ALREADY_EXISTS`]).
 pub const MODEL_NAME_ALREADY_EXISTS: &str = "Model name already exists for this REST API";
+
+/// The `ConflictException` message for a model a `Method` of the same API still names in
+/// its `requestModels`, which is what `DeleteModel` refuses while the reference stands
+/// (see [`RestApiEntry::method_referencing_model`]).
+///
+/// BUILT FROM STATE: the fixed text names the condition and the variable parts are the
+/// model's own name and the referencing METHOD REQUEST, which API Gateway identifies by
+/// its resource path and verb ([`MethodReference::in_method_request`]) — so a client is
+/// told which method request still has to be updated.
+pub fn model_in_use(model_name: &str, referencing: &MethodReference) -> String {
+    format!(
+        "Cannot delete model '{model_name}', is referenced in method request: {}",
+        referencing.in_method_request()
+    )
+}
 
 /// The `BadRequestException` message for a `name` that is not a model name: "The name of
 /// the model. Must be alphanumeric." (`CreateModel$name`), so a name carrying anything

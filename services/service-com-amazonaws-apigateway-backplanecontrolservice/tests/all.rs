@@ -238,6 +238,12 @@ mod delete_base_path_mapping;
 mod update_base_path_mapping;
 #[path = "all/update_model.rs"]
 mod update_model;
+#[path = "all/stage_request_validation.rs"]
+mod stage_request_validation;
+#[path = "all/model_in_use.rs"]
+mod model_in_use;
+#[path = "all/documentation_part_import_warnings.rs"]
+mod documentation_part_import_warnings;
 #[path = "all/model_collection.rs"]
 mod model_collection;
 #[path = "all/delete_domain_name_access_association.rs"]
