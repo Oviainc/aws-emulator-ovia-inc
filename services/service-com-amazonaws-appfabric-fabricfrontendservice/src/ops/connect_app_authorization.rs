@@ -199,8 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `authRequest` is "required if the app authorization for the request is
         // configured with an OAuth2 (oauth2) authorization type" — a condition
         // on the STORED record, so the boundary validator (which sees only the
-        // request) cannot check it.
-        if authorization.auth_type == "oauth2" && input.auth_request.is_none() {
+        // request) cannot check it. Which authorizations are that kind is the
+        // record's own question, answered in one place
+        // ([`crate::state::AppAuthorizationRecord::is_oauth2`]).
+        if authorization.is_oauth2() && input.auth_request.is_none() {
             return Err(ConnectAppAuthorizationErrorModeled::ValidationException(
                 crate::state::auth_request_required(&authorization.auth_type),
             )

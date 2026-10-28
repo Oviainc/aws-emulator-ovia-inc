@@ -53,6 +53,8 @@ mod ingestion_destination_loss;
 mod ingestion_enablement;
 #[path = "all/nested_resource_arn_region.rs"]
 mod nested_resource_arn_region;
+#[path = "all/oauth2_auth_type_predicate.rs"]
+mod oauth2_auth_type_predicate;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

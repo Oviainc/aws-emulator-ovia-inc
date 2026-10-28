@@ -423,6 +423,19 @@ impl AppAuthorizationRecord {
         self.status == APP_AUTHORIZATION_STATUS_CONNECTED
     }
 
+    /// Whether this authorization is the kind whose grant runs through an OAuth
+    /// consent step — its stored `authType` is [`AUTH_TYPE_OAUTH2`] — the ONE
+    /// place that rule is spelled out, as [`is_connected`](Self::is_connected)
+    /// is for the status.
+    ///
+    /// Everything that hangs off the question (the URL the consent step runs at,
+    /// and whether the connect handshake has to carry the `authRequest` that
+    /// step hands back) decides with this, so a change to how the stored
+    /// `authType` is spelled cannot leave one caller matching and another not.
+    pub fn is_oauth2(&self) -> bool {
+        self.auth_type == AUTH_TYPE_OAUTH2
+    }
+
     /// The modelled `Tenant` this authorization was created for.
     pub fn to_tenant(&self) -> Tenant {
         Tenant {
@@ -442,7 +455,7 @@ impl AppAuthorizationRecord {
     /// [`oauth_flow_url`]. An `apiKey` authorization carries its credential
     /// already and has no consent step, so it reports no URL.
     pub fn auth_url(&self) -> Option<String> {
-        if self.auth_type == AUTH_TYPE_OAUTH2 {
+        if self.is_oauth2() {
             Some(oauth_flow_url(&self.region, &self.app_bundle_id, &self.id))
         } else {
             None
