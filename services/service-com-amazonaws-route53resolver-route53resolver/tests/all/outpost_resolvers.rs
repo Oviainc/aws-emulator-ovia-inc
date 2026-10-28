@@ -20,7 +20,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     call, emulator_with_outposts, error_type, expect_error, ok, parse_time, rack_outpost,
-    string_member, without_status, ACCOUNT, REGION,
+    string_member, without_status, Emulator, ACCOUNT, REGION,
 };
 
 /// The `OutpostResolver` of a create/get/update/delete response.
@@ -53,7 +53,7 @@ fn unracked_outpost_arn(partition: &str, region: &str, tail: &str) -> String {
 ///
 /// A Resolver on an Outpost can only be created on an Outpost the account has,
 /// so every case that creates one starts here.
-async fn emulator_on_outposts(count: usize) -> (MultiServiceRouter, Vec<String>) {
+async fn emulator_on_outposts(count: usize) -> (Emulator, Vec<String>) {
     let router = emulator_with_outposts();
     let mut outposts = Vec::with_capacity(count);
     for index in 0..count {
@@ -64,7 +64,7 @@ async fn emulator_on_outposts(count: usize) -> (MultiServiceRouter, Vec<String>)
 
 /// The same, for the one Outpost a case that does not care which Outpost it is
 /// on puts its Resolvers on.
-async fn emulator_on_one_outpost() -> (MultiServiceRouter, String) {
+async fn emulator_on_one_outpost() -> (Emulator, String) {
     let (router, outposts) = emulator_on_outposts(1).await;
     let outpost = outposts
         .into_iter()

@@ -185,8 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An added address lives in a subnet: "If you specify a subnet ID, Resolver
         // chooses an IP address for you from the available IPs in the specified
         // subnet", and `IpAddressResponse$SubnetId` reports "The ID of one subnet"
-        // for every address an endpoint holds. The emulator keeps no subnet
-        // inventory, so it cannot derive the subnet of a bare address.
+        // for every address an endpoint holds. A bare address names no subnet to
+        // place it in, so the member is required here.
         let Some(subnet_id) = requested.subnet_id.clone() else {
             return Err(
                 AssociateResolverEndpointIpAddressErrorModeled::InvalidParameterException(
@@ -199,6 +199,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The endpoint the address is being added to is resolved FIRST: a request
+        // naming an endpoint the account does not hold is answered for that,
+        // whatever else it carries. The lock is released again so the subnet
+        // resolution below never holds two services' stores at once; the write
+        // path repeats this lookup under the lock it writes through.
+        {
+            let store = state.lock();
+            if !store
+                .resolver_endpoints
+                .contains_key(&input.resolver_endpoint_id)
+            {
+                return Err(
+                    AssociateResolverEndpointIpAddressErrorModeled::ResourceNotFoundException(
+                        crate::state::resolver_endpoint_not_found(&input.resolver_endpoint_id),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The added address is placed IN a subnet of the caller's VPC, so the
+        // `SubnetId` has to be a subnet the account holds — the same resolution
+        // the create path makes for every address it places. Refused before
+        // anything is written, so the endpoint is left exactly as it was.
+        if let Some(unknown) =
+            crate::state::unresolvable_subnet_id(&*self.engine, [subnet_id.as_str()])
+        {
+            return Err(
+                AssociateResolverEndpointIpAddressErrorModeled::InvalidParameterException(
+                    crate::state::subnet_not_found(&unknown),
+                )
+                .into(),
+            );
+        }
 
         let mut store = state.lock();
 
@@ -263,8 +298,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ip_id: crate::state::mint_ip_id(ip_seq),
             subnet_id,
             // An address the request did not supply is left unset rather than
-            // invented: the emulator holds no subnet inventory, so it cannot know a
-            // value that lies inside the subnet's CIDR. The same as a create.
+            // invented: the service does not pick one out of the subnet's CIDR
+            // range here. The same as a create.
             ip: requested.ip.clone(),
             ipv6: requested.ipv6.clone(),
             status: crate::state::IP_STATUS_CREATING.to_string(),

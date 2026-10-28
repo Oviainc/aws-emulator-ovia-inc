@@ -408,28 +408,67 @@ async fn get_tables_pages_over_the_stored_tables() {
     }
 }
 
-/// `MaxResults` is modelled with range 1..100. Both published bounds are served; a
-/// value one past either bound is refused before the handler runs.
+/// The page size a `GetTables` is served is the one its `MaxResults` asks for: a value
+/// above the bound the member's modelled type declares is SERVED rather than refused, which
+/// is what the service does — the common "one big page" listing answers with every matching
+/// table and no `NextToken` — and a value that names no servable page at all is refused with
+/// Glue's own `InvalidInputException`, the error class a Glue client can match, and never
+/// with the cross-service `ValidationException`.
+///
+/// The rows differ along the page size asked for: each published bound of the modelled
+/// range (1 and 100, from `smithy_query` on `GetTablesRequest$MaxResults`), one past the
+/// upper bound (101), a page far larger than the catalog holds (1000), the largest value
+/// the member's type can carry, and \u2014 on the refusal side \u2014 one past the lower bound (0)
+/// and a negative size.
 #[tokio::test]
-async fn get_tables_honours_the_modelled_max_results_range() {
+async fn get_tables_serves_the_page_size_the_request_asks_for() {
     let router = emulator();
     create_database(&router, "bounds_db").await;
-    create_table(&router, "bounds_db", "events").await;
+    let stored = ["alpha", "beta", "delta", "events", "gamma"];
+    for table in stored {
+        create_table(&router, "bounds_db", table).await;
+    }
 
-    for accepted in [1, 100] {
+    // (the page size asked for, how many tables the first page must carry)
+    let served: [(i64, usize); 5] = [
+        (1, 1),
+        (100, stored.len()),
+        (101, stored.len()),
+        (1000, stored.len()),
+        (i64::from(i32::MAX), stored.len()),
+    ];
+    for (page_size, expected) in served {
         let (status, body) = call(
             &router,
             "GetTables",
-            &json!({ "DatabaseName": "bounds_db", "MaxResults": accepted }),
+            &json!({ "DatabaseName": "bounds_db", "MaxResults": page_size }),
         )
         .await;
         assert_eq!(
             status, 200,
-            "case MaxResults {accepted}: a published bound must be served, got {status} with {body}"
+            "case MaxResults {page_size}: the page size a request asks for is served, got \
+             {status} with {body}"
+        );
+        let page = body["TableList"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default();
+        assert_eq!(
+            page, expected,
+            "case MaxResults {page_size}: expected {expected} tables on the page, got {page} \
+             in {body}"
+        );
+        // A page that held every matching table is the last one, so it carries no cursor.
+        let has_token = !body["NextToken"].is_null();
+        assert_eq!(
+            has_token,
+            expected < stored.len(),
+            "case MaxResults {page_size}: NextToken is present only on a non-final page, got \
+             {body}"
         );
     }
 
-    for refused in [0, 101] {
+    for refused in [0, -1] {
         let (status, body) = call(
             &router,
             "GetTables",
@@ -438,7 +477,13 @@ async fn get_tables_honours_the_modelled_max_results_range() {
         .await;
         assert_eq!(
             status, 400,
-            "case MaxResults {refused}: a value outside the modelled range must be refused, got {status} with {body}"
+            "case MaxResults {refused}: a page size no listing can serve must be refused, got \
+             {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("InvalidInputException"),
+            "case MaxResults {refused}: expected Glue's InvalidInputException, got {}",
+            error_code(&body)
         );
     }
 }
@@ -987,8 +1032,8 @@ async fn catalog_id_selects_the_one_catalog_this_emulator_holds() {
 /// test misleading.
 ///
 /// The rows span every such member of the slice. Governed/transactional and
-/// point-in-time reads (`TransactionId`, `QueryAsOfTime`), a transactional write,
-/// partition indexes and an Iceberg create all answer 501 `NotImplemented` — "nobody
+/// point-in-time reads (`TransactionId`, `QueryAsOfTime`), a transactional write and
+/// partition indexes all answer 501 `NotImplemented` — "nobody
 /// has written it yet" — while the one combination the model forbids outright
 /// (`QueryAsOfTime` together with `TransactionId`) answers `InvalidInputException`,
 /// because that is a client error whatever else is supported.
@@ -999,15 +1044,6 @@ async fn unsupported_members_are_refused_not_silently_dropped() {
     create_table(&router, "guarded_db", "events").await;
 
     let unimplemented: Vec<(&str, &str, Value)> = vec![
-        (
-            "CreateTable with OpenTableFormatInput",
-            "CreateTable",
-            json!({
-                "DatabaseName": "guarded_db",
-                "TableInput": { "Name": "iceberg_table" },
-                "OpenTableFormatInput": { "IcebergInput": { "MetadataOperation": "CREATE" } }
-            }),
-        ),
         (
             "CreateTable with PartitionIndexes",
             "CreateTable",
