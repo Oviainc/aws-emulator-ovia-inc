@@ -188,13 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ObjectiveFilter.Domains` is one of this service's single-ARN resource
         // filters: it carries one domain ARN at a time and that entry must name a
         // domain. Which entry counts and which entries are acceptable, the sentence a
-        // filter outside that is refused with, and reading the accepted ARN by the
-        // domain's identity rather than by the partition it is written in, are all the
-        // one rule in `crate::state::single_resource_filter_arn` — shared with the
-        // filter ListCommonControls takes, because it is one rule for the class and not
-        // one per operation.
-        let domain_filter = crate::state::single_resource_filter_arn(
+        // filter outside that is refused with, reading the accepted ARN by the domain's
+        // identity rather than by the partition it is written in, the one fingerprint
+        // dimension the filter contributes to a page token and the narrowing of the
+        // collection to the domain's objectives are all the one rule in
+        // `crate::state::SingleResourceFilter` — shared with the filter
+        // ListCommonControls takes, because it is one rule for the class and not one
+        // per operation. All this operation says is which filter member the entries
+        // come from and which stored member holds an objective's domain.
+        let domain_filter = crate::state::SingleResourceFilter::read(
             "domain",
+            "domains",
             input
                 .objective_filter
                 .as_ref()
@@ -206,21 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let fingerprint = crate::state::filter_fingerprint(&[(
-            "domains",
-            domain_filter.clone().into_iter().collect(),
-        )]);
+        let fingerprint = domain_filter.fingerprint();
         let page = crate::state::page(
             "objectives",
             &fingerprint,
             state
                 .objectives
                 .iter()
-                .filter(|(_, objective)| {
-                    domain_filter
-                        .as_deref()
-                        .is_none_or(|arn| objective.domain_arn == arn)
-                })
+                .filter(|(_, objective)| domain_filter.admits(&objective.domain_arn))
                 .map(|(arn, objective)| {
                     (arn.clone(), objective_summary(objective, &state.domains))
                 }),

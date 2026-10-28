@@ -445,6 +445,69 @@ pub fn single_resource_filter_arn<Entry: ResourceFilterEntry>(
     Ok(Some(canonical_catalog_arn(kind, arn)))
 }
 
+/// A single-ARN resource filter a list operation received, read: the zero-or-one
+/// canonical parent ARN it narrows to, under the name of the page-fingerprint dimension
+/// it contributes.
+///
+/// Every list operation that takes such a filter narrows and fingerprints by the same
+/// rule, so the rule is this one type rather than one copy per operation: the filter
+/// contributes exactly ONE `(dimension, values)` pair to the page fingerprint — the
+/// resolved ARN, or no value at all for a filter that narrows nothing — and it admits
+/// exactly those children whose stored parent ARN is that ARN, every child when it
+/// narrows nothing. The dimension carries the resolved ARN rather than the caller's
+/// spelling of it, so a `NextToken` stays valid for every spelling of the same resource
+/// (see [`canonical_catalog_arn`]) and is refused for a different one.
+///
+/// What stays per-operation is only what the model makes per-operation: the filter
+/// member the entries came from and which stored member of the listed record holds the
+/// parent ARN.
+#[derive(Debug, Clone)]
+pub struct SingleResourceFilter {
+    /// The fingerprint dimension this filter contributes, named after the filter
+    /// structure's list member (lowerCamel, as [`filter_fingerprint`]'s other callers
+    /// name theirs).
+    dimension: &'static str,
+    /// The resource ARN to narrow to, or `None` for a filter that narrows nothing.
+    parent_arn: Option<String>,
+}
+
+impl SingleResourceFilter {
+    /// Read the filter `entries` a list operation received, whose entries name a
+    /// resource of `kind` and which contributes the fingerprint dimension `dimension`.
+    ///
+    /// Which entry counts, which entries are acceptable, the sentence an unacceptable
+    /// filter is refused with and reading the accepted ARN by the resource's identity
+    /// are [`single_resource_filter_arn`]'s rule, unchanged; the caller lifts the
+    /// refusal into its own modeled `ValidationException`.
+    pub fn read<Entry: ResourceFilterEntry>(
+        kind: &str,
+        dimension: &'static str,
+        entries: Option<&[Entry]>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            dimension,
+            parent_arn: single_resource_filter_arn(kind, entries)?,
+        })
+    }
+
+    /// The page fingerprint of this filter: its one dimension, carrying the one ARN it
+    /// narrows to or no value at all.
+    pub fn fingerprint(&self) -> String {
+        filter_fingerprint(&[(
+            self.dimension,
+            self.parent_arn.clone().into_iter().collect(),
+        )])
+    }
+
+    /// Does a listed record whose stored parent ARN is `parent_arn` survive this
+    /// filter? A filter that narrows nothing admits every record.
+    pub fn admits(&self, parent_arn: &str) -> bool {
+        self.parent_arn
+            .as_deref()
+            .is_none_or(|narrowed_to| parent_arn == narrowed_to)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parent summaries
 // ---------------------------------------------------------------------------

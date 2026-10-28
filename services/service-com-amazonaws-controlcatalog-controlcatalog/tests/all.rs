@@ -37,6 +37,8 @@ mod published_ontology;
 mod refusal_wording;
 #[path = "all/single_resource_filter.rs"]
 mod single_resource_filter;
+#[path = "all/single_resource_filter_paging.rs"]
+mod single_resource_filter_paging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_messages.rs"]

@@ -198,13 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CommonControlFilter.Objectives` is one of this service's single-ARN resource
         // filters: it carries one objective ARN at a time and that entry must name an
         // objective. Which entry counts and which entries are acceptable, the sentence
-        // a filter outside that is refused with, and reading the accepted ARN by the
-        // objective's identity rather than by the partition it is written in, are all
-        // the one rule in `crate::state::single_resource_filter_arn` — shared with the
-        // filter ListObjectives takes, because the rule, and the sentence it refuses
-        // with, belong to the class and not to the member at fault.
-        let objective_filter = crate::state::single_resource_filter_arn(
+        // a filter outside that is refused with, reading the accepted ARN by the
+        // objective's identity rather than by the partition it is written in, the one
+        // fingerprint dimension the filter contributes to a page token and the
+        // narrowing of the collection to the objective's common controls are all the
+        // one rule in `crate::state::SingleResourceFilter` — shared with the filter
+        // ListObjectives takes, because the rule, and the sentence it refuses with,
+        // belong to the class and not to the member at fault. All this operation says
+        // is which filter member the entries come from and which stored member holds a
+        // common control's objective.
+        let objective_filter = crate::state::SingleResourceFilter::read(
             "objective",
+            "objectives",
             input
                 .common_control_filter
                 .as_ref()
@@ -216,10 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let fingerprint = crate::state::filter_fingerprint(&[(
-            "objectives",
-            objective_filter.clone().into_iter().collect(),
-        )]);
+        let fingerprint = objective_filter.fingerprint();
         let page = crate::state::page(
             "common-controls",
             &fingerprint,
@@ -227,9 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .common_controls
                 .iter()
                 .filter(|(_, common_control)| {
-                    objective_filter
-                        .as_deref()
-                        .is_none_or(|arn| common_control.objective_arn == arn)
+                    objective_filter.admits(&common_control.objective_arn)
                 })
                 .map(|(arn, common_control)| {
                     (arn.clone(), common_control_summary(common_control, &state))
