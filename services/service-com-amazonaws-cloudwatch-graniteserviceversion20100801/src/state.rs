@@ -118,6 +118,15 @@ pub struct StoredDatum {
     pub storage_resolution: i32,
 }
 
+/// The `StandardUnit` value a datapoint carries when its publisher declared no unit of its
+/// own: `None`, the value the enumerated type declares for a measurement that HAS no unit
+/// (`smithy_query(query="shape",shape="StandardUnit")`).
+///
+/// So "no unit" is a unit like any other here: it is its own storage bucket, a read naming it
+/// selects exactly the datapoints published without one, and a read naming none reports them
+/// under it.
+pub const UNIT_NONE: &str = "None";
+
 impl StoredDatum {
     /// The one value every observation in this datum took, when that value is known.
     ///
@@ -138,6 +147,19 @@ impl StoredDatum {
         } else {
             None
         }
+    }
+
+    /// The unit this datapoint is stored under: the one its publisher declared, and
+    /// [`UNIT_NONE`] when it declared none.
+    ///
+    /// A datapoint has a unit whether or not its publisher named one, because the enumerated
+    /// type has a value for "no unit" ([`UNIT_NONE`]): so a read selecting that value finds
+    /// the datapoints published without one, and a read selecting none reports them under it.
+    /// The one definition of a datapoint's unit, shared by every reader that selects on one
+    /// and by the alarm evaluation that grades one, so none of them can disagree about which
+    /// bucket a datapoint is in.
+    pub fn unit(&self) -> &str {
+        self.unit.as_deref().unwrap_or(UNIT_NONE)
     }
 
     /// The instant this datapoint is AGGREGATED at: the start of the one-minute bucket its own
@@ -440,7 +462,9 @@ pub fn retained_at_period(timestamp_secs: f64, period: i32, now: f64) -> bool {
 ///
 /// `unit` is the caller's unit filter: "If you specify a unit, the operation returns only
 /// data that was collected with that unit specified. […] CloudWatch does not perform unit
-/// conversions." A request naming none takes every datapoint.
+/// conversions." A request naming none takes every datapoint. A datapoint's own unit is the
+/// one its publisher declared, or [`UNIT_NONE`] when it declared none
+/// ([`StoredDatum::unit`]), so both halves of the selection read the same unit.
 pub fn windows_by_unit<'a>(
     data: &'a [StoredDatum],
     start: f64,
@@ -448,9 +472,9 @@ pub fn windows_by_unit<'a>(
     period: i32,
     unit: Option<&str>,
     now: f64,
-) -> BTreeMap<(i64, Option<&'a str>), Vec<&'a StoredDatum>> {
+) -> BTreeMap<(i64, &'a str), Vec<&'a StoredDatum>> {
     let span = f64::from(period);
-    let mut windows: BTreeMap<(i64, Option<&str>), Vec<&StoredDatum>> = BTreeMap::new();
+    let mut windows: BTreeMap<(i64, &str), Vec<&StoredDatum>> = BTreeMap::new();
     for datum in data {
         // The instant the datapoint is AGGREGATED at, which is the start of its own minute for
         // one published at regular resolution ([`StoredDatum::aggregated_instant`]): a read sees
@@ -459,7 +483,7 @@ pub fn windows_by_unit<'a>(
         if instant < start || instant >= end {
             continue;
         }
-        if unit.is_some_and(|unit| datum.unit.as_deref() != Some(unit)) {
+        if unit.is_some_and(|wanted| datum.unit() != wanted) {
             continue;
         }
         if !retained_at_period(instant, period, now) {
@@ -467,10 +491,7 @@ pub fn windows_by_unit<'a>(
         }
         #[allow(clippy::cast_possible_truncation)]
         let index = ((instant - start) / span).floor() as i64;
-        windows
-            .entry((index, datum.unit.as_deref()))
-            .or_default()
-            .push(datum);
+        windows.entry((index, datum.unit())).or_default().push(datum);
     }
     windows
 }
@@ -944,8 +965,10 @@ pub fn is_extended_statistic(statistic: &str) -> bool {
 pub struct WrittenSeries {
     /// The series the datapoints were stored into.
     pub key: MetricKey,
-    /// The unit each stored datapoint carried, in the order the request listed them.
-    pub units: Vec<Option<String>>,
+    /// The unit each stored datapoint carried, in the order the request listed them — each as
+    /// the datapoint is STORED under ([`StoredDatum::unit`]), so a datum whose publisher
+    /// declared none names [`UNIT_NONE`] here rather than nothing.
+    pub units: Vec<String>,
 }
 
 /// A stored metric alarm: the modelled shape `DescribeAlarms` returns, plus the tags
@@ -2745,7 +2768,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 watched.iter().any(|(key, selector)| {
                     series.key == *key
                         && series.units.iter().any(|unit| {
-                            alarm_evaluation::grades_unit(selector.as_deref(), unit.as_deref())
+                            alarm_evaluation::grades_unit(selector.as_deref(), unit)
                         })
                 })
             });
