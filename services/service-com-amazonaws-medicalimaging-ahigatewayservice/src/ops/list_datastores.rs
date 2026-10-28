@@ -15,7 +15,9 @@
 //! The continuation token is opaque on the wire — hex over a marked encoding of the
 //! FULL sort key the next page starts at — so a string this service did not mint is
 //! refused, and paging cannot skip or repeat a store even when the one the token named
-//! has been deleted in the meantime.
+//! has been deleted in the meantime. The marker names the REGION the position belongs
+//! to, because that region is this collection's whole identity: a token minted while
+//! paging one region's data stores is not a position in another's and is refused.
 //!
 //! A data store whose deletion has landed is enumerated in `DELETED` for as long as its
 //! record survives ([`crate::state::DATASTORE_DELETED_RETENTION`]), and leaves the
@@ -172,13 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // The token is this service's own opaque handle; only one this service minted
-        // can be honoured, and a forged one is a client error, not an empty page. The
-        // refusal is the service's FIXED sentence: it does not vary with the token, so
-        // it reveals nothing about how a real one is built.
+        // The token is this service's own opaque handle, marked with the region the
+        // position belongs to; only one this service minted against THIS region can be
+        // honoured, and anything else is a client error, not an empty page. The refusal
+        // is the service's FIXED sentence: it does not vary with the token, so it
+        // reveals nothing about how a real one is built.
         let resume_from = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+            Some(token) => Some(decode_page_token(&region, token).ok_or_else(|| {
                 ListDatastoresErrorModeled::ValidationException(ValidationException {
                     message: crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                 })
@@ -248,7 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let next_token = ordered.get(end).map(|datastore| encode_page_token(datastore));
+        let next_token = ordered
+            .get(end)
+            .map(|datastore| encode_page_token(&region, datastore));
 
         Ok(ListDatastoresOutput {
             datastore_summaries: Some(datastore_summaries),
@@ -257,11 +262,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The marker every token this listing mints carries, so a hex string this service never
-/// issued — or one minted for another collection — is refused rather than honoured as a
-/// resume point. The codec itself is the service's one
-/// ([`crate::state::encode_page_token`]), so every listing's token is built one way.
-const PAGE_TOKEN_MARKER: &str = "ahi-datastores-v1:";
+/// The marker every token this listing mints carries: this operation's own prefix plus
+/// the region the position belongs to.
+///
+/// A hex string this service never issued, one minted for another collection, and one
+/// minted while paging another region's data stores are all refused rather than honoured
+/// as a resume point — a data store is a regional resource, so the data stores of two
+/// regions are two collections and a position in one is not a position in the other. The
+/// codec itself is the service's one ([`crate::state::encode_page_token`]), so every
+/// listing's token is built one way.
+fn page_token_marker(region: &str) -> String {
+    format!("ahi-datastores-v1:{region}:")
+}
 
 /// The total order the listing walks: creation instant first, id to break a tie — so a
 /// page boundary is stable no matter how the underlying map iterates.
@@ -270,17 +282,17 @@ fn sort_key(datastore: &crate::state::Datastore) -> (u64, u32, &str) {
 }
 
 /// Encode the sort key the next page starts at as this listing's opaque `nextToken`.
-fn encode_page_token(first_of_next_page: &crate::state::Datastore) -> String {
+fn encode_page_token(region: &str, first_of_next_page: &crate::state::Datastore) -> String {
     crate::state::encode_page_token(
-        PAGE_TOKEN_MARKER,
+        &page_token_marker(region),
         first_of_next_page.created_at,
         &first_of_next_page.datastore_id,
     )
 }
 
-/// Decode a token produced by [`encode_page_token`], or `None` when it was not one — a
-/// well-formed hex string without this listing's marker, or with a payload this service
-/// would never mint, is not one.
-fn decode_page_token(token: &str) -> Option<crate::state::PageCursor> {
-    crate::state::decode_page_token(PAGE_TOKEN_MARKER, token)
+/// Decode a token produced by [`encode_page_token`] against `region`, or `None` when it
+/// was not one — a well-formed hex string without this listing's marker, one carrying
+/// another region's, or one with a payload this service would never mint, is not one.
+fn decode_page_token(region: &str, token: &str) -> Option<crate::state::PageCursor> {
+    crate::state::decode_page_token(&page_token_marker(region), token)
 }

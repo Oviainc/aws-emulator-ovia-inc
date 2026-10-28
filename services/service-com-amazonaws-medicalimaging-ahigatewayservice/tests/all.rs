@@ -17,6 +17,8 @@ mod content_reads_shared_rules;
 mod datastore_deleted_window;
 #[path = "all/datastore_lifecycle.rs"]
 mod datastore_lifecycle;
+#[path = "all/datastore_listing_page_tokens.rs"]
+mod datastore_listing_page_tokens;
 #[path = "all/datastore_status_guard.rs"]
 mod datastore_status_guard;
 #[path = "all/error_message_texts.rs"]
