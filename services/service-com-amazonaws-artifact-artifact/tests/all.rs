@@ -35,6 +35,8 @@ mod compliance_inquiry_support_mode;
 mod customer_agreements;
 #[path = "all/document_data_plane.rs"]
 mod document_data_plane;
+#[path = "all/export_document_authorisation.rs"]
+mod export_document_authorisation;
 #[path = "all/front_door.rs"]
 mod front_door;
 #[path = "all/front_door_errors.rs"]

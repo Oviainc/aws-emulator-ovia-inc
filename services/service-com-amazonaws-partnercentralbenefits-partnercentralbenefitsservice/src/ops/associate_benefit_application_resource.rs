@@ -150,27 +150,24 @@ const ASSOCIATED_RESOURCES_MEMBER: &str = "associatedResources";
 /// The refusal an association that would take one application past
 /// [`crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] is answered with: this
 /// service's modelled `ValidationException`, stating the modelled length the stored list
-/// may not exceed. Worded through the same helpers every other refusal of this service goes
-/// through ([`crate::service::constraint_requirement`], [`crate::service::member_clause`]
-/// and [`crate::service::validation_envelope`]), so a caller is shown the same requirement
-/// whether the resource that would not fit arrives on a create or on an association, and
-/// NOTHING of the ARN the request carried is echoed.
+/// may not exceed. The requirement is worded by the helper the centralized walk words a
+/// length with ([`crate::service::constraint_requirement`]) and the exception is built by
+/// the one construction every member refusal of this crate goes through
+/// ([`crate::state::member_validation_exception`]), so a caller is shown the same
+/// requirement whether the resource that would not fit arrives on a create or on an
+/// association, and NOTHING of the ARN the request carried is echoed.
 fn record_full() -> AssociateBenefitApplicationResourceError {
     let requirement = crate::service::constraint_requirement(&ViolationKind::MaxLength(
         crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION as i64,
     ))
     .unwrap_or_default();
-    let clause = crate::service::member_clause(ASSOCIATED_RESOURCES_MEMBER, &requirement, false);
-    AssociateBenefitApplicationResourceErrorModeled::ValidationException(ValidationException {
-        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
-            .unwrap_or_else(|| clause.clone()),
-        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-        field_list: Some(crate::state::validation_field(
+    AssociateBenefitApplicationResourceErrorModeled::ValidationException(
+        crate::state::member_validation_exception(
             ASSOCIATED_RESOURCES_MEMBER,
             &requirement,
-            crate::state::VALIDATION_CODE_INVALID_VALUE,
-        )),
-    })
+            crate::state::VALIDATION_REASON_FIELD,
+        ),
+    )
     .into()
 }
 

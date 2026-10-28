@@ -42,8 +42,7 @@ use crate::ops::types::{
 pub const ARN_NAMESPACE: &str = "ecr-public";
 
 /// The Regions an ECR Public API endpoint is published in — every Region a caller can
-/// reach this surface from, NOT the set a Region-scoped call is served from (that is
-/// [`API_REGION`] alone; see [`serves_region`]).
+/// ADDRESS this surface at.
 ///
 /// `UnsupportedCommandException` ("The action isn't supported in this Region", client,
 /// HTTP 400) is a SERVICE-level error in this model: it is bound to every one of the 23
@@ -53,34 +52,32 @@ pub const ARN_NAMESPACE: &str = "ecr-public";
 /// ECR Public call CAN be refused for the Region it was signed for, and says nothing about
 /// which Regions the service answers in. AWS's service-endpoint reference lists exactly
 /// these two for `api.ecr-public`, and the registry and repository surface —
-/// repositories, images, layer uploads, tags, policies, catalog reads — is served from
-/// either of them.
+/// repositories, images, layer uploads, tags, policies and both catalog legs — is served
+/// from either of them.
 ///
-/// The ONE Region-scoped call is the write of the account-global registry catalog data
-/// (`PutRegistryCatalogData`): the record is written from [`API_REGION`] only, so the same
-/// well-formed request addressed to the OTHER published endpoint is refused rather than
-/// served. The matching read (`GetRegistryCatalogData`) is served everywhere, so a caller
-/// outside the write's Region can still see what the record holds.
+/// Which Region an endpoint is reached AS is a property of the deployment, not of a
+/// request: this emulator publishes ONE endpoint, and a client points at it with whatever
+/// Region its own configuration carries, so the Region in a request's credential scope says
+/// nothing about which of the service's endpoints the caller meant to address. Only the
+/// operator knows that, and declares it ([`API_REGION_ENV`]): until they do, this instance
+/// stands in for whichever Region a caller reaches it as and no call is refused for its
+/// Region ([`serves_region`]).
 pub const ENDPOINT_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
-/// The single Region AWS performs the account-global registry-catalog write in, which is
-/// the Region its refusal names: the first of [`ENDPOINT_REGIONS`].
+/// The Region AWS documents the account-global registry-catalog write
+/// (`PutRegistryCatalogData`) as performed in: the first of [`ENDPOINT_REGIONS`], and so the
+/// value an operator standing this instance up as that endpoint declares in
+/// [`API_REGION_ENV`].
 ///
 /// Publishing an API endpoint in a Region and performing a Region-scoped write in it are
 /// different properties: this is the second one, and it holds for exactly one Region.
 pub const API_REGION: &str = ENDPOINT_REGIONS[0];
 
-/// The environment variable the operator names the Region THIS emulator instance stands in
-/// for in, on top of the Region a Region-scoped call is performed in ([`API_REGION`]).
+/// The environment variable the operator declares the Region THIS emulator instance stands
+/// in for in — the endpoint of this service it is standing up as.
 pub const API_REGION_ENV: &str = "ECR_PUBLIC_API_REGION";
 
-/// The Region THIS emulator instance is deployed as, when [`API_REGION_ENV`] names one.
-///
-/// Which Region an endpoint is reached as is a property of the deployment, not of the
-/// service: an instance deployed as a Region stands in for that Region's endpoint on top
-/// of [`API_REGION`], so a Region-scoped call that reaches it as that Region is served
-/// instead of being refused for a Region it IS being served on. An instance the operator
-/// tells nothing serves a Region-scoped call as [`API_REGION`] alone.
+/// The Region this emulator instance stands in for, when [`API_REGION_ENV`] declares one.
 pub fn configured_region() -> Option<String> {
     ::std::env::var(API_REGION_ENV)
         .ok()
@@ -88,50 +85,63 @@ pub fn configured_region() -> Option<String> {
         .filter(|region| !region.is_empty())
 }
 
-/// Whether an instance deployed as `configured` — `None` when its environment names no
-/// Region ([`configured_region`]) — serves a Region-scoped call that reaches it as
-/// `region`: the single Region that call is performed in ([`API_REGION`]), or the Region
-/// this instance is deployed as.
+/// Whether an instance standing in for `configured` — `None` when the operator has declared
+/// no Region ([`configured_region`]) — serves a Region-scoped call for a request that
+/// reaches it as `region`.
 ///
-/// The Regions that merely publish an endpoint ([`ENDPOINT_REGIONS`]) are NOT consulted
-/// here, and that is the point: a call scoped to one Region is refused for every OTHER
-/// Region the service answers in, which is the only place the refusal can be observed.
+/// An instance that stands in for no declared Region stands in for whichever Region a caller
+/// reaches it as, so there is no Region it is NOT the endpoint of and every call is served:
+/// one endpoint answers a client configured for any Region, and refusing the Region a
+/// request happens to be signed for would refuse the endpoint the caller actually reached.
+/// Once the operator declares WHICH endpoint this instance is, a call AWS performs in one
+/// Region is served only as that Region and refused for every other.
 ///
 /// A Region name is case-insensitive, so every comparison here is too.
 pub fn serves_region(configured: Option<&str>, region: &str) -> bool {
-    region.eq_ignore_ascii_case(API_REGION)
-        || configured.is_some_and(|configured| region.eq_ignore_ascii_case(configured))
+    configured.is_none_or(|configured| region.eq_ignore_ascii_case(configured))
+}
+
+/// The `UnsupportedCommandException` an instance standing in for `configured` refuses a
+/// Region-scoped call reaching it as `region` with, or `None` when it serves that call
+/// ([`serves_region`]).
+///
+/// The message is a deterministic function of the request and of the deployment: the
+/// operation the caller named, then the Region this instance performs that call in.
+pub fn unsupported_for_region(
+    configured: Option<&str>,
+    region: &str,
+    operation: &str,
+) -> Option<UnsupportedCommandException> {
+    if serves_region(configured, region) {
+        return None;
+    }
+    let serving = configured?;
+    Some(UnsupportedCommandException {
+        message: Some(format!(
+            "{operation} command is only supported in {serving}."
+        )),
+    })
 }
 
 /// The `UnsupportedCommandException` a Region-scoped ECR Public call that reaches this
-/// instance as a Region it does not serve as is refused with, or `None` when the request
-/// reached it as a Region it does serve ([`serves_region`]).
+/// instance as a Region it does not stand in for is refused with, or `None` when it is
+/// served ([`unsupported_for_region`]).
 ///
-/// This is the gate of the ONE Region-scoped operation (see [`ENDPOINT_REGIONS`]): it is
-/// called by `PutRegistryCatalogData` before it touches the account-global record, and by
-/// nothing else — an operation AWS serves from every published endpoint must not consult
-/// it, or a caller that reached ECR Public from another Region is refused everything.
+/// This is the gate of the ONE Region-scoped operation: it is called by
+/// `PutRegistryCatalogData` before it touches the account-global record, and by nothing
+/// else — an operation AWS serves from every published endpoint must not consult it, or a
+/// caller that reached ECR Public from another Region is refused everything.
 ///
 /// The Region a request carries is the one in its SigV4 credential scope, parsed by
 /// `emulator_server::sigv4_credential_scope` (the single source of SigV4-scope parsing). A
 /// request that carries no well-formed SigV4 `Authorization` names no Region at all, so
 /// there is nothing to refuse it for and it is served.
-///
-/// The message is a deterministic function of the request: the operation the caller named,
-/// then the Region that operation is served from ([`API_REGION`]).
 pub fn unsupported_in_region(
     parts: &::http::request::Parts,
     operation: &str,
 ) -> Option<UnsupportedCommandException> {
     let region = ::emulator_server::sigv4_credential_scope(&parts.headers)?.region;
-    if serves_region(configured_region().as_deref(), &region) {
-        return None;
-    }
-    Some(UnsupportedCommandException {
-        message: Some(format!(
-            "{operation} command is only supported in {API_REGION}."
-        )),
-    })
+    unsupported_for_region(configured_region().as_deref(), &region, operation)
 }
 
 /// The universal host prefix every ECR Public repository URI carries, as

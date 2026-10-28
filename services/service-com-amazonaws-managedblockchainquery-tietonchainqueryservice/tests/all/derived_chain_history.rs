@@ -302,11 +302,16 @@ async fn a_window_anywhere_in_the_ledgers_life_holds_the_busiest_addresss_transa
         let address = network.busiest_address();
         for (from, to) in windows(&network) {
             let case = format!("{}/{address}@{from}..{to}", network.network);
+            // The rows below are about the whole window, so the request opts in to the
+            // transactions that have not reached finality: a request carrying no
+            // `confirmationStatusFilter` lists only the ones that have (the rule
+            // `finality_default.rs` owns).
             let body = json!({
                 "network": network.network,
                 "address": address,
                 "fromBlockchainInstant": {"time": from},
                 "toBlockchainInstant": {"time": to},
+                "confirmationStatusFilter": {"include": ["FINAL", "NONFINAL"]},
             });
             let reply = emulator.ok("/list-transactions", &body).await;
             let instants = timestamps(&reply);

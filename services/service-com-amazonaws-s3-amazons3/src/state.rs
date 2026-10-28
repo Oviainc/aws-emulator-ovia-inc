@@ -5807,6 +5807,18 @@ impl Bucket {
         self.website = Some(configuration);
     }
 
+    /// Remove the bucket's website configuration, leaving none associated with it.
+    ///
+    /// What `DeleteBucketWebsite` does — "This action removes the website configuration for
+    /// a bucket" (that operation's own documentation) — which puts the bucket back in the
+    /// state it was created in, so a later `GetBucketWebsite` answers
+    /// [`NO_SUCH_WEBSITE_CONFIGURATION_CODE`] again. Scoped to this one bucket's website
+    /// configuration: nothing else on the record is touched, the way [`Bucket::clear_cors`]
+    /// is scoped to the cors configuration.
+    pub fn clear_website(&mut self) {
+        self.website = None;
+    }
+
     /// The bucket's cors configuration, or `None` when no cors configuration is associated
     /// with the bucket.
     pub fn cors(&self) -> Option<&[BucketCorsRule]> {

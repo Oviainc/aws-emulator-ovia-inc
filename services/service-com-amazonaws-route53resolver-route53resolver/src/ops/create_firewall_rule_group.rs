@@ -254,6 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A group created empty has no change in flight, so the clock owes
             // it no transition: the status it reports is already the settled one.
             settled_at: None,
+            // Sharing is configured afterwards, by attaching a resource policy,
+            // so a group that was just created carries none.
+            firewall_rule_group_policy: None,
         };
 
         let rule_group = record.to_rule_group(now);

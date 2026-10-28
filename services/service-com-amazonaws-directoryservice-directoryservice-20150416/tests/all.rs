@@ -45,6 +45,8 @@ mod event_topics;
 mod harness;
 #[path = "all/ip_route_removal.rs"]
 mod ip_route_removal;
+#[path = "all/ldaps.rs"]
+mod ldaps;
 #[path = "all/log_subscriptions.rs"]
 mod log_subscriptions;
 #[path = "all/microsoft_ad.rs"]

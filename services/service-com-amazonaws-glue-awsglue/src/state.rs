@@ -257,7 +257,8 @@ use crate::ops::types::{
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties, TargetTableConfig,
     TriggerUpdate,
-    UpdateClassifierInput, UpdateCrawlerInput, UpdateMLTransformInput, Workflow, WorkflowGraph,
+    UpdateClassifierInput, UpdateCrawlerInput, UpdateMLTransformInput, UpdateWorkflowInput,
+    Workflow, WorkflowGraph,
     WorkflowRun,
     WorkflowRunStatistics, XMLClassifier,
 };
@@ -5505,6 +5506,25 @@ pub fn ml_transform_update_names_a_change(input: &UpdateMLTransformInput) -> boo
         || input.max_retries.is_some()
 }
 
+/// Whether an `UpdateWorkflow` request names a member of the workflow to change at all.
+///
+/// Every member of that request other than the `Name` addressing the workflow is optional,
+/// so a request carrying none of them asks for no change: nothing is written, so the
+/// workflow's `LastModifiedOn` stays where the last write that did change something put it
+/// — the same way an `UpdateCrawler` naming no member leaves its crawler's `LastUpdated`
+/// alone ([`crawler_update_names_a_change`]). Written as an exhaustive destructuring so a
+/// member added to the request shape cannot be silently left out of the answer.
+pub fn workflow_update_names_a_change(input: &UpdateWorkflowInput) -> bool {
+    let UpdateWorkflowInput {
+        name: _,
+        description,
+        default_run_properties,
+        max_concurrent_runs,
+    } = input;
+
+    description.is_some() || default_run_properties.is_some() || max_concurrent_runs.is_some()
+}
+
 /// The message the catalog's metadata form type surface refuses an identifier it holds no
 /// form type under with: the value of that refusal's `EntityNotFoundException$Message`.
 ///
@@ -9583,6 +9603,40 @@ impl WorkflowEntry {
             // A workflow a create wrote has not been run.
             runs: Vec::new(),
         }
+    }
+
+    /// Apply an `UpdateWorkflow` request to this stored workflow, member by member, as
+    /// served at `now`.
+    ///
+    /// Every member the request CARRIES replaces the stored one and every member it OMITS
+    /// is preserved: the request is a patch over the definition the create registered, the
+    /// same way an `UpdateCrawler` ([`CrawlerEntry::apply_update`]) or an
+    /// `UpdateMLTransform` ([`MlTransformEntry::apply_update`]) is, and unlike `UpdateJob`,
+    /// whose submitted definition is documented to overwrite the stored one completely.
+    /// `Name` ADDRESSES the workflow rather than changing it (`UpdateWorkflowRequest` has no
+    /// rename member), and the request has no member for the create instant, the tags or the
+    /// runs already started of the workflow, so none of those is this request's to change.
+    ///
+    /// A member whose value is a WHOLE collection is replaced whole rather than merged key
+    /// by key: `DefaultRunProperties` is "a collection of properties to be used as part of
+    /// each execution of the workflow", so a request naming that collection sets it, which is
+    /// what makes merging the business of `PutWorkflowRunProperties` — the operation that
+    /// writes individual properties, and onto one RUN rather than onto the workflow.
+    ///
+    /// The new defaults apply to the runs STARTED AFTER this write: a run already begun
+    /// holds the properties it began with ([`WorkflowRunEntry::run_properties`]).
+    /// `LastModifiedOn` becomes `now`, since it "moves with every write to this workflow".
+    pub fn apply_update(&mut self, input: &UpdateWorkflowInput, now: SystemTime) {
+        if let Some(description) = input.description.as_ref() {
+            self.description = Some(description.clone());
+        }
+        if let Some(default_run_properties) = input.default_run_properties.as_ref() {
+            self.default_run_properties = Some(default_run_properties.clone());
+        }
+        if let Some(max_concurrent_runs) = input.max_concurrent_runs {
+            self.max_concurrent_runs = Some(max_concurrent_runs);
+        }
+        self.last_modified_on = now;
     }
 
     /// The maximum number of this workflow's runs that may be in flight at once, or `None`

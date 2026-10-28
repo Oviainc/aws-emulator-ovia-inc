@@ -172,6 +172,10 @@ pub(crate) async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>
     );
     let host_project_id = member(&project, "projectId");
 
+    // An open workspace: the pipeline and task rows below create INSIDE one, and
+    // those creates resolve the name through the workspace registry.
+    crate::support::ensure_workspace(router, WORKSPACE).await;
+
     let rows = vec![
         Target {
             label: "CreateAssetModel",

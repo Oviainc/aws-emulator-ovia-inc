@@ -125,7 +125,9 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// that same catalog in the handler, once the type is known to be published
 /// (`crate::state::resolve_type_version`). The deployment targets a definition's
 /// parameters name must be servable, because each targeted account and Region pair
-/// becomes a stored configuration (`crate::state::deployment_targets_rejection`). The
+/// becomes a stored configuration (`crate::state::deployment_targets_rejection`, which
+/// counts those pairs the way the handler below deploys them, from `local_account` and
+/// `local_region` for a definition naming no account or no Region). The
 /// remaining checks are
 /// the store's own bounds on collections the model gives no length (see
 /// `crate::state`'s `MAX_*` constants), the provider-reserved tag-key namespace a
@@ -133,7 +135,11 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// `IAMRoleArn` form of
 /// `LocalDeploymentAdministrationRoleArn`, which the model states as an
 /// `@arnReference` rather than as a `@pattern` the boundary could enforce.
-fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<String> {
+fn definitions_rejection(
+    input: &CreateConfigurationManagerInput,
+    local_account: &str,
+    local_region: &str,
+) -> Option<String> {
     if input.configuration_definitions.is_empty() {
         return Some(
             "ConfigurationDefinitions must carry at least one configuration definition"
@@ -188,6 +194,8 @@ fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<Stri
                 crate::state::deployment_targets_rejection(
                     "ConfigurationDefinitions.Parameters",
                     &definition.parameters,
+                    local_account,
+                    local_region,
                 )
             })
     })
@@ -285,7 +293,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        if let Some(why) = definitions_rejection(&input) {
+        // Quick Setup is a regional control plane: the Region this request was signed
+        // for is the Region the manager it creates is served from, and so the Region a
+        // definition naming none is deployed in. Read before the request is checked,
+        // because the deployments a definition fans out to — what the check below bounds
+        // and what the handler then deploys — are counted from it.
+        let region = crate::state::request_region(ctx.parts());
+        let account = ::engine::emulator_account_id().to_string();
+
+        if let Some(why) = definitions_rejection(&input, &account, &region) {
             return Err(CreateConfigurationManagerErrorModeled::ValidationException(
                 ValidationException { message: Some(why) },
             )
@@ -320,8 +336,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let region = crate::state::request_region(ctx.parts());
-        let account = ::engine::emulator_account_id().to_string();
         let created_at = ::std::time::SystemTime::now();
 
         let mut store = state.lock();

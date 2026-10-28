@@ -227,6 +227,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // A `workspaceName` the request carries puts the dataset INSIDE that
+        // workspace, so a workspace this store holds no record of is the same
+        // absence every other workspace-scoped operation of this service reports —
+        // resolved before anything is written, so a create naming a workspace
+        // nobody opened persists no dataset.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(CreateDatasetError::Modeled(
+                    CreateDatasetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::not_found_message(
+                                crate::state::RESOURCE_WORKSPACE,
+                                workspace,
+                            ),
+                        },
+                    ),
+                ));
+            }
+        }
+
         // `clientToken` makes this create idempotent, as the member documents: "A
         // unique case-sensitive identifier that you can provide to ensure the
         // idempotency of the request." A retry — an SDK's own, after a timeout —
@@ -234,7 +254,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call minted and writes nothing; a token already spent on a DIFFERENT request
         // belongs to another call, which is the modelled conflict rather than a second
         // dataset. Decided BEFORE the request is resolved against the store, because
-        // the call it repeats was already served.
+        // the call it repeats was already served — behind the workspace lookup above,
+        // which the workspace a retry names has to pass just as the first call's did.
         let fingerprint = crate::state::request_fingerprint(
             &[
                 &input.dataset_name,

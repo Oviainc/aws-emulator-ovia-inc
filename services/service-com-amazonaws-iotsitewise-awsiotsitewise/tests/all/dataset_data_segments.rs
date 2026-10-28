@@ -432,6 +432,11 @@ pub(crate) async fn create_dataset(
     dataset_type: Option<&str>,
     workspace: Option<&str>,
 ) -> String {
+    // A dataset the request puts in a workspace is created INSIDE it, and the
+    // create resolves the name through the workspace registry.
+    if let Some(workspace) = workspace {
+        crate::support::ensure_workspace(router, workspace).await;
+    }
     let mut body = json!({
         "datasetName": name,
         "datasetSource": { "sourceType": "SITEWISE", "sourceFormat": "TIMESERIES" },

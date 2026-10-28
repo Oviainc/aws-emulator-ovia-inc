@@ -4,9 +4,12 @@
 //! Reports the queries in flight on one graph: one summary per query — its id, its text,
 //! the state it is in and the milliseconds it waited and has been running — oldest
 //! admission first, capped at the `maxResults` the request asked for and restricted to
-//! one state when `state` names one rather than `ALL`. REPORTING only — the single write
-//! it makes is reclaiming the queries the clock has already ended, which had stopped at
-//! that instant whether or not anybody called.
+//! one state when `state` names one rather than `ALL`. The listing is read through the
+//! graph's own data plane, which answers only while the graph is `AVAILABLE`: a graph
+//! this store does not hold, and one that is not serving, are both refused with the one
+//! client error this operation models (400 `ValidationException`). REPORTING only — the
+//! single write it makes is reclaiming the queries the clock has already ended, which
+//! had stopped at that instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -200,6 +203,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let graph_id = graph.id.clone();
+
+        // The listing is read from the graph's OWN data endpoint — the operation is
+        // bound to the host prefix `{graphIdentifier}.`
+        // (`smithy_query(query="operation",operation="ListQueries")` -> endpoint) — and
+        // that endpoint serves only while the graph is serving, so a graph that is not
+        // serving has no queries in flight to list and no plane to list them from. An
+        // empty success would tell the caller the graph is serving and idle, which is a
+        // different fact, so the state is reported as the refusal `crate::state` words
+        // for every operation on that endpoint (this operation declares no
+        // `ConflictException`, so the one client error it models carries it).
+        if !graph.status.is_serving() {
+            let refused = crate::state::graph_data_plane_unavailable(
+                &graph_id,
+                graph.status,
+                "list queries on",
+            );
+            return Err(ListQueriesErrorModeled::ValidationException(refused).into());
+        }
 
         // Reporting only: the sole write the listing makes is reclaiming the queries the
         // clock had already ended at this instant — each accepted cancellation that has

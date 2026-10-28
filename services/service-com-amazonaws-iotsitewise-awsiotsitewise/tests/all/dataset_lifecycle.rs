@@ -246,6 +246,11 @@ fn create_body(case: &CreateCase) -> Value {
 /// Create the dataset `case` describes and return its id, asserting the create
 /// itself answered as `CreateDataset` documents.
 async fn create_dataset(router: &MultiServiceRouter, case: &CreateCase) -> String {
+    // A case that names a workspace creates the dataset INSIDE it, and the create
+    // resolves the name through the workspace registry.
+    if let Some(workspace) = case.workspace {
+        crate::support::ensure_workspace(router, workspace).await;
+    }
     let (status, created) = call(router, "POST", DATASETS, Some(create_body(case))).await;
     assert_eq!(
         status, 202,
@@ -763,6 +768,10 @@ async fn a_read_is_scoped_by_the_workspace_and_the_version_it_names() {
 #[tokio::test]
 async fn the_workspace_rule_bounds_what_a_create_accepts() {
     let router = router();
+    // The workspace the rows below name: a create that puts a dataset in a
+    // workspace resolves the name through the workspace registry, so what these
+    // rows are about is the dataset-type rule and nothing else.
+    crate::support::ensure_workspace(&router, "ws-1").await;
 
     // (case, datasetType, workspaceName, accepted). The rule is the model's own, on
     // `workspaceName`: "Required for session and curated datasets. Omit this field
