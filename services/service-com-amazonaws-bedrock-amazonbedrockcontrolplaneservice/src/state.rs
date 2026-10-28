@@ -2023,14 +2023,20 @@ pub const MODEL_INVOCATION_JOB_BEGINS_AFTER: Duration = Duration::from_millis(50
 /// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`] before it is owed its move to
 /// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`].
 ///
-/// Longer than the three spans before it, and longer than the interval a client polls a job
-/// at: the run is the half of the lifecycle callers act ON — watching a job's progress,
-/// stopping one that is still running, reacting to a running job in a scheduler — so the
-/// running status has to be one a caller polling at a human interval reads the job in,
-/// rather than one that falls between two polls. A real submission runs for as long as its
-/// records take; this emulator reads no input and runs no inference, so this span is its own
-/// rather than derived from an input.
-pub const MODEL_INVOCATION_JOB_COMPLETE_AFTER: Duration = Duration::from_secs(60);
+/// CHOSEN, not documented: a real submission runs for as long as its records and the queue
+/// it is in take, which is no published figure, so this is the emulator's own span — the one
+/// [`MODEL_COPY_JOB_COMPLETE_AFTER`] and [`EVALUATION_JOB_COMPLETE_AFTER`] use for the same
+/// kind of accepted-then-finishes job. It is longer than the three spans before it, so the
+/// running status is one a caller polling the job reads it in — and can still stop it in —
+/// rather than one that falls between two polls; and it is of the same order as those spans,
+/// so the terminal status and the results stored under the output prefix are reachable
+/// inside a single short polling pass rather than after a wall-clock wait longer than a
+/// caller's budget. The WORK the span stands over is performed, not skipped
+/// ([`model_invocation_run::run_batch_inference`] reads the input and invokes the model once
+/// per record), and the span does not scale with the input: it is materialised from the
+/// stored due instant on the next call that touches the record rather than waited on, so no
+/// handler sleeps.
+pub const MODEL_INVOCATION_JOB_COMPLETE_AFTER: Duration = Duration::from_secs(3);
 
 /// The instants a batch inference job submitted at a given moment is owed each of its
 /// status transitions at: the whole progression

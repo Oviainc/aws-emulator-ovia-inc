@@ -23,7 +23,7 @@
 //! `timeoutDurationInHours` is reported as the instant the job WOULD time out
 //! (`jobExpirationTime`) and nothing more: the member is modelled `range 24..168`, so the
 //! earliest timeout a request can ask for stands a day after the submission, while a job
-//! here begins seconds after it and ends a minute later — no request can reach its own
+//! here begins seconds after it and ends seconds later — no request can reach its own
 //! expiration instant, so no timeout transition is ever due.
 //!
 //! ## Shape of an operation

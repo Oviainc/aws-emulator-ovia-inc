@@ -49,7 +49,7 @@ const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000";
 
 /// The bucket every input object below is staged in and every result object is written to.
-const BUCKET: &str = "example-batch-inference";
+pub(crate) const BUCKET: &str = "example-batch-inference";
 
 /// A bucket no `CreateBucket` below ever creates.
 const ABSENT_BUCKET: &str = "example-batch-inference-missing";
@@ -70,18 +70,19 @@ const COMPLETE_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_COMPLETE_A
 const SLACK: Duration = Duration::from_millis(500);
 
 /// One stored batch inference job, cloned out of the store the handlers share so a case can
-/// settle it at an instant of its own choosing: the span a running job dwells for is
-/// measured in minutes, which no test can sleep through.
-type JobRecord = bedrock::state::ModelInvocationJobRecord;
+/// settle it at an instant of its own choosing: the span a running job dwells for is longer
+/// than the three before it, so a case that only needs the terminal status reads it off a
+/// clone rather than sleeping through that span as well.
+pub(crate) type JobRecord = bedrock::state::ModelInvocationJobRecord;
 
 /// One emulator: this service and Amazon S3 on a single shared engine behind the production
 /// router — what `build_router` assembles, narrowed to the services under test.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(bedrock::EmulatedService::new(Arc::clone(&engine)));
@@ -93,7 +94,7 @@ fn emulator() -> Emulator {
 
 impl Emulator {
     /// One control-plane call, signed for [`REGION`] the way an SDK signs it.
-    async fn bedrock(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn bedrock(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(&value).expect("a serializable request body")
         });
@@ -144,7 +145,7 @@ impl Emulator {
     /// live in the URI and the body is the object's own bytes, so this is a raw request
     /// rather than a modelled call. The credential scope names `s3`, which is what the
     /// router claims on.
-    async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, bytes::Bytes) {
+    pub(crate) async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, bytes::Bytes) {
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
@@ -157,7 +158,7 @@ impl Emulator {
     }
 
     /// The stored record of one job, cloned out of the shared store.
-    fn stored_job(&self, arn: &str) -> JobRecord {
+    pub(crate) fn stored_job(&self, arn: &str) -> JobRecord {
         let state = bedrock::state::service_state(&*self.engine)
             .expect("the shared engine carries this service's store");
         let store = state.lock();
@@ -171,7 +172,7 @@ impl Emulator {
 
 /// `PUT /<bucket>` — `CreateBucket` — so the input objects below have a bucket to live in
 /// and the results have one to be written to.
-async fn given_bucket(emu: &Emulator) {
+pub(crate) async fn given_bucket(emu: &Emulator) {
     let (status, body) = emu.s3("PUT", &format!("/{BUCKET}"), &[]).await;
     assert_eq!(
         status,
@@ -183,7 +184,7 @@ async fn given_bucket(emu: &Emulator) {
 
 /// `PUT /<bucket>/<key>` — `PutObject` — of a `.jsonl` file holding `lines`, one JSON text
 /// per line, which is the documented input format.
-async fn given_input_object(emu: &Emulator, key: &str, lines: &[String]) {
+pub(crate) async fn given_input_object(emu: &Emulator, key: &str, lines: &[String]) {
     let file: String = lines.iter().map(|line| format!("{line}\n")).collect();
     let (status, body) = emu
         .s3("PUT", &format!("/{BUCKET}/{key}"), file.as_bytes())
@@ -197,7 +198,7 @@ async fn given_input_object(emu: &Emulator, key: &str, lines: &[String]) {
 }
 
 /// `CreateModelInvocationJob` with the members every row sets, answering with the `jobArn`.
-async fn submit(
+pub(crate) async fn submit(
     emu: &Emulator,
     name: &str,
     model_id: &str,
@@ -230,7 +231,7 @@ async fn submit(
 }
 
 /// `GetModelInvocationJob` on the job `arn` names.
-async fn read_job(emu: &Emulator, arn: &str) -> Reply {
+pub(crate) async fn read_job(emu: &Emulator, arn: &str) -> Reply {
     emu.bedrock(
         "GET",
         &format!("/model-invocation-job/{}", label(arn)),
@@ -241,18 +242,18 @@ async fn read_job(emu: &Emulator, arn: &str) -> Reply {
 
 /// The minted job id a `ModelInvocationJobArn` carries, which is the folder a job's results
 /// live under.
-fn job_id(arn: &str) -> &str {
+pub(crate) fn job_id(arn: &str) -> &str {
     arn.rsplit('/').next().expect("an ARN has a last segment")
 }
 
 /// The record count a response reports under `name`, or `None` when it omits the member.
-fn count(reply: &Reply, name: &str) -> Option<i64> {
+pub(crate) fn count(reply: &Reply, name: &str) -> Option<i64> {
     reply.get(name).as_i64()
 }
 
 /// One input record in the documented form: a JSON object carrying `modelInput`, and
 /// `recordId` when the row gives one.
-fn record(record_id: Option<&str>, model_input: Value) -> String {
+pub(crate) fn record(record_id: Option<&str>, model_input: Value) -> String {
     let mut line = serde_json::Map::new();
     if let Some(record_id) = record_id {
         line.insert("recordId".to_string(), json!(record_id));
@@ -263,7 +264,7 @@ fn record(record_id: Option<&str>, model_input: Value) -> String {
 
 /// A body `InvokeModel` serves for the Meta Llama family: the family's documented request
 /// schema requires `prompt`.
-fn llama_input(prompt: &str) -> Value {
+pub(crate) fn llama_input(prompt: &str) -> Value {
     json!({"prompt": prompt, "max_gen_len": 64})
 }
 
@@ -553,7 +554,7 @@ async fn a_job_that_has_begun_has_run_the_model_over_its_input_and_written_its_r
         );
 
         // The terminal status the run decided, read off the record settled past the instant
-        // the job is owed it: the span a running job dwells for is measured in minutes.
+        // the job is owed it, rather than by sleeping through the running span once more.
         let mut record = emu.stored_job(arn);
         record.settle(record.submit_time + VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER
             + COMPLETE_AFTER);

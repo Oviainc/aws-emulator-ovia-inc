@@ -128,8 +128,8 @@ fn lifespan() -> Duration {
 /// The stored record of one batch inference job, cloned out of the store the handlers share.
 ///
 /// Cloned rather than borrowed so a case can settle it at an instant of its own choosing:
-/// the clock rule is about spans of wall-clock time measured in minutes, which no test can
-/// sleep through.
+/// the clock rule is about spans of wall-clock time longer than a case wants to sleep
+/// through, and ageing or settling a clone brings the same elapsed time.
 fn stored_job(emu: &Emulator, arn: &str) -> JobRecord {
     let state =
         service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::service_state(
@@ -858,7 +858,7 @@ async fn a_job_reports_completed_only_once_its_whole_run_span_has_elapsed() {
 
     // A tick before the run span is up the job is still RUNNING, stamped at the instant it
     // began. Ageing the stored record brings the same elapsed time a wall clock would, which
-    // is how a run span measured in minutes is asserted without sleeping through one.
+    // is how the whole run span is asserted without sleeping through it.
     age_job(&emu, &arn, lifespan.saturating_sub(tick));
     let running = get(&emu, &arn).await;
     let case = "a tick before the run span is up";
@@ -1106,13 +1106,17 @@ async fn a_client_polling_at_any_interval_up_to_the_run_span_observes_the_job_ru
 
     // The intervals a client polls a job at, from a tight loop up to the run span itself: at
     // every one of them the job must be observable while it is RUNNING, because that is the
-    // state a caller acts on — watching progress, stopping a job that has not finished.
+    // state a caller acts on — watching progress, stopping a job that has not finished. The
+    // longest row is the running span, which is the bound the rule can hold up to: a client
+    // that polls LESS often than a job runs for is carried past the running status by its own
+    // interval, on the real service as much as here, and nothing the service does can stop
+    // that.
     for interval in [
+        Duration::from_millis(50),
         Duration::from_millis(250),
-        Duration::from_secs(1),
-        Duration::from_secs(5),
-        Duration::from_secs(10),
-        Duration::from_secs(30),
+        COMPLETE_AFTER / 4,
+        COMPLETE_AFTER / 2,
+        COMPLETE_AFTER * 3 / 4,
         COMPLETE_AFTER,
     ] {
         let mut record = pristine.clone();
@@ -1707,7 +1711,7 @@ async fn a_stop_winds_down_a_job_that_has_not_finished() {
         // carries no due instant any more, and settling it an hour past the instant an
         // unstopped job would have completed leaves it the job the stop ended, at the instant
         // the stop ended it. Settled on the record because the run span an unstopped job
-        // takes is measured in minutes, which no test can sleep through.
+        // takes is longer than a case wants to sleep through.
         let mut stopped_record = stored_job(&emu, &arn);
         for (field, due) in [
             ("validating", stopped_record.validating_due_at),
@@ -1795,8 +1799,8 @@ async fn a_stop_of_a_job_that_cannot_be_stopped_changes_nothing() {
                 tokio::time::sleep(STOPPED_AFTER + MARGIN).await;
             }
             Reach::Completed => {
-                // The run span an unstopped job takes is measured in minutes, so the elapsed
-                // time is brought by ageing the stored record rather than slept through.
+                // The run span an unstopped job takes is longer than a case wants to sleep
+                // through, so the elapsed time is brought by ageing the stored record.
                 age_job(&emu, &arn, lifespan() + MARGIN);
             }
         }
