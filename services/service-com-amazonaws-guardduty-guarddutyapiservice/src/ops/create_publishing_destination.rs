@@ -167,6 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(bad_request)?;
 
+        // The per-resource tag ceiling holds however the tags arrive, so a create
+        // carrying more of them than a resource may hold is refused here rather
+        // than storing a resource past the limit
+        // ([`crate::state::created_tag_count_rejection`]).
+        if let Some(message) = crate::state::created_tag_count_rejection(input.tags.as_ref()) {
+            return Err(bad_request(message));
+        }
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         let now = state.tick_millis();

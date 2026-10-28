@@ -161,6 +161,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx);
 
+        // The per-resource tag ceiling holds however the tags arrive, so a create
+        // carrying more of them than a resource may hold is refused here — before
+        // anything is written — rather than storing a resource past the limit
+        // ([`crate::state::created_tag_count_rejection`]).
+        if let Some(message) = crate::state::created_tag_count_rejection(input.tags.as_ref()) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
+        }
+
         // `RuleId` carries its own length and pattern constraints and `Mode` is a
         // modelled enum, both refused at the request boundary, so reaching here
         // means the pair is well formed and only its EXISTENCE is open.

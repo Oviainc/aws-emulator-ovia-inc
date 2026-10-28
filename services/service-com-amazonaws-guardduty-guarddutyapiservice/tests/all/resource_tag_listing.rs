@@ -111,9 +111,9 @@ fn longest_value() -> String {
 
 /// The tag maps a resource is created with, and which the report must hand back
 /// unchanged. The rows differ along everything the rule generalises over: the COUNT of
-/// entries (one, several, a map at the published maximum), the key ALPHABET and LENGTH
-/// (`len 1..128` with the punctuation `smithy_query(shape="TagMap")` admits, both
-/// bounds included) and the value LENGTH (`len 0..256`, both bounds included).
+/// entries (one, several, a map at the per-resource ceiling), the key ALPHABET and
+/// LENGTH (`len 1..128` with the punctuation `smithy_query(shape="TagMap")` admits,
+/// both bounds included) and the value LENGTH (`len 0..256`, both bounds included).
 fn listing_rows() -> Vec<(String, Vec<(String, String)>)> {
     let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
     let mut rows: Vec<(String, Vec<(String, String)>)> = vec![
@@ -139,16 +139,17 @@ fn listing_rows() -> Vec<(String, Vec<(String, String)>)> {
         ),
     ];
 
-    // A map at the published maximum of `TagMap` (`len 1..200`).
-    let at_the_maximum: Vec<(String, String)> = (0..TAGS_PER_RESOURCE)
+    // A map that fills the resource to the most tags it may carry
+    // (`state::TAGS_PER_RESOURCE`).
+    let at_the_ceiling: Vec<(String, String)> = (0..TAGS_PER_RESOURCE)
         .map(|index| (format!("filler-{index}"), format!("value-{index}")))
         .collect();
     rows.push((
         format!(
-            "a map at the published maximum of {} tags",
-            at_the_maximum.len()
+            "a map at the per-resource ceiling of {} tags",
+            at_the_ceiling.len()
         ),
-        at_the_maximum,
+        at_the_ceiling,
     ));
     rows
 }

@@ -167,19 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // How many keys this request would ADD: a key the resource already carries is
-        // overwritten rather than appended, so it grows the map by nothing. Counted
-        // before anything is written, so a refused add persists none of the request's
-        // tags — not even the ones that would have fitted.
-        let added = input
-            .tags
-            .keys()
-            .filter(|key| !tags.contains_key(key.as_str()))
-            .count();
-        if tags.len() + added > crate::state::TAGS_PER_RESOURCE {
-            return Err(crate::scaffolded::Scaffolded::invalid_input(
-                crate::state::tag_limit_message(),
-            ));
+        // The per-resource tag ceiling, through the one rule every writer of a tag
+        // map on this service shares ([`crate::state::tag_count_rejection`]): a key
+        // the resource already carries is overwritten rather than appended, so it
+        // grows the map by nothing, and the decision is taken before anything is
+        // written, so a refused add persists none of the request's tags — not even
+        // the ones that would have fitted.
+        if let Some(message) =
+            crate::state::tag_count_rejection(tags, input.tags.keys().map(String::as_str))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(message));
         }
 
         // "Adds tags to a resource" (this operation's own documentation): `Tags` is

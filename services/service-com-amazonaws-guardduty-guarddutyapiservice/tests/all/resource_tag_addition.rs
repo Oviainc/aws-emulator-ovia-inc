@@ -47,6 +47,11 @@ const INVALID_INPUT: &str = "InvalidInputException";
 /// A well-formed minted id (32 hexadecimal characters) that no create ever minted.
 const ABSENT_ID: &str = "0123456789abcdef0123456789abcdef";
 
+/// The most entries one request's map may carry: `TagMap` is `len 1..200`
+/// (`smithy_query(shape="TagMap")`), which is a different quantity from how many tags
+/// one resource may hold (`state::TAGS_PER_RESOURCE`).
+const TAG_MAP_MAX_ENTRIES: usize = 200;
+
 /// The tags every resource in this suite is CREATED with, so each row only has to name
 /// what it adds. The value of one of them is the empty string a `TagValue` (`len
 /// 0..256` — `smithy_query(shape="TagMap")`) may be.
@@ -100,10 +105,10 @@ fn longest_value() -> String {
 // ---------------------------------------------------------------------------
 
 /// The tags one `TagResource` call carries. The rows differ along everything the rule
-/// generalises over: the COUNT added (one, several, a map at the published maximum),
-/// WHICH keys (fresh, already carried, each character class a `TagKey` admits, the
-/// longest one), the VALUE written (ordinary, empty, the longest one) and whether the
-/// add overlaps what the resource already carries.
+/// generalises over: the COUNT added (one, several, a map that fills the resource to
+/// its ceiling), WHICH keys (fresh, already carried, each character class a `TagKey`
+/// admits, the longest one), the VALUE written (ordinary, empty, the longest one) and
+/// whether the add overlaps what the resource already carries.
 fn addition_rows() -> Vec<(String, Vec<(String, String)>)> {
     let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
     let mut rows: Vec<(String, Vec<(String, String)>)> = vec![
@@ -146,20 +151,22 @@ fn addition_rows() -> Vec<(String, Vec<(String, String)>)> {
         ),
     ];
 
-    // A map at the published maximum of `TagMap` (`len 1..200`), which is also the most
-    // a resource may end up carrying: the two keys the create gave it, re-stated, plus
-    // 198 fresh ones.
-    let mut at_the_maximum: Vec<(String, String)> = BASE_TAGS
+    // A map that takes the resource exactly to the per-resource ceiling: the two keys
+    // the create gave it, re-stated, plus fresh ones for the rest of it.
+    let mut at_the_ceiling: Vec<(String, String)> = BASE_TAGS
         .iter()
         .map(|(key, value)| pair(key, value))
         .collect();
-    at_the_maximum.extend(
+    at_the_ceiling.extend(
         (0..TAGS_PER_RESOURCE - BASE_TAGS.len())
             .map(|index| (format!("filler-{index}"), format!("value-{index}"))),
     );
     rows.push((
-        format!("a map at the published maximum of {} tags", at_the_maximum.len()),
-        at_the_maximum,
+        format!(
+            "a map that fills the resource to its ceiling of {} tags",
+            at_the_ceiling.len()
+        ),
+        at_the_ceiling,
     ));
     rows
 }
@@ -366,15 +373,18 @@ async fn an_unresolvable_resource_arn_is_refused_without_echoing_it() {
 /// 1..200`) and its values are `len 0..256`
 /// (`smithy_query(operation="TagResource")`, `smithy_query(shape="TagMap")`). The map
 /// is exercised one below its minimum and one past its maximum, and a value one past
-/// its maximum; the bounds themselves are accepted in
-/// `adding_tags_merges_into_the_map_the_resource_already_carries`.
+/// its maximum; the map's minimum is accepted in
+/// `adding_tags_merges_into_the_map_the_resource_already_carries`. How many tags one
+/// RESOURCE may carry is a different quantity, pinned in the
+/// `tags_per_resource_ceiling` suite.
 #[tokio::test]
 async fn a_request_outside_the_modelled_constraints_is_refused() {
     let router = new_router();
     let (detector, resources) = tagged_resources(&router, REGION, &base_tags()).await;
     let detector_arn = arn_of(REGION, &format!("detector/{detector}"));
 
-    let one_past_the_maximum: Vec<(String, String)> = (0..=TAGS_PER_RESOURCE)
+    // One past `TagMap`'s own `len 1..200`.
+    let one_past_the_maximum: Vec<(String, String)> = (0..=TAG_MAP_MAX_ENTRIES)
         .map(|index| (format!("filler-{index}"), format!("value-{index}")))
         .collect();
     let too_many: Vec<(&str, &str)> = one_past_the_maximum

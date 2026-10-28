@@ -175,6 +175,8 @@ mod sample_finding_catalog;
 mod state_roundtrip;
 #[path = "all/tag_map_projection.rs"]
 mod tag_map_projection;
+#[path = "all/tags_per_resource_ceiling.rs"]
+mod tags_per_resource_ceiling;
 #[path = "all/threat_entity_set_delete.rs"]
 mod threat_entity_set_delete;
 #[path = "all/threat_entity_set_lifecycle.rs"]

@@ -8154,32 +8154,66 @@ pub fn resource_arn_rejection(arn: &str) -> String {
     }
 }
 
-/// The most tags one resource carries.
+/// The most tags one resource carries — the PUBLISHED quota, not a figure this
+/// emulator chose: "Tagging is currently supported for detectors, finding filters,
+/// IP sets, threat intel sets, and publishing destination, with a limit of 50 tags
+/// per resource" (`smithy_query(query="doc", shape="ListTagsForResource")`).
 ///
-/// Neither the model nor this service's documentation carries a tags-per-resource
-/// figure, so — like [`PUBLISHING_DESTINATIONS_PER_DETECTOR`] — this is an
-/// EMULATOR-CHOSEN bound rather than a published quota: a 201st tag is refused
-/// here, where the real service may refuse it sooner. The number is taken from the
-/// map that both carries tags in and reports them (`TagMap` is `len 1..200` —
-/// `smithy_query(shape="TagMap")`), because a resource holding more than that
-/// could not be reported by the `Tags` member of its own read at all.
+/// It is a different quantity from the `len 1..200` on `TagMap`
+/// (`smithy_query(shape="TagMap")`), which bounds how many pairs ONE REQUEST's map
+/// may carry: a request inside that bound can still ask for more tags than a
+/// resource may hold, and is refused here rather than at the modelled boundary.
+/// The limit is stated for the resource and not for a path to it, so it holds
+/// however the tags arrive — through `TagResource` or through the `Tags` member of
+/// a create. The sentence predates the newer classes that carry a `TagMap` of
+/// their own (the entity sets, the Malware Protection plan, the custom
+/// detection-rule association), and the figure is applied to those too: one
+/// ceiling for every resource of this service, which is also what the single
+/// rejection message can say.
 ///
-/// The same number BOUNDS the store on this path: a tag key is REQUEST-chosen, so
-/// without a ceiling a caller adding fresh keys to one resource could grow its
-/// map without limit — the hazard [`MAX_CLIENT_TOKENS`] guards for request-chosen
-/// token keys. Every other way a tag is stored is a create, whose whole `TagMap`
-/// is already bounded by the same 200.
-pub const TAGS_PER_RESOURCE: usize = 200;
+/// It also BOUNDS the store: a tag key is REQUEST-chosen, so without a ceiling a
+/// caller adding fresh keys to one resource could grow its map without limit — the
+/// hazard [`MAX_CLIENT_TOKENS`] guards for request-chosen token keys.
+pub const TAGS_PER_RESOURCE: usize = 50;
 
-/// The message an add that would take a resource past [`TAGS_PER_RESOURCE`] tags
-/// is refused with. Like every other rejection here it names the limit and the
-/// resource it bounds, never the caller's keys — see
+/// The message a write that would leave a resource carrying more than
+/// [`TAGS_PER_RESOURCE`] tags is refused with. Like every other rejection here it
+/// names the limit and the resource it bounds, never the caller's keys — see
 /// [`publishing_destination_limit_message`]. The resource is named as "the
-/// resource" because `ResourceArn` reaches seven classes of them and the limit is
-/// the same for each.
+/// resource" because the limit reaches every class of them and is the same for
+/// each.
 pub fn tag_limit_message() -> String {
     format!(
         "The request is rejected because the resource has reached the limit of {TAGS_PER_RESOURCE} tags."
+    )
+}
+
+/// Refuse a write that would leave ONE resource carrying more than
+/// [`TAGS_PER_RESOURCE`] tags, with [`tag_limit_message`]; `None` when it fits.
+///
+/// `carried` is the map the resource holds now and `requested` the keys the
+/// request carries: a key the resource already carries is OVERWRITTEN rather than
+/// appended, so it grows the resource by nothing. Decided before anything is
+/// written, so a refused request persists none of the request's tags — not even
+/// the ones that would have fitted.
+pub fn tag_count_rejection<'keys>(
+    carried: &BTreeMap<String, String>,
+    requested: impl IntoIterator<Item = &'keys str>,
+) -> Option<String> {
+    let added = requested
+        .into_iter()
+        .filter(|key| !carried.contains_key(*key))
+        .count();
+    (carried.len() + added > TAGS_PER_RESOURCE).then(tag_limit_message)
+}
+
+/// The same rule for a CREATE: the resource does not exist yet, so the whole
+/// `TagMap` the request carries is what it would be created carrying. A create
+/// that names no `Tags` member at all carries nothing and is never refused.
+pub fn created_tag_count_rejection(tags: Option<&HashMap<String, String>>) -> Option<String> {
+    tag_count_rejection(
+        &BTreeMap::new(),
+        tags.into_iter().flatten().map(|(key, _)| key.as_str()),
     )
 }
 
