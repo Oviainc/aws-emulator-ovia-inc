@@ -256,26 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Cedar performs validation on all submitted new or updated static
-        // policies and policy templates" — the same rule `CreatePolicyTemplate`
-        // applies to a create, including a STRICT store that holds no schema to
-        // validate against.
-        if store.validation_mode == "STRICT" {
-            match store.schema.as_ref() {
-                None => {
-                    return Err(invalid(crate::ops::InvalidInput::new(
-                        crate::ops::paths::POLICY_STORE_ID,
-                        "its validation mode is STRICT and it contains no schema, so there \
-                         is nothing to validate a policy template against",
-                    )));
-                }
-                Some(schema) => {
-                    crate::state::cedar::validate_policy_template(
-                        &schema.cedar_json,
-                        &input.statement,
-                    )
-                    .map_err(refused)?;
-                }
-            }
+        // policies and policy templates" — the same rule on the store that
+        // `CreatePolicyTemplate` applies to a create, including a STRICT store
+        // that holds no schema to validate against.
+        if let Some(schema_json) = store
+            .schema_to_validate_against(crate::state::ValidatedContent::PolicyTemplate)
+            .map_err(invalid)?
+        {
+            crate::state::cedar::validate_policy_template(schema_json, &input.statement)
+                .map_err(refused)?;
         }
 
         // The store's Cedar-text budget, which a replacement can grow: the bytes

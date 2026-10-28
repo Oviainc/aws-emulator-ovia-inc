@@ -296,23 +296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // validate the policy against the schema in the policy store. If
                 // the updated static policy doesn't pass validation, the
                 // operation fails and the update isn't stored."
-                if store.validation_mode == "STRICT" {
-                    match store.schema.as_ref() {
-                        None => {
-                            return Err(invalid(crate::ops::InvalidInput::new(
-                                crate::ops::paths::POLICY_STORE_ID,
-                                "its validation mode is STRICT and it contains no schema, so \
-                                 there is nothing to validate a policy against",
-                            )));
-                        }
-                        Some(schema) => {
-                            crate::state::cedar::validate_static_policy(
-                                &schema.cedar_json,
-                                &def.statement,
-                            )
-                            .map_err(refused)?;
-                        }
-                    }
+                if let Some(schema_json) = store
+                    .schema_to_validate_against(crate::state::ValidatedContent::Policy)
+                    .map_err(invalid)?
+                {
+                    crate::state::cedar::validate_static_policy(schema_json, &def.statement)
+                        .map_err(refused)?;
                 }
 
                 // The store's Cedar-text budget, which a replacement can grow:

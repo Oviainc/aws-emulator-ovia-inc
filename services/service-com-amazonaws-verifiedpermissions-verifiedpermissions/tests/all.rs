@@ -53,6 +53,8 @@ mod schema;
 mod schema_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_validation_settings.rs"]
+mod store_validation_settings;
 #[path = "all/tagging.rs"]
 mod tagging;
 #[path = "all/template_linked_policies.rs"]

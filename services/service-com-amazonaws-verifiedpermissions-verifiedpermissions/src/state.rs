@@ -409,6 +409,35 @@ pub struct StoredSchema {
     pub last_updated_date: DateTime,
 }
 
+/// `ValidationSettings.mode` = `STRICT`: the store requires a schema and Cedar
+/// validates every static policy and policy template submitted to it.
+pub const VALIDATION_MODE_STRICT: &str = "STRICT";
+
+/// Which kind of Cedar document a write handler is about to validate.
+///
+/// The rule a store's validation settings impose is ONE rule over both kinds
+/// ([`PolicyStore::schema_to_validate_against`]); the only thing that differs
+/// between a policy and a policy template is the noun the refusal's reason names,
+/// so that noun is carried here instead of being spelled at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidatedContent {
+    /// A static policy's statement: `CreatePolicy` and `UpdatePolicy`.
+    Policy,
+    /// A policy template's statement: `CreatePolicyTemplate` and
+    /// `UpdatePolicyTemplate`.
+    PolicyTemplate,
+}
+
+impl ValidatedContent {
+    /// How the refusal's reason sentence names this kind of document.
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Policy => "a policy",
+            Self::PolicyTemplate => "a policy template",
+        }
+    }
+}
+
 /// The EMPTY Cedar schema document: a schema that declares no namespace, and the
 /// document a policy store holds until `PutSchema` writes one. It is also the
 /// document `PutSchema` returns a store to — `SchemaDefinition$cedarJson`
@@ -922,6 +951,46 @@ impl PolicyStore {
             created_date: self.created_date,
             last_updated_date: self.created_date,
         })
+    }
+
+    /// The Cedar schema this store validates submitted content against, for ONE
+    /// place where every write handler asks the question.
+    ///
+    /// `ValidationSettings` documents the rule exactly: "STRICT — Requires a
+    /// schema to be present in the policy store. Cedar performs validation on all
+    /// submitted new or updated static policies and policy templates. Any that
+    /// fail validation are rejected and Cedar doesn't store them in the policy
+    /// store", and "If Mode=STRICT and the policy store doesn't contain a schema,
+    /// Verified Permissions rejects all static policies and policy templates
+    /// because there is no schema to validate against." So:
+    ///
+    /// * `Ok(None)` — the store validates nothing, and the content is stored as
+    ///   submitted;
+    /// * `Ok(Some(cedar_json))` — the schema document to validate it against;
+    /// * `Err` — the store is `STRICT` and holds no schema, so there is nothing to
+    ///   validate against. Nothing is wrong with the submitted content: the member
+    ///   at fault is `policyStoreId`, the one the caller can act on (put a schema
+    ///   in that store, or name a store that has one).
+    ///
+    /// Nothing is written to reach any of the three answers.
+    pub fn schema_to_validate_against(
+        &self,
+        content: ValidatedContent,
+    ) -> Result<Option<&str>, crate::ops::InvalidInput> {
+        if self.validation_mode != VALIDATION_MODE_STRICT {
+            return Ok(None);
+        }
+        match self.schema.as_ref() {
+            None => Err(crate::ops::InvalidInput::new(
+                crate::ops::paths::POLICY_STORE_ID,
+                format!(
+                    "its validation mode is STRICT and it contains no schema, so there is \
+                     nothing to validate {} against",
+                    content.noun()
+                ),
+            )),
+            Some(schema) => Ok(Some(schema.cedar_json.as_str())),
+        }
     }
 
     /// Mint the next `policyId` for this store. `SP` + 22 base62 characters, the

@@ -317,30 +317,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request and a handler must not be able to panic on caller input.
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
-        // `ValidationSettings` documents this exactly: "STRICT — Requires a schema
-        // to be present in the policy store. Cedar performs validation on all
-        // submitted new or updated static policies and policy templates. Any that
-        // fail validation are rejected and Cedar doesn't store them in the policy
-        // store", and "If Mode=STRICT and the policy store doesn't contain a
-        // schema, Verified Permissions rejects all static policies and policy
-        // templates because there is no schema to validate against."
-        let schema_json = match store.validation_mode.as_str() {
-            "STRICT" => match store.schema.as_ref() {
-                None => {
-                    // Nothing is wrong with the definition here: the STORE the
-                    // request named holds no schema, which is the member the
-                    // caller can act on (put a schema in it, or name a store
-                    // that has one).
-                    return Err(invalid(crate::ops::InvalidInput::new(
-                        crate::ops::paths::POLICY_STORE_ID,
-                        "its validation mode is STRICT and it contains no schema, so there \
-                         is nothing to validate a policy against",
-                    )));
-                }
-                Some(schema) => Some(schema.cedar_json.as_str()),
-            },
-            _ => None,
-        };
+        // What the store's validation settings say this policy is checked
+        // against — `None` when the store validates nothing, and the refusal a
+        // STRICT store with no schema raises. The rule lives on the store, so
+        // every write handler that validates Cedar asks it the same way.
+        let schema_json = store
+            .schema_to_validate_against(crate::state::ValidatedContent::Policy)
+            .map_err(invalid)?;
 
         // The effect and the scope are properties of the Cedar this definition
         // resolves to, so they come from Cedar: the parser for a `static`

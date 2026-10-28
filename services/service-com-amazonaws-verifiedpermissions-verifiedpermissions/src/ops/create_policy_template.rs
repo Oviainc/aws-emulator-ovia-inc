@@ -257,35 +257,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameters is a conflict however well-formed this statement is.)
         crate::state::cedar::parse_policy_template(&input.statement).map_err(invalid)?;
 
-        // `ValidationSettings` documents this exactly: "STRICT — Requires a schema
-        // to be present in the policy store. Cedar performs validation on all
-        // submitted new or updated static policies and policy templates. Any that
-        // fail validation are rejected and Cedar doesn't store them in the policy
-        // store", and "If Mode=STRICT and the policy store doesn't contain a
-        // schema, Verified Permissions rejects all static policies and policy
-        // templates because there is no schema to validate against." A template is
-        // one of the two things that validation covers, so it follows the same
-        // rule `CreatePolicy` applies to a static policy.
-        if store.validation_mode == "STRICT" {
-            match store.schema.as_ref() {
-                None => {
-                    // Nothing is wrong with the statement here: the STORE the
-                    // request named holds no schema, which is the member the
-                    // caller can act on.
-                    return Err(invalid(crate::ops::InvalidInput::new(
-                        crate::ops::paths::POLICY_STORE_ID,
-                        "its validation mode is STRICT and it contains no schema, so there \
-                         is nothing to validate a policy template against",
-                    )));
-                }
-                Some(schema) => {
-                    crate::state::cedar::validate_policy_template(
-                        &schema.cedar_json,
-                        &input.statement,
-                    )
-                    .map_err(refused)?;
-                }
-            }
+        // "Cedar performs validation on all submitted new or updated static
+        // policies and policy templates" — a template is one of the two things
+        // validation covers, so it goes through the same rule on the store that
+        // `CreatePolicy` applies to a static policy, including a STRICT store that
+        // holds no schema to validate against.
+        if let Some(schema_json) = store
+            .schema_to_validate_against(crate::state::ValidatedContent::PolicyTemplate)
+            .map_err(invalid)?
+        {
+            crate::state::cedar::validate_policy_template(schema_json, &input.statement)
+                .map_err(refused)?;
         }
 
         // "Specifies a name for the policy template that is unique among all
