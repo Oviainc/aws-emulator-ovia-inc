@@ -530,12 +530,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "To retrieve the checksum, this parameter must be enabled"
         // (`HeadObjectRequest$ChecksumMode`): the checksum the write stored with the object
         // is reported only to a read that asked for it, and an object stored under no
-        // checksum algorithm reports none however the mode is set.
+        // checksum algorithm reports none however the mode is set. A HEAD "has the same
+        // options as a GET operation on an object", so the checksum it advertises is the one
+        // of the SPAN a GET of this same request would return
+        // ([`crate::state::Object::checksum_of_span`]) and the two cannot disagree.
         let reported = crate::state::reported_checksums(
             object
-                .checksum
-                .as_ref()
-                .filter(|_| input.checksum_mode.is_some()),
+                .checksum_of_span(span)
+                .filter(|_| input.checksum_mode.is_some())
+                .as_ref(),
         );
 
         // The Object Lock state this HEAD reports, rendered off the version's own record by

@@ -10,6 +10,12 @@
 //! marker, which becomes the current version of the object", and "to permanently delete an
 //! object in a versioned bucket, you must include the object's versionId in the request".
 //!
+//! A delete carrying `If-Match`, `x-amz-if-match-last-modified-time` or
+//! `x-amz-if-match-size` is CONDITIONAL on the version it addresses still being the one
+//! those members describe: it is carried out when every condition holds and refused with
+//! HTTP 412 `PreconditionFailed` when one does not
+//! ([`crate::state::delete_precondition_fails`] carries the rule), taking nothing away.
+//!
 //! A delete that really would remove a stored version is subject to S3 OBJECT LOCK: while a
 //! legal hold is on that version, or its retention period is still running, the delete is
 //! refused with 403 `AccessDenied` and the version stays stored
@@ -353,16 +359,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
         ctx: &smithy_server_runtime::OperationContext<'_>,
         correlation: &crate::state::request_ids::RequestCorrelation,
     ) -> Result<DeleteObjectNoContent, DeleteObjectError> {
-        // A conditional delete answers 412 when the condition fails.
-        if input.if_match.is_some()
-            || input.if_match_last_modified_time.is_some()
-            || input.if_match_size.is_some()
-        {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteObject with a conditional If-Match / x-amz-if-match-* header",
-            ));
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::unmodeled(
                 "InternalError",
@@ -371,6 +367,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
             )
         })?;
         let mut store = state.lock();
+
+        // The conditional members, judged against the version this delete ADDRESSES — the
+        // delete is what they make conditional, so they are judged here, before anything is
+        // taken away, through the one rule every conditional delete in this service is
+        // judged by ([`crate::state::delete_precondition_fails`]). A refused delete removes
+        // nothing and lays no marker, so the version stays exactly as it was and the caller
+        // can read its tag, its size and its last-modified time and retry: this is the
+        // compare-and-delete half of the compare-and-write pair `PutObject`'s own
+        // conditional members are the other half of.
+        if input.if_match.is_some()
+            || input.if_match_last_modified_time.is_some()
+            || input.if_match_size.is_some()
+        {
+            let Some(bucket_record) = store.bucket(&input.bucket) else {
+                return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            };
+            // A delete that names a `versionId` addresses that stored version; one that
+            // names none addresses the key's CURRENT object, which is nothing at all where
+            // the key holds nothing or a delete marker hides it.
+            let addressed = match input.version_id.as_deref() {
+                None => bucket_record.object(&input.key),
+                Some(version_id) => bucket_record
+                    .stored_version(&input.key, version_id)
+                    .and_then(|held| held.as_object()),
+            };
+            if crate::state::delete_precondition_fails(
+                addressed,
+                input.if_match.as_deref(),
+                input
+                    .if_match_last_modified_time
+                    .as_ref()
+                    .and_then(crate::state::instant_of),
+                input.if_match_size,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::PRECONDITION_FAILED_CODE,
+                    crate::state::PRECONDITION_FAILED_STATUS,
+                    crate::state::PRECONDITION_FAILED_MESSAGE,
+                ));
+            }
+        }
 
         // Whether this delete asks to bypass governance-mode restrictions, and the instant
         // every Object Lock judgement below is made at — one instant for the whole call, so

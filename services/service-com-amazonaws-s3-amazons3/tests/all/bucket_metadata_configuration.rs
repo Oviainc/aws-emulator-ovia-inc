@@ -37,7 +37,8 @@
 //!   the three tables carries that container.
 //! * A bucket carries at most one metadata configuration, so a second create is refused
 //!   with `MetadataConfigurationAlreadyExists` (HTTP 409) and leaves the stored one
-//!   untouched; a bucket carrying none answers `NoSuchConfiguration` (HTTP 404), one this
+//!   untouched; a bucket carrying none answers `MetadataConfigurationNotFound` (HTTP 404),
+//!   one this
 //!   emulator does not hold `NoSuchBucket` (HTTP 404), and an
 //!   `x-amz-expected-bucket-owner` that is not the account's HTTP 403 `AccessDenied`.
 
@@ -659,7 +660,7 @@ async fn a_day_count_outside_the_published_range_is_refused_and_records_nothing(
         let reading = get_metadata_configuration(&router, &bucket, &[]).await;
         assert_eq!(
             reading.error_code(),
-            "NoSuchConfiguration",
+            "MetadataConfigurationNotFound",
             "case {name:?}: a refused create must record nothing, got {:?}",
             String::from_utf8_lossy(&reading.body)
         );
@@ -782,12 +783,13 @@ async fn a_call_naming_an_address_or_an_owner_this_emulator_does_not_hold_says_w
     );
     assert_eq!(
         absent.error_code(),
-        "NoSuchConfiguration",
-        "a bucket carrying no metadata configuration must say the configuration is not there"
+        "MetadataConfigurationNotFound",
+        "a bucket carrying no metadata configuration must say the metadata configuration is \
+         not there"
     );
     assert_eq!(
         absent.error_message(),
-        "The specified configuration does not exist.",
+        "The metadata configuration was not found",
         "the text S3 publishes for that code"
     );
 
@@ -810,7 +812,7 @@ async fn a_call_naming_an_address_or_an_owner_this_emulator_does_not_hold_says_w
     let still_absent = get_metadata_configuration(&router, case.bucket, &[]).await;
     assert_eq!(
         still_absent.error_code(),
-        "NoSuchConfiguration",
+        "MetadataConfigurationNotFound",
         "a denied create must record nothing"
     );
 

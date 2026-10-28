@@ -30,8 +30,8 @@
 //!   member decides and the date member beside it is ignored;
 //! * a source whose storage class is `GLACIER` or `DEEP_ARCHIVE` has to be restored first
 //!   ("before using an object as a source object for the copy operation, you must restore
-//!   a copy of it if …"), which is exactly what this operation's one modelled error,
-//!   `ObjectNotInActiveTierError` (403), reports.
+//!   a copy of it if …"), which is refused with the storage-class refusal worded for the
+//!   source object — `InvalidObjectState` (403);
 //!
 //! Every assertion drives a real HTTP request through the router (the harness and the
 //! object, encryption, tagging and versioning helpers are the ones the suites beside this
@@ -1059,7 +1059,7 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
             copy_source: "copy-refusal-origin/frozen.csv",
             headers: Vec::new(),
             status: 403,
-            code: "ObjectNotInActiveTierError",
+            code: "InvalidObjectState",
         },
         RefusalRow {
             case: "a source whose storage class is DEEP_ARCHIVE",
@@ -1068,7 +1068,7 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
             copy_source: "copy-refusal-origin/deep.csv",
             headers: Vec::new(),
             status: 403,
-            code: "ObjectNotInActiveTierError",
+            code: "InvalidObjectState",
         },
         RefusalRow {
             case: "an expected destination bucket owner that is not this account",

@@ -153,12 +153,16 @@ pub const MAX_OBJECTS_PER_BUCKET: usize = 1_000;
 
 /// How many bytes of object payload one bucket in this emulator may hold in total.
 ///
-/// Same reason as [`MAX_OBJECTS_PER_BUCKET`], for the other dimension: an object's bytes
-/// are kept verbatim, so a few large writes exhaust memory as surely as many small ones.
-/// Also not a fidelity claim — AWS caps one `PutObject` payload at 5 GiB and a bucket not
-/// at all; this is the emulator's own budget, and a write that would take a bucket past it
-/// is refused rather than recorded.
-pub const MAX_OBJECT_BYTES_PER_BUCKET: usize = 16 * 1024 * 1024;
+/// NOT a fidelity claim, in either direction: AWS bounds what one bucket holds not at all,
+/// and the only size constraints it enforces are on a SINGLE payload — 5 GiB per
+/// `PutObject`, and 5 MiB to 5 GiB per part of a multipart upload. This is the emulator's
+/// own budget, because an object's bytes are kept verbatim in this process's memory, and it
+/// is therefore set ABOVE the traffic AWS accepts rather than below it: an SDK or the CLI
+/// uploading a file of tens of MiB in 8 MiB parts, several such files into one bucket, and
+/// the parts of an upload in flight beside the objects already stored. A write past it is
+/// refused rather than recorded — a refusal that is the emulator's own and says so, never a
+/// quota the API announces.
+pub const MAX_OBJECT_BYTES_PER_BUCKET: usize = 64 * 1024 * 1024;
 
 /// How many objects this emulator will hold ACROSS every bucket.
 ///
@@ -174,7 +178,11 @@ pub const MAX_OBJECTS_TOTAL: usize = 10_000;
 /// budgets of this workspace's peer services (appconfig's
 /// `MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`, codeguruprofiler's `MAX_RETAINED_PROFILE_BYTES`).
 /// A write that would take the whole store past it is refused rather than recorded.
-pub const MAX_OBJECT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+///
+/// Sized above [`MAX_OBJECT_BYTES_PER_BUCKET`] for the same reason that one is sized above
+/// the traffic AWS accepts: several buckets each holding the multipart uploads of an
+/// ordinary session is traffic S3 serves, so it is traffic this store records.
+pub const MAX_OBJECT_BYTES_TOTAL: usize = 128 * 1024 * 1024;
 
 /// How many sessions `CreateSession` keeps vended at once.
 ///
@@ -4324,7 +4332,9 @@ pub struct BucketMetadataConfiguration {
 /// table ARN, and S3 Tables table names are written in lowercase letters, digits and
 /// underscores), so each character outside that set becomes an underscore. Derived from the
 /// bucket's own name rather than minted, so the table a reader reports for one bucket is
-/// the same on every read and two buckets never share a table.
+/// the same on every read — and two bucket names that differ only in the characters this
+/// folds (a dot where another has a hyphen) name the same table, which is what the
+/// `*AlreadyExists` provisioning failures report.
 pub fn metadata_table_name(bucket: &str, suffix: &str) -> String {
     let stem: String = bucket
         .chars()
@@ -5527,13 +5537,14 @@ impl Bucket {
 
     /// Take the bucket's S3 Metadata configuration away, reporting whether it carried one.
     ///
-    /// What `DeleteBucketMetadataConfiguration` does: it "deletes an S3 Metadata
-    /// configuration from a general purpose bucket" (that operation's own documentation), so
-    /// the whole subresource goes and a read of it reports none again. It does NOT delete the
-    /// tables the configuration created — those live in the managed table bucket's namespace
-    /// ([`ComAmazonawsS3Amazons3State::metadata_namespace_holds`]), which is why a later
-    /// create of the same configuration provisions into
-    /// [`METADATA_TABLE_STATUS_FAILED`] with [`METADATA_JOURNAL_TABLE_EXISTS_CODE`].
+    /// What `DeleteBucketMetadataConfiguration` does to the BUCKET: it "deletes an S3
+    /// Metadata configuration from a general purpose bucket" (that operation's own
+    /// documentation), so the whole subresource goes and a read of it reports none again. The
+    /// tables the configuration created are S3 Metadata's own, created and deleted with the
+    /// configuration, so they are released from the managed table bucket's namespace with it
+    /// — which the store does, where that namespace lives
+    /// ([`ComAmazonawsS3Amazons3State::delete_metadata_configuration`] is the one way in, so
+    /// the two halves cannot be applied separately).
     pub fn clear_metadata_configuration(&mut self) -> bool {
         self.metadata_configuration.take().is_some()
     }
@@ -7615,6 +7626,48 @@ impl Object {
         }
         None
     }
+
+    /// The checksum a response carrying `span` of this object reports — `None` for a span
+    /// no checksum of this store's describes, and for an object written under no checksum
+    /// algorithm at all.
+    ///
+    /// Every `Checksum*` member is "the Base64 encoded … checksum of the object" (each
+    /// member's own documentation), so the value a response advertises has to be the digest
+    /// of the bytes that response CARRIES: a reader validating it recomputes the digest over
+    /// the body it received. So
+    ///
+    /// * a read of the whole object (`span` of `None`, or a span covering every byte)
+    ///   reports the checksum the write recorded;
+    /// * a read narrowed to exactly one part of the object reports THAT part's own digest,
+    ///   which the completion recorded beside it ([`ObjectPartRecord::checksum`]), under the
+    ///   object's algorithm;
+    /// * any other narrowed read reports no checksum, because this store holds no digest of
+    ///   those bytes and the object's own would describe a body the response does not carry.
+    ///
+    /// ONE place for the rule, so a GET and a HEAD of the same span cannot advertise
+    /// different checksums.
+    pub fn checksum_of_span(&self, span: Option<ByteSpan>) -> Option<ObjectChecksum> {
+        let stored = self.checksum.as_ref()?;
+        let Some(span) = span else {
+            return Some(stored.clone());
+        };
+        if span.first() == 0 && span.len() >= self.body.len() {
+            return Some(stored.clone());
+        }
+        let part = self
+            .parts
+            .iter()
+            .find(|part| self.part_span(part.part_number) == Some(span))?;
+        Some(ObjectChecksum {
+            algorithm: stored.algorithm.clone(),
+            value: part.checksum.clone()?,
+            // The object's own type, which "determines how part-level checksums are
+            // combined to create an object-level checksum for multipart objects"
+            // (`GetObjectOutput$ChecksumType`) — a property of the object, not of the span
+            // this response carries of it.
+            checksum_type: stored.checksum_type.clone(),
+        })
+    }
 }
 
 /// One in-progress multipart upload this emulator holds, as the
@@ -7881,6 +7934,63 @@ pub fn write_precondition_fails(
         held_etag.is_none_or(|held| etag_value(held) != etag_value(expected))
     });
     none_match_fails || match_fails
+}
+
+/// The `If-Match` value that matches whatever entity tag the addressed object carries:
+/// "`If-Match` does accept a string value of an '*' (asterisk) character to denote a match
+/// of any ETag" (`DeleteObjectRequest$IfMatch`).
+pub const ANY_ENTITY_TAG: &str = "*";
+
+/// Whether a conditional DELETE of the object version a request addresses must be refused,
+/// given the three conditional members it carried — `held` being that version, or `None`
+/// when the request addresses nothing the store holds.
+///
+/// The three conditions, each quoted from the member that carries it:
+///
+/// * "Deletes the object if the ETag (entity tag) value provided during the delete operation
+///   matches the ETag of the object in S3. If the ETag values do not match, the operation
+///   returns a `412 Precondition Failed` error" (`DeleteObjectRequest$IfMatch`), with
+///   [`ANY_ENTITY_TAG`] matching any tag — so a request addressing nothing has no tag to
+///   match and is refused;
+/// * "the object is deleted only if its modification times matches the provided `Timestamp`.
+///   If the `Timestamp` values do not match, the operation returns a `412 Precondition
+///   Failed` error. If the `Timestamp` matches or if the object doesn't exist, the operation
+///   returns a `204 Success (No Content)` response"
+///   (`$IfMatchLastModifiedTime`), compared at the one-second resolution an HTTP date
+///   carries (RFC 9110 §5.6.7), which is the format that member is bound in;
+/// * "the object is deleted only if its size matches the provided size in bytes"
+///   (`$IfMatchSize`), with the same "or if the object doesn't exist" success.
+///
+/// "You can use the `If-Match`, `x-amz-if-match-last-modified-time` and
+/// `x-amz-if-match-size` conditional headers in conjunction with each-other or individually"
+/// (`$IfMatchSize`): every member the request carries has to hold, so one failing condition
+/// refuses the delete.
+///
+/// The tags are compared by VALUE ([`etag_value`]), for the reason
+/// [`write_precondition_fails`] compares them that way.
+pub fn delete_precondition_fails(
+    held: Option<&Object>,
+    if_match: Option<&str>,
+    if_match_last_modified_time: Option<SystemTime>,
+    if_match_size: Option<i64>,
+) -> bool {
+    let match_fails = if_match.is_some_and(|expected| {
+        held.is_none_or(|object| {
+            expected.trim() != ANY_ENTITY_TAG
+                && etag_value(&object.etag) != etag_value(expected.trim())
+        })
+    });
+    let time_fails = if_match_last_modified_time.is_some_and(|expected| {
+        held.is_some_and(|object| {
+            whole_seconds(object.last_modified) != whole_seconds(expected)
+        })
+    });
+    let size_fails = if_match_size.is_some_and(|expected| {
+        held.is_some_and(|object| {
+            i64::try_from(object.body.len()).unwrap_or(i64::MAX) != expected
+        })
+    });
+    match_fails || time_fails || size_fails
 }
 
 /// Whether a conditional READ of an object whose entity tag is `etag` and which was last
@@ -8737,20 +8847,24 @@ pub struct ComAmazonawsS3Amazons3State {
     /// release cannot be applied in one place and skipped in another.
     vended_sessions: BTreeMap<String, SystemTime>,
     /// The metadata tables that exist in the managed table bucket's namespace
-    /// ([`METADATA_TABLE_NAMESPACE`]), by table name.
+    /// ([`METADATA_TABLE_NAMESPACE`]), as `table name -> the general purpose bucket whose
+    /// metadata configuration created it`.
     ///
     /// ONE namespace for the whole store, because that is its scope: the managed table
     /// bucket is one per Region and every bucket's metadata tables are created inside it, so
     /// a table name is taken or free for the store rather than for one bucket.
     ///
-    /// Kept apart from the bucket's own configuration because the two have different
-    /// lifetimes: deleting a metadata configuration deletes the configuration, NOT the
-    /// tables it created ("Delete the journal table, and then try again", the
-    /// `ErrorDetails$ErrorCode` documentation for `JournalTableAlreadyExists`), so a later
-    /// create of the same configuration finds its table name still taken and provisions into
-    /// [`METADATA_TABLE_STATUS_FAILED`]. Nothing in this service's API deletes a table from
-    /// the namespace: it is an S3 Tables resource, which this service owns no part of.
-    metadata_namespace_tables: BTreeSet<String>,
+    /// Kept apart from the bucket's own configuration because its SCOPE is different: the
+    /// name of a table is taken or free for the whole namespace, so a create asks this map
+    /// rather than the bucket whether the name it would provision under is free — and
+    /// provisions into [`METADATA_TABLE_STATUS_FAILED`] with
+    /// [`METADATA_JOURNAL_TABLE_EXISTS_CODE`] when another table already holds it. Each entry
+    /// records WHOSE configuration created the table, which is what lets a delete release the
+    /// tables of the configuration it takes away
+    /// ([`Self::delete_metadata_configuration`]) and only those: a configuration whose own
+    /// table could not be created holds no entry here, so deleting it leaves the name exactly
+    /// where it was. Nothing else in this service's API takes a table out of the namespace.
+    metadata_namespace_tables: BTreeMap<String, String>,
 }
 
 impl Default for ComAmazonawsS3Amazons3State {
@@ -8773,7 +8887,7 @@ impl Default for ComAmazonawsS3Amazons3State {
             published_retained_bytes: 0,
             published_versions: 0,
             vended_sessions: BTreeMap::new(),
-            metadata_namespace_tables: BTreeSet::new(),
+            metadata_namespace_tables: BTreeMap::new(),
         };
         store.record_published_buckets();
         store
@@ -8830,35 +8944,68 @@ impl ComAmazonawsS3Amazons3State {
     /// already in the namespace is one S3 cannot create a second table under, which is the
     /// `*AlreadyExists` provisioning failure the configuration then reports.
     pub fn metadata_namespace_holds(&self, table: &str) -> bool {
-        self.metadata_namespace_tables.contains(table)
+        self.metadata_namespace_tables.contains_key(table)
     }
 
     /// How many more tables the managed table bucket's namespace has room for
     /// ([`MAX_METADATA_NAMESPACE_TABLES`]).
     ///
-    /// The namespace is the one record here that nothing releases — a table outlives the
-    /// configuration that created it, which is the whole point of it — so what keeps it
-    /// bounded is this ceiling: a create that would carry it past the maximum is refused
-    /// instead, with nothing recorded. Read under the guard the caller already holds, so two
-    /// concurrent creates cannot both fit in room only one of them has.
+    /// A table is released only by the delete of the configuration that created it
+    /// ([`Self::delete_metadata_configuration`]), so a caller creating configurations for
+    /// bucket after bucket without deleting any would grow the namespace without bound; what
+    /// keeps it bounded is this ceiling: a create that would carry it past the maximum is
+    /// refused instead, with nothing recorded. Read under the guard the caller already holds,
+    /// so two concurrent creates cannot both fit in room only one of them has.
     pub fn metadata_namespace_room(&self) -> usize {
         MAX_METADATA_NAMESPACE_TABLES.saturating_sub(self.metadata_namespace_tables.len())
     }
 
-    /// Record `table` as a table of the managed table bucket's namespace, reporting whether
-    /// the namespace had room for it ([`Self::metadata_namespace_room`]).
+    /// Record `table` as a table of the managed table bucket's namespace created by the
+    /// metadata configuration of the general purpose bucket `bucket`, reporting whether the
+    /// namespace had room for it ([`Self::metadata_namespace_room`]).
     ///
     /// Called for each table a create really provisions, so the namespace holds exactly the
-    /// tables this store has created — and keeps holding them once the configuration that
-    /// created them is deleted, which is what the namespace is for. `false` records nothing.
-    pub fn record_metadata_namespace_table(&mut self, table: &str) -> bool {
-        if self.metadata_namespace_tables.contains(table) {
+    /// tables this store has created, until the configuration that created them is deleted
+    /// ([`Self::delete_metadata_configuration`]) and they are released with it. A name
+    /// another bucket's configuration already holds is left with that bucket — nothing is
+    /// overwritten, because the table under that name is the one that bucket created — and
+    /// `false` records nothing at all.
+    pub fn record_metadata_namespace_table(&mut self, table: &str, bucket: &str) -> bool {
+        if self.metadata_namespace_tables.contains_key(table) {
             return true;
         }
         if self.metadata_namespace_room() == 0 {
             return false;
         }
-        self.metadata_namespace_tables.insert(table.to_string());
+        self.metadata_namespace_tables
+            .insert(table.to_string(), bucket.to_string());
+        true
+    }
+
+    /// Take the S3 Metadata configuration of the bucket named `bucket` away, TOGETHER WITH
+    /// the tables it created, reporting whether this store holds that bucket at all — the one
+    /// outcome the caller answers differently; a bucket carrying no configuration has nothing
+    /// to delete and is already in the asked-for state, so it reports the same `true` a
+    /// delete that removed one does.
+    ///
+    /// The tables belong to the configuration: a V2 configuration's journal, inventory and
+    /// annotation tables are the ones S3 Metadata created for it in the managed table
+    /// bucket's namespace, so deleting the configuration leaves the namespace without them
+    /// and a later create of the same configuration provisions its tables again instead of
+    /// finding their names taken. Exactly the tables THIS bucket's configuration created are
+    /// released, which is what each namespace entry records: a configuration whose own table
+    /// could not be created because another bucket's table holds the name owns no entry, so
+    /// deleting it leaves that name where it is. Both halves happen here, under one guard,
+    /// because the configuration lives on the bucket and the namespace lives on the store: a
+    /// delete that did one and not the other would leave a name taken by a table nothing
+    /// holds.
+    pub fn delete_metadata_configuration(&mut self, bucket: &str) -> bool {
+        let Some(held) = self.buckets.get_mut(bucket) else {
+            return false;
+        };
+        held.clear_metadata_configuration();
+        self.metadata_namespace_tables
+            .retain(|_, created_for| created_for != bucket);
         true
     }
 
@@ -10594,6 +10741,16 @@ pub const RESTORE_NOT_ALLOWED_MESSAGE: &str =
 pub const INVALID_OBJECT_STATE_READ_MESSAGE: &str =
     "The operation is not valid for the object's storage class";
 
+/// The `<Message>` S3 sends beside [`INVALID_OBJECT_STATE_CODE`] when the call is barred by
+/// the storage class the SOURCE object's bytes are in: "Operation is not valid for the
+/// source object's storage class."
+///
+/// The same condition [`INVALID_OBJECT_STATE_READ_MESSAGE`] words for the object being
+/// read, worded for the object being copied FROM — a fixed sentence naming neither the
+/// object nor its class, which is why it lives here beside the other code/message pairs.
+pub const INVALID_OBJECT_STATE_COPY_SOURCE_MESSAGE: &str =
+    "Operation is not valid for the source object's storage class";
+
 /// The code `RestoreObject` answers when a retrieval is already running on the version it
 /// names: `RestoreAlreadyInProgress`, with HTTP 409 Conflict — the special error that
 /// operation publishes for the cause "Object restore is already in progress". Not a shape
@@ -10913,6 +11070,24 @@ pub const METADATA_CONFIGURATION_ALREADY_EXISTS_MESSAGE: &str =
 /// Conflict, the status S3 renders every "the resource is already there" code with
 /// (`BucketAlreadyExists` and `BucketAlreadyOwnedByYou` carry the same one).
 pub const METADATA_CONFIGURATION_ALREADY_EXISTS_STATUS: u16 = 409;
+
+/// The code S3 answers a call that addresses the S3 Metadata configuration of a general
+/// purpose bucket which carries none — a bucket that never had one, or whose configuration
+/// a `DeleteBucketMetadataConfiguration` has removed.
+///
+/// The metadata-configuration family names its own not-there condition rather than sharing
+/// the id-addressed [`NO_SUCH_CONFIGURATION_CODE`] of the other bucket subresources, the
+/// same way it names its own already-there condition
+/// ([`METADATA_CONFIGURATION_ALREADY_EXISTS_CODE`]): a configuration a bucket carries at
+/// most one of, addressed by the bucket alone.
+pub const METADATA_CONFIGURATION_NOT_FOUND_CODE: &str = "MetadataConfigurationNotFound";
+/// See [`METADATA_CONFIGURATION_NOT_FOUND_CODE`] — the text S3 sends for that code, fixed,
+/// with nothing from the request in it.
+pub const METADATA_CONFIGURATION_NOT_FOUND_MESSAGE: &str = "The metadata configuration was not found";
+/// The HTTP status [`METADATA_CONFIGURATION_NOT_FOUND_CODE`] is rendered with: 404, the
+/// status S3 renders every "the subresource is not there" code with (the sibling
+/// [`NO_SUCH_CONFIGURATION_STATUS`] is the same one).
+pub const METADATA_CONFIGURATION_NOT_FOUND_STATUS: u16 = 404;
 
 /// What [`Bucket::put_metrics_configuration`], [`Bucket::put_analytics_configuration`] or
 /// [`Bucket::put_inventory_configuration`] did, so the caller answers each outcome without

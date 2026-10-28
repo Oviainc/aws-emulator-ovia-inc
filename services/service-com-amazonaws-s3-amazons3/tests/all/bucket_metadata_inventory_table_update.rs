@@ -33,9 +33,9 @@
 //!   (`MetadataTableEncryptionConfiguration$KmsKeyArn`): a keyless KMS algorithm is refused
 //!   with `InvalidArgument` (HTTP 400) and records nothing.
 //! * A bucket carrying no metadata configuration has no inventory table to enable or
-//!   disable, so the call answers `NoSuchConfiguration` (HTTP 404); a bucket this emulator
-//!   does not hold `NoSuchBucket` (HTTP 404), and an `x-amz-expected-bucket-owner` that is
-//!   not the account's HTTP 403 `AccessDenied` — each with nothing recorded.
+//!   disable, so the call answers `MetadataConfigurationNotFound` (HTTP 404); a bucket this
+//!   emulator does not hold `NoSuchBucket` (HTTP 404), and an `x-amz-expected-bucket-owner`
+//!   that is not the account's HTTP 403 `AccessDenied` — each with nothing recorded.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -430,20 +430,20 @@ async fn an_update_naming_an_address_or_an_owner_this_emulator_does_not_hold_say
     );
     assert_eq!(
         absent_configuration.error_code(),
-        "NoSuchConfiguration",
-        "an update of a configuration the bucket does not carry must say the configuration is \
-         not there, got {:?}",
+        "MetadataConfigurationNotFound",
+        "an update of a configuration the bucket does not carry must say the metadata \
+         configuration is not there, got {:?}",
         String::from_utf8_lossy(&absent_configuration.body)
     );
     assert_eq!(
         absent_configuration.error_message(),
-        "The specified configuration does not exist.",
+        "The metadata configuration was not found",
         "a refusal carries the text S3 publishes for that code"
     );
     let still_absent = get_metadata_configuration(&router, bucket, &[]).await;
     assert_eq!(
         still_absent.error_code(),
-        "NoSuchConfiguration",
+        "MetadataConfigurationNotFound",
         "a refused update must record nothing, got {:?}",
         String::from_utf8_lossy(&still_absent.body)
     );

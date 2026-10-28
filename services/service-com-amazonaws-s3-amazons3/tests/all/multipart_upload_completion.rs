@@ -568,7 +568,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             headers: &[],
             status: 400,
             code: "InvalidPart",
-            message: "One or more of the specified parts could not be found. The part may \
+            message: "One or more of the specified parts could not be found.  The part may \
                       not have been uploaded, or the specified entity tag may not match \
                       the part's entity tag.",
         },
@@ -581,7 +581,7 @@ fn refusal_cases() -> Vec<RefusalCase> {
             headers: &[],
             status: 400,
             code: "InvalidPart",
-            message: "One or more of the specified parts could not be found. The part may \
+            message: "One or more of the specified parts could not be found.  The part may \
                       not have been uploaded, or the specified entity tag may not match \
                       the part's entity tag.",
         },

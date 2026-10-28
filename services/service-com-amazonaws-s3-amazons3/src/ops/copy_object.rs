@@ -262,6 +262,13 @@
 //!
 //! * `ObjectNotInActiveTierError` (HTTP 403) — The source object of the COPY action is not in
 //!   the active tier and is only stored in Amazon S3 Glacier.
+//!
+//! The model declares that error; it is NOT what a copy from an archived source is refused
+//! with. The recorded behaviour of a copy whose source object's bytes are in `GLACIER` or
+//! `DEEP_ARCHIVE` is the storage-class refusal `InvalidObjectState` (403) with
+//! [`crate::state::INVALID_OBJECT_STATE_COPY_SOURCE_MESSAGE`] — the same classification a
+//! READ of that version is refused with — so that is what the handler answers, and the
+//! legacy Glacier-tier code above is answered to nothing.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -630,16 +637,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             return Err(CopyObjectErrorModeled::NoSuchKey(NoSuchKey {}).into());
         };
 
+        // ONE instant for the whole call, so the state the source is judged in and the time
+        // the destination is written at cannot come from two different readings of the clock.
+        let now = ::std::time::SystemTime::now();
+
         // "Before using an object as a source object for the copy operation, you must
         // restore a copy of it if … the storage class of the source object is GLACIER or
-        // DEEP_ARCHIVE" (`CopyObjectRequest$StorageClass`) — which is exactly what this
-        // operation's one modelled error reports: "The source object of the COPY action is
-        // not in the active tier and is only stored in Amazon S3 Glacier."
-        if crate::state::ARCHIVED_STORAGE_CLASSES.contains(&source_object.storage_class.as_str()) {
-            return Err(CopyObjectErrorModeled::ObjectNotInActiveTierError(
-                ObjectNotInActiveTierError {},
-            )
-            .into());
+        // DEEP_ARCHIVE" (`CopyObjectRequest$StorageClass`) — so a source whose bytes are
+        // archived with no restored copy available bars the copy, exactly when a READ of
+        // that same version is barred ([`crate::state::Object::archived_at`] decides both),
+        // and a restore that has fallen due lifts the bar for both.
+        //
+        // What the refusal SAYS is the storage-class refusal, the one `InvalidObjectState`
+        // (403) carries, worded for the source object — the condition is the source's
+        // storage class, so the code a client branches on is the one it is for a read of
+        // such an object rather than the legacy Glacier-tier code. The message depends on
+        // which object the class barred, so it travels with it through the unmodelled
+        // channel.
+        if source_object.archived_at(now) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_OBJECT_STATE_CODE,
+                crate::state::INVALID_OBJECT_STATE_STATUS,
+                crate::state::INVALID_OBJECT_STATE_COPY_SOURCE_MESSAGE,
+            ));
         }
 
         // The copy-source preconditions, judged against the version actually found.
@@ -702,7 +722,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // ([`crate::state::object_etag`]); its last-modified time is NOW, because the copy
         // is a write of its own.
         let etag = crate::state::object_etag(&source_object.body);
-        let last_modified = ::std::time::SystemTime::now();
+        let last_modified = now;
         let mut object = crate::state::Object {
             etag: etag.clone(),
             last_modified,

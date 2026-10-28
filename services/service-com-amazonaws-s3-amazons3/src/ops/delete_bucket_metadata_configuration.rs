@@ -191,28 +191,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        let Some(bucket) = store.bucket_mut(&input.bucket) else {
-            // The model declares no error for this operation, so the bucket this emulator
-            // does not hold is reported through the unmodelled channel with the code and
-            // status every other bucket-subresource call in this crate answers it with.
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::NO_SUCH_BUCKET_CODE,
-                NO_SUCH_BUCKET_STATUS,
-                crate::state::NO_SUCH_BUCKET_MESSAGE,
-            ));
-        };
         // "Deletes an S3 Metadata configuration from a general purpose bucket" (this
         // operation's own documentation): the whole subresource goes, so
         // `GetBucketMetadataConfiguration` reports none again. Idempotent, like every other
         // subresource delete in this crate: a bucket carrying no configuration is already in
         // the asked-for state, so the call still succeeds.
         //
-        // The TABLES the configuration created are not deleted with it — they are S3 Tables
-        // resources in the managed table bucket's namespace, and "Delete the journal table,
-        // and then try again" (`ErrorDetails$ErrorCode`, `JournalTableAlreadyExists`) is
-        // what AWS tells a caller that creates the configuration again. So the namespace
-        // keeps them, and the next create provisions into `FAILED`.
-        bucket.clear_metadata_configuration();
+        // The TABLES the configuration created go with it — they are the ones S3 Metadata
+        // created for that configuration in the managed table bucket's namespace, so their
+        // names are free again and a fresh `CreateBucketMetadataConfiguration` on the same
+        // bucket provisions its tables rather than finding their names taken. Exactly the
+        // tables THIS bucket's configuration created are released
+        // ([`crate::state::ComAmazonawsS3Amazons3State::delete_metadata_configuration`] does
+        // both halves under the one guard), so a configuration whose own table could not be
+        // created leaves the name of the table that is there where it was.
+        //
+        // `false` is the bucket this emulator does not hold: the model declares no error for
+        // this operation, so it is reported through the unmodelled channel with the code and
+        // status every other bucket-subresource call in this crate answers it with.
+        if !store.delete_metadata_configuration(&input.bucket) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                NO_SUCH_BUCKET_STATUS,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        }
 
         // `Unit` output: success is the modelled 204 and an empty body.
         Ok(DeleteBucketMetadataConfigurationOutput)

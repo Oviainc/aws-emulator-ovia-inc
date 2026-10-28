@@ -555,11 +555,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports it through, so a GET and a HEAD of the same version cannot disagree about
         // it. An object stored under no checksum algorithm reports none however the mode is
         // set.
+        //
+        // WHICH checksum is the one of the bytes this response carries
+        // ([`crate::state::Object::checksum_of_span`]): a response narrowed to a span of the
+        // object advertises that span's own digest or none at all, never the whole object's
+        // over a partial body.
         let reported = crate::state::reported_checksums(
             object
-                .checksum
-                .as_ref()
-                .filter(|_| input.checksum_mode.is_some()),
+                .checksum_of_span(span)
+                .filter(|_| input.checksum_mode.is_some())
+                .as_ref(),
         );
 
         // The Object Lock state this read reports, rendered once off the version's own

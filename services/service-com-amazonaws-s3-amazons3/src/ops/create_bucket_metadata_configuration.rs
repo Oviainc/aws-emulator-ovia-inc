@@ -347,9 +347,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot create: "A journal table already exists in the Amazon Web Services managed
         // table bucket's namespace" (`ErrorDetails$ErrorCode`, the V2 list), which is a
         // provisioning failure rather than a refusal of the create — the configuration is
-        // recorded and the table reports `FAILED` with those `ErrorDetails`. That is the
-        // state a bucket is in after its configuration was deleted and created again: the
-        // delete takes the configuration away and leaves the tables it created behind.
+        // recorded and the table reports `FAILED` with those `ErrorDetails`. The namespace is
+        // one per Region and a table name is derived from the general purpose bucket's name
+        // ([`crate::state::metadata_table_name`]), so that is the state a create is in when
+        // ANOTHER bucket whose name folds to the same table name already carries a
+        // configuration.
         //
         // `ContentMD5` is NOT verified, and `ChecksumAlgorithm` not acted on: by the time
         // this handler runs the payload is the deserialized container rather than the bytes
@@ -455,10 +457,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every table this create really provisions joins the managed table bucket's
-        // namespace, and stays in it once the configuration is deleted — which is what makes
-        // a later create of the same configuration report the failure above. A table that
+        // namespace, recorded against the bucket whose configuration created it, and stays in
+        // it until that configuration is deleted — which is what makes a create whose table
+        // name another bucket's configuration holds report the failure above. A table that
         // FAILED to be created adds nothing: the name was already taken by the table that is
-        // there.
+        // there, and that table's own configuration keeps it.
         let created: Vec<String> = [
             (!journal_taken).then(|| journal_name.clone()),
             recorded
@@ -476,9 +479,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .into_iter()
         .flatten()
         .collect();
-        // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): a
-        // table outlives the configuration that created it, so nothing releases a name and
-        // the ceiling is what keeps the record bounded whatever a caller does. A create that
+        // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): a name
+        // is released only by the delete of the configuration that created it, so a caller
+        // creating configurations for bucket after bucket without deleting any would grow the
+        // record without bound and the ceiling is what keeps it bounded. A create that
         // would carry it past the maximum is refused with NOTHING recorded — the emulator's
         // own ceiling, so it goes out through the framework's 400 refusal channel rather
         // than as an AWS error code, the way this handler's other resource guard does.
@@ -490,7 +494,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         for name in &created {
-            store.record_metadata_namespace_table(name);
+            store.record_metadata_namespace_table(name, &input.bucket);
         }
 
         let Some(bucket) = store.bucket_mut(&input.bucket) else {

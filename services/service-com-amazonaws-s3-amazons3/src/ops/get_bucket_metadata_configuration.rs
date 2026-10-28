@@ -9,9 +9,9 @@
 //! `CREATING` and a later one `ACTIVE`.
 //!
 //! A bucket carrying no metadata configuration answers
-//! [`crate::state::NO_SUCH_CONFIGURATION_CODE`] (HTTP 404), one this emulator does not
-//! hold `NoSuchBucket` (HTTP 404), and an `x-amz-expected-bucket-owner` that is not this
-//! account's HTTP 403 `AccessDenied`. Reads only: nothing about the bucket changes.
+//! [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP 404), one this emulator
+//! does not hold `NoSuchBucket` (HTTP 404), and an `x-amz-expected-bucket-owner` that is not
+//! this account's HTTP 403 `AccessDenied`. Reads only: nothing about the bucket changes.
 //!
 //! ## Shape of an operation
 //!
@@ -202,14 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let Some(configuration) = bucket.metadata_configuration() else {
-            // A bucket is created carrying no metadata configuration, and nothing is
-            // derived for one that carries none: the read reports that the configuration it
-            // names does not exist, the way every other bucket-subresource read in this
-            // crate reports a subresource the bucket does not carry.
+            // A bucket is created carrying no metadata configuration, and a delete takes the
+            // one it had away; nothing is derived for a bucket that carries none, so the read
+            // reports the metadata configuration not being there — the condition this family
+            // names for itself ([`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`]),
+            // which is also what makes a delete-then-read loop terminate.
             return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::NO_SUCH_CONFIGURATION_CODE,
-                crate::state::NO_SUCH_CONFIGURATION_STATUS,
-                crate::state::NO_SUCH_CONFIGURATION_MESSAGE,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
             ));
         };
         // The tables live in the Region the general purpose bucket lives in, so the ARNs

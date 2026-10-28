@@ -755,9 +755,10 @@ const INVALID_PART_CODE: &str = "InvalidPart";
 /// See [`INVALID_PART_CODE`].
 const INVALID_PART_STATUS: u16 = 400;
 /// The `<Message>` that code's entry in the same list publishes — the FIXED text S3 sends
-/// whichever way the named part failed to match.
+/// whichever way the named part failed to match, reproduced verbatim down to the TWO spaces
+/// that separate its two sentences.
 const INVALID_PART_MESSAGE: &str =
-    "One or more of the specified parts could not be found. The part may not have been \
+    "One or more of the specified parts could not be found.  The part may not have been \
      uploaded, or the specified entity tag may not match the part's entity tag.";
 
 /// The code S3 answers a completion whose parts list is not in ascending part-number order:

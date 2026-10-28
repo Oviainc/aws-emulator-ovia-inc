@@ -147,6 +147,8 @@ mod object_batch_deletion;
 mod object_copy;
 #[path = "all/object_content_type.rs"]
 mod object_content_type;
+#[path = "all/object_conditional_deletes.rs"]
+mod object_conditional_deletes;
 #[path = "all/object_conditional_writes.rs"]
 mod object_conditional_writes;
 #[path = "all/object_default_encryption.rs"]
@@ -171,6 +173,8 @@ mod object_listing_v1;
 mod object_lock_enforcement;
 #[path = "all/object_partial_reads.rs"]
 mod object_partial_reads;
+#[path = "all/object_plane_byte_budget.rs"]
+mod object_plane_byte_budget;
 #[path = "all/object_replication.rs"]
 mod object_replication;
 #[path = "all/object_retention.rs"]
@@ -197,6 +201,8 @@ mod object_write_and_read_back;
 mod object_write_tagging_header;
 #[path = "all/objects.rs"]
 mod objects;
+#[path = "all/partial_read_checksums.rs"]
+mod partial_read_checksums;
 #[path = "all/presigned_object_reads.rs"]
 mod presigned_object_reads;
 #[path = "all/presigned_query_authentication.rs"]
@@ -207,6 +213,8 @@ mod published_refusal_wording;
 mod public_access_block_default;
 #[path = "all/public_access_guardrails.rs"]
 mod public_access_guardrails;
+#[path = "all/refusal_class_fidelity.rs"]
+mod refusal_class_fidelity;
 #[path = "all/refusal_codes.rs"]
 mod refusal_codes;
 #[path = "all/request_integrity_headers.rs"]

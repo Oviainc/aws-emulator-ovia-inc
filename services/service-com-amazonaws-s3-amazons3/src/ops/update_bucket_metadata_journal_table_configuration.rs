@@ -11,7 +11,8 @@
 //! name and status, and the inventory and annotation tables, are left exactly as they were.
 //!
 //! A bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404), one carrying no
-//! metadata configuration [`crate::state::NO_SUCH_CONFIGURATION_CODE`] (HTTP 404), an
+//! metadata configuration [`crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE`] (HTTP
+//! 404), an
 //! `x-amz-expected-bucket-owner` that is not this account's HTTP 403 `AccessDenied`, and a
 //! retention outside the published day range `InvalidArgument` (HTTP 400) with nothing
 //! written.
@@ -253,16 +254,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Enables or disables journal table record expiration for an S3 Metadata
         // configuration on a general purpose bucket" (this operation's own documentation):
         // the journal table belongs to a metadata configuration, so a bucket carrying none
-        // has no records to expire and the request names a configuration that is not there —
-        // the answer every other call on a subresource the bucket does not carry gives, with
-        // nothing written.
+        // has no records to expire — the mutation is refused with the metadata
+        // configuration's own not-there condition, the same one a READ of it answers, and
+        // nothing is written (never a silent no-op that would look like a success).
         if !bucket.update_metadata_journal_record_expiration(
             input.journal_table_configuration.record_expiration.clone(),
         ) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::NO_SUCH_CONFIGURATION_CODE,
-                crate::state::NO_SUCH_CONFIGURATION_STATUS,
-                crate::state::NO_SUCH_CONFIGURATION_MESSAGE,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_CODE,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_STATUS,
+                crate::state::METADATA_CONFIGURATION_NOT_FOUND_MESSAGE,
             ));
         }
 
