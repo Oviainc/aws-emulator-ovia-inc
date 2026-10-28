@@ -2420,6 +2420,22 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         Some(record)
     }
 
+    /// Remove the lifecycle policy `(kind, name)` identifies, dropping every idempotency
+    /// token that named it with it — so a later read of that pair reports the modelled
+    /// not-found detail and the freed pair may be created again, exactly as
+    /// [`Self::remove_access_policy`] does for a data access policy.
+    pub fn remove_lifecycle_policy(
+        &mut self,
+        kind: &str,
+        name: &str,
+    ) -> Option<LifecyclePolicyRecord> {
+        let record = self
+            .lifecycle_policies
+            .remove(&(kind.to_string(), name.to_string()))?;
+        self.forget_tokens_for(&policy_token_value(kind, name));
+        Some(record)
+    }
+
     /// Remove the security configuration `id` names, dropping every idempotency token
     /// that named it with it.
     pub fn remove_security_config(&mut self, id: &str) -> Option<SecurityConfigRecord> {
