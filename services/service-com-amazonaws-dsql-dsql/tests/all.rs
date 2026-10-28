@@ -53,6 +53,8 @@ mod pagination_token_refusal;
 mod policy_document_class;
 #[path = "all/policy_version_conflict_and_lockout.rs"]
 mod policy_version_conflict_and_lockout;
+#[path = "all/quota_refusal_identity.rs"]
+mod quota_refusal_identity;
 #[path = "all/refusal_resource_identity.rs"]
 mod refusal_resource_identity;
 #[path = "all/reserved_tag_keys.rs"]

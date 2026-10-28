@@ -342,18 +342,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this operation's own `ServiceQuotaExceededException` rather than growing
         // the emulator's heap. Checked AFTER the idempotency lookup, so a repeat of
         // a request already served still answers from the store at the ceiling.
+        //
+        // The resource whose quota was exceeded is the one that HOLDS the
+        // collection at its ceiling — here the account that owns the clusters, not
+        // a cluster, and least of all the cluster this refused call never minted —
+        // so the identity pair is built from that resource through the one helper
+        // every refusal of this crate reports an identity with
+        // (`crate::state::ResourceIdentity`).
         if state.clusters.len() >= crate::state::MAX_CLUSTERS {
             return Err(CreateClusterErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
+                crate::state::ResourceIdentity::account().quota_exceeded(
+                    format!(
                         "The maximum number of clusters ({}) has already been created.",
                         crate::state::MAX_CLUSTERS
                     ),
-                    resource_id: ::engine::emulator_account_id().to_string(),
-                    resource_type: crate::state::RESOURCE_TYPE_CLUSTER.to_string(),
-                    service_code: crate::state::ARN_SERVICE.to_string(),
-                    quota_code: QUOTA_CODE_CLUSTERS_PER_ACCOUNT.to_string(),
-                },
+                    QUOTA_CODE_CLUSTERS_PER_ACCOUNT,
+                ),
             )
             .into());
         }

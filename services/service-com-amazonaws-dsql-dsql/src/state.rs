@@ -129,6 +129,14 @@ pub const RESOURCE_TYPE_STREAM: &str = "stream";
 /// by the cluster's identifier.
 pub const RESOURCE_TYPE_POLICY: &str = "policy";
 
+/// The `resourceType` a refusal about the ACCOUNT itself carries.
+///
+/// The account is the resource that holds every per-account collection of this
+/// service — the clusters an account owns, which is the account segment of every
+/// ARN this service mints ([`cluster_arn`]) — so it is the resource a ceiling on
+/// such a collection reports, identified by its own 12-digit id.
+pub const RESOURCE_TYPE_ACCOUNT: &str = "account";
+
 /// The `ValidationExceptionReason` for a member whose value failed this service's
 /// own check (`smithy_query(query="shape", shape="ValidationExceptionReason")`:
 /// cannotParse | deletionProtectionEnabled | fieldValidationFailed | other |
@@ -1643,6 +1651,22 @@ impl ResourceIdentity {
         Self {
             resource_type: RESOURCE_TYPE_CLUSTER.to_string(),
             resource_id: identifier.to_string(),
+        }
+    }
+
+    /// The identity of the account this emulator serves: the type segment an
+    /// account is reported under, and that account's own 12-digit identifier —
+    /// the account segment every ARN this service mints carries.
+    ///
+    /// The account is what HOLDS the clusters of this service, so it is the
+    /// resource a refusal about a per-account collection reports; an account id
+    /// is not an identifier of any resource stored under another type segment
+    /// (`ClusterId` is `^[a-z0-9]{26}$`), so it is reported with this type and
+    /// never with another's.
+    pub fn account() -> Self {
+        Self {
+            resource_type: RESOURCE_TYPE_ACCOUNT.to_string(),
+            resource_id: ::engine::emulator_account_id().to_string(),
         }
     }
 
