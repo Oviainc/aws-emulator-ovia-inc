@@ -183,10 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata only, and this write needs nothing from it.
-        let _ = ctx;
-
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
         // denied)" — `PutObjectTaggingRequest$ExpectedBucketOwner`, judged the way every
@@ -313,6 +309,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+
+        // The tag set this call placed on the object is an object event of its own
+        // (`s3:ObjectTagging:Put`), published to whatever destinations the bucket's
+        // notification configuration names for it — through the same seam `PutObject`
+        // publishes its write through.
+        let tagged = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::TaggingPut,
+            &input.key,
+        );
+        let tagged = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.object(&input.key))
+        {
+            Some(object) => tagged.of_object(object),
+            None => tagged,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[tagged]);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
 
         Ok(PutObjectTaggingOutput {
             // "The versionId of the object the tag-set was added to" — reported for a

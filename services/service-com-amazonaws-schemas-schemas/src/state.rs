@@ -1216,7 +1216,9 @@ pub struct Schema {
     /// selects comes from [`Schema::latest_stored_version`], the highest version the
     /// schema still HOLDS, and not from here.
     pub latest_version: u64,
-    /// When the schema itself was last written (created, or a new version added).
+    /// When the schema itself was last written: created, a definition minted or
+    /// removed, or its own metadata replaced. [`Schema::modified_at`] is the one place
+    /// this is written after creation.
     pub last_modified: SystemTime,
     /// Versions by number. Numeric keys, so the map's order is the version order —
     /// a string key would sort `"10"` before `"2"`.
@@ -1409,25 +1411,51 @@ impl Schema {
     /// version the store no longer holds describes nothing and goes with it, and so
     /// does the idempotency-token entry that names it: a token whose version is gone
     /// names nothing a retry could answer with, which is also what keeps that map no
-    /// larger than the version set it records mints into. The schema itself, every
-    /// other version and [`Schema::latest_version`] are left exactly as they were:
-    /// deleting a definition is not deleting the schema, and a freed number is never
-    /// minted again.
-    pub fn remove_version(&mut self, version: u64) -> bool {
+    /// larger than the version set it records mints into. Every other version and
+    /// [`Schema::latest_version`] are left exactly as they were: deleting a definition
+    /// is not deleting the schema, and a freed number is never minted again.
+    ///
+    /// Taking a definition away is a write TO the schema — what a version-less read
+    /// resolves to and how many versions the schema holds both change — so it moves
+    /// [`Schema::last_modified`] through [`Schema::modified_at`]; a call that removes
+    /// nothing writes nothing and moves it not at all.
+    pub fn remove_version(&mut self, version: u64, now: SystemTime) -> bool {
         if self.versions.remove(&version).is_none() {
             return false;
         }
         self.code_bindings
             .retain(|(bound_version, _), _| *bound_version != version);
         self.minted_by_token.retain(|_, minted| *minted != version);
+        self.modified_at(now);
         true
     }
 
     /// Remove the version a request's `SchemaVersion` label NAMES, resolving the
     /// label exactly as [`Schema::version_for`] resolves it for a read; answer
     /// whether the schema held it.
-    pub fn remove_version_named(&mut self, requested: &str) -> bool {
-        Self::version_number(requested).is_some_and(|version| self.remove_version(version))
+    pub fn remove_version_named(&mut self, requested: &str, now: SystemTime) -> bool {
+        Self::version_number(requested).is_some_and(|version| self.remove_version(version, now))
+    }
+
+    /// Replace the schema's description and record the write.
+    ///
+    /// The description is metadata OF THE SCHEMA rather than of any one definition, so
+    /// replacing it is a change to the schema whichever version a later read selects —
+    /// which is why it goes through the same recorder a definition write does.
+    pub fn set_description(&mut self, description: String, now: SystemTime) {
+        self.description = Some(description);
+        self.modified_at(now);
+    }
+
+    /// Record that the schema itself was written at `now`.
+    ///
+    /// The ONE writer of [`Schema::last_modified`], so every path that changes the
+    /// schema reports the member the same way: the member is the instant the schema was
+    /// last modified, and what modifies a schema is a definition minted, a definition
+    /// removed, or its own metadata replaced — not one of those three in particular. A
+    /// read never calls this, so reading a schema cannot move the member.
+    fn modified_at(&mut self, now: SystemTime) {
+        self.last_modified = now;
     }
 
     /// Store `content` as this schema's NEXT version and answer the version stored.
@@ -1448,7 +1476,7 @@ impl Schema {
     ) -> &SchemaVersion {
         let version = self.latest_version.saturating_add(1);
         self.latest_version = version;
-        self.last_modified = now;
+        self.modified_at(now);
         self.r#type = r#type.clone();
         self.versions.insert(
             version,

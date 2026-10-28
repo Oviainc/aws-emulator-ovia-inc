@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared ARN parse: a notification destination's stored ARN is read for the Region it
+# names and the queue it addresses through the one parse every service reads an ARN with.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -16,7 +19,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# The clock a delivery task is bounded by: `tokio::time::timeout` abandons one request's
+# object-event fan-out past `state::notifications::DELIVERY_DEADLINE`.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -46,12 +51,28 @@ percent-encoding = "2"
 # attribute the API publishes and the element the framework's XML codec binds
 # (`src/service/wire.rs`), rather than editing XML documents as strings.
 quick-xml = "0.41"
+# The AWS SDKs for the four destinations a bucket's event notification configuration
+# publishes to, driven over the in-process callback (`OperationContext::callback`): an
+# object event becomes a `PutEvents` onto the default event bus, a `SendMessage`, a
+# `Publish` or an asynchronous `Invoke` (`state::notifications`). Only the generated
+# clients are needed — the emulator supplies the transport, so the SDKs' own HTTPS stacks
+# and runtimes are left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
+aws-sdk-sqs = { version = "1", default-features = false }
+aws-sdk-sns = { version = "1", default-features = false }
+aws-sdk-lambda = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 # `quick-xml` above is also what the tests read a restXml body with.
+# EventBridge, SQS and Lambda are mounted beside S3 in the event-notification test:
+# without them there is nowhere for an object event to be delivered, and what that suite
+# asserts is the message each destination really received.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 
 [lints]
 workspace = true

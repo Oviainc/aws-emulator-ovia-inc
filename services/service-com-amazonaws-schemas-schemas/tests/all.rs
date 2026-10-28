@@ -63,6 +63,8 @@ mod resource_policy;
 mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/schema_last_modified.rs"]
+mod schema_last_modified;
 #[path = "all/schema_name_collation.rs"]
 mod schema_name_collation;
 #[path = "all/schema_read_resolution.rs"]

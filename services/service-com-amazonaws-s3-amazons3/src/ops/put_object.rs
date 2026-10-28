@@ -344,7 +344,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store the object cannot be recorded at all, and none of the
             // modelled errors says that, so the scaffold's 501 carries what is true:
@@ -829,7 +828,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        Ok(PutObjectOutput {
+        // The object event this write produced, and the notifications the bucket's event
+        // notification configuration owes for it — rendered while the store is still
+        // held, off the version this write left at the key, and delivered once the answer
+        // is settled and the store released. A bucket with no notifications configured
+        // owes none.
+        let created = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::CreatedByPut,
+            &input.key,
+        );
+        let created = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.object(&input.key))
+        {
+            Some(object) => created.of_object(object),
+            None => created,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[created]);
+
+        let output = PutObjectOutput {
             e_tag: Some(etag),
             // "If you enable versioning for a bucket, Amazon S3 automatically generates a
             // unique version ID for the object being stored. Amazon S3 returns this ID in
@@ -877,7 +894,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // members are refused above, and `RequestCharged` reports a Requester Pays
             // charge this emulator does not model.
             ..PutObjectOutput::default()
-        })
+        };
+
+        // The store is released BEFORE the deliveries are started: each one reaches its
+        // destination service through this same emulator, and the write it reports is
+        // already recorded.
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
+
+        Ok(output)
     }
 }
 

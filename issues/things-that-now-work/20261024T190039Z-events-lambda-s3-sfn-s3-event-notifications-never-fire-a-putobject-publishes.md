@@ -8,6 +8,8 @@ Issue-Commit: ee21bdc0559bb252101e2375a2c132d26bd8f920
 
 # S3 event notifications never fire: a PutObject publishes no aws.s3 'Object Created' event to EventBridge and never invokes a LambdaFunctionConfiguration target (2 causes)
 
+> _Resolution: S3's notification emitter is implemented (`services/service-com-amazonaws-s3-amazons3/src/state/notifications.rs`), so an object change is delivered to every destination its bucket's configuration names and published onto the default event bus when EventBridge delivery is enabled. Cause 1's check passes. Cause 2's S3 half — the `LambdaFunctionConfiguration` branch and its asynchronous invoke — is implemented and tested, but its check still times out downstream: Lambda's `Invoke` has no in-process runtime for a deployment package, so the recorded handler's body never runs and issues no `PutEvents`. That remaining blocker is tracked by `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`._
+
 > _Note: this issue was identified against the code base at commit `ee21bdc0559bb252101e2375a2c132d26bd8f920`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

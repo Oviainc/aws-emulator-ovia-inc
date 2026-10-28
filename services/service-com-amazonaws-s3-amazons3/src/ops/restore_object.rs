@@ -215,10 +215,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata only, and this write needs nothing from it.
-        let _ = ctx;
-
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
         // denied)" — `RestoreObjectRequest$ExpectedBucketOwner`, judged the way every other
@@ -454,6 +450,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+
+        // Asking for the archived copy back is an object event of its own
+        // (`s3:ObjectRestore:Post`), published to whatever destinations the bucket's
+        // notification configuration names for it — through the same seam `PutObject`
+        // publishes its write through. The COMPLETION of the restore is owed by the clock
+        // rather than by this call, and no call of this emulator performs it, so nothing
+        // here publishes `s3:ObjectRestore:Completed`.
+        let restore_initiated = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::RestoreInitiated,
+            &input.key,
+        );
+        let restore_initiated = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.addressed_object(&input.key, version_id))
+        {
+            Some(object) => restore_initiated.of_object(object),
+            None => restore_initiated,
+        };
+        let pending =
+            crate::state::notifications::pending(&store, &input.bucket, &[restore_initiated]);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
 
         Ok(RestoreObjectOutput {
             // "If present, indicates that the requester was successfully charged for the
