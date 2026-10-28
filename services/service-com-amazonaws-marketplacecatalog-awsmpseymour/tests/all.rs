@@ -17,6 +17,8 @@ mod assessment_production;
 mod assessments;
 #[path = "all/change_pair_uniqueness.rs"]
 mod change_pair_uniqueness;
+#[path = "all/change_reference_resolution.rs"]
+mod change_reference_resolution;
 #[path = "all/change_set_failures.rs"]
 mod change_set_failures;
 #[path = "all/change_set_lifecycle.rs"]

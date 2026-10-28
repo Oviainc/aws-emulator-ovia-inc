@@ -3154,19 +3154,16 @@ pub const ENTITY_IDENTIFIER_PATTERN: &str =
 /// The suffix of the change-reference alternative of [`ENTITY_IDENTIFIER_PATTERN`].
 const CHANGE_REFERENCE_SUFFIX: &str = ".Entity.Identifier";
 
-/// The longest change name the change-reference alternative of
-/// [`ENTITY_IDENTIFIER_PATTERN`] admits (its `{1,72}`).
-const CHANGE_REFERENCE_NAME_MAX: usize = 72;
-
 /// Whether `value` is an `Entity$Identifier`: [`ENTITY_IDENTIFIER_PATTERN`]
 /// spelled out as a predicate.
+///
+/// Only the change-reference alternative begins with `$` — no entity id does —
+/// so that character is what decides which alternative a value is read as.
 pub fn is_entity_identifier(value: &str) -> bool {
-    if let Some(change_name) = value
-        .strip_prefix('$')
-        .and_then(|rest| rest.strip_suffix(CHANGE_REFERENCE_SUFFIX))
-    {
-        return (1..=CHANGE_REFERENCE_NAME_MAX).contains(&change_name.chars().count())
-            && change_name.chars().all(|c| c.is_ascii_alphabetic());
+    if let Some(rest) = value.strip_prefix('$') {
+        return rest
+            .strip_suffix(CHANGE_REFERENCE_SUFFIX)
+            .is_some_and(is_change_name);
     }
     match value.split_once('@') {
         Some((id, revision)) => {
@@ -3191,6 +3188,111 @@ pub fn invalid_entity_identifier(identifier: &str) -> ValidationException {
     validation_message(format!(
         "Requested entity identifier '{identifier}' is invalid. \
          It should match with {ENTITY_IDENTIFIER_PATTERN}."
+    ))
+}
+
+/// The `ChangeName` a `$<ChangeName>.Entity.Identifier` identifier names, and
+/// `None` for an identifier that names an entity id instead.
+///
+/// This is the change-reference alternative of [`ENTITY_IDENTIFIER_PATTERN`]
+/// read for the one thing inside it that carries meaning: which change of the
+/// same change set the entity belongs to.
+pub fn change_reference_name(identifier: &str) -> Option<&str> {
+    identifier
+        .strip_prefix('$')?
+        .strip_suffix(CHANGE_REFERENCE_SUFFIX)
+        .filter(|name| is_change_name(name))
+}
+
+/// Where a chain of change references ENDS: the change that the change at
+/// `start` acts through, which is the one naming an entity of its own or
+/// creating one.
+///
+/// `references[i]` is the change the change at `i` names through
+/// [`change_reference_name`], and `None` for a change that names an entity id
+/// or no entity at all. A change acts on the entity of the change it names, so
+/// following the chain to its end is what says which entity that is. A chain
+/// that returns to a change it has already passed names no entity, and is
+/// reported by `None`: at most one step per change is taken, so the walk is
+/// bounded by the change set's length however the references are written.
+pub fn reference_chain_end(references: &[Option<usize>], start: usize) -> Option<usize> {
+    let mut at = start;
+    for _ in 0..references.len() {
+        match references.get(at).copied().flatten() {
+            Some(next) => at = next,
+            None => return Some(at),
+        }
+    }
+    None
+}
+
+/// The syntax the service documents for `Change$ChangeName`: the characters the
+/// modelled `@pattern` admits with the modelled `@length(min: 1, max: 72)`
+/// folded into it, which is how the service quotes it back to a caller.
+///
+/// The modelled `@pattern` (`^[a-zA-Z]$`) admits a SINGLE letter, which leaves
+/// the modelled length's 72 nothing to describe, so the pattern on its own
+/// cannot be what a caller is told to satisfy. The change-reference alternative
+/// of [`ENTITY_IDENTIFIER_PATTERN`] states the same name as up to 72 letters,
+/// and a reference can only name a change name a caller may send — so that is
+/// the length a change name has here too.
+pub const CHANGE_NAME_PATTERN: &str = "^[a-zA-Z]{1,72}$";
+
+/// The `{1,72}` of [`CHANGE_NAME_PATTERN`].
+const CHANGE_NAME_MAX: usize = 72;
+
+/// Whether `value` is a `Change$ChangeName`: [`CHANGE_NAME_PATTERN`] spelled out
+/// as a predicate — one to [`CHANGE_NAME_MAX`] ASCII letters.
+pub fn is_change_name(value: &str) -> bool {
+    (1..=CHANGE_NAME_MAX).contains(&value.chars().count())
+        && value.chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// The modelled `ValidationException` payload for a `ChangeName` outside
+/// [`CHANGE_NAME_PATTERN`].
+pub fn invalid_change_name(name: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested change name '{name}' is invalid. \
+         It should match with {CHANGE_NAME_PATTERN}."
+    ))
+}
+
+/// The modelled `ValidationException` payload for a change set two of whose
+/// changes carry the same `ChangeName`.
+///
+/// A change name is how one change of a change set names ANOTHER change
+/// ([`change_reference_name`]), so a name two changes carry identifies neither:
+/// like a repeated (entity, change type) pair, it is the request contradicting
+/// itself, and the fault is built from the request — the name that was
+/// repeated.
+pub fn duplicate_change_name(change_name: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested changes contain multiple changes with the same change name \
+         '{change_name}'. Change names should be unique."
+    ))
+}
+
+/// The modelled `ValidationException` payload for a change reference naming a
+/// change the change set does not carry.
+///
+/// A reference is resolved against the changes of the SAME request, so a name
+/// none of them carries names no entity — stated with the identifier the
+/// request sent and the change name read out of it.
+pub fn unknown_change_reference(identifier: &str, change_name: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested entity identifier '{identifier}' names the change \
+         '{change_name}', which no change of this request is named. A change \
+         reference names a change of the same change set."
+    ))
+}
+
+/// The modelled `ValidationException` payload for a change reference whose chain
+/// of references leads back to a change it has already passed, so it names no
+/// entity ([`reference_chain_end`]).
+pub fn circular_change_reference(identifier: &str) -> ValidationException {
+    validation_message(format!(
+        "Requested entity identifier '{identifier}' names a change whose own \
+         entity identifier leads back to it, so it names no entity."
     ))
 }
 

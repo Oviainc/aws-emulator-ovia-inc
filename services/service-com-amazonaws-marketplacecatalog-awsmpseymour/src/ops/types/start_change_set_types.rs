@@ -29,7 +29,16 @@ pub struct StartChangeSetInput {
     pub intent: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#Change")]
+// `skip_validation` names `ChangeName` for the same reason `Entity` (see `shared_types`)
+// names its two members: the syntax this service publishes for a change name is the one
+// the `$<ChangeName>.Entity.Identifier` reference states — up to 72 letters, which is also
+// the modelled `@length(min: 1, max: 72)` — where the modelled `@pattern` (`^[a-zA-Z]$`)
+// admits a single letter and so leaves that length nothing to describe. The handler judges
+// it (`crate::state::is_change_name`) and answers the modelled `ValidationException`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#Change",
+    skip_validation = ["ChangeName"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct Change {
     pub change_type: String,

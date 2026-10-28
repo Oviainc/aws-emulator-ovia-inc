@@ -251,7 +251,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut claimed: ::std::collections::HashSet<(String, String)> =
             ::std::collections::HashSet::with_capacity(input.change_set.len());
-        for change in &input.change_set {
+        // The changes a change reference can name, by the `ChangeName` each one
+        // carries. A MAP, so resolving a reference below costs one lookup
+        // rather than a scan of the change set.
+        let mut named_changes: ::std::collections::HashMap<&str, usize> =
+            ::std::collections::HashMap::with_capacity(input.change_set.len());
+        for (index, change) in input.change_set.iter().enumerate() {
             // `Entity$Type` names an entity type, on its own or at a schema
             // version (`<EntityType>@<version>`) — the form the service accepts
             // and every real caller sends. It is judged here rather than at the
@@ -275,6 +280,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::invalid_change_type(&change.change_type),
                 )
                 .into());
+            }
+            // `Change$ChangeName` is the name the OTHER changes of this change
+            // set name this change by, so it is judged against the syntax that
+            // reference states — up to 72 letters — rather than against the
+            // single letter the modelled `@pattern` admits
+            // (`skip_validation` on `Change`). A name two changes carry
+            // identifies neither of them, so a change set that repeats one is
+            // refused like one that repeats a pair: both are the request
+            // contradicting itself.
+            if let Some(name) = change.change_name.as_deref() {
+                if !crate::state::is_change_name(name) {
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::invalid_change_name(name),
+                    )
+                    .into());
+                }
+                if named_changes.insert(name, index).is_some() {
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::duplicate_change_name(name),
+                    )
+                    .into());
+                }
             }
             // The same reserved namespace, for the tags this change would put on
             // its entity.
@@ -314,6 +341,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // Which change of THIS change set each change's identifier names, by
+        // index: a change may act on the entity another change of the same
+        // change set acts on by naming that change
+        // (`$<ChangeName>.Entity.Identifier`), so such an identifier is
+        // resolved against the submitted changes and against nothing in the
+        // store. A reference naming a change the request does not carry, and a
+        // chain of references that leads back to a change it has already
+        // passed, name no entity at all — both are rules about the REQUEST, so
+        // both are judged here, before the store is read.
+        let mut references: Vec<Option<usize>> = vec![None; input.change_set.len()];
+        for (index, change) in input.change_set.iter().enumerate() {
+            let Some(identifier) = change.entity.identifier.as_deref() else {
+                continue;
+            };
+            let Some(name) = crate::state::change_reference_name(identifier) else {
+                continue;
+            };
+            let Some(target) = named_changes.get(name).copied() else {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::unknown_change_reference(identifier, name),
+                )
+                .into());
+            };
+            references[index] = Some(target);
+        }
+        // Where each change's chain of references ENDS, by index: the change
+        // whose entity it therefore acts on, which is the change itself when it
+        // names no other.
+        let mut targets: Vec<usize> = Vec::with_capacity(input.change_set.len());
+        for (index, change) in input.change_set.iter().enumerate() {
+            let Some(target) = crate::state::reference_chain_end(&references, index) else {
+                let identifier = change.entity.identifier.as_deref().unwrap_or_default();
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::circular_change_reference(identifier),
+                )
+                .into());
+            };
+            targets.push(target);
         }
 
         // "The intent related to the request. The default is APPLY." `Intent`
@@ -360,7 +427,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut changes: Vec<crate::state::ChangeRecord> =
             Vec::with_capacity(input.change_set.len());
-        for change in &input.change_set {
+        // The entity each change resolved to, by index, filled as the changes
+        // are read: a change that names another change acts on the SAME entity,
+        // so resolving one of them resolves both, whichever is read first — and
+        // the entity a change creates is reserved ONCE however many changes
+        // name it.
+        let mut resolved: Vec<Option<Option<String>>> = vec![None; input.change_set.len()];
+        // The (entity, change type) pairs the changes have taken once the
+        // entity each one acts on is known, which is what the uniqueness rule
+        // above cannot see on a change set whose changes name each other.
+        let mut claimed_entities: ::std::collections::HashSet<(String, String)> =
+            ::std::collections::HashSet::with_capacity(input.change_set.len());
+        for (index, change) in input.change_set.iter().enumerate() {
             let entity_type = crate::state::entity_type_of(&change.entity.r#type);
 
             // "You can use either Details or DetailsDocument, but not both."
@@ -461,35 +539,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `EntityIdList` can report it while the change set runs. A
             // `VALIDATE` change set never creates an entity, so it reserves
             // nothing.
-            let entity_id = match change.entity.identifier.as_deref() {
-                Some(identifier) => {
-                    // The identifier addresses the entity at an optional
-                    // revision, so what it names is the entity id inside it —
-                    // which is what a refusal for an absent entity names too.
-                    let entity_id = crate::state::entity_id_of(identifier);
-                    let Some(entity) = store.resolve_identifier(identifier) else {
-                        return Err(StartChangeSetErrorModeled::ResourceNotFoundException(
-                            crate::state::entity_not_found(entity_id),
-                        )
-                        .into());
+            //
+            // A change that names another change acts on that change's entity,
+            // so the change it resolves THROUGH is the one its chain of
+            // references ends at — itself, when it names no change.
+            let target = targets[index];
+            let target_change = &input.change_set[target];
+            let target_entity_type = crate::state::entity_type_of(&target_change.entity.r#type);
+            // An entity is of ONE type, so a change acting on another change's
+            // entity acts on it under the type that change named.
+            if target != index && target_entity_type != entity_type {
+                let named = target_change.change_name.as_deref().unwrap_or_default();
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::validation(
+                        "ChangeSet.Entity.Type",
+                        format!(
+                            "the entity of change '{named}' is a {target_entity_type}, \
+                             not a {entity_type}"
+                        ),
+                    ),
+                )
+                .into());
+            }
+            let entity_id = match resolved[target].clone() {
+                Some(held) => held,
+                None => {
+                    let held = match target_change.entity.identifier.as_deref() {
+                        Some(identifier) => {
+                            // The identifier addresses the entity at an optional
+                            // revision, so what it names is the entity id inside
+                            // it — which is what a refusal for an absent entity
+                            // names too.
+                            let entity_id = crate::state::entity_id_of(identifier);
+                            let Some(entity) = store.resolve_identifier(identifier) else {
+                                return Err(
+                                    StartChangeSetErrorModeled::ResourceNotFoundException(
+                                        crate::state::entity_not_found(entity_id),
+                                    )
+                                    .into(),
+                                );
+                            };
+                            if entity.entity_type != target_entity_type {
+                                let held = entity.entity_type.clone();
+                                return Err(StartChangeSetErrorModeled::ValidationException(
+                                    crate::state::validation(
+                                        "ChangeSet.Entity.Type",
+                                        format!(
+                                            "entity {entity_id} is a {held}, not a \
+                                             {target_entity_type}"
+                                        ),
+                                    ),
+                                )
+                                .into());
+                            }
+                            Some(entity.id.clone())
+                        }
+                        None if intent == crate::state::INTENT_APPLY => {
+                            Some(store.mint_entity_id())
+                        }
+                        None => None,
                     };
-                    if entity.entity_type != entity_type {
-                        let held = entity.entity_type.clone();
-                        return Err(StartChangeSetErrorModeled::ValidationException(
-                            crate::state::validation(
-                                "ChangeSet.Entity.Type",
-                                format!("entity {entity_id} is a {held}, not a {entity_type}"),
-                            ),
-                        )
-                        .into());
-                    }
-                    Some(entity.id.clone())
+                    resolved[target] = Some(held.clone());
+                    held
                 }
-                None if intent == crate::state::INTENT_APPLY => Some(store.mint_entity_id()),
-                None => None,
             };
 
             if let Some(entity_id) = entity_id.as_deref() {
+                // "Within a single ChangeSet, you can't start the same change
+                // type against the same entity multiple times" — judged here on
+                // the entity the changes RESOLVED to as well as above on the one
+                // each named, because two changes reach one entity whenever one
+                // of them names the other or the entity it creates.
+                if !claimed_entities.insert((entity_id.to_string(), change.change_type.clone())) {
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::duplicate_change_pair(&change.change_type, entity_id),
+                    )
+                    .into());
+                }
                 // "when a ChangeSet is running, all the entities targeted by
                 // the different changes are locked until the change set has
                 // completed … If you try to start a change set containing a
