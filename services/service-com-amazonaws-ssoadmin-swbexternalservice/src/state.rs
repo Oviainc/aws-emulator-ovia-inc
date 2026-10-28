@@ -243,9 +243,17 @@ pub const CLIENT_TOKEN_MISMATCH_MESSAGE: &str =
      parameters.";
 
 /// The refusal an `InstanceArn` this account holds no instance for earns, as the message
-/// of the modelled `AccessDeniedException` — the only not-found channel
-/// `DescribeInstance`/`DeleteInstance` declare ("DELETE_IN_PROGRESS — … Returns
-/// AccessDeniedException after the delete operation completes").
+/// of whichever not-found the calling operation models — the `ResourceNotFoundException`
+/// (HTTP 404) most of this API declares, or the `AccessDeniedException` (HTTP 403) that is
+/// the only such channel on `DescribeInstance`/`DeleteInstance`, `AddRegion`,
+/// `ListRegions`, `ListApplications` and the trusted-token-issuer create and list
+/// ("DELETE_IN_PROGRESS — … Returns AccessDeniedException after the delete operation
+/// completes").
+///
+/// One condition reads ONE way: every operation that resolves an `InstanceArn` reports it
+/// through this helper, so a client that branches on the detail text — the only member
+/// these error shapes carry — sees the same sentence for one ARN whichever operation it
+/// called.
 ///
 /// Built from the request: it names the ARN that resolved to nothing.
 pub fn instance_not_found_message(instance_arn: &str) -> String {
