@@ -6,6 +6,12 @@
 //! one [`crate::state::TRANSITION_SPAN`] later, and the `OperationId` returned names a
 //! persisted `START_APPLICATION` operation record that `GetOperation` reads back.
 //!
+//! The database management system the application is connected to comes up WITH it
+//! ([`crate::state::StoredDbms::start`]): the call carries no switch to leave the DBMS
+//! down — unlike `StopApplication`, which stops it only when it names it as the
+//! connected entity to stop — so a start brings the databases of this application to
+//! `STARTING` now and `RUNNING` one span later, whatever stopped them.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,6 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Starting the application starts the database management system it is connected
+        // to: this call carries no switch to leave it down, and an application cannot run
+        // without its databases.
+        application.dbms.start(now);
         application.status = crate::state::APPLICATION_STATUS_STARTING.to_string();
         application.last_updated = now;
         application.pending = Some(crate::state::PendingTransition {

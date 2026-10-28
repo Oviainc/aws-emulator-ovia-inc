@@ -60,6 +60,13 @@
 //! [`StoredApplication::database_view`], so the database a caller reads one by one is the
 //! database the listing reports.
 //!
+//! The database management system those databases live in is the one thing held BESIDE
+//! that record ([`StoredApplication::dbms`]), because the application and its connected
+//! DBMS are started and stopped separately: `StopApplication` stops the DBMS only when
+//! it names it as the connected entity to stop, so `Database$Status` reports the DBMS's
+//! own status ([`StoredDbms::status_for`]) rather than a second reading of the
+//! application's.
+//!
 //! An application's COMPONENTS are held the same way, ON the application rather than in
 //! a map of their own (a `ComponentId` names a component only within its application):
 //! the [`StoredComponent`] records in [`StoredApplication::components`] are the ones its
@@ -501,6 +508,106 @@ pub struct PendingSettings {
     pub database_arn: Option<String>,
 }
 
+/// A `DatabaseStatus` the clock owes the database management system connected to an
+/// application: the status it takes at `due_at`, whether or not anybody calls.
+#[derive(Debug, Clone)]
+pub struct PendingDbmsStatus {
+    /// When the change falls due. See [`TRANSITION_SPAN`].
+    pub due_at: SystemTime,
+    /// The `DatabaseStatus` the connected DBMS takes then.
+    pub status: String,
+}
+
+/// The running state of the database management system an application is connected to:
+/// the SAP HANA system its databases ([`StoredApplication::databases`]) live in.
+///
+/// It is held SEPARATELY from the application's own status because the two are started
+/// and stopped separately: a stop of the application reaches the connected DBMS only
+/// when the call names it as the connected entity to stop
+/// (`StopApplication$StopConnectedEntity`), the way that call's other switch reaches the
+/// Amazon EC2 instances only when it asks for them, while a start of the application
+/// brings the DBMS up with it because the call carries no switch to leave it down. So
+/// what `Database$Status` reports is this status rather than a second reading of the
+/// application's ([`Self::status_for`]).
+///
+/// Stopping and starting a DBMS is asynchronous like every other unit of work here: the
+/// call moves it to the transient status now and stores the instant the next one falls
+/// due ([`PendingDbmsStatus`]), which [`Self::settle`] materialises for every reader at
+/// once. Nothing sleeps.
+#[derive(Debug, Clone)]
+pub struct StoredDbms {
+    /// A `DatabaseStatus` value; see the `DATABASE_STATUS_*` constants.
+    pub status: String,
+    /// The status the clock owes it, if one is outstanding.
+    pub pending: Option<PendingDbmsStatus>,
+}
+
+impl StoredDbms {
+    /// The DBMS of a freshly registered application: a registration describes a running
+    /// SAP system, so nothing has stopped its database system. While the registration
+    /// itself is still under way no database status follows from it at all, which is
+    /// what [`Self::status_for`] reports.
+    pub fn running() -> Self {
+        Self {
+            status: DATABASE_STATUS_RUNNING.to_string(),
+            pending: None,
+        }
+    }
+
+    /// Materialise the status the clock already owes this DBMS, and answer the instant it
+    /// was owed at — `None` when nothing was due.
+    ///
+    /// The change was due at [`PendingDbmsStatus::due_at`] whether or not anybody called,
+    /// so applying it on a read reports what the DBMS already is rather than changing it.
+    pub fn settle(&mut self, now: SystemTime) -> Option<SystemTime> {
+        let due_at = self.pending.as_ref().map(|pending| pending.due_at)?;
+        if now < due_at {
+            return None;
+        }
+        let pending = self.pending.take().expect("checked present just above");
+        self.status = pending.status;
+        Some(due_at)
+    }
+
+    /// Stop the DBMS: it is `STOPPING` now and `STOPPED` one [`TRANSITION_SPAN`] later.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.transition(now, DATABASE_STATUS_STOPPING, DATABASE_STATUS_STOPPED);
+    }
+
+    /// Start the DBMS: it is `STARTING` now and `RUNNING` one [`TRANSITION_SPAN`] later.
+    pub fn start(&mut self, now: SystemTime) {
+        self.transition(now, DATABASE_STATUS_STARTING, DATABASE_STATUS_RUNNING);
+    }
+
+    /// Put the DBMS in `transient` now and owe it `settled` one [`TRANSITION_SPAN`] from
+    /// now, so a caller acting straight after the call still observes the transition.
+    fn transition(&mut self, now: SystemTime, transient: &str, settled: &str) {
+        self.status = transient.to_string();
+        self.pending = Some(PendingDbmsStatus {
+            due_at: now + TRANSITION_SPAN,
+            status: settled.to_string(),
+        });
+    }
+
+    /// The `DatabaseStatus` a database of an application whose `ApplicationStatus` is
+    /// `application_status` reports.
+    ///
+    /// A database lives in the connected DBMS, so the status it reports is that DBMS's —
+    /// but only from a status in which the service has established what the application
+    /// runs at all. For any other application status (its registration or its
+    /// deregistration is still under way, or discovery never succeeded) nothing is known
+    /// about its databases, which is what the model's `UNKNOWN` states.
+    pub fn status_for(&self, application_status: &str) -> &str {
+        match application_status {
+            APPLICATION_STATUS_ACTIVATED
+            | APPLICATION_STATUS_STARTING
+            | APPLICATION_STATUS_STOPPING
+            | APPLICATION_STATUS_STOPPED => self.status.as_str(),
+            _ => DATABASE_STATUS_UNKNOWN,
+        }
+    }
+}
+
 /// A registered SAP application: the state `Application` and `ApplicationSummary` are
 /// rebuilt from.
 #[derive(Debug, Clone)]
@@ -548,6 +655,10 @@ pub struct StoredApplication {
     /// that names a configuration is updating one it already holds rather than
     /// installing it ([`settings_update_message`] states which).
     pub backint: Option<BackintConfig>,
+    /// The running state of the database management system this application is connected
+    /// to — the SAP HANA system its databases live in, started and stopped separately
+    /// from the application itself ([`StoredDbms`]).
+    pub dbms: StoredDbms,
     /// The change the clock owes this application, if one is outstanding.
     pub pending: Option<PendingTransition>,
 }
@@ -565,6 +676,12 @@ impl StoredApplication {
     /// itself: [`RegionState::settle`] is what forgets it, and until it does this
     /// application still reports the `DELETING` status its deregistration gave it.
     pub fn settle(&mut self, now: SystemTime) {
+        // The connected DBMS runs on its own clock: a stop that named it as the connected
+        // entity, or a start that brought it back up, is due whether or not the
+        // application has a change outstanding too.
+        if let Some(due_at) = self.dbms.settle(now) {
+            self.last_updated = due_at.max(self.last_updated);
+        }
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
@@ -973,7 +1090,8 @@ impl StoredApplication {
     ///   match decides which credentials reach it); a database no credential names
     ///   carries none rather than the application's other credentials.
     /// * `Status` follows the application's, as a component's does
-    ///   ([`database_status_for`]).
+    ///   ([`StoredDbms::status_for`]), which a stop that names the connected DBMS moves
+    ///   without moving the application's.
     /// * `LastUpdated` is the instant the application record last changed, which is the
     ///   last thing that could have changed its databases.
     /// * `ConnectedComponentArns` are the ARNs of this application's components that this
@@ -1014,7 +1132,7 @@ impl StoredApplication {
             database_name: Some(database.database_name.clone()),
             database_type: Some(database.database_type.clone()),
             arn: Some(database.arn.clone()),
-            status: Some(database_status_for(&self.status).to_string()),
+            status: Some(self.dbms.status_for(&self.status).to_string()),
             // Discovered on the HANA instance; see this method's docs.
             primary_host: None,
             sql_port: None,
@@ -3406,27 +3524,6 @@ pub fn component_status_for(application_status: &str) -> &'static str {
         APPLICATION_STATUS_STOPPING => COMPONENT_STATUS_STOPPING,
         APPLICATION_STATUS_STOPPED => COMPONENT_STATUS_STOPPED,
         _ => COMPONENT_STATUS_UNDEFINED,
-    }
-}
-
-/// The `DatabaseStatus` of a SAP HANA database of an application whose
-/// `ApplicationStatus` is `application_status`.
-///
-/// A database runs as part of its application, exactly as a component does
-/// ([`component_status_for`]): starting and stopping an application is what starts and
-/// stops the database of its HANA component, so the database is up exactly while the
-/// application is up and is in the same transition while the application is in one. For
-/// any other application status — one where the service has not established what the
-/// application is running (its registration or its deregistration is still under way, or
-/// discovery never succeeded) — no database status follows from it, which is what the
-/// model's `UNKNOWN` states.
-pub fn database_status_for(application_status: &str) -> &'static str {
-    match application_status {
-        APPLICATION_STATUS_ACTIVATED => DATABASE_STATUS_RUNNING,
-        APPLICATION_STATUS_STARTING => DATABASE_STATUS_STARTING,
-        APPLICATION_STATUS_STOPPING => DATABASE_STATUS_STOPPING,
-        APPLICATION_STATUS_STOPPED => DATABASE_STATUS_STOPPED,
-        _ => DATABASE_STATUS_UNKNOWN,
     }
 }
 

@@ -323,6 +323,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `UpdateApplicationSettings$Backint`'s to install, so a freshly registered
             // application holds none.
             backint: None,
+            // A registration describes a running SAP system, so nothing has stopped the
+            // database management system its databases live in; only a stop that names
+            // the connected DBMS does
+            // (`crate::state::StoredDbms`). While the registration itself is still under
+            // way no database status follows from it at all.
+            dbms: crate::state::StoredDbms::running(),
             // Registration is asynchronous: the application becomes ACTIVATED with a
             // SUCCESS discovery one `TRANSITION_SPAN` from now, and the first request at
             // or after that instant reports it. Nothing sleeps.

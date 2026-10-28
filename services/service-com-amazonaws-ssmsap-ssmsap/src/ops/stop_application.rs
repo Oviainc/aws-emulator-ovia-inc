@@ -6,13 +6,18 @@
 //! [`crate::state::TRANSITION_SPAN`] later, and the `OperationId` returned names a
 //! persisted `STOP_APPLICATION` operation record that `GetOperation` reads back. The
 //! two optional switches the call carries are recorded as that operation's
-//! `Properties`.
+//! `Properties`, and each of them also ACTS, extending the stop beyond the application
+//! itself to exactly what it names:
 //!
-//! `IncludeEc2InstanceShutdown` is one of those switches and it also ACTS: set to true,
-//! the Amazon EC2 instances the registration associated with the application are stopped
-//! through the service that owns them
-//! ([`crate::state::ec2_shutdown::stop_instances`]), so the shutdown is observable where
-//! an instance's state lives.
+//! * `IncludeEc2InstanceShutdown` set to true stops the Amazon EC2 instances the
+//!   registration associated with the application, through the service that owns them
+//!   ([`crate::state::ec2_shutdown::stop_instances`]), so the shutdown is observable
+//!   where an instance's state lives.
+//! * `StopConnectedEntity` stops the connected database management system
+//!   ([`crate::state::StoredDbms::stop`]): it is `STOPPING` now and `STOPPED` one
+//!   [`crate::state::TRANSITION_SPAN`] later, which is what every `GetDatabase` of this
+//!   application's databases then reports. A stop that does NOT name it leaves the DBMS
+//!   as it was — running, if that is what it was — while the application stops.
 //!
 //! ## Shape of an operation
 //!
@@ -194,7 +199,8 @@ fn record_stop(
     let mut state = state.lock();
     state.settle(now);
 
-    if let Some(entity) = input.stop_connected_entity.as_deref() {
+    let stop_connected_entity = input.stop_connected_entity.as_deref();
+    if let Some(entity) = stop_connected_entity {
         // `StopConnectedEntity` is an enum in the model, so the boundary validator
         // has already refused anything outside it; this re-states the refusal
         // against the model's own catalogue.
@@ -233,6 +239,14 @@ fn record_stop(
             )),
         )
         .into());
+    }
+
+    // The connected entity the call names is stopped WITH the application: the model's
+    // only `ConnectedEntityType` is the DBMS, so naming one stops the database management
+    // system this application's databases live in, on its own clock and separately from
+    // the application's own status. A call that names none leaves it as it was.
+    if stop_connected_entity.is_some() {
+        application.dbms.stop(now);
     }
 
     application.status = crate::state::APPLICATION_STATUS_STOPPING.to_string();

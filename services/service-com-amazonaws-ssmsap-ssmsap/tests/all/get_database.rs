@@ -14,7 +14,8 @@
 //! resolved, and the `Database` reported for it carries the ids, name, type and ARN the
 //! listing reports for that same record plus what the registration declared about it (the
 //! credentials that name it) and what the store knows about the application it belongs to
-//! (the status that application is in, the instant its record last changed, and the ARN of
+//! (the status of the database management system that application is connected to, the
+//! instant its record last changed, and the ARN of
 //! the component the database belongs to); a reference no database of this account and
 //! Region answers is refused, and nothing the registration did not state is reported.
 //!
@@ -678,15 +679,19 @@ enum Act {
     Nothing,
     /// Wait out the change the clock owes the application.
     Settle,
-    /// Make the asynchronous call this route addresses.
-    Call(&'static str),
+    /// Make the asynchronous call this route addresses, naming the connected entity to
+    /// stop when the step carries one.
+    Call(&'static str, Option<&'static str>),
 }
 
-/// RULE: a database runs as part of its application, so the status it reports is the one
-/// that follows the status its application is in — including the transient status an
-/// asynchronous call gives the application until the clock settles it.
+/// RULE: a database lives in the database management system its application is connected
+/// to, so the status it reports is that DBMS's — the transient status the asynchronous
+/// call that stops or starts it gives it until the clock settles it, and `UNKNOWN` while
+/// the service has established nothing about what the application runs. A stop reaches
+/// that DBMS only when it names it as the connected entity to stop
+/// (`tests/all/stop_connected_entity.rs` is the suite that spans that rule).
 #[tokio::test]
-async fn the_status_of_a_database_follows_the_application_it_belongs_to() {
+async fn the_status_of_a_database_follows_the_dbms_it_lives_in() {
     let emulator = Emulator::new();
     let application_id = "hdb-status";
     let body = Case {
@@ -710,25 +715,44 @@ async fn the_status_of_a_database_follows_the_application_it_belongs_to() {
     // Each step is (what to do to the application, how an assertion names the step, the
     // status the database must report afterwards). A registration, a stop and a start are
     // asynchronous, so the read straight after each call sees the transient status and the
-    // read after the clock has settled sees the status the application moved to.
+    // read after the clock has settled sees the status the DBMS moved to.
     let reference = json!({"ApplicationId": application_id, "DatabaseId": "SYSTEMDB"});
     let steps: &[(Act, &str, &str)] = &[
         // Registering: the service has not established what the application runs yet.
         (Act::Nothing, "just registered", "UNKNOWN"),
         (Act::Settle, "registered and settled", "RUNNING"),
-        (Act::Call("/stop-application"), "stopping", "STOPPING"),
-        (Act::Settle, "stopped", "STOPPED"),
-        (Act::Call("/start-application"), "starting", "STARTING"),
+        // A stop that names no connected entity stops the application alone.
+        (
+            Act::Call("/stop-application", None),
+            "the application is stopping",
+            "RUNNING",
+        ),
+        (Act::Settle, "the application has stopped", "RUNNING"),
+        // One that names the DBMS stops the DBMS the database lives in.
+        (
+            Act::Call("/stop-application", Some("DBMS")),
+            "the DBMS is stopping",
+            "STOPPING",
+        ),
+        (Act::Settle, "the DBMS has stopped", "STOPPED"),
+        (
+            Act::Call("/start-application", None),
+            "starting",
+            "STARTING",
+        ),
         (Act::Settle, "started and settled", "RUNNING"),
     ];
     for (act, step, want) in steps {
         match act {
             Act::Nothing => {}
             Act::Settle => settle().await,
-            Act::Call(path) => {
-                let reply = emulator
-                    .send(path, json!({"ApplicationId": application_id}))
-                    .await;
+            Act::Call(path, connected_entity) => {
+                let mut body = Map::new();
+                body.insert("ApplicationId".into(), json!(application_id));
+                if let Some(entity) = connected_entity {
+                    body.insert("StopConnectedEntity".into(), json!(entity));
+                }
+                let reply = emulator.send(path, Value::Object(body)).await;
                 assert_eq!(
                     reply.status, 200,
                     "case {step:?}: expected 200 from {path}, got {reply:?}"

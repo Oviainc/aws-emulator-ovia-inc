@@ -83,6 +83,8 @@ mod resource_tags;
 mod settings_destroyed_databases;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_connected_entity.rs"]
+mod stop_connected_entity;
 #[path = "all/sub_check_result_cursor.rs"]
 mod sub_check_result_cursor;
 #[path = "all/sub_check_results.rs"]
