@@ -161,16 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
             })?;
 
-        // `TagMap` is `@length(1, 50)`, so an untagged environment reports no `Tags`
-        // member rather than an empty map outside that bound.
+        // The `Tags` member is decided in the one place the `Environment` shape reads it
+        // from, so both responses agree about what this environment's tags are.
         Ok(ListTagsForResourceOutput {
-            tags: (!stored.tags.is_empty()).then(|| {
-                stored
-                    .tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            tags: stored.tags_member(),
         })
     }
 }
