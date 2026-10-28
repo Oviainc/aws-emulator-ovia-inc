@@ -18,6 +18,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// regional scoping names its own.
 pub(crate) const REGION: &str = "us-east-1";
 
+/// The access-key id every call below is signed with unless a case names another: one
+/// neither STS nor IAM holds a record of, so it resolves to the account's own ambient
+/// identity — the position an AWS account root credential is in, which no identity-based
+/// policy governs.
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEMULATOR";
+
 /// A router with only this service mounted, over one shared engine — the same
 /// assembly `core/router` performs, minus the other services.
 pub(crate) fn router() -> MultiServiceRouter {
@@ -36,10 +42,41 @@ pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryE
     (router, engine)
 }
 
-/// Call one operation in `region` and return its HTTP status and JSON body.
+/// [`router`], with the IAM and STS services mounted beside this one over the SAME engine
+/// — the assembly a case about the identity-based half of an authorization decision needs,
+/// since the principal a request speaks for and the documents in force on it are those two
+/// services' own state.
+pub(crate) fn router_with_identity_services() -> MultiServiceRouter {
+    let (mut router, engine) = router_with_engine();
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(
+        service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// Call one operation in `region` as [`ACCOUNT_KEY`] and return its HTTP status and JSON
+/// body.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    call_as(router, region, ACCOUNT_KEY, operation, body).await
+}
+
+/// [`call`], signed with `access_key_id` in the SigV4 credential scope — which is where a
+/// service reads the caller's access key id from, so this is what makes a call speak for
+/// one principal rather than another.
+pub(crate) async fn call_as(
+    router: &MultiServiceRouter,
+    region: &str,
+    access_key_id: &str,
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
@@ -52,7 +89,7 @@ pub(crate) async fn call(
             "authorization",
             format!(
                 "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEMULATOR/20260101/{region}/kms/aws4_request, \
+                 Credential={access_key_id}/20260101/{region}/kms/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=0000"
             ),
         )
@@ -74,6 +111,22 @@ pub(crate) async fn call(
 /// Call one operation in [`REGION`], requiring success.
 pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     ok_in(router, REGION, operation, body).await
+}
+
+/// Call one operation in [`REGION`] as `access_key_id`, requiring success.
+pub(crate) async fn ok_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
+    let (status, payload) = call_as(router, REGION, access_key_id, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {operation} {body} as {access_key_id}: expected HTTP 200, got {status} with \
+         {payload}"
+    );
+    payload
 }
 
 /// Call one operation in `region`, requiring success.
@@ -150,6 +203,112 @@ pub(crate) async fn refused(
         "case {operation} {body}: expected a failure, got HTTP 200 with {payload}"
     );
     (status, error_code(&payload), error_message(&payload))
+}
+
+/// Call an operation that must fail as `access_key_id`, and report its status, wire error
+/// code and message.
+pub(crate) async fn refused_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, String, String) {
+    let (status, payload) = call_as(router, REGION, access_key_id, operation, body).await;
+    assert_ne!(
+        status, 200,
+        "case {operation} {body} as {access_key_id}: expected a failure, got HTTP 200 with \
+         {payload}"
+    );
+    (status, error_code(&payload), error_message(&payload))
+}
+
+/// Create an IAM user through IAM's OWN operations — with `policy` as its inline policy
+/// when one is given — and answer the access-key id of a long-term key minted for it,
+/// beside the user's ARN.
+///
+/// A principal made this way is one the IAM store really holds, so the identity-based
+/// documents this service reads for it are the ones IAM wrote.
+pub(crate) async fn iam_user(
+    router: &MultiServiceRouter,
+    user_name: &str,
+    policy: Option<&str>,
+) -> (String, String) {
+    let body = iam_query(router, "CreateUser", &[("UserName", user_name.to_string())]).await;
+    let arn = xml_element(&body, "Arn")
+        .unwrap_or_else(|| panic!("CreateUser must answer the user Arn, got {body}"));
+    if let Some(policy) = policy {
+        iam_query(
+            router,
+            "PutUserPolicy",
+            &[
+                ("UserName", user_name.to_string()),
+                ("PolicyName", "inline".to_string()),
+                ("PolicyDocument", policy.to_string()),
+            ],
+        )
+        .await;
+    }
+    let body = iam_query(router, "CreateAccessKey", &[("UserName", user_name.to_string())]).await;
+    let access_key_id = xml_element(&body, "AccessKeyId")
+        .unwrap_or_else(|| panic!("CreateAccessKey must answer an AccessKeyId, got {body}"));
+    (access_key_id, arn)
+}
+
+/// One awsQuery call to IAM as [`ACCOUNT_KEY`], requiring success, with its response body.
+async fn iam_query(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, String)],
+) -> String {
+    let mut body = format!("Action={action}&Version=2010-05-08");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://iam.amazonaws.com/")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20260101/{REGION}/iam/aws4_request, \
+                 SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed awsQuery request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(status, 200, "iam:{action} must succeed, got {status} {body}");
+    body
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
+/// 3986's unreserved characters literal — so a policy document's braces and quotes survive
+/// the round trip.
+fn form_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// The text of the first `<name>…</name>` element of an awsQuery response.
+fn xml_element(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].to_string())
 }
 
 /// Wrap `material` under the public wrapping key `GetParametersForImport` answered, with
