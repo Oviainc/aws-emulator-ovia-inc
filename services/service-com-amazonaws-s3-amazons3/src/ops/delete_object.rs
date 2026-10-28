@@ -442,6 +442,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
             return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
 
+        // A DELETE MARKER is replicated where the covering rules ask for it — "specifies
+        // whether Amazon S3 replicates delete markers"
+        // (`DeleteMarkerReplication$Status`) — so the marker this delete laid is laid in
+        // those destinations too. A delete that removed a version, or found nothing there,
+        // laid no marker and so replicates nothing; the delete of ONE version (handled
+        // above, where `versionId` is named) is never replicated.
+        if matches!(outcome, crate::state::ObjectDeletion::MarkerLaid { .. }) {
+            let _ = store.replicate_delete_marker(&input.bucket, &input.key);
+        }
+
         // What this delete DID is also what it notifies about: a removal is
         // `s3:ObjectRemoved:Delete` and a delete marker is
         // `s3:ObjectRemoved:DeleteMarkerCreated`, while a delete that found nothing there
