@@ -165,13 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // way, the way `set_identity_notification_topic` stores a topic ARN:
         // reporting back a value no later lookup of this service would match
         // would make the record disagree with the resource it names.
-        if let Some(sns_destination) = destination.sns_destination.as_mut() {
-            sns_destination.topic_arn = sns_destination.topic_arn.trim().to_string();
-        }
-        if let Some(firehose) = destination.kinesis_firehose_destination.as_mut() {
-            firehose.delivery_stream_arn = firehose.delivery_stream_arn.trim().to_string();
-            firehose.iam_role_arn = firehose.iam_role_arn.trim().to_string();
-        }
+        crate::state::trim_event_destination_arns(&mut destination);
 
         // What the request DESCRIBES is read first, through the one shared rule
         // both event-destination writers follow: a destination that describes

@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let package = store.packages.get(&input.package_name).ok_or_else(|| {
             GetPackageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Package {} does not exist", input.package_name)),
+                message: Some(crate::state::missing_package_message(&input.package_name)),
             })
         })?;
 

@@ -87,6 +87,8 @@ mod ses_template_update;
 mod ses_unverified_sender_refusal;
 #[path = "all/ses_unverified_sender_region.rs"]
 mod ses_unverified_sender_region;
+#[path = "all/ses_update_configuration_set_event_destination.rs"]
+mod ses_update_configuration_set_event_destination;
 #[path = "all/ses_update_receipt_rule.rs"]
 mod ses_update_receipt_rule;
 #[path = "all/ses_validation_refusal_wording.rs"]

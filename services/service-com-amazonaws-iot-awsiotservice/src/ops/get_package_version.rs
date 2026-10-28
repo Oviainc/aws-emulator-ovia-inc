@@ -181,9 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetPackageVersionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Version {} of package {} does not exist",
-                            input.version_name, input.package_name
+                        message: Some(crate::state::missing_package_version_message(
+                            &input.package_name,
+                            &input.version_name,
                         )),
                     },
                 )

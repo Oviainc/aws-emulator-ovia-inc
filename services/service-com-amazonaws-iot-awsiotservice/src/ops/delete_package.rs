@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the software package the request names from the account's catalog
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::packages`]), so no reader of
+//! that package finds it afterwards and the name is free to be created again.
+//!
+//! The operation is `@idempotent` and models NO not-found error, so a `packageName`
+//! the catalog does not hold is a 200 that removed nothing — the state the caller
+//! asked for is the state it gets — rather than a refusal this operation cannot
+//! express.
+//!
+//! "All package versions must be deleted before deleting the software package": a
+//! package that still holds versions is refused with the modelled
+//! `ValidationException` (HTTP 400) and kept whole, so no version is removed by a call
+//! that names only its package.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +146,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePackage"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePackageErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // An `@idempotent` delete that models no not-found error answers with the state
+        // the caller asked for: that package is gone.
+        let Some(package) = store.packages.get(&input.package_name) else {
+            return Ok(DeletePackageOutput {});
+        };
+
+        // Every version has to go first, so a delete that names only the package never
+        // takes versions with it.
+        let version_count = package.versions.len();
+        if version_count > 0 {
+            return Err(DeletePackageErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Package {} still holds {version_count} version(s); all package \
+                         versions must be deleted before deleting the software package",
+                        input.package_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.packages.remove(&input.package_name);
+        Ok(DeletePackageOutput {})
     }
 }

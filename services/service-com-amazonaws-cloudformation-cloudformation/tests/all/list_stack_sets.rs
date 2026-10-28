@@ -18,8 +18,8 @@
 //! execution on and off, and the three drift aggregates a StackSet's instances can add up to
 //! (never checked, every instance in sync, one instance drifted).
 //!
-//! `CreateStackSet` and `UpdateStackSet` are the store's WRITERS a wire call can drive —
-//! `DeleteStackSet` is still a scaffold with a stub issue of its own — so the rows
+//! `CreateStackSet`, `UpdateStackSet` and `DeleteStackSet` are the store's WRITERS a wire
+//! call can drive — so the rows
 //! below, which span StackSet shapes no single call sequence produces, are seeded straight
 //! into the store through
 //! `state::ComAmazonawsCloudformationCloudformationState::record_stack_set`, the same device
@@ -316,12 +316,30 @@ async fn every_member_is_read_off_the_stackset_record() {
 
         // The same record read through `DescribeStackSet`: the two reads cannot disagree
         // about the StackSet's identity, status, permission model or drift.
+        //
+        // A DELETED record is the one row this cross-check is different for: `DeleteStackSet`
+        // leaves the summary the list above reports, and nothing RESOLVES the StackSet any
+        // more, so the describe of it is the modelled `StackSetNotFoundException` instead —
+        // which `delete_stack_set.rs` pins over the whole deletion path.
         let (http_status, described) = call(
             &router,
             "DescribeStackSet",
             &[member("StackSetName", row.stack_set)],
         )
         .await;
+        if row.stack_set_status == status::DELETED {
+            assert_eq!(
+                http_status, 404,
+                "case {case:?}: expected a deleted StackSet to resolve to nothing, got \
+                 {http_status} {described}"
+            );
+            assert_eq!(
+                xml_text(&described, "Code").as_deref(),
+                Some("StackSetNotFoundException"),
+                "case {case:?}: expected the modelled refusal, got {described}"
+            );
+            continue;
+        }
         assert_eq!(
             http_status, 200,
             "case {case:?}: expected DescribeStackSet to answer 200, got {http_status} \

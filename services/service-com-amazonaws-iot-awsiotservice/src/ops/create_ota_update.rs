@@ -30,12 +30,14 @@
 //! ([`crate::state::MAX_JOB_TARGETS`], [`crate::state::MAX_OTA_UPDATE_FILES`]) and
 //! refused past either with the modelled `LimitExceededException`.
 //!
+//! The deployed job's DOCUMENT is generated here, not supplied: `CreateOTAUpdate`
+//! models no `document` member, so the document the update's job hands its targets is
+//! built from the request's `files`, `protocols` and `awsJobPresignedUrlConfig`
+//! ([`crate::state::ota_update_job_document`]) and persisted on the job, which is what
+//! `GetJobDocument` reports and what every execution the deployment creates carries.
+//!
 //! What this handler does not honour, and how it answers instead:
 //!
-//! * The deployed job carries NO `document`: an OTA job document names the stream and
-//!   the signed firmware image AWS's OTA Update Manager builds, and nothing here
-//!   streams or signs a file, so the job's executions report no `jobDocument` rather
-//!   than an invented one — the same answer a job created from `documentSource` gets.
 //! * `awsJobAbortConfig` / `awsJobTimeoutConfig` / `awsJobExecutionsRolloutConfig`
 //!   shape the RATE of a rollout, its abort criteria and its per-device timeout, not
 //!   whether an execution exists: every target is given its execution at once, which is
@@ -344,6 +346,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .and_then(|config| config.in_progress_timeout_in_minutes);
 
+        // The document the deployed job hands its targets: the OTA service generates it
+        // from the request — this operation models no `document` member — so it is
+        // built here, before any lock is taken, and a request whose files would not fit
+        // one `JobDocument` is refused instead of deploying a job no reader can report.
+        let job_document = crate::state::ota_update_job_document(
+            &region,
+            ota_update.protocols.as_deref(),
+            ota_update.aws_job_presigned_url_config.as_ref(),
+            &ota_update.files,
+        )
+        .map_err(|length| {
+            invalid(format!(
+                "the job document generated for this OTA update is {length} bytes; a \
+                 job document may be at most {} bytes",
+                crate::state::MAX_JOB_DOCUMENT_BYTES
+            ))
+        })?;
+
         // Nothing is written until every target resolves and both ids are free, so a
         // request this operation refuses creates neither the update, nor its job, nor
         // an execution for the targets that did resolve. The lock order is this
@@ -401,10 +421,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_id: aws_iot_job_id.clone(),
             job_arn: ota_update.aws_iot_job_arn.clone(),
             description: ota_update.description.clone(),
-            // An OTA job document names the stream and the signed image AWS builds;
-            // nothing here streams or signs a file, so the job carries none rather
-            // than an invented one.
-            document: None,
+            // The document the OTA service generated for this update above: it is the
+            // job's own, so `GetJobDocument` reports it and every execution the
+            // deployment creates hands the device the same copy.
+            document: Some(job_document),
             document_source: None,
             targets: ota_update.targets.clone(),
             target_selection: ota_update.target_selection.clone(),

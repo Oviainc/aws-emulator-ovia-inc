@@ -11,11 +11,13 @@
 //! `SubJobMetadata`. Every other job type is one plain job. The `JobId` answered is the
 //! main job's for an export order, the job's own otherwise.
 //!
-//! A request that names a `ClusterId` creates a node of that cluster instead: a job
-//! attribute the request leaves out is the cluster's ("the other job attributes are
-//! inherited from the cluster"), while one the request supplies is this job's own, and the
-//! create is refused once the cluster holds the five nodes a cluster supports — or once the
-//! cluster has left the lifecycle window in which its node set still grows at all.
+//! A request that names a `ClusterId` creates a node of that cluster instead: every
+//! attribute the cluster's own record holds for the order it ships is the node's too ("the
+//! other job attributes are inherited from the cluster"), so a request that names one of
+//! them with a value other than the cluster's is refused as a combination that cannot
+//! hold, while the members a cluster holds no order-wide value for stay the node's own.
+//! The create is refused once the cluster holds the five nodes a cluster supports — or once
+//! the cluster has left the lifecycle window in which its node set still grows at all.
 //!
 //! ## Shape of an operation
 //!
@@ -462,42 +464,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateJob<Eng> {
             // "Job or cluster creation failed. One or more inputs were invalid. Confirm
             // that the CreateClusterRequest$SnowballType value supports your
             // CreateJobRequest$JobType, and try again"
-            // (`InvalidInputCombinationException`): a node's job type and device type are
-            // the cluster's, so a request that names either and disagrees with the cluster
-            // is a combination that cannot hold, rather than an instruction to change the
-            // order.
-            for (member, requested, held) in [
-                ("JobType", input.job_type.as_deref(), cluster.job_type.as_str()),
-                (
-                    "SnowballType",
-                    input.snowball_type.as_deref(),
-                    cluster.snowball_type.as_str(),
-                ),
-            ] {
-                if requested.is_some_and(|requested| requested != held) {
-                    return Err(CreateJobErrorModeled::InvalidInputCombinationException(
-                        InvalidInputCombinationException {
-                            message: Some(format!(
-                                "Job creation failed. One or more inputs were invalid: the \
-                                 cluster {cluster_id} is a {held} cluster, so a node of it \
-                                 cannot be created with a different {member}."
-                            )),
-                        },
-                    )
-                    .into());
-                }
+            // (`InvalidInputCombinationException`): an attribute the cluster's own record
+            // holds for the whole order it ships — `ClusterMetadata` reports ONE of each,
+            // one address and one shipping speed included — is carried by every node of
+            // that cluster rather than copied per node, so a request that names one of
+            // them with a value other than the cluster's is a combination that cannot
+            // hold, rather than an instruction to ship this one node elsewhere, at another
+            // speed, under another role than the rest of the order. Which attributes those
+            // are, and how a named value is compared with the cluster's, is the one rule
+            // `crate::state::StoredCluster::first_disagreeing_order_attribute` holds —
+            // the same set `UpdateJob` and `UpdateCluster` write to the cluster AND to
+            // every node of it, so a create can no longer store a divergence those two
+            // then silently write away.
+            if let Some(member) = cluster.first_disagreeing_order_attribute(&input) {
+                // The model documents this error's wording for the one pair it names: "Job
+                // or cluster creation failed. One or more inputs were invalid. Confirm that
+                // the CreateClusterRequest$SnowballType value supports your
+                // CreateJobRequest$JobType, and try again"
+                // (`InvalidInputCombinationException`). Every other attribute of the order
+                // is refused in that same sentence, naming the member that carried it on
+                // each side and the cluster whose value it disagrees with.
+                let confirm = match member {
+                    "JobType" | "SnowballType" => "Confirm that the \
+                         CreateClusterRequest$SnowballType value supports your \
+                         CreateJobRequest$JobType, and try again."
+                        .to_string(),
+                    member => format!(
+                        "Confirm that the CreateJobRequest${member} value matches the \
+                         CreateClusterRequest${member} value of the cluster {cluster_id}, \
+                         from which a node job inherits its other job attributes, and try \
+                         again."
+                    ),
+                };
+                return Err(CreateJobErrorModeled::InvalidInputCombinationException(
+                    InvalidInputCombinationException {
+                        message: Some(format!(
+                            "Job or cluster creation failed. One or more inputs were \
+                             invalid. {confirm}"
+                        )),
+                    },
+                )
+                .into());
             }
 
-            // The node job starts as the cluster's attributes, under an id of its own:
-            // "you only need to provide the clusterId value; the other job attributes are
-            // inherited from the cluster" — inheritance is what fills a member the request
-            // leaves OUT, which is the whole of what "you only need to provide" says. A
-            // member the request does carry is this job's own, since every one of them is
-            // a modelled input of this operation and `Description` is documented as "an
-            // optional description of this specific job": per job, not per cluster. So
-            // each member is the value supplied, and the cluster's only where none was.
-            // The members a cluster does not model at all have nothing to inherit, so for
-            // them the request is the only source.
+            // The node job IS the cluster's attributes, under an id of its own: "you only
+            // need to provide the clusterId value; the other job attributes are inherited
+            // from the cluster". The check above has already held every attribute of the
+            // order the request names to the cluster's value, so the request has nothing
+            // left to contribute to those: what it still carries is the members a cluster
+            // holds no order-wide value for — the capacity a device is configured with and
+            // whether it is managed remotely, neither of which `ClusterMetadata` reports —
+            // and the members only a job has, which the cluster holds nothing to inherit
+            // them from.
             let job_id = store.mint_job_id();
             let unlock_code = store.mint_unlock_code();
             let mut node = cluster.node_job(
@@ -505,26 +523,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateJob<Eng> {
                 ::std::time::SystemTime::now(),
                 unlock_code,
             );
-            // The job type and the device type are the two the check above has already
-            // held to the cluster's, so a supplied value here equals what was inherited.
-            node.job_type = supplied(input.job_type).or(node.job_type);
-            node.snowball_type = supplied(input.snowball_type).or(node.snowball_type);
             node.snowball_capacity_preference = supplied(input.snowball_capacity_preference)
                 .or(node.snowball_capacity_preference);
-            node.shipping_option = supplied(input.shipping_option).or(node.shipping_option);
-            node.description = supplied(input.description).or(node.description);
-            node.address_id = supplied(input.address_id).or(node.address_id);
-            node.forwarding_address_id =
-                supplied(input.forwarding_address_id).or(node.forwarding_address_id);
-            node.role_arn = supplied(input.role_arn).or(node.role_arn);
-            node.kms_key_arn = supplied(input.kms_key_arn).or(node.kms_key_arn);
             node.remote_management = supplied(input.remote_management).or(node.remote_management);
-            node.resources = input.resources.or(node.resources);
-            node.notification = input.notification.or(node.notification);
-            node.on_device_service_configuration = input
-                .on_device_service_configuration
-                .or(node.on_device_service_configuration);
-            node.tax_documents = input.tax_documents.or(node.tax_documents);
             // A cluster models none of these, so there is nothing to inherit them from.
             node.long_term_pricing_id = input.long_term_pricing_id;
             node.device_configuration = input.device_configuration;

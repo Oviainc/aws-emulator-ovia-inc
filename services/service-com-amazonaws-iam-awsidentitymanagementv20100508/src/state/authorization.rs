@@ -9,11 +9,13 @@
 //! explicit `Deny` whose statement is about the request wins over every `Allow`, an
 //! `Allow` with no `Deny` permits, and a principal with neither is refused (the implicit
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
-//! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message that is ONE sentence
-//! built from the three things the decision was made about — the principal, the action
-//! and the resource — closed by why the decision went that way, and nothing further: a
-//! denial reports the decision, so it carries no clause about where to read more and no
-//! value that varies from one refusal to the next.
+//! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
+//! things the decision was made about — the principal, the action and the resource —
+//! closed by why the decision went that way. A refusal that READ the documents in force
+//! and found none allowing the call reports an evaluation whose details can be read, so
+//! that sentence continues with where to read them and under which authorization id
+//! ([`not_authorized_with_details`]); a refusal that read no document, and one explained
+//! by an explicit `Deny`, end at the reason ([`not_authorized`]).
 //!
 //! The four pieces, each held in exactly one place:
 //!
@@ -35,16 +37,18 @@
 //!    evaluation of IAM policy documents against `(action, resource)`, so IAM and every
 //!    other service handed the same documents decide alike.
 //!
-//! ## What the decision knows about the caller
+//! ## What the decision knows about the request
 //!
-//! A statement may be written to depend on WHO is calling rather than only on what is
-//! asked: through a `Condition` clause over a key of the signing principal, or through a
-//! policy VARIABLE in its `Resource` element, which the shared evaluation substitutes from
-//! the request's condition context. Since the signing principal is resolved here before
-//! anything is decided, that context is built from it ([`principal_context`]) and passed
-//! with the request, so one document attached to many users scopes itself to each of them
-//! and a clause over a principal tag is decided from the tags the user holds at the instant
-//! of the call.
+//! A statement may be written to depend on WHO is calling, or on WHICH resource is
+//! addressed, rather than only on what is asked: through a `Condition` clause over a key
+//! of the signing principal or of the target, or through a policy VARIABLE in its
+//! `Resource` element, which the shared evaluation substitutes from the request's
+//! condition context. Since the signing principal is resolved here before anything is
+//! decided, and the target is named by the call, that context is built from both
+//! ([`request_context`]) and passed with the request, so one document attached to many
+//! users scopes itself to each of them, a clause over a principal tag is decided from the
+//! tags the user holds at the instant of the call, and a clause over a tag of the
+//! addressed resource is decided from the tags that resource holds then.
 //!
 //! ## The callers that are not IAM users
 //!
@@ -121,6 +125,9 @@ pub const GET_USER: &str = "iam:GetUser";
 
 /// `iam:UpdateUser`.
 pub const UPDATE_USER: &str = "iam:UpdateUser";
+
+/// `iam:GetUserPolicy`.
+pub const GET_USER_POLICY: &str = "iam:GetUserPolicy";
 
 /// `iam:ListGroupsForUser`.
 pub const LIST_GROUPS_FOR_USER: &str = "iam:ListGroupsForUser";
@@ -241,7 +248,20 @@ const USER_ID_KEY: &str = "aws:userid";
 /// read from the principal's CURRENT tags, since nothing in the request carries them.
 const PRINCIPAL_TAG_PREFIX: &str = "aws:PrincipalTag/";
 
-/// The condition keys a request to IAM MODELS, whatever values it then carries for them
+/// The prefix the condition key of ONE tag of the resource the request ADDRESSES is
+/// spelled with in IAM's own key namespace: "`iam:ResourceTag/tag-key` — works with the
+/// tag attached to the IAM resource", the spelling an identity policy about an IAM
+/// resource uses.
+const IAM_RESOURCE_TAG_PREFIX: &str = "iam:ResourceTag/";
+
+/// The GLOBAL spelling of the same key: "`aws:ResourceTag/tag-key` — compares the tag key-
+/// value pair that you specify in the policy with the key-value pair attached to the
+/// resource". Both name the tags of the resource the request is taken on, so both are
+/// answered from the same tag set.
+const AWS_RESOURCE_TAG_PREFIX: &str = "aws:ResourceTag/";
+
+/// The condition keys a request to IAM MODELS about its SIGNING PRINCIPAL, whatever
+/// values it then carries for them
 /// (`::service_common::iam_authorization::Request::published`).
 ///
 /// The signing principal is resolved before any decision is made, so for each of these
@@ -249,7 +269,12 @@ const PRINCIPAL_TAG_PREFIX: &str = "aws:PrincipalTag/";
 /// carries none. [`PRINCIPAL_TAG_PREFIX`] is published as the whole key FAMILY it is,
 /// because the principal's tags are known in full: a key of that family the context does
 /// not carry is a tag the principal does not hold, not a key this emulator cannot read.
-const PUBLISHED_CONTEXT_KEYS: &[&str] = &[USER_NAME_KEY, USER_ID_KEY, PRINCIPAL_TAG_PREFIX];
+const PUBLISHED_PRINCIPAL_KEYS: &[&str] = &[USER_NAME_KEY, USER_ID_KEY, PRINCIPAL_TAG_PREFIX];
+
+/// The two resource-tag key families, published — like [`PRINCIPAL_TAG_PREFIX`] — only
+/// where the addressed resource's tag set is known in full, which is what lets a clause
+/// over one of its tags be decided at all.
+const PUBLISHED_RESOURCE_TAG_KEYS: &[&str] = &[IAM_RESOURCE_TAG_PREFIX, AWS_RESOURCE_TAG_PREFIX];
 
 /// The condition context a request signed by `user` carries: what IAM knows about the
 /// SIGNING principal at the instant of the call, which is where a policy variable's value
@@ -270,6 +295,40 @@ fn principal_context(user: &User) -> Vec<(String, String)> {
         ));
     }
     context
+}
+
+/// The condition context ONE request carries, and the keys it declares it models: what
+/// IAM knows about the signing principal ([`principal_context`]) together with what it
+/// knows about the RESOURCE the request is taken on.
+///
+/// A statement may be written to depend on the target rather than on the caller — an
+/// attribute-based grant comparing a tag of the resource to a tag of the principal is the
+/// canonical case — so the tags the addressed resource holds at the instant of the call
+/// are part of the request the decision is made about, under both spellings of the
+/// resource-tag key family. They are read from the store
+/// ([`IamState::resource_tags`](super::ComAmazonawsIamAwsidentitymanagementv20100508State::resource_tags)),
+/// so retagging either side changes what the same unchanged request decides.
+///
+/// The two families are DECLARED only for a resource whose tag set the account knows in
+/// full; for an ARN naming nothing it holds, a clause over one of its tags stays
+/// undecided, which is the fail-closed reading the shared evaluation gives every key this
+/// emulator cannot answer for.
+fn request_context(
+    store: &IamState,
+    principal: &[(String, String)],
+    resource: &str,
+) -> (Vec<(String, String)>, Vec<&'static str>) {
+    let mut context = principal.to_vec();
+    let mut published = PUBLISHED_PRINCIPAL_KEYS.to_vec();
+    if let Some(tags) = store.resource_tags(resource) {
+        for tag in tags {
+            for prefix in PUBLISHED_RESOURCE_TAG_KEYS {
+                context.push((format!("{prefix}{}", tag.key), tag.value.clone()));
+            }
+        }
+        published.extend_from_slice(PUBLISHED_RESOURCE_TAG_KEYS);
+    }
+    (context, published)
 }
 
 /// Whether the principal that signed this request may perform `action` on `resource`.
@@ -321,11 +380,13 @@ pub fn authorize_named(
 
     let principals = [principal.clone()];
     // What the policies in force are decided against BESIDES the action and the resource:
-    // the keys that describe the signing principal, which a statement reads either through
-    // a `Condition` clause or through a policy variable in its `Resource` element.
+    // the keys that describe the signing principal and the resource the call is taken on,
+    // which a statement reads either through a `Condition` clause or through a policy
+    // variable in its `Resource` element.
+    let (context, published) = request_context(store, &context, resource);
     let request = iam::Request::new(action, resource, &principals)
         .with_context(&context)
-        .with_published_keys(PUBLISHED_CONTEXT_KEYS);
+        .with_published_keys(&published);
     let decided = iam::identity_decision(&policies.documents, &request);
     // Whether the documents in force grant the call at all. An attachment whose
     // document the account does not hold is a grant this emulator cannot read, so it
@@ -383,7 +444,100 @@ pub fn authorize_named(
         explicit_deny = decided == Decision::Denied || capped == Decision::Denied,
         "the policies in force on the caller do not permit this call"
     );
-    Err(not_authorized(&principal, action, named_as, &reason))
+    // A refusal that WITHHELD a grant — the documents in force were read and none of them
+    // allowed the call — reports an evaluation there are details to read, so it closes
+    // with the pointer at those details. A refusal that read no document at all has no
+    // evaluation to point at, and one explained by an explicit `Deny` is explained by that
+    // statement, so each of those ends at the reason.
+    if decided == Decision::Denied || capped == Decision::Denied || policies.documents.is_empty() {
+        return Err(not_authorized(&principal, action, named_as, &reason));
+    }
+    Err(not_authorized_with_details(
+        &principal,
+        action,
+        named_as,
+        &reason,
+        &authorization_id(ctx, &principal, action, resource),
+    ))
+}
+
+/// Where the authorization details of ONE refused request are read: the console page for
+/// an authorization id.
+///
+/// The host and the Region parameter are IAM's own endpoint Region whichever Region the
+/// caller addressed, because IAM is a global service: there is one place its authorization
+/// details are served from, so a refusal answered to a caller elsewhere still points
+/// there.
+///
+/// LIMITATION, stated so the pointer is not mistaken for more than it is: this gate names
+/// the id of the refusal it is answering, and nothing here records the evaluation behind
+/// it, so a reader that follows the id into the authorization-details reader is told the
+/// details are not available. Recording them is the work of the operation that serves
+/// them, not of the refusal that names one.
+const AUTHORIZATION_DETAILS_PAGE: &str =
+    "https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1#/authorization-details/";
+
+/// [`not_authorized`], closed by the pointer to the authorization details of the
+/// evaluation that withheld the call: the page those details are read on, and the
+/// authorization id a reader of them takes.
+fn not_authorized_with_details(
+    principal: &str,
+    action: &str,
+    named_as: &str,
+    reason: &str,
+    authorization_id: &str,
+) -> AccessDenied {
+    AccessDenied::new(format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
+         {reason}. Go to {AUTHORIZATION_DETAILS_PAGE}{authorization_id} for complete \
+         details, or call the GetRequestAuthorizationDetails API with the following \
+         authorization id: {authorization_id}"
+    ))
+}
+
+/// The authorization id of THIS request: the handle its refusal points at.
+///
+/// Derived from what the request itself carries — the instant it was signed, the digest of
+/// its content, and what the decision was made about — rather than drawn at random, so two
+/// refusals over different content, at different instants or about different subjects are
+/// pointed at under different ids, and nothing has to be remembered for an id to stay the
+/// id of that refusal. It is a FUNCTION of those facts and nothing else: two refusals that
+/// agree on every one of them — the same caller refused the same call on the same content
+/// within the same second — are pointed at under one id, which is the determinism the
+/// wording this gate answers with is asserted on. The credential and signature a request is
+/// signed with are deliberately NOT part of it: the id travels back to the caller, so
+/// nothing derived from signing material goes into it.
+///
+/// Rendered by the tree's ONE derivation of an id from a seed
+/// ([`::service_common::caller_principal::aws_unique_id`]), in the lower case an
+/// authorization id is spelled in; it carries no type prefix, because an authorization id
+/// names a request rather than an entity.
+fn authorization_id(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    principal: &str,
+    action: &str,
+    resource: &str,
+) -> String {
+    /// The header fields that say WHEN a request was signed and WHAT it carried, neither
+    /// of which is credential material.
+    const REQUEST_HEADERS: &[&str] = &["x-amz-date", "x-amz-content-sha256"];
+    /// The separator between the seed's parts, so two different splittings of the same
+    /// text cannot seed the same id.
+    const SEPARATOR: char = '\n';
+
+    let headers = &ctx.parts().headers;
+    let mut seed = String::new();
+    for header in REQUEST_HEADERS {
+        if let Some(value) = headers.get(*header).and_then(|value| value.to_str().ok()) {
+            seed.push_str(value);
+        }
+        seed.push(SEPARATOR);
+    }
+    for part in [principal, action, resource] {
+        seed.push_str(part);
+        seed.push(SEPARATOR);
+    }
+    ::service_common::caller_principal::aws_unique_id("", &seed).to_lowercase()
 }
 
 /// The `AccessDenied` text AWS words a call it will not perform for its caller with:
@@ -395,6 +549,8 @@ pub fn authorize_named(
 /// is worded exactly as the policy decision above is, differing only in that reason.
 /// Every part of it is a fact of the request and of the account's state, so the same
 /// refused call is worded the same on every run and in every Region.
+/// [`not_authorized_with_details`] is this sentence continued by the pointer at the
+/// authorization details of an evaluation that withheld a grant.
 pub fn not_authorized(principal: &str, action: &str, named_as: &str, reason: &str) -> AccessDenied {
     AccessDenied::new(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
@@ -458,10 +614,12 @@ pub fn delegation_permission_check(
     let mut short_of_an_ask = false;
     for (action, resource) in &asks {
         // The same question [`authorize_named`] asks, so it is asked with the same
-        // knowledge of the caller (see [`principal_context`]).
+        // knowledge of the caller and of the resource each ask names
+        // ([`request_context`]).
+        let (ask_context, published) = request_context(store, &context, resource);
         let request = iam::Request::new(action, resource, &principals)
-            .with_context(&context)
-            .with_published_keys(PUBLISHED_CONTEXT_KEYS);
+            .with_context(&ask_context)
+            .with_published_keys(&published);
         let decided = iam::identity_decision_prepared(&documents, &request);
         if decided == Decision::Denied {
             return PERMISSION_CHECK_DENIED;

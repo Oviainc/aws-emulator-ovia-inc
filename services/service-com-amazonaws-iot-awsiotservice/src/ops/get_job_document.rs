@@ -14,9 +14,11 @@
 //! job has no parameter for is reported as written, because nothing here knows what it
 //! resolves to.
 //!
-//! A job created from `documentSource` — an S3 object this emulator does not fetch, as
-//! is the job an OTA update deploys — has no document here, so this reports none rather
-//! than inventing one; that is the same answer its executions give.
+//! A job created from `documentSource` — an S3 object this emulator does not fetch —
+//! has no document here, so this reports none rather than inventing one; that is the
+//! same answer its executions give. The job an OTA update deploys DOES have one: the
+//! OTA service generates that document on create
+//! ([`crate::state::ota_update_job_document`]), so it is reported like any other.
 //!
 //! ## Shape of an operation
 //!

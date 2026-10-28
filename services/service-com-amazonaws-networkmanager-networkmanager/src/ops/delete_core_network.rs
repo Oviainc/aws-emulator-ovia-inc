@@ -2,8 +2,10 @@
 
 //! @op DeleteCoreNetwork
 //! Deletes a core network along with the policy document it holds, reporting the removed
-//! record as `DELETING`, so the global network that owned it can then be deleted. An
-//! unknown `CoreNetworkId` is a 404. This is the ONLY file to touch for this operation.
+//! record as `DELETING`, so the global network that owned it can then be deleted. A core
+//! network still holding resources of its own (attachments, peerings) is refused with the
+//! dependency `ValidationException` (400). An unknown `CoreNetworkId` is a 404. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -147,17 +149,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deletes a core network along with all core network policies. This can only be
         // done if there are no attachments on a core network." The policies live on the
         // record itself (`state::CoreNetworkRecord::policy_versions`), so removing the
-        // record removes them with it; the attachments it holds block the delete until the
-        // caller removes them, reported like every other dependency refusal of this service
-        // through `state::dependents_block_delete`.
+        // record removes them with it; the resources it holds — its attachments and its
+        // peerings — block the delete until the caller removes them, reported like every
+        // other dependency refusal of this service through
+        // `state::dependents_block_delete`.
         //
         // The dependency refusal is computed only for a core network that IS stored, so the
         // one not-found answer below stays the single path for an id that names nothing.
         if store.core_networks.contains_key(&input.core_network_id) {
             let attachments = store.attachment_count_of_core_network(&input.core_network_id);
+            // A peering is a resource with an id, a reader and a delete of its own, and it
+            // hangs off exactly ONE core network (`state::PeeringRecord::core_network_id`),
+            // so it is a dependent of exactly the kind every delete of this service refuses
+            // to orphan — counted the way the per-core-network peering quota counts it.
+            // Were it not counted, the delete would leave a peering naming a core network
+            // no read can resolve: still served by its own reader while the global
+            // network's inventory, which resolves a peering through its core network, had
+            // stopped counting it.
+            let peerings = store.peering_count_of_core_network(&input.core_network_id);
+            // Listed with the kind the operation's own documentation names first ("This can
+            // only be done if there are no attachments on a core network").
             if let Some(refusal) = crate::state::dependents_block_delete(
                 crate::state::CORE_NETWORK_KIND,
-                &[(crate::state::ATTACHMENT_KIND, attachments)],
+                &[
+                    (crate::state::ATTACHMENT_KIND, attachments),
+                    (crate::state::PEERING_KIND, peerings),
+                ],
             ) {
                 return Err(DeleteCoreNetworkErrorModeled::ValidationException(refusal).into());
             }
