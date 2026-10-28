@@ -231,6 +231,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this write
+        // owes names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
+        let output = self.store(input, ctx, &correlation)?;
+        // Recorded LAST, so the response carries the pair the notifications already named
+        // this call by.
+        correlation.answer();
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObjectAcl<Eng> {
+    /// Replace the addressed version's ACL, answering what the caller is told and
+    /// starting the notifications the bucket's configuration owes for it.
+    ///
+    /// Everything that reads or writes the store lives here, so the guard is released
+    /// when this returns.
+    fn store(
+        &self,
+        input: PutObjectAclInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        correlation: &crate::state::request_ids::RequestCorrelation,
+    ) -> Result<PutObjectAclOutput, PutObjectAclError> {
+        // Everything this write needs is in its deserialized input: the canned ACL, the
+        // five grant headers, the version id and the expected owner all travel as members.
         // `ContentMD5` and `ChecksumAlgorithm` are integrity checks over the RAW request
         // body, which this handler never sees — the boundary has already parsed that body
         // into `AccessControlPolicy` — so they are left where `PutBucketAcl` leaves them.
@@ -402,7 +428,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(object) => acl_put.of_object(object),
             None => acl_put,
         };
-        let pending = crate::state::notifications::pending(&store, &input.bucket, &[acl_put]);
+        let pending =
+            crate::state::notifications::pending(&store, &input.bucket, &[acl_put], correlation);
         drop(store);
         crate::state::notifications::publish(ctx, pending);
 

@@ -323,6 +323,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this delete
+        // owes names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
+        let output = self.store(input, ctx, &correlation)?;
+        // Recorded LAST, so the response carries the pair the notifications already named
+        // this call by.
+        correlation.answer();
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng> {
+    /// Carry out the delete, answering what the caller is told and starting the
+    /// notifications the bucket's configuration owes for it.
+    ///
+    /// Everything that reads or writes the store lives here, so the guard is released
+    /// when this returns.
+    fn store(
+        &self,
+        input: DeleteObjectInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        correlation: &crate::state::request_ids::RequestCorrelation,
+    ) -> Result<DeleteObjectNoContent, DeleteObjectError> {
         // A conditional delete answers 412 when the condition fails.
         if input.if_match.is_some()
             || input.if_match_last_modified_time.is_some()
@@ -388,8 +412,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &input.key,
                     )
                     .of_version(Some(version_id.to_string()));
-                    let pending =
-                        crate::state::notifications::pending(&store, &input.bucket, &[removed]);
+                    let pending = crate::state::notifications::pending(
+                        &store,
+                        &input.bucket,
+                        &[removed],
+                        correlation,
+                    );
                     drop(store);
                     crate::state::notifications::publish(ctx, pending);
                     Ok(DeleteObjectNoContent {
@@ -438,7 +466,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             | crate::state::ObjectDeletion::VersionCountReached
             | crate::state::ObjectDeletion::TotalVersionCountReached => Vec::new(),
         };
-        let pending = crate::state::notifications::pending(&store, &input.bucket, &events);
+        let pending =
+            crate::state::notifications::pending(&store, &input.bucket, &events, correlation);
         drop(store);
         crate::state::notifications::publish(ctx, pending);
 
@@ -446,9 +475,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing versioned happened, so there is no marker and no version id to
             // report: the 204 carries no header of its own.
             crate::state::ObjectDeletion::Removed
-            | crate::state::ObjectDeletion::NothingThere => {
-                Ok(DeleteObjectNoContent::default())
-            }
+            | crate::state::ObjectDeletion::NothingThere => Ok(DeleteObjectNoContent::default()),
             // "Indicates whether the specified object version that was permanently deleted
             // was (true) or was not (false) a delete marker" / "Returns the version ID of
             // the delete marker created as a result of the DELETE operation": this delete
