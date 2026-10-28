@@ -193,6 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // latest stored version is the one generation runs against. The number is
         // resolved HERE and stored on the binding, so a later version of the schema
         // does not silently re-point a binding that was generated from this one.
+        //
+        // The READ resolution, not `crate::state::writable_registry`, and deliberately:
+        // what this call changes is not the registry's content but the binding it
+        // generates for the asking caller, and the schema version it names is only
+        // read. So a caller generates bindings for every schema it may read, the
+        // service-owned event catalogue included — which is what the code-binding
+        // operations are for — while every call that would change what a registry HOLDS
+        // still resolves through the write resolution and is refused for that registry.
         let (schema, version) = state
             .schema_at_version_mut(
                 &input.registry_name,

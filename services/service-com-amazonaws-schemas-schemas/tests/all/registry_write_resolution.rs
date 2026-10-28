@@ -221,7 +221,10 @@ impl Write {
 
 /// The service's one sentence for a caller's write to a service-owned registry, as
 /// every handler that refuses one words it.
-fn service_owned_sentence(registry: &str) -> String {
+///
+/// Shared with [`crate::code_bindings_for_managed_schemas`], which asserts the same
+/// refusal on the schema a code binding was just generated from.
+pub(crate) fn service_owned_sentence(registry: &str) -> String {
     format!(
         "Registry {registry} is an AWS-managed registry; its contents are owned by AWS \
          and cannot be created, updated or deleted."

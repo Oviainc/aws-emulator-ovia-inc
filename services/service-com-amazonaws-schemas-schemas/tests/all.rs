@@ -21,6 +21,8 @@ mod aws_managed_event_catalog;
 mod code_binding_lifecycle;
 #[path = "all/code_bindings.rs"]
 mod code_bindings;
+#[path = "all/code_bindings_for_managed_schemas.rs"]
+mod code_bindings_for_managed_schemas;
 #[path = "all/create_discoverer.rs"]
 mod create_discoverer;
 #[path = "all/describe_discoverer.rs"]

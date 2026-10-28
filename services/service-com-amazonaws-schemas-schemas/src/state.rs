@@ -190,12 +190,22 @@ impl ComAmazonawsSchemasSchemasState {
     /// The registry a caller's WRITE names, resolved for mutation, or why the write
     /// reaches none.
     ///
-    /// Every write this service serves that names a registry — to the registry itself,
-    /// to a schema or schema version in it, or to its resource-based policy — takes the
-    /// same two steps before it changes anything: the store must hold a registry of
-    /// that name, and what is in a service-owned registry is AWS's, so a caller may
-    /// read it but not write to it. Resolving and refusing together is what keeps the
-    /// second step from being forgotten by a handler that remembers the first.
+    /// Every write this service serves that changes what a registry HOLDS — the
+    /// registry itself, a schema or schema version in it, its tags or its
+    /// resource-based policy — takes the same two steps before it changes anything: the
+    /// store must hold a registry of that name, and what is in a service-owned registry
+    /// is AWS's, so a caller may read it but not write to it. Resolving and refusing
+    /// together is what keeps the second step from being forgotten by a handler that
+    /// remembers the first.
+    ///
+    /// A call that changes nothing the registry holds does not resolve through here, and
+    /// `PutCodeBinding` is the one such call this service serves: the code it starts
+    /// generating is derived FROM a schema version it only reads, and the binding is the
+    /// asking caller's own artifact rather than part of the registry's content. That is
+    /// why code generation is served for the schemas of a service-owned registry —
+    /// generating bindings for the published AWS event schemas is what the code-binding
+    /// operations are for — and why that put resolves through
+    /// [`Self::schema_at_version_mut`], deliberately and not by omission.
     ///
     /// The refusals are RETURNED rather than worded here, because each operation
     /// answers them through its own modelled error enum; the sentences are the
@@ -293,6 +303,14 @@ impl ComAmazonawsSchemasSchemasState {
     /// borrow, not an assumption about the store: the caller holds the one state lock
     /// across both, so nothing can have removed what the first lookup resolved — the
     /// same reason [`Self::writable_registry`] re-fetches what it has just resolved.
+    ///
+    /// It asks nothing about who OWNS the registry, and that is deliberate: the only
+    /// thing a caller attaches through this resolution is a code binding, which is code
+    /// generated from the resolved version for the caller who asked and leaves the
+    /// schema, its versions, its metadata and the registry exactly as they were. A
+    /// caller may generate bindings for every schema it may READ, the published AWS
+    /// event schemas included, so a write that CHANGES a registry's content resolves
+    /// through [`Self::writable_registry`] and this one must not.
     pub fn schema_at_version_mut(
         &mut self,
         registry_name: &str,
@@ -3862,6 +3880,11 @@ pub fn registry_not_empty() -> ConflictException {
 
 /// Refuse a caller's write to a service-owned registry or one of its schemas: AWS
 /// owns that content, so a caller may read it but never change it.
+///
+/// The content AWS owns is the registry, its schemas, their versions, their metadata
+/// and its policy. Code generated FROM one of those schemas is not that content — it is
+/// the asking caller's artifact — so a code-binding put is not refused here; see
+/// [`ComAmazonawsSchemasSchemasState::schema_at_version_mut`].
 pub fn managed_registry_is_read_only(registry: &str) -> ForbiddenException {
     forbidden(format!(
         "Registry {registry} is an AWS-managed registry; its contents are owned by AWS \
