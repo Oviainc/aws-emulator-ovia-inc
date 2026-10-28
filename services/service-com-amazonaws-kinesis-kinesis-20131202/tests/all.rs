@@ -61,6 +61,8 @@ mod stream_consumers;
 mod stream_encryption;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
+#[path = "all/stream_not_active_refusal.rs"]
+mod stream_not_active_refusal;
 #[path = "all/stream_removal.rs"]
 mod stream_removal;
 #[path = "all/stream_tags.rs"]

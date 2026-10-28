@@ -318,7 +318,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let status = stream.status(now);
         if !stream.serves_shards(now) {
             return Err(not_found(crate::state::stream_not_active_message(
-                &identifier, status,
+                &stream.name,
+                status,
             )));
         }
 
