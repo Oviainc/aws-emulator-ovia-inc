@@ -22,6 +22,12 @@
 //! what the record keeps; `DescribePublisher` reports the identity provider computed from
 //! it.
 //!
+//! Accepting the terms is not enough on its own: registering is open only to an ACCOUNT
+//! that is already enrolled as an Amazon Web Services Marketplace seller, an enrollment made
+//! outside this API, so an account that never enrolled is refused with that same modelled
+//! `CFNRegistryException` and writes nothing
+//! ([`crate::state::publisher::MarketplaceSellerEnrollment`]).
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -169,8 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // No `settle` call: a publisher registration carries no status the clock owes, and
-        // this operation neither reads nor writes a stack.
-        let publisher_id = state.lock().register_publisher(input.connection_arn);
+        // this operation neither reads nor writes a stack. The account-eligibility gate
+        // lives in the write itself, so a registration this account may not make is refused
+        // with the registry's own modelled 400 and stores nothing.
+        let publisher_id = state
+            .lock()
+            .register_publisher(input.connection_arn)
+            .map_err(registry_exception)?;
 
         Ok(RegisterPublisherOutput {
             publisher_id: Some(publisher_id),

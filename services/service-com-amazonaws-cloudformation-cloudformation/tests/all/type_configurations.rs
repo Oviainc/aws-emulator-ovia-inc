@@ -5,7 +5,8 @@
 //!
 //! The rule every case here holds the service to: **`ActivateType` puts the activation of a
 //! public extension in this account and Region's registry and answers the ARN this account
-//! addresses it by; `SetTypeConfiguration` persists the account-level configuration of the
+//! addresses it by — for a RESOURCE extension only when the request names an execution role;
+//! `SetTypeConfiguration` persists the account-level configuration of the
 //! extension THAT ARN names and answers the ARN of the configuration data; and
 //! `BatchDescribeTypeConfigurations` reads that same configuration, alias and ARN back,
 //! reporting an identifier that resolves to no extension as this batch's own error entry

@@ -4,11 +4,22 @@
 //! Activating a public third-party extension in this account and Region: the registry
 //! record the activation leaves, and the ARN this account addresses it by.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ActivateType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What the operation does
+//!
+//! "Activates a public third-party extension… to make it available for use in stack
+//! templates in your current account and Region", so the call WRITES one record of this
+//! Region's registry — addressed by the local name the activation gives the extension (its
+//! `TypeNameAlias`, else the extension's own name), which is the ARN it answers and the name
+//! `SetTypeConfiguration` and `DescribeType` then address it by.
+//!
+//! What the activation installs comes from the PUBLIC extension it activates, where this
+//! Region's registry holds the publication it was published by
+//! ([`crate::state::ComAmazonawsCloudformationCloudformationState::published_extension`]), so
+//! the activated version's schema and its published version number are that record's rather
+//! than invented. An activation of a public RESOURCE extension that names no
+//! `ExecutionRoleArn` is refused with the registry's own modelled `CFNRegistryException`
+//! (400) and writes nothing: CloudFormation invokes a resource type's handlers on the
+//! activating account's behalf, so there has to be a role for it to invoke them under.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the request names, and the rules the model states in prose rather than in a
         // constraint. Refused before any state is touched.
         let named = PublicExtension::read(&input).map_err(registry_exception)?;
+        // "The name of the IAM execution role to use to activate the extension": a public
+        // RESOURCE extension provisions resources through handlers CloudFormation invokes on
+        // the activating account's behalf, so there has to be a role for it to invoke them
+        // under and an activation that names none is refused. A module declares no handlers
+        // and a Hook is invoked on the stack operation's own credentials, so neither needs
+        // one.
+        if named.type_kind == registry::registry_type::RESOURCE && input.execution_role_arn.is_none()
+        {
+            return Err(registry_exception(NO_EXECUTION_ROLE.to_string()));
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no registry to activate an
             // extension in, so this answers 501 rather than an activation nothing recorded.
@@ -442,6 +463,12 @@ fn split_public_type_arn(arn: &str) -> Option<(String, String, String)> {
         type_name.replace('-', "::"),
     ))
 }
+
+/// The refusal AWS answers an activation of a public RESOURCE extension that names no
+/// execution role: CloudFormation invokes that extension's handlers on the activating
+/// account's behalf, so there has to be a role for it to invoke them under. Entirely fixed
+/// text: no part of it comes from the request or from the store.
+const NO_EXECUTION_ROLE: &str = "Please provide execution role to activate the Resource type";
 
 /// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
 /// during a CloudFormation registry operation".

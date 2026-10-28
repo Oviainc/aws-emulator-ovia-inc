@@ -167,23 +167,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ConflictException` is "the requested state transition isn't valid":
         // a list whose last change has not settled yet still has one in flight,
-        // so the delete is refused and the record is left exactly as it is. Once
-        // the clock has made the settled status due, the same call is served.
-        // The status is read out as an owned value, so the record is no longer
+        // so the delete is refused with the sentence the model states for that
+        // class (`crate::state::state_transition_conflict`, shared with the
+        // rule-group delete) and the record is left exactly as it is. Once the
+        // clock has made the settled status due, the same call is served. The
+        // status is read out as an owned value, so the record is no longer
         // borrowed when it is taken out of the store below.
         let in_flight = store
             .firewall_domain_lists
             .get(&input.firewall_domain_list_id)
             .map(|record| record.status_at(now).to_string())
             .filter(|status| status != crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE);
-        if let Some(status) = in_flight {
+        if in_flight.is_some() {
             return Err(DeleteFirewallDomainListErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Firewall domain list with ID \"{}\" is {} and cannot be deleted until that change completes",
-                        input.firewall_domain_list_id, status
-                    )),
-                },
+                crate::state::state_transition_conflict(),
             )
             .into());
         }

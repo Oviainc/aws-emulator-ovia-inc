@@ -287,6 +287,8 @@ mod snapshot_copy;
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]
 mod static_ip_allocation;
+#[path = "all/static_ip_detach.rs"]
+mod static_ip_detach;
 #[path = "all/static_ip_listing.rs"]
 mod static_ip_listing;
 #[path = "all/static_ip_release.rs"]

@@ -21,7 +21,8 @@ use sha2::{Digest, Sha256};
 use ::service_com_amazonaws_outposts_outpostsolafservice::state as outposts;
 
 use crate::ops::types::{
-    AccessDeniedException, FirewallConfig, FirewallDomainList, FirewallDomainListMetadata,
+    AccessDeniedException, ConflictException, FirewallConfig, FirewallDomainList,
+    FirewallDomainListMetadata,
     FirewallRule, FirewallRuleGroup,
     InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
@@ -425,6 +426,13 @@ pub const MAX_STORED_FIREWALL_DOMAIN_LISTS: usize = 1_000;
 /// `CreateFirewallRuleGroup` "creates an empty DNS Firewall rule group", which
 /// is settled the moment it exists, so the clock owes it no transition.
 pub const FIREWALL_RULE_GROUP_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The `FirewallRuleGroupStatus` a rule group reports once a delete has been
+/// accepted for it, the model's `DELETING`: `DeleteFirewallRuleGroup` answers
+/// with the rule group it just deleted, which is on its way out and so is no
+/// longer in the settled status it held until that call — the same role
+/// [`FIREWALL_DOMAIN_LIST_STATUS_DELETING`] plays for a domain list.
+pub const FIREWALL_RULE_GROUP_STATUS_DELETING: &str = "DELETING";
 
 /// `ResourceNotFoundException$ResourceType` for a firewall rule group: the
 /// modelled shape name of the resource, as for
@@ -1158,6 +1166,21 @@ pub fn firewall_domain_list_not_found(
     ResourceNotFoundException {
         message: Some(resource_not_found_message(firewall_domain_list_id)),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string()),
+    }
+}
+
+/// The `ConflictException` a DNS Firewall delete answers for a resource whose
+/// last change has not settled yet, built here so the deletes that refuse one
+/// report the same body.
+///
+/// The sentence is the one the model states for this error class
+/// (`smithy_query(query="shape",shape="ConflictException")`): "The requested
+/// state transition isn't valid. For example, you can't delete a firewall
+/// domain list if it is in the process of being deleted". It names no resource
+/// and no status, so nothing is interpolated into it.
+pub fn state_transition_conflict() -> ConflictException {
+    ConflictException {
+        message: Some("The requested state transition isn't valid.".to_string()),
     }
 }
 

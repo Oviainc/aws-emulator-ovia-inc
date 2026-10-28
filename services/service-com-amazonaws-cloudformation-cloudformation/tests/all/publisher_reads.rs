@@ -23,7 +23,8 @@
 
 use crate::publisher_registration::assert_registry_refusal;
 use crate::stack_lifecycle::{
-    call, call_in, member, router_with_engine, store, xml_text, ACCOUNT_ID, REGION,
+    call, call_in, enroll_as_a_marketplace_seller, member, router_with_engine, store, xml_text,
+    ACCOUNT_ID, REGION,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::publisher::{
     identity_provider, publisher_status,
@@ -133,6 +134,9 @@ async fn a_read_of_a_publisher_no_registration_stands_behind_is_refused() {
 #[tokio::test]
 async fn a_read_reports_the_registration_the_request_addresses() {
     let (router, engine) = router_with_engine();
+    // Being an enrolled Amazon Web Services Marketplace seller is what lets this account
+    // register at all, which the rows below read the registration of.
+    enroll_as_a_marketplace_seller(&engine);
 
     // The registration every row below reads back, written through the wire that writes it.
     let (status_code, body) = call(

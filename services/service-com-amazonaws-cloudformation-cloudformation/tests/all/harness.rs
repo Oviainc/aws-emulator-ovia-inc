@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use service_com_amazonaws_cloudformation_cloudformation::state::publisher::MarketplaceSellerEnrollment;
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     ComAmazonawsCloudformationCloudformationState, STATUS_TRANSITION_DELAY,
 };
@@ -74,6 +75,17 @@ pub fn store(
     engine: &Arc<engine::InMemoryEngine>,
 ) -> engine::ServiceState<ComAmazonawsCloudformationCloudformationState> {
     engine.state::<ComAmazonawsCloudformationCloudformationState>()
+}
+
+/// Say that the account these requests are signed for is an enrolled Amazon Web Services
+/// Marketplace seller, which is what `RegisterPublisher` requires of the account registering.
+///
+/// The enrollment is made outside this API — no CloudFormation operation performs it — so a
+/// suite whose cases run as a publisher says so on the store, exactly as an operator says it
+/// with `state::publisher::MARKETPLACE_SELLER_ENV`. A store nobody says it of is an account
+/// that never enrolled, which is what `publisher_registration.rs` holds the refusal to.
+pub fn enroll_as_a_marketplace_seller(engine: &Arc<engine::InMemoryEngine>) {
+    store(engine).lock().marketplace_seller = MarketplaceSellerEnrollment::enrolled();
 }
 
 /// Wait past the instant a stack operation's terminal status becomes due.

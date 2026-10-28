@@ -11,6 +11,11 @@
 //! a removal that removed nothing. A value that is not an ACM certificate ARN never
 //! reaches the set: both doors answer it with the modelled `BadRequestException` (400).
 //!
+//! What the set is keyed by is the WHOLE ARN the request carried — `Arn` targets the
+//! model's bare `__string` and nothing takes it apart — so two ARNs that differ anywhere
+//! are two certificates, and an accepted association answers the modelled 201 with no
+//! member at all (its response shape has none).
+//!
 //! The API has no operation that READS the set, so every case here observes it the only
 //! way a client can: through what `DisassociateCertificate` answers. That is also what
 //! makes these cases fail against a handler that stores nothing — a disassociation of a
@@ -124,11 +129,27 @@ fn assert_disassociated(case: &str, reply: &Reply) {
 }
 
 /// Assert `reply` is the 201 an association answers with.
+///
+/// The association's response shape carries NO members
+/// (`smithy_query(query="operation",operation="AssociateCertificate")`: `output {}`, `http`
+/// code 201), so an accepted association answers that status and nothing else — no error
+/// type, and no member invented for the body.
 fn assert_associated(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 201,
         "case {case:?}: expected HTTP 201, got {} with body {}",
         reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type.as_deref(),
+        None,
+        "case {case:?}: an accepted association carries no error type, got {:?}",
+        reply.error_type
+    );
+    assert!(
+        reply.body.is_null() || reply.body.as_object().is_some_and(|body| body.is_empty()),
+        "case {case:?}: the association's response shape has no members, got body {}",
+        reply.body
     );
 }
 
@@ -398,4 +419,90 @@ async fn associating_past_the_account_capacity_is_a_quota_refusal() {
         "case back at capacity: expected HTTP 402, got {} with body {}",
         refused.status, refused.body
     );
+}
+
+/// One ACM certificate ARN, and the ARNs that differ from it in exactly one field.
+///
+/// `Arn` targets the model's bare `__string` with no pattern, so the member carries the
+/// whole ARN and nothing takes it apart: two ARNs are the same certificate only when they
+/// are the same string. The rows differ along every field an ARN has — the partition, the
+/// region, the account and the certificate id — including two ways an id can be a
+/// near-miss: one character apart, and one extending the other.
+fn near_miss_pairs() -> Vec<(&'static str, &'static str, &'static str)> {
+    // The ARN every row's variant is built from: a certificate id of the shape ACM issues.
+    const BASE: &str =
+        "arn:aws:acm:us-west-2:123456789012:certificate/3f5c1b7a-9d2e-4c6f-8a1b-2c3d4e5f6a7b";
+    vec![
+        (
+            "certificate ids one character apart",
+            BASE,
+            "arn:aws:acm:us-west-2:123456789012:certificate/3f5c1b7a-9d2e-4c6f-8a1b-2c3d4e5f6a7c",
+        ),
+        (
+            "one certificate id extending the other",
+            BASE,
+            "arn:aws:acm:us-west-2:123456789012:certificate/3f5c1b7a-9d2e-4c6f-8a1b-2c3d4e5f6a7b-replica",
+        ),
+        (
+            "the same certificate id in another case",
+            BASE,
+            "arn:aws:acm:us-west-2:123456789012:certificate/3F5C1B7A-9D2E-4C6F-8A1B-2C3D4E5F6A7B",
+        ),
+        (
+            "another region",
+            BASE,
+            "arn:aws:acm:us-east-1:123456789012:certificate/3f5c1b7a-9d2e-4c6f-8a1b-2c3d4e5f6a7b",
+        ),
+        (
+            "another account",
+            BASE,
+            "arn:aws:acm:us-west-2:210987654321:certificate/3f5c1b7a-9d2e-4c6f-8a1b-2c3d4e5f6a7b",
+        ),
+        (
+            "another partition",
+            BASE,
+            "arn:aws-us-gov:acm:us-west-2:123456789012:certificate/3f5c1b7a-9d2e-4c6f-8a1b-2c3d4e5f6a7b",
+        ),
+    ]
+}
+
+/// What `AssociateCertificate` adds is the exact ARN the request carried: two ARNs that
+/// differ anywhere are two certificates, so associating one never associates the other and
+/// never replaces it.
+///
+/// Each pair runs on its own account, so what is observed is only the two ARNs: the second
+/// one is not associated after the first one is, both are held once both are associated,
+/// and each removal addresses exactly its own ARN.
+#[tokio::test]
+async fn an_association_is_keyed_by_the_whole_arn() {
+    for (case, left, right) in near_miss_pairs() {
+        let emulator = Emulator::new();
+
+        assert_associated(&format!("{case}, the first ARN"), &associate(&emulator, left).await);
+        // The near miss is a different certificate, so the account does not hold it yet.
+        assert_not_associated(
+            &format!("{case}, the second ARN before it is associated"),
+            &disassociate(&emulator, right).await,
+        );
+
+        assert_associated(&format!("{case}, the second ARN"), &associate(&emulator, right).await);
+        // Associating the second one did not replace the first: both are held, and each
+        // removal takes only the ARN it addresses.
+        assert_disassociated(
+            &format!("{case}, removing the first ARN"),
+            &disassociate(&emulator, left).await,
+        );
+        assert_not_associated(
+            &format!("{case}, the first ARN after its removal"),
+            &disassociate(&emulator, left).await,
+        );
+        assert_disassociated(
+            &format!("{case}, removing the second ARN"),
+            &disassociate(&emulator, right).await,
+        );
+        assert_not_associated(
+            &format!("{case}, the second ARN after its removal"),
+            &disassociate(&emulator, right).await,
+        );
+    }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateServiceLastAccessedDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateServiceLastAccessedDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateServiceLastAccessedDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the service-last-accessed report the request's `Arn` asks for and answers the
+//! `JobId` that report is read back by (`GetServiceLastAccessedDetails`,
+//! `GetServiceLastAccessedDetailsWithEntities`). The job is a record of the account: its
+//! generation is DUE a short span after this call
+//! ([`crate::state::ACCESS_REPORT_GENERATION_SECONDS`]), so a caller reading straight
+//! afterwards sees it `IN_PROGRESS`, and from the due instant the read serves the report.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +181,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateServiceLastAccessedDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateServiceLastAccessedDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateServiceLastAccessedDetails"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server error, so an unreachable store is reported
+            // through the crate's generic refusal channel rather than as a report job
+            // nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the IAM store is unavailable",
+            ));
+        };
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is recorded, and the resource the decision is made on
+        // is the one the report would be about — the ARN this request addresses.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::GENERATE_SERVICE_LAST_ACCESSED_DETAILS,
+            &input.arn,
+        )?;
+
+        // "The ARN of the IAM resource (user, group, role, or managed policy) used to
+        // generate information about when the resource was last used": a value that is
+        // none of those four ARNs names nothing a report can be generated for, which is
+        // an invalid input rather than a missing entity — the separation
+        // `ListPoliciesGrantingServiceAccess` makes for the ARN it is addressed by.
+        if crate::state::parse_entity_arn(&input.arn).is_none()
+            && crate::state::parse_policy_arn(&input.arn).is_none()
+        {
+            return Err(
+                GenerateServiceLastAccessedDetailsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "ARN {} is not valid: Arn must be the ARN of an IAM user, group, \
+                             role or managed policy",
+                            input.arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A well-formed ARN the account holds no such resource under "referenced a
+        // resource entity that does not exist", and the resource this operation is
+        // addressed by is the ARN itself, so the refusal names that ARN.
+        if store.report_resource_policies(&input.arn).is_none() {
+            return Err(
+                GenerateServiceLastAccessedDetailsErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!("ARN {} does not exist.", input.arn)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "If you don't include this optional parameter, the operation generates service
+        // data": the level of detail is resolved ONCE, here, and stored with the job, so
+        // the read reports the level this request asked for.
+        let granularity = input
+            .granularity
+            .unwrap_or_else(|| crate::state::USAGE_GRANULARITY_SERVICE_LEVEL.to_string());
+
+        // Generating the report is work the clock owes: "to check the status of the
+        // GenerateServiceLastAccessedDetails request, use the JobId parameter in the same
+        // operations and test the JobStatus response parameter", so the job starts out in
+        // flight and the instant its generation is due is stored rather than slept for.
+        let created = crate::state::now();
+        let completes = ::aws_smithy_types::DateTime::from_secs(
+            created.secs() + crate::state::ACCESS_REPORT_GENERATION_SECONDS,
+        );
+        let job_id = store.next_service_last_accessed_job_id();
+        store.service_last_accessed_reports.insert(
+            job_id.clone(),
+            crate::state::ServiceLastAccessedJob {
+                arn: input.arn,
+                granularity,
+                created,
+                completes,
+            },
+        );
+        // A finished report is kept for a caller to read again, but the account retains a
+        // bounded number of them: past that, the oldest jobs are dropped, so repeated
+        // generates cannot grow the store without end.
+        while store.service_last_accessed_reports.len()
+            > crate::state::MAX_RETAINED_ACCESS_REPORT_JOBS
+        {
+            let Some(oldest) = store
+                .service_last_accessed_reports
+                .iter()
+                .min_by_key(|(id, job)| (job.created.secs(), (*id).clone()))
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            store.service_last_accessed_reports.remove(&oldest);
+        }
+
+        // Audit record for the change: the acting principal, the operation and the job it
+        // recorded, so a state-changing call leaves a local record.
+        ::tracing::info!(
+            audit = true,
+            operation = "GenerateServiceLastAccessedDetails",
+            outcome = "recorded",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            job_id = %job_id,
+            "a service last accessed report was asked for"
+        );
+        Ok(GenerateServiceLastAccessedDetailsOutput {
+            job_id: Some(job_id),
+        })
     }
 }

@@ -212,10 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetOrganizationsAccessReportErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!(
-                            "The job ID {} cannot be found.",
-                            input.job_id
-                        )),
+                        message: Some(crate::state::report_job_not_found(&input.job_id)),
                     },
                 )
                 .into(),
