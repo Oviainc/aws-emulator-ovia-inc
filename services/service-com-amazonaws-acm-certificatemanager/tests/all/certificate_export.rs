@@ -7,16 +7,17 @@
 //! that names no ACM certificate, an ARN naming no stored certificate, a certificate
 //! export was never allowed for (which every certificate created without the `Export`
 //! opt-in is, and the opt-in "cannot [be updated] after the the certificate is
-//! created"), and a certificate whose material ACM holds none of yet. Every one of
-//! these is HTTP 400 with its own code and sentence, and none of them is a server
-//! fault.
+//! created"), an ARN under which no ISSUED certificate stands — the member names "an
+//! ARN of the issued certificate" — and a certificate whose material ACM holds none of
+//! yet. Every one of these is HTTP 400 with its own code and sentence, and none of them
+//! is a server fault.
 //!
 //! The table spans the classes the rule generalises over: both kinds of certificate a
 //! client can create (imported and requested), the export option absent, `DISABLED` and
-//! `ENABLED`, a pending and an issued request, an ARN naming nothing and an ARN naming
-//! another kind of ACM resource — and, so the classification is shown to be independent
-//! of the passphrase, a passphrase at each end of the modelled `@length 4..128` range
-//! plus one byte past its lower bound.
+//! `ENABLED`, an issued request and one that never reached ISSUED, an ARN naming nothing
+//! and an ARN naming another kind of ACM resource — and, so the classification is shown
+//! to be independent of the passphrase, a passphrase at each end of the modelled
+//! `@length 4..128` range plus one byte past its lower bound.
 
 use serde_json::{json, Value};
 
@@ -39,6 +40,12 @@ fn expected_not_export_enabled_message(arn: &str) -> String {
 const EXPECTED_REQUEST_IN_PROGRESS_MESSAGE: &str =
     "The certificate request is in process and the certificate in your account has not yet \
      been issued.";
+
+/// The `ResourceNotFoundException` sentence ACM answers when the ARN resolves but names
+/// no ISSUED certificate, as recorded against the real service.
+fn expected_no_issued_certificate_message(arn: &str) -> String {
+    format!("Could not find an issued certificate {arn}")
+}
 
 /// An `ExportCertificate` call with `passphrase` as the `Passphrase` blob.
 async fn export(
@@ -77,7 +84,8 @@ async fn export_classifies_the_certificate_the_request_names() {
 
     // A requested certificate per export option: absent, DISABLED and ENABLED. The
     // private-CA requests have nothing to prove, so the clock carries them to ISSUED;
-    // the public one is still PENDING_VALIDATION when it is exported below.
+    // the public one names a domain nobody can be delegated, so the clock carries it to
+    // a terminal status that is not ISSUED.
     let default_option = request_certificate(
         &router,
         &json!({
@@ -95,10 +103,10 @@ async fn export_classifies_the_certificate_the_request_names() {
         }),
     )
     .await;
-    let pending_enabled = request_certificate(
+    let unissued_enabled = request_certificate(
         &router,
         &json!({
-            "DomainName": "pending.export.example.com",
+            "DomainName": "unissued.export.example.com",
             "ValidationMethod": "DNS",
             "Options": { "Export": "ENABLED" },
         }),
@@ -122,12 +130,12 @@ async fn export_classifies_the_certificate_the_request_names() {
     let not_a_certificate =
         format!("arn:aws:acm:{REGION}:{ACCOUNT}:acme-endpoint/00000000-0000-0000-0000-000000000000");
 
-    // The private-CA requests reach ISSUED; the public one stays pending, so the rows
-    // below cover a certificate in each state.
+    // The private-CA requests reach ISSUED; the public one reaches a terminal status
+    // that is not ISSUED, so the rows below cover a certificate in each state.
     let (status, response) = call(
         &router,
         "DescribeCertificate",
-        &json!({ "CertificateArn": &pending_enabled }),
+        &json!({ "CertificateArn": &unissued_enabled }),
     )
     .await;
     assert_eq!(
@@ -139,6 +147,7 @@ async fn export_classifies_the_certificate_the_request_names() {
         (&disabled, "ISSUED"),
         (&issued_enabled, "ISSUED"),
         (&imported, "ISSUED"),
+        (&unissued_enabled, "FAILED"),
     ] {
         let detail = describe(&router, arn).await;
         assert_eq!(
@@ -191,11 +200,11 @@ async fn export_classifies_the_certificate_the_request_names() {
             expected_not_export_enabled_message(&disabled),
         ),
         (
-            "a pending certificate created with Export ENABLED",
-            &pending_enabled,
+            "an unissued certificate created with Export ENABLED",
+            &unissued_enabled,
             b"Sim2RealPass123".to_vec(),
-            "RequestInProgressException",
-            EXPECTED_REQUEST_IN_PROGRESS_MESSAGE.to_string(),
+            "ResourceNotFoundException",
+            expected_no_issued_certificate_message(&unissued_enabled),
         ),
         (
             "an issued certificate created with Export ENABLED",
@@ -292,4 +301,147 @@ async fn a_passphrase_past_the_modelled_bound_is_refused_before_the_store_is_rea
             );
         }
     }
+}
+
+/// The passphrase every row below sends, inside the modelled `@length 4..128` range.
+const A_PASSPHRASE: &[u8] = b"Sim2RealPass123";
+
+/// RULE: the ARN this operation takes is "an Amazon Resource Name (ARN) of the issued
+/// certificate" (`ExportCertificateRequest$CertificateArn` doc), so an export-enabled
+/// certificate the account holds in any `CertificateStatus` other than `ISSUED` is an
+/// ARN under which there is no issued certificate: HTTP 400 `ResourceNotFoundException`
+/// with `Could not find an issued certificate <arn>` — whichever non-issued status the
+/// record is in — and the refusal leaves the record as it was.
+#[tokio::test]
+async fn an_export_enabled_certificate_that_is_not_issued_names_no_issued_certificate() {
+    let (router, engine) = router_with_engine();
+
+    // Three export-enabled requests, differing in what the clock owes each: a domain
+    // whose control COULD be published, so the request waits its validation window out;
+    // a domain nobody can be delegated, so the request fails; and a private-CA request
+    // ("if you are requesting a private certificate, domain validation is not
+    // required"), which is the ISSUED row the rule stops at.
+    let waiting = request_certificate(
+        &router,
+        &json!({
+            "DomainName": "waiting.export.probe-domain.com",
+            "ValidationMethod": "DNS",
+            "Options": { "Export": "ENABLED" },
+        }),
+    )
+    .await;
+    let unprovable = request_certificate(
+        &router,
+        &json!({
+            "DomainName": "*.unprovable.export.example.org",
+            "ValidationMethod": "HTTP",
+            "Options": { "Export": "ENABLED" },
+        }),
+    )
+    .await;
+    let issued = request_certificate(
+        &router,
+        &json!({
+            "DomainName": "boundary.export.probe-domain.net",
+            "CertificateAuthorityArn": PRIVATE_CA_ARN,
+            "Options": { "Export": "ENABLED" },
+        }),
+    )
+    .await;
+
+    // Before any outcome falls due, both public requests are in the status a requested
+    // certificate "enters upon being requested".
+    for (case, arn) in [
+        ("a request still awaiting domain validation", &waiting),
+        ("a request whose domain can never be validated", &unprovable),
+    ] {
+        assert_no_issued_certificate(&router, case, arn, "PENDING_VALIDATION").await;
+    }
+
+    // Then the clock: each stored outcome falls due, carrying the two public requests to
+    // the terminal statuses they were headed for.
+    make_validation_due_now(&engine);
+    for (case, arn, status) in [
+        (
+            "a request that waited out its validation window",
+            &waiting,
+            "VALIDATION_TIMED_OUT",
+        ),
+        (
+            "a request whose domain can never be validated",
+            &unprovable,
+            "FAILED",
+        ),
+    ] {
+        assert_no_issued_certificate(&router, case, arn, status).await;
+    }
+
+    // The ISSUED record bounds the rule: an issued certificate stands under that ARN, so
+    // whatever this emulator can hand back for it, the answer is not "there is no issued
+    // certificate here".
+    let case = "an issued certificate created with Export ENABLED";
+    let detail = describe(&router, &issued).await;
+    assert_eq!(
+        detail["Status"].as_str(),
+        Some("ISSUED"),
+        "case {case:?}: expected the fixture to be ISSUED, got {detail}"
+    );
+    let (status, response) = export(&router, &issued, A_PASSPHRASE).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected a 400, got {status} {response}"
+    );
+    let code = error_code(&response);
+    assert_ne!(
+        code, "ResourceNotFoundException",
+        "case {case:?}: an issued certificate is found under its ARN, got {code} {response}"
+    );
+    let message = error_message(&response);
+    assert_ne!(
+        message,
+        expected_no_issued_certificate_message(&issued),
+        "case {case:?}: an issued certificate is found under its ARN, got {message:?}"
+    );
+}
+
+/// Export `arn`, which must be in the non-issued `expected_status`, and assert the
+/// refusal is the modelled "no issued certificate under this ARN" one — and that it
+/// changed nothing about the record.
+async fn assert_no_issued_certificate(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    expected_status: &str,
+) {
+    let detail = describe(router, arn).await;
+    assert_eq!(
+        detail["Status"].as_str(),
+        Some(expected_status),
+        "case {case:?}: expected the fixture to be {expected_status}, got {detail}"
+    );
+
+    let (status, response) = export(router, arn, A_PASSPHRASE).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected a 400, got {status} {response}"
+    );
+    let code = error_code(&response);
+    assert_eq!(
+        code, "ResourceNotFoundException",
+        "case {case:?}: a certificate in {expected_status} is no issued certificate, expected \
+         ResourceNotFoundException, got {code} {response}"
+    );
+    let message = error_message(&response);
+    let expected_message = expected_no_issued_certificate_message(arn);
+    assert_eq!(
+        message, expected_message,
+        "case {case:?}: expected the sentence {expected_message:?}, got {message:?}"
+    );
+
+    let after = describe(router, arn).await;
+    assert_eq!(
+        after["Status"].as_str(),
+        Some(expected_status),
+        "case {case:?}: a refused export changes nothing, expected {expected_status}, got {after}"
+    );
 }

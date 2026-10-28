@@ -4,8 +4,9 @@
 //! IMPLEMENTED: resolves the `CertificateArn` against this service's certificate store
 //! and answers the export of the record stored under it — classifying an ARN that names
 //! no ACM certificate, an ARN naming no stored certificate, a certificate export was
-//! never allowed for, and a certificate whose material ACM does not hold yet, each with
-//! the modelled error that reports exactly that condition.
+//! never allowed for, an ARN under which no ISSUED certificate stands, and a certificate
+//! whose material ACM does not hold yet, each with the modelled error that reports
+//! exactly that condition.
 //!
 //! Export is opt-in at creation and cannot be turned on afterwards
 //! (`CertificateOptions$Export`), so a certificate created without it — which every
@@ -235,6 +236,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "An Amazon Resource Name (ARN) of the issued certificate"
+        // (`ExportCertificateRequest$CertificateArn` doc): this operation addresses one
+        // kind of certificate, the ISSUED one, so a record in any other
+        // `CertificateStatus` — still awaiting its domain validation, or past it without
+        // being issued — is an ARN under which there is no issued certificate to export.
+        // That is the condition `ResourceNotFoundException` reports ("the specified
+        // certificate cannot be found"), named with the sentence for an ARN that
+        // resolves while the certificate the argument addresses does not, and NOT with
+        // the retry-now signal below: the status is the record's current one, not a step
+        // on the way to export.
+        if certificate.status != crate::state::STATUS_ISSUED {
+            return Err(ExportCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::issued_certificate_not_found_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "The exported file contains the certificate, the certificate chain, and the
         // encrypted private key associated with the public key that is embedded in the
         // certificate" (this operation's doc): all three are material of a key pair ACM
@@ -245,8 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // export, which is the condition `RequestInProgressException` reports: "the
         // certificate request is in process and the certificate in your account has not
         // yet been issued". This service mints no key pair for a certificate it was
-        // asked to issue, so that material is what it does not hold — the same gap
-        // `GetCertificate` reports with the same modelled error for the same record.
+        // asked to issue, so that material is what it does not hold for the record
+        // reaching here — the same gap `GetCertificate` reports with the same modelled
+        // error for the same record.
         Err(ExportCertificateErrorModeled::RequestInProgressException(
             RequestInProgressException {
                 message: Some(crate::state::REQUEST_IN_PROGRESS_MESSAGE.to_string()),
