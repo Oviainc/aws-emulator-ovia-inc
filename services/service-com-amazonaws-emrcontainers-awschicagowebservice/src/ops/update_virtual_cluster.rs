@@ -173,7 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.virtual_cluster(&region, &input.id) else {
             return Err(UpdateVirtualClusterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Virtual cluster {} was not found", input.id)),
+                    // The one not-found wording of this service
+                    // ([`crate::state::ResourceKind`]), built from the requested id.
+                    message: Some(
+                        crate::state::ResourceKind::VirtualCluster
+                            .not_found_message(&input.id),
+                    ),
                 },
             )
             .into());

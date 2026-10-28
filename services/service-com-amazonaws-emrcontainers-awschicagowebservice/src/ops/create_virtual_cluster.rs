@@ -198,9 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(CreateVirtualClusterErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Security configuration {configuration_id} doesn't exist."
-                        )),
+                        // The one not-found wording of this service
+                        // ([`crate::state::ResourceKind`]), built from the referenced id,
+                        // so a reference that resolves nowhere is reported exactly as a
+                        // read of that resource reports it.
+                        message: Some(
+                            crate::state::ResourceKind::SecurityConfiguration
+                                .not_found_message(configuration_id),
+                        ),
                     },
                 )
                 .into());

@@ -153,9 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.remove_job_template(&region, &input.id) else {
             return Err(DeleteJobTemplateErrorModeled::ValidationException(
                 ValidationException {
-                    // The same not-found message form the read path uses: `<Resource
-                    // type> <id> doesn't exist.`, built from the requested id.
-                    message: Some(format!("Job Template {} doesn't exist.", input.id)),
+                    // The one not-found wording of this service
+                    // ([`crate::state::ResourceKind`]), built from the requested id.
+                    message: Some(
+                        crate::state::ResourceKind::JobTemplate.not_found_message(&input.id),
+                    ),
                 },
             )
             .into());
