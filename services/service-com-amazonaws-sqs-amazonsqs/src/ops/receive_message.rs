@@ -9,6 +9,12 @@
 //! token hands the identical batch and receipt handles back. It is the ONLY file to
 //! touch for `ReceiveMessage`.
 //!
+//! A queue whose `RedrivePolicy` names a dead-letter target bounds how many times one of
+//! its messages is handed over: a message that has had them all is moved to that queue
+//! instead of being delivered again
+//! ([`crate::state::ComAmazonawsSqsAmazonsqsState::dead_letter_due`]), which this receive
+//! applies before it decides what there is to deliver.
+//!
 //! A message in a queue encrypted with a customer managed KMS key is sealed under a data
 //! key only KMS can open, so the receive is gated on that key being usable and on this
 //! caller holding the decrypt grant ([`crate::state::encryption::authorize_queue_key`]):
@@ -388,12 +394,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // takes nothing out of the queue.
             let delivering = {
                 let mut state = store.lock();
+                if let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) {
+                    // Retention lapses and visibility timeouts are owed by the clock,
+                    // so what this sees is what the walk below would deliver.
+                    queue.materialise_due(now);
+                }
+                // A message this queue has already handed over as many times as its
+                // `RedrivePolicy` allows is not handed over again: it goes to the
+                // dead-letter queue that policy names, BEFORE this receive decides what
+                // there is to deliver, so what the walk below sees is what the queue may
+                // still hand out.
+                if let Some(queue_name) =
+                    sqs::queue_name_from_url(&input.queue_url).map(str::to_string)
+                {
+                    state.dead_letter_due(&region, &queue_name, now);
+                }
                 state
-                    .queue_by_url_mut(&region, &input.queue_url)
+                    .queue_by_url(&region, &input.queue_url)
                     .is_some_and(|queue| {
-                        // Retention lapses and visibility timeouts are owed by the clock,
-                        // so what this sees is what the walk below would deliver.
-                        queue.materialise_due(now);
                         // A retry under a FIFO attempt token hands the batch that token
                         // names over again, which opens those messages afresh.
                         let retrying = attempt_id
@@ -557,6 +575,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let receipt_handle = queue.mint_receipt_handle();
                     let message = &mut queue.messages[index];
                     message.receive_count = message.receive_count.saturating_add(1);
+                    // This queue's own count of the deliveries it has made, which is what
+                    // its `RedrivePolicy` bounds: the delivery below is one of them.
+                    message.queue_receive_count = message.queue_receive_count.saturating_add(1);
                     if message.first_received_at.is_none() {
                         message.first_received_at = Some(now);
                     }

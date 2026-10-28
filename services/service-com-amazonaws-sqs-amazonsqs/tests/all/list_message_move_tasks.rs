@@ -370,9 +370,10 @@ async fn a_listing_naming_no_queue_or_asking_outside_the_result_range_is_refused
 }
 
 /// A running task's rate and progress are reported from its record and the clock: the
-/// counts always add up to the messages it took, never go backwards, and reach "every
-/// message moved, none left" exactly when the task is `COMPLETED` — and reporting them
-/// neither delivers a message nor frees the source queue for a second task.
+/// number to move is the size the task was started over and stays there, the moved count
+/// never goes backwards, and it reaches that size exactly when the task is `COMPLETED` —
+/// and reporting them neither delivers a message nor frees the source queue for a second
+/// task.
 #[tokio::test]
 async fn a_tasks_reported_progress_follows_the_record_and_the_clock() {
     let router = emulator();
@@ -406,11 +407,18 @@ async fn a_tasks_reported_progress_follows_the_record_and_the_clock() {
         );
         let moved = number(&entry, "ApproximateNumberOfMessagesMoved");
         let to_move = number(&entry, "ApproximateNumberOfMessagesToMove");
+        // "This number is obtained at the time of starting the message movement task"
+        // (ListMessageMoveTasksResultEntry$ApproximateNumberOfMessagesToMove): it is the
+        // size the task was started over, so it does not fall as the task delivers.
         assert_eq!(
-            moved + to_move,
-            taken,
-            "case the running task: expected the counts to add up to the {taken} messages \
-             taken, got {entry}"
+            to_move, taken,
+            "case the running task: expected the {taken} messages the task was started \
+             over, got {entry}"
+        );
+        assert!(
+            moved <= taken,
+            "case the running task: expected at most the {taken} messages taken to have \
+             moved, got {entry}"
         );
         assert!(
             moved >= moved_before,
@@ -423,7 +431,7 @@ async fn a_tasks_reported_progress_follows_the_record_and_the_clock() {
         if status == "RUNNING" {
             saw_running = true;
             assert!(
-                to_move > 0,
+                moved < taken,
                 "case a RUNNING task: expected messages still to move, got {entry}"
             );
             // A listing is a report, not a turn of the crank: while the task runs, the
@@ -443,8 +451,9 @@ async fn a_tasks_reported_progress_follows_the_record_and_the_clock() {
         } else {
             assert_eq!(
                 (status.as_str(), moved, to_move),
-                ("COMPLETED", taken, 0),
-                "case a finished task: expected every message moved and none left, got {entry}"
+                ("COMPLETED", taken, taken),
+                "case a finished task: expected every message it was started over to have \
+                 moved, got {entry}"
             );
             break;
         }

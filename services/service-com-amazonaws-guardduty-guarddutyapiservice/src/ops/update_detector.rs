@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDetector
-//! IMPLEMENTED: mutates the persisted detector and bumps its `UpdatedAt`, so a later
-//! `GetDetector` observes the new status, publishing frequency and feature
-//! configuration. An unknown id is refused with `BadRequestException`.
+//! IMPLEMENTED: mutates the persisted detector and, when the request carried a
+//! configuration member to write, bumps its `UpdatedAt`, so a later `GetDetector`
+//! observes the new status, publishing frequency and feature configuration. An
+//! unknown id is refused with `BadRequestException`.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -185,21 +186,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
+        // Every member but the `DetectorId` label is OPTIONAL
+        // (`smithy_query(operation="UpdateDetector")`), so this is a PARTIAL update:
+        // each member the request carries is written and each one it omits leaves the
+        // stored value where it was. `configured` records whether this request wrote
+        // any of the detector's configuration at all.
+        let mut configured = false;
         if let Some(enable) = input.enable {
             detector.status = if enable {
                 crate::state::ENABLED.to_string()
             } else {
                 crate::state::DISABLED.to_string()
             };
+            configured = true;
         }
         if let Some(frequency) = input.finding_publishing_frequency.clone() {
             detector.finding_publishing_frequency = Some(frequency);
+            configured = true;
         }
         // The deprecated `DataSources` view is applied first so an explicit
-        // `Features` entry for the same switch wins.
-        crate::state::apply_data_sources(detector, input.data_sources.as_ref(), now);
-        crate::state::apply_feature_configurations(detector, input.features.as_ref(), now);
-        detector.updated_at_millis = now;
+        // `Features` entry for the same switch wins. Both views are applied whatever
+        // the other one did, so `|=` and not `||`.
+        configured |= crate::state::apply_data_sources(detector, input.data_sources.as_ref(), now);
+        configured |=
+            crate::state::apply_feature_configurations(detector, input.features.as_ref(), now);
+        // `UpdatedAt` is "the last-updated timestamp for the detector"
+        // (`smithy_query(operation="GetDetector")`), so it says when the detector's
+        // configuration was last written — but a request that carried no
+        // configuration member wrote none of it and changed nothing, so it moves no
+        // timestamp either.
+        if configured {
+            detector.updated_at_millis = now;
+        }
 
         Ok(UpdateDetectorOutput {})
     }

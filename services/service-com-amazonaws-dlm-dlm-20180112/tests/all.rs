@@ -45,6 +45,8 @@ mod policy_read_projection;
 mod policy_type;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
+#[path = "all/schedule_retention_floor.rs"]
+mod schedule_retention_floor;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unresolvable_policy_id.rs"]
