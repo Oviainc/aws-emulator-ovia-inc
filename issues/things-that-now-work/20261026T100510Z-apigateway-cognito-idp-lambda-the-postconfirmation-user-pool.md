@@ -39,3 +39,19 @@ Actual — both Cognito calls return success, the function is never invoked, no 
 5. CreateUserPoolClient (GenerateSecret=false, ExplicitAuthFlows including ALLOW_USER_PASSWORD_AUTH/ALLOW_ADMIN_USER_PASSWORD_AUTH).
 6. SignUp a new username with an `email` attribute, then AdminConfirmSignUp that username in the pool.
 7. Poll ReceiveMessage on the queue. Expected: a message within seconds whose body carries triggerSource='PostConfirmation_ConfirmSignUp' and the username/pool id/email from steps 3 and 6. Actual: the queue stays empty indefinitely and the check hangs until the 60 s harness cap.
+
+## Resolution
+The reported cause is fixed in the cognito-idp trigger path: a pool whose `LambdaConfig`
+names a `PostConfirmation` function now has that function invoked synchronously when a
+confirmation completes (`AdminConfirmSignUp`, `ConfirmSignUp` and `ConfirmForgotPassword`),
+with the user-pool trigger event the dispatch builds from the pool and the stored user —
+`triggerSource`, `userPoolId`, `userName` and `request.userAttributes` among its members
+(`services/service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice/src/state/lambda_triggers.rs`).
+
+The step 7 observable of this check is still not reachable, and NOT because Cognito
+withholds the invocation: the message the check polls for is one the function's own
+python3.12 handler sends, so it needs Lambda to EXECUTE a deployment package. That is
+tracked by `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`
+— until it is fixed, Lambda answers `NotImplemented` for every `RequestResponse` invocation,
+which this dispatch logs as a trigger that produced no verdict rather than inventing one.
+

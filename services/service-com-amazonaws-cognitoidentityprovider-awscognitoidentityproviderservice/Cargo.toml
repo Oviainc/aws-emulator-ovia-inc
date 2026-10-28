@@ -8,6 +8,7 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -16,6 +17,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
+# Invoking a user pool's configured Lambda triggers, over the in-process callback
+# into this same emulator (`src/state/lambda_triggers.rs`).
+aws-sdk-lambda = { version = "1", default-features = false }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }

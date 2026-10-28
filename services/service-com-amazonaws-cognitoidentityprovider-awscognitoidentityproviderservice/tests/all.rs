@@ -123,6 +123,8 @@ mod managed_login_branding_updates;
 mod log_delivery_configuration;
 #[path = "all/message_delivery_and_live_codes.rs"]
 mod message_delivery_and_live_codes;
+#[path = "all/post_confirmation_trigger.rs"]
+mod post_confirmation_trigger;
 #[path = "all/provisioned_limits.rs"]
 mod provisioned_limits;
 #[path = "all/public_user_not_found_message.rs"]

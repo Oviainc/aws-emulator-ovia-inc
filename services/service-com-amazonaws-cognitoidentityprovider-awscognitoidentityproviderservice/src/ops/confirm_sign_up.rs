@@ -8,6 +8,10 @@
 //! spends it: the account becomes `CONFIRMED` and the attribute the code was sent to
 //! becomes verified, which is also what makes that value the user's alias.
 //!
+//! Confirming the sign-up reaches the pool's post-confirmation trigger, which this
+//! operation invokes with the `PostConfirmation_ConfirmSignUp` event
+//! ([`crate::state::lambda_triggers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -236,118 +240,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only: the app client in the body names the pool, and
-        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
-        // which this emulator invokes none of.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
         // A code's validity is read against the clock, so an expired one is refused
         // whether or not anything has swept it.
         let now = ::std::time::SystemTime::now();
+        // The app client in the body names the pool, and is the client id the event a
+        // trigger receives reports as its caller; `ClientMetadata` is the "input for any
+        // custom workflows that this action triggers" that reaches the function too.
+        let caller =
+            crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id));
 
-        let mut guard = state.lock();
-        // This operation models no `UserPoolId`: the app client the request names is
-        // what resolves the pool the user signed up in.
-        let pool = guard
-            .pool_of_client(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
-        let user_pool_id = pool.id.clone();
-        let client = pool
-            .clients
-            .get(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
-        if !client.accepts_secret_hash(&input.username, input.secret_hash.as_deref()) {
-            return Err(unverified_secret_hash(&input.client_id));
-        }
-        let hides_user_existence = client.hides_user_existence();
-
-        let Some(user) = pool.user(&input.username) else {
-            return Err(if hides_user_existence {
-                not_authorized(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE)
-            } else {
-                user_not_found()
-            });
-        };
-        if !user.enabled {
-            return Err(not_authorized("User is disabled."));
-        }
-        // This operation "confirms the account of a new user" (its own doc): an account
-        // something already confirmed is not one a code confirms again.
-        if user.status != crate::state::UserStatus::Unconfirmed {
-            return Err(not_authorized(&format!(
-                "User cannot be confirmed. Current status is {}",
-                user.status.as_str()
-            )));
-        }
-        let username = user.username.clone();
-
-        // The code is checked against the one STORED for this user's sign-up, and the
-        // record says which attribute the message went to — which is the attribute the
-        // user "confirms ownership of" by answering it.
-        let accepted = user
-            .check_code(
-                &crate::state::CodePurpose::SignUpConfirmation,
-                &input.confirmation_code,
-                now,
-            )
-            .map_err(code_rejected)?;
-        let attribute = accepted.attribute.clone();
-        let destination = accepted.destination.clone();
-
-        // Confirming the value makes it an ACTIVE alias of this user
-        // ([`crate::state::User::alias_is_active`]), and an alias value names ONE user
-        // of the pool: "If `ForceAliasCreation` is `false`, the API throws an
-        // `AliasExistsException` error" for a value another user already holds, and
-        // `true` "migrates the alias from the previous user to the newly created user"
-        // (`ConfirmSignUp.ForceAliasCreation` in this service's model).
-        let migrate_from = if pool.is_alias_attribute(&attribute)
-            && pool.alias_taken(&attribute, &destination, &username)
-        {
-            if !input.force_alias_creation {
-                return Err(alias_exists(&attribute));
+        // The confirmation is performed under the state lock, which this block RELEASES
+        // before the trigger it hands back is invoked: the function is another service's
+        // and must not be waited on while every other request of this one waits for the
+        // lock.
+        let dispatch = {
+            let mut guard = state.lock();
+            // This operation models no `UserPoolId`: the app client the request names is
+            // what resolves the pool the user signed up in.
+            let pool = guard
+                .pool_of_client(&input.client_id)
+                .ok_or_else(|| client_not_found(&input.client_id))?;
+            let user_pool_id = pool.id.clone();
+            let client = pool
+                .clients
+                .get(&input.client_id)
+                .ok_or_else(|| client_not_found(&input.client_id))?;
+            if !client.accepts_secret_hash(&input.username, input.secret_hash.as_deref()) {
+                return Err(unverified_secret_hash(&input.client_id));
             }
-            pool.users
-                .iter()
-                .find(|(_, other)| {
-                    other.username != username
-                        && other.destination_of(&attribute).as_deref() == Some(destination.as_str())
-                        && other.alias_is_active(&attribute)
-                })
-                .map(|(key, _)| key.clone())
-        } else {
-            None
-        };
+            let hides_user_existence = client.hides_user_existence();
 
-        let pool = guard
-            .pool_mut(&user_pool_id)
-            .ok_or_else(internal_error)?;
-        // The migrated alias is no longer the previous holder's: its value stays, but
-        // the flag that made it an alias no longer vouches for it.
-        if let Some(key) = migrate_from {
-            if let Some(flag) = crate::state::verified_flag(&attribute) {
-                if let Some(previous) = pool.users.get_mut(&key) {
-                    previous
-                        .attributes
-                        .insert(flag.to_string(), crate::state::FLAG_UNCONFIRMED.to_string());
-                    previous.user_last_modified_date = now;
+            let Some(user) = pool.user(&input.username) else {
+                return Err(if hides_user_existence {
+                    not_authorized(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE)
+                } else {
+                    user_not_found()
+                });
+            };
+            if !user.enabled {
+                return Err(not_authorized("User is disabled."));
+            }
+            // This operation "confirms the account of a new user" (its own doc): an
+            // account something already confirmed is not one a code confirms again.
+            if user.status != crate::state::UserStatus::Unconfirmed {
+                return Err(not_authorized(&format!(
+                    "User cannot be confirmed. Current status is {}",
+                    user.status.as_str()
+                )));
+            }
+            let username = user.username.clone();
+
+            // The code is checked against the one STORED for this user's sign-up, and the
+            // record says which attribute the message went to — which is the attribute the
+            // user "confirms ownership of" by answering it.
+            let accepted = user
+                .check_code(
+                    &crate::state::CodePurpose::SignUpConfirmation,
+                    &input.confirmation_code,
+                    now,
+                )
+                .map_err(code_rejected)?;
+            let attribute = accepted.attribute.clone();
+            let destination = accepted.destination.clone();
+
+            // Confirming the value makes it an ACTIVE alias of this user
+            // ([`crate::state::User::alias_is_active`]), and an alias value names ONE user
+            // of the pool: "If `ForceAliasCreation` is `false`, the API throws an
+            // `AliasExistsException` error" for a value another user already holds, and
+            // `true` "migrates the alias from the previous user to the newly created user"
+            // (`ConfirmSignUp.ForceAliasCreation` in this service's model).
+            let migrate_from = if pool.is_alias_attribute(&attribute)
+                && pool.alias_taken(&attribute, &destination, &username)
+            {
+                if !input.force_alias_creation {
+                    return Err(alias_exists(&attribute));
+                }
+                pool.users
+                    .iter()
+                    .find(|(_, other)| {
+                        other.username != username
+                            && other.destination_of(&attribute).as_deref()
+                                == Some(destination.as_str())
+                            && other.alias_is_active(&attribute)
+                    })
+                    .map(|(key, _)| key.clone())
+            } else {
+                None
+            };
+
+            let pool = guard.pool_mut(&user_pool_id).ok_or_else(internal_error)?;
+            // The migrated alias is no longer the previous holder's: its value stays, but
+            // the flag that made it an alias no longer vouches for it.
+            if let Some(key) = migrate_from {
+                if let Some(flag) = crate::state::verified_flag(&attribute) {
+                    if let Some(previous) = pool.users.get_mut(&key) {
+                        previous
+                            .attributes
+                            .insert(flag.to_string(), crate::state::FLAG_UNCONFIRMED.to_string());
+                        previous.user_last_modified_date = now;
+                    }
                 }
             }
-        }
 
-        let user = pool.user_mut(&username).ok_or_else(internal_error)?;
-        // "their user account becomes active", and they "confirm ownership of the email
-        // address or phone number that they provided" — so the flag for the attribute
-        // the code was sent to now says the value was confirmed.
-        user.status = crate::state::UserStatus::Confirmed;
-        if let Some(flag) = crate::state::verified_flag(&attribute) {
-            user.attributes
-                .insert(flag.to_string(), crate::state::FLAG_CONFIRMED.to_string());
+            let user = pool.user_mut(&username).ok_or_else(internal_error)?;
+            // "their user account becomes active", and they "confirm ownership of the email
+            // address or phone number that they provided" — so the flag for the attribute
+            // the code was sent to now says the value was confirmed.
+            user.status = crate::state::UserStatus::Confirmed;
+            if let Some(flag) = crate::state::verified_flag(&attribute) {
+                user.attributes
+                    .insert(flag.to_string(), crate::state::FLAG_CONFIRMED.to_string());
+            }
+            // The code is accepted ONCE: presenting it again finds nothing outstanding.
+            user.consume_code(&crate::state::CodePurpose::SignUpConfirmation);
+            user.user_last_modified_date = now;
+
+            // The sign-up is confirmed, so the pool's post-confirmation trigger has
+            // reached its stage. The event is built from the pool and the user as this
+            // call left them, under the lock they are read from.
+            let pool = guard.pool(&user_pool_id).ok_or_else(internal_error)?;
+            let user = pool.user(&username).ok_or_else(internal_error)?;
+            crate::state::lambda_triggers::post_confirmation(
+                pool,
+                user,
+                crate::state::lambda_triggers::Confirmation::SignUp,
+                caller,
+                input.client_metadata.as_ref(),
+            )
+        };
+
+        if let Some(dispatch) = dispatch {
+            crate::state::lambda_triggers::invoke(ctx, &dispatch)
+                .await
+                .map_err(trigger_failed)?;
         }
-        // The code is accepted ONCE: presenting it again finds nothing outstanding.
-        user.consume_code(&crate::state::CodePurpose::SignUpConfirmation);
-        user.user_last_modified_date = now;
 
         Ok(ConfirmSignUpOutput {
             // `Session` is only answered for a confirmation that carries one, to "sign
@@ -355,6 +384,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // starts no such session at sign-up, so there is none to continue.
             session: None,
         })
+    }
+}
+
+/// What a post-confirmation trigger's failure is for THIS operation: the modelled error
+/// each outcome amounts to, carrying the message the dispatch built.
+///
+/// The user stays confirmed either way. The trigger "can take custom actions after a user
+/// confirms their user account" (`LambdaConfigType$PostConfirmation`), so it runs once the
+/// confirmation this call performed is already settled; what the failure changes is what
+/// this call ANSWERS, not what it wrote.
+fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> ConfirmSignUpError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            ConfirmSignUpErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            ConfirmSignUpErrorModeled::UnexpectedLambdaException(UnexpectedLambdaException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }
 

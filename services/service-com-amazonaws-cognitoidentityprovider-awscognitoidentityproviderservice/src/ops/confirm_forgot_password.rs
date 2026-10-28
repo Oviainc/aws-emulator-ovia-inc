@@ -9,6 +9,10 @@
 //! already spent are all refused `CodeMismatchException`, and one past its validity
 //! window `ExpiredCodeException`.
 //!
+//! Confirming the reset reaches the pool's post-confirmation trigger, which this
+//! operation invokes with the `PostConfirmation_ConfirmForgotPassword` event
+//! ([`crate::state::lambda_triggers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -221,84 +225,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only: the app client in the body names the pool, and
-        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
-        // which this emulator invokes none of.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
         // A code's validity is read against the clock, so an expired one is refused
         // whether or not anything has swept it.
         let now = ::std::time::SystemTime::now();
+        // The app client in the body names the pool, and is the client id the event a
+        // trigger receives reports as its caller; `ClientMetadata` is the "input for any
+        // custom workflows that this action triggers" that reaches the function too.
+        let caller =
+            crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id));
 
-        let mut guard = state.lock();
-        // This operation models no `UserPoolId`: the app client the request names is
-        // what resolves the pool whose user is reset.
-        let pool = guard
-            .pool_of_client(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
-        let user_pool_id = pool.id.clone();
-        let client = pool
-            .clients
-            .get(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
-        if !client.accepts_secret_hash(&input.username, input.secret_hash.as_deref()) {
-            return Err(unverified_secret_hash(&input.client_id));
-        }
-        let hides_user_existence = client.hides_user_existence();
+        // The reset is performed under the state lock, which this block RELEASES before
+        // the trigger it hands back is invoked: the function is another service's and
+        // must not be waited on while every other request of this one waits for the lock.
+        let dispatch = {
+            let mut guard = state.lock();
+            // This operation models no `UserPoolId`: the app client the request names is
+            // what resolves the pool whose user is reset.
+            let pool = guard
+                .pool_of_client(&input.client_id)
+                .ok_or_else(|| client_not_found(&input.client_id))?;
+            let user_pool_id = pool.id.clone();
+            let client = pool
+                .clients
+                .get(&input.client_id)
+                .ok_or_else(|| client_not_found(&input.client_id))?;
+            if !client.accepts_secret_hash(&input.username, input.secret_hash.as_deref()) {
+                return Err(unverified_secret_hash(&input.client_id));
+            }
+            let hides_user_existence = client.hides_user_existence();
 
-        let Some(user) = pool.user(&input.username) else {
-            return Err(if hides_user_existence {
-                not_authorized(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE)
-            } else {
-                user_not_found()
-            });
+            let Some(user) = pool.user(&input.username) else {
+                return Err(if hides_user_existence {
+                    not_authorized(crate::state::USERNAME_CLIENT_NOT_FOUND_MESSAGE)
+                } else {
+                    user_not_found()
+                });
+            };
+            if !user.enabled {
+                return Err(not_authorized("User is disabled."));
+            }
+            let username = user.username.clone();
+
+            // The code is checked against the one STORED for a reset of this user, and
+            // checked BEFORE the password: a caller that does not hold the code learns
+            // nothing about the pool's password policy.
+            user.check_code(
+                &crate::state::CodePurpose::PasswordReset,
+                &input.confirmation_code,
+                now,
+            )
+            .map_err(code_rejected)?;
+            // "The new password that your user wants to set" has to comply with the pool's
+            // own policy, as every other password this API accepts does. Refused BEFORE
+            // anything is written, and without spending the code: the reset the user asked
+            // for is still outstanding, so a corrected password can still complete it.
+            if let Some(message) = pool.check_password(&input.password) {
+                return Err(invalid_password(message));
+            }
+
+            let user = guard
+                .pool_mut(&user_pool_id)
+                .and_then(|pool| pool.user_mut(&username))
+                .ok_or_else(internal_error)?;
+            // The password the user signs in with from now on is the one it just chose, and
+            // it owes no further change: this is the user's own choice, not a temporary one
+            // an administrator set.
+            user.password = Some(input.password.clone());
+            user.password_permanent = true;
+            user.password_set_at = Some(now);
+            // A user Amazon Cognito was waiting on a new password from owes none now.
+            if matches!(
+                user.status,
+                crate::state::UserStatus::ResetRequired
+                    | crate::state::UserStatus::ForceChangePassword
+            ) {
+                user.status = crate::state::UserStatus::Confirmed;
+            }
+            // The code is accepted ONCE: presenting it again finds nothing outstanding.
+            user.consume_code(&crate::state::CodePurpose::PasswordReset);
+            user.user_last_modified_date = now;
+
+            // The reset is confirmed, so the pool's post-confirmation trigger has reached
+            // its stage. The event is built from the pool and the user as this call left
+            // them, under the lock they are read from.
+            let pool = guard.pool(&user_pool_id).ok_or_else(internal_error)?;
+            let user = pool.user(&username).ok_or_else(internal_error)?;
+            crate::state::lambda_triggers::post_confirmation(
+                pool,
+                user,
+                crate::state::lambda_triggers::Confirmation::ForgotPassword,
+                caller,
+                input.client_metadata.as_ref(),
+            )
         };
-        if !user.enabled {
-            return Err(not_authorized("User is disabled."));
-        }
-        let username = user.username.clone();
 
-        // The code is checked against the one STORED for a reset of this user, and
-        // checked BEFORE the password: a caller that does not hold the code learns
-        // nothing about the pool's password policy.
-        user.check_code(
-            &crate::state::CodePurpose::PasswordReset,
-            &input.confirmation_code,
-            now,
-        )
-        .map_err(code_rejected)?;
-        // "The new password that your user wants to set" has to comply with the pool's
-        // own policy, as every other password this API accepts does. Refused BEFORE
-        // anything is written, and without spending the code: the reset the user asked
-        // for is still outstanding, so a corrected password can still complete it.
-        if let Some(message) = pool.check_password(&input.password) {
-            return Err(invalid_password(message));
+        if let Some(dispatch) = dispatch {
+            crate::state::lambda_triggers::invoke(ctx, &dispatch)
+                .await
+                .map_err(trigger_failed)?;
         }
-
-        let user = guard
-            .pool_mut(&user_pool_id)
-            .and_then(|pool| pool.user_mut(&username))
-            .ok_or_else(internal_error)?;
-        // The password the user signs in with from now on is the one it just chose, and
-        // it owes no further change: this is the user's own choice, not a temporary one
-        // an administrator set.
-        user.password = Some(input.password.clone());
-        user.password_permanent = true;
-        user.password_set_at = Some(now);
-        // A user Amazon Cognito was waiting on a new password from owes none now.
-        if matches!(
-            user.status,
-            crate::state::UserStatus::ResetRequired | crate::state::UserStatus::ForceChangePassword
-        ) {
-            user.status = crate::state::UserStatus::Confirmed;
-        }
-        // The code is accepted ONCE: presenting it again finds nothing outstanding.
-        user.consume_code(&crate::state::CodePurpose::PasswordReset);
-        user.user_last_modified_date = now;
 
         Ok(ConfirmForgotPasswordOutput {})
+    }
+}
+
+/// What a post-confirmation trigger's failure is for THIS operation: the modelled error
+/// each outcome amounts to, carrying the message the dispatch built.
+///
+/// The new password stands either way. The trigger "can take custom actions after a user
+/// confirms" (`LambdaConfigType$PostConfirmation`), so it runs once the reset this call
+/// performed is already settled; what the failure changes is what this call ANSWERS, not
+/// what it wrote.
+fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> ConfirmForgotPasswordError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            ConfirmForgotPasswordErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            ConfirmForgotPasswordErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 

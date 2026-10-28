@@ -7,6 +7,11 @@
 //! operation computes its response from this state — a create stores a resource
 //! and a later read renders the STORED resource, never the request that made it.
 
+/// The user-pool Lambda-trigger dispatch: a pool's [`LambdaConfigType`] member becomes an
+/// invocation of the function it names, with the event for the stage the invoking
+/// operation reached.
+pub mod lambda_triggers;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

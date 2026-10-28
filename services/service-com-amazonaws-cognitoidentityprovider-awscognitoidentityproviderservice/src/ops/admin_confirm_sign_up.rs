@@ -8,6 +8,10 @@
 //! here verifies nothing: no code was answered, so no attribute value was proven to
 //! belong to the user.
 //!
+//! Confirming the sign-up reaches the pool's post-confirmation trigger, which this
+//! operation invokes with the `PostConfirmation_ConfirmSignUp` event
+//! ([`crate::state::lambda_triggers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,36 +190,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only: `ClientMetadata` is input for the Lambda triggers
-        // this action would invoke, which this emulator invokes none of.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
         let now = ::std::time::SystemTime::now();
+        // This operation names no app client: IAM credentials authorize it, so the event
+        // a trigger receives carries no client id of its own. `ClientMetadata` is the
+        // "input for any custom workflows that this action triggers" that does reach the
+        // function, as the request assigned it.
+        let caller = crate::state::lambda_triggers::Caller::of(ctx.parts(), None);
 
-        let mut guard = state.lock();
-        let pool = guard
-            .pool_mut(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        let user = pool.user_mut(&input.username).ok_or_else(user_not_found)?;
-        // This operation "confirms user sign-up" (its own doc): an account something
-        // already confirmed, or one that never signed up in this pool and so owes no
-        // confirmation, is not one this call confirms again.
-        if user.status != crate::state::UserStatus::Unconfirmed {
-            return Err(not_authorized(&format!(
-                "User cannot be confirmed. Current status is {}",
-                user.status.as_str()
-            )));
+        let dispatch = {
+            let mut guard = state.lock();
+            let pool = guard
+                .pool_mut(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            let user = pool.user_mut(&input.username).ok_or_else(user_not_found)?;
+            // This operation "confirms user sign-up" (its own doc): an account something
+            // already confirmed, or one that never signed up in this pool and so owes no
+            // confirmation, is not one this call confirms again.
+            if user.status != crate::state::UserStatus::Unconfirmed {
+                return Err(not_authorized(&format!(
+                    "User cannot be confirmed. Current status is {}",
+                    user.status.as_str()
+                )));
+            }
+            // "This request sets a user account active in a user pool" — and nothing more:
+            // no code was presented, so no attribute value was proven to be the user's and
+            // no verified flag moves. The code the sign-up sent has nothing left to confirm.
+            user.status = crate::state::UserStatus::Confirmed;
+            user.consume_code(&crate::state::CodePurpose::SignUpConfirmation);
+            user.user_last_modified_date = now;
+
+            // The sign-up is confirmed, so the pool's post-confirmation trigger has
+            // reached its stage. The event is built from the pool and the user as this
+            // call left them, under the lock they are read from; the invocation itself
+            // waits until the lock is released below.
+            let pool = guard
+                .pool(&input.user_pool_id)
+                .ok_or_else(internal_error)?;
+            let user = pool.user(&input.username).ok_or_else(internal_error)?;
+            crate::state::lambda_triggers::post_confirmation(
+                pool,
+                user,
+                crate::state::lambda_triggers::Confirmation::SignUp,
+                caller,
+                input.client_metadata.as_ref(),
+            )
+        };
+
+        if let Some(dispatch) = dispatch {
+            crate::state::lambda_triggers::invoke(ctx, &dispatch)
+                .await
+                .map_err(trigger_failed)?;
         }
-        // "This request sets a user account active in a user pool" — and nothing more:
-        // no code was presented, so no attribute value was proven to be the user's and
-        // no verified flag moves. The code the sign-up sent has nothing left to confirm.
-        user.status = crate::state::UserStatus::Confirmed;
-        user.consume_code(&crate::state::CodePurpose::SignUpConfirmation);
-        user.user_last_modified_date = now;
 
         Ok(AdminConfirmSignUpOutput {})
+    }
+}
+
+/// What a post-confirmation trigger's failure is for THIS operation: the modelled error
+/// each outcome amounts to, carrying the message the dispatch built.
+///
+/// The user stays confirmed either way. The trigger "can take custom actions after a user
+/// confirms their user account" (`LambdaConfigType$PostConfirmation`), so it runs once the
+/// confirmation this call performed is already settled; what the failure changes is what
+/// this call ANSWERS, not what it wrote.
+fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> AdminConfirmSignUpError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            AdminConfirmSignUpErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            AdminConfirmSignUpErrorModeled::UnexpectedLambdaException(UnexpectedLambdaException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }
 
