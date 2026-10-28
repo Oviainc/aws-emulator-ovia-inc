@@ -81,6 +81,8 @@ mod index_registry;
 mod index_schema_updates;
 #[path = "all/insight_details.rs"]
 mod insight_details;
+#[path = "all/insight_feedback.rs"]
+mod insight_feedback;
 #[path = "all/insights.rs"]
 mod insights;
 #[path = "all/instance_type_catalog.rs"]
