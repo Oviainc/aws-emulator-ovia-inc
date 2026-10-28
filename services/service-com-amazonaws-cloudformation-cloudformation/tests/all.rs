@@ -33,6 +33,8 @@ mod change_set_preview;
 mod client_request_tokens;
 #[path = "all/cognito_resource_types.rs"]
 mod cognito_resource_types;
+#[path = "all/cognito_user_pool_return_values.rs"]
+mod cognito_user_pool_return_values;
 #[path = "all/content_delivery_stack_outputs.rs"]
 mod content_delivery_stack_outputs;
 #[path = "all/cross_stack_imports.rs"]

@@ -2887,6 +2887,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     CLOUDFRONT_RESPONSE_HEADERS_POLICY,
     "AWS::CloudWatch::Alarm",
     CLOUDWATCH_METRIC_STREAM,
+    COGNITO_USER_POOL,
     "AWS::DynamoDB::Table",
     EC2_DHCP_OPTIONS,
     EC2_INTERNET_GATEWAY,
@@ -3012,6 +3013,34 @@ fn return_values(
             attributes.insert("Arn".to_string(), arn.clone());
             attributes.insert("Name".to_string(), name.to_string());
             (arn, attributes)
+        }
+        // "Ref returns the user pool ID"; Fn::GetAtt: Arn
+        // ("arn:aws:cognito-idp:us-east-1:123412341234:userpool/us-east-1_123412341"),
+        // ProviderName ("The provider name of the Amazon Cognito user pool") and
+        // ProviderURL ("The URL of the provider of the Amazon Cognito user pool"). The
+        // provider name is the pool's endpoint host and its identity
+        // (`cognito-idp.<region>.amazonaws.com/<user pool id>`) — the name an identity
+        // pool's `CognitoIdentityProviders`, a principal-tag mapping's
+        // `IdentityProviderName` and a `Logins` entry all name the pool by — and the
+        // provider URL is that same host and identity as an `https` URL, which is the
+        // issuer an OpenID relying party reads. Both are built from the resource's OWN
+        // identity, so whatever a `Ref` to the pool answers, the provider the pool
+        // publishes names that same pool; making that identity the id the owning service
+        // mints is the business of the open issue on service-assigned physical ids
+        // (`20261023T114649Z-cloudformation-outputs-carry-no-outputvalue-failed-resources-never`).
+        COGNITO_USER_POOL => {
+            let host = format!("{COGNITO_IDP_ARN_NAMESPACE}.{region}.{URL_SUFFIX}");
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    COGNITO_IDP_ARN_NAMESPACE,
+                    region,
+                    &format!("userpool/{name}"),
+                ),
+            );
+            attributes.insert("ProviderName".to_string(), format!("{host}/{name}"));
+            attributes.insert("ProviderURL".to_string(), format!("https://{host}/{name}"));
+            (name.to_string(), attributes)
         }
         // "Ref returns the bucket name"; Fn::GetAtt: Arn, DomainName,
         // DualStackDomainName, RegionalDomainName, WebsiteURL — each one a DNS name S3
@@ -4121,6 +4150,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::RUM::AppMonitor" => &["Id"],
         "AWS::CloudWatch::Alarm" => &["Arn"],
         CLOUDWATCH_METRIC_STREAM => &["Arn"],
+        COGNITO_USER_POOL => &["Arn", "ProviderName", "ProviderURL"],
         FIS_EXPERIMENT_TEMPLATE => &["Id"],
         CLOUDFRONT_DISTRIBUTION => &["DomainName", "Id"],
         CLOUDFRONT_ORIGIN_ACCESS_CONTROL => &["Id"],
@@ -4540,6 +4570,18 @@ pub const CODECOMMIT_REPOSITORY: &str = "AWS::CodeCommit::Repository";
 /// declares through [`declared_name_property`]. Its `UserPoolId` is the other half of that
 /// identity and stays a declared PROPERTY, which is what the provisioner's calls carry.
 pub const COGNITO_USER_POOL_GROUP: &str = "AWS::Cognito::UserPoolGroup";
+
+/// The type of an Amazon Cognito user pool (the cognito-idp model's
+/// `awsService.cloudFormationName: Cognito`), whose published return values
+/// [`return_values`] carries: a pool is how a federated identity pool, an app client and an
+/// OpenID relying party all name the same user pool, and each of them names it through one
+/// of those values.
+pub const COGNITO_USER_POOL: &str = "AWS::Cognito::UserPool";
+
+/// Amazon Cognito user pools' ARN namespace and endpoint prefix, which its own model
+/// carries as `awsService.arnNamespace` and `endpointPrefix` (`cognito-idp`) — the service
+/// segment of a pool's ARN and the host its pool endpoints are served under.
+const COGNITO_IDP_ARN_NAMESPACE: &str = "cognito-idp";
 
 /// An Amazon ECS cluster's resource type (ECS's model: `cloudFormationName: ECS`). This
 /// is the type `super::provisioning` creates in Amazon ECS itself.
