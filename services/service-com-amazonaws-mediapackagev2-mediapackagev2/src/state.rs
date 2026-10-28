@@ -26,10 +26,10 @@
 //! The same holds for the members the SERVICE applies rather than the caller: a channel's
 //! input type and output locking mode, its switching and CMSD-header blocks, an origin
 //! endpoint's segment settings, startover window and URI/stream-name modes, and every
-//! manifest configuration's window, URI path type and child-manifest URL encoding are
-//! materialised ONCE, at create time, from the submitted value or the service's default,
-//! and stored — so the create response, a later read and the list projection all report
-//! the same concrete value.
+//! manifest configuration's window, URI path type, child-manifest URL encoding and (on
+//! the HLS families) child manifest name are materialised ONCE, at create time, from the
+//! submitted value or the service's default, and stored — so the create response, a later
+//! read and the list projection all report the same concrete value.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -163,6 +163,17 @@ pub const DEFAULT_INCLUDE_IFRAME_ONLY_STREAMS: bool = false;
 /// configuration that does not ask for it — recorded behaviour: the service reports the
 /// encoding off.
 pub const DEFAULT_URL_ENCODE_CHILD_MANIFEST: bool = false;
+
+/// The child manifest name MediaPackage applies to an HLS or low-latency HLS manifest
+/// configuration submitted without one.
+///
+/// The model states the rule on both sides of the wire: the create shapes say "If you
+/// don't enter a value, MediaPackage uses the default manifest name, index, with an added
+/// suffix to distinguish it from the manifest name", and the `Get*` shapes name the
+/// applied value outright — "MediaPackage uses the default child manifest name, index_1".
+/// The suffixed form is why the reported member's `ResourceName` pattern admits `_` while
+/// the submitted member's `ManifestName` pattern does not.
+pub const DEFAULT_CHILD_MANIFEST_NAME: &str = "index_1";
 
 /// The most manifest configurations one origin endpoint stores, counted across the HLS,
 /// low-latency HLS, DASH and MSS families together.
@@ -1984,7 +1995,8 @@ impl ManifestLocation<'_> {
 /// The stored form of a submitted HLS manifest: everything the caller asked for, plus
 /// the URL the service computes for it and the manifest settings the service applies to
 /// what the caller left out ([`DEFAULT_MANIFEST_WINDOW_SECONDS`],
-/// [`DEFAULT_URI_PATH_TYPE`], and child-manifest URL encoding off).
+/// [`DEFAULT_URI_PATH_TYPE`], [`DEFAULT_CHILD_MANIFEST_NAME`], and child-manifest URL
+/// encoding off).
 pub fn stored_hls_manifest(
     submitted: CreateHlsManifestConfiguration,
     at: ManifestLocation<'_>,
@@ -1992,7 +2004,11 @@ pub fn stored_hls_manifest(
     GetHlsManifestConfiguration {
         url: at.url(&submitted.manifest_name, ManifestKind::Hls),
         manifest_name: submitted.manifest_name,
-        child_manifest_name: submitted.child_manifest_name,
+        child_manifest_name: Some(
+            submitted
+                .child_manifest_name
+                .unwrap_or_else(|| DEFAULT_CHILD_MANIFEST_NAME.to_string()),
+        ),
         manifest_window_seconds: Some(
             submitted
                 .manifest_window_seconds
@@ -2017,7 +2033,7 @@ pub fn stored_hls_manifest(
 
 /// The stored form of a submitted low-latency HLS manifest. Low-latency HLS publishes
 /// the same `.m3u8` playlist as plain HLS, so it shares the URL rule and the same
-/// manifest-setting defaults.
+/// manifest-setting defaults, child manifest name included.
 pub fn stored_low_latency_hls_manifest(
     submitted: CreateLowLatencyHlsManifestConfiguration,
     at: ManifestLocation<'_>,
@@ -2025,7 +2041,11 @@ pub fn stored_low_latency_hls_manifest(
     GetLowLatencyHlsManifestConfiguration {
         url: at.url(&submitted.manifest_name, ManifestKind::Hls),
         manifest_name: submitted.manifest_name,
-        child_manifest_name: submitted.child_manifest_name,
+        child_manifest_name: Some(
+            submitted
+                .child_manifest_name
+                .unwrap_or_else(|| DEFAULT_CHILD_MANIFEST_NAME.to_string()),
+        ),
         manifest_window_seconds: Some(
             submitted
                 .manifest_window_seconds

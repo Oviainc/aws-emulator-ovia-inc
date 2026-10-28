@@ -98,3 +98,5 @@ mod shared_entity_tag_precondition;
 mod shared_manifest_count_builder;
 #[path = "all/create_idempotency_optional_members.rs"]
 mod create_idempotency_optional_members;
+#[path = "all/default_child_manifest_name.rs"]
+mod default_child_manifest_name;
