@@ -10,12 +10,14 @@
 //! does not own — the account's EC2 instances and its AWS Directory Service directories —
 //! live here too, each behind its own seed seam; the instances are ALSO resolved against
 //! the service that owns them ([`ec2_fleet`]), which is what makes an instance a client
-//! really launched a target this service accepts. The
+//! really launched a target this service accepts, and so are the subnets and the security
+//! group a registration's `Settings` name. The
 //! list/lookup/pagination/filter helpers live here as well, so the operation handlers in
 //! `ops/` all resolve a resource the same way instead of each growing its own copy.
 
-/// Resolving the EC2 instance a request names against the instances the account has,
-/// through the service that owns instances.
+/// Resolving the EC2 resources a request names — the instance it acts on, the network a
+/// registration's settings name — against what the account has, through the service that
+/// owns them.
 pub mod ec2_fleet;
 
 use std::collections::{HashMap, HashSet};

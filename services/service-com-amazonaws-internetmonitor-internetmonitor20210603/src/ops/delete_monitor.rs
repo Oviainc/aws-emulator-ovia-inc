@@ -153,6 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A health event belongs to its monitor, so it goes with the monitor: a monitor
         // later created with this name is a new monitor, which has had no health events.
         store.forget_health_events_for(&input.monitor_name);
+        // A started query is a query OF this monitor, and is reportable only through it,
+        // so it goes with the monitor for the same reason.
+        store.forget_queries_for(&input.monitor_name);
         Ok(DeleteMonitorOutput {})
     }
 }

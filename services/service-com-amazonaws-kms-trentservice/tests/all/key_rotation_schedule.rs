@@ -29,8 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use super::harness::{
-    assert_empty, call, create_alias, create_key, describe, error_code, ok, replicate_into, router,
-    text, REGION,
+    assert_empty, call, create_alias, create_key, describe, error_code, error_message, ok,
+    replicate_into, router, text, REGION,
 };
 
 /// Seconds in a day: the unit `RotationPeriodInDays` counts in
@@ -662,11 +662,9 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
     // property is set on the primary key of the set. The set is replicated into
     // another Region and then promoted there, which is what leaves this endpoint
     // serving a replica of the set rather than its primary key.
-    let replica = text(
-        "setup",
-        &create_key(&router, &json!({"MultiRegion": true})).await,
-        "KeyId",
-    );
+    let replica_created = create_key(&router, &json!({"MultiRegion": true})).await;
+    let replica = text("setup", &replica_created, "KeyId");
+    let replica_arn = text("setup", &replica_created, "Arn");
     replicate_into(&router, "setup", &replica, &["eu-west-2"]).await;
     ok(
         &router,
@@ -686,7 +684,19 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
             code, "UnsupportedOperationException",
             "case {case:?}: expected UnsupportedOperationException, got {code:?} in {payload}"
         );
-        assert_no_message(&case, &payload);
+        // This refusal is about WHICH key of the set carries the property, so it names
+        // the replica and the operation rather than carrying the bare code the refusal
+        // of an unrotatable key kind carries.
+        let message = error_message(&payload);
+        assert_eq!(
+            message,
+            format!(
+                "{replica_arn} is a multi-region replica key which is not valid for \
+                 {operation}."
+            ),
+            "case {case:?}: expected the refusal to name the replica key and the \
+             operation, got {message:?} in {payload}"
+        );
     }
 }
 

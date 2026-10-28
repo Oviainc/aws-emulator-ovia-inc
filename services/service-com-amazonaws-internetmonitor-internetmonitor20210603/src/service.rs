@@ -98,15 +98,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. Internet Monitor does NOT answer that class with the
+        // `ValidationException` shape its operations model: it refuses a request
+        // that fails input validation with HTTP 400 and the error code
+        // `BadRequestException` — the shape `TagResource` models for exactly this
+        // ("A bad request was received") — stating the class of the failure rather
+        // than naming the member. The modelled `ValidationException` is what an
+        // operation answers for a refusal of its own semantics (a filter value
+        // that names no member of its enum, a query id it cannot resolve), which
+        // the handlers return themselves and this seam never sees.
+        //
+        // Both the code and the message are replaced together, because a client
+        // branches on the code. An authentication refusal keeps the framework's
+        // own wording: it is not an input-validation failure.
+        match refusal {
+            Refusal::Invalid(_) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string(),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

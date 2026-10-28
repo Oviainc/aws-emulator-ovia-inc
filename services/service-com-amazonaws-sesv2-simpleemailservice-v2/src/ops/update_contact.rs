@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored contact the request names on the stored list it names: the topic
+//! preferences it supplies, whether the contact is unsubscribed from everything, and
+//! the attribute data it carries. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata is not needed: the contact is keyed by its list and address
+        // within the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateContact without the shared emulator state",
+            ));
+        };
+
+        let list_name = input.contact_list_name;
+        let address = input.email_address;
+        // The same key `CreateContact` stored the contact under.
+        let key = crate::state::identity_key(&address);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(list) = store.contact_lists.get_mut(&list_name) else {
+            return Err(UpdateContactErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::contact_list_not_found(&list_name)),
+            })
+            .into());
+        };
+        // This operation updates a contact and never creates one, so a list holding no
+        // contact under this address is the modelled 404 — decided before the input is
+        // read, so a request naming no stored contact changes nothing whatever it
+        // carries.
+        if !list.contacts.contains_key(&key) {
+            return Err(contact_not_found_error(&address));
+        }
+
+        // A preference can only be stated for a topic the list publishes, since that is
+        // what a topic name names — the same rule `CreateContact` applies on the way in.
+        let preferences = input.topic_preferences.unwrap_or_default();
+        if let Some(unknown) = preferences
+            .iter()
+            .find(|preference| !list.publishes_topic(&preference.topic_name))
+        {
+            let topic_name = &unknown.topic_name;
+            return Err(UpdateContactErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::contact_list_topic_not_found(
+                    &list_name, topic_name,
+                )),
+            })
+            .into());
+        }
+        // Attribute data is a JSON document within a character bound, on whichever
+        // operation it arrives; nothing is written when it is neither.
+        if input
+            .attributes_data
+            .as_deref()
+            .is_some_and(|data| !crate::state::attributes_data_is_acceptable(data))
+        {
+            return Err(UpdateContactErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_attributes_data()),
+            })
+            .into());
+        }
+
+        // The record the checks above were made against. It is reached again here
+        // because those checks read the list itself, which cannot be borrowed while the
+        // contact on it is being written; the key has not changed, and the store has
+        // been held under the one lock throughout.
+        let Some(record) = list.contacts.get_mut(&key) else {
+            return Err(contact_not_found_error(&address));
+        };
+        // Each member the request binds is applied to the member it names: a supplied
+        // preference sets the status of the one topic it names, `UnsubscribeAll` becomes
+        // the boolean the request resolved to (the model defaults it to false), and a
+        // supplied attribute document REPLACES the stored one whole — it is one opaque
+        // document, not a set of fields to merge into. A document the request does not
+        // carry leaves the stored one alone.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateContact"))
+        // The modelled description warns that preferences left out of the request are
+        // removed; the service itself keeps them and applies the request's preferences
+        // per topic, so that is what is stored here — the preferences a contact stated
+        // for the topics this request says nothing about survive the update.
+        record.merge_topic_preferences(preferences);
+        record.unsubscribe_all = input.unsubscribe_all;
+        if let Some(attributes_data) = input.attributes_data {
+            record.attributes_data = Some(attributes_data);
+        }
+        record.last_updated_at = now;
+
+        // `UpdateContactResponse` carries no members: the stored contact is read back
+        // with `GetContact`.
+        Ok(UpdateContactOutput {})
     }
+}
+
+/// The modelled 404 for an address the named list holds no contact under.
+fn contact_not_found_error(email_address: &str) -> UpdateContactError {
+    UpdateContactErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::contact_not_found(email_address)),
+    })
+    .into()
 }
