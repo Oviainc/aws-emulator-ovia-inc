@@ -23,7 +23,12 @@
 //!   identity no Easy DKIM setup covers is refused with HTTP 400;
 //! * a value that is no domain name is refused with HTTP 400 and nothing is
 //!   stored; only identities in the list are reported, and a report may name at
-//!   most 100 of them.
+//!   most 100 of them;
+//! * the report is a MAP of the requested identities the account holds, each
+//!   entry resolved from that identity's OWN record and the setup covering it, so
+//!   one call naming many identities reports every one of them independently, an
+//!   identity named more than once is reported once, and the order they were
+//!   named in changes nothing.
 
 use crate::harness::{call, element, elements, emulator, field, map_entries, Field};
 use service_com_amazonaws_ses_simpleemailservice::ops::VERIFICATION_STATUS_VALUES;
@@ -583,4 +588,218 @@ async fn a_report_may_name_at_most_the_published_number_of_identities() {
         "case {} identities: expected InvalidParameterValue, got {body}",
         past_the_bound.len()
     );
+}
+
+/// One identity of the account, and what the report must carry for it — resolved
+/// from that identity's own record and the Easy DKIM setup that covers it.
+struct Row {
+    /// What this row is, for the assertion messages.
+    case: &'static str,
+    /// The identity, as it was recorded and as the request names it.
+    identity: &'static str,
+    /// The entry the report must carry for it.
+    expected: Reported,
+}
+
+#[tokio::test]
+async fn one_call_reports_every_requested_identity_from_its_own_record() {
+    let router = emulator();
+
+    // Two Easy DKIM setups, so an identity reported with one cannot be passing by
+    // carrying the other's tokens, and a domain identity with no setup at all.
+    let signed = "signed.example.com";
+    let signed_tokens = verify_domain_dkim_ok(&router, signed).await;
+    let other = "other-signed.example.net";
+    let other_tokens = verify_domain_dkim_ok(&router, other).await;
+    let plain = "plain.example.org";
+    verify_domain_identity(&router, plain).await;
+
+    // Addresses under each setup — one of them a label deeper — and one nothing
+    // covers.
+    for address in [
+        "user@signed.example.com",
+        "off@signed.example.com",
+        "user@mail.signed.example.com",
+        "user@other-signed.example.net",
+        "user@plain.example.org",
+    ] {
+        verify_email_identity(&router, address).await;
+    }
+
+    // Signing is stored on the identity it was set on, so switching it off on a
+    // domain and on one address says nothing about the identities beside them —
+    // including the ones that share their covering setup.
+    set_dkim_enabled_ok(&router, other, false).await;
+    set_dkim_enabled_ok(&router, "off@signed.example.com", false).await;
+
+    // `IdentityDkimAttributes$DkimEnabled` is documented "Is true if DKIM signing
+    // is enabled for email sent from the identity. It's false otherwise. The
+    // default value is true", so an identity nothing switched off reports `true` —
+    // spelled out here rather than read from the implementation's own constant.
+    let on = true.to_string();
+    let off = false.to_string();
+    // The rows span what one entry is resolved from: the class of identity
+    // (domain, address), whether a setup covers it and how far above it that
+    // setup sits, and that identity's own signing flag.
+    let rows = vec![
+        Row {
+            case: "a domain with its own Easy DKIM setup",
+            identity: signed,
+            expected: Reported {
+                enabled: on.clone(),
+                status: PENDING.to_string(),
+                tokens: Some(signed_tokens.clone()),
+            },
+        },
+        Row {
+            case: "a domain with its own setup and signing off",
+            identity: other,
+            expected: Reported {
+                enabled: off.clone(),
+                status: PENDING.to_string(),
+                tokens: Some(other_tokens.clone()),
+            },
+        },
+        Row {
+            case: "a domain no Easy DKIM setup covers",
+            identity: plain,
+            expected: Reported {
+                enabled: on.clone(),
+                status: NOT_STARTED.to_string(),
+                tokens: None,
+            },
+        },
+        Row {
+            case: "an address under the first setup",
+            identity: "user@signed.example.com",
+            expected: Reported {
+                enabled: on.clone(),
+                status: PENDING.to_string(),
+                tokens: Some(signed_tokens.clone()),
+            },
+        },
+        Row {
+            case: "an address under the first setup with signing off",
+            identity: "off@signed.example.com",
+            expected: Reported {
+                enabled: off,
+                status: PENDING.to_string(),
+                tokens: Some(signed_tokens.clone()),
+            },
+        },
+        Row {
+            case: "an address under a subdomain of the first setup",
+            identity: "user@mail.signed.example.com",
+            expected: Reported {
+                enabled: on.clone(),
+                status: PENDING.to_string(),
+                tokens: Some(signed_tokens),
+            },
+        },
+        Row {
+            case: "an address under the second setup, whose domain has signing off",
+            identity: "user@other-signed.example.net",
+            expected: Reported {
+                enabled: on.clone(),
+                status: PENDING.to_string(),
+                tokens: Some(other_tokens),
+            },
+        },
+        Row {
+            case: "an address no Easy DKIM setup covers",
+            identity: "user@plain.example.org",
+            expected: Reported {
+                enabled: on,
+                status: NOT_STARTED.to_string(),
+                tokens: None,
+            },
+        },
+    ];
+
+    // Named in one call, together with an identity the account does not hold.
+    let stranger = "stranger.example.com";
+    let mut named: Vec<&str> = rows.iter().map(|row| row.identity).collect();
+    named.push(stranger);
+
+    // The report is a map, so the order the identities were named in is not part
+    // of the question asked.
+    for ordering in ["as named", "in the reverse order"] {
+        let mut requested = named.clone();
+        if ordering == "in the reverse order" {
+            requested.reverse();
+        }
+        let listed = reported_all(&router, &requested).await;
+        assert_eq!(
+            listed.len(),
+            rows.len(),
+            "case {ordering}: expected one entry per identity the account holds ({}), got \
+             {listed:?}",
+            rows.len()
+        );
+        for row in &rows {
+            let found = listed
+                .iter()
+                .find(|(key, _)| key == row.identity)
+                .map(|(_, attributes)| attributes.clone());
+            assert_eq!(
+                found,
+                Some(row.expected.clone()),
+                "case {:?} ({ordering}): expected {:?}, got {found:?}",
+                row.case,
+                row.expected
+            );
+        }
+        assert!(
+            !listed.iter().any(|(key, _)| key == stranger),
+            "case {ordering}: an unverified identity must not be reported, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn naming_an_identity_more_than_once_reports_it_once() {
+    // The report is a map keyed by identity, so a request that names one twice
+    // asks about one identity.
+    let router = emulator();
+    let domain = "repeated.example.com";
+    let tokens = verify_domain_dkim_ok(&router, domain).await;
+    let address = "user@repeated.example.com";
+    verify_email_identity(&router, address).await;
+    let stranger = "stranger.example.net";
+
+    // Both identities are covered by the one setup and keep the documented default
+    // signing flag (`IdentityDkimAttributes$DkimEnabled`: "The default value is
+    // true"), so every entry any of these rows reports is this.
+    let expected = Reported {
+        enabled: true.to_string(),
+        status: PENDING.to_string(),
+        tokens: Some(tokens),
+    };
+
+    // The rows differ in how the request repeats an identity: twice, three times,
+    // beside another identity, and around one the account does not hold.
+    let cases: &[(&str, &[&str], usize)] = &[
+        ("one identity named twice", &[domain, domain], 1),
+        ("one identity named three times", &[domain, domain, domain], 1),
+        ("two identities, one of them twice", &[domain, address, domain], 2),
+        (
+            "a repeat around an identity the account does not hold",
+            &[domain, stranger, domain],
+            1,
+        ),
+    ];
+    for (case, requested, entries) in cases {
+        let listed = reported_all(&router, requested).await;
+        assert_eq!(
+            listed.len(),
+            *entries,
+            "case {case:?}: expected {entries} entry/entries, got {listed:?}"
+        );
+        for (key, reported) in &listed {
+            assert_eq!(
+                reported, &expected,
+                "case {case:?}: expected {key:?} reported as {expected:?}, got {reported:?}"
+            );
+        }
+    }
 }
