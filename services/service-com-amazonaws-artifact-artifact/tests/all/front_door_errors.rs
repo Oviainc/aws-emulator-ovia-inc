@@ -311,9 +311,9 @@ async fn a_compliance_inquiry_target_the_front_door_cannot_authorize_is_refused_
     // The other class of unauthorizable target: a well-formed id the account holds no
     // inquiry for. That judgement needs this service's state, so the HANDLER makes it and
     // answers the same refusal — exactly as an unpublished `reportId` is answered above.
-    // Only `GetComplianceInquiryMetadata` is implemented today; the other three inquiry
-    // operations still answer their scaffolded 501 (their own stub issues), which is why
-    // they are not rows here.
+    // All four inquiry operations are implemented and each makes it; the rows for the
+    // other three live in `implemented_inquiry_operations.rs`, beside the evidence that
+    // those same operations serve an inquiry the account does hold.
     for (case, id) in UNHELD_INQUIRY_IDS {
         let answer = get(
             &router,
@@ -334,9 +334,9 @@ async fn a_well_formed_target_reaches_the_operation() {
 
     // A target the gateway authorizes is passed through, and the operation answers for
     // itself. For an inquiry that means an inquiry this account HOLDS, so one is created
-    // first: `GetComplianceInquiryMetadata` then serves it, and
-    // `ListComplianceInquiryQueries` answers its own scaffolded 501 — which this suite
-    // deliberately does not pin beyond "not refused by the front door".
+    // first: `GetComplianceInquiryMetadata` and `ListComplianceInquiryQueries` then serve
+    // it — what each answers beyond "not refused by the front door" is pinned by their own
+    // suites, which this one deliberately does not duplicate.
     let created = call(
         &router,
         "POST",

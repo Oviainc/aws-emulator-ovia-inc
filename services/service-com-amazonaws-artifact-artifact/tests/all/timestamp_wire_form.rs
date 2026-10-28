@@ -25,12 +25,14 @@
 //!    model-generated text and no such engine runs in this emulator — and that absence,
 //!    not a query-level error that never happened, is what says so.
 //!
-//! Rule 1 is checked end to end over HTTP across every implemented operation that reports
-//! a timestamp (so the rows differ along operation, shape, member, whether the member is
+//! Rule 1 is checked end to end over HTTP across the operations below that report a
+//! timestamp (so the rows differ along operation, shape, member, whether the member is
 //! `@required`, and whether the instant has a sub-second part: a created inquiry's
 //! `createdAt` comes from the clock, a catalog period is a whole second), and directly on
-//! the member schemas, which is the only reach the shapes behind a scaffolded 501
-//! (`ResponseVersion`, `PutComplianceInquiryFeedbackResponse$submittedAt`) have.
+//! the member schemas, which is the only reach a shape no operation of this service
+//! reports (`ResponseVersion`) has. `PutComplianceInquiryFeedbackResponse$submittedAt` is
+//! reported over HTTP by `PutComplianceInquiryFeedback`, and its end-to-end row lives in
+//! `implemented_inquiry_operations.rs`, beside that operation's other rows.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -371,10 +373,9 @@ async fn every_reported_date_time_member_is_an_rfc3339_string() {
 /// service models carries `@timestampFormat("date-time")`, and a member the model does not
 /// annotate carries none.
 ///
-/// This is the only reach the shapes behind a scaffolded 501 have — `ResponseVersion` and
-/// `PutComplianceInquiryFeedbackResponse$submittedAt`, which only
-/// `PutComplianceInquiryFeedback` and an edited response would report — and it is what
-/// fails if any of these schemas goes back to the vendored codegen's output.
+/// This is the only reach `ResponseVersion` has, the one shape here no operation of this
+/// service reports — only an edited response would carry it — and it is what fails if any
+/// of these schemas goes back to the vendored codegen's output.
 #[test]
 fn every_modelled_timestamp_member_carries_the_date_time_format() {
     // Source: `smithy_query(query="shape",shape="InquirySummary,InquiryDetail,QuerySummary,
