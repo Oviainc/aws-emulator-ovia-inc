@@ -12,8 +12,8 @@
 //! tagging is an upsert on the tag set the resource already carries, whatever
 //! kind of resource the ARN names; untagging removes exactly the named keys and
 //! is idempotent; a call that would carry a resource past the modelled maximum
-//! of 50 tags is refused and stores nothing; and a page sequence partitions the
-//! listing.
+//! of 50 tags is refused with the error the operation declares for exceeding the
+//! tag limit and stores nothing; and a page sequence partitions the listing.
 
 use std::collections::BTreeMap;
 
@@ -22,7 +22,7 @@ use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MAX_TAGS_PER_RESOURCE,
 };
 
-use crate::harness::{entity_arn, workspace_arn, Emulator, Resp};
+use crate::harness::{component_type_arn, entity_arn, scene_arn, workspace_arn, Emulator, Resp};
 
 /// The `tags` member of a `ListTagsForResource` response, as a map a test can
 /// compare: a JSON object, never an absent member.
@@ -356,13 +356,92 @@ impl CapCase {
             accepted,
         }
     }
+
+    /// The size of the tag set this row would leave on the resource: the keys it
+    /// already carries plus the request's keys it does not — rewriting a key it
+    /// carries never grows the set.
+    fn resulting(&self) -> usize {
+        self.stored.len()
+            + self
+                .applied
+                .keys()
+                .filter(|key| !self.stored.contains_key(*key))
+                .count()
+    }
+}
+
+/// Drive one row of the tag-maximum table against `resource_arn` and assert the
+/// whole rule on it: the answer the row expects, a refusal that is the modelled
+/// 400 `TooManyTagsException` carrying the modelled message and a code the
+/// operation DECLARES, and the set the resource is left holding, read back
+/// through `ListTagsForResource` so a refused call is proven to have stored
+/// nothing. The one assertion block both tables below drive.
+async fn assert_cap_case(emulator: &Emulator, case: &str, resource_arn: &str, row: &CapCase) {
+    if !row.stored.is_empty() {
+        assert_eq!(
+            emulator
+                .tag_resource(resource_arn, as_json(&row.stored))
+                .await
+                .status,
+            200,
+            "case {case:?}: storing the initial {} tags must succeed",
+            row.stored.len()
+        );
+    }
+
+    let resp = emulator
+        .tag_resource(resource_arn, as_json(&row.applied))
+        .await;
+    let mut expected = row.stored.clone();
+    if row.accepted {
+        assert!(
+            row.resulting() <= MAX_TAGS_PER_RESOURCE,
+            "case {case:?}: an accepted row must stay within the maximum \
+             {MAX_TAGS_PER_RESOURCE}, got {}",
+            row.resulting()
+        );
+        assert_eq!(
+            resp.status, 200,
+            "case {case:?}: expected 200 from TagResource, got {resp:?}"
+        );
+        expected.extend(row.applied.clone());
+    } else {
+        assert!(
+            row.resulting() > MAX_TAGS_PER_RESOURCE,
+            "case {case:?}: a refused row must reach past the maximum \
+             {MAX_TAGS_PER_RESOURCE}, got {}",
+            row.resulting()
+        );
+        let code = resp.error_type.clone().unwrap_or_default();
+        assert!(
+            TAG_RESOURCE_MODELED_ERRORS.contains(&code.as_str()),
+            "case {case:?}: expected one of the declared errors \
+             {TAG_RESOURCE_MODELED_ERRORS:?}, got {resp:?}"
+        );
+        assert_eq!(
+            (resp.status, code.as_str()),
+            (400, "TooManyTagsException"),
+            "case {case:?}: expected a 400 TooManyTagsException, got {resp:?}"
+        );
+        assert_eq!(
+            resp.member("message").as_str(),
+            Some(TOO_MANY_TAGS_MESSAGE),
+            "case {case:?}: expected the modelled tag-limit message, got {resp:?}"
+        );
+    }
+
+    let listed = all_tags(emulator, case, resource_arn).await;
+    assert_eq!(
+        listed, expected,
+        "case {case:?}: expected the stored set {expected:?}, got {listed:?}"
+    );
 }
 
 /// RULE: a `TagResource` call is accepted exactly while the tag set it would
 /// leave on the resource is within the maximum of 50 tags per resource
-/// ([`MAX_TAGS_PER_RESOURCE`]); otherwise it is refused as the QUOTA refusal
-/// exceeding a per-resource quota earns — HTTP 402
-/// `ServiceQuotaExceededException` — and stores nothing. Rewriting the value of
+/// ([`MAX_TAGS_PER_RESOURCE`]); otherwise it is refused with the error the
+/// operation models for exceeding the tag limit — HTTP 400
+/// `TooManyTagsException` — and stores nothing. Rewriting the value of
 /// a key the resource already carries never grows the set, so it is accepted
 /// even at the maximum.
 ///
@@ -421,62 +500,188 @@ async fn tagging_past_the_maximum_is_refused_and_stores_nothing() {
         ),
     ];
 
-    for CapCase {
-        case,
-        stored,
-        applied,
-        accepted,
-    } in &rows
-    {
+    for row in &rows {
         // A workspace of its own per row, so one row's tag set cannot leak into
         // the next.
         let emulator = Emulator::new();
-        let workspace_id = format!("cap{case}");
+        let workspace_id = format!("cap{}", row.case);
         assert_eq!(
             emulator.create_workspace(&workspace_id).await.status,
             200,
-            "case {case:?}: the workspace must be created"
+            "case {:?}: the workspace must be created",
+            row.case
         );
-        let resource_arn = workspace_arn(&workspace_id);
-        if !stored.is_empty() {
+        assert_cap_case(&emulator, row.case, &workspace_arn(&workspace_id), row).await;
+    }
+}
+
+/// The message the modelled `TooManyTagsException` carries, written out here so
+/// the WORDING is a check that can fail: it is the sentence the model states for
+/// this error class
+/// (`smithy_query(query="shape",shape="TooManyTagsException")`).
+const TOO_MANY_TAGS_MESSAGE: &str = "The number of tags exceeds the limit.";
+
+/// The error codes `TagResource` declares, from
+/// `smithy_query(query="operation",operation="TagResource")`: the refusal of a
+/// request to this operation is always one of these, never a code the operation
+/// does not declare.
+const TAG_RESOURCE_MODELED_ERRORS: [&str; 3] = [
+    "AccessDeniedException",
+    "ResourceNotFoundException",
+    "TooManyTagsException",
+];
+
+/// One taggable resource of `kind`, carrying no tags, and the ARN that names it.
+///
+/// Every kind of resource this service mints an ARN for is created through its
+/// own operation, so the ARN under test is one the service really holds.
+async fn taggable_resource(emulator: &Emulator, kind: &str, case: &str) -> String {
+    let workspace_id = "taglimit";
+    assert_eq!(
+        emulator.create_workspace(workspace_id).await.status,
+        200,
+        "case {case:?}: the workspace holding the resource must be created"
+    );
+    match kind {
+        "workspace" => workspace_arn(workspace_id),
+        "entity" => {
             assert_eq!(
                 emulator
-                    .tag_resource(&resource_arn, as_json(stored))
+                    .create_entity(workspace_id, json!({"entityId": "pump", "entityName": "Pump"}))
                     .await
                     .status,
                 200,
-                "case {case:?}: storing the initial {} tags must succeed",
-                stored.len()
+                "case {case:?}: the entity under test must be created"
             );
+            entity_arn(workspace_id, "pump")
         }
-
-        let resp = emulator.tag_resource(&resource_arn, as_json(applied)).await;
-        let mut expected = stored.clone();
-        if *accepted {
+        "componentType" => {
             assert_eq!(
-                resp.status, 200,
-                "case {case:?}: expected 200 from TagResource, got {resp:?}"
+                emulator
+                    .create_component_type(workspace_id, "com.example.pump", json!({}))
+                    .await
+                    .status,
+                200,
+                "case {case:?}: the component type under test must be created"
             );
-            expected.extend(applied.clone());
-        } else {
-            assert_eq!(
-                (resp.status, resp.error_type.as_deref()),
-                (402, Some("ServiceQuotaExceededException")),
-                "case {case:?}: expected a 402 ServiceQuotaExceededException, got {resp:?}"
-            );
+            component_type_arn(workspace_id, "com.example.pump")
         }
-        assert!(
-            expected.len() <= cap,
-            "case {case:?}: the expected set is {} tags, past the maximum {cap}",
-            expected.len()
-        );
-
-        let listed = all_tags(&emulator, case, &resource_arn).await;
-        assert_eq!(
-            listed, expected,
-            "case {case:?}: expected the stored set {expected:?}, got {listed:?}"
-        );
+        "scene" => {
+            assert_eq!(
+                emulator
+                    .create_scene(
+                        workspace_id,
+                        json!({"sceneId": "floor", "contentLocation": "s3://bucket/floor.json"}),
+                    )
+                    .await
+                    .status,
+                200,
+                "case {case:?}: the scene under test must be created"
+            );
+            scene_arn(workspace_id, "floor")
+        }
+        other => panic!("case {case:?}: no taggable resource of kind {other:?}"),
     }
+}
+
+/// RULE: a refusal of `TagResource` is one of the error codes the operation
+/// DECLARES, and the one it answers for a call that would leave a resource past
+/// the per-resource tag maximum is the error modelled for exceeding the tag
+/// limit — HTTP 400 `TooManyTagsException`, carrying the message the model
+/// states for that error class — whatever kind of resource
+/// the ARN names and however far past the maximum the call reaches.
+///
+/// The rows differ along how full the resource already is, how many of the
+/// request's keys are new, how far past the maximum the resulting set would
+/// reach (both sides of the boundary, one past it and three past it) and, in the
+/// outer loop, the kind of resource the ARN names. The not-found row is the
+/// second declared code, so the rule is checked on a refusal the tag maximum has
+/// nothing to do with.
+#[tokio::test]
+async fn a_tag_refusal_is_an_error_the_operation_declares() {
+    let cap = MAX_TAGS_PER_RESOURCE;
+
+    let rows: Vec<CapCase> = vec![
+        CapCase::new("emptyToFull", BTreeMap::new(), tag_batch(cap, "first"), true),
+        CapCase::new(
+            "fullRewrittenInPlace",
+            tag_batch(cap, "first"),
+            tag_batch(cap, "second"),
+            true,
+        ),
+        CapCase::new(
+            "fullPlusOneNew",
+            tag_batch(cap, "first"),
+            BTreeMap::from([("extra".to_string(), "x".to_string())]),
+            false,
+        ),
+        CapCase::new(
+            "fullPlusAReplacementAndANewKey",
+            tag_batch(cap, "first"),
+            BTreeMap::from([
+                ("k00".to_string(), "rewritten".to_string()),
+                ("extra".to_string(), "x".to_string()),
+            ]),
+            false,
+        ),
+        CapCase::new(
+            "fullPlusThreeNew",
+            tag_batch(cap, "first"),
+            BTreeMap::from([
+                ("extra1".to_string(), "x".to_string()),
+                ("extra2".to_string(), "y".to_string()),
+                ("extra3".to_string(), "z".to_string()),
+            ]),
+            false,
+        ),
+        CapCase::new(
+            "oneStoredPlusAFullBatchOfNewKeys",
+            BTreeMap::from([("seed".to_string(), "s".to_string())]),
+            tag_batch(cap, "batch"),
+            false,
+        ),
+    ];
+
+    for kind in ["workspace", "entity", "componentType", "scene"] {
+        for row in &rows {
+            // A resource of its own per row, so one row's tag set cannot leak
+            // into the next.
+            let emulator = Emulator::new();
+            let case = format!("{kind}/{}", row.case);
+            let resource_arn = taggable_resource(&emulator, kind, &case).await;
+            assert_cap_case(&emulator, &case, &resource_arn, row).await;
+        }
+    }
+
+    // The other declared refusal: an ARN of the right shape that names no
+    // stored resource. Its code is in the same declared set, and the tag
+    // maximum has nothing to do with it.
+    let emulator = Emulator::new();
+    let absent = workspace_arn("neverCreated");
+    let resp = emulator
+        .tag_resource(&absent, json!({"env": "test"}))
+        .await;
+    let code = resp.error_type.clone().unwrap_or_default();
+    assert!(
+        TAG_RESOURCE_MODELED_ERRORS.contains(&code.as_str()),
+        "case \"absentResource\": expected one of the declared errors \
+         {TAG_RESOURCE_MODELED_ERRORS:?}, got {resp:?}"
+    );
+    assert_eq!(
+        (resp.status, code.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"absentResource\": expected a 404 ResourceNotFoundException, got {resp:?}"
+    );
+    // The refused call stored nothing here either: the ARN still names no
+    // resource, so the listing refuses it the same way rather than reporting a
+    // tag set the refusal conjured.
+    let listed = emulator.list_tags_for_resource(&absent, json!({})).await;
+    assert_eq!(
+        (listed.status, listed.error_type.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "case \"absentResource\": the refused call must leave the ARN naming no resource, \
+         got {listed:?}"
+    );
 }
 
 /// RULE: `ListTagsForResource` serves one page at a time in tag-key order and
