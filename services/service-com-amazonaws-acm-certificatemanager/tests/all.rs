@@ -45,6 +45,8 @@ mod acme_external_account_binding_lifecycle;
 mod acme_external_account_binding_listing;
 #[path = "all/acme_external_account_binding_revocation.rs"]
 mod acme_external_account_binding_revocation;
+#[path = "all/acme_resource_deletion_authorization.rs"]
+mod acme_resource_deletion_authorization;
 #[path = "all/acme_surface_wire_values.rs"]
 mod acme_surface_wire_values;
 #[path = "all/certificate_detail_projection.rs"]

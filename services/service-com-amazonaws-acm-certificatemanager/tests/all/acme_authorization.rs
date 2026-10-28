@@ -55,10 +55,10 @@ pub(crate) const CROSS_ACCOUNT_ARN_MESSAGE: &str =
 /// The access key id of the account's own published credential, as every other suite in
 /// this crate signs with it: a key neither STS nor IAM holds a record for, which is the
 /// position AWS account root credentials are in.
-const ACCOUNT_KEY_ID: &str = "AKIDTEST";
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIDTEST";
 
 /// The access key id of the assumed-role session every row below signs with.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
 
 /// The role that session is assumed from, and the session's own name.
 const ROLE: &str = "acm-acme-reader";
@@ -72,7 +72,7 @@ const SESSION_SECONDS: i32 = 3_600;
 
 /// A router serving this service beside the IAM and STS services, over ONE shared engine,
 /// so the policies and the session the cases seed are the ones those services hold.
-fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -96,7 +96,7 @@ fn router_with_identity() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 ///
 /// The same wire shape every other suite of this crate uses, with the access key id as a
 /// parameter: it is what names the principal the request speaks for.
-async fn call_as(
+pub(crate) async fn call_as(
     router: &MultiServiceRouter,
     access_key_id: &str,
     operation: &str,
@@ -130,7 +130,7 @@ async fn call_as(
 }
 
 /// The principal ARN the seeded session speaks for — what a refusal must name.
-fn session_arn() -> String {
+pub(crate) fn session_arn() -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{ROLE}/{SESSION}",
         ::engine::emulator_account_id()
@@ -150,7 +150,7 @@ fn role_arn() -> String {
 /// `iam:CreateRole` and `sts:AssumeRole` record them: the identity is the `assumed-role`
 /// ARN `sts:GetCallerIdentity` reports, and the role is the IAM entity whose policies are
 /// in force on it.
-fn given_session(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn given_session(engine: &Arc<engine::InMemoryEngine>) {
     let now = SystemTime::now();
     let account = ::engine::emulator_account_id();
     let role_arn = role_arn();
@@ -216,7 +216,7 @@ fn given_role_boundary(engine: &Arc<engine::InMemoryEngine>, arn: Option<&str>) 
 /// Attach `document` to the role as its inline policy, replacing whatever it carried —
 /// what `iam:PutRolePolicy` does. `None` takes every policy off it, as
 /// `iam:DeleteRolePolicy` does.
-fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
+pub(crate) fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
     let store = iam::service_state(&**engine).expect("the IAM store");
     let mut store = store.lock();
     match document {
@@ -239,7 +239,7 @@ fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Val
 }
 
 /// A policy allowing `actions` on every resource.
-fn allow(actions: Value) -> Value {
+pub(crate) fn allow(actions: Value) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": "*" }]
@@ -329,7 +329,7 @@ fn given_user_policies(
 
 /// Which of IAM's two refusals a row expects.
 #[derive(Debug, Clone, Copy)]
-enum Refusal {
+pub(crate) enum Refusal {
     /// The default deny of a request no statement allows.
     DefaultDeny,
     /// The explicit deny of a request a `Deny` statement covers.
@@ -338,7 +338,7 @@ enum Refusal {
 
 impl Refusal {
     /// The clause IAM closes the refusal with.
-    fn reason(self, action: &str) -> String {
+    pub(crate) fn reason(self, action: &str) -> String {
         match self {
             Self::DefaultDeny => {
                 format!("because no identity-based policy allows the {action} action")
