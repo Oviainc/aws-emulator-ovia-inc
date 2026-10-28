@@ -27,6 +27,8 @@ mod channel_lifecycle;
 mod channel_listing;
 #[path = "all/channel_removal.rs"]
 mod channel_removal;
+#[path = "all/consumer_deregistration.rs"]
+mod consumer_deregistration;
 #[path = "all/data_records.rs"]
 mod data_records;
 #[path = "all/encrypted_records.rs"]

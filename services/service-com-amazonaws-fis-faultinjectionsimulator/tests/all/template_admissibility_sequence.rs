@@ -10,9 +10,9 @@
 //! answer a template of the same shape with the SAME status, the same error code and the
 //! same message. FIS states these rules about a template (an execution role that names an
 //! IAM role, the stop conditions it declares, the values its experiment options admit, the
-//! destination a log configuration names, how many actions it may carry and what FIS's
-//! built-in wait action takes), and none of them is expressible as a modelled constraint,
-//! so each one is server-side.
+//! destination a log configuration names, how many actions it may carry, the order those
+//! actions declare through `startAfter` and what FIS's built-in wait action takes), and none
+//! of them is expressible as a modelled constraint, so each one is server-side.
 //!
 //! The rows differ along what the rule generalises over: which refusal of the sequence the
 //! template earns (each one in turn, plus rows the sequence admits), its error class (a 400
@@ -185,6 +185,26 @@ fn rows() -> Vec<Row> {
                 }
             }),
             refusal: Some(invalid("actions.second.startAfter")),
+        },
+        Row {
+            // `tests/all/action_order_is_acyclic.rs` covers the shapes of the action graph
+            // this rule generalises over; the row here is the sequence's own refusal for it.
+            case: "a startAfter order no run can carry out",
+            members: json!({
+                "actions": {
+                    "a": {
+                        "actionId": "aws:fis:wait",
+                        "parameters": { "duration": "PT2M" },
+                        "startAfter": ["b"]
+                    },
+                    "b": {
+                        "actionId": "aws:fis:wait",
+                        "parameters": { "duration": "PT2M" },
+                        "startAfter": ["a"]
+                    }
+                }
+            }),
+            refusal: Some(invalid("actions.a.startAfter")),
         },
         Row {
             case: "a wait action carrying no duration",

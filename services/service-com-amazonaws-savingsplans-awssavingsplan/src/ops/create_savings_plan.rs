@@ -151,17 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let commitment = crate::state::parse_commitment(&input.commitment).map_err(validation)?;
-        // The purchase time AS SUPPLIED, for the idempotency fingerprint: a
-        // replay of the same request must fingerprint the same however much
+        // The purchase time AS SUPPLIED, or `None` when the request named none:
+        // a replay of the same request must fingerprint the same however much
         // later it arrives, so the server-derived default below must not reach
-        // it.
-        let supplied_purchase_time = input
-            .purchase_time
-            .as_ref()
-            .and_then(|time| time.to_millis().ok())
-            .map(|millis| millis.to_string())
-            .unwrap_or_default();
-        let purchase_millis = match input.purchase_time.as_ref() {
+        // the fingerprint.
+        let supplied_purchase_millis = match input.purchase_time.as_ref() {
             Some(time) => {
                 let millis = time.to_millis().map_err(|_| {
                     validation("purchaseTime is not a representable time".to_string())
@@ -169,9 +163,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Bound the request-derived instant here, so no later
                 // arithmetic on it can be handed an extreme value.
                 crate::state::check_purchase_time(millis, now).map_err(validation)?;
-                millis
+                Some(millis)
             }
-            None => now,
+            None => None,
+        };
+        let purchase_millis = supplied_purchase_millis.unwrap_or(now);
+        // The amount is parsed here, before the fingerprint below needs it, and
+        // kept alongside the parsed units AS THE CALLER SPELLED IT, so a clause
+        // that reports it back reports the request's own value rather than the
+        // magnitude this service read it at.
+        let supplied_upfront = match input.upfront_payment_amount.as_deref() {
+            Some(amount) => Some((
+                amount,
+                crate::state::parse_amount("upfrontPaymentAmount", amount).map_err(validation)?,
+            )),
+            None => None,
         };
         // The purchase's own tags are bounded by the same rule `TagResource`
         // enforces, so a plan cannot be created over the tag limit either —
@@ -207,19 +213,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused rather than answered with the first plan. The fingerprint is
         // taken over the request as the client sent it, so a replay minutes
         // later still fingerprints the same.
+        //
+        // Every member enters the fingerprint AS THE STORE HOLDS IT, never as
+        // the request spelled it: the fingerprint is the identity of the stored
+        // plan, so two spellings this service itself reads to one stored value
+        // — an amount at a different scale, an instant inside the same second —
+        // are one request and answer idempotently. A member the store keeps
+        // verbatim (the offering id, a tag) is already in that form; one the
+        // store normalises (an amount it parses, an instant it truncates)
+        // contributes the normalised value, and a member the request omitted
+        // contributes nothing.
         let client_token = input.client_token.as_deref().filter(|t| !t.is_empty());
-        let stored_commitment = crate::state::format_amount(commitment);
         let mut named: Vec<(String, String)> = vec![
             (
                 "savingsPlanOfferingId".to_string(),
                 input.savings_plan_offering_id.clone(),
             ),
-            ("commitment".to_string(), stored_commitment),
+            (
+                "commitment".to_string(),
+                crate::state::format_amount(commitment),
+            ),
             (
                 "upfrontPaymentAmount".to_string(),
-                input.upfront_payment_amount.clone().unwrap_or_default(),
+                supplied_upfront
+                    .map(|(_, units)| crate::state::format_amount(units))
+                    .unwrap_or_default(),
             ),
-            ("purchaseTime".to_string(), supplied_purchase_time),
+            (
+                "purchaseTime".to_string(),
+                supplied_purchase_millis
+                    .map(|millis| crate::state::truncate_to_second(millis).to_string())
+                    .unwrap_or_default(),
+            ),
         ];
         named.extend(
             tags.iter()
@@ -277,16 +302,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stores is exact.
         let term_hours = offering.term_hours();
         let total = commitment.saturating_mul(term_hours);
-        // The amount is kept alongside the parsed units AS THE CALLER SPELLED
-        // IT, so a clause that reports it back reports the request's own value
-        // rather than the magnitude this service read it at.
-        let supplied_upfront = match input.upfront_payment_amount.as_deref() {
-            Some(amount) => Some((
-                amount,
-                crate::state::parse_amount("upfrontPaymentAmount", amount).map_err(validation)?,
-            )),
-            None => None,
-        };
 
         // How the term is paid for follows the offering's payment option:
         // everything up front, nothing up front, or a whole-number share up

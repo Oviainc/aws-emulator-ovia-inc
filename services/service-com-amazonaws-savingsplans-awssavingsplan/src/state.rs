@@ -138,10 +138,15 @@ pub fn parse_millis(value: &str) -> Option<i64> {
 /// Truncate epoch milliseconds to whole seconds: a purchase time is
 /// second-granular (`DateTime` is documented as `YYYY-MM-DDTHH:MM:SSZ`).
 ///
+/// Public because this is the instant a purchase is HELD at, so anything that
+/// has to agree with the stored record about which instant a request named — a
+/// handler's idempotency fingerprint, say — normalises it through this one
+/// function rather than through a second copy of the rule.
+///
 /// Saturating, not plain arithmetic: the value can come from the request, and a
 /// total function here is what keeps an extreme one from overflowing rather than
 /// being answered.
-fn truncate_to_second(millis: i64) -> i64 {
+pub fn truncate_to_second(millis: i64) -> i64 {
     millis.saturating_sub(millis.rem_euclid(1000))
 }
 

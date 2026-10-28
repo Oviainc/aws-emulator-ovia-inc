@@ -281,9 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The idempotency ledger must not outlive the resources it describes (the same
         // reason a deleted node releases its create token): a create whose every minted id
-        // is now deleted or deleting could only replay ids nothing a caller can still use.
-        // Once for the call — the voting path sweeps once for its own removals the same
-        // way.
+        // is now deleted or deleting could only replay ids nothing a caller can still use —
+        // the member this call removed, and every node of that member, which begins
+        // deleting with it. Once for the call — the voting path sweeps once for its own
+        // removals the same way.
         guard.forget_dangling_tokens();
 
         Ok(DeleteMemberOutput {})

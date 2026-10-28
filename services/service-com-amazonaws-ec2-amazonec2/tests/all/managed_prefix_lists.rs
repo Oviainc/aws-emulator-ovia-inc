@@ -29,6 +29,8 @@
 //!    A published list carries the SAME id `DescribePrefixLists` reports for it.
 //! 6. Both operations leave `DryRun` requests and reads alone: a dry run answers 412 and
 //!    stores nothing, and describing twice reports the same lists.
+//! 7. The ACCOUNT SEGMENT of a reported ARN names whoever owns the list: this account for
+//!    one it created, and the literal `aws` for one Amazon Web Services owns itself.
 //!
 //! The entries a create stores are asserted through the engine's own store: the operation
 //! that reports them, `GetManagedPrefixListEntries`, is still a scaffold stub with its own
@@ -1114,4 +1116,146 @@ async fn the_ids_filters_and_page_size_narrow_what_is_reported() {
         "InvalidPaginationToken",
         "a forged token: expected InvalidPaginationToken, got {body}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Who the account segment of a reported prefix list's ARN names
+// ---------------------------------------------------------------------------
+
+/// The account-id segment the ARN of a resource Amazon Web Services owns itself carries, as
+/// a client reads it off the wire: `arn:aws:ec2:<region>:aws:prefix-list/<id>`. Written out
+/// here rather than read from the crate, so this suite pins the literal rather than whatever
+/// the service happens to build.
+const SERVICE_OWNED_ACCOUNT_SEGMENT: &str = "aws";
+
+/// The Regions the ARN table spans. Each one publishes lists of its own, so every row carries
+/// a different Region in the ARNs under test: [`REGION`] and [`OTHER_REGION`] are the two the
+/// rest of this suite uses, and the other two are further Regions the issue did not cite.
+const ARN_REGIONS: [&str; 4] = [REGION, OTHER_REGION, "us-west-2", "ap-southeast-1"];
+
+/// Every prefix list a describe reported, as `(prefixListId, ownerId, prefixListArn)` — read
+/// off the document tree, so each member is paired with the list it belongs to rather than
+/// with the one at the same position in a flat list of elements.
+fn reported_lists(case: &str, body: &str) -> Vec<(String, String, String)> {
+    let document = super::wire::document(case, body);
+    document
+        .descendants()
+        .filter(|node| node.is_element() && super::wire::child(*node, "prefixListId").is_some())
+        .map(|list| {
+            let text = |name: &str| {
+                super::wire::child_text(list, name).unwrap_or_else(|| {
+                    panic!("case {case:?}: a reported list carries no <{name}> in {body}")
+                })
+            };
+            (text("prefixListId"), text("ownerId"), text("prefixListArn"))
+        })
+        .collect()
+}
+
+/// One prefix list of the account's own, created in `region`: its id and the ARN the create
+/// answered for it.
+async fn create_own_in(router: &MultiServiceRouter, region: &str) -> (String, String) {
+    let params = vec![
+        param("PrefixListName", &format!("own-in-{region}")),
+        param("AddressFamily", PREFIX_LIST_ADDRESS_FAMILY_IPV4),
+        param("MaxEntries", "5"),
+    ];
+    let (status, body) =
+        super::ec2_query::call(router, region, "CreateManagedPrefixList", &params).await;
+    assert_eq!(
+        status, 200,
+        "seeding a list in {region}: expected HTTP 200, got {status} with body {body}"
+    );
+    let id = member(&body, "prefixListId")
+        .unwrap_or_else(|| panic!("seeding a list in {region}: no prefixListId in {body}"));
+    let arn = member(&body, "prefixListArn")
+        .unwrap_or_else(|| panic!("seeding a list in {region}: no prefixListArn in {body}"));
+    (id, arn)
+}
+
+/// RULE: the account-id segment of an ARN this service reports names WHOEVER OWNS the
+/// resource — the account this emulator serves for a resource the account created, and the
+/// literal `aws` for one Amazon Web Services owns itself — with the rest of the ARN (the
+/// partition, the service, the resource's own Region and its id) the same either way. So a
+/// prefix list a Region publishes, which reports `OwnerId` `AWS`, reports
+/// `arn:aws:ec2:<region>:aws:prefix-list/<id>`, and a list the account created keeps its
+/// account id there.
+///
+/// The rows differ along the Region the describe is signed for and, within each, along which
+/// kind of owner the reported list has.
+#[tokio::test]
+async fn the_account_segment_of_a_reported_arn_names_whoever_owns_the_list() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let account = engine::emulator_account_id().to_string();
+
+    // The account's own lists, by id, with the ARN their create answered. A list the account
+    // created belongs to the account whichever Region a later describe is signed for, so the
+    // ARN to expect for one is the one it was created with — not one built from the Region of
+    // the call reading it.
+    let mut own: Vec<(String, String)> = Vec::new();
+
+    for region in ARN_REGIONS {
+        own.push(create_own_in(&router, region).await);
+
+        let (status, body) = describe_in(&router, region, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        let reported = reported_lists(region, &body);
+        assert!(
+            reported.len() > own.len(),
+            "case {region:?}: expected the account's {} lists and the Region's published \
+             ones, got {reported:?}",
+            own.len()
+        );
+
+        let mut service_owned = 0usize;
+        for (id, owner, arn) in &reported {
+            let expected = if owner == AWS_MANAGED_PREFIX_LIST_OWNER {
+                service_owned += 1;
+                format!(
+                    "arn:aws:ec2:{region}:{SERVICE_OWNED_ACCOUNT_SEGMENT}:prefix-list/{id}"
+                )
+            } else {
+                assert_eq!(
+                    owner, &account,
+                    "case {region:?}: a list is owned either by the service or by this \
+                     account, got owner {owner:?} on {id}"
+                );
+                own.iter()
+                    .find(|(own_id, _)| own_id == id)
+                    .map(|(_, own_arn)| own_arn.clone())
+                    .unwrap_or_else(|| {
+                        panic!("case {region:?}: {id} is no list this test created")
+                    })
+            };
+            assert_eq!(
+                arn, &expected,
+                "case {region:?}, list {id} owned by {owner}: expected {expected}, got {arn}"
+            );
+            if owner == AWS_MANAGED_PREFIX_LIST_OWNER {
+                assert!(
+                    !arn.contains(account.as_str()),
+                    "case {region:?}, list {id}: a service-owned list's ARN must not name \
+                     the caller's account {account}, got {arn}"
+                );
+            }
+        }
+        assert!(
+            service_owned > 0,
+            "case {region:?}: a Region publishes at least one list of its own, got \
+             {reported:?}"
+        );
+    }
+
+    // An account-owned list keeps its account segment: the two kinds of ARN differ, so the
+    // shape of the ARN alone tells a published list from a created one.
+    let owned_segment = format!(":{account}:");
+    for (id, arn) in &own {
+        assert!(
+            arn.starts_with("arn:aws:ec2:") && arn.contains(&owned_segment),
+            "list {id}: expected an ARN carrying the account {account}, got {arn}"
+        );
+    }
 }

@@ -1145,17 +1145,37 @@ pub fn per_severity_value(counts: &BTreeMap<&'static str, i64>) -> FindingMetric
     per_severity_with(|severity| Some(counts.get(severity).copied().unwrap_or(0) as f64))
 }
 
-/// The region this request is for, read from its SigV4 credential scope.
+/// The region this request is for: the region of its SigV4 credential scope when that
+/// value has a Region's shape, else [`DEFAULT_REGION`].
+///
+/// A credential scope is request-controlled text (the framework rejects only an EMPTY
+/// region), and every value this service builds a region into — a `scanNameArn`, a
+/// published upload host — is built from the value this answers, so the reduction to a
+/// Region happens once, here, through [`region_or_default`].
 pub fn request_region(headers: &::http::HeaderMap) -> String {
-    ::emulator_server::sigv4_credential_scope(headers)
-        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+    let scope = ::emulator_server::sigv4_credential_scope(headers)
+        .map(|scope| scope.region)
+        .unwrap_or_default();
+    region_or_default(&scope).to_string()
 }
 
 /// `scanNameArn` for `scan_name`:
 /// `arn:aws:codeguru-security:<region>:<account>:scans/<scanName>`, built through the
 /// shared ARN helper so the account segment is the emulator's canonical one.
+///
+/// The region segment reaches the ARN only through [`region_or_default`], so what this
+/// builds satisfies the modelled `ScanNameArn` shape — [`SCAN_NAME_ARN_PATTERN`]'s region
+/// class and the shape's [`SCAN_NAME_ARN_MAX_LEN`] bound — whatever region was asked
+/// for: a response never carries a value its own member's shape forbids, and the ARN the
+/// service hands back is one [`parse_scan_arn`] reads back, so the scan stays addressable
+/// by the ARN it was reported under (the tagging operations resolve a `resourceArn` that
+/// way).
 pub fn scan_name_arn(region: &str, scan_name: &str) -> String {
-    ::engine::emulator_arn(SERVICE_CODE, region, &format!("scans/{scan_name}"))
+    ::engine::emulator_arn(
+        SERVICE_CODE,
+        region_or_default(region),
+        &format!("scans/{scan_name}"),
+    )
 }
 
 /// The upload target `CreateUploadUrl` publishes as `s3Url` for one code artifact:
@@ -1166,9 +1186,9 @@ pub fn scan_name_arn(region: &str, scan_name: &str) -> String {
 /// can actually be performed against this emulator (`crate::service` serves it).
 ///
 /// The URL is derived from the RECORDED artifact. The region only ever reaches the host
-/// through [`url_region`], which keeps a credential scope that is not a Region out of the
-/// host position; the scan name and the artifact id are path segments of a record this
-/// service minted.
+/// through [`region_or_default`], which keeps a credential scope that is not a Region out
+/// of the host position; the scan name and the artifact id are path segments of a record
+/// this service minted.
 pub fn upload_url(region: &str, scan_name: &str, code_artifact_id: &str) -> String {
     format!(
         "https://{host}/{account}/{scan_name}/{code_artifact_id}",
@@ -1181,7 +1201,7 @@ pub fn upload_url(region: &str, scan_name: &str, code_artifact_id: &str) -> Stri
 pub fn upload_host(region: &str) -> String {
     format!(
         "{UPLOAD_HOST_LABEL}.{region}.amazonaws.com",
-        region = url_region(region)
+        region = region_or_default(region)
     )
 }
 
@@ -1254,13 +1274,14 @@ pub enum UploadOutcome {
     NoSuchTarget,
 }
 
-/// The region a published URL's host names: the request's own when it has a Region's
-/// shape, else [`DEFAULT_REGION`].
+/// The region a value this service reports or publishes may name: `region` when it has a
+/// Region's shape, else [`DEFAULT_REGION`].
 ///
 /// A credential scope is request-controlled text, and this value is interpolated into a
-/// host, so only a value shaped like a Region may reach it — which is also what keeps
-/// every URL this service publishes one [`is_upload_host`] recognises.
-fn url_region(region: &str) -> &str {
+/// host and into an ARN, so only a value shaped like a Region may reach either — which is
+/// what keeps every URL this service publishes one [`is_upload_host`] recognises and every
+/// ARN it reports one its own member's shape admits.
+fn region_or_default(region: &str) -> &str {
     if is_region_shaped(region) {
         region
     } else {
@@ -1269,8 +1290,12 @@ fn url_region(region: &str) -> &str {
 }
 
 /// True when `value` has an AWS Region's shape: lowercase alphabetic segments joined by
-/// `-`, ending in a digit group, at least three segments.
+/// `-`, ending in a digit group, at least three segments, and no longer than
+/// [`REGION_MAX_LEN`].
 fn is_region_shaped(value: &str) -> bool {
+    if value.len() > REGION_MAX_LEN {
+        return false;
+    }
     let mut segments = value.split('-').rev();
     let Some(number) = segments.next() else {
         return false;
@@ -1296,9 +1321,28 @@ fn is_region_shaped(value: &str) -> bool {
 pub const SCAN_NAME_ARN_PATTERN: &str =
     r"^arn:aws:codeguru-security:[\S]+:[\d]{12}:scans\/[a-zA-Z0-9-_$:.]*$";
 
+/// The upper `@length` bound of the modelled `ScanNameArn` shape, in characters
+/// (`smithy_query(query="shape",shape="ScanNameArn")`: length 1..300). A size limit on
+/// the whole ARN, which [`SCAN_NAME_ARN_PATTERN`] says nothing about.
+pub const SCAN_NAME_ARN_MAX_LEN: usize = 300;
+
 /// The fixed head of every `ScanNameArn`: the `aws` partition and this service's
 /// namespace, as [`SCAN_NAME_ARN_PATTERN`] spells them.
 pub const SCAN_ARN_PREFIX: &str = "arn:aws:codeguru-security:";
+
+/// The longest region segment that keeps EVERY ARN this service can report inside
+/// [`SCAN_NAME_ARN_MAX_LEN`]: that bound less the ARN's fixed text ([`SCAN_ARN_PREFIX`],
+/// the `:` before the account id and [`SCAN_ARN_RESOURCE_SEGMENT`]), its
+/// [`ACCOUNT_ID_DIGITS`]-digit account id and the longest name a `ScanName` can be
+/// ([`SCAN_NAME_MAX_LEN`]). Part of what makes a value a Region here
+/// ([`is_region_shaped`]), because a region is not reported on its own: it is a segment
+/// of a value that carries its own size limit.
+const REGION_MAX_LEN: usize = SCAN_NAME_ARN_MAX_LEN
+    - SCAN_ARN_PREFIX.len()
+    - ":".len()
+    - ACCOUNT_ID_DIGITS
+    - SCAN_ARN_RESOURCE_SEGMENT.len()
+    - SCAN_NAME_MAX_LEN;
 
 /// What separates an ARN's account-id segment from the scan name it names, from the
 /// same pattern (`:scans\/`).

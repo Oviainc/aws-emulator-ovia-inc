@@ -3634,7 +3634,10 @@ fn target_parameters_refusal(
 /// The rules on one action, none of them expressible as a modelled constraint:
 ///
 /// * `startAfter` is "the name of the action that must be completed before the current
-///   action starts", so it names an action the same template declares;
+///   action starts", so it names an action the same template declares, and the
+///   "completed before" ordering it states has to be realisable: the actions ordered by it
+///   form a DAG, because an action inside a cycle waits for an action that waits for it and
+///   so can never start ([`actions_cycle_refusal`]);
 /// * `actionId` is "the ID of the action", one of the actions FIS PUBLISHES
 ///   ([`ACTION_CATALOG`], which `GetAction` reports from), so an id the catalog holds no
 ///   action for is refused rather than stored and later started;
@@ -3683,6 +3686,98 @@ pub fn actions_refusal(
         if let Some(refusal) = action_targets_refusal(name, action, entry, targets) {
             return Some(refusal);
         }
+    }
+    // The ordering rule is about the action graph as a WHOLE rather than about one entry,
+    // so it is judged once every action is itself admissible — and after the rule above
+    // that every `startAfter` names a declared action, which is what makes the edges of
+    // that graph meaningful.
+    actions_cycle_refusal(actions)
+}
+
+/// `None` when the `startAfter` ordering over `actions` is realisable — the actions form a
+/// directed acyclic graph; otherwise the `ValidationException` that refuses the template.
+///
+/// `startAfter` is "the name of the action that must be completed before the current action
+/// starts", so a set of actions that reaches itself through it describes an order no run
+/// can carry out: every action of the cycle waits for another action of the cycle to
+/// complete first, and none of them can ever start. Such a template is refused here rather
+/// than persisted, for the same reason a `startAfter` naming an undeclared action is.
+///
+/// Each action is settled once and each `startAfter` entry followed once, so the walk costs
+/// O(actions + `startAfter` entries) — linear in the request. It carries the chain it is
+/// resolving on its OWN stack rather than on the call stack, so however many actions a
+/// request names, the depth it reaches is an allocation and not a recursion. The refusal is
+/// deterministic: the actions are entered in name order and each one's `startAfter` in the
+/// order the template records it, so one template always earns the same message.
+fn actions_cycle_refusal(
+    actions: &HashMap<String, ExperimentTemplateAction>,
+) -> Option<ValidationException> {
+    let mut names: Vec<&str> = actions.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    // The actions already shown to reach no cycle: each one is walked once.
+    let mut settled: HashSet<&str> = HashSet::with_capacity(actions.len());
+    for root in names {
+        let Some(cycle) = cycle_from(root, actions, &mut settled) else {
+            continue;
+        };
+        // The cycle is reported as the chain of actions it runs through, from an action ON
+        // it back to that same action, so the caller sees which `startAfter` entries close
+        // it. The member the message names is that action.
+        let chain = cycle.join(" startAfter ");
+        return Some(invalid_input(format!(
+            "actions.{}.startAfter must not form a cycle, got {chain}.",
+            cycle.first().copied().unwrap_or_default()
+        )));
+    }
+    None
+}
+
+/// The chain of actions closing a cycle reachable from `root`, from an action ON the cycle
+/// back to itself, or `None` when nothing `root` waits for — directly or transitively —
+/// reaches one.
+///
+/// `waiting` is the chain currently being resolved, each entry holding how many of that
+/// action's `startAfter` entries have been followed; an action that appears on it twice is
+/// an action waiting for itself. A `startAfter` entry the map holds no action for has no
+/// outgoing edge: it is already refused by the rule above this one, and contributes no
+/// false cycle here.
+fn cycle_from<'a>(
+    root: &'a str,
+    actions: &'a HashMap<String, ExperimentTemplateAction>,
+    settled: &mut HashSet<&'a str>,
+) -> Option<Vec<&'a str>> {
+    if settled.contains(&root) {
+        return None;
+    }
+    let mut waiting: Vec<(&'a str, usize)> = vec![(root, 0)];
+    while let Some((name, followed)) = waiting.last().copied() {
+        let earlier = actions
+            .get(name)
+            .and_then(|action| action.start_after.as_ref())
+            .and_then(|entries| entries.get(followed))
+            .map(String::as_str);
+        let Some(earlier) = earlier else {
+            // Every action this one waits for is settled, so this one is too.
+            settled.insert(name);
+            waiting.pop();
+            continue;
+        };
+        if let Some((_, followed)) = waiting.last_mut() {
+            *followed += 1;
+        }
+        let Some((earlier, _)) = actions.get_key_value(earlier) else {
+            continue;
+        };
+        let earlier = earlier.as_str();
+        if settled.contains(&earlier) {
+            continue;
+        }
+        if let Some(start) = waiting.iter().position(|(seen, _)| *seen == earlier) {
+            let mut cycle: Vec<&str> = waiting[start..].iter().map(|(seen, _)| *seen).collect();
+            cycle.push(earlier);
+            return Some(cycle);
+        }
+        waiting.push((earlier, 0));
     }
     None
 }
@@ -3946,9 +4041,10 @@ pub fn template_refusal(template: &ExperimentTemplateRecord) -> Option<TemplateR
         return Some(TemplateRefusal::QuotaExceeded(refusal));
     }
     // An action FIS publishes no action for, one missing a parameter its published contract
-    // requires, one naming a target the template does not declare and a wait beyond the
-    // documented bound are each refused HERE rather than persisted: a template a call
-    // accepts is one the service would run.
+    // requires, one naming a target the template does not declare, a wait beyond the
+    // documented bound and an action order that cannot be carried out at all are each
+    // refused HERE rather than persisted: a template a call accepts is one the service
+    // would run.
     if let Some(refusal) = actions_refusal(&template.actions, &template.targets) {
         return Some(TemplateRefusal::Invalid(refusal));
     }
@@ -4140,8 +4236,9 @@ pub fn run_span(modelled: Duration) -> Duration {
 /// parsed exactly once up front, so the whole computation costs O(actions + `startAfter`
 /// entries) — linear in the request, never in its square. The number of actions is capped
 /// at [`MAX_ACTIONS_PER_TEMPLATE`] when the template is created, which also bounds the
-/// recursion depth here; a `startAfter` cycle, which FIS refuses but which a record could
-/// still carry, is broken at the back edge rather than recursing forever.
+/// recursion depth here; a `startAfter` cycle, which no stored template carries because
+/// [`actions_cycle_refusal`] refuses one, is still broken at the back edge rather than
+/// recursing forever, so this walk terminates on any action map it is handed.
 fn critical_path(actions: &HashMap<String, ExperimentTemplateAction>) -> Duration {
     // Parsed once per action, outside the walk.
     let spans: HashMap<&str, Duration> = actions

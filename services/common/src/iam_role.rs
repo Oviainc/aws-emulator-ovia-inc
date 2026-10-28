@@ -118,28 +118,107 @@ pub async fn role_is_unassumable(
     let Some(role_name) = role_name(role_arn) else {
         return false;
     };
+    match role_answer(ctx, region, role_name).await {
+        // IAM reported the role: it is assumable only if the trust policy it carries
+        // admits the principal. A role with no readable grant is refused — that IS what
+        // IAM answered about it.
+        RoleAnswer::Held(document) => !document.is_some_and(|document| {
+            crate::iam_trust_policy::admits_service_principal(&document, service_principal)
+                .unwrap_or(false)
+        }),
+        // IAM says this account holds no such role: the refusal is grounded.
+        RoleAnswer::Absent => true,
+        // Nothing was learned, so nothing is refused.
+        RoleAnswer::Unknown => false,
+    }
+}
+
+/// Whether IAM ANSWERED that `role_arn` is a role this account cannot hand to
+/// `service_principal` for the request `context` describes: the value names no role of this
+/// account, this account holds no such role, or the trust policy the role carries does not
+/// grant that principal the assume THIS request would make.
+///
+/// The question [`role_is_unassumable`] answers, narrowed to ONE pass: a service a caller
+/// hands a role to, to act under it for the request being authorized, may act under it only
+/// where the grant covers that request, so the statement's `Condition` is part of the
+/// decision ([`crate::iam_trust_policy::grants_service_principal`]) and the keys the pass
+/// carries are the caller's to state — nothing is guessed for a key it does not. That is
+/// also why a role of ANOTHER account is refused here where the weaker reading stays silent:
+/// `iam:PassRole` is granted by the account that HOLDS the role, so a value naming another
+/// account's role is one no principal of this account can pass, whatever that role trusts.
+///
+/// `false` — do not refuse — for everything that is NOT such an answer, for the reason
+/// [`role_is_unassumable`] gives: an answer this emulator could not READ, and any failure
+/// other than IAM reporting the role absent, including an emulator with no IAM mounted at
+/// all. A trust document IAM DID return and this cannot read as a policy is the other case,
+/// and is refused: that document is what IAM answered about the role, and it carries no
+/// grant this can act on.
+pub async fn role_pass_is_unauthorized(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    service_principal: &str,
+    context: &[(String, String)],
+) -> bool {
+    let Some(role_name) = role_name(role_arn) else {
+        return true;
+    };
+    match role_answer(ctx, region, role_name).await {
+        RoleAnswer::Held(document) => !document.is_some_and(|document| {
+            crate::iam_trust_policy::grants_service_principal(
+                &document,
+                service_principal,
+                role_arn,
+                context,
+            )
+            .unwrap_or(false)
+        }),
+        RoleAnswer::Absent => true,
+        RoleAnswer::Unknown => false,
+    }
+}
+
+/// What IAM answers about a role of this account, as the two readings above share ONE hop.
+enum RoleAnswer {
+    /// IAM holds a role under that name, and reported this trust document for it (`None`
+    /// when the answer carried none).
+    Held(Option<String>),
+    /// IAM answered that this account holds no role under that name.
+    Absent,
+    /// Nothing was learned: there is no IAM to ask, or the answer carried no role at all,
+    /// which is this emulator failing to READ an answer rather than IAM reporting a bad
+    /// role.
+    Unknown,
+}
+
+/// The in-process `GetRole` both readings are grounded in ([`crate::iam_client`]).
+async fn role_answer(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_name: &str,
+) -> RoleAnswer {
     let answer = crate::iam_client::iam_client(ctx, region)
         .get_role()
         .role_name(role_name)
         .send()
         .await;
     match answer {
-        // IAM reported the role: it is assumable only if the trust policy it carries
-        // admits the principal. A role with no readable grant is refused — that IS what
-        // IAM answered about it.
         Ok(output) => match output.role() {
-            Some(role) => !role.assume_role_policy_document().is_some_and(|document| {
-                crate::iam_trust_policy::admits_service_principal(document, service_principal)
-                    .unwrap_or(false)
-            }),
-            // A 200 carrying no `role` member is this emulator failing to READ an answer,
-            // not IAM reporting a bad role, so it grounds no refusal.
-            None => false,
+            Some(role) => RoleAnswer::Held(
+                role.assume_role_policy_document()
+                    .map(::std::string::ToString::to_string),
+            ),
+            None => RoleAnswer::Unknown,
         },
-        // IAM says this account holds no such role: the refusal is grounded.
-        Err(error) => error
-            .as_service_error()
-            .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception),
+        Err(error) => {
+            if error.as_service_error().is_some_and(
+                ::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception,
+            ) {
+                RoleAnswer::Absent
+            } else {
+                RoleAnswer::Unknown
+            }
+        }
     }
 }
 

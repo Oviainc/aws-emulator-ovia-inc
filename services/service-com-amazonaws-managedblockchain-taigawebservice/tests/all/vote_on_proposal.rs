@@ -46,7 +46,10 @@ const OTHER_ACCOUNT: &str = "210987654321";
 /// `comparator` — the policy the proposals on that network are decided by. `comparator`
 /// of `None` leaves `ThresholdComparator` out, and `percentage` of `None` leaves
 /// `ThresholdPercentage` out, which fixes no threshold at all.
-fn network_body(
+///
+/// `pub(crate)`, like the two calls below, so the sibling suite that drives a removal
+/// proposal reaches it through this one helper rather than a second copy of it.
+pub(crate) fn network_body(
     token: &str,
     name: &str,
     percentage: Option<i64>,
@@ -65,7 +68,7 @@ fn network_body(
 }
 
 /// Create one proposal on `network_id` as `member_id` and answer its `ProposalId`.
-async fn create_proposal(
+pub(crate) async fn create_proposal(
     router: &MultiServiceRouter,
     network_id: &str,
     member_id: &str,
@@ -93,7 +96,7 @@ async fn create_proposal(
 }
 
 /// Cast one vote.
-async fn vote(
+pub(crate) async fn vote(
     router: &MultiServiceRouter,
     network_id: &str,
     proposal_id: &str,

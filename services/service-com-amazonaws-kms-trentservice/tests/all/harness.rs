@@ -366,6 +366,15 @@ pub(crate) async fn settle_key_state(
     }
 }
 
+/// A principal ARN in the emulator's own account, which is the form KMS requires of a
+/// grantee or retiring principal.
+pub(crate) fn principal(resource: &str) -> String {
+    format!(
+        "arn:aws:iam::{account}:{resource}",
+        account = engine::emulator_account_id()
+    )
+}
+
 /// A member of a metadata object, as a string.
 pub(crate) fn text(case: &str, value: &Value, member: &str) -> String {
     value[member]

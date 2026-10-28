@@ -233,6 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         };
 
         let now = ::std::time::SystemTime::now();
+        // Which issuers the pool trusts is partly IAM's record — an
+        // `OpenIdConnectProviderARNs` entry names an IAM OpenID Connect provider — so the
+        // account's providers are read BEFORE this service's own store is locked.
+        let registered = crate::state::registered_oidc_providers(&*self.engine);
         let mut store = state.lock();
 
         // The identity named is what this call unlinks logins FROM, so it has to be one
@@ -270,9 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         }
 
         // A `Logins` entry is decided by the pool the identity belongs to, exactly as it is
-        // wherever else this service is handed one: an entry naming an Amazon Cognito user
-        // pool carries its issuer in the provider name, so a token minted by a user pool
-        // that is none of this pool's `CognitoIdentityProviders` authorizes nobody here.
+        // wherever else this service is handed one: the entry carries its issuer in the
+        // provider name, so the trust that pool states for the issuer — and the audience
+        // that trust accepts — decides it.
         let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
             return Err(UnlinkIdentityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -281,14 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
             )
             .into());
         };
-        if input
-            .logins
-            .keys()
-            .any(|provider| !pool.accepts_login_provider(provider))
-        {
+        if let Some(refusal) = pool.login_trust(&registered).refuse(&input.logins) {
             return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
-                    message: Some(crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                    message: Some(refusal.message().to_string()),
                 },
             )
             .into());

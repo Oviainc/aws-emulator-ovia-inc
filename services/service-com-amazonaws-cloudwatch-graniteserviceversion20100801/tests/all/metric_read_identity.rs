@@ -615,7 +615,9 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
         RefusalRow {
             // A SCALAR outside its enum keeps the framework's own CLAUSE — the value and the
             // member path it arrived on — under this service's validation code, the one every
-            // validation refusal it makes carries (`crate::metric_stream_scope`).
+            // validation refusal it makes carries (`crate::metric_stream_scope`). The read that
+            // DOES model a parameter fault answers that instead, over its own enumerated
+            // members (`crate::unit_read_identity`).
             case: "a scalar member outside its enum",
             operation: "GetMetricData",
             request: json!({

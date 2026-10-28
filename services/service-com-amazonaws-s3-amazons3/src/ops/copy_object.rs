@@ -353,7 +353,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store neither the source can be read nor the copy recorded, and
             // none of the modelled errors says that, so the scaffold's 501 carries what is
@@ -845,7 +844,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        Ok(CopyObjectOutput {
+        // The object event this copy produced, and the notifications the destination
+        // bucket's configuration owes for it — the same seam `PutObject` publishes its
+        // write through, under this operation's own event value.
+        let created = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::CreatedByCopy,
+            &input.key,
+        );
+        let created = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.object(&input.key))
+        {
+            Some(object) => created.of_object(object),
+            None => created,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[created]);
+
+        let output = CopyObjectOutput {
             // "Container for all response elements" — the entity tag and last-modified
             // time of the object this copy created, which is what a client compares a
             // later read against.
@@ -892,7 +907,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // members are refused above, and `RequestCharged` reports a Requester Pays
             // charge this emulator does not model.
             ..CopyObjectOutput::default()
-        })
+        };
+
+        // Published with the store released, the way `PutObject` publishes its own write.
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
+
+        Ok(output)
     }
 }
 

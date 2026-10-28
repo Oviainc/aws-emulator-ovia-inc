@@ -231,12 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Everything this write needs is in its deserialized input: the canned ACL, the
-        // five grant headers, the version id and the expected owner all travel as members.
         // `ContentMD5` and `ChecksumAlgorithm` are integrity checks over the RAW request
         // body, which this handler never sees — the boundary has already parsed that body
         // into `AccessControlPolicy` — so they are left where `PutBucketAcl` leaves them.
-        let _ = ctx;
 
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
@@ -390,6 +387,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+
+        // Replacing the object's ACL is an object event of its own (`s3:ObjectAcl:Put`),
+        // published to whatever destinations the bucket's notification configuration names
+        // for it — through the same seam `PutObject` publishes its write through.
+        let acl_put = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::AclPut,
+            &input.key,
+        );
+        let acl_put = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.addressed_object(&input.key, version_id))
+        {
+            Some(object) => acl_put.of_object(object),
+            None => acl_put,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[acl_put]);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
 
         Ok(PutObjectAclOutput {
             // "If present, indicates that the requester was successfully charged for the

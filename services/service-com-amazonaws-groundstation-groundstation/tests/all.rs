@@ -29,6 +29,8 @@ mod available_contacts;
 mod config_defaults_and_references;
 #[path = "all/config_listing.rs"]
 mod config_listing;
+#[path = "all/config_reference_integrity.rs"]
+mod config_reference_integrity;
 #[path = "all/contact_cancellation.rs"]
 mod contact_cancellation;
 #[path = "all/contact_dataflows_and_pass_stages.rs"]

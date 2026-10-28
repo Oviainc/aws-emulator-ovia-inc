@@ -17,6 +17,8 @@ mod amount_magnitude_refusals;
 mod commitment_bounds;
 #[path = "all/foreign_resource_arn_refusal.rs"]
 mod foreign_resource_arn_refusal;
+#[path = "all/idempotent_request_identity.rs"]
+mod idempotent_request_identity;
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
 #[path = "all/offering_product_type_coverage.rs"]
