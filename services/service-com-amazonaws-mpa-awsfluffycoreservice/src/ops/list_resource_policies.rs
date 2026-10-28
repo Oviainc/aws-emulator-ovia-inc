@@ -21,6 +21,13 @@
 //! A read: it reports what the store holds and changes nothing a later caller sees,
 //! beyond the clock-owed changes `materialize_due` materialises for every handler.
 //!
+//! `NextToken` is this listing's own ([`crate::state::position_token`]): it names this
+//! listing — this operation, for THIS resource — and the attachment position the previous
+//! page stopped at, so the next page is the attachments after it. A token this listing
+//! did not hand out — one it cannot read, one another listing (or another resource's
+//! attachments) issued, or one naming a position this resource has no attachment at —
+//! earns `ValidationException` (400).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -190,21 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
             .map_err(ListResourcePoliciesErrorModeled::AccessDeniedException)?;
 
-        // The token is this service's own: how many of the resource's policies the
-        // previous pages already reported. Anything else never came from here.
-        let already_reported = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
-            None => 0usize,
-            Some(token) => token.parse::<usize>().map_err(|_| {
-                ListResourcePoliciesError::Modeled(
-                    ListResourcePoliciesErrorModeled::ValidationException(
-                        crate::state::foreign_next_token(),
-                    ),
-                )
-            })?,
-        };
-        // The width one `MaxResults` asks for, from the one place this service decides it
-        // ([`crate::state::list_page_size`]).
-        let page_size = crate::state::list_page_size(input.max_results);
+        // The token is this service's own: it names THIS listing and the attachment
+        // position the next page starts after. Its grammar is read here, with the
+        // request's other shape; that the position was handed out is decided below,
+        // against the resource's attachments themselves.
+        let after = crate::state::token_position(
+            crate::state::Listing::ResourcePolicies {
+                resource_arn: &input.resource_arn,
+            },
+            input.next_token.as_deref(),
+        )
+        .map_err(ListResourcePoliciesErrorModeled::ValidationException)?;
 
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListResourcePoliciesError::Modeled(
@@ -231,19 +234,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let remaining = attached.len().saturating_sub(already_reported);
-        let reported = remaining.min(page_size);
-        let page: Vec<ListResourcePoliciesResponseResourcePolicy> = attached
-            .iter()
-            .skip(already_reported)
-            .take(reported)
-            .map(entry)
-            .collect();
-        let next_token = (remaining > reported).then(|| (already_reported + reported).to_string());
+        // The page is cut by the one paging rule this service's position listings share
+        // ([`crate::state::page_after_position`]): an attachment's position is its place
+        // in the resource's attachment list, counted from one, so the token names the
+        // last attachment reported and a position this listing never handed out is
+        // refused rather than answered with a page.
+        let positioned = attached.iter().zip(1u64..).map(|(policy, position)| (position, policy));
+        let page = crate::state::page_after_position(
+            crate::state::Listing::ResourcePolicies {
+                resource_arn: &input.resource_arn,
+            },
+            positioned,
+            after,
+            input.max_results,
+        )
+        .map_err(ListResourcePoliciesErrorModeled::ValidationException)?;
 
         Ok(ListResourcePoliciesOutput {
-            resource_policies: Some(page),
-            next_token,
+            resource_policies: Some(page.records.iter().copied().map(entry).collect()),
+            next_token: page.next_token,
         })
     }
 }

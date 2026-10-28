@@ -89,6 +89,19 @@ impl Listing {
         }
     }
 
+    /// Which listing this is for the token grammar: a token carries the listing it was
+    /// issued by — the operation, and the resource it pages over — so only that listing
+    /// can resume from it.
+    fn token_listing(&self) -> state::Listing<'_> {
+        match self.kind {
+            Kind::ApprovalTeams => state::Listing::ApprovalTeams,
+            Kind::IdentitySources => state::Listing::IdentitySources,
+            Kind::Sessions => state::Listing::Sessions {
+                approval_team_arn: &self.team_arn,
+            },
+        }
+    }
+
     /// The member each reported entry carries its own ARN in.
     fn id_member(&self) -> &'static str {
         match self.kind {
@@ -347,15 +360,19 @@ async fn walk(
                     width,
                     "case {case:?}: a page followed by a NextToken must be {width} wide: {page:?}"
                 );
-                // The token IS the stored position of the last record the page reported,
-                // which is what makes the next page resume exactly after it.
+                // The token IS this listing's token for the stored position of the last
+                // record the page reported, which is what makes the next page resume
+                // exactly after it.
                 let last = on_this_page
                     .last()
                     .expect("a full page reports at least one record");
                 assert_eq!(
                     next,
-                    listing.stored_position(harness, last).to_string(),
-                    "case {case:?}: the token must be the stored position of {last:?}, \
+                    state::position_token(
+                        listing.token_listing(),
+                        listing.stored_position(harness, last)
+                    ),
+                    "case {case:?}: the token must name the stored position of {last:?}, \
                      got {next:?}"
                 );
                 token = Some(next.to_string());
