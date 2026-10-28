@@ -203,15 +203,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The ARN carries the region the request was signed for, so a tenant minted
-        // in one region does not claim another's.
-        let region = crate::state::request_region(ctx.parts());
+        // in one region does not claim another's, and the account whose tenant names
+        // are being checked is the caller's own.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+        let region = scope.region.clone();
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         if store.tenants.contains_key(&name) {
+            // A tenant name is unique within one account, so the refusal names the
+            // account the name is already taken in beside the name itself.
             return Err(CreateTenantErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
-                    message: Some(crate::state::tenant_already_exists(&name)),
+                    message: Some(crate::state::tenant_already_exists(
+                        &name,
+                        scope.account_id,
+                    )),
                 },
             )
             .into());
@@ -231,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let tenant_id = store.next_tenant_id(now);
         let arn = crate::state::tenant_arn(&region, &name, &tenant_id);
-        let mut record = TenantRecord::new(&name, tenant_id, arn, now);
+        let mut record = TenantRecord::new(&name, tenant_id, arn, &region, now);
         record.tags = input
             .tags
             .unwrap_or_default()

@@ -185,14 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(entity) = found else {
-            // This operation does model "the resource you attempted to access doesn't
-            // exist", so a reference naming no entity this call reaches is reported with
-            // it rather than as invalid input — the wording is the one the reputation
-            // writes use, which model no such error.
-            return Err(GetReputationEntityErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::reputation_entity_not_found(&reference)),
-            })
-            .into());
+            // A reputation entity exists only for a resource this account owns —
+            // nothing creates one — so a reference resolving to nothing cannot name an
+            // entity at all: it is invalid input rather than a resource that happens
+            // to be gone, which is also why the reputation WRITES model no
+            // `NotFoundException`. A reference outside the call's scope is answered
+            // identically, so neither tells the caller about anything outside it.
+            return Err(bad_request(crate::state::reputation_entity_not_found(
+                &reference,
+            )));
         };
 
         Ok(GetReputationEntityOutput {
