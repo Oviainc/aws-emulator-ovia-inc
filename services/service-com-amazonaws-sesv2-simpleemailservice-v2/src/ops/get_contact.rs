@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(record) = list.contacts.get(&crate::state::identity_key(&address)) else {
             return Err(GetContactErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::contact_not_found(&list_name, &address)),
+                message: Some(crate::state::contact_not_found(&address)),
             })
             .into());
         };
