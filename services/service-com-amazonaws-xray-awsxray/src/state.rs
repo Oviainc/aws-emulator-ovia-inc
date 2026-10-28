@@ -4743,20 +4743,29 @@ pub fn is_retrieval_token_form(token: &str) -> bool {
 /// with, before any lookup: the name the operation gives the member, the value
 /// the request submitted, and why it could not be read.
 ///
-/// X-Ray words this refusal "Invalid <member> <value> passed: Invalid Execution
-/// Id" — the member the operation names, then the value it could not read,
-/// then a FIXED detail phrase that interpolates nothing. The rejected value is
-/// the sentence's only variable, so it is named once and the detail never grows
-/// with it; the sentence is built here once and each reader passes the member
-/// name it uses (`retrieval token`, `execution id`).
+/// X-Ray words this refusal as TWO clauses: an outer one naming the parameter
+/// and the value the request submitted — "Invalid <member> <value> passed: " —
+/// and then, verbatim, the failure of the execution-id decoder the token is
+/// handed to, which names that same value again
+/// ([`MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX`]).
+///
+/// The rejected value is the sentence's only variable and it is substituted
+/// TWICE, once per clause, because each clause is written by a different layer
+/// about the same value: that second echo is what identifies WHICH value failed
+/// when only the decoder's clause is read or matched on. The sentence is built
+/// here once and each reader passes the member name it uses (`retrieval token`,
+/// `execution id`).
 pub fn malformed_retrieval_token_message(member: &str, token: &str) -> String {
-    format!("Invalid {member} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_DETAIL}")
+    format!(
+        "Invalid {member} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX}{token}"
+    )
 }
 
-/// The fixed detail clause that closes a malformed-`RetrievalToken` refusal
-/// ([`malformed_retrieval_token_message`]): the same capitalised phrase whatever
-/// the operation and whatever the value, carrying no part of the request.
-pub const MALFORMED_RETRIEVAL_TOKEN_DETAIL: &str = "Invalid Execution Id";
+/// The fixed lead-in of the inner, decoder clause of a malformed-`RetrievalToken`
+/// refusal ([`malformed_retrieval_token_message`]): the same sentence-cased
+/// phrase whatever the operation and whatever the value, closed by the rejected
+/// value itself.
+pub const MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX: &str = "Invalid execution id provided: ";
 
 // ---------------------------------------------------------------------------
 // Sampling rules
