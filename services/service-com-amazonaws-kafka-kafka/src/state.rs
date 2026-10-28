@@ -110,6 +110,10 @@
 //! stored record, while `ListVpcConnections` pages the region's connections and
 //! renders each one with [`VpcConnection::to_vpc_connection`] — so a listed
 //! connection and a described one are two views of one record.
+//! `ListClientVpcConnections` pages the SAME registry narrowed to one target
+//! cluster, rendering each record with
+//! [`VpcConnection::to_client_vpc_connection`], so a cluster's client
+//! connections are that same one record seen from the cluster's side.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -120,7 +124,8 @@ use regex::RegexSet;
 use crate::ops::types::{
     BadRequestException, BrokerEBSVolumeInfo, BrokerNodeGroupInfo, BrokerNodeInfo,
     BrokerSoftwareInfo,
-    ChannelLoggingInfo, ClientAuthentication, ClusterInfo, ClusterOperationInfo, ClusterOperationV2,
+    ChannelLoggingInfo, ClientAuthentication, ClientVpcConnection, ClusterInfo, ClusterOperationInfo,
+    ClusterOperationV2,
     ClusterOperationV2Provisioned, Configuration,
     ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, ConsumerGroupReplicationUpdate,
     CreateChannelInput,
@@ -865,8 +870,8 @@ pub fn serverless_topic_apis_unsupported<E>() -> crate::scaffolded::Scaffolded<E
 pub const NODE_TYPE_BROKER: &str = "BROKER";
 
 /// The largest page a listing may report, from the `range` on the `MaxResults`
-/// shape (1..100) that `ListClusters`, `ListClustersV2` and `ListKafkaVersions`
-/// all bind. Also the page size used when a request names none.
+/// shape (1..100) that this service's paginated listings bind. Also the page
+/// size used when a request names none.
 pub const MAX_RESULTS_LIMIT: i32 = 100;
 
 /// Marker that prefixes a cluster page token's plaintext, so a token minted for
@@ -1473,6 +1478,10 @@ pub struct VpcConnection {
     /// serves only its own region's connections.
     pub region: String,
     pub target_cluster_arn: String,
+    /// The account that requested the connection, as the account segment of its
+    /// own ARN names it. Reported as `ClientVpcConnection$Owner` by the cluster's
+    /// listing of its client connections.
+    pub owner: String,
     /// One of [`VPC_CONNECTION_AUTHENTICATION_TYPES`].
     pub authentication: String,
     pub vpc_id: String,
@@ -3823,6 +3832,7 @@ impl VpcConnection {
             arn,
             region: region.to_string(),
             target_cluster_arn: cluster_arn.to_string(),
+            owner: account.to_string(),
             authentication: input.authentication,
             vpc_id: input.vpc_id,
             client_subnets: input.client_subnets,
@@ -3863,6 +3873,23 @@ impl VpcConnection {
             authentication: Some(self.authentication.clone()),
             vpc_id: Some(self.vpc_id.clone()),
             state: Some(self.state.clone()),
+        }
+    }
+
+    /// The connection as the `ClientVpcConnection` shape
+    /// `ListClientVpcConnections` reports: the view a CLUSTER has of one client
+    /// connection to it, which names the account that owns the connection
+    /// instead of the cluster it targets — the caller named that cluster to get
+    /// this listing. Every member is read off the same stored record
+    /// [`Self::to_vpc_connection`] renders, so the two listings and
+    /// `DescribeVpcConnection` cannot disagree about a connection.
+    pub fn to_client_vpc_connection(&self) -> ClientVpcConnection {
+        ClientVpcConnection {
+            vpc_connection_arn: self.arn.clone(),
+            authentication: Some(self.authentication.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            state: Some(self.state.clone()),
+            owner: Some(self.owner.clone()),
         }
     }
 }

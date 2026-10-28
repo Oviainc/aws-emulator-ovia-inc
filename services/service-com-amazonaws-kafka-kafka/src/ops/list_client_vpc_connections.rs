@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClientVpcConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClientVpcConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClientVpcConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One cluster's client (PrivateLink) VPC connections, paged out of the
+//! service's one multi-VPC connection registry ([`crate::state::VpcConnection`])
+//! narrowed to the connections that target the cluster the caller named.
+//! Reporting only: the writes it makes are the `CREATING` -> `AVAILABLE`
+//! transitions the clock already owed the connections on this page (and the
+//! transitions owed the cluster it resolves), each due at the same instant
+//! whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +77,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::ops::Bound;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -113,6 +113,51 @@ impl From<ListClientVpcConnectionsErrorModeled> for ListClientVpcConnectionsErro
     fn from(modeled: ListClientVpcConnectionsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Marker that prefixes this listing's page-token plaintext, so a token minted
+/// for some other list cannot be mistaken for one of these. The cluster the
+/// token was minted for is part of the plaintext, so one cluster's page cannot
+/// resume another cluster's client-connection listing.
+const NEXT_TOKEN_PREFIX: &str = "kafka:client-vpc-connections:";
+
+/// Separates the cluster ARN a token was minted for from the connection ARN the
+/// page stopped at. An MSK ARN cannot contain it, so the plaintext splits back
+/// into exactly two fields.
+const NEXT_TOKEN_SEPARATOR: char = '#';
+
+/// Encode the cluster and the connection ARN a page stopped at as a token,
+/// through the crate's one page-token codec
+/// ([`crate::state::encode_page_token`]).
+fn encode_next_token(cluster_arn: &str, last_connection_arn: &str) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &format!("{cluster_arn}{NEXT_TOKEN_SEPARATOR}{last_connection_arn}"),
+    )
+}
+
+/// The connection ARN a token resumes after, or `None` when the token is not one
+/// this operation minted FOR THIS CLUSTER: a token carries the list it was
+/// minted from, so one cluster's token cannot resume another cluster's listing.
+fn decode_next_token(token: &str, cluster_arn: &str) -> Option<String> {
+    let plaintext = crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token)?;
+    let (arn, last_connection_arn) = plaintext.split_once(NEXT_TOKEN_SEPARATOR)?;
+    if arn != cluster_arn {
+        return None;
+    }
+    Some(last_connection_arn.to_string())
+}
+
+/// Refuse an unusable request member. This operation models no
+/// `NotFoundException`, so a `ClusterArn` that names nothing is a bad PARAMETER
+/// here, exactly as `CreateVpcConnection` refuses an unusable
+/// `TargetClusterArn`.
+fn bad_request(member: &str, message: String) -> ListClientVpcConnectionsError {
+    ListClientVpcConnectionsErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(member.to_string()),
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The `ListClientVpcConnections` operation.
@@ -151,18 +196,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClientVpcConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClientVpcConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClientVpcConnections"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListClientVpcConnectionsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // The shape check depends on the request alone, so it runs before the
+        // state lock is taken: a value that is not a cluster ARN is a request
+        // this reader cannot act on, which every cluster reader refuses the same
+        // way.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(bad_request(
+                "ClusterArn",
+                format!(
+                    "{} is not a valid Amazon MSK cluster ARN.",
+                    input.cluster_arn
+                ),
+            ));
+        }
+
+        // Absent `MaxResults` pages at the largest size the model allows, and no
+        // request may ask for a longer page than that range permits.
+        const PAGE_LIMIT: usize = crate::state::MAX_RESULTS_LIMIT as usize;
+        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_RESULTS_LIMIT))
+            .unwrap_or(PAGE_LIMIT)
+            .clamp(1, PAGE_LIMIT);
+
+        let mut state = state.lock();
+        let now = std::time::SystemTime::now();
+
+        // A regional endpoint knows only its own region's clusters, so an ARN
+        // from another region names nothing here. Resolved through the settling
+        // lookup, which materialises the transitions the clock already owed THAT
+        // cluster.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(bad_request(
+                "ClusterArn",
+                format!(
+                    "No cluster exists in {region} with the ARN {}",
+                    input.cluster_arn
+                ),
+            ));
+        };
+        // The cluster's OWN ARN, as the registry stores it on every connection
+        // that targets it, so the filter and the page token are both keyed to
+        // the resolved cluster rather than to the spelling of the request.
+        let cluster_arn = cluster.arn.clone();
+
+        // A token names the connection the previous page stopped at; the next
+        // page starts after it in the registry's own order, so a connection
+        // created or deleted between pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token, &cluster_arn) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(bad_request(
+                        "NextToken",
+                        "The pagination token is not valid.".to_string(),
+                    ))
+                }
+            },
+        };
+
+        // PASS 1 — choose this page's registry keys. The registry is ordered by
+        // ARN, so a token resumes by SEEKING to its position rather than walking
+        // the keys already returned; the scan from there stops as soon as the
+        // page is full, and connections belonging to another region or to
+        // another cluster are skipped past.
+        let mut keys: Vec<String> = Vec::with_capacity(page_size);
+        let mut more_remain = false;
+        let resume_from = match resume_after.as_deref() {
+            Some(last) => Bound::Excluded(last),
+            None => Bound::Unbounded,
+        };
+        for (arn, connection) in state
+            .vpc_connections
+            .range::<str, _>((resume_from, Bound::Unbounded))
+        {
+            if connection.region != region || connection.target_cluster_arn != cluster_arn {
+                continue;
+            }
+            if keys.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            keys.push(arn.clone());
+        }
+
+        // PASS 2 — settle and render exactly the connections this page reports.
+        // The only write is the `CREATING` -> `AVAILABLE` transition the clock
+        // already owed each of them, and the work is bounded by the page size
+        // rather than by the size of the registry.
+        let mut page: Vec<ClientVpcConnection> = Vec::with_capacity(keys.len());
+        for key in &keys {
+            // Every key came from pass 1 under THIS lock, so each one still
+            // resolves. Reported as a server fault rather than skipped: a page
+            // shorter than the keys the token was minted from would hide a
+            // connection instead of failing, so a refactor that ever let the two
+            // passes see different registries fails loudly here.
+            let Some(connection) = state.settled_vpc_connection_in(&region, key, now) else {
+                debug_assert!(
+                    false,
+                    "VPC connection {key} was chosen for this page but no longer resolves"
+                );
+                return Err(
+                    ListClientVpcConnectionsErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "a VPC connection selected for this page is no longer registered"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            page.push(connection.to_client_vpc_connection());
+        }
+
+        // The token is minted from the REGISTRY KEY the resume comparison uses,
+        // not from the rendered `ClientVpcConnection`, so the two can never
+        // disagree and a full page can never be mistaken for the last one.
+        let next_token = if more_remain {
+            keys.last()
+                .map(|last| encode_next_token(&cluster_arn, last))
+        } else {
+            None
+        };
+
+        Ok(ListClientVpcConnectionsOutput {
+            client_vpc_connections: Some(page),
+            next_token,
+        })
     }
 }

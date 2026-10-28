@@ -416,6 +416,34 @@ impl Emulator {
             .await
     }
 
+    /// `ListClientVpcConnections`, which the model binds to
+    /// `GET /v1/clusters/{ClusterArn}/client-vpc-connections` with `MaxResults`
+    /// and `NextToken` as query parameters; `query` is the whole query string
+    /// including its `?`, or empty.
+    pub async fn list_client_vpc_connections(&self, cluster_arn: &str, query: &str) -> Reply {
+        self.list_client_vpc_connections_in(REGION, cluster_arn, query)
+            .await
+    }
+
+    /// The same listing, as the endpoint of `region` serves it.
+    pub async fn list_client_vpc_connections_in(
+        &self,
+        region: &str,
+        cluster_arn: &str,
+        query: &str,
+    ) -> Reply {
+        self.call_in(
+            region,
+            "GET",
+            &format!(
+                "/v1/clusters/{}/client-vpc-connections{query}",
+                pct(cluster_arn)
+            ),
+            None,
+        )
+        .await
+    }
+
     /// Create `request` under `region`'s endpoint, assert it succeeded, and hand
     /// back the minted ARN — the regional counterpart of
     /// [`Self::create_vpc_connection_ok`].

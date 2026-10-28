@@ -19,6 +19,8 @@ mod broker_type_update;
 mod channel_deletion;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/client_vpc_connection_listing.rs"]
+mod client_vpc_connection_listing;
 #[path = "all/cluster_delete_state_guard.rs"]
 mod cluster_delete_state_guard;
 #[path = "all/cluster_lifecycle.rs"]
