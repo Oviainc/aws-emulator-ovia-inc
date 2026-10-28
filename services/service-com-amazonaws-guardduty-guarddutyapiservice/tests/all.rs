@@ -51,6 +51,8 @@ mod detector_sub_resource_creates;
 mod detector_sub_resource_deletes;
 #[path = "all/detector_update_without_configuration.rs"]
 mod detector_update_without_configuration;
+#[path = "all/entity_set_delete_retention.rs"]
+mod entity_set_delete_retention;
 #[path = "all/filter_delete.rs"]
 mod filter_delete;
 #[path = "all/filter_detector_timestamp.rs"]

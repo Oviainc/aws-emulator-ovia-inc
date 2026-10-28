@@ -3927,6 +3927,14 @@ pub struct EntitySetRecord {
     pub status_due_millis: Option<i64>,
     pub created_at_millis: i64,
     pub updated_at_millis: i64,
+    /// The instant a delete was ACCEPTED for this set, or `None` while no delete
+    /// has been. It is the key [`evict_deleted_entity_sets`] evicts the retained
+    /// deleted records by, oldest deletion first, so it records the acceptance and
+    /// nothing else moves it — not the clock settling
+    /// [`ENTITY_SET_DELETE_PENDING`] to [`ENTITY_SET_DELETED`], which rewrites
+    /// [`Self::updated_at_millis`] to the instant the settled status was owed and
+    /// would otherwise reorder two deletions accepted within one span.
+    pub deleted_at_millis: Option<i64>,
     /// `ErrorDetails`: only an `ERROR` set carries one.
     pub error_details: Option<String>,
 }
@@ -3978,6 +3986,7 @@ impl EntitySetRecord {
             status_due_millis,
             created_at_millis: now,
             updated_at_millis: now,
+            deleted_at_millis: None,
             error_details: None,
         }
     }
@@ -3988,8 +3997,14 @@ impl EntitySetRecord {
     /// Such a record is no longer a live entity set: it is still REPORTED, so a
     /// read can answer with the status the delete put it in, but GuardDuty is not
     /// keeping it, so it occupies none of the detector's entity-set slots.
+    ///
+    /// [`Self::deleted_at_millis`] answers it, so the instant a delete was accepted
+    /// and the fact that one was are the SAME field and cannot drift:
+    /// [`Self::begin_delete`] is the only thing that accepts a deletion, and it is
+    /// what puts the set in [`ENTITY_SET_DELETE_PENDING`], which [`Self::settle`]
+    /// only ever moves on to [`ENTITY_SET_DELETED`].
     pub fn is_deleting(&self) -> bool {
-        self.status == ENTITY_SET_DELETE_PENDING || self.status == ENTITY_SET_DELETED
+        self.deleted_at_millis.is_some()
     }
 
     /// Accept this entity set's deletion: [`ENTITY_SET_DELETE_PENDING`] now, with
@@ -4008,6 +4023,7 @@ impl EntitySetRecord {
         self.status = ENTITY_SET_DELETE_PENDING.to_string();
         self.status_due_millis = Some(now.saturating_add(ENTITY_SET_TRANSITION_MILLIS));
         self.updated_at_millis = now;
+        self.deleted_at_millis = Some(now);
         true
     }
 
@@ -4108,14 +4124,15 @@ fn evict_deleted_entity_sets(sets: &mut BTreeMap<String, EntitySetRecord>, keep:
     if surplus == 0 {
         return;
     }
-    // The oldest deletions first: `updated_at_millis` on a record being deleted is
-    // the instant its delete was accepted (or the instant `DELETED` was owed), and
+    // The oldest deletions first: `deleted_at_millis` is the instant the delete was
+    // ACCEPTED and nothing moves it afterwards — unlike `updated_at_millis`, which
+    // `EntitySetRecord::settle` rewrites to the instant `DELETED` was owed — and
     // `tick_millis` makes those instants strictly increasing, so the ordering is
     // total and the id only breaks a tie that cannot arise.
     let mut deleted: Vec<(i64, String)> = sets
         .values()
         .filter(|set| set.is_deleting() && set.id != keep)
-        .map(|set| (set.updated_at_millis, set.id.clone()))
+        .map(|set| (set.deleted_at_millis.unwrap_or_default(), set.id.clone()))
         .collect();
     deleted.sort_unstable();
     for (_, id) in deleted.into_iter().take(surplus) {
