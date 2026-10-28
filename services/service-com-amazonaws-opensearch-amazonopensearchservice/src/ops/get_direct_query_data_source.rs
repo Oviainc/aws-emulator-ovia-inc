@@ -183,9 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: data_source.description.clone(),
             // The stored list is empty exactly where the data source is associated with
             // no OpenSearch collection, which the response reports by carrying no
-            // `OpenSearchArns` at all rather than an empty list.
-            open_search_arns: (!data_source.open_search_arns.is_empty())
-                .then(|| data_source.open_search_arns.clone()),
+            // `OpenSearchArns` at all rather than an empty list — the same projection
+            // the inventory listing reports that member through.
+            open_search_arns: data_source.reported_open_search_arns(),
             // "Returns the current policy configuration in JSON format, or null if no
             // custom policy is configured": the document is reported as the service
             // holds it, and absent where the data source carries none.

@@ -43,7 +43,8 @@ use crate::ops::types::{
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
     DataSource as LinkedDataSource, DataSourceAttachmentSummary, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
-    DeploymentStrategyOptionsStatus, DirectQueryDataSourceType, DisabledOperationException,
+    DeploymentStrategyOptionsStatus, DirectQueryDataSource, DirectQueryDataSourceType,
+    DisabledOperationException,
     DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainMaintenanceDetails,
     DomainPackageDetails,
@@ -670,6 +671,41 @@ pub struct DirectQueryDataSourceRecord {
     /// write them through
     /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::tagged_resource`].
     pub tags: TagSet,
+}
+
+impl DirectQueryDataSourceRecord {
+    /// The collections this data source is associated with as a response reports
+    /// them: absent where it is associated with none, because a member the record
+    /// has nothing for is one the service leaves out rather than one it answers with
+    /// an empty list.
+    pub fn reported_open_search_arns(&self) -> Option<Vec<String>> {
+        (!self.open_search_arns.is_empty()).then(|| self.open_search_arns.clone())
+    }
+
+    /// The tags attached to this data source as a response reports them, on the same
+    /// rule as [`Self::reported_open_search_arns`].
+    pub fn reported_tag_list(&self) -> Option<Vec<Tag>> {
+        (!self.tags.is_empty()).then(|| tag_list(&self.tags))
+    }
+
+    /// This record as the modelled `DirectQueryDataSource` a listing reports, from
+    /// the SAME stored record `GetDirectQueryDataSource` answers with — so a data
+    /// source's row in the inventory and its own read cannot disagree about its
+    /// type, description, collections, identifier or tags.
+    ///
+    /// `DirectQueryDataSource` is "the configuration details for a data source that
+    /// can be directly queried": the members it declares, and no others, so the
+    /// access policy only the single read models is not reported here.
+    pub fn to_summary(&self) -> DirectQueryDataSource {
+        DirectQueryDataSource {
+            data_source_name: Some(self.data_source_name.clone()),
+            data_source_type: Some(self.data_source_type.clone()),
+            description: self.description.clone(),
+            open_search_arns: self.reported_open_search_arns(),
+            data_source_arn: Some(self.arn.clone()),
+            tag_list: self.reported_tag_list(),
+        }
+    }
 }
 
 /// Which member of `DirectQueryDataSourceType` a data source is, as the model names

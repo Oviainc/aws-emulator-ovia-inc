@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDirectQueryDataSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDirectQueryDataSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDirectQueryDataSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's inventory of direct query data sources, one page at a
+//! time, from the [`crate::state::DirectQueryDataSourceRecord`]s
+//! `AddDirectQueryDataSource` persisted and `GetDirectQueryDataSource` reports one
+//! at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +76,20 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{
+    invalid_next_token, service_state, state_unavailable, DirectQueryDataSourceRecord,
+};
+
+/// How many data sources ONE page of this inventory carries.
+///
+/// The operation takes a `NextToken` and answers one, so the inventory is paged, but
+/// the model gives it no page-size member: the page size is the service's to pick and
+/// this is the emulator's choice of it — smaller than
+/// [`crate::state::DIRECT_QUERY_DATA_SOURCE_QUOTA`], so an account's set can span
+/// more than one page and a caller that ignores the token cannot mistake a first page
+/// for the whole inventory.
+const MAX_PAGE: usize = 10;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +163,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDirectQueryDataSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDirectQueryDataSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDirectQueryDataSources"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // A pure read: every record is projected onto the response and nothing about
+        // any of them changes, so the next caller sees what this one saw.
+        let store = state.lock();
+
+        // Order-stable, because the store is keyed by the data source's name: the same
+        // request reports the same order twice, which is what lets a token name a place
+        // in the inventory. Bounded by the store itself: this account holds at most
+        // `crate::state::DIRECT_QUERY_DATA_SOURCE_QUOTA` data sources.
+        let ordered: Vec<&DirectQueryDataSourceRecord> =
+            store.direct_query_data_sources.values().collect();
+
+        // "Send the request again using the returned token to retrieve the next page":
+        // the token names the data source the next page starts at, so paging resumes
+        // from a place in the inventory rather than from an offset a later add or
+        // delete would have shifted. It is only ever a value this operation handed out,
+        // so one naming no data source of the account is a malformed request rather
+        // than an empty page. The EMPTY token names no place either, and is the one
+        // value a client can send without having been given it, so it starts from the
+        // first page.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => ordered
+                .iter()
+                .position(|data_source| data_source.data_source_name == token)
+                .ok_or_else(|| {
+                    ListDirectQueryDataSourcesErrorModeled::ValidationException(
+                        invalid_next_token(),
+                    )
+                })?,
+        };
+        let end = start.saturating_add(MAX_PAGE).min(ordered.len());
+
+        Ok(ListDirectQueryDataSourcesOutput {
+            // Answered from the STORED records, so a data source's row here and its own
+            // read report one data source. The listing answers with the page it
+            // selected even where that page is empty: the list IS this operation's
+            // answer, and an account holding no data source has an empty inventory
+            // rather than none.
+            direct_query_data_sources: Some(
+                ordered[start..end]
+                    .iter()
+                    .map(|data_source| data_source.to_summary())
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the data
+            // source the next page starts at, and nothing once this page ended the
+            // inventory.
+            next_token: ordered
+                .get(end)
+                .map(|data_source| data_source.data_source_name.clone()),
+        })
     }
 }
