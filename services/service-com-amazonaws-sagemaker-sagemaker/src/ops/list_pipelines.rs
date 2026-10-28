@@ -1,22 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPipelines
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPipelines`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPipelines::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `ListPipelines::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! IMPLEMENTED: filters, sorts and pages the pipelines `CreatePipeline` stored in
+//! `crate::state`, reporting one `PipelineSummary` per pipeline the request selects. A
+//! pure READ: nothing is written, so a listing never changes what a later caller sees.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -131,6 +119,15 @@ impl<Eng> ListPipelines<Eng> {
     }
 }
 
+/// `SortBy`'s documented default for this operation ("The field by which to sort results.
+/// The default is `CreatedTime`."), which names the `SortPipelinesBy` member
+/// `crate::state::DEFAULT_SORT_BY` spells, shared with the crate's other listings;
+/// `SortOrder`'s default is `crate::state::DEFAULT_SORT_ORDER`, this operation documenting
+/// none of its own. The accepted value sets are the generated `*_VALUES` slices in
+/// `super::types`, so a refusal stays in step with the model rather than with a
+/// transcription of it.
+const SORT_BY_NAME: &str = "Name";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListPipelines<Eng>
 {
@@ -146,20 +143,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPipelines` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPipelinesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPipelines"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `SortBy` and `SortOrder` each select one member of their modelled enum, so a
+        // value that is neither — including a member the model may add — is REFUSED here
+        // rather than silently ordered by another key.
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !SORT_PIPELINES_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                SORT_PIPELINES_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let after = input.created_after.map(crate::state::timestamp_key);
+        let before = input.created_before.map(crate::state::timestamp_key);
+
+        // A read: the guard is taken, the selected records are projected into summaries
+        // and NOTHING is written back.
+        let store = state.lock();
+        // Each record's creation key is computed ONCE, here, and carried beside the
+        // record: the bounds and the sort below both read it rather than converting the
+        // stored instant again on every comparison.
+        let mut matching: Vec<((i64, u32), &crate::state::Pipeline)> = store
+            .pipelines
+            .values()
+            .filter(|pipeline| {
+                // "The prefix of the pipeline name": a prefix selects the names that
+                // START with it, which is not the substring match the crate's
+                // `NameContains` filters apply.
+                input
+                    .pipeline_name_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| pipeline.name.starts_with(prefix))
+            })
+            .filter_map(|pipeline| {
+                // Both bounds are inclusive, so a timestamp copied straight out of a
+                // prior response's `CreationTime` still selects that pipeline.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(pipeline.creation_time));
+                let selected = after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound);
+                selected.then_some((created, pipeline))
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `PipelineName`
+        // ascending in both directions, so two pipelines created in the same instant keep
+        // one order whichever way the page is sorted — and a `NextToken` resolved against
+        // a freshly computed result set lands on the same boundary.
+        matching.sort_by(|(left_created, left), (right_created, right)| {
+            let by_key = if sort_by == SORT_BY_NAME {
+                left.name.cmp(&right.name)
+            } else {
+                // The only other member is `CreationTime`, this operation's default.
+                left_created.cmp(right_created)
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| {
+                        matching.iter().position(|(_, pipeline)| pipeline.name == name)
+                    })
+                    .ok_or_else(|| {
+                        // The crate's one wording for a token it cannot resolve, so every
+                        // paginated listing of this service refuses alike.
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise the whole store. The
+        // token below is emitted whenever anything is left, so a paginating client walks
+        // the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        // A token only where a further page exists, so a paginating client stops.
+        let next_token = page
+            .last()
+            .filter(|_| end < matching.len())
+            .map(|(_, last)| crate::state::encode_page_token(&last.name));
+
+        Ok(ListPipelinesOutput {
+            // "This list can be empty": a page carrying no pipeline is the list with no
+            // entry, never an absent member a caller would have to read as "unknown".
+            pipeline_summaries: Some(
+                page.iter()
+                    .map(|(_, pipeline)| PipelineSummary {
+                        // The ARN the create minted, replayed rather than re-rendered, so
+                        // a summary and `DescribePipeline` report one ARN per pipeline.
+                        pipeline_arn: Some(pipeline.arn.clone()),
+                        pipeline_name: Some(pipeline.name.clone()),
+                        pipeline_display_name: pipeline.display_name.clone(),
+                        pipeline_description: pipeline.description.clone(),
+                        role_arn: Some(pipeline.role_arn.clone()),
+                        creation_time: Some(crate::state::timestamp(pipeline.creation_time)),
+                        last_modified_time: Some(crate::state::timestamp(
+                            pipeline.last_modified_time,
+                        )),
+                        // "The last time that a pipeline execution began" — stamped by
+                        // `StartPipelineExecution`, so a pipeline that never ran reports
+                        // none rather than an instant nothing happened at.
+                        last_execution_time: pipeline
+                            .last_run_time
+                            .map(crate::state::timestamp),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

@@ -2,10 +2,12 @@
 
 //! @op CreatePipeline
 //! IMPLEMENTED: validates the request's pipeline definition — the published schema
-//! version, the step list, unique step names, and a `DependsOn` graph that resolves and
-//! is acyclic — then registers the pipeline in `crate::state` under its `PipelineName`,
-//! minting the `PipelineArn` from the request's region. This is the ONLY file to touch
-//! for this operation.
+//! version, the step list, unique step names, a `DependsOn` graph that resolves and is
+//! acyclic, and property references that name parameters the definition declares — then
+//! registers the pipeline in `crate::state` under its `PipelineName`, minting the
+//! `PipelineArn` from the request's region. Each definition defect carries its own
+//! diagnosis (see [`crate::state::pipeline_definition_violation`]), so a caller can tell
+//! one from another. This is the ONLY file to touch for this operation.
 //!
 //! A definition handed in through `PipelineDefinitionS3Location` is the one input path
 //! left unimplemented: it needs the definition fetched from S3, which nothing here does

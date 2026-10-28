@@ -31,12 +31,18 @@ pub(crate) fn definition(steps: Value) -> String {
     json!({ "Version": DEFINITION_VERSION, "Metadata": {}, "Steps": steps }).to_string()
 }
 
-/// A `Fail` step named `name`, depending on `depends_on`.
+/// A `Lambda` step named `name`, depending on `depends_on`.
+///
+/// A Lambda step is a step another step may wait on: a `Fail` step ends the run and a
+/// `Condition` step hands control to a branch, so neither may be the target of a
+/// `DependsOn` edge (`pipeline_definition_diagnosis` pins those two refusals).
 pub(crate) fn step(name: &str, depends_on: &[&str]) -> Value {
     let mut built = json!({
         "Name": name,
-        "Type": "Fail",
-        "Arguments": { "ErrorMessage": format!("{name} stopped the pipeline") },
+        "Type": "Lambda",
+        "Arguments": {
+            "FunctionArn": format!("arn:aws:lambda:us-east-1:{ACCOUNT}:function:{name}"),
+        },
     });
     if !depends_on.is_empty() {
         built["DependsOn"] = json!(depends_on);
@@ -126,7 +132,7 @@ async fn a_definition_whose_step_graph_resolves_and_is_acyclic_is_accepted() {
             "top-level-step-depends-on-a-branch-step",
             json!([
                 condition_step("Gate", json!([step("Branch", &[])]), json!([])),
-                step("After", &["Branch", "Gate"])
+                step("After", &["Branch"])
             ]),
         ),
         (

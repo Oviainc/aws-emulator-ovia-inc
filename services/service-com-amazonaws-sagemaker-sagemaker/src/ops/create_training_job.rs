@@ -8,7 +8,10 @@
 //! `ValidationException`, a `TrainingJobName` already in use with the modelled
 //! `ResourceInUse` and a request past the store's bound with the modelled
 //! `ResourceLimitExceeded` — and stores it as `InProgress` together with the instant the
-//! clock owes its terminal status. This is the ONLY file to touch for this operation.
+//! clock owes its terminal status. The accepted request is kept as sent, but for the
+//! hyperparameters the service itself does not keep (see
+//! [`crate::state::retained_hyper_parameters`]). This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## No training container ever runs here
 //!
@@ -305,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
@@ -397,6 +400,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // An empty-valued hyperparameter is not kept: the stored map holds only the
+        // entries a reader can tell from an absent key. See
+        // `crate::state::retained_hyper_parameters`.
+        input.hyper_parameters = crate::state::retained_hyper_parameters(input.hyper_parameters);
 
         store.training_jobs.insert(
             input.training_job_name.clone(),

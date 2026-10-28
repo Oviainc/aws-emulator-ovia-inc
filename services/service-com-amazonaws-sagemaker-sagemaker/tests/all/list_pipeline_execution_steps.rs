@@ -39,11 +39,10 @@ const PAST_EXECUTION_DUE: Duration =
 /// display name and description its declaration carries.
 type ExpectedStep = (&'static str, Option<&'static str>, Option<&'static str>);
 
-/// A `Fail` step — the one step kind whose whole declaration is control-plane data —
-/// named `name`, depending on `depends_on` and carrying whichever of the optional
-/// `DisplayName` / `Description` keys are supplied. `pipeline_lifecycle::step` is this
-/// same step without those two keys, which only this suite reads back.
-fn fail_step(
+/// A `Lambda` step named `name`, depending on `depends_on` and carrying whichever of the
+/// optional `DisplayName` / `Description` keys are supplied. `pipeline_lifecycle::step` is
+/// this same step without those two keys, which only this suite reads back.
+fn labelled_step(
     name: &str,
     depends_on: &[&str],
     display_name: Option<&str>,
@@ -51,8 +50,10 @@ fn fail_step(
 ) -> Value {
     let mut built = json!({
         "Name": name,
-        "Type": "Fail",
-        "Arguments": { "ErrorMessage": format!("{name} stopped the pipeline") },
+        "Type": "Lambda",
+        "Arguments": {
+            "FunctionArn": format!("arn:aws:lambda:us-east-1:{ACCOUNT}:function:{name}"),
+        },
     });
     if !depends_on.is_empty() {
         built["DependsOn"] = json!(depends_on);
@@ -120,15 +121,15 @@ async fn a_listing_reports_the_steps_of_the_run_the_stored_definition_declares()
     let cases: Vec<(&str, Value, Vec<ExpectedStep>, Value)> = vec![
         (
             "single-step-no-optional-members",
-            json!([fail_step("Only", &[], None, None)]),
+            json!([labelled_step("Only", &[], None, None)]),
             vec![("Only", None, None)],
             json!({}),
         ),
         (
             "two-steps-with-display-name-and-description",
             json!([
-                fail_step("Prepare", &[], Some("Prepare the data"), Some("step one")),
-                fail_step("Train", &["Prepare"], Some("Train the model"), None),
+                labelled_step("Prepare", &[], Some("Prepare the data"), Some("step one")),
+                labelled_step("Train", &["Prepare"], Some("Train the model"), None),
             ]),
             vec![
                 ("Prepare", Some("Prepare the data"), Some("step one")),
@@ -139,9 +140,9 @@ async fn a_listing_reports_the_steps_of_the_run_the_stored_definition_declares()
         (
             "chain-declared-against-the-dependency-direction",
             json!([
-                fail_step("Last", &["Middle"], None, Some("the tail")),
-                fail_step("Middle", &["Head"], None, None),
-                fail_step("Head", &[], Some("the head"), None),
+                labelled_step("Last", &["Middle"], None, Some("the tail")),
+                labelled_step("Middle", &["Head"], None, None),
+                labelled_step("Head", &[], Some("the head"), None),
             ]),
             vec![
                 ("Last", None, Some("the tail")),
@@ -153,13 +154,13 @@ async fn a_listing_reports_the_steps_of_the_run_the_stored_definition_declares()
         (
             "condition-branches-share-the-step-namespace",
             json!([
-                fail_step("Prepare", &[], None, None),
+                labelled_step("Prepare", &[], None, None),
                 condition_step(
                     "Check",
-                    json!([fail_step("WhenTrue", &["Prepare"], Some("if"), None)]),
-                    json!([fail_step("WhenFalse", &["Prepare"], None, Some("else"))]),
+                    json!([labelled_step("WhenTrue", &["Prepare"], Some("if"), None)]),
+                    json!([labelled_step("WhenFalse", &["Prepare"], None, Some("else"))]),
                 ),
-                fail_step("After", &["Check"], None, None),
+                labelled_step("After", &["Prepare"], None, None),
             ]),
             vec![
                 ("Prepare", None, None),
@@ -173,9 +174,9 @@ async fn a_listing_reports_the_steps_of_the_run_the_stored_definition_declares()
         (
             "selective-run-reports-only-the-steps-it-selected",
             json!([
-                fail_step("Prepare", &[], None, None),
-                fail_step("Train", &["Prepare"], Some("Train the model"), None),
-                fail_step("Evaluate", &["Train"], None, None),
+                labelled_step("Prepare", &[], None, None),
+                labelled_step("Train", &["Prepare"], Some("Train the model"), None),
+                labelled_step("Evaluate", &["Train"], None, None),
             ]),
             vec![
                 ("Prepare", None, None),
@@ -327,7 +328,7 @@ async fn pagination_walks_every_step_exactly_once() {
     let names: Vec<String> = (0..12).map(|index| format!("Step{index:02}")).collect();
     let steps: Vec<Value> = names
         .iter()
-        .map(|name| fail_step(name, &[], None, None))
+        .map(|name| labelled_step(name, &[], None, None))
         .collect();
     let execution_arn = started(&emulator, "paged", json!(steps), &json!({})).await;
     tokio::time::sleep(PAST_EXECUTION_DUE).await;
@@ -418,7 +419,7 @@ async fn a_listing_the_store_cannot_resolve_is_refused() {
     let execution_arn = started(
         &emulator,
         "listable",
-        json!([fail_step("Only", &[], None, None)]),
+        json!([labelled_step("Only", &[], None, None)]),
         &json!({}),
     )
     .await;
@@ -428,7 +429,7 @@ async fn a_listing_the_store_cannot_resolve_is_refused() {
     let deleted_execution = started(
         &emulator,
         "deleted",
-        json!([fail_step("Only", &[], None, None)]),
+        json!([labelled_step("Only", &[], None, None)]),
         &json!({}),
     )
     .await;

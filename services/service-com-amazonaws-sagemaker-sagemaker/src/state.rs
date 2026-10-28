@@ -419,6 +419,30 @@ pub const PIPELINE_DEFINITION_VERSION: &str = "2020-12-01";
 /// payload, so nothing inside them is walked as a pipeline step.
 const PIPELINE_CONDITION_STEP_TYPE: &str = "Condition";
 
+/// The `Type` of the step kind that ENDS a run: it stops the pipeline with its own error
+/// message, so nothing follows it.
+const PIPELINE_FAIL_STEP_TYPE: &str = "Fail";
+
+/// The step `Type`s no `DependsOn` entry may name as its target.
+///
+/// A `DependsOn` edge waits for the target step to COMPLETE, and neither of these two
+/// kinds completes into something a successor can run after: a fail step ends the run,
+/// and a condition step hands control to one of its own branches rather than to the
+/// steps declared beside it. Each is refused by name, so a caller is told which kind it
+/// tried to wait on.
+const PIPELINE_UNDEPENDABLE_STEP_TYPES: [&str; 2] =
+    [PIPELINE_FAIL_STEP_TYPE, PIPELINE_CONDITION_STEP_TYPE];
+
+/// The key a pipeline definition writes a property reference under: the schema's
+/// `{"Get": "<reference>"}` form, which is how a step's arguments name a value resolved
+/// when the pipeline runs.
+const PIPELINE_PROPERTY_REFERENCE_KEY: &str = "Get";
+
+/// The property-reference prefix that addresses one of the definition's own parameters,
+/// i.e. a reference of the form `Parameters.<name>`, where `<name>` is a name the
+/// definition's top-level `Parameters` list declares.
+const PIPELINE_PARAMETER_REFERENCE_PREFIX: &str = "Parameters.";
+
 /// The version id a pipeline carries from the moment it is created. `UpdatePipeline`
 /// mints later ones; nothing here does yet, so a created pipeline has exactly this one.
 pub const PIPELINE_INITIAL_VERSION: i64 = 1;
@@ -1238,6 +1262,28 @@ impl TrainingJob {
             .trim_end_matches('/');
         format!("{base}/{}/output/model.tar.gz", self.name)
     }
+}
+
+/// The hyperparameters a training job KEEPS, out of those its create supplied.
+///
+/// `HyperParameterValue` is modelled `@length min 0` — an empty value is a legal thing to
+/// send — but recorded SageMaker does not keep an entry whose value is the empty string:
+/// the described job reports a map without that key, so a key supplied empty is
+/// indistinguishable from one never supplied, while every non-empty value round-trips
+/// unchanged. A caller that reads the map back to decide whether a knob was configured
+/// therefore sees the same key set here as on the service.
+///
+/// Applied where the job is STORED rather than where one reader reports it, so every
+/// reader of the record answers the same key set.
+pub fn retained_hyper_parameters(
+    supplied: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    supplied.map(|supplied| {
+        supplied
+            .into_iter()
+            .filter(|(_, value)| !value.is_empty())
+            .collect()
+    })
 }
 
 /// An endpoint configuration created by `CreateEndpointConfig`, as
@@ -3477,15 +3523,22 @@ pub const CLUSTER_NODE_NOT_FOUND: &str = "Specified cluster node not found";
 ///
 /// * it parses as a JSON object carrying those two keys,
 /// * every step declares a name no other step in the definition declares,
-/// * every `DependsOn` entry names a step the definition declares, and the resulting
-///   graph is acyclic, and
+/// * every `DependsOn` entry names another step the definition declares — never the
+///   waiting step itself, and never a step of a kind nothing can wait on
+///   ([`PIPELINE_UNDEPENDABLE_STEP_TYPES`]) — and the resulting graph is acyclic,
+/// * every property reference to one of the pipeline's own parameters names a parameter
+///   the definition declares, and
 /// * it declares at most [`PIPELINE_MAX_STEPS`] steps and
 ///   [`PIPELINE_MAX_STEP_DEPENDENCIES`] dependency edges between them, the two counts
 ///   the walk's work is the product of — so validating a definition stays short whatever
 ///   the megabyte the member's modelled length admits is filled with.
 ///
 /// The returned text is the refusal's message; the caller renders it as the 400
-/// `ValidationException` that an unsatisfiable definition is refused with.
+/// `ValidationException` that an unsatisfiable definition is refused with. Each DEFECT
+/// CLASS carries its own diagnosis, so a caller matching on the reason can tell one
+/// definition defect from another: see [`PIPELINE_DAG_CYCLE`],
+/// [`step_cannot_depend_on_itself`], [`step_depends_on_unknown_step`],
+/// [`step_cannot_depend_on_step_kind`] and [`unknown_parameter_property_reference`].
 pub fn pipeline_definition_violation(definition: &str) -> Option<String> {
     let parsed = match ::serde_json::from_str::<::serde_json::Value>(definition) {
         Ok(parsed) => parsed,
@@ -3538,24 +3591,117 @@ pub fn pipeline_definition_violation(definition: &str) -> Option<String> {
         return Some(violation);
     }
     // Resolution and the cycle walk both reach a dependency through `by_name`, so each
-    // is O((steps + edges) log steps) over counts the two bounds above cap.
+    // is O((steps + edges) log steps) over counts the two bounds above cap. Every way one
+    // EDGE can be unsatisfiable is diagnosed before the graph as a whole is walked, so the
+    // refusal states the defect the caller can act on rather than the condition it shows
+    // up as: a step naming itself, a target no step declares, or a target of a kind
+    // nothing can wait on.
     for step in &declared.steps {
         for dependency in &step.depends_on {
-            if !declared.by_name.contains_key(dependency) {
-                return Some(format!(
-                    "step {} depends on step {dependency}, which this pipeline definition \
-                     does not declare",
-                    step.name
+            if *dependency == step.name {
+                return Some(step_cannot_depend_on_itself(step.name));
+            }
+            let Some(&target) = declared.by_name.get(dependency) else {
+                return Some(step_depends_on_unknown_step(step.name, dependency));
+            };
+            // `by_name` only ever holds the index of a step already collected, so the
+            // lookup resolves; going on rather than indexing keeps the walk total.
+            let Some(target_step) = declared.steps.get(target) else {
+                continue;
+            };
+            if PIPELINE_UNDEPENDABLE_STEP_TYPES.contains(&target_step.step_type) {
+                return Some(step_cannot_depend_on_step_kind(
+                    step.name,
+                    target_step.step_type,
+                    dependency,
                 ));
             }
         }
     }
-    first_pipeline_cycle(&declared).map(|cycle| {
-        format!(
-            "PipelineDefinition declares a circular dependency between its steps: {}",
-            cycle.join(" -> ")
-        )
-    })
+    if pipeline_graph_has_cycle(&declared) {
+        return Some(PIPELINE_DAG_CYCLE.to_string());
+    }
+    // Resolved last: a definition whose step graph does not resolve is refused for THAT,
+    // and only a definition that does have a graph has arguments worth resolving the
+    // references of.
+    let parameters: BTreeSet<&str> = declared_parameter_names(&parsed).into_iter().collect();
+    unresolved_parameter_reference(&parsed, &parameters)
+}
+
+/// How SageMaker diagnoses a step that names ITSELF among the steps it depends on — an
+/// edge that can never be satisfied, and the one cycle a caller can read off the step
+/// alone, so it is stated as the step's own defect rather than as a property of the graph.
+fn step_cannot_depend_on_itself(step: &str) -> String {
+    format!("Step: {step} can not depend on itself.")
+}
+
+/// How SageMaker diagnoses a `DependsOn` entry naming a step the definition does not
+/// declare: both the step that waits and the name nothing declares, as the request sent
+/// them, so the caller can tell a misspelled dependency from a missing declaration.
+fn step_depends_on_unknown_step(step: &str, missing: &str) -> String {
+    format!("Step: {step} depends on unknown Step: {missing}")
+}
+
+/// How SageMaker diagnoses a `DependsOn` entry whose target is one of the step kinds
+/// nothing may wait on ([`PIPELINE_UNDEPENDABLE_STEP_TYPES`]): the waiting step, the
+/// target's KIND (the step's own `Type` with `Step` after it, as the service names the
+/// kind) and the target.
+fn step_cannot_depend_on_step_kind(step: &str, target_type: &str, target: &str) -> String {
+    format!("Step: {step} can not depends on {target_type}Step: {target}")
+}
+
+/// How SageMaker diagnoses a step graph that is not a DAG.
+///
+/// FIXED text carrying nothing from the request: the service reports that the resolution
+/// found a cycle, and neither the steps on it nor the path through them — a caller acts on
+/// the defect class, and the enumeration of a path is one of many the same graph admits.
+const PIPELINE_DAG_CYCLE: &str = "Detected cycle in the DAG.";
+
+/// How SageMaker diagnoses a property reference to a pipeline parameter the definition
+/// does not declare: the reference AS WRITTEN, in the brackets the service quotes a
+/// reference in.
+fn unknown_parameter_property_reference(parameter: &str) -> String {
+    format!("Unknown property reference [{PIPELINE_PARAMETER_REFERENCE_PREFIX}{parameter}].")
+}
+
+/// The first property reference in `document` that addresses a pipeline parameter not
+/// among `declared`, as the refusal's message, or `None` when every one of them resolves.
+///
+/// A definition's steps reach the pipeline's own parameters through the schema's
+/// `{"Get": "Parameters.<name>"}` references, which may sit anywhere inside a step's
+/// arguments, so the whole document is walked — in document order, and iteratively, so a
+/// deeply nested definition cannot drive the walk into unbounded recursion. The work is
+/// linear in the document already parsed above, whose size the member's modelled length
+/// bounds. A reference with any other prefix addresses something else (a step's
+/// properties, the execution) and is not a parameter reference.
+fn unresolved_parameter_reference(
+    document: &::serde_json::Value,
+    declared: &BTreeSet<&str>,
+) -> Option<String> {
+    let mut pending = vec![document];
+    while let Some(value) = pending.pop() {
+        match value {
+            ::serde_json::Value::Object(members) => {
+                if let Some(parameter) = members
+                    .get(PIPELINE_PROPERTY_REFERENCE_KEY)
+                    .and_then(::serde_json::Value::as_str)
+                    .and_then(|reference| {
+                        reference.strip_prefix(PIPELINE_PARAMETER_REFERENCE_PREFIX)
+                    })
+                {
+                    if !declared.contains(parameter) {
+                        return Some(unknown_parameter_property_reference(parameter));
+                    }
+                }
+                // Reversed, so the walk pops the members in the order the document wrote
+                // them and the refusal names the FIRST unresolved reference.
+                pending.extend(members.values().rev());
+            }
+            ::serde_json::Value::Array(entries) => pending.extend(entries.iter().rev()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The refusal for a definition declaring more steps than [`PIPELINE_MAX_STEPS`].
@@ -3639,25 +3785,42 @@ pub fn pipeline_definition_parameter_names(definition: &str) -> Vec<String> {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(definition) else {
         return Vec::new();
     };
-    parsed
+    declared_parameter_names(&parsed)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The parameter names a parsed definition's top-level `Parameters` list declares, in
+/// declaration order — borrowed from the document, so the validator resolves a reference
+/// against them without copying the names it already parsed.
+///
+/// The one reading of that list: [`pipeline_definition_parameter_names`] reports it to the
+/// start call that assigns values, and [`pipeline_definition_violation`] resolves the
+/// definition's own property references against it, so the two cannot disagree about what
+/// a definition declares.
+fn declared_parameter_names(document: &::serde_json::Value) -> Vec<&str> {
+    document
         .get("Parameters")
         .and_then(::serde_json::Value::as_array)
         .map(|entries| {
             entries
                 .iter()
                 .filter_map(|entry| entry.get("Name").and_then(::serde_json::Value::as_str))
-                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()
 }
 
 /// One step of a pipeline definition, reduced to what the dependency graph is built
-/// from and what a step execution of it reports: the name it declares, the step names it
-/// depends on, and the display name and description it optionally carries — all borrowed
-/// from the parsed document so a large definition is not copied to walk it.
+/// from and what a step execution of it reports: the name and kind it declares, the step
+/// names it depends on, and the display name and description it optionally carries — all
+/// borrowed from the parsed document so a large definition is not copied to walk it.
 struct PipelineStep<'a> {
     name: &'a str,
+    /// The step's declared `Type`, which decides whether another step may depend on it
+    /// ([`PIPELINE_UNDEPENDABLE_STEP_TYPES`]) and whether it holds branches of its own.
+    step_type: &'a str,
     depends_on: Vec<&'a str>,
     display_name: Option<&'a str>,
     description: Option<&'a str>,
@@ -3752,6 +3915,7 @@ fn collect_pipeline_steps<'a>(
         out.by_name.insert(name, out.steps.len());
         out.steps.push(PipelineStep {
             name,
+            step_type,
             depends_on,
             display_name: member
                 .get("DisplayName")
@@ -3786,14 +3950,16 @@ fn collect_pipeline_steps<'a>(
     None
 }
 
-/// The first cycle the steps' `DependsOn` edges form, as the step names along it, or
-/// `None` when the graph is acyclic.
+/// Whether the steps' `DependsOn` edges form a cycle, i.e. whether the definition's
+/// dependency graph is not a DAG.
 ///
 /// A depth-first walk that carries its own stack rather than recursing, so a definition
 /// with a long dependency chain cannot exhaust the call stack, and that resolves each
-/// edge through the name index rather than scanning the steps. A dependency no step
-/// declares is skipped here: it is refused before this runs.
-fn first_pipeline_cycle(declared: &DeclaredSteps<'_>) -> Option<Vec<String>> {
+/// edge through the name index rather than scanning the steps. Answers only WHETHER the
+/// graph is cyclic, because that is what the refusal states ([`PIPELINE_DAG_CYCLE`]
+/// carries no path). A dependency no step declares is skipped here: it is refused before
+/// this runs.
+fn pipeline_graph_has_cycle(declared: &DeclaredSteps<'_>) -> bool {
     /// Not yet visited.
     const UNSEEN: u8 = 0;
     /// On the current walk's path.
@@ -3822,18 +3988,7 @@ fn first_pipeline_cycle(declared: &DeclaredSteps<'_>) -> Option<Vec<String>> {
                 continue;
             };
             match colour[next] {
-                ON_PATH => {
-                    let from = path
-                        .iter()
-                        .position(|frame| frame.0 == next)
-                        .unwrap_or_default();
-                    let mut cycle: Vec<String> = path[from..]
-                        .iter()
-                        .map(|frame| steps[frame.0].name.to_string())
-                        .collect();
-                    cycle.push(steps[next].name.to_string());
-                    return Some(cycle);
-                }
+                ON_PATH => return true,
                 UNSEEN => {
                     colour[next] = ON_PATH;
                     path.push((next, 0));
@@ -3842,7 +3997,7 @@ fn first_pipeline_cycle(declared: &DeclaredSteps<'_>) -> Option<Vec<String>> {
             }
         }
     }
-    None
+    false
 }
 
 /// An app's ARN: `...:app/<DomainId>/<owner>/<AppType>/<AppName>`.

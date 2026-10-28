@@ -62,7 +62,7 @@ fn algorithm_missing(name: &str) -> String {
 
 /// A `CreateTrainingJob` body naming `name`, with `specification` as its
 /// `AlgorithmSpecification` and `output` as its output location.
-fn training_body(name: &str, specification: Value, output: &str) -> Value {
+pub(crate) fn training_body(name: &str, specification: Value, output: &str) -> Value {
     json!({
         "TrainingJobName": name,
         "AlgorithmSpecification": specification,
@@ -85,7 +85,7 @@ fn training_body(name: &str, specification: Value, output: &str) -> Value {
 }
 
 /// An `AlgorithmSpecification` naming the algorithm by its container image.
-fn image_specification() -> Value {
+pub(crate) fn image_specification() -> Value {
     json!({ "TrainingImage": training_image(), "TrainingInputMode": "File" })
 }
 

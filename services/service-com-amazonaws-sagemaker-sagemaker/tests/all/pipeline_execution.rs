@@ -32,7 +32,7 @@ const DECLARED_PARAMETERS: [&str; 3] = ["Alpha", "Beta", "Gamma"];
 
 /// A pipeline definition in the published schema version declaring `parameters` and
 /// `steps`.
-fn definition_declaring(parameters: &[&str], steps: Value) -> String {
+pub(crate) fn definition_declaring(parameters: &[&str], steps: Value) -> String {
     let declared: Vec<Value> = parameters
         .iter()
         .map(|name| json!({ "Name": name, "Type": "String", "DefaultValue": "unset" }))
