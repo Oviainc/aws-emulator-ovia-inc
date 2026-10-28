@@ -727,9 +727,29 @@ pub fn tag_ceiling_message(resource_arn: &str) -> String {
 /// Built from the request, like [`application_not_found_message`]: it names the ARN that
 /// resolved to nothing. An ARN held under a different instance than the `InstanceArn`
 /// the request carried resolves to nothing too — see
-/// [`ComAmazonawsSsoadminSwbexternalserviceState::taggable_resource_tags`].
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::tag_target`].
 pub fn taggable_resource_not_found_message(resource_arn: &str) -> String {
     format!("Could not find a taggable resource with arn {resource_arn}.")
+}
+
+/// Why a tag WRITE could not reach the resource its `ResourceArn` named, as resolved by
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::tag_target_mut`].
+///
+/// Each operation declares its own error enum, so the resolution answers the refusal and
+/// the handler maps it onto the variant its model carries — the division
+/// [`ComAmazonawsSsoadminSwbexternalserviceState::add_region`] and [`cursor_after`]
+/// already keep. The reporting side needs no such enum: its only refusal is the
+/// not-found, so [`ComAmazonawsSsoadminSwbexternalserviceState::tag_target`] answers that
+/// message directly.
+#[derive(Debug)]
+pub enum TagWriteRefusal {
+    /// Nothing the request could tag is held under the ARNs it named: the operation's
+    /// modelled `ResourceNotFoundException` carries this message.
+    NotFound(String),
+    /// The instance holding the resource is still being created, so the write is the
+    /// conflict with that `CreateInstance`: the operation's modelled `ConflictException`
+    /// carries this message.
+    Conflict(String),
 }
 
 /// Merge `requested` into the tag set `stored`, which is what a tagging write composes
@@ -2992,22 +3012,23 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// The INSTANCE that holds the taggable resource `resource_arn` names, or `None` for
     /// an ARN this account holds no resource under.
     ///
-    /// What a tagging write asks to reach the status of the instance the resource lives
-    /// under ([`Self::instance_creation_in_progress`]): an instance is itself taggable, so
+    /// What [`Self::tag_target_mut`] asks to reach the status of the instance the resource
+    /// lives under ([`Self::instance_creation_in_progress`]): an instance is itself
+    /// taggable, so
     /// this answers the instance's own ARN for it and the holding instance's for a
     /// permission set, an application or a trusted token issuer.
-    pub fn taggable_resource_instance(&self, resource_arn: &str) -> Option<&str> {
+    fn taggable_resource_instance(&self, resource_arn: &str) -> Option<&str> {
         self.taggable_resource(resource_arn).map(|(owner, _)| owner)
     }
 
-    /// The tags the taggable resource `resource_arn` names carries, for an operation that
-    /// REPORTS them.
+    /// The tags the taggable resource `resource_arn` names carries — the resolution step
+    /// of [`Self::tag_target`], which is how a handler reaches it.
     ///
     /// `instance_arn` is the request's optional `InstanceArn`: when a caller sends one, a
     /// resource held under a DIFFERENT instance is as absent here as one that was never
     /// created — the same rule [`Self::permission_set`] resolves a permission set by — so
     /// the read and the write below never disagree about which resource an ARN names.
-    pub fn taggable_resource_tags(
+    fn taggable_resource_tags(
         &self,
         instance_arn: Option<&str>,
         resource_arn: &str,
@@ -3016,9 +3037,9 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         instance_arn.is_none_or(|arn| arn == owner).then_some(tags)
     }
 
-    /// The same tag set, for an operation that CHANGES it. Resolves exactly as
-    /// [`Self::taggable_resource_tags`].
-    pub fn taggable_resource_tags_mut(
+    /// The same tag set for a handler that CHANGES it — the resolution step of
+    /// [`Self::tag_target_mut`]. Resolves exactly as [`Self::taggable_resource_tags`].
+    fn taggable_resource_tags_mut(
         &mut self,
         instance_arn: Option<&str>,
         resource_arn: &str,
@@ -3039,6 +3060,71 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.trusted_token_issuers
             .get_mut(resource_arn)
             .map(|record| &mut record.tags)
+    }
+
+    /// THE resolution the whole tag surface shares, for an operation that REPORTS the tag
+    /// set: the tags of the resource a tag request names, or the message of the
+    /// not-found its caller models.
+    ///
+    /// `instance_arn` is the request's optional `InstanceArn`. When a caller sends one it
+    /// names the instance the resource is expected to live under, so an ARN this account
+    /// holds no instance for can hold no resource either
+    /// ([`instance_not_found_message`]), and a resource held under a DIFFERENT instance is
+    /// as absent as one that was never created. Never created, already deleted, gone with
+    /// its instance, or held elsewhere — the same answer either way
+    /// ([`taggable_resource_not_found_message`]). A resource that exists and carries no
+    /// tag is an EMPTY set, which is a different answer from that refusal.
+    pub fn tag_target(
+        &self,
+        instance_arn: Option<&str>,
+        resource_arn: &str,
+    ) -> Result<&Vec<Tag>, String> {
+        self.tag_request_instance_scope(instance_arn)?;
+        self.taggable_resource_tags(instance_arn, resource_arn)
+            .ok_or_else(|| taggable_resource_not_found_message(resource_arn))
+    }
+
+    /// The same resolution for an operation that CHANGES the tag set, which withholds one
+    /// thing more: the instance that HOLDS the resource decides whether the write is
+    /// available at all, since an instance still being created serves only its own
+    /// describe and delete, so a tag write on it — or on anything under it — is the
+    /// conflict with the `CreateInstance` still in flight
+    /// ([`Self::instance_creation_in_progress`]).
+    pub fn tag_target_mut(
+        &mut self,
+        instance_arn: Option<&str>,
+        resource_arn: &str,
+    ) -> Result<&mut Vec<Tag>, TagWriteRefusal> {
+        self.tag_request_instance_scope(instance_arn)
+            .map_err(TagWriteRefusal::NotFound)?;
+        self.tag_write_holder_ready(resource_arn)
+            .map_err(TagWriteRefusal::Conflict)?;
+        self.taggable_resource_tags_mut(instance_arn, resource_arn)
+            .ok_or_else(|| {
+                TagWriteRefusal::NotFound(taggable_resource_not_found_message(resource_arn))
+            })
+    }
+
+    /// The optional `InstanceArn` a tag request may carry: it names the instance the
+    /// resource is expected to live under, and an ARN this account holds no instance for
+    /// can hold no resource either.
+    fn tag_request_instance_scope(&self, instance_arn: Option<&str>) -> Result<(), String> {
+        match instance_arn.filter(|arn| self.instance(arn).is_none()) {
+            Some(arn) => Err(instance_not_found_message(arn)),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the instance holding the named resource is far enough along to take a tag
+    /// write, as the `Err` message of the conflict it earns while it is not.
+    fn tag_write_holder_ready(&self, resource_arn: &str) -> Result<(), String> {
+        match self
+            .taggable_resource_instance(resource_arn)
+            .filter(|holder| self.instance_creation_in_progress(holder))
+        {
+            Some(holder) => Err(instance_creation_in_progress_message(holder)),
+            None => Ok(()),
+        }
     }
 
     /// Store the status of one assignment deletion, evicting the OLDEST records while

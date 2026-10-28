@@ -81,6 +81,8 @@ mod custom_entity_type_deletion;
 mod custom_entity_type_listing;
 #[path = "all/custom_entity_types.rs"]
 mod custom_entity_types;
+#[path = "all/dashboard_url.rs"]
+mod dashboard_url;
 #[path = "all/data_catalog.rs"]
 mod data_catalog;
 #[path = "all/data_catalog_encryption_settings.rs"]
@@ -107,6 +109,10 @@ mod get_mapping;
 mod get_plan;
 #[path = "all/get_table_entity_not_found.rs"]
 mod get_table_entity_not_found;
+#[path = "all/iceberg_tables.rs"]
+mod iceberg_tables;
+#[path = "all/identity_center_configuration.rs"]
+mod identity_center_configuration;
 #[path = "all/glossaries.rs"]
 mod glossaries;
 #[path = "all/glossary_deletion.rs"]
@@ -121,6 +127,8 @@ mod glossary_terms;
 mod integration_resource_properties;
 #[path = "all/integration_table_properties.rs"]
 mod integration_table_properties;
+#[path = "all/job_bookmarks.rs"]
+mod job_bookmarks;
 #[path = "all/job_deletion.rs"]
 mod job_deletion;
 #[path = "all/job_listing.rs"]
@@ -165,6 +173,10 @@ mod security_configurations;
 mod state_roundtrip;
 #[path = "all/store_capacity.rs"]
 mod store_capacity;
+#[path = "all/table_optimizers.rs"]
+mod table_optimizers;
+#[path = "all/table_update_concurrency.rs"]
+mod table_update_concurrency;
 #[path = "all/table_version_deletion.rs"]
 mod table_version_deletion;
 #[path = "all/table_version_listing.rs"]
@@ -183,6 +195,8 @@ mod trigger_updates;
 mod triggers;
 #[path = "all/unfiltered_metadata.rs"]
 mod unfiltered_metadata;
+#[path = "all/unfiltered_table_metadata.rs"]
+mod unfiltered_table_metadata;
 #[path = "all/usage_profiles.rs"]
 mod usage_profiles;
 #[path = "all/wire.rs"]

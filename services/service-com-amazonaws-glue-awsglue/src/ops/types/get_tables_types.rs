@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetTablesRequest")]
+// `MaxResults` carries `skip_validation`: the service does NOT hold this member to the
+// `@range(min: 1, max: 100)` its modelled type (`CatalogGetterPageSize`) declares — a
+// listing that asks for one big page of a thousand tables is served, not refused — and a
+// page size it DOES reject is a Glue input error (`InvalidInputException`), not the
+// cross-service `ValidationException` the boundary walk answers with. The handler decides
+// what the page size may be (`crate::ops::get_tables`).
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.glue#GetTablesRequest",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct GetTablesInput {
     pub catalog_id: Option<String>,

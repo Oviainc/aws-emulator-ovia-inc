@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{emulator, expect_error, ok, string_member, without_status};
+use super::harness::{emulator, expect_error, ok, string_member, without_status, Emulator};
 use super::resolver_rule_deletion::{forward_rule, outbound_endpoint};
 
 /// One association a row sets up: which fixture rule it is of, which fixture VPC
@@ -230,7 +230,7 @@ fn listed_ids(body: &Value) -> Vec<String> {
 /// The fixture rules and VPCs of one row, with the associations it made in
 /// creation order.
 struct Fixture {
-    router: MultiServiceRouter,
+    router: Emulator,
     rules: Vec<String>,
     vpcs: Vec<String>,
     made: Vec<Value>,
