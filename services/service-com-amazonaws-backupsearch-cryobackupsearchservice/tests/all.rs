@@ -17,6 +17,8 @@ mod backup_index_status_gate;
 mod client_token_replay_rule;
 #[path = "all/client_token_window.rs"]
 mod client_token_window;
+#[path = "all/completed_with_issues_status_message.rs"]
+mod completed_with_issues_status_message;
 #[path = "all/export_client_token_expiry.rs"]
 mod export_client_token_expiry;
 #[path = "all/export_jobs.rs"]
