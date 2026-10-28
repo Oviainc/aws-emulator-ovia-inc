@@ -414,28 +414,64 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
 /// The symbols a tag key or value may carry beside letters, digits and spaces.
 ///
-/// The symbol set of the tag character class Amazon Web Services states for a tag
+/// The symbol set of the tag character class Amazon EMR states for a tag
 /// ([`TAG_CHARACTER_PATTERN`]), so a tag carrying any other character — a symbol such as
 /// an emoji, punctuation outside this list, a control character — is not a tag Amazon EMR
-/// holds. Listed in the order the pattern states them.
-pub const TAG_PUNCTUATION: [char; 8] = ['_', '.', ':', '/', '=', '+', '-', '@'];
+/// holds. Listed in the order the refusal enumerates them
+/// ([`tag_charset_message`]), which is also the order the pattern states them in: the
+/// class a caller is TOLD about and the class that is ENFORCED are this one list, so they
+/// cannot come apart.
+///
+/// EVIDENCE for the list: Amazon EMR states this class in ONE place only — the sentence
+/// it refuses an out-of-class tag with, which enumerates `_ . : / = + \ -` — and the
+/// Smithy model constrains neither `Tag$Key` nor `Tag$Value` with a `@pattern`. So the
+/// enumeration in that sentence is the whole of what is known about the class, and it is
+/// what is enforced here: the backslash belongs to it, and `@`, which the sentence does
+/// not name, does not. A symbol the service tells no caller about is not one it is known
+/// to hold.
+pub const TAG_PUNCTUATION: [char; 8] = ['_', '.', ':', '/', '=', '+', '\\', '-'];
 
-/// The character class a tag key and value are drawn from, as Amazon Web Services states
-/// it for a tag: Unicode letters (`\p{L}`), separators (`\p{Z}`) and numbers (`\p{N}`),
-/// plus [`TAG_PUNCTUATION`].
+/// The character class a tag key and value are drawn from, as Amazon EMR states it for a
+/// tag: Unicode letters (`\p{L}`), separators (`\p{Z}`) and numbers (`\p{N}`), plus
+/// [`TAG_PUNCTUATION`].
 ///
 /// This is the one statement of the class, so a caller reading it and
 /// [`is_tag_char`] applying it cannot come to disagree about what a tag may hold.
-pub const TAG_CHARACTER_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
+pub const TAG_CHARACTER_PATTERN: &str = r"^([\p{L}\p{Z}\p{N}_.:/=+\\\-]*)$";
 
-/// How a tag key or value Amazon EMR would not have stored is refused.
+/// How a tag key or value carrying a character outside the tag character class is
+/// refused: Amazon EMR's own sentence for that class of request, which names the half of
+/// the pair it rejected, quotes the text the request sent, and then states the class
+/// itself — so the caller learns from the refusal what a tag may hold.
+///
+/// `member` is the singular member name (`key` or `value`); the sentence names it once as
+/// the member it rejected and once in the plural the rule is stated over. The symbol half
+/// of the class is rendered from [`TAG_PUNCTUATION`] rather than spelled out again, which
+/// is what keeps the enumerated class the enforced one ([`is_tag_char`]).
+fn tag_charset_message(member: &str, value: &str) -> String {
+    // The enumeration, one symbol at a time with a space between: two characters per
+    // symbol, so the string is built in one allocation.
+    let mut symbols = String::with_capacity(TAG_PUNCTUATION.len() * 2);
+    for symbol in TAG_PUNCTUATION {
+        if !symbols.is_empty() {
+            symbols.push(' ');
+        }
+        symbols.push(symbol);
+    }
+    format!(
+        "Invalid tag {member}: '{value}'. Tag {member}s may only contain unicode letters, \
+         digits, whitespace, or one of these symbols: '{symbols}'."
+    )
+}
+
+/// How a tag key or value past its documented length bound is refused.
 ///
 /// AWS publishes no wording for this class, so it is this service's own sentence for a
 /// value it rejects ([`not_valid_message`]) with the half of the pair in front of it, the
 /// way [`unknown_cluster_message`] is built: the member the caller has to fix and the
 /// value it sent. What IS the contract is the refusal itself — HTTP 400 with the client
 /// error the operation models — rather than a tag Amazon EMR would never have held.
-fn tag_not_valid_message(member: &str, value: &str) -> String {
+fn tag_too_long_message(member: &str, value: &str) -> String {
     format!("Tag {member} {}", not_valid_message(value))
 }
 
@@ -460,9 +496,10 @@ pub fn is_tag_char(c: char) -> bool {
 /// both members as plain strings and constrains neither, so none of this is refused at
 /// the boundary.
 ///
-/// One sentence states every one of those classes ([`tag_not_valid_message`]): each is a
-/// member of the request Amazon EMR rejects, so the caller is told which half of the pair
-/// it was and what it sent.
+/// Each class has the sentence Amazon EMR answers it with, and both name the member of
+/// the request that was rejected and the text it carried: the character class states the
+/// class a tag is drawn from ([`tag_charset_message`]), the length bound this service's
+/// own sentence for a value it will not hold ([`tag_too_long_message`]).
 pub fn validate_tags(tags: &[Tag]) -> Result<(), String> {
     for tag in tags {
         let Some(key) = tag.key.as_deref().filter(|key| !key.is_empty()) else {
@@ -475,8 +512,11 @@ pub fn validate_tags(tags: &[Tag]) -> Result<(), String> {
             ("key", key, MAX_TAG_KEY_CHARS),
             ("value", value, MAX_TAG_VALUE_CHARS),
         ] {
-            if text.chars().count() > max || text.chars().any(|c| !is_tag_char(c)) {
-                return Err(tag_not_valid_message(member, text));
+            if text.chars().count() > max {
+                return Err(tag_too_long_message(member, text));
+            }
+            if text.chars().any(|c| !is_tag_char(c)) {
+                return Err(tag_charset_message(member, text));
             }
         }
     }
