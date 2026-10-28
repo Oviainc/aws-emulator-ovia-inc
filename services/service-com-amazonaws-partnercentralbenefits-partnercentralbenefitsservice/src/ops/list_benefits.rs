@@ -222,9 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The benefits are keyed by id in a `BTreeMap`, so this walk is in one stable
         // order and the token is simply the id to resume at — the range starts directly
-        // at that key rather than rescanning from the front. One extra matching record is
-        // taken to decide whether a further page exists, and is not reported.
-        let mut page: Vec<&crate::state::Benefit> = catalog
+        // at that key rather than rescanning from the front. The page and the cursor that
+        // resumes after it are then taken from this walk by
+        // [`crate::state::page_with_cursor`], the one place that lookahead is computed.
+        let matching = catalog
             .benefits
             .range(resume_from.unwrap_or_default()..)
             .map(|(_, benefit)| benefit)
@@ -238,14 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.status.as_ref(),
                         std::slice::from_ref(&benefit.status),
                     )
-            })
-            .take(page_size.saturating_add(1))
-            .collect();
+            });
 
-        let next_token = page
-            .get(page_size)
-            .map(|benefit| crate::state::encode_page_token(&input.catalog, &benefit.id));
-        page.truncate(page_size);
+        let (page, next_token) =
+            crate::state::page_with_cursor(matching, page_size, &input.catalog);
 
         Ok(ListBenefitsOutput {
             benefit_summaries: Some(

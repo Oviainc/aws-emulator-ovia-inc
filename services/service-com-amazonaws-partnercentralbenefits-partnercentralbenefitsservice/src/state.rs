@@ -3023,3 +3023,62 @@ pub fn resume_from<Record>(
     }
     Ok(Some(id))
 }
+
+/// One record a `@paginated` listing of this service pages over.
+///
+/// Every collection a listing pages is keyed by its record's own id, and that id is the
+/// whole of what a cursor resuming the listing names (see [`encode_page_token`]) — so this
+/// is all [`page_with_cursor`] needs of a record, whichever kind it is paging.
+pub trait PagedRecord {
+    /// The id this record is stored under, which is the key a cursor naming it resumes at.
+    fn record_id(&self) -> &str;
+}
+
+impl PagedRecord for Benefit {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl PagedRecord for BenefitApplication {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl PagedRecord for BenefitAllocation {
+    fn record_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The page a `@paginated` listing reports and the `NextToken` it hands back, from
+/// `matching` — the records of `catalog`, in the collection's own key order, that the
+/// request's filters selected.
+///
+/// The single construction of the lookahead every listing of this service pages with, so
+/// the number of records a page reports and the record its cursor resumes at cannot drift
+/// between the listings: exactly ONE record past the page is taken from `matching` to
+/// decide whether a further page exists, the cursor is issued for that extra record, and
+/// the extra record itself is NOT reported. `None` as the cursor is what says the page
+/// carried the last matching record.
+///
+/// Beside the other steps of the same rule — [`page_size`] for how many records a page
+/// holds, [`encode_page_token`] for the cursor's encoding and [`resume_from`] for the key
+/// a cursor resumes at.
+pub fn page_with_cursor<'records, Record, Matching>(
+    matching: Matching,
+    page_size: usize,
+    catalog: &str,
+) -> (Vec<&'records Record>, Option<String>)
+where
+    Record: PagedRecord + 'records,
+    Matching: Iterator<Item = &'records Record>,
+{
+    let mut page: Vec<&'records Record> = matching.take(page_size.saturating_add(1)).collect();
+    let next_token = page
+        .get(page_size)
+        .map(|record| encode_page_token(catalog, record.record_id()));
+    page.truncate(page_size);
+    (page, next_token)
+}
