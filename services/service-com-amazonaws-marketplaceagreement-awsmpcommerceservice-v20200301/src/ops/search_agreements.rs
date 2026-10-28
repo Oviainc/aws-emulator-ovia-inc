@@ -217,6 +217,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(SearchAgreementsErrorModeled::ValidationException(refusal).into());
         }
 
+        // A search states a window on one stored instant as a pair of filter
+        // names rather than as a pair of input members — and
+        // `SearchAgreementsInput$filters` expects both at once ("To filter by
+        // `EndTime`, you can use `BeforeEndTime`, `AfterEndTime`, or both") —
+        // but the two bounds are the same exclusive pair the sibling listings
+        // carry: a lower bound at or after the upper one spans no instant, so
+        // the pair states a period rather than selecting on one and is refused
+        // before any agreement is scanned
+        // (`crate::state::filter_time_window_refusal`).
+        if let Some(refusal) = crate::state::filter_time_window_refusal(&filters) {
+            return Err(SearchAgreementsErrorModeled::ValidationException(refusal).into());
+        }
+
         // `Sort$sortBy`: "`StartTime` and `LastUpdateTime` are supported only
         // when `PartyType` is `Proposer`" — so a search scoped to a party type
         // may only sort on an attribute that party type supports, and the

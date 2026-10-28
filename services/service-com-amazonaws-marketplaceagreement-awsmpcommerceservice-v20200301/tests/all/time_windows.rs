@@ -118,7 +118,11 @@ fn reported(window: &Window, answer: &Answer) -> usize {
 }
 
 /// The `fields` entries of a refusal, as the members they name.
-fn named_members(answer: &Answer) -> Vec<String> {
+///
+/// `pub(crate)` because the `search_time_windows` suite pins this same rule where
+/// the pair of bounds arrives as two filter names, and reads the refusal the same
+/// way.
+pub(crate) fn named_members(answer: &Answer) -> Vec<String> {
     answer.body["fields"]
         .as_array()
         .cloned()

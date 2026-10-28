@@ -132,7 +132,12 @@ fn value_for(name: &str) -> &'static str {
         "EndTimeBehaviorReasonCode" => "NO_RENEWAL_TERM",
         "InitialAgreementId" => "agmt-0000000000000001",
         "LicenseArn" => "arn:aws:license-manager:us-east-1:000000000000:license/l-1",
-        // Every `Before…`/`After…` filter selects on an instant.
+        // Every `Before…`/`After…` filter selects on an instant. A list naming
+        // BOTH bounds of one window bounds it from the far past upwards and
+        // from the far future downwards, so the pair spans every instant and a
+        // row is about the combination alone (`search_time_windows.rs` owns the
+        // rule about a pair that spans none).
+        instant if instant.starts_with("After") => "2000-01-01T00:00:00Z",
         _ => "2999-01-01T00:00:00Z",
     }
 }

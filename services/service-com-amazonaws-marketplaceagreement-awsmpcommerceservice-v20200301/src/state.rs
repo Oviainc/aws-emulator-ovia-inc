@@ -1110,6 +1110,21 @@ pub const PARTY_TYPE_FILTER_NAME: &str = "PartyType";
 /// are left out of [`ACCEPTOR_FILTER_COMBINATIONS`] rather than doubling it.
 pub const END_TIME_FILTER_NAMES: &[&str] = &["BeforeEndTime", "AfterEndTime"];
 
+/// The filter-name pairs of `SearchAgreementsInput$filters` that bound ONE
+/// stored instant from both sides, each entry `(lower bound, upper bound)`.
+///
+/// The member documents each name as "a date used to filter agreements with a
+/// date before/after the `endTime`/`startTime`/`lastUpdateTime` of an
+/// agreement", so the two names of a pair bound the same stored instant, and it
+/// expects callers to send both at once ("To filter by `EndTime`, you can use
+/// `BeforeEndTime`, `AfterEndTime`, or both"). Every such pair is one window, so
+/// [`filter_time_window_refusal`] reads them all.
+pub const FILTER_TIME_WINDOW_NAMES: &[(&str, &str)] = &[
+    ("AfterEndTime", "BeforeEndTime"),
+    ("AfterStartTime", "BeforeStartTime"),
+    ("AfterLastUpdateTime", "BeforeLastUpdateTime"),
+];
+
 /// Every filter-name combination `SearchAgreementsInput$filters` lists as
 /// supported "when the `PartyType` is `Acceptor`", each as the names it carries
 /// BESIDE the three that say nothing about which combination it is: the required
@@ -3294,6 +3309,59 @@ pub fn filter_combination_refusal(filters: &[Filter]) -> Option<ValidationExcept
 /// The dotted request path of the filter list itself, which is the member a rule
 /// over the WHOLE list is about — no single element of it is the wrong one.
 const FILTERS_PATH: &str = "filters";
+
+/// Every bound the filter list states through the filter `name`, as the position
+/// of the filter that carried it and the instant its value names.
+///
+/// A list may carry the same bound more than once — the filters are an AND, so
+/// each occurrence bounds the same stored instant. Call [`validate_filters`]
+/// first: a value it would refuse names no instant and is skipped here.
+fn filter_bounds(filters: &[Filter], name: &str) -> Vec<(usize, f64)> {
+    filters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, filter)| match filter_parts(index, filter) {
+            Ok((filter_name, value)) if filter_name == name => {
+                filter_instant(value).map(|instant| (index, instant))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Refuse a filter LIST that bounds one stored instant from BOTH sides with its
+/// lower bound at or after its upper bound, BEFORE any agreement is scanned.
+///
+/// A search states such a window as a pair of filter names rather than as a pair
+/// of input members ([`FILTER_TIME_WINDOW_NAMES`]), but it is the same pair of
+/// exclusive bounds on one instant that [`time_window_refusal`] owns the rule
+/// for, so it is answered by that rule — naming the two filter values that
+/// bounded the period. The filters are an AND, so a list naming a bound twice
+/// states a malformed period as soon as ANY of its lower bounds is at or after
+/// any of its upper ones.
+///
+/// Nothing here reads the store, so the answer is the same whatever it holds.
+/// Call [`validate_filters`] first: every bound this compares is a value that
+/// parsed as an instant.
+pub fn filter_time_window_refusal(filters: &[Filter]) -> Option<ValidationException> {
+    FILTER_TIME_WINDOW_NAMES
+        .iter()
+        .find_map(|&(after_name, before_name)| {
+            let uppers = filter_bounds(filters, before_name);
+            filter_bounds(filters, after_name)
+                .iter()
+                .find_map(|&(after_index, after)| {
+                    uppers.iter().find_map(|&(before_index, before)| {
+                        time_window_refusal(
+                            Some(after),
+                            Some(before),
+                            &filter_value_path(after_index),
+                            &filter_value_path(before_index),
+                        )
+                    })
+                })
+        })
+}
 
 /// Whether `agreement` matches every filter the search named.
 ///

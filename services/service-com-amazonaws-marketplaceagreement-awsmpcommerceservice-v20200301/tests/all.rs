@@ -79,6 +79,8 @@ mod refusal_wording;
 mod replacement_source_status;
 #[path = "all/search_filter_combinations.rs"]
 mod search_filter_combinations;
+#[path = "all/search_time_windows.rs"]
+mod search_time_windows;
 #[path = "all/selector_resolution.rs"]
 mod selector_resolution;
 #[path = "all/selector_values.rs"]

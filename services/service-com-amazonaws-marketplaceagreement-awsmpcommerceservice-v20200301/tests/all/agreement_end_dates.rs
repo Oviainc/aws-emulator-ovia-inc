@@ -259,7 +259,10 @@ async fn selected(router: &MultiServiceRouter, filters: Value) -> BTreeSet<Strin
 
 /// `instant`, in epoch seconds, as the RFC-3339 timestamp a filter value spells
 /// an instant with.
-fn filter_instant(instant: f64) -> String {
+///
+/// `pub(crate)` because the `search_time_windows` suite bounds the same instants
+/// with the same filter values rather than spelling a second formatter.
+pub(crate) fn filter_instant(instant: f64) -> String {
     ::aws_smithy_types::DateTime::from_secs_f64(instant)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .expect("an instant inside the agreement's own window is RFC-3339 spellable")
