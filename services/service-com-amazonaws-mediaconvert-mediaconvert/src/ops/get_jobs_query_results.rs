@@ -183,18 +183,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The matched page is the one the query stored when it was started, so the jobs a
         // caller polls do not shift under them. A query that has not completed yet
-        // reports no page at all, only its status.
-        let complete = query.status == crate::state::JOBS_QUERY_STATUS_COMPLETE;
+        // reports no page at all, only its status — and the page is BOTH halves: the jobs
+        // it matched and the cursor for the batch after them, which `reported_page` hands
+        // back together so neither can be reported without the other.
         let status = Some(query.status.clone());
-        let next_token = query.result_next_token.clone();
-        let matched = query.matched.clone();
-        let jobs = complete.then(|| {
-            matched
-                .iter()
-                .filter_map(|id| state.jobs.get(id))
-                .map(|job| job.view(&region))
-                .collect()
-        });
+        let page = query
+            .reported_page()
+            .map(|(matched, next_token)| (matched.to_vec(), next_token.map(str::to_string)));
+        let (jobs, next_token) = match page {
+            Some((matched, next_token)) => (
+                Some(
+                    matched
+                        .iter()
+                        .filter_map(|id| state.jobs.get(id))
+                        .map(|job| job.view(&region))
+                        .collect(),
+                ),
+                next_token,
+            ),
+            None => (None, None),
+        };
 
         Ok(GetJobsQueryResultsOutput {
             jobs,
