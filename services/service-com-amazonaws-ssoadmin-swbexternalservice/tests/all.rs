@@ -151,6 +151,8 @@ mod resource_untagging;
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource_resolution.rs"]
+mod tag_resource_resolution;
 #[path = "all/tags_from_creates.rs"]
 mod tags_from_creates;
 #[path = "all/trusted_token_issuer_list.rs"]

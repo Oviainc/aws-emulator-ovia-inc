@@ -6,6 +6,12 @@
 //!
 //! Lists the tables actually stored in one database, in folded-name order.
 //!
+//! The tables of a FEDERATED database are not among them: that database "points to an
+//! entity outside the Glue Data Catalog", so its tables are held by the source its
+//! registration names, and no such source can be reached from here — which is
+//! `FederationSourceRetryableException`, exactly as it is for the single-table read
+//! (`crate::state::federated_source_refusal`).
+//!
 //! `Expression` is "A regular expression pattern. If present, only those tables whose
 //! names match the pattern are returned" (`GetTablesRequest$Expression`), and it selects
 //! the tables whose WHOLE name matches it: a metacharacter keeps its regular-expression
@@ -23,7 +29,12 @@
 //! with `InvalidInputException`, as is one whose compiled matcher would be larger than
 //! [`MAX_PATTERN_PROGRAM_BYTES`], so the work a caller-supplied pattern can buy stays
 //! bounded. `MaxResults` truncates the page and the returned `NextToken` is the last name
-//! on it, so the next call resumes at the first stored name strictly after it.
+//! on it, so the next call resumes at the first stored name strictly after it. A page size
+//! LARGER than the bound the model declares for that member is served rather than refused,
+//! which is what the service does: one call asking for a thousand tables answers with
+//! every matching table and no `NextToken`. A size below the modelled minimum names no
+//! servable page and is refused with this service's own `InvalidInputException`, the error
+//! class a Glue client can match, rather than with the cross-service `ValidationException`.
 //!
 //! Members this slice does not act on, and why: `AuditContext` is input-only Lake
 //! Formation audit metadata that does not change this operation's answer. Every other
@@ -133,10 +144,22 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page this operation serves, and the page size it uses when the request
-/// names no `MaxResults`. Source: the model's `MaxResults` target `CatalogGetterPageSize`,
-/// whose range is 1..100.
-const MAX_PAGE_SIZE: i32 = 100;
+/// The page this operation serves when the request names no `MaxResults`. Source: the
+/// model's `MaxResults` target `CatalogGetterPageSize`, whose range is 1..100, so the
+/// largest page the model describes is the one a request that asks for no particular size
+/// is served.
+///
+/// A request that DOES name a size is served that size, above this one included: the
+/// service answers a `MaxResults` of a thousand with every matching table on one page, so
+/// the modelled maximum bounds the default and not the request.
+const DEFAULT_PAGE_SIZE: i32 = 100;
+
+/// The smallest page a request may ask for: the minimum of that same modelled range. A
+/// request naming fewer than one table per page asks for a page no listing can serve, and
+/// is refused with this service's own `InvalidInputException` — never with the
+/// cross-service `ValidationException`, which no Glue error class matches (`MaxResults`
+/// carries `skip_validation`, see `super::types::get_tables_types`).
+const MIN_PAGE_SIZE: i32 = 1;
 
 /// Ceiling on the size of the matcher one `Expression` compiles to, re-exported from
 /// where it lives beside the pattern language it bounds
@@ -393,13 +416,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // Absent `MaxResults`, page at the largest value the model accepts for it
-        // (`CatalogGetterPageSize`, range 1..100). The clamp re-states that range in
-        // the handler so the page size is never 0 even if the boundary validator ever
-        // stops enforcing it.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
-            .unwrap_or(MAX_PAGE_SIZE as usize)
-            .clamp(1, MAX_PAGE_SIZE as usize);
+        // The page size: what the request asked for, else the page a request that names no
+        // size is served. A size below the modelled minimum names no servable page and is
+        // refused as this service's own input error; a size ABOVE the modelled maximum is
+        // served, because the service serves it.
+        let requested_page_size = input.max_results.unwrap_or(DEFAULT_PAGE_SIZE);
+        if requested_page_size < MIN_PAGE_SIZE {
+            return Err(GetTablesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::page_size_below_minimum(
+                        requested_page_size,
+                        MIN_PAGE_SIZE,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        let page_size = usize::try_from(requested_page_size).unwrap_or(usize::MAX);
 
         // The page is built under the store's guard and the guard released before KMS is
         // asked anything: the key material of the tables on the page travels out with it.
@@ -416,6 +450,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+
+            // The tables of a FEDERATED database are held by the source that database
+            // points at, not by the catalog, so the listing is answered by that source —
+            // and no such source can be reached from here
+            // (`crate::state::federated_source_refusal`).
+            if let Some(message) = crate::state::federated_source_refusal(database) {
+                return Err(GetTablesErrorModeled::FederationSourceRetryableException(
+                    FederationSourceRetryableException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
 
             let matching: Vec<&crate::state::TableEntry> = database
                 .tables_ordered()

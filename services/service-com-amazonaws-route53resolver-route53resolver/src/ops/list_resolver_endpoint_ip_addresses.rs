@@ -214,8 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListResolverEndpointIpAddressesOutput {
             next_token: page.next_token,
-            // "The value that you specified for MaxResults in the request."
-            max_results: input.max_results,
+            // "The value that you specified for MaxResults in the request",
+            // reported as the page size this answer was cut to: for a request
+            // that named none that is the documented default, "If you don't
+            // specify a value for MaxResults, Resolver returns up to 100 IP
+            // addresses".
+            max_results: Some(page.max_results),
             ip_addresses: Some(page.items),
         })
     }

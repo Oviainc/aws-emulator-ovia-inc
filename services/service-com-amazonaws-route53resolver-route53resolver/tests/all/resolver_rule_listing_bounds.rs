@@ -21,11 +21,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::{
-    MAX_FILTERS, MAX_FILTER_VALUES,
+    DEFAULT_PAGE_SIZE, MAX_FILTERS, MAX_FILTER_VALUES,
 };
-use smithy_server_runtime::MultiServiceRouter;
-
-use super::harness::{call, emulator, error_type, ok, string_member};
+use super::harness::{call, emulator, error_type, ok, string_member, Emulator};
 use super::resolver_rule_deletion::{forward_rule, outbound_endpoint};
 use super::resolver_rules::listed_ids;
 
@@ -36,7 +34,7 @@ const MAX_RESULTS_BOUNDS: (i64, i64) = (1, 100);
 
 /// Create `count` FORWARD rules through one endpoint and return their `Id`s in
 /// creation order.
-async fn seed(router: &MultiServiceRouter, prefix: &str, count: usize) -> Vec<String> {
+async fn seed(router: &Emulator, prefix: &str, count: usize) -> Vec<String> {
     let endpoint = outbound_endpoint(router, &format!("ep-{prefix}")).await;
     let mut ids = Vec::new();
     for index in 0..count {
@@ -89,26 +87,30 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 }
 
 /// A request that names no `MaxResults` is answered with the whole collection in
-/// one page — "If you don't specify a value for MaxResults, Resolver returns up
-/// to 100 Resolver rules" — and the response echoes `MaxResults` only when the
-/// request carried one, because the member is "the value that you specified for
-/// MaxResults in the request".
+/// one page, and the response reports the page size that was applied: the value
+/// the request named, or the documented default when it named none — "If you
+/// don't specify a value for MaxResults, Resolver returns up to 100 Resolver
+/// rules".
 #[tokio::test]
-async fn max_results_is_echoed_only_when_the_request_names_one() {
+async fn max_results_reports_the_page_size_applied() {
     let router = emulator();
     let ids = seed(&router, "echo", 4).await;
 
-    for (case, request, echoed) in [
-        ("MaxResults omitted", json!({}), None),
+    for (case, request, reported) in [
+        (
+            "MaxResults omitted",
+            json!({}),
+            i64::try_from(DEFAULT_PAGE_SIZE).expect("the default page size fits in an i64"),
+        ),
         (
             "MaxResults at the published maximum",
             json!({ "MaxResults": MAX_RESULTS_BOUNDS.1 }),
-            Some(MAX_RESULTS_BOUNDS.1),
+            MAX_RESULTS_BOUNDS.1,
         ),
         (
             "MaxResults larger than the collection",
             json!({ "MaxResults": 5 }),
-            Some(5),
+            5,
         ),
     ] {
         let listed = ok(&router, "ListResolverRules", request).await;
@@ -119,8 +121,8 @@ async fn max_results_is_echoed_only_when_the_request_names_one() {
         );
         assert_eq!(
             listed.get("MaxResults").and_then(Value::as_i64),
-            echoed,
-            "case {case:?}: expected MaxResults {echoed:?}, got {listed}"
+            Some(reported),
+            "case {case:?}: expected MaxResults {reported}, got {listed}"
         );
         assert_eq!(
             listed.get("NextToken"),
