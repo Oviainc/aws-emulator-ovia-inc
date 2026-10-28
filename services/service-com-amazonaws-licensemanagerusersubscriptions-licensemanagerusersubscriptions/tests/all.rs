@@ -61,6 +61,8 @@ mod resource_resolution_refusals;
 mod settings_network_resolution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subscription_product_names_the_subscription.rs"]
+mod subscription_product_names_the_subscription;
 #[path = "all/tag_validation.rs"]
 mod tag_validation;
 #[path = "all/update_settings_network_propagation.rs"]
