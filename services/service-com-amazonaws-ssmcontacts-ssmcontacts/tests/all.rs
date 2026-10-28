@@ -85,6 +85,8 @@ mod rotation_overrides;
 mod rotation_reads;
 #[path = "all/rotation_start_time.rs"]
 mod rotation_start_time;
+#[path = "all/rotation_time_zone.rs"]
+mod rotation_time_zone;
 #[path = "all/rotation_updates.rs"]
 mod rotation_updates;
 #[path = "all/start_engagement.rs"]
