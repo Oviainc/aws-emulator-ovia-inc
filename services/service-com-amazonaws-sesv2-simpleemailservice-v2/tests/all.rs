@@ -69,6 +69,8 @@ mod email_identity_mail_from_attributes;
 mod email_identity_policies;
 #[path = "all/email_identity_verification_info.rs"]
 mod email_identity_verification_info;
+#[path = "all/email_template_updates.rs"]
+mod email_template_updates;
 #[path = "all/email_templates.rs"]
 mod email_templates;
 #[path = "all/export_jobs.rs"]
