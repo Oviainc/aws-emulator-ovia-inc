@@ -480,6 +480,23 @@ pub fn first_class_parameters(parameters: &BTreeMap<String, String>) -> HashMap<
 pub const NO_DEPLOYMENT_TARGET_MESSAGE: &str =
     "Either TargetAccounts or TargetOrganizationalUnits must be defined in parameters.";
 
+/// Why a configuration definition whose parameters name no Region to deploy into is
+/// refused.
+///
+/// `ConfigurationDefinitionInput$Parameters` documents one parameter table per
+/// configuration type, and those tables mark [`PARAMETER_TARGET_REGIONS`]
+/// `(Required)` — in deliberate contrast to the two
+/// target keys beside it, which the same tables mark optional and require only one of
+/// (`smithy_query(query="doc", shape="ConfigurationDefinitionInput",
+/// member="Parameters")`). A definition is deployed into the Regions it names and into
+/// no others, so a parameter set naming none names nowhere to deploy.
+///
+/// Worded the way this service words [`NO_DEPLOYMENT_TARGET_MESSAGE`], the other
+/// refusal of a parameter map that leaves out what it must provide, and naming the
+/// parameter that is missing. It carries no value of the request: one definition either
+/// names the Regions to deploy into or it does not.
+pub const NO_DEPLOYMENT_REGION_MESSAGE: &str = "TargetRegions must be defined in parameters.";
+
 /// How many account-and-Region deployments ONE configuration definition may fan out
 /// to.
 ///
@@ -602,20 +619,19 @@ fn deployment_target_parameters<P: ConfigurationParameters + ?Sized>(
 /// A Quick Setup configuration definition names where it is deployed through its
 /// parameters, and the service deploys one configuration per targeted account and
 /// Region, which is what that configuration reports as the account and Region it was
-/// deployed in. A definition naming no Region is deployed in the Region of the
-/// manager that owns it, and one naming no account is deployed in `local_account` —
-/// the single account this emulator serves, which is also the only account the
-/// organizational units a definition may target instead could resolve to here.
+/// deployed in. The Regions are exactly the ones the definition's
+/// [`PARAMETER_TARGET_REGIONS`] names — nothing stands in for a Region a definition
+/// never asked for, so a parameter set naming none is deployed nowhere at all, which
+/// is what [`deployment_targets_rejection`] refuses before any of it is stored. One
+/// naming no account is deployed in `local_account` — the single account this emulator
+/// serves, which is also the only account the organizational units a definition may
+/// target instead could resolve to here.
 pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
     parameters: &P,
     local_account: &str,
-    local_region: &str,
 ) -> Vec<DeploymentTarget> {
     let targets = deployment_target_parameters(parameters);
-    let mut regions = comma_separated(targets.regions);
-    if regions.is_empty() {
-        regions.push(local_region.to_string());
-    }
+    let regions = comma_separated(targets.regions);
     let mut accounts = comma_separated(targets.accounts);
     if accounts.is_empty() {
         accounts.push(local_account.to_string());
@@ -635,21 +651,22 @@ pub fn deployment_targets<P: ConfigurationParameters + ?Sized>(
 /// served, or `None` when they can.
 ///
 /// `ConfigurationParametersMap` bounds each key and value but says nothing about what
-/// a value means, so these rules live here: a parameter set must name somewhere to
-/// deploy to ([`NO_DEPLOYMENT_TARGET_MESSAGE`]), a targeted account is named by its
-/// account id, and the number of account-and-Region deployments one definition fans out
-/// to is bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a
-/// create and an update refuse the same target sets — and, counting the deployments
+/// a value means, so these rules live here: a parameter set must provide every
+/// parameter the documented parameter tables require of it — somewhere to deploy to
+/// ([`NO_DEPLOYMENT_TARGET_MESSAGE`]) and the Regions to deploy into
+/// ([`NO_DEPLOYMENT_REGION_MESSAGE`]) — a targeted account is named by its account id,
+/// and the number of account-and-Region deployments one definition fans out to is
+/// bounded by [`MAX_DEPLOYMENT_TARGETS`]. The one place the rule lives, so a create and
+/// an update refuse the same target sets — and, counting the deployments
 /// [`deployment_targets`] would build from the same parameters, with the same
-/// `local_account` and `local_region` defaults a definition naming no account or no
-/// Region is deployed in, refuse exactly the sets that cannot be deployed. `member`
-/// labels the request member the parameters arrived on, so a refusal stating one of
-/// this service's own bounds names what the caller sent.
+/// `local_account` default a definition naming no account is deployed in, refuse exactly
+/// the sets that cannot be deployed. `member` labels the request member the parameters
+/// arrived on, so a refusal stating one of this service's own bounds names what the
+/// caller sent.
 pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
     member: &str,
     parameters: &P,
     local_account: &str,
-    local_region: &str,
 ) -> Option<String> {
     let target_parameters = deployment_target_parameters(parameters);
     let accounts = comma_separated(target_parameters.accounts);
@@ -660,6 +677,13 @@ pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
     let organizational_units = comma_separated(target_parameters.organizational_units);
     if accounts.is_empty() && organizational_units.is_empty() {
         return Some(NO_DEPLOYMENT_TARGET_MESSAGE.to_string());
+    }
+    // The Regions a definition deploys into are required of every configuration type
+    // the service offers, and a key written with no entries provides none, so a
+    // parameter set that leaves them out is refused rather than deployed into a Region
+    // the caller never named.
+    if comma_separated(target_parameters.regions).is_empty() {
+        return Some(NO_DEPLOYMENT_REGION_MESSAGE.to_string());
     }
     if let Some(malformed) = accounts.iter().find(|account| {
         account.len() != ACCOUNT_ID_DIGITS || !account.bytes().all(|b| b.is_ascii_digit())
@@ -673,7 +697,7 @@ pub fn deployment_targets_rejection<P: ConfigurationParameters + ?Sized>(
     // The bound is read off the deployments themselves rather than off a formula over
     // the parameter values, so what is counted here is exactly what the definition is
     // deployed to: whatever a parameter set fans out to, it fans out to that here too.
-    let targets = deployment_targets(parameters, local_account, local_region).len();
+    let targets = deployment_targets(parameters, local_account).len();
     (targets > MAX_DEPLOYMENT_TARGETS).then(|| {
         format!(
             "{member} names {targets} account and Region deployments, more than the \
