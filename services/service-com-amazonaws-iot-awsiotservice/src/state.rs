@@ -549,6 +549,13 @@ impl ComAmazonawsIotAwsiotserviceState {
 
     /// The endpoint identifier for `region`, creating and recording it on the first
     /// call — the "returns or creates" half of `DescribeEndpoint`.
+    ///
+    /// The region is caller-influenced (it comes from the request's SigV4 credential
+    /// scope), so the number of records this can create is CAPPED at
+    /// [`MAX_ENDPOINT_REGIONS`]: past the cap the identifier is still answered and
+    /// nothing is recorded, so the store cannot grow without bound. That costs nothing
+    /// observable, because the identifier is a pure function of the account and the
+    /// region ([`derive_endpoint_identifier`]) and every later call derives the same one.
     pub fn endpoint_identifier_or_create(&mut self, account_id: &str, region: &str) -> String {
         if let Some(created) = self.endpoint_identifiers.get(region) {
             return created.clone();
@@ -586,6 +593,24 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// Longest request-derived value one audit field carries.
+///
+/// A value read off the request — the access key id a caller presented, the request
+/// target — is caller-controlled, so an unbounded echo would let one request emit an
+/// arbitrarily long record.
+pub(crate) const MAX_AUDIT_FIELD: usize = 128;
+
+/// A request-derived value as it may appear in an audit record: control characters
+/// (above all CR and LF, which would forge a second record) replaced, and the whole
+/// thing bounded by [`MAX_AUDIT_FIELD`] on a character boundary.
+pub(crate) fn audit_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .take(MAX_AUDIT_FIELD)
+        .collect()
 }
 
 /// The ARN of a thing: `arn:aws:iot:<region>:<account>:thing/<thingName>`.

@@ -51,6 +51,8 @@ mod thing_group_hierarchy;
 mod thing_listing;
 #[path = "all/thing_registry_lifecycle.rs"]
 mod thing_registry_lifecycle;
+#[path = "all/topic_rule_deletion.rs"]
+mod topic_rule_deletion;
 #[path = "all/topic_rule_enablement.rs"]
 mod topic_rule_enablement;
 #[path = "all/topic_rule_listing.rs"]

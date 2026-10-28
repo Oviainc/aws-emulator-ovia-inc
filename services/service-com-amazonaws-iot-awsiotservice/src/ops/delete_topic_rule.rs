@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTopicRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTopicRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTopicRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the rule the store holds under the requested name, so every later reader of
+//! the rules store stops reporting it: `GetTopicRule` of that name refuses,
+//! `ListTopicRules` no longer carries it, and a later `CreateTopicRule` may take the
+//! name again.
+//!
+//! The name is the rule's identity and its key in the store, so the removal of that one
+//! record is the whole operation. A name the store does not hold is NOT refused: the
+//! operation models no not-found error at all, and what the call asks for — that the
+//! account hold no rule under that name — already holds, so the delete has nothing to
+//! report. A reader that owes a rule has to refuse when there is none; a delete owes
+//! nothing, which is what makes it idempotent.
+//!
+//! Whether the caller MAY delete the rule is not decided here, and deliberately so:
+//! this emulator evaluates no permissions for any operation, so the modelled
+//! `UnauthorizedException` is unreachable from this handler and the only failure it
+//! answers is the store being unreachable. A caller's own permissions are therefore
+//! not something a test against this emulator can conclude anything about.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +137,34 @@ impl From<DeleteTopicRuleErrorModeled> for DeleteTopicRuleError {
     }
 }
 
+/// Record this state-changing call for attribution: the operation, the identity the
+/// request PRESENTED (the SigV4 access key id, a public identifier and never a
+/// secret), the request target, the rule the call named and how the call ended.
+///
+/// A delete is the one call that makes a rule stop existing, so without a record
+/// nothing about it is observable afterwards — the rule it removed is gone. Every
+/// request-derived field goes through [`crate::state::audit_field`], which bounds it
+/// and strips the control characters that would otherwise forge a second record; the
+/// subscriber supplies the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    rule_name: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteTopicRule",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        rule_name = %crate::state::audit_field(rule_name),
+        outcome,
+        "state-changing operation"
+    );
+}
+
 /// The `DeleteTopicRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +201,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTopicRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTopicRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTopicRuleErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // "Deletes the rule": the rule's name is its identity and its key in the rules
+        // store, so deleting it is removing that one record. Nothing else the store
+        // holds refers to a rule, so the removal is the whole write — and a rule that
+        // is gone is gone for every reader of the store, not merely flagged.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTopicRule"))
+        // A name the store does not hold removes nothing and still succeeds: this
+        // operation models no not-found error (only
+        // `ConflictingResourceUpdateException`, `InternalException`,
+        // `InvalidRequestException`, `ServiceUnavailableException` and
+        // `UnauthorizedException`), and the state the call asks for already holds, so a
+        // repeat of a delete — or a delete of a name nobody created — is the same
+        // answer as the first one and leaves every other rule exactly as it was.
+        // The rule is addressed by NAME alone — nothing about the request's region
+        // takes part in a delete, because the name is the rule's key in the store — so
+        // the removal below is the whole write.
+        let removed = store.topic_rules.remove(&input.rule_name).is_some();
+        drop(store);
+
+        // What the call DID, which is the one thing a later reader of the store cannot
+        // recover: a removed rule leaves nothing behind to be read.
+        audit(
+            ctx,
+            &input.rule_name,
+            if removed { "deleted" } else { "no-such-rule" },
+        );
+
+        // `DeleteTopicRule`'s output shape is `Unit`: a successful delete reports no
+        // members at all, and that the rule is gone is read back through
+        // `GetTopicRule` and `ListTopicRules`.
+        Ok(DeleteTopicRuleOutput)
     }
 }

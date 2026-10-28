@@ -215,24 +215,6 @@ fn endpoint_region(parts: &::http::request::Parts) -> String {
     }
 }
 
-/// Longest request-derived value one audit field carries.
-///
-/// The access key id, the request target and the requested endpoint type are all
-/// caller-controlled, so an unbounded echo would let one request emit an
-/// arbitrarily long log line.
-const MAX_AUDIT_FIELD: usize = 128;
-
-/// A request-derived value as it may appear in an audit record: control characters
-/// (above all CR and LF, which would forge a second record) replaced, and the whole
-/// thing bounded by [`MAX_AUDIT_FIELD`] on a character boundary.
-fn audit_field(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| if c.is_control() { '.' } else { c })
-        .take(MAX_AUDIT_FIELD)
-        .collect()
-}
-
 /// Emit the structured access record for one `DescribeEndpoint` call.
 ///
 /// Called on EVERY branch this handler returns from, because one of them creates
@@ -252,9 +234,10 @@ fn audit(
         target: "emulator::audit",
         service = ctx.identity().signing_name(),
         operation = "DescribeEndpoint",
-        access_key_id = %audit_field(&::engine::extract_akid(&parts.headers)),
-        request_target = %audit_field(&format!("{} {}", parts.method, parts.uri.path())),
-        endpoint_type = %audit_field(endpoint_type.unwrap_or("")),
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        endpoint_type = %crate::state::audit_field(endpoint_type.unwrap_or("")),
         outcome,
         "iot api call"
     );
@@ -344,6 +327,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint identifier and records it, every later call answers from that
         // record, so all of this account's endpoint addresses share one prefix and
         // repeating the call returns the same endpoint.
+        //
+        // The region is read from the caller's credential scope, so the set of keys the
+        // record store is grown by is client-influenced, and that store is BOUNDED:
+        // `endpoint_identifier_or_create` records at most
+        // `crate::state::MAX_ENDPOINT_REGIONS` regions and records nothing past that
+        // cap, so no sequence of requests can grow this service's state without limit by
+        // varying the signed region. Answering past the cap costs nothing observable:
+        // the identifier is a pure function of the account and the region
+        // (`crate::state::derive_endpoint_identifier`), so the address a caller is told
+        // never depends on whether a record for it fit.
         let (identifier, created) = {
             let mut store = state.lock();
             let already_created = store.endpoint_identifier(&region).is_some();
