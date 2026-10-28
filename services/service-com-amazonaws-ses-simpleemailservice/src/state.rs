@@ -973,6 +973,23 @@ impl ReceiptRuleSet {
         self.rules.insert(at.min(self.rules.len()), rule);
         true
     }
+
+    /// Take the rule named `name` out of this set, and say whether a rule was
+    /// taken out.
+    ///
+    /// The rules that sat after it close up, so the order the rules this set
+    /// keeps are evaluated in is unchanged. `false`, having changed nothing, when
+    /// the set holds no rule of that name — which the deleting operation, modelling
+    /// no not-found error for a rule, answers as the state the caller asked for.
+    pub fn remove_rule(&mut self, name: &str) -> bool {
+        match self.rule_position(name) {
+            Some(at) => {
+                self.rules.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// One custom verification email template in the account's store.

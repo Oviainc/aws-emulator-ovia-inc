@@ -250,6 +250,28 @@ pub(crate) fn deploy_stage(name: &str, input: &str, bucket: &str, key: &str, ext
     })
 }
 
+/// The id of the execution a pipeline's own CREATION started.
+///
+/// Creating a pipeline runs it once — `TriggerType` carries `CreatePipeline` for
+/// exactly that run — so a pipeline has an execution before anything starts one, and
+/// this is how a suite names it.
+///
+/// `pub(crate)` with the harness: the suites that drive one execution of a freshly
+/// created pipeline drive THAT run rather than growing a second copy of this lookup.
+pub(crate) async fn creation_run(emulator: &Emulator, pipeline: &str) -> String {
+    let listed = emulator
+        .ok("ListPipelineExecutions", &json!({"pipelineName": pipeline}))
+        .await;
+    listed["pipelineExecutionSummaries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|summary| summary["trigger"]["triggerType"] == json!("CreatePipeline"))
+        .and_then(|summary| summary["pipelineExecutionId"].as_str())
+        .unwrap_or_else(|| panic!("creating {pipeline} ran it once, got {listed}"))
+        .to_string()
+}
+
 /// Poll `GetPipelineExecution` until the execution reaches a terminal status.
 pub(crate) async fn wait_for_terminal(emulator: &Emulator, pipeline: &str, execution: &str) -> Value {
     let deadline = Instant::now() + WAIT;
@@ -523,10 +545,9 @@ async fn an_approval_action_holds_its_stage_until_the_token_is_answered() {
             ),
         )
         .await;
-    let started = emulator
-        .ok("StartPipelineExecution", &json!({"name": pipeline}))
-        .await;
-    let execution = started["pipelineExecutionId"].as_str().unwrap().to_string();
+    // The execution under test is the one the pipeline's creation started: creating a
+    // pipeline runs it once, and that run is what reaches the approval action.
+    let execution = creation_run(&emulator, pipeline).await;
 
     // The approval token is published only once the action is REACHED.
     let deadline = Instant::now() + WAIT;
@@ -660,10 +681,8 @@ async fn a_rejected_approval_fails_the_execution_and_withholds_the_downstream_st
             ),
         )
         .await;
-    let started = emulator
-        .ok("StartPipelineExecution", &json!({"name": pipeline}))
-        .await;
-    let execution = started["pipelineExecutionId"].as_str().unwrap().to_string();
+    // Again the creation run is the execution under test, for the same reason.
+    let execution = creation_run(&emulator, pipeline).await;
 
     let deadline = Instant::now() + WAIT;
     let mut token = None;

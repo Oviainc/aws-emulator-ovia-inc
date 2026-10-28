@@ -17,6 +17,8 @@ mod asset_processing_configuration;
 mod control_plane_reference_resolution;
 #[path = "all/data_automation_invocations.rs"]
 mod data_automation_invocations;
+#[path = "all/refusal_echoes_no_request_value.rs"]
+mod refusal_echoes_no_request_value;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

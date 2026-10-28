@@ -179,7 +179,7 @@ pub(crate) fn error_code(response: &http::Response<Bytes>) -> String {
         .to_string()
 }
 
-fn header(response: &http::Response<Bytes>, name: &str) -> String {
+pub(crate) fn header(response: &http::Response<Bytes>, name: &str) -> String {
     response
         .headers()
         .get(name)

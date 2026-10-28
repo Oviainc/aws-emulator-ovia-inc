@@ -186,7 +186,9 @@ async fn reported_revisions_fill_the_slots_of_a_pipeline_whose_source_is_readabl
         )
         .await;
 
-    for index in 0..MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE {
+    // One slot is already taken by the run the pipeline's creation started, so the
+    // reports that fit inside the bound are one fewer than the bound.
+    for index in 0..MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE - 1 {
         let (status, answered) = put_revision(&emulator, "holding", &format!("rev-{index}")).await;
         assert_eq!(
             (status, answered["newRevision"].clone()),
@@ -252,7 +254,9 @@ async fn executions_that_wait_fill_the_pipelines_slots() {
         )
         .await;
 
-    for index in 0..MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE {
+    // One slot is already taken by the run the pipeline's creation started, so the
+    // reports that fit inside the bound are one fewer than the bound.
+    for index in 0..MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE - 1 {
         let (status, answered) = put_revision(&emulator, "waiting", &format!("rev-{index}")).await;
         assert_eq!(
             status, 200,

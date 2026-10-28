@@ -2371,6 +2371,14 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // own Smithy model) — a generated name is already inside that character set, since
         // letters, digits and the hyphen are all admitted, but may be longer than the bound.
         SES_CONFIGURATION_SET => rules(64, Characters::AsGenerated),
+        // Amazon SES `CreateReceiptRuleSet.RuleSetName` and `CreateReceiptRule.Rule.Name`:
+        // each member's own rule is "Contain only ASCII letters (a-z, A-Z), numbers (0-9),
+        // underscores (_), or dashes (-)" (a rule's name admits periods too), "Start and end
+        // with a letter or number" and "Contain 64 characters or fewer"
+        // (`ReceiptRuleSetName` and `ReceiptRule$Name`, Amazon SES's own Smithy model) — a
+        // generated name is already inside both character sets and starts and ends with one
+        // of their characters, but may be longer than the bound.
+        SES_RECEIPT_RULE_SET | SES_RECEIPT_RULE => rules(64, Characters::AsGenerated),
         // Amazon ECS `CreateCluster.clusterName`: "Up to 255 letters (uppercase and
         // lowercase), numbers, underscores, and hyphens are allowed" (Amazon ECS API
         // reference) — ECS's model carries no `@length` for it.
@@ -2744,6 +2752,10 @@ fn declared_name_property(resource_type: &str) -> Option<&'static str> {
         // `DomainName`, so neither `DomainNameName` nor `Name` finds it.
         APIGATEWAYV2_DOMAIN_NAME => Some("DomainName"),
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
+        // Amazon SES's `CreateReceiptRuleSet` takes a `RuleSetName` — "Ref returns the rule
+        // set name" — so the type publishes `RuleSetName`; the type's last segment is
+        // `ReceiptRuleSet`, so neither `ReceiptRuleSetName` nor `Name` finds it.
+        SES_RECEIPT_RULE_SET => Some("RuleSetName"),
         // Amazon Redshift's `CreateCluster` takes a `ClusterIdentifier` — "You use this
         // identifier to refer to the cluster for any subsequent cluster operations" — so
         // the type publishes `ClusterIdentifier`; the type's last segment is `Cluster`, so
@@ -4235,6 +4247,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // id EC2 minted.
         || resource_type == EC2_VPC
         || resource_type == EC2_SUBNET
+        // An Amazon SES receipt rule is one more, for the same reason read from the other
+        // side: "Ref returns the receipt rule name", and a declaration states that name
+        // inside the type's `Rule` property rather than through a name property of its own,
+        // so the naming rules here cannot reach it. The create is what answers the name the
+        // rule was created under, and the record keeps it — a re-deploy of the same template
+        // then sees the rule the stack already has rather than one to create again.
+        || resource_type == SES_RECEIPT_RULE
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -4424,6 +4443,28 @@ pub const SNS_SUBSCRIPTION: &str = "AWS::SNS::Subscription";
 /// `DescribeConfigurationSet` and `DeleteConfigurationSet` alike). The type publishes no
 /// `Fn::GetAtt` attribute, so it carries no entry in [`published_attribute_names`] either.
 pub const SES_CONFIGURATION_SET: &str = "AWS::SES::ConfigurationSet";
+
+/// An Amazon SES receipt rule set's resource type, under the same namespace. This is the
+/// type `super::provisioning` creates in Amazon SES itself, through that service's own
+/// `CreateReceiptRuleSet`.
+///
+/// It carries NO [`return_values`] arm either, so its physical resource id is the set's
+/// NAME — that type's published return value ("Ref returns the rule set name") and the
+/// identifier every operation of the owning service addresses a receipt rule set by
+/// (`RuleSetName`, on `DescribeReceiptRuleSet`, `SetActiveReceiptRuleSet` and
+/// `DeleteReceiptRuleSet` alike). The name property it is read from is unconventional, so
+/// the type is registered in [`declared_name_property`].
+pub const SES_RECEIPT_RULE_SET: &str = "AWS::SES::ReceiptRuleSet";
+
+/// One receipt rule OF such a set, under the same namespace: the type a template declares a
+/// rule of a rule set with, created through the owning service's own `CreateReceiptRule`.
+///
+/// Its published return value is the RULE's name ("Ref returns the receipt rule name"),
+/// which a declaration states INSIDE the type's `Rule` property rather than through a name
+/// property of its own — so no naming rule here computes it and
+/// [`identity_is_service_assigned`] names this type: the identifier in force is the one the
+/// create answered with.
+pub const SES_RECEIPT_RULE: &str = "AWS::SES::ReceiptRule";
 
 /// The `AWS::ECR::PublicRepository` resource type: an Amazon ECR Public repository.
 ///

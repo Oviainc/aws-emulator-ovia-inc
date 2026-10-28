@@ -882,6 +882,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-codecommit"
+version = "1.121.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2d7b742b1d4c6dd32a8674f382c1e96ad47d9f94da97cf576b36f828dbf342b"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-directconnect"
 version = "1.125.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7679,17 +7702,22 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-codecommit",
  "aws-sdk-iam",
+ "aws-sdk-lambda",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bytes",
  "hex",
  "http",
  "serde_json",
  "serde_json_path",
+ "service-com-amazonaws-codecommit-codecommit-20150413",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-s3-amazons3",
  "service-common",
  "sha2 0.10.9",

@@ -18,6 +18,11 @@ service-common = { path = "../common" }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The IAM client CreatePipeline checks the declaration's roleArn against.
 aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The CodeCommit client a CodeCommit source action resolves its branch tip and reads the
+# revision's files with, over the same in-process callback.
+aws-sdk-codecommit = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Lambda client an invoke action performs its work with, over the same callback.
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Reader for the artifact archive an S3 deploy action with Extract=true unzips.
 # Pinned to 9.x: RUSTSEC-2026-0368 affects every earlier release.
 #
@@ -52,10 +57,16 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
-# The execution tests mount S3 and IAM beside codepipeline on one engine, because the
-# execution engine moves artifacts through S3 and CreatePipeline checks the role in IAM.
+# The Lambda deployment package and the CodeCommit file content a test uploads are
+# blobs, which the JSON wire form carries base64-encoded.
+base64 = "0.22"
+# The execution tests mount S3, IAM, CodeCommit and Lambda beside codepipeline on one
+# engine, because the execution engine performs its actions' work through them and
+# CreatePipeline checks the role in IAM.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-codecommit-codecommit-20150413 = { workspace = true }
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]

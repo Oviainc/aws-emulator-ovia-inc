@@ -210,7 +210,11 @@ fn reported_parts(answer: &Answer) -> usize {
 ///
 /// The tag is written out exactly as the pair carries it, so a case can name it with the
 /// double quotes S3 wraps a tag in or without them — both name the same part.
-fn completion_payload(parts: &[(i32, String)]) -> String {
+///
+/// `pub(crate)`: the multipart notification suite
+/// ([`super::multipart_upload_event_notifications`]) completes its uploads with the same
+/// payload rather than keeping a second copy of the parts list.
+pub(crate) fn completion_payload(parts: &[(i32, String)]) -> String {
     let mut payload = String::from("<CompleteMultipartUpload>");
     for (part_number, etag) in parts {
         payload.push_str(&format!(
@@ -227,7 +231,11 @@ fn completion_payload(parts: &[(i32, String)]) -> String {
 /// then calculates the MD5 digest of these concatenated values", with "a dash with the total
 /// number of parts" appended. Computed here from the part bytes alone, in ascending
 /// part-number order.
-fn expected_multipart_etag(parts: &[Vec<u8>]) -> String {
+///
+/// `pub(crate)`: the multipart notification suite
+/// ([`super::multipart_upload_event_notifications`]) judges the entity tag a delivered
+/// record reports against the same derivation, rather than keeping a second copy of it.
+pub(crate) fn expected_multipart_etag(parts: &[Vec<u8>]) -> String {
     let mut digest = Md5::new();
     for part in parts {
         digest.update(Md5::digest(part));

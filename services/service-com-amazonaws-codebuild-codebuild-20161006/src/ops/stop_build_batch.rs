@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopBuildBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopBuildBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopBuildBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops a stored batch build that is still running: this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +130,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopBuildBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopBuildBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopBuildBatch"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StopBuildBatch (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let now = crate::state::now_millis();
+        let mut guard = state.lock();
+
+        let Some(stored) = guard.build_batches.get_mut(&input.id) else {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            return Err(StopBuildBatchErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The absent resource is named by the id the request gave, exactly
+                    // as given — the way `crate::ops::stop_build` names the build this
+                    // operation's sibling holds no record of, with this operation's own
+                    // resource kind.
+                    message: Some(format!("Build batch {} does not exist", input.id)),
+                },
+            )
+            .into());
+        };
+
+        // A batch build the clock already finished keeps the outcome it reached:
+        // stopping one is only possible while it is still running, which is
+        // `crate::ops::stop_build`'s rule for the single build.
+        stored.settle(now);
+        let stopped = !stored.build_batch.complete;
+        if stopped {
+            stored.build_batch.build_batch_status = Some("STOPPED".to_string());
+            stored.build_batch.current_phase = Some("STOPPED".to_string());
+            stored.build_batch.complete = true;
+            stored.build_batch.end_time = Some(crate::state::datetime(now));
+            stored.build_batch.phases =
+                Some(crate::state::stopped_batch_phases(stored.start_millis, now));
+        }
+        // The record this call leaves behind, so the answer and every later read
+        // report the same batch build.
+        let build_batch = stored.build_batch.clone();
+        drop(guard);
+
+        // The lock is dropped before the audit record is written, so a log consumer
+        // can never hold this service's state. Recorded the way
+        // `crate::ops::delete_build_batch` records the other call that ends a batch
+        // build's life: which operation changed what, and whether it changed anything
+        // at all.
+        if stopped {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::BuildBatchStopped,
+                Some(&input.id),
+            );
+        }
+
+        Ok(StopBuildBatchOutput {
+            build_batch: Some(build_batch),
+        })
     }
 }

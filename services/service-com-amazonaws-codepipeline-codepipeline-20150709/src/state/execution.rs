@@ -38,10 +38,18 @@
 //!   reads is the declaration's, under the key and at the version the start's
 //!   `SourceRevisionOverride`s pin for it ([`s3_source_pin`]), and at the object's
 //!   current version when nothing pinned one.
-//! * every other provider (CodeBuild, CloudFormation, Lambda, a custom job worker …)
-//!   is work this emulator cannot perform, so its action FAILS with a reason saying so
-//!   and the execution reaches `Failed`. Nothing is ever reported as having run when
-//!   nothing ran.
+//! * a `Source` action whose provider is `CodeCommit` resolves the branch its
+//!   configuration names to that branch's tip commit and writes the repository's files
+//!   at that commit into the artifact store, through in-process CodeCommit and S3
+//!   calls; the commit id is the revision the execution ran and the external execution
+//!   the action reports.
+//! * an action whose provider is `Lambda` performs its work by INVOKING the function
+//!   its configuration names, through an in-process Lambda call, and its outcome is
+//!   what that invocation answered.
+//! * every other provider (CodeBuild, CloudFormation, a custom job worker …) is work
+//!   this emulator cannot perform, so its action FAILS with a reason saying so and the
+//!   execution reaches `Failed`. Nothing is ever reported as having run when nothing
+//!   ran.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -119,6 +127,20 @@ pub const MAX_EXTRACTED_ENTRY_BYTES: usize = MAX_EXTRACTED_BYTES;
 /// could not be delivered anyway, and the expansion ratio over a 16 MiB artifact is
 /// therefore capped at 1:1 rather than at deflate's ~1000:1.
 pub const MAX_EXTRACTED_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most files one source repository's commit may carry into an artifact.
+///
+/// A source action packs the files of a commit, which is caller content: the count has
+/// to be bounded before any of it is read. The same figure as
+/// [`MAX_ARCHIVE_ENTRIES`], because what is packed here is what an extracting deploy
+/// action later unpacks. Past it the action fails with its reason instead of reading.
+pub const MAX_SOURCE_FILES: usize = MAX_ARCHIVE_ENTRIES;
+
+/// The most bytes one source repository's commit may carry into an artifact.
+///
+/// The same figure as [`MAX_EXTRACTED_BYTES`], for the same reason: the artifact is
+/// written to a bucket, so a commit larger than that budget could not be stored anyway.
+pub const MAX_SOURCE_BYTES: usize = MAX_EXTRACTED_BYTES;
 
 /// The `StageTransitionType` whose hold keeps an execution OUT of a stage.
 pub const TRANSITION_INBOUND: &str = "Inbound";
@@ -247,6 +269,12 @@ pub struct ActionRun {
     pub error: Option<(String, String)>,
     /// When the action's status last changed.
     pub last_status_change: SystemTime,
+    /// When the execution STARTED this action, or `None` while it has not reached it.
+    pub start_time: Option<SystemTime>,
+    /// The id of the run in the external system that performed this action's work,
+    /// when the work was performed by one: the commit a source action resolved, the
+    /// function an invoke action ran. `None` while nothing external has run.
+    pub external_execution_id: Option<String>,
 }
 
 impl ActionRun {
@@ -264,7 +292,7 @@ impl ActionRun {
                 last_status_change: Some(to_date_time(self.last_status_change)),
                 token: self.token.clone(),
                 last_updated_by: self.last_updated_by.clone(),
-                external_execution_id: None,
+                external_execution_id: self.external_execution_id.clone(),
                 external_execution_url: None,
                 percent_complete: None,
                 error_details: self.error.as_ref().map(|(code, message)| ErrorDetails {
@@ -419,6 +447,8 @@ fn plan_action(action: &ActionDeclaration, now: SystemTime) -> ActionRun {
         last_updated_by: None,
         error: None,
         last_status_change: now,
+        start_time: None,
+        external_execution_id: None,
     }
 }
 
@@ -677,6 +707,42 @@ pub enum Job {
         /// Where the produced artifacts are written.
         outputs: Vec<ArtifactRef>,
     },
+    /// A CodeCommit source action: resolve the branch's tip commit and write the
+    /// repository's files at that commit into the artifact store.
+    CodeCommitSource {
+        /// The execution the action belongs to.
+        execution_id: String,
+        /// The stage's index in the execution's plan.
+        stage: usize,
+        /// The action's index in that stage.
+        action: usize,
+        /// The repository the action's configuration names.
+        repository: String,
+        /// The branch whose tip the action reads.
+        branch: String,
+        /// Where the produced artifacts are written.
+        outputs: Vec<ArtifactRef>,
+    },
+    /// A Lambda action: invoke the function the action's configuration names, passing
+    /// it the job event CodePipeline publishes for such an action.
+    LambdaInvoke {
+        /// The execution the action belongs to.
+        execution_id: String,
+        /// The stage's index in the execution's plan.
+        stage: usize,
+        /// The action's index in that stage.
+        action: usize,
+        /// The function the action invokes.
+        function_name: String,
+        /// `UserParameters`, the configuration value the event carries verbatim.
+        user_parameters: Option<String>,
+        /// The id the job event publishes for this action's run.
+        job_id: String,
+        /// The artifacts the function is handed, by declared name.
+        inputs: Vec<(String, ArtifactRef)>,
+        /// The artifact locations the function is to write, by declared name.
+        outputs: Vec<(String, ArtifactRef)>,
+    },
     /// An S3 deploy action: read the input artifact, write the delivered object(s).
     S3Deploy {
         /// The execution the action belongs to.
@@ -709,6 +775,18 @@ impl Job {
                 action,
                 ..
             }
+            | Self::CodeCommitSource {
+                execution_id,
+                stage,
+                action,
+                ..
+            }
+            | Self::LambdaInvoke {
+                execution_id,
+                stage,
+                action,
+                ..
+            }
             | Self::S3Deploy {
                 execution_id,
                 stage,
@@ -730,6 +808,9 @@ pub enum JobOutcome {
         revision: Option<String>,
         /// The action's output variables, keyed by bare name.
         variables: BTreeMap<String, String>,
+        /// The id of the run in the external system that performed the work, when the
+        /// work ran in one.
+        external_id: Option<String>,
     },
     /// The work could not be performed: a `FailureType` and why.
     Failed {
@@ -737,5 +818,7 @@ pub enum JobOutcome {
         code: String,
         /// Why the action failed.
         message: String,
+        /// The id of the external run the work was attempted as, when it reached one.
+        external_id: Option<String>,
     },
 }

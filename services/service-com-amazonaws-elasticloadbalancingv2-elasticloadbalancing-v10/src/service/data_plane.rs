@@ -1,0 +1,1346 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The Application Load Balancer DATA plane: how a request a client addresses to a load
+//! balancer's own name is recognised, and how it is answered out of the listener
+//! configuration this service holds.
+//!
+//! A load balancer this service creates publishes the name a client sends traffic to —
+//! `LoadBalancer$DNSName`, "the public DNS name of the load balancer" — and that name is
+//! NOT this API's endpoint: its first label is the load balancer's own, so the emulator's
+//! front door can resolve no target service from such a request and answers `404
+//! UnknownService` for the one address this service told the caller to use. Nothing
+//! answered a load balancer's own traffic at all, so a client that polls it waits for an
+//! answer that never comes.
+//!
+//! What an Application Load Balancer answers is decided by the LISTENER the request
+//! reaches, out of records the control plane already holds: "rules are evaluated in
+//! priority order, from the lowest value to the highest value ... When the conditions for
+//! a rule are met, its actions are performed. If the conditions for no rules are met, the
+//! actions for the default rule are performed" (`CreateRule`), and a default rule's
+//! actions ARE its listener's `DefaultActions`. So this module is the second half of
+//! [`crate::service::EmulatedService`]: the claim ([`claims_parts`], read by
+//! `Service::can_handle`) and the serving ([`serve`], reached from
+//! `Service::override_routing_error`, which the router reaches BEFORE authentication —
+//! which is what lets a load balancer's own traffic, carrying no AWS credential, be
+//! answered at all).
+//!
+//! Every status, header and byte it answers is computed from what a create or a modify
+//! persisted, and it writes NOTHING: serving traffic moves no status, consumes no quota
+//! and bumps no counter.
+//!
+//! # What a request addresses, and how it is resolved
+//!
+//! A client on the machine this emulator runs on resolves a load balancer's DNS name
+//! nowhere at all, so three addressings resolve beside the published one. Each is checked
+//! against the records this service holds, so one request still has one claimant:
+//!
+//! * HOST-STYLE, the addressing `LoadBalancer$DNSName` publishes: the request's host IS
+//!   the DNS name of a load balancer this store holds, and the whole path is the request
+//!   path;
+//! * PREFIXED PATH-STYLE: the data plane is named by the reserved namespace segment
+//!   [`EMULATOR_PATH_NAMESPACE`] and [`DATA_PLANE_SEGMENT`], then the load balancer's DNS
+//!   name or its name, then the request path —
+//!   `/_aws/elasticloadbalancing/{dns-name-or-name}/{path}`. The segment begins with `_`,
+//!   which no modelled path segment of any service does, so the prefix collides with no
+//!   control-plane route;
+//! * PATH-STYLE: the load balancer's DNS name or name is the FIRST PATH SEGMENT and the
+//!   request path is what follows it, read only on a host that names NO service (the
+//!   emulator's own endpoint), so a first segment that happens to equal a load balancer's
+//!   name never takes a request away from the service its host names;
+//! * ENDPOINT-ONLY, for a client that carries the request path alone: on a host that names
+//!   no service, a store holding exactly ONE load balancer that serves HTTP has no other
+//!   load balancer the request could be meant for — and the path has to be one that load
+//!   balancer has a RULE written for, so a path it does not mention is left to whatever the
+//!   request was really addressed to rather than taken from another plane that reads a
+//!   host-independent addressing of its own. With more than one load balancer, or a path no
+//!   rule matches, the request must say which — by host, by prefix or by first segment.
+//!
+//! The last two are read only for a request that presents none of what an AWS API call
+//! presents ([`AWS_API_CALL_HEADERS`], [`AWS_API_CALL_QUERY_PARAMETERS`]): a signed or
+//! presigned call on the emulator's own endpoint is a control-plane request, and this plane
+//! never takes one.
+//!
+//! # What it performs, and what it answers instead
+//!
+//! A `fixed-response` action is answered in full — its status code, its content type and
+//! its message body are the response — and so is a `redirect`, whose `Location` is built
+//! by substituting the request's own components into the placeholders the action carries.
+//!
+//! A `forward` names targets this emulator has no server behind: a registered target is an
+//! instance id or an address, and nothing in this emulator listens on it. Neither a body
+//! nor a status is invented for a backend that never ran, so a forward is answered the way
+//! a load balancer answers those two conditions — [`NO_HEALTHY_TARGET_STATUS`] when the
+//! group has no healthy target to send the request to, and [`TARGET_UNREACHABLE_STATUS`]
+//! when it has one and the connection to it cannot be made.
+//!
+//! An `authenticate-oidc`, `authenticate-cognito` or `jwt-validation` action needs the
+//! identity provider it names, and this emulator makes no outbound connection to one, so
+//! such a rule is answered [`ACTION_NOT_PERFORMED_STATUS`] rather than by letting an
+//! unauthenticated request through to the action behind it. What AWS answers an
+//! unauthenticated client — a 302 to the action's own authorization endpoint — is NOT
+//! rendered: the client would be sent to a provider this emulator cannot reach, and the
+//! session cookie it would come back with is one nothing here can issue, so the redirect
+//! would only move the failure one hop away from its cause.
+
+use std::time::SystemTime;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
+use smithy_server_runtime::http;
+
+use crate::ops::types::{Action, RuleCondition};
+use crate::state::{
+    service_state, ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState,
+    ListenerRecord, LoadBalancerFamily, LoadBalancerRecord,
+};
+// How a client ADDRESSES a data plane, from the one reading of it in the tree: the
+// reserved path namespace, the first path segment, the host without its port, the port a
+// client addressed, and whether a host names a service at all.
+use ::service_common::data_plane_addressing::{
+    addressed_port, first_segment, host_only, names_a_service, EMULATOR_PATH_NAMESPACE,
+};
+
+/// The segment that names THIS service's data plane behind [`EMULATOR_PATH_NAMESPACE`]:
+/// the `arnNamespace`/`endpointPrefix` both Elastic Load Balancing models publish.
+const DATA_PLANE_SEGMENT: &str = "elasticloadbalancing";
+
+/// The protocols whose listeners have rules to evaluate and a response to render — the
+/// two `ProtocolEnum` values an Application Load Balancer's listeners carry.
+const HTTP_PROTOCOLS: &[&str] = &["HTTP", "HTTPS"];
+
+/// The `RuleCondition$Field` values this plane matches on, from that member's own list.
+const PATH_PATTERN_FIELD: &str = "path-pattern";
+const HOST_HEADER_FIELD: &str = "host-header";
+const HTTP_REQUEST_METHOD_FIELD: &str = "http-request-method";
+const HTTP_HEADER_FIELD: &str = "http-header";
+const QUERY_STRING_FIELD: &str = "query-string";
+const SOURCE_IP_FIELD: &str = "source-ip";
+
+/// The `ActionTypeEnum` values that END a rule's action list by answering the client,
+/// from `Action$Type`'s own list: the action that renders a response, the one that sends
+/// the client elsewhere, and the one that passes the request to a target group.
+const FIXED_RESPONSE_ACTION: &str = "fixed-response";
+const REDIRECT_ACTION: &str = "redirect";
+const FORWARD_ACTION: &str = "forward";
+
+/// The default `FixedResponseActionConfig$ContentType`: "The content type. Maximum size
+/// is 32 KB. If the value is not specified, the default value is `text/plain`."
+const DEFAULT_FIXED_RESPONSE_CONTENT_TYPE: &str = "text/plain";
+
+/// The status a load balancer answers while it is still coming up: it is publishing a
+/// name, and its listeners are not yet serving traffic on it.
+const PROVISIONING_STATUS: u16 = 503;
+
+/// The status a `forward` to a target group with no healthy target earns: "if a target
+/// group contains no registered targets, or if a target group contains only unhealthy
+/// targets, the load balancer returns an HTTP 503".
+pub const NO_HEALTHY_TARGET_STATUS: u16 = 503;
+
+/// The status a `forward` whose target cannot be CONNECTED to earns: a load balancer that
+/// cannot establish a connection to the target it chose answers HTTP 502. Every target
+/// this emulator holds is a registration — an instance id or an address — with no server
+/// of this emulator's behind it, so this is what a forward to a healthy target answers
+/// rather than a body invented for a backend that never ran.
+pub const TARGET_UNREACHABLE_STATUS: u16 = 502;
+
+/// The status an action this emulator cannot perform earns, rather than serving what is
+/// behind it: an `authenticate-oidc`, `authenticate-cognito` or `jwt-validation` action
+/// has to reach the identity provider it names, and this emulator makes no outbound
+/// connection.
+pub const ACTION_NOT_PERFORMED_STATUS: u16 = 500;
+
+/// The `TargetHealthStateEnum` value a target that can be sent requests reports.
+const HEALTHY_TARGET_STATE: &str = "healthy";
+
+/// The longest condition value this plane matches a request against: `RuleCondition$Values`
+/// documents a host name and a path pattern as each "up to 128 characters in length", so a
+/// longer one is a value no rule of a load balancer carries. It is matched against nothing
+/// rather than walked, which bounds the PATTERN side of every match below.
+const MAX_CONDITION_VALUE_CHARS: usize = 128;
+
+/// The longest run of request text one condition is matched against — the path, the host, a
+/// header value or a query parameter.
+///
+/// The emulator's OWN bound, as [`crate::state::LOAD_BALANCER_QUOTA`] is: far above any URL
+/// a workflow serves, and what stops one request's matching work, and the characters it
+/// materialises to do it, growing with the size of the text the request carries.
+const MAX_MATCHED_CHARS: usize = 1024;
+
+/// The character comparisons ONE request's whole rule walk may cost.
+///
+/// Each match is charged the product of the two lengths before it runs — the bound on the
+/// cost of a walk with one backtrack point per `*` — so the work of the request as a WHOLE
+/// is bounded, and not merely each value's. The budget is far above what any configuration
+/// charges: a listener at the published maximum of
+/// [`crate::state::RULES_PER_LOAD_BALANCER`] rules, each carrying a condition value of the
+/// full [`MAX_CONDITION_VALUE_CHARS`], matched against a 256-character path, charges about
+/// 3.3 million. A walk that spends it stops, and the listener's default actions answer —
+/// the same answer a request no rule matches gets.
+const MAX_MATCH_STEPS: usize = 4_000_000;
+
+/// The characters ONE request's redirect rendering may produce, across all five components
+/// of the `Location` it builds.
+///
+/// The emulator's OWN bound, as [`MAX_MATCHED_CHARS`] is: far above any URL a redirect
+/// sends a client to, and what stops the placeholders a stored template holds multiplying
+/// the request's own host, path or query into a response header of the caller's choosing.
+/// Every character the rendering produces is charged to it, so nothing past the bound is
+/// allocated; a redirect that does not fit is an action this plane could not perform.
+const MAX_REDIRECT_RENDER_CHARS: usize = 8 * 1024;
+
+/// What makes a request an AWS API CALL rather than a load balancer's own traffic: an
+/// `X-Amz-Target` or the date a signed request carries, the two a PRESIGNED one carries in
+/// its query string instead of a header, and an `Authorization` naming the SIGV4 SCHEME.
+///
+/// The scheme is what is read on that header, not its presence: ordinary traffic through a
+/// load balancer carries `Authorization: Basic …` or `Bearer …`, and such a request is the
+/// load balancer's to answer.
+const AWS_API_CALL_HEADERS: &[&str] = &["x-amz-target", "x-amz-date"];
+const AWS_API_CALL_QUERY_PARAMETERS: &[&str] = &["X-Amz-Credential", "X-Amz-Signature"];
+const SIGV4_SCHEME: &str = "AWS4-HMAC-SHA256";
+
+/// The five placeholders a `redirect` action's components may be written with, from
+/// `RedirectActionConfig`: "You can reuse URI components using the following reserved
+/// keywords: #{protocol}, #{host}, #{port}, #{path} (the leading "/" is not included) and
+/// #{query} (the leading "?" is not included)."
+const PROTOCOL_PLACEHOLDER: &str = "#{protocol}";
+const HOST_PLACEHOLDER: &str = "#{host}";
+const PORT_PLACEHOLDER: &str = "#{port}";
+const PATH_PLACEHOLDER: &str = "#{path}";
+const QUERY_PLACEHOLDER: &str = "#{query}";
+
+/// What a data-plane request ADDRESSES, as the wire carries it: the host it was sent to —
+/// absent on a request that carries neither a `Host` header nor an absolute URI — its
+/// path, and whether it presents what an AWS API call presents.
+///
+/// Built from BOTH shapes the router hands this module, the buffered parts the claim reads
+/// and the runtime-API request the serving seam reads, so one rule resolves both and the
+/// claim cannot resolve a different load balancer than the answer does.
+#[derive(Debug)]
+struct Addressed<'a> {
+    host: Option<&'a str>,
+    path: &'a str,
+    /// What an AWS API call presents ([`AWS_API_CALL_HEADERS`],
+    /// [`AWS_API_CALL_QUERY_PARAMETERS`]): a load balancer's own traffic presents none of
+    /// it, and a request that does is a control-plane call.
+    aws_api_call: bool,
+}
+
+impl<'a> Addressed<'a> {
+    /// The addressing of the buffered request these parts came from.
+    fn of_parts(parts: &'a http::request::Parts) -> Self {
+        Self {
+            host: parts
+                .headers
+                .get("host")
+                .and_then(|host| host.to_str().ok())
+                .or_else(|| parts.uri.authority().map(http::uri::Authority::as_str)),
+            path: parts.uri.path(),
+            aws_api_call: AWS_API_CALL_HEADERS
+                .iter()
+                .any(|name| parts.headers.contains_key(*name))
+                || sigv4_signed(
+                    parts
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                )
+                || presigned(parts.uri.query()),
+        }
+    }
+
+    /// The addressing of a runtime-API request, whose URI arrives as a string and is
+    /// parsed by the `http` crate (`uri`) rather than split by hand.
+    fn of_request(req: &'a RtRequest, uri: &'a http::Uri) -> Self {
+        Self {
+            host: req
+                .headers()
+                .get("host")
+                .or_else(|| uri.authority().map(http::uri::Authority::as_str)),
+            path: uri.path(),
+            aws_api_call: AWS_API_CALL_HEADERS
+                .iter()
+                .any(|name| req.headers().get(*name).is_some())
+                || sigv4_signed(req.headers().get("authorization"))
+                || presigned(uri.query()),
+        }
+    }
+}
+
+/// Whether an `Authorization` header names the SigV4 scheme, which is what an AWS API
+/// call's credential is presented under — as opposed to the `Basic`/`Bearer` credential
+/// ordinary traffic through a load balancer carries.
+fn sigv4_signed(authorization: Option<&str>) -> bool {
+    authorization.is_some_and(|value| {
+        value
+            .get(..SIGV4_SCHEME.len())
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case(SIGV4_SCHEME))
+    })
+}
+
+/// Whether a query string carries the SigV4 scope a PRESIGNED request puts there instead
+/// of in a header, which is an AWS API call however little else it presents.
+fn presigned(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let name = pair.split('=').next().unwrap_or(pair);
+        AWS_API_CALL_QUERY_PARAMETERS.contains(&name)
+    })
+}
+
+/// The request URI of a runtime-API request, parsed by the `http` crate: the authority —
+/// absent on the origin-form URI a client sends on the wire — the path and the query.
+///
+/// A URI this parse rejects is one the server would not have accepted, and it resolves to
+/// `http::Uri`'s own default (`/`), which names no load balancer and claims nothing.
+fn parsed_uri(uri: &str) -> http::Uri {
+    uri.parse::<http::Uri>().unwrap_or_default()
+}
+
+/// What a request resolves to: the load balancer it addresses, and the path WITHIN that
+/// load balancer's own endpoint — which is what the rules are evaluated against.
+#[derive(Debug)]
+struct Resolved {
+    load_balancer_arn: String,
+    request_path: String,
+}
+
+/// Whether this data plane serves the request these `parts` came from — read by
+/// `Service::can_handle`, so a request addressed to a load balancer this service holds
+/// reaches this service instead of the front door's `UnknownService`.
+pub fn claims_parts<Eng: Send + Sync + 'static>(engine: &Eng, parts: &http::request::Parts) -> bool {
+    resolve(engine, &Addressed::of_parts(parts)).is_some()
+}
+
+/// [`claims_parts`] for the runtime-API request the serving seam is handed, resolved by
+/// the same rule.
+pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
+    let uri = parsed_uri(req.uri());
+    resolve(engine, &Addressed::of_request(req, &uri)).is_some()
+}
+
+/// Which load balancer `addressed` addresses, and the path within its endpoint, or `None`
+/// when this data plane serves the request not at all.
+///
+/// The four addressings are the module documentation's, in that order. Each one resolves
+/// only to a load balancer that SERVES HTTP ([`serves_http`]) — a Network or Gateway Load
+/// Balancer has no rules to evaluate and no response to render — so the claim and the
+/// answer cannot disagree about which requests this plane can answer.
+fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> Option<Resolved> {
+    let state = service_state(engine)?;
+    let store = state.lock();
+
+    // PREFIXED PATH-STYLE, the one addressing that is explicit about naming this plane,
+    // and so the one read whatever the request's host is and whatever it presents.
+    if let Some((named, path)) = prefixed_addressing(addressed.path) {
+        return resolved(&store, named_load_balancer(&store, named)?, path);
+    }
+    // A path under the reserved namespace that did NOT name this plane names another one,
+    // which serves its own requests: reading it as this load balancer's would make two
+    // services claim one request, which the router answers `500 AmbiguousService`.
+    if first_segment(addressed.path).is_some_and(|(first, _)| first == EMULATOR_PATH_NAMESPACE) {
+        return None;
+    }
+
+    let host = addressed.host.map(host_only);
+
+    // HOST-STYLE: the published `DNSName` itself.
+    if let Some(host) = host {
+        if let Some(record) = store
+            .load_balancers
+            .values()
+            .find(|record| record.dns_name.eq_ignore_ascii_case(host))
+        {
+            return resolved(&store, record, addressed.path);
+        }
+    }
+
+    // The remaining two addressings are the emulator's own endpoint, which is the only
+    // address a client on this machine can reach. A host that names some service — this
+    // service's own control plane, or another service's endpoint — keeps answering as that
+    // service, and a request presenting AWS API credentials is a control-plane call.
+    if addressed.aws_api_call || host.is_some_and(names_a_service) {
+        return None;
+    }
+
+    // PATH-STYLE: the load balancer named by the first path segment.
+    if let Some((first, rest)) = first_segment(addressed.path) {
+        if let Some(record) = named_load_balancer(&store, first) {
+            return resolved(&store, record, rest);
+        }
+    }
+
+    // ENDPOINT-ONLY: the request path alone, for a client that carries nothing else. It is
+    // read only when the store holds exactly ONE load balancer that serves HTTP, and only
+    // for a path that load balancer has a RULE written for: the other planes that read a
+    // host-independent addressing require the path to name something they own (a deployed
+    // stage, for one), and a path no rule of the only load balancer mentions is left to
+    // whatever the request was really addressed to rather than claimed here — two
+    // claimants is what the router answers `500 AmbiguousService`.
+    let mut serving = store
+        .load_balancers
+        .values()
+        .filter(|record| serves_http(&store, record));
+    let only = serving.next()?;
+    if serving.next().is_some() {
+        return None;
+    }
+    if !a_rule_is_written_for(&store, only, addressed.path) {
+        return None;
+    }
+    resolved(&store, only, addressed.path)
+}
+
+/// Whether a rule of `record`'s addressed listener is written for this PATH: a
+/// `path-pattern` condition of one of its rules matches it.
+///
+/// This is the one thing the ENDPOINT-ONLY claim asks of a path, and it asks only about
+/// the path: the claim is handed no method, no header and no query, so the other condition
+/// fields are not read here. A rule whose conditions name no path pattern therefore does
+/// not make the claim, and neither does the listener's default action — a client that wants
+/// those names the load balancer, by host, by the reserved prefix or by the first segment.
+fn a_rule_is_written_for(store: &ElbState, record: &LoadBalancerRecord, path: &str) -> bool {
+    let Some(listener) = listener_addressed(store, record, None) else {
+        return false;
+    };
+    let mut budget = MAX_MATCH_STEPS;
+    listener.rules.iter().any(|rule| {
+        rule.conditions
+            .iter()
+            .filter(|condition| condition.field.as_deref() == Some(PATH_PATTERN_FIELD))
+            .any(|condition| {
+                let configured = condition
+                    .path_pattern_config
+                    .as_ref()
+                    .and_then(|config| config.values.as_deref())
+                    .unwrap_or_default();
+                condition
+                    .values
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .chain(configured)
+                    .any(|pattern| matches_within(pattern, path, CASE_SENSITIVE, &mut budget))
+            })
+    })
+}
+
+/// One resolution, for a load balancer that serves HTTP; `None` for one that does not, so
+/// no addressing can claim a request this plane cannot answer.
+fn resolved(store: &ElbState, record: &LoadBalancerRecord, path: &str) -> Option<Resolved> {
+    serves_http(store, record).then(|| Resolved {
+        load_balancer_arn: record.arn.clone(),
+        request_path: path.to_string(),
+    })
+}
+
+/// Whether this load balancer has traffic of this kind to serve: an Application Load
+/// Balancer — the family whose listeners carry rules and whose actions render a response —
+/// with at least one listener on an HTTP protocol to answer with.
+fn serves_http(store: &ElbState, record: &LoadBalancerRecord) -> bool {
+    record.family() == LoadBalancerFamily::Application
+        && listener_addressed(store, record, None).is_some()
+}
+
+/// The load balancer `named` names, by its DNS name or by its own name, both read
+/// case-insensitively (a DNS name is case-insensitive, and a load balancer's name is
+/// unique per Region).
+fn named_load_balancer<'s>(store: &'s ElbState, named: &str) -> Option<&'s LoadBalancerRecord> {
+    store.load_balancers.values().find(|record| {
+        record.dns_name.eq_ignore_ascii_case(named) || record.name.eq_ignore_ascii_case(named)
+    })
+}
+
+/// The load balancer name and the request path of a PREFIXED PATH-STYLE addressing:
+/// `/_aws/elasticloadbalancing/{dns-name-or-name}/{path}`, by exact segment equality.
+fn prefixed_addressing(path: &str) -> Option<(&str, &str)> {
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (segment, rest) = first_segment(rest)?;
+    if segment != DATA_PLANE_SEGMENT {
+        return None;
+    }
+    let (named, rest) = first_segment(rest)?;
+    (!named.is_empty()).then_some((named, rest))
+}
+
+/// Everything the rules and the actions are evaluated against: what the client sent.
+#[derive(Debug, Default)]
+struct DataPlaneRequest {
+    method: String,
+    /// The path within the load balancer's own endpoint, as [`Resolved`] read it.
+    path: String,
+    /// The query string, without the leading `?`.
+    query: String,
+    /// The host the client addressed, without its port.
+    host: String,
+    /// Every header, with its name lower-cased: a header condition names its header
+    /// case-insensitively.
+    headers: Vec<(String, String)>,
+    /// The port the client addressed, when it named one.
+    port: Option<i32>,
+}
+
+impl DataPlaneRequest {
+    /// What the runtime-API request carries, for the path [`resolve`] read out of it and
+    /// the `uri` the `http` crate parsed out of it.
+    fn of(req: &RtRequest, uri: &http::Uri, path: &str) -> Self {
+        let host = req
+            .headers()
+            .get("host")
+            .or_else(|| uri.authority().map(http::uri::Authority::as_str));
+        Self {
+            method: req.method().to_string(),
+            path: path.to_string(),
+            query: uri.query().unwrap_or_default().to_string(),
+            host: host.map(host_only).unwrap_or_default().to_string(),
+            headers: req
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+                .collect(),
+            port: addressed_port(host),
+        }
+    }
+
+    /// The first value of `name`, read case-insensitively.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(held, _)| held == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// One answer this plane renders: the status, the content type and `Location` it carries,
+/// and the body.
+#[derive(Debug, Default)]
+struct Served {
+    status: u16,
+    content_type: Option<String>,
+    location: Option<String>,
+    body: Vec<u8>,
+}
+
+impl Served {
+    /// A status with no body: what a load balancer answers for a request it could not pass
+    /// on, where no body of its own is this emulator's to invent.
+    fn status(status: u16) -> Self {
+        Self {
+            status,
+            ..Self::default()
+        }
+    }
+}
+
+/// Answer a request this plane claimed, out of the records the control plane holds.
+///
+/// Reached from `Service::override_routing_error` for a request [`claims_request`]
+/// resolved, so the resolution here repeats that one; a resolution that has gone away
+/// between the two (the load balancer was deleted by another request in between) is a load
+/// balancer no longer serving the name, which is [`PROVISIONING_STATUS`] rather than a
+/// panic.
+pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+    let uri = parsed_uri(req.uri());
+    let Some(resolved) = resolve(engine, &Addressed::of_request(req, &uri)) else {
+        return rendered(&Served::status(PROVISIONING_STATUS));
+    };
+    let request = DataPlaneRequest::of(req, &uri, &resolved.request_path);
+    let Some(state) = service_state(engine) else {
+        return rendered(&Served::status(PROVISIONING_STATUS));
+    };
+    let store = state.lock();
+    let Some(record) = store.load_balancers.get(&resolved.load_balancer_arn) else {
+        return rendered(&Served::status(PROVISIONING_STATUS));
+    };
+    let now = SystemTime::now();
+    // A load balancer the clock still owes its move out of `provisioning` is not serving
+    // traffic on the name it published yet. Read, never written: this plane moves no
+    // status.
+    if now < record.active_at {
+        return rendered(&Served::status(PROVISIONING_STATUS));
+    }
+    let Some(listener) = listener_addressed(&store, record, request.port) else {
+        return rendered(&Served::status(PROVISIONING_STATUS));
+    };
+    let served = answered(&store, listener, &request, now);
+    // The record of one request this endpoint answered, as a load balancer's own access
+    // log carries it: which load balancer and listener took it, what was asked, and what
+    // was answered. Reported through the emulator's own logging facility, so a client can
+    // see which plane claimed a request it believed went elsewhere.
+    tracing::info!(
+        load_balancer = %record.arn,
+        listener = %listener.arn,
+        method = %request.method,
+        host = %request.host,
+        path = %request.path,
+        status = served.status,
+        "the load balancer answered a request on the name it published"
+    );
+    rendered(&served)
+}
+
+/// The listener the request reached: the one listening on the port the client addressed
+/// and, where that port names none of them — a client reaching the emulator's own endpoint
+/// addresses the EMULATOR's port, not the load balancer's — the lowest-numbered one, which
+/// is the port a load balancer's first listener is given.
+fn listener_addressed<'s>(
+    store: &'s ElbState,
+    record: &LoadBalancerRecord,
+    port: Option<i32>,
+) -> Option<&'s ListenerRecord> {
+    let mut listeners: Vec<&ListenerRecord> = record
+        .listener_arns
+        .iter()
+        .filter_map(|arn| store.listeners.get(arn))
+        .filter(|listener| {
+            listener
+                .protocol
+                .as_deref()
+                .is_some_and(|protocol| HTTP_PROTOCOLS.contains(&protocol))
+        })
+        .collect();
+    listeners.sort_by(|left, right| left.port.cmp(&right.port).then_with(|| left.arn.cmp(&right.arn)));
+    port.and_then(|port| {
+        listeners
+            .iter()
+            .copied()
+            .find(|listener| listener.port == Some(port))
+    })
+    .or_else(|| listeners.first().copied())
+}
+
+/// What `listener` answers `request` with: the actions of the first rule whose conditions
+/// are all met, in ascending priority order, and otherwise the listener's own default
+/// actions — which are its default rule's.
+fn answered(
+    store: &ElbState,
+    listener: &ListenerRecord,
+    request: &DataPlaneRequest,
+    now: SystemTime,
+) -> Served {
+    performed(store, listener, matched_actions(listener, request), request, now)
+}
+
+/// The actions the request matched: "rules are evaluated in priority order, from the
+/// lowest value to the highest value", and the default actions when no rule's conditions
+/// are met. The ARN breaks a tie only so the walk is stable whatever the store's
+/// iteration order; two rules of one listener never share a priority.
+///
+/// The whole walk shares ONE matching budget ([`MAX_MATCH_STEPS`]), so what a request
+/// costs is bounded however many rules the listener carries and however long their
+/// condition values are. A walk that spends it stops where it is, and the default actions
+/// answer.
+fn matched_actions<'l>(listener: &'l ListenerRecord, request: &DataPlaneRequest) -> &'l [Action] {
+    let mut budget = MAX_MATCH_STEPS;
+    for rule in crate::state::rules_in_evaluation_order(listener) {
+        if budget == 0 {
+            tracing::warn!(
+                rule = %rule.arn,
+                "the request spent its whole matching budget before this rule, so the \
+                 listener's default actions answer it"
+            );
+            break;
+        }
+        if !rule.conditions.is_empty() && conditions_met(&rule.conditions, request, &mut budget) {
+            return &rule.actions;
+        }
+    }
+    &listener.default_actions
+}
+
+/// Whether EVERY condition of a rule is met — "each rule ... include[s] up to one of each
+/// of the following conditions", and a rule matches when all of them do.
+fn conditions_met(
+    conditions: &[RuleCondition],
+    request: &DataPlaneRequest,
+    budget: &mut usize,
+) -> bool {
+    conditions
+        .iter()
+        .all(|condition| condition_met(condition, request, budget))
+}
+
+/// Whether one condition is met. A condition's values are alternatives — any one of them
+/// matching is a match — and each is written the wildcard language
+/// [`matches_within`] reads.
+///
+/// Two condition forms are NOT evaluated here, and each is left UNMET with a warning
+/// naming it rather than matched on a guess — so a rule passed over for one of them is
+/// traceable to the form, instead of looking like a rule the request simply did not match:
+///
+/// * `RegexValues`: this emulator has no regular-expression engine for that dialect, and a
+///   hand-written approximation of one would match the wrong requests silently;
+/// * `source-ip`: AWS evaluates it against the address of the CONNECTION, and documents
+///   that the addresses in `X-Forwarded-For` do not satisfy it (an `http-header` condition
+///   is how that header is matched). A request served in-process carries no connection
+///   address for this plane to read, and matching a request-supplied header instead would
+///   let any client satisfy a rule written to gate traffic by CIDR.
+fn condition_met(
+    condition: &RuleCondition,
+    request: &DataPlaneRequest,
+    budget: &mut usize,
+) -> bool {
+    let direct = condition.values.as_deref().unwrap_or_default();
+    let field = condition.field.as_deref().unwrap_or_default();
+    if carries_regex_values(condition) {
+        tracing::warn!(
+            field,
+            "the condition matches on regular expressions, which this plane does not \
+             evaluate, so it is left unmet and its rule is passed over"
+        );
+        return false;
+    }
+    match field {
+        // "path-pattern ... the comparison is case sensitive", and the pattern is matched
+        // against the path alone, not the query string.
+        PATH_PATTERN_FIELD => {
+            let configured = condition
+                .path_pattern_config
+                .as_ref()
+                .and_then(|config| config.values.as_deref())
+                .unwrap_or_default();
+            direct
+                .iter()
+                .chain(configured)
+                .any(|pattern| matches_within(pattern, &request.path, CASE_SENSITIVE, budget))
+        }
+        // A host name is case-insensitive, so the comparison is made without regard to
+        // case rather than by folding either side here.
+        HOST_HEADER_FIELD => {
+            let configured = condition
+                .host_header_config
+                .as_ref()
+                .and_then(|config| config.values.as_deref())
+                .unwrap_or_default();
+            direct
+                .iter()
+                .chain(configured)
+                .any(|pattern| matches_within(pattern, &request.host, CASE_INSENSITIVE, budget))
+        }
+        // "http-request-method ... the comparison is case sensitive", and a method is
+        // upper case on the wire. No wildcard is documented for it, so the value is the
+        // method itself — and the values are read from its own configuration shape alone:
+        // `RuleCondition$Values` is documented "specify only when Field is host-header or
+        // path-pattern".
+        HTTP_REQUEST_METHOD_FIELD => condition
+            .http_request_method_config
+            .as_ref()
+            .and_then(|config| config.values.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .any(|value| value == &request.method),
+        // The header NAME is case-insensitive; its values are patterns.
+        HTTP_HEADER_FIELD => {
+            let Some(config) = condition.http_header_config.as_ref() else {
+                return false;
+            };
+            let Some(name) = config.http_header_name.as_deref() else {
+                return false;
+            };
+            let Some(value) = request.header(&name.to_ascii_lowercase()) else {
+                return false;
+            };
+            config
+                .values
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|pattern| matches_within(pattern, value, CASE_SENSITIVE, budget))
+        }
+        // A query-string condition's pair matches when the request carries a parameter
+        // whose key and value both match; an entry with no key matches on the value alone.
+        QUERY_STRING_FIELD => condition
+            .query_string_config
+            .as_ref()
+            .and_then(|config| config.values.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .any(|pair| {
+                request.query.split('&').filter(|raw| !raw.is_empty()).any(|raw| {
+                    let (key, value) = raw.split_once('=').unwrap_or((raw, ""));
+                    pair.key
+                        .as_deref()
+                        .is_none_or(|pattern| {
+                            matches_within(pattern, key, CASE_SENSITIVE, budget)
+                        })
+                        && pair.value.as_deref().is_none_or(|pattern| {
+                            matches_within(pattern, value, CASE_SENSITIVE, budget)
+                        })
+                })
+            }),
+        // "source-ip ... you must specify an IP address block in CIDR", evaluated against
+        // the address of the CONNECTION — which a request served in-process does not
+        // carry, so the condition is left unmet (see this function's own documentation).
+        SOURCE_IP_FIELD => {
+            tracing::warn!(
+                "the condition matches on the client's connection address, which a request \
+                 served in-process does not carry, so it is left unmet and its rule is \
+                 passed over"
+            );
+            false
+        }
+        // A field this service does not match on names no condition a rule could have
+        // been created with.
+        _ => false,
+    }
+}
+
+/// Whether this condition matches on REGULAR EXPRESSIONS — in `RegexValues`, or in the
+/// `RegexValues` of the field's own configuration shape — which is what
+/// [`condition_met`] leaves unmet rather than approximating.
+fn carries_regex_values(condition: &RuleCondition) -> bool {
+    let listed = |values: Option<&Vec<String>>| values.is_some_and(|values| !values.is_empty());
+    listed(condition.regex_values.as_ref())
+        || condition
+            .path_pattern_config
+            .as_ref()
+            .is_some_and(|config| listed(config.regex_values.as_ref()))
+        || condition
+            .host_header_config
+            .as_ref()
+            .is_some_and(|config| listed(config.regex_values.as_ref()))
+        || condition
+            .http_header_config
+            .as_ref()
+            .is_some_and(|config| listed(config.regex_values.as_ref()))
+}
+
+/// Whether `value` matches `pattern` in the wildcard language every condition's values
+/// are written in — "? (matches exactly 1 character)" and "* (matches 0 or more
+/// characters)", with the pattern matching the WHOLE value — charged to this request's
+/// matching `budget`.
+///
+/// The walk itself is `service_common::iam_authorization::wildcard_match`, which is the one
+/// implementation of that language in the tree (the same two metacharacters, the same
+/// whole-value match, and the case flag that serves both the case-sensitive comparisons and
+/// the case-insensitive host one). What is added here is the BOUND: a value longer than
+/// AWS publishes for a condition, or request text longer than this emulator matches
+/// against, is matched against nothing, and the product of the two lengths — the bound on
+/// a walk with one backtrack point per `*` — is charged to the budget before the walk runs,
+/// so the whole request's matching cost is capped rather than growing with what the caller
+/// sent and stored.
+fn matches_within(pattern: &str, value: &str, case_sensitive: bool, budget: &mut usize) -> bool {
+    // Measured through a bounded probe, so the measuring itself cannot be made to walk
+    // text of the caller's choosing, and CHARGED before the lengths are judged, so the
+    // rejected case cannot be repeated for free either.
+    let pattern_chars = pattern.chars().take(MAX_CONDITION_VALUE_CHARS + 1).count();
+    let value_chars = value.chars().take(MAX_MATCHED_CHARS + 1).count();
+    // At least one step per match, so a walk cannot repeat for free on empty text.
+    let cost = pattern_chars.saturating_mul(value_chars).max(1);
+    if cost > *budget {
+        *budget = 0;
+        return false;
+    }
+    *budget -= cost;
+    if pattern_chars > MAX_CONDITION_VALUE_CHARS || value_chars > MAX_MATCHED_CHARS {
+        tracing::warn!(
+            pattern_chars,
+            value_chars,
+            "the condition value or the request text is longer than this plane matches, so \
+             the condition is left unmet"
+        );
+        return false;
+    }
+    ::service_common::iam_authorization::wildcard_match(pattern, value, case_sensitive)
+}
+
+/// What [`matches_within`]'s case flag means at each call site: a host name compares
+/// without regard to case, and every other condition value compares exactly.
+const CASE_SENSITIVE: bool = true;
+const CASE_INSENSITIVE: bool = false;
+
+/// Perform the matched action list: the terminating action answers the client, and an
+/// action this emulator cannot perform answers [`ACTION_NOT_PERFORMED_STATUS`] rather than
+/// serving what is behind it.
+///
+/// "The last action to be performed must be one of the following types of actions: a
+/// forward, fixed-response, or redirect" — so the answer is the terminating action with
+/// the highest `Order`, which is the last one performed.
+fn performed(
+    store: &ElbState,
+    listener: &ListenerRecord,
+    actions: &[Action],
+    request: &DataPlaneRequest,
+    now: SystemTime,
+) -> Served {
+    if let Some(action) = actions
+        .iter()
+        .find(|action| !is_terminating(&action.r#type))
+    {
+        tracing::warn!(
+            action = %action.r#type,
+            "the action needs an identity provider this emulator makes no connection to, \
+             so the request it guards is not served"
+        );
+        return Served::status(ACTION_NOT_PERFORMED_STATUS);
+    }
+    let Some(action) = actions
+        .iter()
+        .filter(|action| is_terminating(&action.r#type))
+        .max_by_key(|action| action.order.unwrap_or_default())
+    else {
+        // A listener with no default action and a matched rule with no action have nothing
+        // to answer with, which no create admits.
+        return Served::status(NO_HEALTHY_TARGET_STATUS);
+    };
+    match action.r#type.as_str() {
+        FIXED_RESPONSE_ACTION => fixed_response(action),
+        REDIRECT_ACTION => redirect(action, listener, request),
+        FORWARD_ACTION => forward(store, action, now),
+        // Unreachable: every type that is not terminating was answered above, and
+        // `Action$Type` carries no other terminating one.
+        _ => Served::status(ACTION_NOT_PERFORMED_STATUS),
+    }
+}
+
+/// Whether this action type ANSWERS the client, as opposed to guarding what follows it.
+fn is_terminating(action_type: &str) -> bool {
+    matches!(
+        action_type,
+        FIXED_RESPONSE_ACTION | REDIRECT_ACTION | FORWARD_ACTION
+    )
+}
+
+/// The response a `fixed-response` action renders: "the HTTP response code (2XX, 4XX, or
+/// 5XX)", the content type, and the message body — all three as they were persisted.
+fn fixed_response(action: &Action) -> Served {
+    let Some(config) = action.fixed_response_config.as_ref() else {
+        return Served::status(NO_HEALTHY_TARGET_STATUS);
+    };
+    let Ok(status) = config.status_code.parse::<u16>() else {
+        // `FixedResponseActionConfig$StatusCode` is a three-digit code; a record carrying
+        // anything else is one no create admits.
+        return Served::status(NO_HEALTHY_TARGET_STATUS);
+    };
+    let body = config.message_body.clone().unwrap_or_default().into_bytes();
+    Served {
+        status,
+        content_type: Some(
+            config
+                .content_type
+                .clone()
+                .unwrap_or_else(|| DEFAULT_FIXED_RESPONSE_CONTENT_TYPE.to_string()),
+        ),
+        location: None,
+        body,
+    }
+}
+
+/// The response a `redirect` action renders: its status code, and a `Location` built by
+/// substituting the request's own components into the placeholders each component carries.
+///
+/// The defaults are the ones the action's own documentation gives for a component left
+/// out — the request's own protocol, host, port, path and query — so a redirect that
+/// changes one component keeps the rest.
+fn redirect(action: &Action, listener: &ListenerRecord, request: &DataPlaneRequest) -> Served {
+    let Some(config) = action.redirect_config.as_ref() else {
+        return Served::status(NO_HEALTHY_TARGET_STATUS);
+    };
+    let Some(status) = config
+        .status_code
+        .strip_prefix("HTTP_")
+        .and_then(|code| code.parse::<u16>().ok())
+    else {
+        // `RedirectActionConfig$StatusCode` is `HTTP_301` or `HTTP_302`; a record carrying
+        // anything else is one no create admits.
+        return Served::status(NO_HEALTHY_TARGET_STATUS);
+    };
+    // ONE budget for the whole redirect, charged every character the rendering produces,
+    // so the URL this plane builds cannot grow with the stored template's placeholders
+    // times the request's own path or query.
+    let mut budget = MAX_REDIRECT_RENDER_CHARS;
+    let mut component = |held: Option<&String>, default: &str| {
+        substituted(
+            held.map(String::as_str).unwrap_or(default),
+            listener,
+            request,
+            &mut budget,
+        )
+    };
+    let rendered = (
+        component(config.protocol.as_ref(), PROTOCOL_PLACEHOLDER),
+        component(config.host.as_ref(), HOST_PLACEHOLDER),
+        component(config.port.as_ref(), PORT_PLACEHOLDER),
+        component(config.path.as_ref(), &format!("/{PATH_PLACEHOLDER}")),
+        component(config.query.as_ref(), QUERY_PLACEHOLDER),
+    );
+    let (Some(protocol), Some(host), Some(port), Some(path), Some(query)) = rendered else {
+        tracing::warn!(
+            "the redirect's URL does not fit the characters one request's rendering may \
+             produce, so the action is not performed"
+        );
+        return Served::status(ACTION_NOT_PERFORMED_STATUS);
+    };
+
+    // A URI scheme is case-insensitive and is written in lower case, while the protocol
+    // the action and the listener carry is the model's own upper-case `ProtocolEnum`.
+    let scheme = protocol.to_ascii_lowercase();
+    let mut location = format!("{scheme}://{host}");
+    // The port is left off when it is the one the scheme implies, which is the URL a
+    // client is sent to for a redirect that keeps the default port.
+    if !port.is_empty() && Some(port.as_str()) != default_port(&scheme) {
+        location.push(':');
+        location.push_str(&port);
+    }
+    if !path.starts_with('/') {
+        location.push('/');
+    }
+    location.push_str(&path);
+    if !query.is_empty() {
+        location.push('?');
+        location.push_str(&query);
+    }
+    Served {
+        status,
+        content_type: None,
+        location: Some(location),
+        body: Vec::new(),
+    }
+}
+
+/// One redirect component with every placeholder replaced by what the request carried:
+/// the listener's protocol and port — the protocol the request arrived on and the port its
+/// listener serves — and the request's own host, path (without its leading `/`) and query
+/// (without its leading `?`).
+///
+/// Rendered under `budget`, which every character the output carries is charged to —
+/// whether it came from the stored template or from the request — so a template holding
+/// many placeholders cannot multiply the request's own text into a header of the caller's
+/// choosing, and nothing is allocated past the bound rather than after it. `None` where
+/// the budget runs out: a redirect this plane could not build, which [`redirect`] answers
+/// as an action it could not perform.
+fn substituted(
+    template: &str,
+    listener: &ListenerRecord,
+    request: &DataPlaneRequest,
+    budget: &mut usize,
+) -> Option<String> {
+    let protocol = listener.protocol.clone().unwrap_or_default();
+    let port = listener
+        .port
+        .map(|port| port.to_string())
+        .unwrap_or_default();
+    let replacements: [(&str, &str); 5] = [
+        (PROTOCOL_PLACEHOLDER, protocol.as_str()),
+        (HOST_PLACEHOLDER, request.host.as_str()),
+        (PORT_PLACEHOLDER, port.as_str()),
+        (
+            PATH_PLACEHOLDER,
+            request.path.strip_prefix('/').unwrap_or(&request.path),
+        ),
+        (QUERY_PLACEHOLDER, request.query.as_str()),
+    ];
+    let mut rendered = String::new();
+    let mut rest = template;
+    'template: while !rest.is_empty() {
+        for (placeholder, value) in &replacements {
+            if let Some(tail) = rest.strip_prefix(*placeholder) {
+                if value.len() > *budget {
+                    *budget = 0;
+                    return None;
+                }
+                *budget -= value.len();
+                rendered.push_str(value);
+                rest = tail;
+                continue 'template;
+            }
+        }
+        let mut characters = rest.chars();
+        let Some(next) = characters.next() else {
+            break;
+        };
+        if next.len_utf8() > *budget {
+            *budget = 0;
+            return None;
+        }
+        *budget -= next.len_utf8();
+        rendered.push(next);
+        rest = characters.as_str();
+    }
+    Some(rendered)
+}
+
+/// The port a URL of `protocol` implies, and so leaves out.
+fn default_port(protocol: &str) -> Option<&'static str> {
+    match protocol {
+        "HTTP" | "http" => Some("80"),
+        "HTTPS" | "https" => Some("443"),
+        _ => None,
+    }
+}
+
+/// What a `forward` answers. The target groups it names are this store's own; a target of
+/// one is a registration this emulator has no server behind, so the answer is the status a
+/// load balancer gives for the condition that holds: no healthy target to choose, or a
+/// target chosen whose connection cannot be made.
+fn forward(store: &ElbState, action: &Action, now: SystemTime) -> Served {
+    let named = crate::state::action_target_group_arns(std::slice::from_ref(action));
+    let healthy = named.iter().any(|arn| {
+        store.target_groups.get(arn).is_some_and(|group| {
+            group.targets.values().any(|target| {
+                group.health_of(target, now).state.as_deref() == Some(HEALTHY_TARGET_STATE)
+            })
+        })
+    });
+    if healthy {
+        tracing::warn!(
+            "the target group's healthy target is a registration with no server of this \
+             emulator's behind it, so the connection to it cannot be made"
+        );
+        return Served::status(TARGET_UNREACHABLE_STATUS);
+    }
+    Served::status(NO_HEALTHY_TARGET_STATUS)
+}
+
+/// One rendered answer: the status, its headers and its body, as the wire carries them.
+fn rendered(served: &Served) -> RtResponse {
+    let mut response = RtResponse::new(
+        StatusCode::try_from(served.status)
+            .unwrap_or_else(|_| StatusCode::try_from(PROVISIONING_STATUS).expect("503 is a status")),
+        SdkBody::from(served.body.clone()),
+    );
+    if let Some(content_type) = &served.content_type {
+        if let Err(refused) = response
+            .headers_mut()
+            .try_insert("content-type", content_type.clone())
+        {
+            // A content type is a stored value no operation holds to a media type, so one
+            // the wire cannot carry is left off the response rather than failing it.
+            tracing::warn!(
+                error = %refused,
+                "the action's content type cannot be sent on the wire and is left off the \
+                 response"
+            );
+        }
+    }
+    if let Some(location) = &served.location {
+        if let Err(refused) = response.headers_mut().try_insert("location", location.clone()) {
+            tracing::warn!(
+                error = %refused,
+                "the redirect's location cannot be sent on the wire and is left off the \
+                 response"
+            );
+        }
+    }
+    let _ = response
+        .headers_mut()
+        .try_insert("content-length", served.body.len().to_string());
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    //! The pure rules of this module that a wire test cannot vary cheaply: the wildcard
+    //! language a condition's values are written in, and how an addressing is split. What
+    //! this plane SERVES is pinned end to end in `tests/all/alb_data_plane.rs`.
+
+    use super::*;
+
+    #[test]
+    fn a_condition_value_matches_in_the_documented_wildcard_language() {
+        // The rows span what the language generalises over: a literal, each
+        // metacharacter alone, both together, a pattern longer than the value, the
+        // backtracking case a single left-to-right scan gets wrong, the case flag each
+        // field compares under, and the two lengths this plane refuses to walk at all.
+        let cases: &[(&str, &str, bool, bool)] = &[
+            ("/a", "/a", CASE_SENSITIVE, true),
+            ("/a", "/b", CASE_SENSITIVE, false),
+            ("/a", "/a/b", CASE_SENSITIVE, false),
+            ("/img/*", "/img/cat.png", CASE_SENSITIVE, true),
+            ("/img/*", "/img/", CASE_SENSITIVE, true),
+            ("/img/*", "/image", CASE_SENSITIVE, false),
+            ("/?", "/a", CASE_SENSITIVE, true),
+            ("/?", "/ab", CASE_SENSITIVE, false),
+            ("/?/b", "/a/b", CASE_SENSITIVE, true),
+            ("*", "", CASE_SENSITIVE, true),
+            ("*", "/anything/at/all", CASE_SENSITIVE, true),
+            ("", "", CASE_SENSITIVE, true),
+            ("", "/a", CASE_SENSITIVE, false),
+            ("/a*b", "/axxxb", CASE_SENSITIVE, true),
+            ("/a*b", "/axxxbc", CASE_SENSITIVE, false),
+            ("/a*b*c", "/abbbc", CASE_SENSITIVE, true),
+            ("*.example", "foo.example", CASE_SENSITIVE, true),
+            ("*.example", "foo.example.org", CASE_SENSITIVE, false),
+            // The case flag: a path compares exactly, a host without regard to case.
+            ("/A", "/a", CASE_SENSITIVE, false),
+            ("SHOP.example.com", "shop.EXAMPLE.com", CASE_INSENSITIVE, true),
+            ("*.example.com", "SHOP.EXAMPLE.COM", CASE_INSENSITIVE, true),
+        ];
+        for (pattern, value, case_sensitive, expected) in cases {
+            let mut budget = MAX_MATCH_STEPS;
+            let matched = matches_within(pattern, value, *case_sensitive, &mut budget);
+            assert_eq!(
+                matched, *expected,
+                "case ({pattern:?}, {value:?}, case_sensitive {case_sensitive}): expected \
+                 {expected}, got {matched}"
+            );
+            assert!(
+                budget < MAX_MATCH_STEPS,
+                "case ({pattern:?}, {value:?}): every match is charged to the budget, which \
+                 is still {budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_requests_matching_is_bounded_by_the_budget_and_the_two_lengths() {
+        // Text longer than this plane matches, and a condition value longer than AWS
+        // publishes, are matched against nothing — whatever wildcard they carry.
+        let long_value = "a".repeat(MAX_MATCHED_CHARS + 1);
+        let long_pattern = "a".repeat(MAX_CONDITION_VALUE_CHARS + 1);
+        let rows: &[(&str, &str, &str)] = &[
+            ("request text past the bound", "*", long_value.as_str()),
+            ("a condition value past the bound", long_pattern.as_str(), "a"),
+        ];
+        for (case, pattern, value) in rows {
+            let mut budget = MAX_MATCH_STEPS;
+            assert!(
+                !matches_within(pattern, value, CASE_SENSITIVE, &mut budget),
+                "case {case:?}: nothing past the bound is walked"
+            );
+            assert!(
+                budget < MAX_MATCH_STEPS,
+                "case {case:?}: a match the bound rejects is charged too, so it cannot be \
+                 repeated for free; the budget is still {budget}"
+            );
+        }
+
+        // The budget is spent, not exceeded: a match whose cost it cannot cover is not
+        // walked, and nothing after it is either.
+        let mut budget = 4_usize;
+        assert!(
+            !matches_within("abcde", "abcde", CASE_SENSITIVE, &mut budget),
+            "a match costing more than the remaining budget is not walked"
+        );
+        assert_eq!(budget, 0, "a spent budget is spent, got {budget}");
+    }
+
+    #[test]
+    fn a_redirect_renders_under_one_budget_and_nothing_past_it() {
+        let listener = ListenerRecord {
+            protocol: Some("HTTP".to_string()),
+            port: Some(80),
+            ..ListenerRecord::default()
+        };
+        let request = DataPlaneRequest {
+            method: "GET".to_string(),
+            path: "/img/cat.png".to_string(),
+            query: "size=large".to_string(),
+            host: "shop.example.com".to_string(),
+            ..DataPlaneRequest::default()
+        };
+        // Each placeholder is replaced by what the request carried, and the literal text
+        // around it is kept.
+        let rows: &[(&str, &str, &str)] = &[
+            ("the protocol", PROTOCOL_PLACEHOLDER, "HTTP"),
+            ("the host", HOST_PLACEHOLDER, "shop.example.com"),
+            ("the port", PORT_PLACEHOLDER, "80"),
+            ("the path without its leading slash", PATH_PLACEHOLDER, "img/cat.png"),
+            ("the query without its question mark", QUERY_PLACEHOLDER, "size=large"),
+            ("a literal", "/moved", "/moved"),
+            (
+                "a placeholder inside literal text",
+                "/new/#{path}?v=2",
+                "/new/img/cat.png?v=2",
+            ),
+            (
+                "the same placeholder twice",
+                "#{host}.#{host}",
+                "shop.example.com.shop.example.com",
+            ),
+        ];
+        for (case, template, expected) in rows {
+            let mut budget = MAX_REDIRECT_RENDER_CHARS;
+            let rendered = substituted(template, &listener, &request, &mut budget);
+            assert_eq!(
+                rendered.as_deref(),
+                Some(*expected),
+                "case {case:?}: expected {expected:?}, got {rendered:?}"
+            );
+            assert!(
+                budget < MAX_REDIRECT_RENDER_CHARS,
+                "case {case:?}: every character rendered is charged to the budget, which is \
+                 still {budget}"
+            );
+        }
+
+        // A template holding many placeholders cannot multiply the request's own text into
+        // a URL of the caller's choosing: the rendering stops at the bound, and nothing
+        // past it is built.
+        let many = PATH_PLACEHOLDER.repeat(MAX_REDIRECT_RENDER_CHARS);
+        let long_path = format!("/{}", "a".repeat(MAX_MATCHED_CHARS));
+        let request = DataPlaneRequest {
+            path: long_path,
+            ..request
+        };
+        let mut budget = MAX_REDIRECT_RENDER_CHARS;
+        assert!(
+            substituted(&many, &listener, &request, &mut budget).is_none(),
+            "a rendering past the bound produces nothing"
+        );
+        assert_eq!(budget, 0, "the bound is spent, got {budget}");
+    }
+
+    #[test]
+    fn a_prefixed_addressing_names_the_load_balancer_and_the_request_path() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                "/_aws/elasticloadbalancing/my-alb/a",
+                Some(("my-alb", "/a")),
+            ),
+            (
+                "/_aws/elasticloadbalancing/my-alb-123.us-west-2.elb.amazonaws.com/a/b",
+                Some(("my-alb-123.us-west-2.elb.amazonaws.com", "/a/b")),
+            ),
+            ("/_aws/elasticloadbalancing/my-alb", Some(("my-alb", "/"))),
+            ("/_aws/elasticloadbalancing/", None),
+            ("/_aws/execute-api/my-alb/a", None),
+            ("/_aws/elasticloadbalancingv2/my-alb/a", None),
+            ("/a", None),
+            ("/", None),
+        ];
+        for (path, expected) in cases {
+            let resolved = prefixed_addressing(path);
+            assert_eq!(
+                resolved, *expected,
+                "case {path:?}: expected {expected:?}, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_is_read_the_way_the_front_door_reads_it() {
+        // A host that names no service is the emulator's own endpoint, which is the only
+        // address a client on this machine can reach.
+        for host in ["127.0.0.1:9297", "localhost:9297", "[::1]:9297", "[::1]"] {
+            assert!(
+                !names_a_service(host),
+                "case {host:?}: a loopback host names no service"
+            );
+        }
+        for host in [
+            "elasticloadbalancing.us-west-2.amazonaws.com",
+            "elasticloadbalancingv2.us-west-2.amazonaws.com:443",
+        ] {
+            assert!(
+                names_a_service(host),
+                "case {host:?}: a service endpoint names its service"
+            );
+        }
+        assert_eq!(
+            addressed_port(Some("my-alb.us-west-2.elb.amazonaws.com:8080")),
+            Some(8080),
+            "the port a host names is the one the client addressed"
+        );
+        assert_eq!(
+            addressed_port(Some("my-alb.us-west-2.elb.amazonaws.com")),
+            None,
+            "a host naming no port leaves the listener to be chosen by the load balancer"
+        );
+    }
+}

@@ -45,7 +45,11 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for, and so the Region the buckets live in
 /// and the one every destination ARN names.
-const REGION: &str = "us-east-1";
+///
+/// `pub(crate)`, like the harness below it: the multipart half of this same rule
+/// ([`super::multipart_upload_event_notifications`]) drives its requests and reads its
+/// deliveries through these rather than standing up a second router of its own.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every emulator ARN carries (`engine::emulator_account_id`).
 const ACCOUNT: &str = "000000000000";
@@ -55,7 +59,7 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// The `Id` every queue configuration below carries, which a delivered record reports as
 /// its `configurationId`.
-const CONFIGURATION_ID: &str = "delivery";
+pub(crate) const CONFIGURATION_ID: &str = "delivery";
 
 /// How long a wait for a delivery lasts before giving up. A delivery is made on a task of
 /// its own as soon as the operation that produced it is answered, so this is many
@@ -75,26 +79,27 @@ const PACKAGE_ZIP_FILE: &str = "ZGVwbG95bWVudC1wYWNrYWdl";
 
 /// S3, EventBridge, SQS and Lambda over one shared engine, reached exactly the way the
 /// production router reaches them.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     headers: http::HeaderMap,
     body: bytes::Bytes,
 }
 
 impl Answer {
     /// The body as text, for a failure message.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
-    /// A response header's value.
-    fn header(&self, name: &str) -> Option<String> {
+    /// A response header's value — among them the entity tag an uploaded part is
+    /// recorded with.
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -117,7 +122,7 @@ impl Answer {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -140,7 +145,7 @@ impl Emulator {
     /// the way it does in production. Neither the key id nor the signature is a
     /// credential: this harness turns request authentication off, exactly as the emulator
     /// runs it unless started with authentication on.
-    async fn send(
+    pub(crate) async fn send(
         &self,
         signing_name: &str,
         method: &str,
@@ -174,7 +179,7 @@ impl Emulator {
     }
 
     /// One S3 request carrying an XML (or empty) payload.
-    async fn s3_xml(&self, method: &str, uri: &str, body: &str) -> Answer {
+    pub(crate) async fn s3_xml(&self, method: &str, uri: &str, body: &str) -> Answer {
         self.send(
             "s3",
             method,
@@ -268,7 +273,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>` — `CreateBucket`.
-    async fn create_bucket(&self, bucket: &str) {
+    pub(crate) async fn create_bucket(&self, bucket: &str) {
         self.create_bucket_of(bucket, BucketKind::Plain).await;
     }
 
@@ -378,7 +383,7 @@ impl Emulator {
     /// `PUT /<bucket>?notification` — `PutBucketNotificationConfiguration` with one
     /// destination configuration and, when `event_bridge` is on, the
     /// `EventBridgeConfiguration` element.
-    async fn put_notification(
+    pub(crate) async fn put_notification(
         &self,
         bucket: &str,
         destination: &Destination<'_>,
@@ -424,7 +429,7 @@ impl Emulator {
     }
 
     /// Create the queue named `name` and answer its url.
-    async fn create_queue(&self, name: &str) -> String {
+    pub(crate) async fn create_queue(&self, name: &str) -> String {
         let created = self.sqs("CreateQueue", &json!({ "QueueName": name })).await;
         created["QueueUrl"]
             .as_str()
@@ -479,7 +484,7 @@ impl Emulator {
 
     /// The first message the queue receives, waiting up to [`DELIVERY_BUDGET`] for the
     /// delivery, or `None` when none arrives in that time.
-    async fn delivered(&self, queue_url: &str) -> Option<Value> {
+    pub(crate) async fn delivered(&self, queue_url: &str) -> Option<Value> {
         let deadline = Instant::now() + DELIVERY_BUDGET;
         loop {
             let mut messages = self.drain(queue_url).await;
@@ -495,7 +500,7 @@ impl Emulator {
 
     /// Whatever the queue receives over [`QUIET_BUDGET`], which is how a row asserts that
     /// NOTHING was delivered.
-    async fn nothing_delivered(&self, queue_url: &str) -> Vec<Value> {
+    pub(crate) async fn nothing_delivered(&self, queue_url: &str) -> Vec<Value> {
         let deadline = Instant::now() + QUIET_BUDGET;
         let mut drained = Vec::new();
         while Instant::now() < deadline {
@@ -513,7 +518,7 @@ impl Emulator {
 /// on each configuration's ARN member
 /// (`smithy_query(query="shape",shape="NotificationConfiguration")`): the Lambda list is
 /// `CloudFunctionConfiguration` and its ARN member is `CloudFunction`.
-struct Destination<'a> {
+pub(crate) struct Destination<'a> {
     element: &'a str,
     arn_element: &'a str,
     arn: &'a str,
@@ -521,7 +526,7 @@ struct Destination<'a> {
 
 impl<'a> Destination<'a> {
     /// The SQS queue `arn` names, as a `QueueConfiguration`.
-    fn queue(arn: &'a str) -> Self {
+    pub(crate) fn queue(arn: &'a str) -> Self {
         Self {
             element: "QueueConfiguration",
             arn_element: "Queue",
@@ -542,12 +547,12 @@ impl<'a> Destination<'a> {
 /// `key` as a REQUEST addresses it: the path segment a client sends, with the one
 /// character the rows carry that a URI cannot hold literally percent-encoded. What S3
 /// then stores is the decoded key, which is what the assertions compare against.
-fn request_key(key: &str) -> String {
+pub(crate) fn request_key(key: &str) -> String {
     key.replace(' ', "%20")
 }
 
 /// The ARN of the queue named `name` in this account.
-fn queue_arn(name: &str) -> String {
+pub(crate) fn queue_arn(name: &str) -> String {
     format!("arn:aws:sqs:{REGION}:{ACCOUNT}:{name}")
 }
 

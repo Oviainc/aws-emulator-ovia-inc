@@ -3,22 +3,18 @@
 //! @op ListActionExecutions
 //! Reports the action executions of a stored pipeline, from this service's state.
 //!
-//! An action execution comes into being when a pipeline execution REACHES the action,
-//!
-//! which in this emulator is when the execution starts: what an execution begins with
-//! are the actions of the executed pipeline version's first stage at that stage's
-//! lowest `runOrder`, so starting one records an `InProgress`
-//! `crate::state::ActionExecutionRecord` for each of them. They are minted by
-//! `record_execution` in `crate::state`, the one way an execution enters the store, so
-//! every call that starts an execution records the same thing. Nothing here RUNS an
-//! action, so no record ever moves to an outcome and no later `runOrder` or stage
-//! starts — this listing reports exactly what started, never an outcome nothing
-//! produced.
+//! An action execution comes into being when a pipeline execution REACHES the action:
+//! the actions the execution begins with (its first stage's, at that stage's lowest
+//! `runOrder`) are reached at the start, and every later action when the execution
+//! plane starts it. Each one is reported from that execution's own plan
+//! (`crate::state::action_executions_for_pipeline`), so an action's status and the
+//! outcome of its work are the ones the engine, the approver or the job worker that
+//! moved it recorded — never an outcome nothing produced.
 //!
 //! Everything else is computed from the store: the pipeline the required
 //! `pipelineName` names must exist, an execution id the filter names must name an
 //! execution of THAT pipeline (the rule `ListRuleExecutions` applies to the same two
-//! filter members), the page runs most recently started first, and the cursor is the
+//! filter members), the page runs newest execution first, and the cursor is the
 //! id of the first record that did not fit on it.
 //!
 //! ## Shape of an operation
@@ -189,12 +185,13 @@ fn latest_only(filter: Option<&ActionExecutionFilter>) -> bool {
 /// the listing's order (which is newest first, so the first record seen for an action
 /// is its latest).
 fn latest_per_action(
-    records: Vec<&crate::state::ActionExecutionRecord>,
-) -> Vec<&crate::state::ActionExecutionRecord> {
-    let mut seen: ::std::collections::BTreeSet<(&str, &str)> = ::std::collections::BTreeSet::new();
+    records: Vec<crate::state::ActionExecutionRecord>,
+) -> Vec<crate::state::ActionExecutionRecord> {
+    let mut seen: ::std::collections::BTreeSet<(String, String)> =
+        ::std::collections::BTreeSet::new();
     records
         .into_iter()
-        .filter(|record| seen.insert((record.stage_name.as_str(), record.action_name.as_str())))
+        .filter(|record| seen.insert((record.stage_name.clone(), record.action_name.clone())))
         .collect()
 }
 
@@ -282,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The order this listing pages through is the store's: the pipeline's action
         // executions, most recently started first.
-        let selected: Vec<&crate::state::ActionExecutionRecord> = state
+        let selected: Vec<crate::state::ActionExecutionRecord> = state
             .action_executions_for_pipeline(&input.pipeline_name)
             .into_iter()
             .filter(|record| selected_by(input.filter.as_ref(), record))

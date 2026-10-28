@@ -679,6 +679,10 @@ pub mod ssml {
 ///
 /// Every character of plain text; for `ssml`, the text content only, because "SSML
 /// tags are not counted as billed characters" (`TextLengthExceededException`). The
+/// text content of an SSML document is every character it carries between its tags,
+/// however that character is spelled: a character written as an entity reference or a
+/// numeric character reference bills as the one character it stands for, the same way
+/// a literal one does. The
 /// SSML document is read with a real XML parser and every element it carries is
 /// checked against the published vocabulary ([`ssml`]), so `Err` here means the SSML
 /// is not well-formed, or not the SSML Amazon Polly accepts — both of which are
@@ -712,6 +716,20 @@ pub fn billed_characters(text: &str, text_type: &str) -> Result<usize, String> {
             Event::CData(ref c) => {
                 billed = billed
                     .saturating_add(String::from_utf8_lossy(c.as_ref()).chars().count());
+            }
+            // The reader BREAKS text at a reference and emits the reference on its
+            // own, so a loop reading only text events would bill none of the
+            // characters the document spells with `&amp;` or `&#NN;` — and those are
+            // text content, which is billed, not markup, which is not.
+            Event::GeneralRef(ref reference) => {
+                let name = reference.decode().map_err(|e| e.to_string())?;
+                // Reconstructed and unescaped so a predefined entity and a numeric
+                // character reference resolve the same way, and a reference that
+                // stands for nothing stays an error rather than billing as nothing.
+                let reconstructed = format!("&{name};");
+                let resolved =
+                    quick_xml::escape::unescape(&reconstructed).map_err(|e| e.to_string())?;
+                billed = billed.saturating_add(resolved.chars().count());
             }
             _ => {}
         }
@@ -1449,6 +1467,25 @@ mod tests {
         assert_eq!(plain, 11, "plain text bills every character");
         let ssml = billed_characters("<speak>hello world</speak>", "ssml").expect("valid ssml");
         assert_eq!(ssml, 11, "SSML tags are not billed, got {ssml}");
+        // A character spelled as a reference is text content, so it bills as the one
+        // character it stands for, whichever spelling it arrives in.
+        let table: [(&str, &str, usize); 4] = [
+            ("predefined entity", "<speak>a&amp;b</speak>", 3),
+            ("numeric reference", "<speak>&#120;&#120;&#120;</speak>", 3),
+            ("hexadecimal reference", "<speak>&#x78;y</speak>", 2),
+            (
+                "references around markup",
+                "<speak>&lt;<break time=\"1s\"/>&gt;</speak>",
+                2,
+            ),
+        ];
+        for (case, text, expected) in table {
+            let billed = billed_characters(text, "ssml").expect("valid ssml");
+            assert_eq!(
+                billed, expected,
+                "case {case:?}: expected {expected} billed characters, got {billed}"
+            );
+        }
         assert!(
             billed_characters("<speak>unclosed", "ssml").is_err(),
             "malformed SSML must be rejected"

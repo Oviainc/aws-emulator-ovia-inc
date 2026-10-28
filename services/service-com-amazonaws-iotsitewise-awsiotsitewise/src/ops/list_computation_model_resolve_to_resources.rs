@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComputationModelResolveToResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComputationModelResolveToResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComputationModelResolveToResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation lists, from the shared engine store (`crate::state`),
+//! one summary per DISTINCT resource that the actions executed on the computation
+//! model the request names resolved to, ordered by that resource's id so
+//! `nextToken` resumes a stable enumeration; a `computationModelId` this store does
+//! not hold is the modelled 404 rather than an empty page. This is the ONLY file to
+//! touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComputationModelResolveToResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComputationModelResolveToResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComputationModelResolveToResources"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        // Nothing a summary carries is scoped to the caller's region — it names the
+        // asset an executed action resolved to — so this listing reads no value off
+        // the request itself.
+        let _ = ctx;
+
+        // A pure read: nothing below writes, so two callers listing in either order
+        // see the same resolved resources.
+        let store = state.lock();
+
+        // The listing is OF one computation model, so an id naming none is the
+        // modelled 404 rather than an empty page, which would report an absent model
+        // as one whose actions resolved to nothing.
+        if !store
+            .computation_models
+            .contains_key(&input.computation_model_id)
+        {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_COMPUTATION_MODEL,
+                &input.computation_model_id,
+            )));
+        }
+
+        // "All distinct resources that are resolved from the executed actions of the
+        // computation model": derived from the records those executes left in this
+        // store, through the one rule every view of them shares, so a resource acted
+        // on repeatedly is reported once and a model whose actions resolved to
+        // nothing reports an empty list.
+        let resolved = store.computation_model_resolved_assets(&input.computation_model_id);
+        let resolved: Vec<&str> = resolved.iter().map(String::as_str).collect();
+
+        // This enumeration's resume point is the resolved resource's own id, and the
+        // page walk every paginated listing of this service shares takes it from
+        // there: it resumes at the token's entry, refusing a token whose resume point
+        // is not in this enumeration rather than answering an empty page; it cuts the
+        // page at `maxResults`, defaulting to this service's page size; and it mints
+        // "the token for the next set of paginated results, or null if there are no
+        // additional results" off the entry that follows the page, so a page that
+        // leaves nothing to resume from reports no token at all.
+        let page = crate::state::page_of(
+            &resolved,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |asset_id: &&str| *asset_id,
+        )
+        .ok_or_else(invalid_token)?;
+
+        Ok(ListComputationModelResolveToResourcesOutput {
+            computation_model_resolve_to_resource_summaries: resolved[page.start..page.end]
+                .iter()
+                .map(|asset_id| ComputationModelResolveToResourceSummary {
+                    // "A summary of the resource that a computation model resolves
+                    // to" carries that resource as the one reference shape every
+                    // view of a resolved resource in this service reports it by.
+                    resolve_to: Some(ResolveTo {
+                        asset_id: (*asset_id).to_string(),
+                    }),
+                })
+                .collect(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the operation documents `maxResults` only as "The
+/// maximum number of results returned for each paginated request". It is the
+/// default this service's other paginated listings already use, so a client that
+/// pages without asking for a size sees one page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+///
+/// The wording every paginated operation of this service refuses an unusable
+/// token with, so a client matching on the message sees one string whichever
+/// listing it was paging.
+fn invalid_token() -> ListComputationModelResolveToResourcesError {
+    ListComputationModelResolveToResourcesErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        },
+    )
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListComputationModelResolveToResourcesError {
+    ListComputationModelResolveToResourcesErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    )
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> ListComputationModelResolveToResourcesError {
+    ListComputationModelResolveToResourcesErrorModeled::InternalFailureException(
+        InternalFailureException {
+            message: "the IoT SiteWise store is unavailable".to_string(),
+        },
+    )
+    .into()
 }

@@ -25,15 +25,18 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     ActionConfiguration, ActionConfigurationProperty, ActionContext, ActionDeclaration,
-    ActionExecutionDetail, ActionExecutionInput, ActionRevision, ActionType,
+    ActionExecutionDetail, ActionExecutionInput, ActionExecutionOutput, ActionExecutionResult,
+    ActionRevision, ActionType,
     ActionTypeDeclaration, ActionTypeId, ActionTypeIdentifier, ActionTypeProperty,
     ActionTypeSettings, Artifact, ArtifactDetail, ArtifactDetails, ArtifactLocation, Condition,
-    ConditionState, CurrentRevision, EncryptionKey, ExecutionDetails, ExecutionTrigger,
+    ConditionState, CurrentRevision, EncryptionKey, ErrorDetails, ExecutionDetails,
+    ExecutionTrigger,
     FailureDetails, Job,
     JobData, ListWebhookItem, PipelineContext, PipelineDeclaration, PipelineExecution,
     PipelineExecutionSummary, PipelineMetadata, PipelineRollbackMetadata, PipelineSummary,
     PipelineVariable,
-    ResolvedPipelineVariable, RuleState, S3ArtifactLocation, SourceRevision, StageConditionState,
+    ResolvedPipelineVariable, RuleState, S3ArtifactLocation, S3Location, SourceRevision,
+    StageConditionState,
     StageContext, Tag, ThirdPartyJob, TransitionState, WebhookDefinition,
 };
 
@@ -461,17 +464,6 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// Execution ids per pipeline name, oldest first (so newest-first listing is
     /// this sequence reversed).
     pub executions_by_pipeline: BTreeMap<String, Vec<String>>,
-    /// Stored action executions, keyed by their generated `actionExecutionId` — what
-    /// `ListActionExecutions` reports. An entry comes into being when the pipeline
-    /// execution it belongs to starts the action
-    /// ([`ActionExecutionRecord::start`]) and lives exactly as long as that
-    /// execution's record, so a listing never reports an action execution of an
-    /// execution no caller can read.
-    pub action_executions: BTreeMap<String, ActionExecutionRecord>,
-    /// Action execution ids per `pipelineExecutionId`, in the order the actions
-    /// started — the same oldest-first shape [`Self::executions_by_pipeline`] has,
-    /// so one order serves both the listing and the eviction.
-    pub action_executions_by_execution: BTreeMap<String, Vec<String>>,
     /// The revision each action currently carries, keyed by `(pipeline name, stage
     /// name, action name)` — what `PutActionRevision` reports about a source and what
     /// the next report of the same source is compared against. Bounded by the stored
@@ -597,24 +589,6 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         candidate
     }
 
-    /// A fresh `actionExecutionId` neither the store nor `minted` already uses.
-    ///
-    /// The same rule [`Self::new_execution_id`] applies to an execution id: 122
-    /// random bits, and the store checked anyway so uniqueness is a property of the
-    /// state rather than of the odds. `minted` carries the ids already handed out in
-    /// the same call but not yet stored, so one call minting several ids cannot hand
-    /// out the same one twice either. Bounded, so a request can never spin.
-    fn fresh_action_execution_id(&self, minted: &BTreeSet<String>) -> String {
-        let mut candidate = random_uuid_v4();
-        for _ in 0..8 {
-            if !self.action_executions.contains_key(&candidate) && !minted.contains(&candidate) {
-                break;
-            }
-            candidate = random_uuid_v4();
-        }
-        candidate
-    }
-
     /// Record `record` as its pipeline's newest execution and return its id.
     ///
     /// The retained history is bounded TWICE: by
@@ -627,12 +601,11 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// tokens that named them — otherwise a token would keep naming an execution no
     /// caller can read, and the maps would grow per request without limit.
     ///
-    /// Starting an execution also records the action executions its first stage begins
-    /// with, so `ListActionExecutions` reports them from the same instant the start
-    /// returns: this is the one way an execution enters the store, so
-    /// `StartPipelineExecution` and `PutActionRevision` cannot disagree about what a
-    /// started execution has running. Those records are dropped with the execution they
-    /// belong to, here and in [`Self::forget_pipeline`].
+    /// The action executions `ListActionExecutions` reports are not stored beside the
+    /// execution: they ARE the execution's own plan, read from it
+    /// ([`Self::action_executions_for_pipeline`]), so what a listing reports about an
+    /// action and what `GetPipelineState` reports about it cannot drift apart, and an
+    /// execution dropped here takes its action executions with it.
     pub fn record_execution(
         &mut self,
         record: PipelineExecutionRecord,
@@ -640,17 +613,7 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     ) -> String {
         let pipeline_name = record.pipeline_name.clone();
         let execution_id = record.pipeline_execution_id.clone();
-        let started = self.starting_action_executions(&record);
         self.executions.insert(execution_id.clone(), record);
-        for action_execution in started {
-            let action_execution_id = action_execution.action_execution_id.clone();
-            self.action_executions_by_execution
-                .entry(execution_id.clone())
-                .or_default()
-                .push(action_execution_id.clone());
-            self.action_executions
-                .insert(action_execution_id, action_execution);
-        }
 
         let mut evicted: Vec<String> = {
             let history = self
@@ -687,7 +650,6 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         if !evicted.is_empty() {
             for id in &evicted {
                 self.executions.remove(id);
-                self.forget_action_executions(id);
             }
             self.idempotency.retain(|_, id| !evicted.contains(id));
             // A job waits for the execution that queued it, so an execution no caller
@@ -859,113 +821,87 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         });
     }
 
-    /// The action executions a freshly started `execution` begins with: one per
-    /// action the execution runs FIRST — the actions of the first stage of its own
-    /// PLAN at that stage's lowest `runOrder` — each `InProgress` as of the
-    /// execution's start.
+    /// Every action execution of `pipeline_name`'s retained executions, newest
+    /// execution first — the order `ListActionExecutions` pages through.
     ///
-    /// The first stage of the plan is the pipeline's first stage for an execution that
-    /// runs the pipeline forward, and the rolled-back stage for a stage rollback,
-    /// whose plan holds that stage alone.
+    /// An action execution exists exactly for an action one of those executions has
+    /// REACHED: the actions it begins with (the first stage of its own plan, at that
+    /// stage's lowest `runOrder`) are reached at the start, and every later action when
+    /// the engine starts it ([`driver`]). What each one reports — its status, when it
+    /// started and last changed, and the outcome of its work — is read from that
+    /// execution's own plan ([`execution::ActionRun`]), which is the single place an
+    /// action's state lives: whoever moves an action (the engine, an approver, a job
+    /// worker) therefore moves what this listing reports, and the listing cannot drift
+    /// from what `GetPipelineState` reports about the same action.
     ///
-    /// An action execution exists only once the execution has reached that action, so
-    /// nothing is minted for a later stage, for a higher `runOrder` in the first
-    /// stage, or for a pipeline version that declares no stage or no action at all:
-    /// those actions have not started, and an action that has not started has no
-    /// execution to report. Nothing in this emulator finishes an action either (see
-    /// [`ACTION_STATUS_IN_PROGRESS`]), so nothing later moves the execution on to the
-    /// next `runOrder` or the next stage.
-    ///
-    /// The declaration read is the one the execution RUNS
+    /// The declaration each record's input is read from is the one its execution RUNS
     /// ([`Pipeline::declaration_at`]), not whatever version the pipeline carries now,
     /// so a later `UpdatePipeline` cannot change what an execution already started.
-    fn starting_action_executions(
-        &self,
-        execution: &PipelineExecutionRecord,
-    ) -> Vec<ActionExecutionRecord> {
-        let Some(pipeline) = self.pipelines.get(&execution.pipeline_name) else {
-            return Vec::new();
-        };
-        let Some(declaration) = pipeline.declaration_at(Some(execution.pipeline_version)) else {
-            return Vec::new();
-        };
-        let Some(stage) = execution
-            .stages
-            .first()
-            .and_then(|run| declared_stage(declaration, run))
-        else {
-            return Vec::new();
-        };
-        let Some(first_run_order) = stage.actions.iter().map(run_order).min() else {
-            return Vec::new();
-        };
-        // The action's Region, when its declaration names none, is the Region the
-        // pipeline itself lives in, which is the one its stored ARN carries.
-        let pipeline_region = parse_resource_arn(&pipeline.arn).map(|arn| arn.region);
-        let mut minted: BTreeSet<String> = BTreeSet::new();
-        let mut started = Vec::new();
-        for action in &stage.actions {
-            if run_order(action) != first_run_order {
-                continue;
-            }
-            // Minted against the store and against the ids this call has already
-            // handed out, so no two action executions share an id however many
-            // executions the store holds.
-            let action_execution_id = self.fresh_action_execution_id(&minted);
-            minted.insert(action_execution_id.clone());
-            started.push(ActionExecutionRecord::start(
-                action_execution_id,
-                execution,
-                &stage.name,
-                action,
-                declaration,
-                pipeline_region.clone(),
-            ));
-        }
-        started
-    }
-
-    /// Drop every action execution recorded for the pipeline execution `execution_id`.
-    fn forget_action_executions(&mut self, execution_id: &str) {
-        for action_execution_id in self
-            .action_executions_by_execution
-            .remove(execution_id)
-            .unwrap_or_default()
-        {
-            self.action_executions.remove(&action_execution_id);
-        }
-    }
-
-    /// Every action execution of `pipeline_name`'s retained executions, most recently
-    /// started first — the order `ListActionExecutions` pages through.
-    ///
-    /// An action execution starts when the execution containing it reaches the
-    /// action, so the newest execution's action executions come first; within one
-    /// execution the actions that started together are reported in the order the
-    /// stage declares them, which is the order they were recorded in.
     pub fn action_executions_for_pipeline(
         &self,
         pipeline_name: &str,
-    ) -> Vec<&ActionExecutionRecord> {
-        self.executions_by_pipeline
+    ) -> Vec<ActionExecutionRecord> {
+        let mut records = Vec::new();
+        for execution_id in self
+            .executions_by_pipeline
             .get(pipeline_name)
             .into_iter()
             .flatten()
             .rev()
-            .filter_map(|execution_id| self.action_executions_by_execution.get(execution_id))
-            .flatten()
-            .filter_map(|action_execution_id| self.action_executions.get(action_execution_id))
-            .collect()
+        {
+            let Some(execution) = self.executions.get(execution_id) else {
+                continue;
+            };
+            let Some(pipeline) = self.pipelines.get(&execution.pipeline_name) else {
+                continue;
+            };
+            let Some(declaration) = pipeline.declaration_at(Some(execution.pipeline_version))
+            else {
+                continue;
+            };
+            // The action's Region, when its declaration names none, is the Region the
+            // pipeline itself lives in, which is the one its stored ARN carries.
+            let pipeline_region = parse_resource_arn(&pipeline.arn).map(|arn| arn.region);
+            for (position, run) in execution.stages.iter().enumerate() {
+                let Some(stage) = declared_stage(declaration, run) else {
+                    continue;
+                };
+                // The actions this execution BEGINS with: the first stage of its plan —
+                // the pipeline's first stage for an execution that runs forward, and the
+                // rolled-back stage for a stage rollback, whose plan holds that stage
+                // alone — at that stage's lowest declared `runOrder`.
+                let begins_with = position == 0;
+                let first_run_order = stage.actions.iter().map(run_order).min();
+                for (index, action) in stage.actions.iter().enumerate() {
+                    let Some(action_run) = run.actions.get(index) else {
+                        continue;
+                    };
+                    let reached = action_run.status.is_some()
+                        || (begins_with && Some(run_order(action)) == first_run_order);
+                    if !reached {
+                        continue;
+                    }
+                    records.push(ActionExecutionRecord::of(
+                        execution,
+                        action_run,
+                        &stage.name,
+                        action,
+                        declaration,
+                        pipeline_region.clone(),
+                    ));
+                }
+            }
+        }
+        records
     }
 
-    /// Forget a pipeline: the declaration, the executions still retained for it, the
-    /// action executions those executions started, the idempotency tokens that named
-    /// them, and the revisions its actions carried.
+    /// Forget a pipeline: the declaration, the executions still retained for it (and
+    /// so the action executions those executions carried), the idempotency tokens that
+    /// named them, and the revisions its actions carried.
     pub fn forget_pipeline(&mut self, name: &str) {
         self.pipelines.remove(name);
         for id in self.executions_by_pipeline.remove(name).unwrap_or_default() {
             self.executions.remove(&id);
-            self.forget_action_executions(&id);
         }
         // The jobs those executions queued for a custom action's worker go with them:
         // a deleted pipeline has no action left waiting for one.
@@ -3335,7 +3271,12 @@ impl PipelineExecutionRecord {
             status_summary: self.status_summary.clone(),
             start_time: Some(to_date_time(self.start_time)),
             last_update_time: Some(to_date_time(self.last_update_time)),
-            source_revisions: optional_list(self.source_revisions.clone()),
+            // `PipelineExecutionSummary$sourceRevisions` is "a list of the source
+            // artifact revisions for this pipeline execution": the list is part of the
+            // summary's shape, so an execution that resolved none reports it EMPTY
+            // rather than absent — a caller may index it without first telling an
+            // execution with no revisions from a missing member.
+            source_revisions: Some(self.source_revisions.clone()),
             trigger: Some(self.trigger.clone()),
             stop_trigger: self.stop.as_ref().map(|stop| crate::ops::types::StopExecutionTrigger {
                 reason: stop.reason.clone(),
@@ -3386,26 +3327,33 @@ pub struct ActionExecutionRecord {
     pub last_update_time: SystemTime,
     /// The action's input, as its declaration configures it.
     pub input: ActionExecutionInput,
+    /// What the action's run produced, once it has produced anything.
+    pub output: Option<ActionExecutionOutput>,
 }
 
 impl ActionExecutionRecord {
-    /// The record for `action` of `stage` starting as part of `execution`.
+    /// The action execution of `action_run` — the run of `action`, in `stage`, of
+    /// `execution`.
+    ///
+    /// Everything about the RUN is read from the plan: the id it is reported under, the
+    /// `ActionExecutionStatus` it carries (an action the execution has reached and that
+    /// has not started its work yet is `InProgress`, which is what it is), when it
+    /// started, when it last changed and what its work produced.
     ///
     /// The input is the declaration's: the action's type id, its configured
     /// `configuration`, the role it assumes (its own `roleArn` when it declares one,
     /// else the pipeline's, which `ActionExecutionInput$roleArn` documents as "assumed
     /// through the roleArn for the pipeline"), its Region, its variable namespace and
     /// the input artifacts it consumes — each by the name the declaration gives it,
-    /// with no `s3location`, because this emulator stores no artifact and so has no
-    /// location to report for one.
+    /// with no `s3location`, because the location an input artifact was read at is the
+    /// producing action's output rather than this action's declaration.
     ///
-    /// `output` and `updatedBy` are absent: the first is what the action produced,
-    /// which nothing has produced yet, and the second is the identity of the user who
-    /// last changed the execution, which this emulator does not resolve (the same
-    /// reason `ExecutionTrigger$triggerDetail` is absent).
-    fn start(
-        action_execution_id: String,
+    /// `updatedBy` is absent: it is the identity of the user who last changed the
+    /// execution, which this emulator does not resolve (the same reason
+    /// `ExecutionTrigger$triggerDetail` is absent).
+    fn of(
         execution: &PipelineExecutionRecord,
+        action_run: &ActionRun,
         stage_name: &str,
         action: &ActionDeclaration,
         declaration: &PipelineDeclaration,
@@ -3413,15 +3361,18 @@ impl ActionExecutionRecord {
     ) -> Self {
         let configuration = action.configuration.clone();
         Self {
-            action_execution_id,
+            action_execution_id: action_run.action_execution_id.clone(),
             pipeline_execution_id: execution.pipeline_execution_id.clone(),
             pipeline_name: execution.pipeline_name.clone(),
             pipeline_version: execution.pipeline_version,
             stage_name: stage_name.to_string(),
             action_name: action.name.clone(),
-            status: ACTION_STATUS_IN_PROGRESS.to_string(),
-            start_time: execution.start_time,
-            last_update_time: execution.start_time,
+            status: action_run
+                .status
+                .clone()
+                .unwrap_or_else(|| ACTION_STATUS_IN_PROGRESS.to_string()),
+            start_time: action_run.start_time.unwrap_or(execution.start_time),
+            last_update_time: action_run.last_status_change,
             input: ActionExecutionInput {
                 action_type_id: Some(action.action_type_id.clone()),
                 resolved_configuration: configuration
@@ -3448,6 +3399,7 @@ impl ActionExecutionRecord {
                 }),
                 namespace: action.namespace.clone(),
             },
+            output: action_execution_output(execution, action_run, action),
         }
     }
 
@@ -3466,12 +3418,75 @@ impl ActionExecutionRecord {
             updated_by: None,
             status: Some(self.status.clone()),
             input: Some(self.input.clone()),
-            // What the action produced. The engine records an action's outcome on the
-            // execution's own plan (`execution::ActionRun`), so this record carries no
-            // output of its own rather than an invented one.
-            output: None,
+            output: self.output.clone(),
         }
     }
+}
+
+/// What an action's run produced, or `None` while it has produced nothing.
+///
+/// An action that has not reported an outcome has no output at all: nothing has run, so
+/// there are no artifacts, no result and no variables to report. Once it HAS — by its
+/// own work, by an approver or by a job worker — the output is what that outcome was:
+/// the artifacts it actually produced into the artifact store (an empty list for an
+/// action that produced none, which is a fact about the run rather than a missing
+/// member), the external run its work was performed as, the summary that run reported,
+/// the `errorDetails` of a failure, and the output variables it published under the
+/// namespace it declares.
+fn action_execution_output(
+    execution: &PipelineExecutionRecord,
+    action_run: &ActionRun,
+    action: &ActionDeclaration,
+) -> Option<ActionExecutionOutput> {
+    if !action_run.is_terminal() {
+        return None;
+    }
+    let output_artifacts = action
+        .output_artifacts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|artifact| {
+            let location = execution.artifacts.get(&artifact.name)?;
+            Some(ArtifactDetail {
+                name: Some(artifact.name.clone()),
+                s3location: Some(S3Location {
+                    bucket: Some(location.bucket.clone()),
+                    key: Some(location.key.clone()),
+                }),
+            })
+        })
+        .collect();
+    let output_variables: HashMap<String, String> = action
+        .namespace
+        .as_deref()
+        .map(|namespace| {
+            let prefix = format!("{namespace}.");
+            execution
+                .variables_map
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((key.strip_prefix(&prefix)?.to_string(), value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ActionExecutionOutput {
+        output_artifacts: Some(output_artifacts),
+        execution_result: Some(ActionExecutionResult {
+            external_execution_id: action_run.external_execution_id.clone(),
+            // What the run reported about itself, which is the same text the action's
+            // state reports as its `summary`.
+            external_execution_summary: action_run.summary.clone(),
+            external_execution_url: None,
+            error_details: action_run.error.as_ref().map(|(code, message)| ErrorDetails {
+                code: Some(code.clone()),
+                message: Some(message.clone()),
+            }),
+            log_stream_arn: None,
+        }),
+        output_variables: (!output_variables.is_empty()).then_some(output_variables),
+    })
 }
 
 /// The `runOrder` `action` runs in: the one it declares, else [`DEFAULT_RUN_ORDER`].
@@ -3764,6 +3779,93 @@ pub fn resolved_execution_mode(declaration: &PipelineDeclaration) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_EXECUTION_MODE)
         .to_string()
+}
+
+/// The `TriggerType` an execution started by the pipeline's own creation records, from
+/// the model's enum (`smithy_query query="shape" shape="TriggerType"`, as
+/// `crate::ops::types::TRIGGER_TYPE_VALUES` lists it): creating a pipeline RUNS it once,
+/// and this is the trigger that run carries.
+pub const TRIGGER_TYPE_CREATE_PIPELINE: &str = "CreatePipeline";
+
+/// Start one execution of the stored pipeline `pipeline_name`, triggered by
+/// `trigger_type`, and answer the id it was recorded under.
+///
+/// This is the start that carries NO caller input: the execution runs the pipeline's
+/// current version, with the variables the declaration itself resolves, no
+/// source-revision override and no idempotency token. It is what makes a pipeline run
+/// on an event of the pipeline rather than on a request about an execution — creating
+/// the pipeline, which runs it once.
+///
+/// `None` when the pipeline is not stored, when its declaration states no artifact
+/// store for `region` (an execution could not produce an artifact at all) or when the
+/// pipeline already carries every concurrent execution it may: the event has no caller
+/// to refuse, so no execution is recorded and the pipeline is left as it is. The
+/// execution's first step becomes due a span from `now` ([`execution::ACTION_STEP`]),
+/// so the caller publishes the start and the driver materialises the steps the clock
+/// makes due ([`advance`]).
+pub fn start_execution(
+    store: &mut ComAmazonawsCodepipelineCodepipeline20150709State,
+    pipeline_name: &str,
+    trigger_type: &str,
+    region: &str,
+    now: SystemTime,
+) -> Option<String> {
+    let pipeline = store.pipelines.get(pipeline_name)?;
+    let declaration = pipeline.declaration.clone();
+    let pipeline_version = pipeline.version;
+    let (artifact_bucket, artifact_encryption_key) = artifact_store(&declaration, region)?;
+    // The declaration's own variables, resolved exactly as a start that overrides none
+    // resolves them; a declaration whose variables cannot be resolved could not run,
+    // and an event that starts a run has no caller to refuse.
+    let variables = resolve_execution_variables(&declaration, &[]).ok()?;
+    let execution_mode = resolved_execution_mode(&declaration);
+    let queued = match store.admit_execution(pipeline_name, &execution_mode, now) {
+        ExecutionAdmission::AtLimit => return None,
+        ExecutionAdmission::Queued => true,
+        ExecutionAdmission::Started => false,
+    };
+    let record = PipelineExecutionRecord {
+        pipeline_execution_id: store.new_execution_id(),
+        pipeline_name: pipeline_name.to_string(),
+        pipeline_version,
+        status: STATUS_IN_PROGRESS.to_string(),
+        status_summary: None,
+        start_time: now,
+        last_update_time: now,
+        trigger: ExecutionTrigger {
+            trigger_type: Some(trigger_type.to_string()),
+            // `ExecutionTrigger$triggerDetail` carries the ARN of the user who ran the
+            // command; this emulator does not resolve a caller identity, so the member
+            // is absent rather than invented.
+            trigger_detail: None,
+        },
+        execution_mode,
+        execution_type: EXECUTION_TYPE_STANDARD.to_string(),
+        variables_map: variables
+            .iter()
+            .filter_map(|variable| {
+                Some((
+                    format!("variables.{}", variable.name.clone()?),
+                    variable.resolved_value.clone()?,
+                ))
+            })
+            .collect(),
+        variables,
+        // Nothing pinned a revision and no source action has resolved one yet, so the
+        // execution carries none until one does.
+        source_revisions: Vec::new(),
+        source_overrides: Vec::new(),
+        stages: plan_stages(&declaration, now),
+        artifact_bucket,
+        artifact_encryption_key,
+        queued,
+        stop: None,
+        artifacts: BTreeMap::new(),
+        manual_retry_attempts: 0,
+        // An execution that runs the pipeline forward rolls nothing back.
+        rollback_target: None,
+    };
+    Some(store.record_execution(record, None))
 }
 
 /// The pipeline structure to REPORT for `declaration`: the stored one, with every

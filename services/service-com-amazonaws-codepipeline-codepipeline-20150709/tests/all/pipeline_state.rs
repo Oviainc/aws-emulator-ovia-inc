@@ -279,10 +279,20 @@ async fn the_state_reports_every_stored_stage_and_action_in_order() {
                 );
             }
 
-            // No execution has been started for these pipelines, so no stage and no
-            // action has an execution to report — and a revision only
-            // `PutActionRevision` records is not reported either.
+            // Creating a pipeline RUNS it once, so the run that creation started has
+            // entered the FIRST stage (it reports that execution) and waits at the one
+            // after it (which reports it as the execution inbound to it); nothing has
+            // reached any stage beyond that, and a revision only `PutActionRevision`
+            // records is not reported anywhere.
+            let entered_by_the_creation_run = position == 0;
+            let waited_at_by_the_creation_run = position == 1;
             for absent in ["latestExecution", "inboundExecution", "inboundExecutions"] {
+                if entered_by_the_creation_run && absent == "latestExecution" {
+                    continue;
+                }
+                if waited_at_by_the_creation_run && absent == "inboundExecution" {
+                    continue;
+                }
                 assert!(
                     reported.get(absent).is_none(),
                     "case {label:?} stage {stage:?}: nothing ran this stage, so {absent} \
@@ -290,11 +300,18 @@ async fn the_state_reports_every_stored_stage_and_action_in_order() {
                 );
             }
             for action in reported["actionStates"].as_array().expect("action states") {
-                for absent in ["latestExecution", "currentRevision", "entityUrl", "revisionUrl"] {
+                for absent in ["currentRevision", "entityUrl", "revisionUrl"] {
                     assert!(
                         action.get(absent).is_none(),
                         "case {label:?} stage {stage:?}: nothing ran this action, so \
                          {absent} must be absent, got {action}"
+                    );
+                }
+                if !entered_by_the_creation_run {
+                    assert!(
+                        action.get("latestExecution").is_none(),
+                        "case {label:?} stage {stage:?}: no execution has reached this \
+                         action, so latestExecution must be absent, got {action}"
                     );
                 }
             }
@@ -496,7 +513,9 @@ async fn reporting_the_state_changes_nothing() {
         executions["pipelineExecutionSummaries"]
             .as_array()
             .map(Vec::len),
-        Some(1),
+        // The two the calls above began: the run the pipeline's creation started and
+        // the one the start did. Reporting the state begins none.
+        Some(2),
         "reporting the state must not start an execution, got {executions}"
     );
 }

@@ -33,6 +33,8 @@ mod pls_replacement_measurement;
 // drive.
 #[path = "all/shared_pls_fixture.rs"]
 mod shared_pls_fixture;
+#[path = "all/ssml_billed_characters.rs"]
+mod ssml_billed_characters;
 #[path = "all/ssml_vocabulary.rs"]
 mod ssml_vocabulary;
 #[path = "all/state_roundtrip.rs"]

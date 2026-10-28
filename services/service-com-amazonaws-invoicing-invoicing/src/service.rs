@@ -125,7 +125,7 @@ struct ServedOperation {
     ) -> Option<Vec<Violation>>,
     /// The media type this operation's responses announce, when it is NOT the one
     /// `override_protocol` serves service-wide: `Some(TAG_PLANE_MEDIA_TYPE)` for the
-    /// tag plane, `None` for an invoice-unit operation.
+    /// tag plane, `None` for every other plane.
     media_type: Option<&'static str>,
 }
 
@@ -151,10 +151,14 @@ struct ServedOperation {
 ///    the whole service, so the per-plane part is stamped here, on everything those
 ///    operations answer — a success and a modelled failure alike.
 ///
-/// Only the operations this emulator IMPLEMENTS are served here. A scaffolded
-/// operation answers HTTP 501 and asserts nothing about its behaviour, so restating
-/// its refusals or its media type would claim a fidelity it does not have; each of
-/// those is its own stub issue.
+/// EVERY operation this emulator implements is served here, whichever plane it belongs
+/// to: the modelled refusal body is a property of the REFUSAL — the model gives
+/// `ValidationException` the same `reason` and `fieldList` members for every operation —
+/// so leaving an implemented operation out would answer one class of refusal two ways,
+/// with the member detail for some operations and the message envelope alone for the
+/// rest. A scaffolded operation is the one exclusion: it answers HTTP 501 and asserts
+/// nothing about its behaviour, so restating its refusals or its media type would claim a
+/// fidelity it does not have; each of those is its own stub issue.
 ///
 /// Generic over the engine type for the same reason the rest of this file is: the
 /// operations whose schemas and routing keys it reads are, so naming a concrete engine
@@ -162,111 +166,79 @@ struct ServedOperation {
 struct FrontDoor<Eng>(::std::marker::PhantomData<Eng>);
 
 impl<Eng: Send + Sync + 'static> FrontDoor<Eng> {
-    /// Every operation this seam serves. Each entry names the operation through its own
-    /// `Operation` impl, so the routing key and the input schema come from the model.
-    fn operations() -> [ServedOperation; 9] {
+    /// Every operation this seam serves: EVERY operation this crate implements, which is
+    /// every operation of the model but the one still scaffolded. Each entry names the
+    /// operation through its own `Operation` impl, so the routing key and the input schema
+    /// come from the model.
+    fn operations() -> [ServedOperation; 20] {
         use crate::ops;
         [
-            ServedOperation {
-                name: <ops::create_invoice_unit::CreateInvoiceUnit<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::CreateInvoiceUnitInput>(
-                        protocol,
-                        req,
-                        <ops::create_invoice_unit::CreateInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: None,
-            },
-            ServedOperation {
-                name: <ops::get_invoice_unit::GetInvoiceUnit<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::GetInvoiceUnitInput>(
-                        protocol,
-                        req,
-                        <ops::get_invoice_unit::GetInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: None,
-            },
-            ServedOperation {
-                name: <ops::list_invoice_units::ListInvoiceUnits<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::ListInvoiceUnitsInput>(
-                        protocol,
-                        req,
-                        <ops::list_invoice_units::ListInvoiceUnits<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: None,
-            },
-            ServedOperation {
-                name: <ops::update_invoice_unit::UpdateInvoiceUnit<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::UpdateInvoiceUnitInput>(
-                        protocol,
-                        req,
-                        <ops::update_invoice_unit::UpdateInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: None,
-            },
-            ServedOperation {
-                name: <ops::delete_invoice_unit::DeleteInvoiceUnit<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::DeleteInvoiceUnitInput>(
-                        protocol,
-                        req,
-                        <ops::delete_invoice_unit::DeleteInvoiceUnit<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: None,
-            },
-            ServedOperation {
-                name: <ops::list_invoice_summaries::ListInvoiceSummaries<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::ListInvoiceSummariesInput>(
-                        protocol,
-                        req,
-                        <ops::list_invoice_summaries::ListInvoiceSummaries<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: None,
-            },
-            ServedOperation {
-                name: <ops::list_tags_for_resource::ListTagsForResource<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::ListTagsForResourceInput>(
-                        protocol,
-                        req,
-                        <ops::list_tags_for_resource::ListTagsForResource<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: Some(TAG_PLANE_MEDIA_TYPE),
-            },
-            ServedOperation {
-                name: <ops::tag_resource::TagResource<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::TagResourceInput>(
-                        protocol,
-                        req,
-                        <ops::tag_resource::TagResource<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: Some(TAG_PLANE_MEDIA_TYPE),
-            },
-            ServedOperation {
-                name: <ops::untag_resource::UntagResource<Eng> as Operation>::NAME,
-                violations: |protocol, req| {
-                    Self::violations::<ops::types::UntagResourceInput>(
-                        protocol,
-                        req,
-                        <ops::untag_resource::UntagResource<Eng> as Operation>::INPUT_SCHEMA,
-                    )
-                },
-                media_type: Some(TAG_PLANE_MEDIA_TYPE),
-            },
+            // The invoice-unit plane.
+            Self::served::<ops::create_invoice_unit::CreateInvoiceUnit<Eng>>(None),
+            Self::served::<ops::get_invoice_unit::GetInvoiceUnit<Eng>>(None),
+            Self::served::<ops::list_invoice_units::ListInvoiceUnits<Eng>>(None),
+            Self::served::<ops::update_invoice_unit::UpdateInvoiceUnit<Eng>>(None),
+            Self::served::<ops::delete_invoice_unit::DeleteInvoiceUnit<Eng>>(None),
+            Self::served::<ops::list_invoice_summaries::ListInvoiceSummaries<Eng>>(None),
+            // The invoice-profile plane.
+            Self::served::<ops::batch_get_invoice_profile::BatchGetInvoiceProfile<Eng>>(None),
+            // The procurement-portal plane.
+            Self::served::<
+                ops::create_procurement_portal_preference::CreateProcurementPortalPreference<Eng>,
+            >(None),
+            Self::served::<
+                ops::get_procurement_portal_preference::GetProcurementPortalPreference<Eng>,
+            >(None),
+            Self::served::<
+                ops::put_procurement_portal_preference::PutProcurementPortalPreference<Eng>,
+            >(None),
+            Self::served::<
+                ops::delete_procurement_portal_preference::DeleteProcurementPortalPreference<Eng>,
+            >(None),
+            Self::served::<
+                ops::update_procurement_portal_preference_status::UpdateProcurementPortalPreferenceStatus<
+                    Eng,
+                >,
+            >(None),
+            Self::served::<
+                ops::send_procurement_portal_validation::SendProcurementPortalValidation<Eng>,
+            >(None),
+            Self::served::<
+                ops::verify_procurement_portal_validation::VerifyProcurementPortalValidation<Eng>,
+            >(None),
+            Self::served::<
+                ops::list_procurement_portal_preferences::ListProcurementPortalPreferences<Eng>,
+            >(None),
+            Self::served::<ops::list_procurement_portals::ListProcurementPortals<Eng>>(None),
+            Self::served::<
+                ops::list_procurement_portal_suppliers::ListProcurementPortalSuppliers<Eng>,
+            >(None),
+            // The tag plane, which announces its own media type.
+            Self::served::<ops::list_tags_for_resource::ListTagsForResource<Eng>>(Some(
+                TAG_PLANE_MEDIA_TYPE,
+            )),
+            Self::served::<ops::tag_resource::TagResource<Eng>>(Some(TAG_PLANE_MEDIA_TYPE)),
+            Self::served::<ops::untag_resource::UntagResource<Eng>>(Some(TAG_PLANE_MEDIA_TYPE)),
         ]
+    }
+
+    /// One entry of the table above, read off the operation itself: `Op` carries the
+    /// routing key the model names it by, the input schema a request for it is validated
+    /// against, and — as [`Operation::Input`] — the shape that request is read into. Taking
+    /// all three from the one type is what keeps an entry from naming one operation's key
+    /// beside another's input, and leaves an entry nothing to state but the media type.
+    fn served<Op: Operation>(media_type: Option<&'static str>) -> ServedOperation {
+        ServedOperation {
+            name: <Op as Operation>::NAME,
+            violations: |protocol, req| {
+                Self::violations::<<Op as Operation>::Input>(
+                    protocol,
+                    req,
+                    <Op as Operation>::INPUT_SCHEMA,
+                )
+            },
+            media_type,
+        }
     }
 
     /// The violations in `req` read against `schema`, the way the framework's own walk
@@ -397,12 +369,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // The invoice-unit and tag operations need it: a refused input is stated in
-        // this service's own modelled `ValidationException` — with the modelled
-        // `reason` and `fieldList` — instead of the framework's generic refusal body,
-        // and the tag plane announces its own media type. See [`FrontDoor`] for why
-        // neither can be done from inside `handle`. The operation names are read from
-        // the model, not spelled out, and a request naming any other operation is left
+        // Every implemented operation needs it: a refused input is stated in this
+        // service's own modelled `ValidationException` — with the modelled `reason` and
+        // `fieldList` — instead of the framework's generic refusal body, and the tag
+        // plane announces its own media type. See [`FrontDoor`] for why neither can be
+        // done from inside `handle`. The operation names are read from the model, not
+        // spelled out, and a request naming an operation that is still scaffolded is left
         // to the generated routing table.
         let routing_key = self.definition().protocol().routing_key(req).ok()?;
         FrontDoor::<Eng>::operations()

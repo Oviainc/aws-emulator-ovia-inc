@@ -492,6 +492,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sources.push(StoredSource::from_set_request(request, name, &region, suffix));
         }
 
+        // `SourcePriority$PrimarySource` is "the name of the source you choose as the
+        // primary source for this flow" — the last request-local reference this handler
+        // resolves, against the sources THIS request creates, which are all the sources a
+        // flow being created has. Resolved through the one function the update path
+        // resolves it with, so a create stores no failover setting UpdateFlow would
+        // refuse; and checked before anything is stored, so a request naming a primary
+        // source it does not create stores no flow at all.
+        if let Some(rejection) = crate::state::flow_primary_source_rejection(
+            input
+                .source_failover_config
+                .as_ref()
+                .and_then(|config| config.source_priority.as_ref()),
+            source_names.iter().map(String::as_str),
+        ) {
+            return Err(bad_request(rejection));
+        }
+
         // An output's name is unique within its flow, so the outputs this request
         // creates are named against each other as well as against the flow's (empty,
         // for a flow being created) set.

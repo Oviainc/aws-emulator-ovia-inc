@@ -71,6 +71,8 @@ mod sandbox_sessions;
 mod source_credentials;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_build_batch.rs"]
+mod stop_build_batch;
 #[path = "all/update_fleet.rs"]
 mod update_fleet;
 #[path = "all/update_project.rs"]

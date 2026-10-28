@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteReceiptRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteReceiptRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteReceiptRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE receipt rule from a rule set the account holds, leaving the rules it
+//! keeps in the order incoming mail is evaluated in. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +130,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteReceiptRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteReceiptRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteReceiptRule"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let rule_set_name = input.rule_set_name;
+        let rule_name = input.rule_name;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `delete_receipt_rule_set.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and the only error this
+            // operation models would claim the rule set does not exist, which is
+            // a different thing to say.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteReceiptRule",
+            ));
+        };
+        let mut state = state.lock();
+
+        // Both names IDENTIFY a record the account already holds, so a name
+        // outside the documented form needs no refusal of its own: a name SES
+        // cannot hold is a name the store does not hold. The rule set is resolved
+        // FIRST — a rule of a set that does not exist is not a rule this account
+        // has, and that is the one refusal this operation models.
+        let Some(rule_set) = state.receipt_rule_sets.get_mut(&rule_set_name) else {
+            return Err(
+                DeleteReceiptRuleErrorModeled::RuleSetDoesNotExistException(
+                    RuleSetDoesNotExistException {
+                        name: Some(rule_set_name.clone()),
+                        message: Some(format!("Rule set does not exist: {rule_set_name}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Deletes the specified receipt rule": the rule leaves the set's ordered
+        // rule list and the rules after it close up, so the order the rules the
+        // set keeps are evaluated in is unchanged. This operation models no
+        // not-found error for the RULE, so a name the set does not hold is
+        // already in the state the caller asked for: the call succeeds having
+        // removed nothing, and the active rule set is not special — a rule may be
+        // taken out of the set email receiving is served by.
+        // The removal says whether a rule was taken out; this operation answers
+        // the same either way, so the answer is deliberately not read here.
+        let _removed = rule_set.remove_rule(&rule_name);
+
+        Ok(DeleteReceiptRuleOutput {})
     }
 }

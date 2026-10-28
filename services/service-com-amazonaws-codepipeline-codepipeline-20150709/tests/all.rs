@@ -29,6 +29,8 @@ mod action_type_definitions;
 mod action_type_provider_entitlement;
 #[path = "all/approval_result_messages.rs"]
 mod approval_result_messages;
+#[path = "all/codecommit_source_actions.rs"]
+mod codecommit_source_actions;
 #[path = "all/custom_action_job_results.rs"]
 mod custom_action_job_results;
 #[path = "all/custom_action_jobs.rs"]
