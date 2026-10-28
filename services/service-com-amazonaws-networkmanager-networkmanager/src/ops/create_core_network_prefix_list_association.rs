@@ -202,40 +202,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
         // same request answers the association the first call stored instead of storing a
-        // second one; the same token asking for something else is a conflict.
-        if let Some(token) = input
-            .client_token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-        {
-            if let Some(existing) = store
-                .prefix_list_associations
-                .values()
-                .find(|record| record.client_token.as_deref() == Some(token))
-            {
-                let same_request = existing.core_network_id == input.core_network_id
+        // second one; the same token asking for something else is a conflict. The walk
+        // itself — the token normalisation, the store lookup and the replay-or-refuse
+        // branch — is [`crate::state::replay_or_conflict`], the one every tokened operation
+        // of this service goes through, so what is left here is only what makes a stored
+        // association THIS request.
+        let client_token = crate::state::normalized_client_token(input.client_token);
+        if let Some(existing) = crate::state::replay_or_conflict(
+            client_token.as_deref(),
+            store.prefix_list_associations.values(),
+            |existing| {
+                existing.core_network_id == input.core_network_id
                     && existing.prefix_list_arn == input.prefix_list_arn
-                    && existing.prefix_list_alias == input.prefix_list_alias;
-                if same_request {
-                    return Ok(reported(existing));
-                }
-                return Err(
-                    CreateCoreNetworkPrefixListAssociationErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "client token {token:?} already associated prefix list {} with core network {}, with a different request",
-                                existing.prefix_list_arn, existing.core_network_id
-                            ),
-                            resource_id: crate::state::prefix_list_association_key(
-                                &existing.core_network_id,
-                                &existing.prefix_list_arn,
-                            ),
-                            resource_type: crate::state::PREFIX_LIST_ASSOCIATION_KIND.to_string(),
-                        },
-                    )
-                    .into(),
-                );
-            }
+                    && existing.prefix_list_alias == input.prefix_list_alias
+            },
+            |existing| crate::state::ClientTokenConflict {
+                effect: format!(
+                    "associated prefix list {} with core network {}",
+                    existing.prefix_list_arn, existing.core_network_id
+                ),
+                resource_id: crate::state::prefix_list_association_key(
+                    &existing.core_network_id,
+                    &existing.prefix_list_arn,
+                ),
+                resource_type: crate::state::PREFIX_LIST_ASSOCIATION_KIND.to_string(),
+            },
+        )
+        .map_err(CreateCoreNetworkPrefixListAssociationErrorModeled::ConflictException)?
+        {
+            return Ok(reported(existing));
         }
 
         // The association's identity IS the core network / prefix list pair, so a repeat of
@@ -293,7 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             core_network_id: input.core_network_id,
             prefix_list_arn: input.prefix_list_arn,
             prefix_list_alias: input.prefix_list_alias,
-            client_token: input.client_token.filter(|token| !token.is_empty()),
+            client_token,
         };
         let answer = reported(&record);
         store.prefix_list_associations.insert(key, record);

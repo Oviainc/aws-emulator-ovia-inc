@@ -178,41 +178,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClientToken` is this operation's modelled `@idempotencyToken`, so a retry of
         // the same put answers the version the first call minted instead of appending a
         // second identical one; the same token carrying a different document or
-        // description is a conflict. An empty token is no token, and the one normalisation
-        // here is what both the lookup and the stored record use.
-        let client_token = input.client_token.filter(|token| !token.is_empty());
-        if let Some(token) = client_token.as_deref() {
-            if let Some(existing) = core_network
-                .policy_versions
-                .values()
-                .find(|version| version.client_token.as_deref() == Some(token))
-            {
-                let same_request = existing.document == input.policy_document
-                    && existing.description == input.description;
-                let version_id = existing.version_id;
-                if same_request {
-                    // Answered from the version the first call stored, so the success
-                    // payload can never be an absent `CoreNetworkPolicy`.
-                    let alias = core_network.policy_alias_of(version_id);
-                    return Ok(PutCoreNetworkPolicyOutput {
-                        core_network_policy: Some(existing.to_shape(alias, now)),
-                    });
-                }
-                return Err(PutCoreNetworkPolicyErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "client token {token:?} already created policy version {version_id} of core network {}, with a different request",
-                            input.core_network_id
-                        ),
-                        resource_id: crate::state::policy_version_resource_id(
-                            &input.core_network_id,
-                            version_id,
-                        ),
-                        resource_type: crate::state::CORE_NETWORK_POLICY_KIND.to_string(),
-                    },
-                )
-                .into());
-            }
+        // description is a conflict. The walk itself — the token normalisation, the lookup
+        // over the versions this core network holds and the replay-or-refuse branch — is
+        // [`crate::state::replay_or_conflict`], the one every tokened operation of this
+        // service goes through, so what is left here is only what makes a stored version
+        // THIS put.
+        let client_token = crate::state::normalized_client_token(input.client_token);
+        let replay = crate::state::replay_or_conflict(
+            client_token.as_deref(),
+            core_network.policy_versions.values(),
+            |existing| {
+                existing.document == input.policy_document
+                    && existing.description == input.description
+            },
+            |existing| crate::state::ClientTokenConflict {
+                effect: format!(
+                    "created policy version {} of core network {}",
+                    existing.version_id, input.core_network_id
+                ),
+                resource_id: crate::state::policy_version_resource_id(
+                    &input.core_network_id,
+                    existing.version_id,
+                ),
+                resource_type: crate::state::CORE_NETWORK_POLICY_KIND.to_string(),
+            },
+        )
+        .map_err(PutCoreNetworkPolicyErrorModeled::ConflictException)?;
+        if let Some(existing) = replay {
+            // Answered from the version the first call stored, so the success payload can
+            // never be an absent `CoreNetworkPolicy`.
+            let alias = core_network.policy_alias_of(existing.version_id);
+            return Ok(PutCoreNetworkPolicyOutput {
+                core_network_policy: Some(existing.to_shape(alias, now)),
+            });
         }
 
         // `LatestVersionId` is what the caller asserts the newest version of this policy
