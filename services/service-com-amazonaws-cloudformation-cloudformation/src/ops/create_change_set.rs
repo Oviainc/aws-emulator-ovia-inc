@@ -802,6 +802,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Validated and within quota: from here the call allocates.
         let change_set_id = crate::state::new_change_set_id(&region, &input.change_set_name);
+        // The id of the operation creating this change set is: every event the creation
+        // records carries it, so the events of one change-set creation are reportable as
+        // that operation's ([`crate::state::StoredOperation`]).
+        let operation_id = crate::state::new_operation_id();
         let stack_id = match target_stack_id {
             Some(stack_id) => stack_id,
             None => {
@@ -824,7 +828,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     now,
                     status::REVIEW_IN_PROGRESS,
                     Some(crate::state::USER_INITIATED.to_string()),
-                    None,
+                    Some(operation_id.clone()),
                     None,
                 );
                 store.stacks.push(stack);
@@ -833,7 +837,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `Stack$ChangeSetId` is the change set that last acted on the stack. A CREATE
         // change set is the only thing that has acted on the stack it created.
-        let operation_id = crate::state::new_operation_id();
         if let Some(stack) = store.resolve_mut(&region, &stack_id) {
             if creates_the_stack {
                 stack.change_set_id = Some(change_set_id.clone());
@@ -842,9 +845,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `CREATE_CHANGESET` operation type names. On a stack that ALREADY exists
                 // a change set changes nothing until it is executed, so that stack's last
                 // operation stays the create or update that last acted on it.
-                stack.record_operation(
+                stack.record_change_set_operation(
                     crate::state::operation_type::CREATE_CHANGESET,
                     &operation_id,
+                    Some(change_set_id.clone()),
+                    now,
                 );
             }
         }
