@@ -259,6 +259,12 @@ mod delete_vpn_connection;
 // insert their two lines, and these two lost three serialized squash merges at the tail.
 #[path = "all/create_snapshots.rs"]
 mod create_snapshots;
+// Which other VPCs `DescribeSecurityGroupReferences` reports as referencing one of the
+// account's security groups, and what it refuses. Declared in the MIDDLE of the list for the
+// reason the suites above give: the head and the tail are both where concurrent ec2 landings
+// insert their two lines, and these two lost two serialized squash merges at the head.
+#[path = "all/security_group_references.rs"]
+mod security_group_references;
 #[path = "all/coip_pools.rs"]
 mod coip_pools;
 #[path = "all/confirm_product_instance.rs"]
