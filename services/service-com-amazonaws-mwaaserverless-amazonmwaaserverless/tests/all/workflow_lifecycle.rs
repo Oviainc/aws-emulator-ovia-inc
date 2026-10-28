@@ -119,9 +119,8 @@ impl Harness {
     }
 
     /// The engine this emulator reads and writes, so a suite can inspect or seed a
-    /// record no modelled operation of this service creates — a run's task
-    /// instances, which come into being only when something executes a workflow
-    /// definition and nothing in this emulator does.
+    /// record of its own — a run's clock fields, or a task instance carrying an
+    /// execution this emulator never performs.
     pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
         &self.engine
     }
@@ -797,8 +796,8 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
         for member in ["CompletedOn", "Duration", "ErrorMessage", "TaskInstances"] {
             assert!(
                 detail[member].is_null(),
-                "case {case:?}: {member} is null while the run is not complete and holds \
-                 no task instance, got {:?}",
+                "case {case:?}: {member} is null while the run is not complete and its \
+                 version's definition declares no task, got {:?}",
                 detail[member]
             );
         }
