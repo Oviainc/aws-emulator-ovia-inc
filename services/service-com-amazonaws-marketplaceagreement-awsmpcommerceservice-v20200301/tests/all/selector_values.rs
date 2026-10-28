@@ -62,11 +62,16 @@ const PUBLISHED_STATUSES: &[&str] = &[
 
 /// Every value `EndTimeBehaviorType` carries
 /// (`smithy_query(query="shape", shape="EndTimeBehaviorType")`).
-const PUBLISHED_END_TIME_BEHAVIORS: &[&str] = &["EXPIRE", "RENEW", "REPLACE"];
+///
+/// `pub(crate)` because the `end_time_behavior_projections` suite sends every
+/// published value of both sets at the two behaviour filters rather than keeping
+/// a second copy of the value sets.
+pub(crate) const PUBLISHED_END_TIME_BEHAVIORS: &[&str] = &["EXPIRE", "RENEW", "REPLACE"];
 
 /// Every value `EndTimeBehaviorReasonCode` carries
-/// (`smithy_query(query="shape", shape="EndTimeBehaviorReasonCode")`).
-const PUBLISHED_END_TIME_REASON_CODES: &[&str] = &[
+/// (`smithy_query(query="shape", shape="EndTimeBehaviorReasonCode")`). See
+/// [`PUBLISHED_END_TIME_BEHAVIORS`] for why it is `pub(crate)`.
+pub(crate) const PUBLISHED_END_TIME_REASON_CODES: &[&str] = &[
     "ACCEPTOR_RENEW_OPTED_OUT",
     "NO_RENEWAL_TERM",
     "PROPOSER_RENEW_OPTED_OUT",

@@ -218,7 +218,10 @@ async fn described(router: &MultiServiceRouter, agreement: &str) -> Answer {
 }
 
 /// The `AgreementViewSummary` `SearchAgreements` reports for `agreement`.
-async fn summary_of(router: &MultiServiceRouter, agreement: &str) -> Value {
+///
+/// `pub(crate)` because the `end_time_behavior_projections` suite reads the same
+/// projection of the same agreements rather than spelling a second lookup.
+pub(crate) async fn summary_of(router: &MultiServiceRouter, agreement: &str) -> Value {
     let answer = search(router, json!({"filters": with_agreement_type(&json!([]))})).await;
     assert_eq!(
         answer.status, 200,
@@ -236,7 +239,9 @@ async fn summary_of(router: &MultiServiceRouter, agreement: &str) -> Value {
 
 /// The agreement ids one search selects, as a set so a row says WHICH agreements
 /// a filter selects without restating the order the sort owns.
-async fn selected(router: &MultiServiceRouter, filters: Value) -> BTreeSet<String> {
+///
+/// `pub(crate)` for the same reason as [`summary_of`].
+pub(crate) async fn selected(router: &MultiServiceRouter, filters: Value) -> BTreeSet<String> {
     let answer = search(router, json!({"filters": with_agreement_type(&filters)})).await;
     assert_eq!(
         answer.status, 200,
@@ -269,7 +274,9 @@ pub(crate) fn filter_instant(instant: f64) -> String {
 }
 
 /// A set of the ids given, for comparing against what a filter selected.
-fn ids(agreements: &[&String]) -> BTreeSet<String> {
+///
+/// `pub(crate)` for the same reason as [`summary_of`].
+pub(crate) fn ids(agreements: &[&String]) -> BTreeSet<String> {
     agreements.iter().map(|id| (*id).clone()).collect()
 }
 

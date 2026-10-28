@@ -39,6 +39,8 @@ mod cancellation_request_withdrawal;
 mod charge_amounts;
 #[path = "all/client_token_scope.rs"]
 mod client_token_scope;
+#[path = "all/end_time_behavior_projections.rs"]
+mod end_time_behavior_projections;
 #[path = "all/entitlement_resources.rs"]
 mod entitlement_resources;
 #[path = "all/error_bodies.rs"]

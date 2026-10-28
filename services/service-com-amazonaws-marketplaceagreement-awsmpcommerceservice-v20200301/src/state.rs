@@ -2249,22 +2249,26 @@ impl Agreement {
         })
     }
 
-    /// What happens to this agreement at its end date.
+    /// What happens to this agreement at its end date, computed from the end
+    /// date and the accepted terms it stores: `None` only for an agreement that
+    /// has no end date, which "never reach[es] an end time", as
+    /// `AgreementViewSummary$endTimeBehaviorType` states its single null case.
     ///
-    /// `DescribeAgreementOutput$endTimeBehavior` states when the member is
-    /// reported at all: "This field is present for every active agreement that
-    /// has an end date. It is not present for an agreement that has no end
-    /// date… It is also not present for an agreement that is no longer active."
-    /// The behaviour itself follows `EndTimeBehavior`: `RENEW` when the accepted
+    /// This is the behaviour itself, so it is the value every projection whose
+    /// member documents no further null case reports, whatever status the
+    /// agreement has reached: a cancellation or a replacement leaves the stored
+    /// end date and accepted terms untouched, so what the agreement does at that
+    /// date stays computable from them. The projection that withholds it from an
+    /// inactive agreement is [`Agreement::end_time_behavior`], which states that
+    /// rule from its own member.
+    ///
+    /// The behaviour follows `EndTimeBehavior`: `RENEW` when the accepted
     /// renewal term enables auto-renewal, and otherwise `EXPIRE` with the reason
     /// the terms give — `NO_RENEWAL_TERM` when they carry no renewal term at
     /// all, `ACCEPTOR_RENEW_OPTED_OUT` when they carry one the acceptor turned
     /// off.
-    pub fn end_time_behavior(&self) -> Option<EndTimeBehavior> {
+    pub fn end_time_behavior_at_end_date(&self) -> Option<EndTimeBehavior> {
         self.end_time?;
-        if self.status != STATUS_ACTIVE {
-            return None;
-        }
         Some(match self.auto_renew() {
             Some(true) => EndTimeBehavior {
                 r#type: "RENEW".to_string(),
@@ -2285,6 +2289,21 @@ impl Agreement {
                 renewal_summary: None,
             },
         })
+    }
+
+    /// The `DescribeAgreementOutput$endTimeBehavior` projection of
+    /// [`Agreement::end_time_behavior_at_end_date`], which that member reports
+    /// under a NARROWER rule than the behaviour itself has: "This field is
+    /// present for every active agreement that has an end date. It is not
+    /// present for an agreement that has no end date… It is also not present for
+    /// an agreement that is no longer active." The second sentence belongs to
+    /// this member alone, so it is applied here rather than inside the
+    /// behaviour every other projection reads.
+    pub fn end_time_behavior(&self) -> Option<EndTimeBehavior> {
+        if self.status != STATUS_ACTIVE {
+            return None;
+        }
+        self.end_time_behavior_at_end_date()
     }
 
     /// The provisioning state of one entitlement of this agreement at `now`:
@@ -2374,8 +2393,14 @@ impl Agreement {
     }
 
     /// The `SearchAgreements` projection of this agreement.
+    ///
+    /// `endTimeBehaviorType`/`endTimeBehaviorReasonCode` carry the behaviour at
+    /// the end date itself ([`Agreement::end_time_behavior_at_end_date`]): the
+    /// summary member documents ONE null case, "agreements that have no end
+    /// date", so an agreement that has one reports what it does at that date
+    /// whatever status it has since reached.
     pub fn to_view_summary(&self) -> AgreementViewSummary {
-        let behavior = self.end_time_behavior();
+        let behavior = self.end_time_behavior_at_end_date();
         AgreementViewSummary {
             agreement_id: Some(self.id.clone()),
             acceptance_time: Some(::aws_smithy_types::DateTime::from(self.acceptance_time)),
@@ -3106,7 +3131,9 @@ fn matches_filter(agreement: &Agreement, name: &str, value: &str) -> bool {
         (Some(stored), Some(bound)) => stored > bound,
         _ => false,
     };
-    let behavior = agreement.end_time_behavior();
+    // The two end-time-behaviour filters select on the members the summary
+    // reports, so they read the same behaviour it does.
+    let behavior = agreement.end_time_behavior_at_end_date();
 
     match name {
         "ResourceIdentifier" => agreement
