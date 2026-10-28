@@ -202,6 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // error that reports it — cannot depend on whether the named stream exists.
         crate::state::check_encryption_configuration_input(&requested, &region)
             .map_err(refusal_error)?;
+        // And the CMK it names is RESOLVED against KMS before anything is recorded: a key
+        // KMS cannot serve could never wrap this stream's data, so the stream must not be
+        // reported as encrypted under it.
+        if let Some(refusal) = crate::state::unusable_kms_key(ctx, &region, &requested).await {
+            return Err(refusal_error(refusal));
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -211,10 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StartDeliveryStreamEncryptionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Firehose stream {} not found",
-                            input.delivery_stream_name
-                        )),
+                        // Scoped to the account, and NOT to the name that was probed — see
+                        // `crate::service::not_found_message`.
+                        message: Some(crate::service::not_found_message()),
                     },
                 )
                 .into(),
@@ -246,21 +251,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change has not settled yet, are both "already in use and not available for this
         // operation".
         if stream.status != crate::state::StreamStatus::Active {
-            return Err(in_use(format!(
-                "Firehose stream {} is {} and server-side encryption cannot be changed \
-                 until it is {}",
-                stream.name,
+            return Err(in_use(crate::service::encryption_blocked_by_stream_message(
+                crate::service::EncryptionChange::Enable,
+                &stream.name,
                 stream.status.as_wire(),
-                crate::state::StreamStatus::Active.as_wire()
             )));
         }
         if stream.encryption_change_in_flight() {
-            return Err(in_use(format!(
-                "server-side encryption for Firehose stream {} is {} and cannot be \
-                 changed until that change settles",
-                stream.name,
-                stream.encryption_status().unwrap_or_default()
-            )));
+            return Err(in_use(
+                crate::service::encryption_blocked_by_encryption_message(
+                    crate::service::EncryptionChange::Enable,
+                    &stream.name,
+                    stream.encryption_status().unwrap_or_default(),
+                ),
+            ));
         }
 
         // "The StartDeliveryStreamEncryption and StopDeliveryStreamEncryption operations
