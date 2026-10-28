@@ -69,6 +69,8 @@ mod map_run_updates;
 mod map_runs;
 #[path = "all/nested_type_discriminator.rs"]
 mod nested_type_discriminator;
+#[path = "all/refusal_message_wording.rs"]
+mod refusal_message_wording;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_request_id.rs"]

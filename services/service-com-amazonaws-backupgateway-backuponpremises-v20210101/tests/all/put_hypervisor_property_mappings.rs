@@ -232,7 +232,7 @@ async fn putting_mappings_persists_them_and_they_read_back() {
         let hypervisor = service_state(&*engine)
             .expect("the in-memory engine must expose this state")
             .lock()
-            .page_of_hypervisors(None, 100)
+            .page_of_hypervisors(REGION, None, 100)
             .items
             .into_iter()
             .find(|record| record.host == *host)

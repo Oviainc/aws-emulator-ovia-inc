@@ -219,7 +219,11 @@ async fn put_method_response(
 
 /// The `uri` an `AWS`/`AWS_PROXY` integration naming a Lambda function carries, in the form
 /// `Integration$uri` documents for it.
-fn lambda_uri() -> String {
+///
+/// `pub(crate)` for the sibling `request_validator_precedes_the_integration` suite, which
+/// points a validated method at a Lambda backend: one spelling of that `uri` across the
+/// suites that name one.
+pub(crate) fn lambda_uri() -> String {
     format!(
         "arn:aws:apigateway:{REGION}:lambda:path/2015-03-31/functions/\
          arn:aws:lambda:{REGION}:123456789012:function:handler/invocations"

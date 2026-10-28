@@ -61,6 +61,8 @@ mod filter_listing;
 mod filter_update_isolation;
 #[path = "all/finding_field_catalog.rs"]
 mod finding_field_catalog;
+#[path = "all/finding_record_update_clock.rs"]
+mod finding_record_update_clock;
 #[path = "all/findings_archive_shared_rule.rs"]
 mod findings_archive_shared_rule;
 #[path = "all/findings_archive_state.rs"]

@@ -857,17 +857,36 @@ impl ComAmazonawsDlmDlm20180112State {
         self.regions.values().map(RegionalPolicies::len).sum()
     }
 
-    /// The id of the policy in that region whose stored `PolicyArn` is `arn`.
+    /// The policy in that region whose stored `PolicyArn` is `arn`, or the
+    /// refusal every ARN-addressed operation answers when none is.
     ///
-    /// The tag operations address a policy by ARN; no index is kept for it,
-    /// because the ARN is derived from the id and the store is small. A stored
-    /// ARN names the region its policy lives in, so an ARN naming another region
-    /// resolves to no policy here.
-    pub fn policy_id_for_arn(&self, region: &str, arn: &str) -> Option<String> {
-        self.policies_in(region)?
-            .values()
-            .find(|policy| policy.policy_arn == arn)
-            .map(|policy| policy.policy_id.clone())
+    /// Resolving an ARN is one rule, so it lives here once: an ARN names the
+    /// policy whose STORED `PolicyArn` it equals, among the policies of the
+    /// region the request was signed for — no index is kept for it, because the
+    /// ARN is derived from the id and the store is small — and an ARN that names
+    /// none is a [`policy_not_found_by_arn`]. A stored ARN names the region its
+    /// policy lives in, so an ARN naming another region resolves to no policy
+    /// here.
+    pub fn policy_by_arn(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Result<&LifecyclePolicyRecord, ResourceNotFoundException> {
+        self.policies_in(region)
+            .and_then(|policies| policies.values().find(|policy| policy.policy_arn == arn))
+            .ok_or_else(|| policy_not_found_by_arn(arn))
+    }
+
+    /// The same rule, mutably, for the ARN-addressed operations that write.
+    pub fn policy_mut_by_arn(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Result<&mut LifecyclePolicyRecord, ResourceNotFoundException> {
+        self.regions
+            .get_mut(region)
+            .and_then(|policies| policies.values_mut().find(|policy| policy.policy_arn == arn))
+            .ok_or_else(|| policy_not_found_by_arn(arn))
     }
 }
 

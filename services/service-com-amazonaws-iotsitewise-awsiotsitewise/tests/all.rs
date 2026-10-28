@@ -151,6 +151,13 @@ mod task_lifecycle;
 #[path = "all/executions.rs"]
 mod executions;
 
+// Declared here beside the `executions` suite it belongs with, for the reason the
+// notes above give: the sorted list and the END of this file are both where every
+// concurrent iotsitewise change puts a declaration of its own. Fold it into the
+// list once the churn settles.
+#[path = "all/describe_execution_reads.rs"]
+mod describe_execution_reads;
+
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.

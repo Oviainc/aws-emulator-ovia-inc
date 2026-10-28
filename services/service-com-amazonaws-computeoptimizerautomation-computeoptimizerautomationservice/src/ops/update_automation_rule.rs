@@ -283,6 +283,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateAutomationRuleErrorModeled::OptInRequiredException(refusal).into());
         }
 
+        // An update that REPLACES the organization configuration re-scopes the
+        // rule, so it is held to the standing a create is held to: the rule may
+        // apply its actions only in accounts the caller may automate in right
+        // now — see `crate::state::…::may_scope_rule_to`. Judged AHEAD of the
+        // token ledger and of the store, so a refused update neither consumes
+        // its client token, applies a member nor bumps the revision. An update
+        // that carries no configuration re-scopes nothing and is not judged
+        // here: a member account's association governs which accounts a rule is
+        // SCOPED to, not whether the rule's other members stay maintainable.
+        if !guard.may_scope_rule_to(input.organization_configuration.as_ref()) {
+            return Err(access_denied());
+        }
+
         match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
             crate::state::TokenOutcome::Fresh => {}
             // A retry of the same update: the revision has already moved on, so
@@ -435,5 +448,17 @@ fn invalid_parameter(message: String) -> UpdateAutomationRuleError {
             message: Some(message),
         },
     )
+    .into()
+}
+
+/// The modelled 403 (`AccessDeniedException`, HTTP 403), for an update that
+/// would scope the rule to an account the caller may not automate in. The
+/// message is this service's fixed access-denied sentence: it names no account,
+/// so the refusal discloses nothing about which accounts the organization
+/// reaches.
+fn access_denied() -> UpdateAutomationRuleError {
+    UpdateAutomationRuleErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::ACCESS_DENIED_MESSAGE.into()),
+    })
     .into()
 }

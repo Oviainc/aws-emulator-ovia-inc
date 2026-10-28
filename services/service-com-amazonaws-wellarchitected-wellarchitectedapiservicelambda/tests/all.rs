@@ -381,3 +381,8 @@ mod review_template_updates;
 // lens suite falls in a crowded run of this list.
 #[path = "all/lens_share_listing.rs"]
 mod lens_share_listing;
+
+// Declared last for the same reason as the declaration above: the sorted position for a
+// check suite falls beside the per-account suite it extends, in a crowded run of this list.
+#[path = "all/check_summaries.rs"]
+mod check_summaries;

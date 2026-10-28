@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGateways
-//! Lists the gateways persisted in [`crate::state`], one `MaxResults`-sized page at a
-//! time. @readonly: it writes nothing. This is the ONLY file to touch for this
-//! operation.
+//! Lists the gateways of the region the request was addressed to, persisted in
+//! [`crate::state`], one `MaxResults`-sized page at a time. @readonly: it writes nothing.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,8 +137,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A gateway is REGIONAL — its ARN carries the region the create that minted it was
+        // signed for — and this listing reports the gateways "owned by an Amazon Web
+        // Services account in an Amazon Web Services Region", so the region the listing
+        // request itself was addressed to is what decides which records are part of it.
+        // One store serves every region a client addresses, so without this a listing
+        // would report gateways another region's endpoint owns.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListGatewaysErrorModeled::InternalServerException(InternalServerException {
@@ -176,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (max.max(1) as usize).min(crate::state::MAX_PAGE_SIZE)
         });
 
-        let page = state.lock().page_of_gateways(after.as_deref(), limit);
+        let page = state.lock().page_of_gateways(&region, after.as_deref(), limit);
 
         Ok(ListGatewaysOutput {
             gateways: Some(

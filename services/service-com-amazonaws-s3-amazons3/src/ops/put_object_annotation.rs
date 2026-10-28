@@ -225,6 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this write
+        // owes names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
         // "If the bucket is owned by a different account, the request fails with an HTTP
         // 403 (Access Denied) error" (`PutObjectAnnotationRequest$ExpectedBucketOwner`),
         // judged the way every other handler here judges it: this emulator serves one
@@ -462,9 +466,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(object) => annotated.of_object(object),
             None => annotated,
         };
-        let pending = crate::state::notifications::pending(&store, &input.bucket, &[annotated]);
+        let pending = crate::state::notifications::pending(
+            &store,
+            &input.bucket,
+            &[annotated],
+            &correlation,
+        );
         drop(store);
         crate::state::notifications::publish(ctx, pending);
+        // Recorded LAST, so the response carries the pair the notifications already named
+        // this call by.
+        correlation.answer();
 
         Ok(PutObjectAnnotationOutput {
             // "The name of the annotation" and "The object key" the annotation was attached

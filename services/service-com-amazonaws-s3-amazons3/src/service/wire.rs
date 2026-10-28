@@ -898,6 +898,46 @@ fn with_partial_content_status(response: Response) -> Response {
 /// [`with_partial_content_status`].
 const PARTIAL_CONTENT_STATUS: u16 = 206;
 
+/// The header naming the request a response answers: "`x-amz-request-id`: A value created
+/// by Amazon S3 that uniquely identifies the request" (Amazon S3 API Reference, *Common
+/// Response Headers*), which every S3 response carries — it is what a client's
+/// `ResponseMetadata.RequestId` reports and what an event notification names the call it
+/// came of by.
+const REQUEST_ID_HEADER: &str = "x-amz-request-id";
+
+/// The second correlation header of that same list: "`x-amz-id-2`: A special token that
+/// helps Amazon Web Services troubleshoot problems", reported as
+/// `ResponseMetadata.HostId`.
+const EXTENDED_REQUEST_ID_HEADER: &str = "x-amz-id-2";
+/// The pair a SUCCESS response carries: the one the operation that served the request
+/// recorded ([`crate::state::request_ids`]), so an event notification and the response of
+/// the call that produced it name the SAME request, or a freshly minted one when nothing
+/// recorded any (every operation that publishes no event).
+///
+/// TAKEN before anything that can fail, so a serializer that errors on its way to a
+/// response cannot leave a pair behind for a LATER response on this thread to pick up. An
+/// ERROR response's pair is the envelope's own — see `serialize_error`.
+fn answering_request() -> crate::state::request_ids::RequestCorrelation {
+    crate::state::request_ids::answering()
+        .unwrap_or_else(crate::state::request_ids::RequestCorrelation::mint)
+}
+
+/// `response` with the two request-correlation headers every S3 response carries.
+fn with_request_correlation(
+    mut response: Response,
+    correlation: crate::state::request_ids::RequestCorrelation,
+) -> Response {
+    // A value a header map refuses is dropped rather than turning a served response into a
+    // transport failure; both are hex, so neither ever is.
+    let _ = response
+        .headers_mut()
+        .try_insert(REQUEST_ID_HEADER, correlation.request_id);
+    let _ = response
+        .headers_mut()
+        .try_insert(EXTENDED_REQUEST_ID_HEADER, correlation.extended_request_id);
+    response
+}
+
 /// `response` with every `@xmlAttribute` member written where the API publishes it, or
 /// `response` unchanged when its body carries none.
 ///
@@ -948,6 +988,10 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         request: &'a Self::Request,
         input_schema: &Schema,
     ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
+        // Whatever this worker thread may still hold from an earlier response is dropped
+        // before this request's handler can record its own pair, so no response can ever
+        // be named by another request's id (see [`crate::state::request_ids`]).
+        crate::state::request_ids::forget_any_unanswered();
         // A request whose body IS an XML document is refused here when that document
         // carries a character XML cannot hold, before any codec reads it. See
         // [`xml_charset_violation`].
@@ -1048,6 +1092,8 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         operation_name: &str,
         success_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
+        // Taken FIRST, before anything that can fail: see [`answering_request`].
+        let correlation = answering_request();
         if UNWRAPPED_XML_OUTPUT_OPERATIONS.contains(&operation_name) {
             if let Some(body) =
                 unwrapped_document(output, output_schema).map_err(ProtocolError::Serde)?
@@ -1061,7 +1107,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 response
                     .headers_mut()
                     .insert("content-type", "application/xml");
-                return Ok(response);
+                return Ok(with_request_correlation(response, correlation));
             }
         }
         let response =
@@ -1071,7 +1117,10 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // belongs on its parent's start tag, where the API publishes it and where a
         // namespace-aware parser can read it. And a response that reports a
         // `Content-Range` carries PART of the object, which HTTP answers with 206.
-        Ok(with_partial_content_status(with_attribute_members(response)))
+        Ok(with_request_correlation(
+            with_partial_content_status(with_attribute_members(response)),
+            correlation,
+        ))
     }
 
     fn serialize_error(
@@ -1081,6 +1130,14 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         error_code: &str,
         http_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
+        // The error envelope's correlation pair is NOT this service's to choose. This
+        // model sets `noErrorWrapping` ([`NO_ERROR_WRAPPING`]), so the inner serializer
+        // writes ONE pair into both the `<RequestId>` / `<HostId>` elements of the body and
+        // the matching response headers — and the two have to agree, because a client reads
+        // the id from the body and an operator reads it from the header. A refusal
+        // publishes no event notification and so records no pair of its own, which is why
+        // there is nothing here to stamp over it with: the ONE value an error response
+        // names its request by is the one the envelope itself carries.
         self.inner
             .serialize_error(error, error_schema, error_code, http_status)
     }

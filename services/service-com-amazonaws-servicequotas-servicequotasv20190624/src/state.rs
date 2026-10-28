@@ -1332,6 +1332,30 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
     }
 
+    /// One history listing's page of records: of the `requests` selected for it, the
+    /// ones that carry `status` now and were made at a level [`requested_at_level`]
+    /// keeps, each rendered through [`Self::request_view`].
+    ///
+    /// Both history listings differ only in which requests they select — the account's
+    /// ([`Self::requests_in_history`]) or one quota's
+    /// ([`Self::requests_for_quota`]) — and then apply this one rule to them, so it
+    /// lives here once rather than in each handler: a caller that names no `Status`
+    /// gets every status, and a caller that names one gets exactly the requests whose
+    /// stored status equals it.
+    pub fn history_view(
+        &self,
+        requests: Vec<QuotaRequest>,
+        status: Option<&str>,
+        level: Option<&str>,
+    ) -> Vec<RequestedServiceQuotaChange> {
+        requests
+            .into_iter()
+            .filter(|request| status.is_none_or(|status| request.status == status))
+            .filter(|request| requested_at_level(&request.quota_requested_at_level, level))
+            .map(|request| self.request_view(&request))
+            .collect()
+    }
+
     /// Start a quota utilization report: reuse the live report this region already
     /// holds, and mint one only when it holds none.
     ///

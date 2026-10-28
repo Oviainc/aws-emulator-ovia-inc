@@ -57,6 +57,8 @@ mod member_account_association_gate;
 mod member_account_initiation_gate;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
+#[path = "all/organization_rule_scope_gate.rs"]
+mod organization_rule_scope_gate;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
 #[path = "all/page_token_refusals.rs"]

@@ -419,12 +419,12 @@ async fn a_malformed_or_foreign_arn_is_invalid_arn() {
         (
             "an execution ARN",
             format!("{prefix}:execution:arn-rule:run-1"),
-            "Invalid ARN resource type: execution, expected stateMachine".to_string(),
+            "Resource type not valid in this context: execution".to_string(),
         ),
         (
             "an activity ARN",
             format!("{prefix}:activity:an-activity"),
-            "Invalid ARN resource type: activity, expected stateMachine".to_string(),
+            "Resource type not valid in this context: activity".to_string(),
         ),
         (
             "a state machine ARN with no name",

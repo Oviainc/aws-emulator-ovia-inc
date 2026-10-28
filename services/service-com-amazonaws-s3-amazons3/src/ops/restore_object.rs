@@ -215,6 +215,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this restore
+        // owes names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
+        let output = self.store(input, ctx, &correlation)?;
+        // Recorded LAST, so the response carries the pair the notifications already named
+        // this call by.
+        correlation.answer();
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreObject<Eng> {
+    /// Initiate the retrieval this request asks for, answering what the caller is told
+    /// and starting the notifications the bucket's configuration owes for it.
+    ///
+    /// Everything that reads or writes the store lives here, so the guard is released
+    /// when this returns.
+    fn store(
+        &self,
+        input: RestoreObjectInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        correlation: &crate::state::request_ids::RequestCorrelation,
+    ) -> Result<RestoreObjectOutput, RestoreObjectError> {
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
         // denied)" — `RestoreObjectRequest$ExpectedBucketOwner`, judged the way every other
@@ -468,8 +492,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(object) => restore_initiated.of_object(object),
             None => restore_initiated,
         };
-        let pending =
-            crate::state::notifications::pending(&store, &input.bucket, &[restore_initiated]);
+        let pending = crate::state::notifications::pending(
+            &store,
+            &input.bucket,
+            &[restore_initiated],
+            correlation,
+        );
         drop(store);
         crate::state::notifications::publish(ctx, pending);
 

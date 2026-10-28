@@ -139,8 +139,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A hypervisor is REGIONAL — its ARN carries the region the import that minted it
+        // was signed for — so, exactly as for every other listing of this service, the
+        // region the listing request was addressed to is what decides which records are
+        // part of it: one store serves every region a client addresses.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListHypervisorsErrorModeled::InternalServerException(InternalServerException {
@@ -182,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One clock reading for the whole page, so two records of the same page cannot
         // report their state as of two different instants.
         let now = ::std::time::SystemTime::now();
-        let page = state.lock().page_of_hypervisors(after.as_deref(), limit);
+        let page = state
+            .lock()
+            .page_of_hypervisors(&region, after.as_deref(), limit);
 
         Ok(ListHypervisorsOutput {
             hypervisors: Some(

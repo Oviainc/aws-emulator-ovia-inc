@@ -49,5 +49,7 @@ mod region_isolation;
 mod schedule_retention_floor;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_arn_resolution.rs"]
+mod tag_arn_resolution;
 #[path = "all/unresolvable_policy_id.rs"]
 mod unresolvable_policy_id;

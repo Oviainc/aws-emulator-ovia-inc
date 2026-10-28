@@ -143,18 +143,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // signed for, so an ARN naming another region names no policy here.
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(policy_id) = store.policy_id_for_arn(&region, &input.resource_arn) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::policy_not_found_by_arn(&input.resource_arn),
-            )
-            .into());
-        };
-        let Some(policy) = store.policy_mut(&region, &policy_id) else {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::policy_not_found_by_arn(&input.resource_arn),
-            )
-            .into());
-        };
+        let policy = store
+            .policy_mut_by_arn(&region, &input.resource_arn)
+            .map_err(UntagResourceErrorModeled::ResourceNotFoundException)?;
 
         // Removing a key the policy does not hold is not an error: the request
         // asks for those keys to be absent, and afterwards they are.
