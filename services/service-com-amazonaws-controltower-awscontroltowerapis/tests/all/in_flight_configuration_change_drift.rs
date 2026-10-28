@@ -15,7 +15,8 @@
 //! assessment" is the absent `driftStatusSummary` member (the status set the model declares
 //! is `IN_SYNC` | `DRIFTED`, neither of which means "unassessed"); for an enabled control it
 //! is `UNKNOWN` in all three dimensions, the value for which the service "is not able to
-//! check the drift status".
+//! check the drift status". The same rule for the call that REMOVES a deployed
+//! configuration rather than applying one is `in_flight_teardown_drift`.
 //!
 //! Asserted over a TABLE whose rows are what the rule generalises over — WHICH call starts
 //! applying a configuration to an already deployed enablement, and WHICH configuration:
@@ -159,19 +160,43 @@ fn baseline_rows() -> Vec<BaselineRow> {
     rows
 }
 
-/// POST `/enable-baseline` for one row, on its own organizational unit so the rows do not
-/// interact.
-async fn enable_baseline(router: &MultiServiceRouter, row: &BaselineRow, index: usize) -> Answer {
+/// The organizational-unit target of the `index`th row of the table `id` names, so no two
+/// rows of any table enable anything on the same target.
+pub(crate) fn ou_target(id: &str, index: usize) -> String {
+    format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-{id}-{index:04}")
+}
+
+/// POST `/enable-baseline` for `baseline` at `version` on `target`, carrying `parameters`
+/// when present (an absent member applies the baseline's own defaults).
+pub(crate) async fn enable_baseline_on(
+    router: &MultiServiceRouter,
+    baseline: &CatalogBaseline,
+    version: &str,
+    parameters: Option<serde_json::Value>,
+    target: &str,
+) -> Answer {
     let mut body = serde_json::json!({
-        "baselineIdentifier": served_arn(row.baseline),
-        "baselineVersion": row.version,
-        "targetIdentifier":
-            format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-ifd1-{index:04}"),
+        "baselineIdentifier": served_arn(baseline),
+        "baselineVersion": version,
+        "targetIdentifier": target,
     });
-    if let Some(parameters) = row.parameters.clone() {
+    if let Some(parameters) = parameters {
         body["parameters"] = parameters;
     }
     call(router, "/enable-baseline", body).await
+}
+
+/// POST `/enable-baseline` for one row, on its own organizational unit so the rows do not
+/// interact.
+async fn enable_baseline(router: &MultiServiceRouter, row: &BaselineRow, index: usize) -> Answer {
+    enable_baseline_on(
+        router,
+        row.baseline,
+        row.version,
+        row.parameters.clone(),
+        &ou_target("ifd1", index),
+    )
+    .await
 }
 
 /// Start `row`'s change against the enablement `arn` names.
@@ -206,7 +231,7 @@ async fn start_baseline_change(
 }
 
 /// `GetEnabledBaseline`'s `enabledBaselineDetails` for `identifier`, asserting it resolved.
-async fn baseline_details(
+pub(crate) async fn baseline_details(
     router: &MultiServiceRouter,
     case: &str,
     identifier: &str,
@@ -227,7 +252,7 @@ async fn baseline_details(
 
 /// The `ListEnabledBaselines` summary carrying `identifier`, so a case asserts the listing
 /// and the detail agree about the same record.
-async fn baseline_summary(
+pub(crate) async fn baseline_summary(
     router: &MultiServiceRouter,
     case: &str,
     identifier: &str,
@@ -250,12 +275,12 @@ async fn baseline_summary(
 }
 
 /// The `driftStatusSummary` member of a reported record, absent as `None`.
-fn drift_summary(record: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn drift_summary(record: &serde_json::Value) -> Option<serde_json::Value> {
     record.get("driftStatusSummary").cloned()
 }
 
-/// `statusSummary.status` of an `EnabledBaselineDetails`.
-fn baseline_status(record: &serde_json::Value) -> Option<&str> {
+/// `statusSummary.status` of an `EnabledBaselineDetails` or an `EnabledBaselineSummary`.
+pub(crate) fn baseline_status(record: &serde_json::Value) -> Option<&str> {
     record
         .get("statusSummary")
         .and_then(|summary| summary.get("status"))
@@ -265,7 +290,7 @@ fn baseline_status(record: &serde_json::Value) -> Option<&str> {
 /// The drift summary an enablement of `baseline` reports once its configuration is
 /// deployed: the whole member as the model nests it for a baseline whose inheritance drift
 /// AWS assesses, and nothing at all for one it does not.
-fn deployed_summary(baseline: &CatalogBaseline) -> Option<serde_json::Value> {
+pub(crate) fn deployed_summary(baseline: &CatalogBaseline) -> Option<serde_json::Value> {
     assesses_inheritance_drift(&served_arn(baseline))
         .then(|| serde_json::json!({ "types": { "inheritance": { "status": "IN_SYNC" } } }))
 }
@@ -394,7 +419,7 @@ struct ControlRow {
 /// A `parameters` list over the first `count` keys `control` declares, each carrying the
 /// `Document` value at the same position of `values` (cycled), so a row configures a
 /// control only with keys it declares.
-fn parameters_of(
+pub(crate) fn parameters_of(
     control: &CatalogControl,
     count: usize,
     values: &[serde_json::Value],

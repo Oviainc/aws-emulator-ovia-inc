@@ -749,6 +749,23 @@ pub struct EnabledControl {
     pub pending_deletion: Option<PendingEnabledControlDeletion>,
 }
 
+impl EnabledControl {
+    /// Withdraw the drift assessment this control carries: every dimension reads `UNKNOWN`,
+    /// the value for which the service "is not able to check the drift status".
+    ///
+    /// Drift is a property of a DEPLOYED configuration, so every call that starts changing
+    /// what this control has deployed — a new configuration, a re-deployment of the one in
+    /// place, or its removal — leaves the assessment withdrawn until the clock makes that
+    /// operation due and [`settle`] assesses what is deployed then.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    fn withdraw_drift_assessment(&mut self) {
+        self.drift_status = DriftStatus::Unknown;
+        self.inheritance_drift_status = DriftStatus::Unknown;
+        self.resource_drift_status = DriftStatus::Unknown;
+    }
+}
+
 /// A control teardown a `DISABLE_CONTROL` has started and the clock has not yet made due.
 ///
 /// `DisableControl` "starts an asynchronous operation that deletes Amazon Web Services
@@ -1728,8 +1745,15 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// reports and a second mutating call collides with. It deploys no configuration, so
     /// unlike an update or a reset it parks no parameters — what it parks is the removal.
     ///
+    /// The configuration the control had deployed is being removed, so it is no longer the
+    /// configuration the target is held against and the control's three drift dimensions
+    /// read `UNKNOWN` while the teardown is in flight, exactly as they do while any other
+    /// change to what it has deployed is in flight ([`start_control_change`]).
+    ///
     /// `None` when `arn` names no stored control, so a handler answers the modelled
     /// `ResourceNotFoundException` and NOTHING is written.
+    ///
+    /// [`start_control_change`]: Self::start_control_change
     ///
     /// [`settle`]: Self::settle
     pub fn record_enabled_control_disable(&mut self, arn: &str, now: SystemTime) -> Option<String> {
@@ -1759,6 +1783,7 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             operation_identifier: operation_identifier.clone(),
             due_at,
         });
+        control.withdraw_drift_assessment();
         Some(operation_identifier)
     }
 
@@ -1811,9 +1836,7 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             due_at: now + OPERATION_SETTLE_AFTER,
             parameters,
         });
-        control.drift_status = DriftStatus::Unknown;
-        control.inheritance_drift_status = DriftStatus::Unknown;
-        control.resource_drift_status = DriftStatus::Unknown;
+        control.withdraw_drift_assessment();
         Some(operation_identifier)
     }
 
@@ -2090,11 +2113,11 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     ///
     /// The configuration this parks is not deployed yet, so the enablement carries no
     /// assessed inheritance drift while the operation is in flight — the one rule
-    /// [`start_enabled_baseline_configuration_change`] holds for every call that applies a
-    /// configuration to an existing enablement.
+    /// [`start_enabled_baseline_change`] holds for every call that starts changing what an
+    /// existing enablement has deployed.
     ///
     /// [`settle`]: Self::settle
-    /// [`start_enabled_baseline_configuration_change`]: Self::start_enabled_baseline_configuration_change
+    /// [`start_enabled_baseline_change`]: Self::start_enabled_baseline_change
     pub fn record_enabled_baseline_update(
         &mut self,
         arn: &str,
@@ -2113,7 +2136,7 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         // cannot drift apart.
         let due_at = now + OPERATION_SETTLE_AFTER;
         let enabled_baseline =
-            self.start_enabled_baseline_configuration_change(arn, &operation_identifier, due_at)?;
+            self.start_enabled_baseline_change(arn, &operation_identifier, due_at)?;
         enabled_baseline.pending_update = Some(PendingEnabledBaselineUpdate {
             operation_identifier: operation_identifier.clone(),
             due_at,
@@ -2133,11 +2156,18 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// so unlike an update it parks no parameters — what it parks is the removal, exactly
     /// as a control's teardown does ([`record_enabled_control_disable`]).
     ///
+    /// The configuration the enablement had deployed is being removed, so it is no longer
+    /// the configuration the target is held against and the enablement carries no assessed
+    /// inheritance drift while the teardown is in flight: the span every call that starts
+    /// changing what an enablement has deployed shares
+    /// ([`start_enabled_baseline_change`]).
+    ///
     /// `None` when `arn` names no stored enablement, so a handler answers the modelled
     /// `ResourceNotFoundException` and NOTHING is written.
     ///
     /// [`settle`]: Self::settle
     /// [`record_enabled_control_disable`]: Self::record_enabled_control_disable
+    /// [`start_enabled_baseline_change`]: Self::start_enabled_baseline_change
     pub fn record_enabled_baseline_disable(
         &mut self,
         arn: &str,
@@ -2149,14 +2179,12 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
 
         let operation_identifier =
             self.record_baseline_operation(BaselineOperationType::DisableBaseline, arn, now);
-        let enabled_baseline = self.enabled_baselines.get_mut(arn)?;
         // ONE instant, held in both places that need it: the status the enablement reports
         // while the teardown runs is owed at the same moment as the removal itself, so the
         // two cannot drift apart.
         let due_at = now + OPERATION_SETTLE_AFTER;
-        enabled_baseline.status = EnablementStatus::UnderChange;
-        enabled_baseline.last_operation_identifier = operation_identifier.clone();
-        enabled_baseline.due_at = due_at;
+        let enabled_baseline =
+            self.start_enabled_baseline_change(arn, &operation_identifier, due_at)?;
         enabled_baseline.pending_deletion = Some(PendingEnabledBaselineDeletion {
             operation_identifier: operation_identifier.clone(),
             due_at,
@@ -2173,8 +2201,8 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     /// that control already carries ([`record_enabled_control_reset`]). What the
     /// re-application settles is inheritance drift — an enablement cannot be assessed against
     /// a configuration still being applied, so the drift status goes back to UNASSESSED here
-    /// (through [`start_enabled_baseline_configuration_change`], which every call that
-    /// applies a configuration shares) and [`settle`] assesses it again once the clock has
+    /// (through [`start_enabled_baseline_change`], which every call that starts changing what
+    /// an enablement has deployed shares) and [`settle`] assesses it again once the clock has
     /// made the operation due.
     ///
     /// `None` when `arn` names no stored enablement, so a handler answers the modelled
@@ -2189,7 +2217,7 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
     ///
     /// [`settle`]: Self::settle
     /// [`record_enabled_control_reset`]: Self::record_enabled_control_reset
-    /// [`start_enabled_baseline_configuration_change`]: Self::start_enabled_baseline_configuration_change
+    /// [`start_enabled_baseline_change`]: Self::start_enabled_baseline_change
     pub fn record_enabled_baseline_reset(&mut self, arn: &str, now: SystemTime) -> Option<String> {
         if !self.enabled_baselines.contains_key(arn) {
             return None;
@@ -2197,7 +2225,7 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
 
         let operation_identifier =
             self.record_baseline_operation(BaselineOperationType::ResetEnabledBaseline, arn, now);
-        self.start_enabled_baseline_configuration_change(
+        self.start_enabled_baseline_change(
             arn,
             &operation_identifier,
             now + OPERATION_SETTLE_AFTER,
@@ -2205,23 +2233,25 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         Some(operation_identifier)
     }
 
-    /// The one span every call that applies a configuration to an already enabled baseline
-    /// shares: mark the enablement `UNDER_CHANGE` until `due_at`, record `operation_identifier`
-    /// as the operation changing it, and drop the inheritance drift assessment it carries.
+    /// The one span every call that starts changing what an already enabled baseline has
+    /// deployed shares — applying a new configuration, re-applying the one in place, or
+    /// removing it: mark the enablement `UNDER_CHANGE` until `due_at`, record
+    /// `operation_identifier` as the operation changing it, and drop the inheritance drift
+    /// assessment it carries.
     ///
-    /// Drift is a property of a DEPLOYED configuration, and the configuration a call like this
-    /// starts applying is not deployed until the clock makes the operation due, so the
-    /// assessment the previous configuration earned stops being reported the moment the change
-    /// starts; [`settle`] assesses the new configuration once it is due. The status is set here
-    /// as well as derived there so a caller reading straight after the call sees the transient
-    /// state.
+    /// Drift is a property of a DEPLOYED configuration, and what a call like this starts is
+    /// not deployed until the clock makes the operation due, so the assessment the
+    /// configuration in place earned stops being reported the moment the change starts;
+    /// [`settle`] assesses what is deployed once it is due, and an enablement whose change was
+    /// its own removal is gone by then. The status is set here as well as derived there so a
+    /// caller reading straight after the call sees the transient state.
     ///
     /// `None` when `arn` names no stored enablement, in which case nothing is written;
     /// otherwise the enablement itself, so a caller that also has a change to park has it in
     /// hand.
     ///
     /// [`settle`]: Self::settle
-    fn start_enabled_baseline_configuration_change(
+    fn start_enabled_baseline_change(
         &mut self,
         arn: &str,
         operation_identifier: &str,

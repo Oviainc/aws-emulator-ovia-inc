@@ -59,6 +59,8 @@ mod get_enabled_baseline;
 mod get_enabled_control;
 #[path = "all/in_flight_configuration_change_drift.rs"]
 mod in_flight_configuration_change_drift;
+#[path = "all/in_flight_teardown_drift.rs"]
+mod in_flight_teardown_drift;
 #[path = "all/inherited_enabled_baselines.rs"]
 mod inherited_enabled_baselines;
 #[path = "all/landing_zone_decommission.rs"]
