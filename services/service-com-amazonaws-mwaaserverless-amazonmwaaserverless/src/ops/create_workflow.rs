@@ -4,7 +4,7 @@
 //! IMPLEMENTED: mints a workflow plus its first immutable version and persists both in
 //! this service's store (`crate::state`). Every value in the response is read back out
 //! of that record, so `GetWorkflow`/`ListWorkflows` report exactly what was stored. A
-//! workflow whose `TriggerMode` asks the service to execute it also gets its automated
+//! workflow whose snapshotted definition declares a schedule also gets its automated
 //! trigger configured, so the service runs it without any caller starting a run.
 //!
 //! ## Shape of an operation
@@ -421,16 +421,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is deleting a workflow this call just created, so the clock
             // owes it no removal.
             deletion_due_at: None,
-            // Set from the version's trigger mode just below, so the trigger a
-            // created workflow carries is the one its configuration asks for.
+            // Set from the schedule the version's definition declares just below, so
+            // the trigger a created workflow carries is the one its definition asks
+            // for.
             next_scheduled_run_at: None,
         };
 
         // "Amazon Managed Workflows for Apache Airflow Serverless automatically creates
         // the first version of the workflow and sets up the necessary execution
-        // environment": a workflow whose configuration asks the service to execute it
-        // gets its trigger configured here, so its first automated run falls due
-        // without anybody calling `StartWorkflowRun`.
+        // environment": a workflow whose definition declares a schedule gets its trigger
+        // configured here, so its first automated run falls due without anybody calling
+        // `StartWorkflowRun`.
         workflow.configure_trigger(now);
 
         store.claim_workflow_name(&region, &input.name, &arn);
