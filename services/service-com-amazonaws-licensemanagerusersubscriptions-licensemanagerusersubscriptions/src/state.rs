@@ -96,7 +96,7 @@ pub const HEALTH_STATUS_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 /// An association in it is still REPORTED — its instance goes on providing user-based
 /// subscriptions in `ListInstances` while the teardown runs — but it is no longer a live
 /// resource: it is not taggable ([`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::holds_resource`]),
-/// and the `(IdentityProvider, InstanceId, Username)` triple it occupies cannot be
+/// and the [`instance_user_key`] identity it occupies cannot be
 /// associated again until the teardown has completed.
 pub fn disassociation_started(status: &str) -> bool {
     status == STATUS_DISASSOCIATING
@@ -110,7 +110,7 @@ pub fn disassociation_started(status: &str) -> bool {
 /// subscription ending — but it is no longer a LIVE subscription: it resolves for no
 /// operation that acts on a subscription, it is not taggable
 /// ([`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::holds_resource`]),
-/// and the `(IdentityProviderArn, product, username)` triple it occupies cannot be
+/// and the [`product_user_key`] identity it occupies cannot be
 /// subscribed again until the teardown has completed.
 pub fn unsubscribe_started(status: &str) -> bool {
     status == STATUS_UNSUBSCRIBED
@@ -454,6 +454,19 @@ pub fn members_must_be_provided(members: &[&str]) -> String {
     format!("{listed} must be provided")
 }
 
+/// The sentence a `StopProductSubscription` is refused with when the user it names has no
+/// subscription in state: the one wording of that refusal, whether the identity the
+/// request named matched nothing at all or named a domain the stored subscription's user
+/// did not come from.
+pub fn no_such_subscription(username: &str, product: &str, domain: Option<&str>) -> String {
+    match domain_key(domain) {
+        Some(domain) => format!(
+            "user {username} has no subscription to product {product} in domain {domain}"
+        ),
+        None => format!("user {username} has no subscription to product {product}"),
+    }
+}
+
 /// A registered identity provider, as `RegisterIdentityProvider` stored it.
 #[derive(Debug, Clone)]
 pub struct IdentityProviderRecord {
@@ -665,8 +678,9 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     pub product_users: HashMap<String, ProductUserRecord>,
     /// Product-user ARNs in subscription order, so a list is stable and pageable.
     pub product_user_order: Vec<String>,
-    /// `(IdentityProviderArn, product, username) -> ProductUserArn`.
-    pub product_user_index: HashMap<(String, String, String), String>,
+    /// [`ProductUserKey`] -> `ProductUserArn`, so a caller that addresses a subscription
+    /// by the identity it was subscribed with resolves the same record an ARN does.
+    pub product_user_index: HashMap<ProductUserKey, String>,
     /// License server endpoints by `LicenseServerEndpointArn`.
     pub license_server_endpoints: HashMap<String, LicenseServerEndpointRecord>,
     /// Endpoint ARNs in creation order, so a list is stable and pageable.
@@ -686,10 +700,9 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     pub instance_users: HashMap<String, InstanceUserRecord>,
     /// Association ARNs in association order, so a list is stable and pageable.
     pub instance_user_order: Vec<String>,
-    /// `(provider key, InstanceId, Username) -> InstanceUserArn`, so a caller that
-    /// addresses an association by its identifier triple resolves the same record its
-    /// ARN does.
-    pub instance_user_index: HashMap<(String, String, String), String>,
+    /// [`InstanceUserKey`] -> `InstanceUserArn`, so a caller that addresses an association
+    /// by the identity it was associated with resolves the same record its ARN does.
+    pub instance_user_index: HashMap<InstanceUserKey, String>,
     /// `InstanceId -> the ARNs of the associations naming it, in association order`.
     ///
     /// The reverse of [`InstanceUserRecord::instance_id`], maintained by the one writer
@@ -1093,8 +1106,9 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Resolve a user association from the two ways `DisassociateUser` can address one:
-    /// its `InstanceUserArn`, or the `(IdentityProvider, InstanceId, Username)` triple it
-    /// was associated with, optionally narrowed by `Domain`.
+    /// its `InstanceUserArn`, or the `(IdentityProvider, InstanceId, Username, Domain)`
+    /// identity it was associated with
+    /// ([`instance_user_arn_for`](Self::instance_user_arn_for)).
     ///
     /// `None` when state holds no such association — the caller decides how to refuse,
     /// because this surface fails CLOSED rather than reporting a not-found.
@@ -1109,33 +1123,36 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let record = if let Some(arn) = instance_user_arn {
             self.instance_users.get(arn)?
         } else {
-            let key = (
-                provider_key(identity_provider?).ok()?,
-                instance_id?.to_string(),
-                username?.to_string(),
-            );
-            let arn = self.instance_user_index.get(&key)?;
+            let arn = self.instance_user_arn_for(
+                &provider_key(identity_provider?).ok()?,
+                instance_id?,
+                username?,
+                domain,
+            )?;
             self.instance_users.get(arn)?
         };
-        // `Domain` narrows the addressing rather than being ignored: an association from
-        // another domain is not the one the caller named.
-        match domain.filter(|d| !d.is_empty()) {
-            Some(domain) if record.domain.as_deref() != Some(domain) => None,
-            _ => Some(record),
+        // `Domain` is part of which user a request names, so an association addressed by
+        // ARN is also only the one the caller asked for when the domain the request names
+        // is the stored user's. The identity lookup above already matched on it.
+        let named = domain_key(domain);
+        if named.is_some() && named != domain_key(record.domain.as_deref()) {
+            return None;
         }
+        Some(record)
     }
 
     /// Store one user association and index it everywhere it is reached from: by ARN, in
-    /// association order, by its `(provider key, InstanceId, Username)` triple and under
-    /// the instance it names.
+    /// association order, by its [`instance_user_key`] identity and under the instance it
+    /// names.
     ///
     /// The ONE writer, so no two of those views of the same association can disagree.
     pub fn insert_instance_user(&mut self, record: InstanceUserRecord) {
         let arn = record.arn.clone();
-        let index_key = (
-            record.provider_key.clone(),
-            record.instance_id.clone(),
-            record.username.clone(),
+        let index_key = instance_user_key(
+            &record.provider_key,
+            &record.instance_id,
+            &record.username,
+            record.domain.as_deref(),
         );
         self.instance_users_by_instance
             .entry(record.instance_id.clone())
@@ -1181,10 +1198,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                 continue;
             };
             dropped.insert(arn.clone());
-            self.instance_user_index.remove(&(
-                record.provider_key.clone(),
-                record.instance_id.clone(),
-                record.username.clone(),
+            self.instance_user_index.remove(&instance_user_key(
+                &record.provider_key,
+                &record.instance_id,
+                &record.username,
+                record.domain.as_deref(),
             ));
             self.tags.remove(arn);
             let emptied = match self.instance_users_by_instance.get_mut(&record.instance_id) {
@@ -1257,7 +1275,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// disassociation does take away immediately is what made the association a LIVE
     /// resource: its tags, so the tagging surface no longer resolves it (see
     /// [`holds_resource`](Self::holds_resource)). The
-    /// `(provider key, InstanceId, Username)` index entry is KEPT, because that triple is
+    /// [`instance_user_key`] index entry is KEPT, because that identity is
     /// still occupied: the user is still being torn down from that instance, so it cannot
     /// be associated with it again until the teardown has completed.
     ///
@@ -1787,15 +1805,17 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Store one product user: the record, its place in the subscription order and the
-    /// `(IdentityProviderArn, product, username)` index that reaches it.
+    /// [`product_user_key`] identity that reaches it.
     ///
-    /// The ONE writer of a product user, so no path can leave the three stores disagreeing
-    /// about what is subscribed.
+    /// The ONE writer of a product user, so the record, the list order and the index that
+    /// reaches it cannot disagree about what is subscribed, nor about which user a stored
+    /// subscription belongs to.
     pub fn insert_product_user(&mut self, record: ProductUserRecord) {
-        let key = (
-            record.identity_provider_arn.clone(),
-            record.product.clone(),
-            record.username.clone(),
+        let key = product_user_key(
+            &record.identity_provider_arn,
+            &record.product,
+            &record.username,
+            record.domain.as_deref(),
         );
         self.product_user_order.push(record.arn.clone());
         self.product_user_index.insert(key, record.arn.clone());
@@ -1879,9 +1899,92 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .ok_or(StateError::ProviderNotRegistered)
     }
 
+    /// The `ProductUserArn` of the subscription a request addresses by the members that
+    /// identify a user — the registration, the product, the user name and `Domain` — or
+    /// `None` when state holds none.
+    ///
+    /// `Domain` NARROWS which user that is, rather than being ignored: a request that names
+    /// one addresses only the subscription stored for that domain (one indexed lookup on
+    /// [`product_user_key`]), so the same user name in another Active Directory domain is
+    /// another user. A request that names none does not narrow: it addresses the user's
+    /// unqualified subscription when there is one, and otherwise the earliest subscription
+    /// held for that user name in any domain, so a caller that never supplies `Domain` goes
+    /// on addressing the subscription it started.
+    ///
+    /// The ONE place that match is made, so the occupancy `StartProductSubscription`
+    /// refuses a duplicate on and the lookup `StopProductSubscription` resolves one by
+    /// cannot disagree about which user is which.
+    pub fn product_user_arn_for(
+        &self,
+        identity_provider_arn: &str,
+        product: &str,
+        username: &str,
+        domain: Option<&str>,
+    ) -> Option<&String> {
+        if let Some(arn) = self.product_user_index.get(&product_user_key(
+            identity_provider_arn,
+            product,
+            username,
+            domain,
+        )) {
+            return Some(arn);
+        }
+        if domain_key(domain).is_some() {
+            return None;
+        }
+        // The request named no domain and the user holds no unqualified subscription, so
+        // there is no identity to look up: the subscriptions of that user name are read off
+        // the subscription order, earliest first. One pass over what the store holds, which
+        // is bounded ([`MAX_RESOURCES_PER_KIND`]), and only on this one addressing.
+        self.product_user_order.iter().find(|arn| {
+            self.product_users.get(*arn).is_some_and(|record| {
+                record.identity_provider_arn == identity_provider_arn
+                    && record.product == product
+                    && record.username == username
+            })
+        })
+    }
+
+    /// The `InstanceUserArn` of the association a request addresses by the members that
+    /// identify a user — the directory, the instance, the user name and `Domain` — or
+    /// `None` when state holds none.
+    ///
+    /// The association plane's counterpart of [`product_user_arn_for`](Self::product_user_arn_for),
+    /// matching `Domain` the same way for the same reason; the unqualified fallback reads
+    /// only the associations of the instance the request names
+    /// ([`instance_users_by_instance`](Self::instance_users_by_instance)), in association
+    /// order.
+    pub fn instance_user_arn_for(
+        &self,
+        provider_key: &str,
+        instance_id: &str,
+        username: &str,
+        domain: Option<&str>,
+    ) -> Option<&String> {
+        if let Some(arn) = self.instance_user_index.get(&instance_user_key(
+            provider_key,
+            instance_id,
+            username,
+            domain,
+        )) {
+            return Some(arn);
+        }
+        if domain_key(domain).is_some() {
+            return None;
+        }
+        self.instance_users_by_instance
+            .get(instance_id)?
+            .iter()
+            .find(|arn| {
+                self.instance_users.get(*arn).is_some_and(|record| {
+                    record.provider_key == provider_key && record.username == username
+                })
+            })
+    }
+
     /// Resolve a product user from the two ways `StopProductSubscription` can address
-    /// one: its `ProductUserArn`, or the `(Username, IdentityProvider, Product)` triple
-    /// it was subscribed with, optionally narrowed by `Domain`.
+    /// one: its `ProductUserArn`, or the `(Username, IdentityProvider, Product, Domain)`
+    /// identity it was subscribed with ([`product_user_arn_for`](Self::product_user_arn_for)).
     ///
     /// `ValidationException` when neither addressing is complete, `ResourceNotFoundException`
     /// when no such subscription is in state.
@@ -1915,30 +2018,24 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             let provider =
                 self.resolve_identity_provider(None, Some(identity_provider), Some(product))?;
             let arn = self
-                .product_user_index
-                .get(&(
-                    provider.arn.clone(),
-                    product.to_string(),
-                    username.to_string(),
-                ))
+                .product_user_arn_for(&provider.arn, product, username, domain)
                 .ok_or_else(|| {
-                    StateError::NotFound(format!(
-                        "user {username} has no subscription to product {product}"
-                    ))
+                    StateError::NotFound(no_such_subscription(username, product, domain))
                 })?;
             self.live_product_user(arn).ok_or_else(|| {
                 StateError::NotFound(format!("product user {arn} has no subscription"))
             })?
         };
-        // `Domain` narrows the addressing rather than being ignored: a subscription from
-        // another domain is not the one the caller named.
-        if let Some(domain) = domain.filter(|d| !d.is_empty()) {
-            if record.domain.as_deref() != Some(domain) {
-                return Err(StateError::NotFound(format!(
-                    "user {} has no subscription in domain {domain}",
-                    record.username
-                )));
-            }
+        // `Domain` is part of which user a request names, so a subscription addressed by
+        // ARN is also only the one the caller asked for when the domain the request names
+        // is the stored user's. The identity lookup above already matched on it.
+        let named = domain_key(domain);
+        if named.is_some() && named != domain_key(record.domain.as_deref()) {
+            return Err(StateError::NotFound(no_such_subscription(
+                &record.username,
+                &record.product,
+                domain,
+            )));
         }
         Ok(record)
     }
@@ -2080,7 +2177,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// Remove one product user from the store and from every index that reaches it.
     ///
     /// This is the FINAL drop, which stops reporting the subscription altogether and frees
-    /// the `(IdentityProviderArn, product, username)` triple it occupied; an end of
+    /// the [`product_user_key`] identity it occupied; an end of
     /// subscription the caller asked for goes through
     /// [`begin_product_user_unsubscription`](Self::begin_product_user_unsubscription)
     /// instead, so the ended subscription stays observable until the teardown the clock
@@ -2127,7 +2224,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// the record is NOT dropped here: a client polling `ListProductSubscriptions` keeps
     /// seeing the subscription in its ended status, with the end date the stop stamped,
     /// instead of it vanishing between two reads. The
-    /// `(IdentityProviderArn, product, username)` index entry is KEPT, because that triple
+    /// [`product_user_key`] index entry is KEPT, because that identity
     /// is still occupied: the user's subscription to that product is still being torn down,
     /// so it cannot be subscribed again until the teardown has completed. What the end of
     /// the subscription does take away immediately is what made it a LIVE subscription: its
@@ -2187,6 +2284,64 @@ pub fn provider_key(identity_provider: &IdentityProvider) -> Result<String, Stat
             }
         }
     }
+}
+
+/// The identity of ONE product subscription:
+/// `(IdentityProviderArn, Product, Username, domain)`.
+pub type ProductUserKey = (String, String, String, Option<String>);
+
+/// The identity of ONE user association:
+/// `(provider key, InstanceId, Username, domain)`.
+pub type InstanceUserKey = (String, String, String, Option<String>);
+
+/// The `Domain` half of a user's identity, normalised.
+///
+/// `Domain` is "the domain name of the Active Directory that contains the user" a
+/// `StartProductSubscription`/`AssociateUser` subscribes or associates, and the
+/// `StopProductSubscription`/`DisassociateUser` that ends one carries it BESIDE the user
+/// name, the provider reference and the product or instance — so it is part of which user
+/// a request names, not a comment on it. A request that supplies none, and one that
+/// supplies the empty string, name the same unqualified user, so both key the same way.
+pub fn domain_key(domain: Option<&str>) -> Option<String> {
+    domain
+        .filter(|domain| !domain.is_empty())
+        .map(str::to_string)
+}
+
+/// The identity of the product subscription a request addresses, or a record holds.
+///
+/// The ONE place that key is built, so the occupancy a `StartProductSubscription` refuses
+/// a duplicate on and the lookup a `StopProductSubscription` resolves one by cannot
+/// disagree about which user is which.
+pub fn product_user_key(
+    identity_provider_arn: &str,
+    product: &str,
+    username: &str,
+    domain: Option<&str>,
+) -> ProductUserKey {
+    (
+        identity_provider_arn.to_string(),
+        product.to_string(),
+        username.to_string(),
+        domain_key(domain),
+    )
+}
+
+/// The identity of the user association a request addresses, or a record holds — the
+/// association plane's counterpart of [`product_user_key`], built the one place for the
+/// same reason.
+pub fn instance_user_key(
+    provider_key: &str,
+    instance_id: &str,
+    username: &str,
+    domain: Option<&str>,
+) -> InstanceUserKey {
+    (
+        provider_key.to_string(),
+        instance_id.to_string(),
+        username.to_string(),
+        domain_key(domain),
+    )
 }
 
 /// The `DirectoryId` of a provider union, when it names one.

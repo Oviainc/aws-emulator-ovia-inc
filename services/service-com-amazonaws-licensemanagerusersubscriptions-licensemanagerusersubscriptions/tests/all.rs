@@ -65,3 +65,5 @@ mod update_settings_network_propagation;
 mod user_associations;
 #[path = "all/user_disassociation.rs"]
 mod user_disassociation;
+#[path = "all/user_domain_names_the_user.rs"]
+mod user_domain_names_the_user;
