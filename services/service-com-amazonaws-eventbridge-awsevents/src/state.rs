@@ -1054,6 +1054,16 @@ pub fn is_transport_refusal(body: &[u8]) -> bool {
 /// `HttpsEndpoint`, so the exchange is made over TLS.
 const HTTPS_SCHEME: &str = "https://";
 
+/// What a refusal states about an endpoint member whose value is not an HTTPS
+/// URL: the endpoint AS SUBMITTED, in single quotes, and what a valid value is.
+///
+/// EventBridge words every such refusal the same way, whichever member carried
+/// the endpoint, so it is written once here rather than at the member that
+/// checks it. The only variable part is the value the request supplied.
+fn invalid_https_endpoint(endpoint: &str) -> String {
+    format!("Endpoint '{endpoint}' is invalid, please provide a valid HTTPS endpoint URL.")
+}
+
 /// Why `endpoint` is not an authorization endpoint EventBridge accepts, or
 /// `None` when it is.
 ///
@@ -1062,16 +1072,27 @@ const HTTPS_SCHEME: &str = "https://";
 /// modelled pattern admits any URL characters, so the scheme is checked here: a
 /// value that is not an `https` URL is refused rather than stored as an endpoint
 /// no token request could be made to.
+///
+/// The refusal names the member whose value was rejected —
+/// `AuthorizationEndpoint`, the leaf, not the `AuthParameters` block that
+/// carries it — so a client that surfaces the rejected parameter points a user
+/// at the field it has to change.
+///
+/// This is a FIDELITY check on a submitted value, and nothing else: it is not
+/// what keeps a stored endpoint from reaching a host. An endpoint this store
+/// holds is only ever dispatched through the in-process emulator transport
+/// ([`smithy_server_runtime::OperationContext::callback`]'s connector, which is
+/// the emulator's own router), so it reaches only what this emulator serves
+/// itself — no socket is opened and no name is resolved, whatever a caller
+/// stored, and an endpoint nothing here serves answers the transport's own
+/// refusal ([`is_transport_refusal`]). An `https` value is therefore accepted on
+/// the same terms AWS accepts it, without the destination being reachable.
 pub fn authorization_endpoint_violation(endpoint: &str) -> Option<String> {
     let scheme_matches = endpoint
         .get(..HTTPS_SCHEME.len())
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case(HTTPS_SCHEME));
-    (!scheme_matches).then(|| {
-        parameter_violation(
-            "AuthParameters",
-            &format!("AuthorizationEndpoint {endpoint:?} is not an https endpoint."),
-        )
-    })
+    (!scheme_matches)
+        .then(|| parameter_violation("AuthorizationEndpoint", &invalid_https_endpoint(endpoint)))
 }
 
 /// Record what a connection's authorization exchange came to: the state the
@@ -3947,14 +3968,45 @@ pub fn managed_rule_refusal_force_overrides(rule_name: &str) -> String {
     )
 }
 
-/// What any reader of the connection slice reports for a name this store holds no
-/// connection for.
+/// The clause every refusal of a connection call opens with, for the call whose
+/// own verb is `verb` ("create", "describe", "update", "delete",
+/// "deauthorize").
 ///
-/// Written once, for the reason [`no_such_rule`] gives: every operation that
-/// resolves a connection — a read, an update, a destination that invokes through
-/// one — refuses a missing one in the same words.
-pub fn no_such_connection(name: &str) -> String {
+/// EventBridge's connection refusals say first WHICH call could not be served
+/// and then why, so the reason that follows is read against the operation that
+/// failed rather than against the resource alone — the same form the
+/// api-destination refusals of this service use
+/// ([`api_destination_call_failed`]). Written once, so every operation on this
+/// resource opens its refusals in the same words.
+pub fn connection_call_failed(verb: &str) -> String {
+    format!("Failed to {verb} the connection(s).")
+}
+
+/// One refusal of a connection call: the failing call
+/// ([`connection_call_failed`]) and then `reason`.
+pub fn connection_refusal(verb: &str, reason: &str) -> String {
+    format!("{} {reason}", connection_call_failed(verb))
+}
+
+/// What any refusal states about a name this store holds no connection for: the
+/// missing CONNECTION by name, as the request named it.
+///
+/// The clause on its own, without the failing call's own prefix, because the
+/// call that ran into a missing connection is not always a connection call: an
+/// api-destination write resolving its `ConnectionArn` opens with ITS call
+/// ([`api_destination_call_failed`]) and then states this.
+pub fn connection_does_not_exist(name: &str) -> String {
     format!("Connection '{name}' does not exist.")
+}
+
+/// What any operation on the connection resource reports for a name this store
+/// holds no connection for: the failing call and then the missing connection.
+///
+/// Written once, for the reason [`no_such_rule`] gives: a read, an update, a
+/// deauthorize and a delete of a connection that does not exist all refuse it in
+/// the same words, differing only in the verb of the call that failed.
+pub fn no_such_connection(verb: &str, name: &str) -> String {
+    connection_refusal(verb, &connection_does_not_exist(name))
 }
 
 /// The name of the connection a `ConnectionArn` names, or `None` when the text is
@@ -3997,6 +4049,17 @@ pub fn api_destination_call_failed(verb: &str) -> String {
     format!("Failed to {verb} the api-destination(s).")
 }
 
+/// One refusal of an api-destination call: the failing call
+/// ([`api_destination_call_failed`]) and then `reason`.
+///
+/// The counterpart of [`connection_refusal`], so both resources compose their
+/// clause in ONE place — a call on this resource that ran into a missing
+/// connection states its own call here and the connection clause
+/// ([`connection_does_not_exist`]) as the reason.
+pub fn api_destination_refusal(verb: &str, reason: &str) -> String {
+    format!("{} {reason}", api_destination_call_failed(verb))
+}
+
 /// What any operation on the API-destination resource reports for a name this
 /// store holds no destination for: the failing call
 /// ([`api_destination_call_failed`]) and then the destination the request named.
@@ -4005,10 +4068,7 @@ pub fn api_destination_call_failed(verb: &str) -> String {
 /// delete of a destination that does not exist all refuse it in the same words,
 /// differing only in the verb of the call that failed.
 pub fn no_such_api_destination(verb: &str, name: &str) -> String {
-    format!(
-        "{} An api-destination '{name}' does not exist.",
-        api_destination_call_failed(verb)
-    )
+    api_destination_refusal(verb, &format!("An api-destination '{name}' does not exist."))
 }
 
 /// Why a replay cannot be cancelled in the state it is in.

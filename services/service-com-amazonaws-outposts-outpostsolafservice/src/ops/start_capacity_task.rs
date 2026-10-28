@@ -251,10 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
 
         let mut store = state.lock();
-        // An Outpost's hardware is installed as its provisioning finishes, so the
-        // installation the clock has already made due is materialised before the
-        // `AssetId` below is resolved against that hardware: the asset ids a caller
-        // read out of `ListAssets` are the ones it can name here.
+        // An Outpost's hardware is installed when an order placed on it has delivered
+        // some, so the installation the clock has already made due is materialised
+        // before the `AssetId` below is resolved against that hardware: the asset ids a
+        // caller read out of `ListAssets` are the ones it can name here.
         store.settle_outposts();
         // A capacity task runs ON an Outpost, so an Outpost the store does not hold
         // cannot take one: the not-found error this operation models, worded as the

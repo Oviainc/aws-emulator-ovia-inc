@@ -1169,10 +1169,13 @@ impl TieringRecord {
 /// which is the group's own operational state and so is the caller's to set.
 pub const CALLER_SETTABLE_BILLING_GROUP_STATUSES: &[&str] = &["ACTIVE", "PENDING"];
 
-/// A billing group as `CreateBillingGroup` persisted it. `Size`,
-/// `BillingGroupType` and the owner half of `Status` are DERIVED (see the methods
-/// below), never stored, so they cannot drift from the membership and the
-/// preferences they are computed from.
+/// A billing group as `CreateBillingGroup` persisted it. `BillingGroupType` and the owner
+/// half of `Status` are DERIVED (see the methods below), never stored, so they cannot
+/// drift from the preferences they are computed from. `Size` is derived too, but not from
+/// this record: the membership a billing period reports is kept per period on the account
+/// memberships, so the one rule that counts it is
+/// [`ComAmazonawsBillingconductorAwsbillingconductorState::billing_group_sizes_in`] and
+/// every reader of a group reports the count it answers with.
 ///
 /// The record carries the group as it stands NOW, plus the generations of it that later
 /// writes superseded ([`BillingGroupVersion`]), because every read of a billing group is
@@ -1205,11 +1208,6 @@ pub struct BillingGroupRecord {
 }
 
 impl BillingGroupRecord {
-    /// `Size`: "The number of accounts in the particular billing group."
-    pub fn size(&self) -> i64 {
-        i64::try_from(self.linked_account_ids.len()).unwrap_or(i64::MAX)
-    }
-
     /// The billing period this group was created in: the first period any read of it
     /// reports it for, since a resource does not exist in a period that precedes it.
     pub fn creation_billing_period(&self) -> String {

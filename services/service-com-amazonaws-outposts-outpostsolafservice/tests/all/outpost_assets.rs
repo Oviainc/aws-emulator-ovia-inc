@@ -30,9 +30,9 @@
 //! installs, so no call in this API creates one; the hardware an Outpost settles with
 //! is its own configuration's, which [`crate::outpost_hardware_installation`] states
 //! and exercises. Each row here RECORDS its assets on the stored Outpost
-//! through the same store seam [`crate::quote_lifecycle`] ages a quote through — while
-//! the Outpost is still provisioning, so the installation the clock owes it leaves the
-//! recorded hardware alone — and then asks over the wire: what the list answers about
+//! through the same store seam [`crate::quote_lifecycle`] ages a quote through — on an
+//! Outpost nothing has been ordered for, so no install the service owes it touches the
+//! recorded hardware — and then asks over the wire: what the list answers about
 //! what is recorded is the whole of rules 1 to 3. The hardware below is the rows' own
 //! data, spanning members and values no one configuration holds at once.
 

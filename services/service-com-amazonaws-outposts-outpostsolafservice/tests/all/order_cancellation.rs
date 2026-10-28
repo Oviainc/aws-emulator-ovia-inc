@@ -150,13 +150,14 @@ fn line_items(order: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Put a stored order in a status this API has no call that reaches.
+/// Put a stored order in a status this API has no call that reaches in a span a case
+/// may sleep for.
 ///
-/// `COMPLETED` is reached by hardware arriving at the site and being installed, which
-/// leaves a record this emulator does not have, so a case about what a FINISHED order
-/// refuses reaches it through the same store seam [`crate::outpost_decommission`] ages
-/// a quote through. The clock-owed transition goes with it, because an order that has
-/// finished is not owed one. Every assertion still goes over the wire.
+/// `COMPLETED` is reached by hardware arriving at the site and being installed, over a
+/// span no case may sleep for, so a case about what a FINISHED order refuses reaches it
+/// through the same store seam [`crate::outpost_decommission`] ages a quote through. The
+/// transitions the clock still owed go with it, because an order that has finished is
+/// owed none. Every assertion still goes over the wire.
 fn finish_order(outposts: &Outposts, order_id: &str, status: &str, case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
@@ -165,7 +166,7 @@ fn finish_order(outposts: &Outposts, order_id: &str, status: &str, case: &str) {
         .get_mut(order_id)
         .unwrap_or_else(|| panic!("case {case:?}: the order {order_id} this case placed is stored"));
     record.order.status = Some(status.to_string());
-    record.in_progress_at = None;
+    record.pending.clear();
 }
 
 /// Rule 1: a cancellation settles the order and every line item of it as cancelled,
