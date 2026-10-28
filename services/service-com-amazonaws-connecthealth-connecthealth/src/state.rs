@@ -9,7 +9,8 @@
 //!
 //! Helpers several operations share (id minting, ARN building, the opaque pagination
 //! cursor, and every response projection — `SubscriptionDescription`,
-//! `WebAppConfiguration`, `EncryptionContext`) live here rather than being copied
+//! `WebAppConfiguration`, `EncryptionContext`, and the recorded `accountId` /
+//! `onboardingGeneration` pair) live here rather than being copied
 //! into each `src/ops/*.rs`: `src/lib.rs` is generated, so this module is the crate's
 //! one shared, editable home.
 
@@ -386,6 +387,31 @@ impl Domain {
             encryption_type: self.encryption_type.as_wire().to_string(),
             kms_key_arn: self.kms_key_arn.clone(),
         }
+    }
+
+    /// This domain's recorded identity pair — the account that owns it and the
+    /// generation it was onboarded through — as the members a Domain response carries
+    /// BESIDE its modelled ones.
+    ///
+    /// Neither member is in the model (see [`RecordedMember`]), so the member SCHEMAS
+    /// stay per-response — each names its own output shape and the member index free in
+    /// it — and the answering operation hands its two in. The member LIST is one
+    /// computation: which members the pair is, in which order, read out of which fields
+    /// of the stored record. Defined once, here, beside the other `Domain` projections,
+    /// and called from each handler that reports a domain, so the create response and
+    /// every later read cannot describe one stored record's identity differently.
+    pub fn recorded_identity_members(
+        &self,
+        account_id_member: &'static ::aws_smithy_schema::Schema,
+        onboarding_generation_member: &'static ::aws_smithy_schema::Schema,
+    ) -> Vec<RecordedMember> {
+        vec![
+            RecordedMember::Text(account_id_member, self.account_id.clone()),
+            RecordedMember::Text(
+                onboarding_generation_member,
+                self.onboarding_generation.as_wire().to_string(),
+            ),
+        ]
     }
 }
 

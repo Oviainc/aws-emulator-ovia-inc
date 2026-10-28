@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGeneratedPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGeneratedPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGeneratedPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the policy generation job a `jobId` names, from the record
+//! `StartPolicyGeneration` stored: its `JobDetails` (the status the clock owes it at this
+//! instant, and when it started and completed) and the result of the generation.
+//!
+//! A REPORTING operation: it writes nothing, so polling a job neither advances it nor
+//! changes what a later caller sees — the status is computed from the stored due instant
+//! against the clock by [`crate::state::PolicyGenerationJob::status_at`].
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGeneratedPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGeneratedPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGeneratedPolicy"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetGeneratedPolicyErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let state = state.lock();
+
+        let job = state
+            .policy_generations
+            .get(&input.job_id)
+            .ok_or_else(|| {
+                GetGeneratedPolicyErrorModeled::ValidationException(
+                    crate::state::policy_generation_not_found(&input.job_id),
+                )
+            })?;
+
+        // `includeResourcePlaceholders` and `includeServiceLevelTemplate` choose the
+        // LEVEL OF DETAIL of the policies a generation produces — resource placeholders
+        // for the actions that support resource-level granularity, and a service-level
+        // template for the services recently used. Both shape the actions the analysis
+        // OBSERVED, and this emulator records no CloudTrail activity for any principal
+        // (see [`crate::state::PolicyGenerationJob::generated_policy_result_at`]), so
+        // there is no action for either level of detail to apply to and the two requests
+        // report the same result rather than a different one invented per flag.
+        let now = ::std::time::SystemTime::now();
+        Ok(GetGeneratedPolicyOutput {
+            job_details: job.job_details_at(now),
+            generated_policy_result: job.generated_policy_result_at(now),
+        })
     }
 }

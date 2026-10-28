@@ -80,28 +80,69 @@ pub struct IdentityPool {
 }
 
 impl IdentityPool {
-    /// Whether this pool accepts a `Logins` entry made in the name of `provider_name`.
+    /// What this pool's stored configuration trusts a presented login's ISSUER through,
+    /// with `registered` — the IAM OpenID Connect providers the account holds
+    /// ([`registered_oidc_providers`]) — resolving the provider ARNs the pool names.
     ///
     /// `GetCredentialsForIdentity` is documented "Any provided logins will be validated
-    /// against supported login providers" (this service's model). What this emulator can
-    /// validate is the trust the POOL's own configuration states, and a login whose
-    /// issuer the provider name itself names is exactly that case: an Amazon Cognito
-    /// user pool, named `cognito-idp.<region>.amazonaws.com/<UserPoolId>` (`GetId.Logins`),
-    /// is a login provider of this pool only when one of its `CognitoIdentityProviders`
-    /// entries names that user pool — so a token minted by any OTHER user pool
-    /// authenticates nobody here, however validly it was signed where it was issued.
+    /// against supported login providers" (this service's model), and a `Logins` entry
+    /// carries its issuer in the provider name itself
+    /// (`cognito-idp.<region>.amazonaws.com/<UserPoolId>` for an Amazon Cognito user pool,
+    /// the issuer's host and path for any other OpenID Connect provider — `GetId.Logins`).
+    /// Two stored members state a trust for such an issuer, and this collects both:
     ///
-    /// A login of any other kind is decided by the provider that issued its token
-    /// (Facebook, Google, an OIDC or SAML issuer), which this emulator does not reach,
-    /// so the pool's stored configuration alone does not refuse it.
-    pub fn accepts_login_provider(&self, provider_name: &str) -> bool {
-        !names_cognito_user_pool(provider_name)
-            || self
-                .cognito_identity_providers
-                .iter()
-                .flatten()
-                .filter_map(|provider| provider.provider_name.as_deref())
-                .any(|name| name == provider_name)
+    /// * a `CognitoIdentityProviders` entry, which names an Amazon Cognito user pool. The
+    ///   trust is the issuer; what the user pool's own token says it was issued for is part
+    ///   of validating that token against the user pool that minted it, which this does not
+    ///   do, so the entry states no audience constraint here.
+    /// * an `OpenIdConnectProviderARNs` entry, whose ARN names the issuer
+    ///   ([`oidc_provider_arn_issuer`]) and whose IAM registration holds the client ids —
+    ///   "a list of client IDs (also known as audiences)" — that trust accepts. The
+    ///   registration is read at the instant the login is presented, so an ARN of THIS
+    ///   account that resolves to no provider states the trust and accepts no audience at
+    ///   all; an ARN naming another account's provider resolves to a registration this
+    ///   emulator does not hold, so what it accepts is not knowable here and the trust
+    ///   states no audience constraint.
+    ///
+    /// The pool's other provider members name no issuer this emulator can decide a token
+    /// against: a public login provider, a SAML provider and the pool's own developer
+    /// provider are each decided elsewhere, so they state no trust here and no login of
+    /// theirs is refused on this configuration.
+    pub fn login_trust(&self, registered: &RegisteredOidcProviders) -> PoolLoginTrust {
+        let mut issuers: BTreeMap<String, TrustedAudiences> = BTreeMap::new();
+        for provider in self.cognito_identity_providers.iter().flatten() {
+            let issuer = provider
+                .provider_name
+                .as_deref()
+                .map(login_provider_issuer)
+                .unwrap_or_default();
+            if issuer.is_empty() {
+                continue;
+            }
+            issuers
+                .entry(issuer.to_string())
+                .or_default()
+                .accept(false, Vec::new());
+        }
+        for arn in self.open_id_connect_provider_arns.iter().flatten() {
+            // The ARN itself names the issuer, so the pool states the trust whether or not
+            // the account still holds the provider; the registration the ARN RESOLVES to is
+            // where the client ids it accepts come from, and one of this account that
+            // resolves to no provider accepts none of them.
+            let Some(issuer) = oidc_provider_arn_issuer(arn) else {
+                continue;
+            };
+            let resolvable = oidc_provider_arn_is_of_this_account(arn);
+            let client_ids = registered
+                .registered(arn)
+                .map(|provider| provider.client_ids.clone())
+                .unwrap_or_default();
+            issuers
+                .entry(issuer.to_string())
+                .or_default()
+                .accept(resolvable, client_ids);
+        }
+        PoolLoginTrust { issuers }
     }
 
     /// Whether a `Logins` entry made in the name of `provider_name` carries an OpenID
@@ -116,20 +157,33 @@ impl IdentityPool {
     /// a public provider, a developer user identifier for the pool's own developer provider
     /// — which is no JSON Web Token and is decided by the provider that issued it.
     pub fn issues_open_id_connect_tokens(&self, provider_name: &str) -> bool {
-        (names_cognito_user_pool(provider_name) && self.accepts_login_provider(provider_name))
+        self.names_cognito_identity_provider(provider_name)
             || self.names_open_id_connect_provider(provider_name)
+    }
+
+    /// Whether one of this pool's `CognitoIdentityProviders` names `provider_name`: the
+    /// Amazon Cognito user pool whose id tokens this pool asked for.
+    fn names_cognito_identity_provider(&self, provider_name: &str) -> bool {
+        let issuer = login_provider_issuer(provider_name);
+        self.cognito_identity_providers
+            .iter()
+            .flatten()
+            .filter_map(|provider| provider.provider_name.as_deref())
+            .any(|named| login_provider_issuer(named) == issuer)
     }
 
     /// Whether `provider_name` is the issuer of one of this pool's
     /// `OpenIdConnectProviderARNs`: an IAM OpenID Connect provider is named
     /// `arn:aws:iam::<account>:oidc-provider/<url without its scheme>`, and that url is the
-    /// name a `Logins` entry of that issuer is made under.
+    /// name a `Logins` entry of that issuer is made under
+    /// ([`oidc_provider_arn_issuer`]).
     fn names_open_id_connect_provider(&self, provider_name: &str) -> bool {
+        let issuer = login_provider_issuer(provider_name);
         self.open_id_connect_provider_arns
             .iter()
             .flatten()
-            .filter_map(|arn| arn.split_once(OIDC_PROVIDER_ARN_RESOURCE_PREFIX))
-            .any(|(_, issuer)| issuer == provider_name)
+            .filter_map(|arn| oidc_provider_arn_issuer(arn))
+            .any(|named| named == issuer)
     }
 
     /// Whether `provider_name` is this pool's own developer provider — "the 'domain' by
@@ -166,9 +220,276 @@ impl IdentityPool {
     }
 }
 
-/// The part of an IAM OpenID Connect provider ARN that precedes the issuer url it names
-/// (`arn:aws:iam::<account>:oidc-provider/<url without its scheme>`).
-const OIDC_PROVIDER_ARN_RESOURCE_PREFIX: &str = ":oidc-provider/";
+/// The ISSUER an identity pool's `OpenIdConnectProviderARNs` entry names: the resource
+/// portion of an IAM OpenID Connect provider ARN
+/// (`arn:<partition>:iam::<account>:oidc-provider/<url without its scheme>`) IS the
+/// provider's URL without its scheme, which is the issuer form a `Logins` provider name
+/// carries.
+///
+/// Read from the ARN rather than from the provider it resolves to, because the pool stores
+/// the ARN and nothing else: an ARN whose provider the account no longer holds still names
+/// the issuer the pool trusts, and what it resolves to decides only which audiences that
+/// trust accepts. `None` for a value that names no OIDC provider at all.
+///
+/// The ARN is read through [`::service_common::arn`], the tree's one parse of an ARN.
+pub fn oidc_provider_arn_issuer(arn: &str) -> Option<&str> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    if parsed.vendor != IAM_ARN_NAMESPACE {
+        return None;
+    }
+    let resource = parsed
+        .resource
+        .strip_prefix(OIDC_PROVIDER_ARN_RESOURCE_PREFIX)?;
+    let issuer = login_provider_issuer(resource);
+    (!issuer.is_empty()).then_some(issuer)
+}
+
+/// Whether an OIDC provider ARN names a provider of the ACCOUNT this emulator serves, and
+/// so one whose IAM registration — the client ids it accepts — this emulator can resolve at
+/// all. An ARN of any other account names a registration held somewhere this emulator does
+/// not reach.
+pub fn oidc_provider_arn_is_of_this_account(arn: &str) -> bool {
+    ::service_common::arn::parse(arn)
+        .is_some_and(|parsed| parsed.account == ::engine::emulator_account_id())
+}
+
+/// The ARN namespace of IAM, whose resources an OIDC provider ARN names.
+const IAM_ARN_NAMESPACE: &str = "iam";
+
+/// The ISSUER a login provider name or an identity provider's URL names: the host-and-path
+/// form both carry — a `Logins` provider name is written that way (`GetId.Logins`) and an
+/// IAM OIDC provider's URL "should correspond to the iss claim in the provider's OpenID
+/// Connect ID tokens" and is stored without its scheme — so the two are compared like for
+/// like.
+///
+/// The derivation is STS's own ([`::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::web_identity_provider_name`]),
+/// called rather than copied: it is this tree's one dropping of a token issuer's scheme,
+/// and the service that redeems a web identity has to read an issuer the same way the
+/// service that federates one does.
+pub fn login_provider_issuer(name: &str) -> &str {
+    ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state::web_identity_provider_name(
+        name,
+    )
+}
+
+/// One IAM OpenID Connect identity provider the account holds, reduced to what deciding a
+/// login against it needs.
+#[derive(Debug, Clone)]
+pub struct RegisteredOidcProvider {
+    /// The client ids it was registered with — "a list of client IDs (also known as
+    /// audiences) that are associated with the specified IAM OIDC provider resource object"
+    /// (`iam:GetOpenIDConnectProvider$ClientIDList`).
+    pub client_ids: Vec<String>,
+}
+
+/// The IAM OpenID Connect identity providers the ACCOUNT holds, keyed by ARN, as a snapshot
+/// taken before this service's own store is locked ([`registered_oidc_providers`]).
+///
+/// An identity pool names such a provider by ARN and nothing else, so what the ARN resolves
+/// to is IAM's record rather than a second copy of it kept here: registering, deleting or
+/// re-registering a provider, or adding a client id to one, changes what the pools naming it
+/// admit, with no write to this service's state at all.
+#[derive(Debug, Default, Clone)]
+pub struct RegisteredOidcProviders {
+    providers: BTreeMap<String, RegisteredOidcProvider>,
+}
+
+impl RegisteredOidcProviders {
+    /// The provider `arn` names, or `None` when the account holds none for it — which is
+    /// the answer for an ARN whose provider was deleted, and for one that never named a
+    /// provider at all.
+    pub fn registered(&self, arn: &str) -> Option<&RegisteredOidcProvider> {
+        self.providers.get(arn)
+    }
+}
+
+/// The IAM OpenID Connect providers the account holds, read through IAM's OWN state
+/// accessor in the same engine, so a provider `iam:CreateOpenIDConnectProvider` wrote is the
+/// very record a login is decided against.
+///
+/// A SNAPSHOT, read before a handler locks this service's store, so no request holds two
+/// services' stores at once. Empty for an engine carrying no IAM store, and for an account
+/// that has registered no provider: either way no identity pool's OIDC provider ARN resolves.
+pub fn registered_oidc_providers<Eng: Send + Sync + 'static>(engine: &Eng) -> RegisteredOidcProviders {
+    let Some(iam) = ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(
+        engine,
+    ) else {
+        return RegisteredOidcProviders::default();
+    };
+    let iam = iam.lock();
+    RegisteredOidcProviders {
+        providers: iam
+            .open_id_connect_providers
+            .iter()
+            .map(|(arn, record)| {
+                (
+                    arn.clone(),
+                    RegisteredOidcProvider {
+                        client_ids: record.client_id_list.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// The audiences the trusts an identity pool states for ONE issuer accept.
+#[derive(Debug, Default, Clone)]
+struct TrustedAudiences {
+    /// Whether some trust for this issuer states no audience constraint at all. Such a
+    /// trust names no audience to compare a token against, so it accepts a token issued for
+    /// any.
+    any: bool,
+    /// The client ids the audience-constrained trusts for this issuer accept.
+    recorded: Vec<String>,
+}
+
+impl TrustedAudiences {
+    /// Add one more trust for this issuer: `constrains` says whether it states an audience
+    /// constraint at all, and `client_ids` are the audiences it accepts — which an
+    /// audience-constrained trust may hold none of, in which case it accepts none.
+    fn accept<I: IntoIterator<Item = String>>(&mut self, constrains: bool, client_ids: I) {
+        for client_id in client_ids {
+            if client_id.is_empty() {
+                continue;
+            }
+            if !self.recorded.contains(&client_id) {
+                self.recorded.push(client_id);
+            }
+        }
+        self.any |= !constrains;
+    }
+}
+
+/// What an identity pool's stored configuration decides about the `Logins` of one request:
+/// the issuers it trusts, with the audiences each of those trusts accepts
+/// ([`IdentityPool::login_trust`]).
+#[derive(Debug, Default, Clone)]
+pub struct PoolLoginTrust {
+    issuers: BTreeMap<String, TrustedAudiences>,
+}
+
+impl PoolLoginTrust {
+    /// Why the `Logins` map of a request authorizes nothing against this trust, if so.
+    ///
+    /// The entries are decided in a stable order, so a map that breaks the rule in two
+    /// places is refused the same way every time.
+    pub fn refuse(&self, logins: &HashMap<String, String>) -> Option<LoginProviderRefusal> {
+        let mut presented: Vec<(&String, &String)> = logins.iter().collect();
+        presented.sort();
+        presented
+            .into_iter()
+            .find_map(|(provider_name, token)| self.refuse_login(provider_name, token))
+    }
+
+    /// Why one presented login authorizes nothing, if so.
+    ///
+    /// An issuer the pool states a trust for admits the login only where the token was
+    /// issued for an audience that trust accepts: the `aud` claim of an OpenID Connect ID
+    /// token names the client it was issued for, and a client id the trust does not hold is
+    /// one the pool never asked for tokens of — so a trust that accepts no client id at all
+    /// (an `OpenIdConnectProviderARNs` entry whose provider the account no longer holds,
+    /// or one registered with no client id) admits no audience either. A token carrying no
+    /// readable audience is not refused here — its audience is decided by the provider that
+    /// issued it, which this emulator does not reach.
+    ///
+    /// An issuer the pool states NO trust for is refused only where the issuer is one this
+    /// emulator itself hosts (an Amazon Cognito user pool, whose provider name names it):
+    /// any other issuer's token is decided by that issuer, so the pool's configuration
+    /// alone does not refuse it.
+    fn refuse_login(&self, provider_name: &str, token: &str) -> Option<LoginProviderRefusal> {
+        let issuer = login_provider_issuer(provider_name);
+        let Some(trusted) = self.issuers.get(issuer) else {
+            return names_cognito_user_pool(issuer)
+                .then_some(LoginProviderRefusal::UnsupportedProvider);
+        };
+        if trusted.any {
+            return None;
+        }
+        let presented = presented_token_audiences(token);
+        if presented.is_empty() {
+            return None;
+        }
+        let accepted = presented
+            .iter()
+            .any(|audience| trusted.recorded.contains(audience));
+        (!accepted).then_some(LoginProviderRefusal::IncorrectAudience)
+    }
+}
+
+/// Why a presented `Logins` entry authorizes nothing against the identity pool's trust for
+/// its issuer. Both are answered with the operation's modelled `NotAuthorizedException`
+/// (HTTP 403).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginProviderRefusal {
+    /// The pool states no trust for the token's issuer.
+    UnsupportedProvider,
+    /// It states one, and the token names an audience that trust does not accept.
+    IncorrectAudience,
+}
+
+impl LoginProviderRefusal {
+    /// The message the refusal carries.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::UnsupportedProvider => UNSUPPORTED_LOGIN_PROVIDER_MESSAGE,
+            Self::IncorrectAudience => INCORRECT_TOKEN_AUDIENCE_MESSAGE,
+        }
+    }
+}
+
+/// The claim naming who a token was issued FOR (RFC 7519 §4.1.3), which an OpenID Connect
+/// ID token carries the client id in — for a provider that issues tokens to an app client,
+/// that client.
+const AUDIENCE_CLAIM: &str = "aud";
+
+/// The claim naming "the principal that is the subject of the JWT" (RFC 7519 §4.1.2), which
+/// an OpenID Connect ID token carries the authenticated user's identifier in.
+const SUBJECT_CLAIM: &str = "sub";
+
+/// The provider's USER IDENTIFIER a presented login names — what an identity is indexed
+/// under in a pool.
+///
+/// `Logins` maps a provider name to a "provider_user_identifier"
+/// (`GetCredentialsForIdentity$Logins`, this service's model), and `GetId` "generates (or
+/// retrieves)" the one identity of that federated user. For a provider whose login is an
+/// OpenID Connect ID token, the identifier that token NAMES is its `sub` claim rather than
+/// the token's own bytes: the same user signing in again — through another app client of the
+/// same issuer, or after a refresh — presents another token naming the same subject, and
+/// both are one federated user. A login no subject can be read out of is indexed by the
+/// value as presented, which is the only identifier it carries (a developer user identifier
+/// among them).
+///
+/// The claims are read through [`presented_token_claims`], the one reading this service
+/// makes of a login ANOTHER party issued, so the identifier a login is indexed under and
+/// the audience it is admitted on come from the same claim set.
+pub fn login_user_identifier(login: &str) -> String {
+    presented_token_claims(login)
+        .and_then(|claims| {
+            claims
+                .get(SUBJECT_CLAIM)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .filter(|subject| !subject.is_empty())
+        .unwrap_or_else(|| login.to_string())
+}
+
+/// The audiences a presented login token names: its `aud` claim, which "MAY be a single
+/// case-sensitive string" or an array of them (RFC 7519 §4.1.3), read through the same
+/// [`presented_token_claims`] / [`claim_values`] pair a role mapping reads a claim with.
+///
+/// Empty for a value that is no identity token and for a token carrying no `aud`: there is
+/// no audience to decide the login on, and nothing is granted on what is read either way.
+fn presented_token_audiences(token: &str) -> Vec<String> {
+    presented_token_claims(token)
+        .map(|claims| claim_values(&claims, AUDIENCE_CLAIM))
+        .unwrap_or_default()
+}
+
+/// The resource type of an IAM OpenID Connect provider ARN, which the issuer url it names
+/// follows (`arn:aws:iam::<account>:oidc-provider/<url without its scheme>`).
+const OIDC_PROVIDER_ARN_RESOURCE_PREFIX: &str = "oidc-provider/";
 
 /// How AWS words the refusal of a login whose provider issues OpenID Connect identity
 /// tokens and whose presented value is not one.
@@ -275,6 +596,19 @@ const COGNITO_USER_POOL_PROVIDER_PREFIX: &str = "cognito-idp.";
 /// to act on.
 pub const UNSUPPORTED_LOGIN_PROVIDER_MESSAGE: &str =
     "Token is not from a supported provider of this identity pool.";
+
+/// The message a `NotAuthorizedException` carries for a `Logins` entry whose token names an
+/// audience the pool's trust for that token's issuer does not accept — a client id that is
+/// in none of the trust's registrations.
+///
+/// One fixed sentence, as [`UNSUPPORTED_LOGIN_PROVIDER_MESSAGE`] is and for the same reason:
+/// the caller holds no credential, so the refusal names neither the audience the token
+/// carried nor the client ids the pool's providers are registered with. It states that the
+/// token was issued for the wrong audience, which is what a client has to act on — the one
+/// thing it can fix, by presenting a token of a client the provider is registered for or by
+/// registering that client with the provider.
+pub const INCORRECT_TOKEN_AUDIENCE_MESSAGE: &str =
+    "Invalid login token. Incorrect token audience.";
 
 /// The message a `NotAuthorizedException` carries for a request naming a developer-identity
 /// mapping the identity pool does not hold: a developer user identifier it has indexed
@@ -635,10 +969,6 @@ fn mapping_key_names_provider(
 /// the identifier a `RoleMappings` entry is keyed by.
 const PROVIDER_CLIENT_SEPARATOR: char = ':';
 
-/// The claim naming who a token was issued to (RFC 7519 §4.1.3), which for a provider that
-/// issues tokens to an app client is that client.
-const AUDIENCE_CLAIM: &str = "aud";
-
 /// The claim set of the identity token a `Logins` entry presents, when the value presented
 /// is a token at all.
 ///
@@ -886,6 +1216,10 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     }
 
     /// The `IdentityId` the pool has linked to this `(provider, login)`, if any.
+    ///
+    /// The login is keyed by the provider's USER IDENTIFIER it names
+    /// ([`login_user_identifier`]), so every login of one federated user resolves to the one
+    /// identity.
     pub fn linked_identity(
         &self,
         identity_pool_id: &str,
@@ -895,7 +1229,7 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         self.login_index.get(&(
             identity_pool_id.to_string(),
             provider.to_string(),
-            login.to_string(),
+            login_user_identifier(login),
         ))
     }
 
@@ -942,6 +1276,10 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
 
     /// Link `(provider, login)` in this pool to `identity_id`, so a later `GetId`
     /// presenting it resolves to that identity.
+    ///
+    /// Indexed under the provider's USER IDENTIFIER the login names
+    /// ([`login_user_identifier`]), which is what makes the link one per federated USER
+    /// rather than one per presented value.
     pub fn link_login(
         &mut self,
         identity_pool_id: &str,
@@ -953,7 +1291,7 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             (
                 identity_pool_id.to_string(),
                 provider.to_string(),
-                login.to_string(),
+                login_user_identifier(login),
             ),
             identity_id.to_string(),
         );
@@ -972,7 +1310,7 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         self.login_index.remove(&(
             identity_pool_id.to_string(),
             provider.to_string(),
-            login.to_string(),
+            login_user_identifier(login),
         ))
     }
 

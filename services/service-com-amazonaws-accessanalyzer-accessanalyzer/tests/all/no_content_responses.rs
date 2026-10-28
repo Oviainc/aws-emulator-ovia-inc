@@ -6,11 +6,11 @@
 //! with no members has no content to report, so it is answered with 204 No Content —
 //! this service's model leaves every success code defaulted (`@http` carries no
 //! `code:`), so the Smithy default of 200 is not a statement about it. The only such
-//! operations in this model are the two tag mutations (`TagResource`,
-//! `UntagResource`; `CancelPolicyGeneration`'s success path is still a 501 stub, so it
-//! has no wire row here). The boundary is pinned too: a call whose output carries
-//! members, and a call whose output is `smithy.api#Unit` (no response structure at all),
-//! both keep 200.
+//! operations in this model are the two tag mutations (`TagResource`, `UntagResource`)
+//! and `CancelPolicyGeneration`, whose own suite (`tests/all/policy_generation.rs`) pins
+//! its 204 along with the job lifecycle it belongs to. The boundary is pinned too: a call
+//! whose output carries members, and a call whose output is `smithy.api#Unit` (no
+//! response structure at all), both keep 200.
 //!
 //! The tables span what the rule generalises over — which mutation, how many tags, the
 //! key and value form (ASCII, Unicode, empty value, each published length bound), how

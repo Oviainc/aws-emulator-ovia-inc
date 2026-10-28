@@ -251,8 +251,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
     ) -> Result<GetCredentialsForIdentityOutput, GetCredentialsForIdentityError> {
         use crate::state::{
             IssuedCredentials, VendedAssume, INVALID_POOL_CONFIGURATION_MESSAGE,
-            UNSUPPORTED_LOGIN_PROVIDER_MESSAGE,
         };
+        use ::std::collections::HashMap;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetCredentialsForIdentityErrorModeled::InternalErrorException(
@@ -264,6 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
         };
 
         let now = ::std::time::SystemTime::now();
+        // Which issuers the identity's pool trusts is partly IAM's record — an
+        // `OpenIdConnectProviderARNs` entry names an IAM OpenID Connect provider — so the
+        // account's providers are read BEFORE this service's own store is locked, and only
+        // for a vend that presents a login at all.
+        let registered = if input.logins.as_ref().is_none_or(HashMap::is_empty) {
+            crate::state::RegisteredOidcProviders::default()
+        } else {
+            crate::state::registered_oidc_providers(&*self.engine)
+        };
         // The pool's own configuration is read FIRST, and only the facts this vend needs
         // are copied out, so the identity-pool store is not held while the IAM and STS
         // stores in the same engine are read.
@@ -282,10 +291,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             let identity_is_disabled = identity.is_disabled();
 
             // "Any provided logins will be validated against supported login providers"
-            // (this operation's own doc): a `Logins` entry that names an Amazon Cognito user
-            // pool carries its issuer in the provider name, so the stored configuration of
-            // the identity's OWN pool decides it — a token minted by a user pool that is
-            // none of that pool's `CognitoIdentityProviders` authorizes nobody here.
+            // (this operation's own doc): a `Logins` entry carries its issuer in the
+            // provider name, so the stored trust the identity's OWN pool states for that
+            // issuer decides it — a `CognitoIdentityProviders` entry, or an
+            // `OpenIdConnectProviderARNs` entry that still resolves to an IAM OIDC
+            // provider — together with the audience that trust accepts.
             let logins = input.logins.clone().unwrap_or_default();
             if !logins.is_empty() {
                 // An identity an unlink left linked to NO provider can no longer be reached
@@ -319,13 +329,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                     )
                     .into());
                 };
-                if logins
-                    .keys()
-                    .any(|provider| !pool.accepts_login_provider(provider))
-                {
+                if let Some(refusal) = pool.login_trust(&registered).refuse(&logins) {
                     return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
-                            message: Some(UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                            message: Some(refusal.message().to_string()),
                         },
                     )
                     .into());
