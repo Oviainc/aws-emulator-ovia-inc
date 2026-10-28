@@ -13,6 +13,13 @@
 //!    `@length` bound — and along the rest of the request: both `baseModelIdentifier`
 //!    spellings, the customization asked for by name or left to the operation's default, the
 //!    tag counts a resource may carry, an `@idempotencyToken` and the signing region.
+//!    The pass is REFUSED only on what this account's IAM ANSWERED about the role, and this
+//!    suite mounts the one service, so there is no IAM here to answer: these rows pin the
+//!    grounding half of the decision. The half IAM answers — whether the account holds that
+//!    role, and whether the trust policy it carries grants Amazon Bedrock the assume this
+//!    pass would make — is pinned in
+//!    `core/router/tests/all/bedrock_model_customization_pass_role.rs`, where this service
+//!    and IAM are mounted over one engine.
 //! 2. **A role of ANOTHER account cannot be passed**, so the create is refused with the
 //!    modelled `AccessDeniedException` (`@httpError(403)`) carrying the one sentence the
 //!    service states that denial with — over rows differing in the other account's digits,
@@ -826,4 +833,113 @@ async fn a_member_outside_its_published_form_is_refused_for_that_form() {
         "a refused create stores no job, got {:?}",
         listed.body
     );
+}
+
+/// RULE (the grounding half of the pass-role decision): a pass is refused only on what this
+/// account's IAM ANSWERED about the role. With the one service mounted there is no IAM to
+/// ask, so nothing is known about any role of this account and no create is refused for its
+/// role — while a role of ANOTHER account needs no IAM answer at all, because `iam:PassRole`
+/// is granted by the account that HOLDS the role.
+#[tokio::test]
+async fn a_pass_is_refused_only_on_what_this_accounts_iam_answered() {
+    let emu = emulator();
+    let model = fine_tuning_model();
+
+    // The rows differ along which account the `roleArn` names and, inside each, along the
+    // forms the member's published pattern admits: a bare name, a name behind an IAM path,
+    // the empty account field, and another partition.
+    let rows: Vec<(&str, String, bool)> = vec![
+        (
+            "a role of this account that no IAM here holds",
+            own_role("grounding-role"),
+            true,
+        ),
+        (
+            "a role of this account behind an IAM path",
+            own_role("service-role/GroundingRole"),
+            true,
+        ),
+        (
+            "a role ARN carrying no account at all",
+            "arn:aws:iam:::role/grounding-role".to_string(),
+            true,
+        ),
+        (
+            "a role of this account in another partition",
+            format!("arn:aws-us-gov:iam::{ACCOUNT}:role/grounding-role"),
+            true,
+        ),
+        (
+            "a role of another account",
+            "arn:aws:iam::210987654321:role/grounding-role".to_string(),
+            false,
+        ),
+        (
+            "a role of another account behind an IAM path",
+            "arn:aws:iam::210987654321:role/service-role/GroundingRole".to_string(),
+            false,
+        ),
+    ];
+
+    for (index, (case, role, admitted)) in rows.into_iter().enumerate() {
+        let job_name = format!("grounding-{index}");
+        let model_name = format!("Grounding{index}");
+        let reply = create(
+            &emu,
+            REGION,
+            create_body(&job_name, &model_name, model, &role, json!({})),
+        )
+        .await;
+
+        if admitted {
+            assert_eq!(
+                reply.status, 201,
+                "case {case:?} ({role}): with nothing IAM answered the pass is not refused, \
+                 got {} {:?}",
+                reply.status, reply.body
+            );
+            let read = get_job(&emu, REGION, &job_name).await;
+            assert_eq!(
+                (read.status, read.text("roleArn").as_str()),
+                (200, role.as_str()),
+                "case {case:?}: the minted job must read back under the role it was passed, \
+                 got {} {:?}",
+                read.status,
+                read.body
+            );
+        } else {
+            assert_eq!(
+                (
+                    reply.status,
+                    reply.error.as_deref(),
+                    refusal_message(&reply).as_str()
+                ),
+                (403, Some("AccessDeniedException"), PASS_ROLE_REFUSAL),
+                "case {case:?} ({role}): a role of another account cannot be passed, got {} \
+                 {:?}",
+                reply.status,
+                reply.body
+            );
+            // The refusal left nothing behind: no job under that name, and no custom model
+            // reserved under the one the request carried.
+            let read = get_job(&emu, REGION, &job_name).await;
+            assert_eq!(
+                read.status, 404,
+                "case {case:?}: a refused create stores no job, got {} {:?}",
+                read.status, read.body
+            );
+            let listed = list_jobs(&emu, REGION, &job_name).await;
+            assert!(
+                listing_rows(&listed, "modelCustomizationJobSummaries").is_empty(),
+                "case {case:?}: a refused create is listed nowhere, got {:?}",
+                listed.body
+            );
+            let models = list_custom_models(&emu, REGION, &model_name).await;
+            assert!(
+                listing_rows(&models, "modelSummaries").is_empty(),
+                "case {case:?}: a refused create reserves no custom model, got {:?}",
+                models.body
+            );
+        }
+    }
 }

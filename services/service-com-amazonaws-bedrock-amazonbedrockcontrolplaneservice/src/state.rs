@@ -2843,25 +2843,75 @@ pub fn pass_role_denial(config: &LoggingConfig) -> Option<String> {
 /// decides whether this caller may pass it stands in front of everything else the request
 /// needs: no resource it names is resolved until that decision is taken.
 ///
-/// What a caller may pass is a role of its OWN account: `iam:PassRole` is granted by the
-/// account that holds the role, so a value naming a role of ANOTHER account is one no
-/// principal of this account can hand to a service, whatever the role is named or trusts.
-/// So the decision is the one reading of a caller-supplied IAM role ARN this tree shares
-/// ([`::service_common::iam_role::role_name`]): a role of this account admits the pass and
-/// the create goes on to mint the job, and everything else — another account's role, an IAM
-/// ARN that names no role — is the denial. That reading takes an EMPTY account field (which
-/// this member's published pattern admits, `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`)
-/// as naming no other account, hence as this one's.
+/// The decision is the one every service that is handed a role to act under makes
+/// ([`::service_common::iam_role::role_pass_is_unauthorized`]), asked for THIS pass:
+///
+/// * the value has to name a role of the CALLER's OWN account — `iam:PassRole` is granted by
+///   the account that holds the role, so another account's role is one no principal of this
+///   account can hand to a service, whatever that role trusts (an EMPTY account field, which
+///   the member's published pattern admits,
+///   `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`, names no other account, hence this one);
+/// * this account's IAM has to HOLD that role; and
+/// * the trust policy the role carries has to grant [`BEDROCK_SERVICE_PRINCIPAL`] the
+///   `sts:AssumeRole` this pass would make. A statement's `Condition` is part of its grant,
+///   so a grant this pass cannot be shown to satisfy is not one: the pass carries the
+///   account whose request Amazon Bedrock would be acting for
+///   ([`SOURCE_ACCOUNT_CONDITION_KEY`]) and nothing else — the job the role would be assumed
+///   for does not exist while its own creation is still being authorized, so its ARN is no
+///   value of this request — and a clause over any other key leaves the statement undecided,
+///   which IAM never reads as a grant. RECORDED, not derived from the documentation: the
+///   corpus records this operation REFUSING a pass of exactly that shape — a role of the
+///   caller's own account, trusted to this service, whose grant is narrowed to the ARN of
+///   the very job the call would create — and no value is guessed for a key the request does
+///   not carry (`::service_common::iam_authorization` decides a clause or leaves it
+///   undecided; it never fills one in).
+///
+/// Refused only on what IAM ANSWERED: an emulator with no IAM to ask, or an answer this
+/// could not read, leaves the pass admitted, because a refusal has to be grounded.
+///
+/// ONE sentence for every refusal this gate makes, [`CROSS_ACCOUNT_PASS_ROLE_DENIED`]: the
+/// corpus records this operation refusing a pass with that sentence and with nothing else,
+/// and it records it for a role of the caller's OWN account — so the recorded wording is not
+/// reserved for the ARN naming another account, and no recording of this operation words a
+/// refused pass any other way. Inventing a second sentence for the other paths of one
+/// decision would be a wording no recording supports; so the gate states the recorded one,
+/// which carries no part of the request to be wrong about.
 ///
 /// A denial is the modelled `AccessDeniedException` (`@httpError(403)`) carrying
 /// [`CROSS_ACCOUNT_PASS_ROLE_DENIED`], with no job and no custom model written, which is
 /// what every recording of such a create shows.
-#[must_use]
-pub fn customization_pass_role_denial(role_arn: &str) -> Option<String> {
-    ::service_common::iam_role::role_name(role_arn)
-        .is_none()
-        .then(|| CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string())
+pub async fn customization_pass_role_denial(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<String> {
+    let context = [(
+        SOURCE_ACCOUNT_CONDITION_KEY.to_string(),
+        ::engine::emulator_account_id().to_string(),
+    )];
+    ::service_common::iam_role::role_pass_is_unauthorized(
+        ctx,
+        region,
+        role_arn,
+        BEDROCK_SERVICE_PRINCIPAL,
+        &context,
+    )
+    .await
+    .then(|| CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string())
 }
+
+/// The principal Amazon Bedrock takes on a role a caller passes it AS.
+///
+/// This service's `aws.api#service$cloudTrailEventSource`
+/// (`smithy_query(query="service_info")`), which is the service principal AWS names Amazon
+/// Bedrock by in an IAM policy — the principal a role that Amazon Bedrock is to assume has
+/// to trust.
+pub const BEDROCK_SERVICE_PRINCIPAL: &str = "bedrock.amazonaws.com";
+
+/// `aws:SourceAccount` — IAM's global condition key for the account whose request the
+/// service is acting for, which is the one value an `iam:PassRole` decision of this account
+/// carries: the account making the call is the account the service would act for.
+const SOURCE_ACCOUNT_CONDITION_KEY: &str = "aws:SourceAccount";
 
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
