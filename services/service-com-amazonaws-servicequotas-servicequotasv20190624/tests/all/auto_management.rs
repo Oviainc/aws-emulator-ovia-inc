@@ -68,7 +68,10 @@ fn notification_arn(name: &str) -> String {
 
 /// The `OptInType` member `name`, checked against the model's own value list, so a row
 /// cannot ask for a type the model does not declare.
-fn opt_in_type(name: &str) -> &'static str {
+///
+/// `pub(crate)` so `auto_management_opt_in_type.rs` — which owns the refusal of a value
+/// OUTSIDE that list — shares this one reader of the member instead of growing a copy.
+pub(crate) fn opt_in_type(name: &str) -> &'static str {
     OPT_IN_TYPE_VALUES
         .iter()
         .copied()
@@ -93,7 +96,10 @@ fn another_opt_in_type(name: &str) -> &'static str {
 
 /// The scalar members of a reported configuration, as `(OptInLevel, OptInType,
 /// OptInStatus, NotificationArn)` — each `None` when the member is absent.
-fn scalars(body: &Value) -> (Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
+///
+/// `pub(crate)` so the suites that assert what a write left on record read it the same
+/// way (see `auto_management_opt_in_type.rs`).
+pub(crate) fn scalars(body: &Value) -> (Option<&str>, Option<&str>, Option<&str>, Option<&str>) {
     let member = |name: &str| body.get(name).and_then(Value::as_str);
     (
         member("OptInLevel"),
@@ -172,7 +178,7 @@ fn assert_every_entry_is_named(case: &str, body: &Value) {
 
 /// Read the configuration back, which must succeed: the read reports
 /// `OptInStatus: DISABLED` rather than failing even when nothing was ever started.
-async fn configuration(client: &Client, case: &str) -> Value {
+pub(crate) async fn configuration(client: &Client, case: &str) -> Value {
     let (status, body) = client.call(GET_CONFIG, &json!({})).await;
     assert_eq!(
         status, 200,
@@ -184,7 +190,11 @@ async fn configuration(client: &Client, case: &str) -> Value {
 /// Dispatch a call that must be refused, and return its status, error code and the
 /// `Message` member that says what was wrong. `quota_workflow`'s own helper reports
 /// only the status and the code.
-async fn refused(client: &Client, operation: &str, body: &Value) -> (u16, String, String) {
+pub(crate) async fn refused(
+    client: &Client,
+    operation: &str,
+    body: &Value,
+) -> (u16, String, String) {
     let (status, parsed) = client.call(operation, body).await;
     let member = |name: &str| {
         parsed

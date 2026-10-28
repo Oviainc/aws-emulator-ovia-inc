@@ -479,10 +479,19 @@ type AppliedKey = (String, String, Option<String>);
 pub struct AutoManagementConfig {
     /// `OptInLevel` — an `OptInLevel` member, as the opt-in named it.
     pub opt_in_level: String,
-    /// `OptInType` — an `OptInType` member, as the opt-in named it. Every member the
-    /// enum declares is stored as given: the member carries no constraint narrowing it
-    /// to a subset, so the boundary validator's enum check is the whole of its
-    /// validation (see [`crate::ops::types::OPT_IN_TYPE_VALUES`]).
+    /// `OptInType` — an `OptInType` member, as the opt-in named it. EVERY member the
+    /// enum declares is stored as given, the auto-adjust mode included: which values an
+    /// enum-valued member accepts is decided by the enum the model declares, and the
+    /// member's prose note ("Currently, only `NotifyOnly` is available") is
+    /// documentation the service does not enforce. The RECORDING is what settles it —
+    /// the behavioural check
+    /// `service-quotas.auto-management-start-update-stop-lifecycle` updates a running
+    /// configuration to the auto-adjust mode, that call is SERVED with HTTP 200 and the
+    /// following read reports the switched mode with `OptInStatus` still `ENABLED`. So
+    /// the boundary validator's enum check is the whole of this member's validation
+    /// (see [`crate::ops::types::OPT_IN_TYPE_VALUES`]); an availability allow-list over
+    /// it would refuse a call the recording serves, which is why neither writer carries
+    /// one.
     pub opt_in_type: String,
     /// `OptInStatus` — [`OPT_IN_STATUS_ENABLED`] while Automatic Management is
     /// started, [`OPT_IN_STATUS_DISABLED`] once it is stopped. Stopping keeps the

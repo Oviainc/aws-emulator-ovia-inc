@@ -28,10 +28,14 @@
 //! Every modelled input constraint — `OptInLevel`'s and `OptInType`'s value sets, the
 //! `NotificationArn` length and pattern, the exclusion list's key and member
 //! patterns — is refused by the boundary validator BEFORE this handler runs, so
-//! reaching here means the configuration is well formed. `OptInType` carries no
-//! constraint narrowing it to a subset of the enum, so every member the enum declares
-//! is stored as given; the member's prose note about which mode is available is
-//! documentation rather than a modelled constraint, and this handler enforces none of
+//! reaching here means the configuration is well formed. EVERY `OptInType` member the
+//! enum declares is then stored as given, including the one the member's prose note
+//! calls not yet available: the note is documentation the SERVICE does not enforce, as
+//! the RECORDING shows — the behavioural check
+//! `service-quotas.auto-management-start-update-stop-lifecycle` switches a running
+//! configuration to the auto-adjust mode and that call is SERVED, not refused (see
+//! [`crate::state::AutoManagementConfig`]). Narrowing the member to a subset here
+//! would refuse a call the recording serves, so this handler enforces no value rule of
 //! its own — the rule `UpdateAutoManagement` applies to the same member.
 //!
 //! ---

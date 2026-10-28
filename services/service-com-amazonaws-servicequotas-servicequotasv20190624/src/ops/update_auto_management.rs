@@ -26,11 +26,15 @@
 //! told about the names in a call it has no configuration to apply.
 //!
 //! An `OptInType` this call names is stored as given whichever member of the enum it
-//! is: the member carries no constraint narrowing it to a subset of the enum, so the
-//! boundary validator's enum check is the whole of its validation and the handler adds
-//! none of its own — the rule `StartAutoManagement` applies to the same member. The
-//! member's prose note about which mode is available is documentation, not a modelled
-//! constraint, and an update of the mode leaves `OptInStatus` as it was.
+//! is: the boundary validator's enum check is the whole of its validation and the
+//! handler adds none of its own — the rule `StartAutoManagement` applies to the same
+//! member. The member's prose note about which mode is available is documentation the
+//! SERVICE does not enforce: the behavioural check
+//! `service-quotas.auto-management-start-update-stop-lifecycle` updates a running
+//! configuration to the auto-adjust mode and that call is SERVED, so refusing it here
+//! would refuse a call the recording serves (see
+//! [`crate::state::AutoManagementConfig`]). An update of the mode leaves `OptInStatus`
+//! as it was.
 //!
 //! ---
 //!

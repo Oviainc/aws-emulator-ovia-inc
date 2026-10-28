@@ -21,6 +21,8 @@ mod auto_management;
 mod auto_management_configuration;
 #[path = "all/auto_management_exclusions.rs"]
 mod auto_management_exclusions;
+#[path = "all/auto_management_opt_in_type.rs"]
+mod auto_management_opt_in_type;
 #[path = "all/catalog_identity.rs"]
 mod catalog_identity;
 #[path = "all/catalog_pagination.rs"]
