@@ -50,3 +50,53 @@ Smithy citations (services/service-com-amazonaws-elasticloadbalancingv2-elasticl
 4. update_stack with the same template but RuleA at Priority 20 and body 'a2'. On AWS the stack settles UPDATE_ROLLBACK_COMPLETE with an UPDATE_FAILED event for 'RuleA' carrying 'HandlerErrorCode: AlreadyExists', because ELBv2 refuses the colliding priority with PriorityInUse (HTTP 400); RuleA is left at Priority 10 with body 'a1' and the ALB still serves 'a1'.
 5. update_stack again with RuleA at Priority 15 and body 'a2': on AWS this settles UPDATE_COMPLETE, the rule ARN is unchanged and the ALB serves 'a2'.
 6. Re-replay elbv2.deploy-elbv2-2-rule-priority-collision-update-rejected.
+
+## Resolution
+
+PARTIAL, and deliberately so — read this before assuming the replayed check converges.
+
+What this report attributes the timeout to (`_poll_stable#19|Timeout|time.sleep(interval_s)`,
+the data-plane GET through the created ALB's DNS name) was that **nothing served an
+Application Load Balancer's own traffic at all**: the name `LoadBalancer$DNSName` publishes
+is not this API's endpoint, so the front door resolved no target service for a request
+addressed to it and answered `404 UnknownService`, and a client polling that name never got
+an answer it could act on. That is now implemented:
+`services/service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10/src/service/data_plane.rs`
+claims a request addressed to a load balancer the ELBv2 store holds and answers it from the
+listener it reaches — the actions of the first rule, in ascending priority order, whose
+conditions are all met, and the listener's default actions when no rule's are — serving a
+`fixed-response` in full, a `redirect` with the `Location` its components build, and a
+`forward` with the status the target condition earns (503 with no healthy target, 502 for a
+target with no server behind it). `tests/all/alb_data_plane.rs` pins it over a table of
+every condition field, each action type and the four addressings a client can reach a load
+balancer by.
+
+The other two things this report names were already true in the tree by the time it was
+picked up, and are unchanged here: `CreateRule` and `SetRulePriorities` both refuse a
+colliding priority with `PriorityInUseException` (HTTP 400 `PriorityInUse`) per listener,
+over the order the whole request leaves behind (`src/ops/create_rule.rs`,
+`src/ops/set_rule_priorities.rs`), and CloudFormation's update path settles out of
+`*_IN_PROGRESS` to `UPDATE_COMPLETE` or rolls back to `UPDATE_ROLLBACK_COMPLETE`
+(`services/service-com-amazonaws-cloudformation-cloudformation/src/ops/update_stack.rs`).
+
+What is still OPEN, and why the replayed check still times out: the ALB this check polls is
+created by a CloudFormation stack, and CloudFormation creates no Elastic Load Balancing
+resource in Elastic Load Balancing at all — it SYNTHESISES the identifiers it reports for
+`AWS::ElasticLoadBalancingV2::{LoadBalancer,Listener,ListenerRule,TargetGroup}`
+(`services/service-com-amazonaws-cloudformation-cloudformation/src/state/template.rs:3444-3680`),
+and its provisioner table has no entry for any of them
+(`src/state/provisioner.rs`'s `provisioner_for`). So the ELBv2 store holds no load balancer
+for the stack's `AlbDns`, there is no listener configuration for this responder to answer
+from, and no ELBv2 call for the colliding-priority update to be refused by. That gap is two
+other open issues' causes, in this order:
+
+* `issues/things-that-do-not-work/20261024T235905Z-elbv2-describerules-answers-listenernotfound-for-the-listener-arn.md`
+  and cause 2 of
+  `issues/things-that-do-not-work/20261023T205437Z-cloudformation-reports-create-complete-for-resources-it-never.md`
+  — CloudFormation must create these resources through the ELBv2 API it later reports;
+* which in turn needs
+  `issues/things-that-do-not-work/20261027T155034Z-cloudformation-ec2-cfn-provisioned-aws-ec2-vpc-and.md`
+  — ELBv2's `CreateLoadBalancer` resolves the subnets a request names against EC2 and
+  refuses an id EC2 holds no subnet for (`src/state/network.rs:165-194`), and the subnet ids
+  a stack reports today are synthesised rather than created in EC2, so provisioning the ALB
+  before the VPC is real would make a stack that reaches CREATE_COMPLETE today fail instead.
