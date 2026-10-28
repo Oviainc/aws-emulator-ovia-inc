@@ -45,6 +45,8 @@ mod scaling_instruction_validation;
 mod scaling_mode_conditional_members;
 #[path = "all/scaling_plan_lifecycle.rs"]
 mod scaling_plan_lifecycle;
+#[path = "all/scaling_plan_resource_paging.rs"]
+mod scaling_plan_resource_paging;
 #[path = "all/scaling_plan_resource_policies.rs"]
 mod scaling_plan_resource_policies;
 #[path = "all/scheduled_action_buffer_time.rs"]

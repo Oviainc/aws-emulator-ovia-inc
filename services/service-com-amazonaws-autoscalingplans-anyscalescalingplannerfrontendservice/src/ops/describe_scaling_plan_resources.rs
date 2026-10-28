@@ -4,6 +4,11 @@
 //! Derives one `ScalingPlanResource` per stored `ScalingInstruction` of the named
 //! plan, read back from [`crate::state`] and paged by `MaxResults`/`NextToken`.
 //!
+//! The resources are reported in the order of the identity that addresses each of them
+//! — the `(ServiceNamespace, ResourceId, ScalableDimension)` triple of its instruction —
+//! and the `NextToken` carries that identity, so a walk resumes at the resource the
+//! previous page stopped after whatever the instruction list looks like by then.
+//!
 //! Each reported resource carries the target tracking scaling policies its own
 //! instruction calls for — "AWS Auto Scaling creates target tracking scaling policies
 //! based on the scaling instructions" — together with the narrative of its scaling
@@ -173,13 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same rule the forecast read applies to its own copy of this member.
         crate::state::validate_plan_version(input.scaling_plan_version).map_err(validation)?;
 
-        // The cursor is the index into the plan's own instruction list, which is
-        // ordered exactly as the plan stores it.
-        let start: usize = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => crate::state::decode_cursor(CURSOR_KIND, token)
-                .and_then(|value| value.parse::<usize>().ok())
-                .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
+        // The cursor is the IDENTITY of the resource the previous page stopped after —
+        // the `(ServiceNamespace, ResourceId, ScalableDimension)` triple this crate
+        // addresses one scalable resource by — so the walk resumes at the resource
+        // itself rather than at a position that an update can move under it.
+        let after: Option<String> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_cursor(CURSOR_KIND, token)
+                    .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
+            ),
         };
 
         let mut state = state.lock();
@@ -194,19 +202,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resources the named plan covers — which, for a plan this service does not hold,
         // is empty. Polling for a plan's resources while it is created or drained is
         // therefore a 200 answer throughout.
-        let (total, scaling_plan_resources) =
+        let (scaling_plan_resources, next_token) =
             match state.plan(&input.scaling_plan_name, input.scaling_plan_version) {
-                None => (0usize, Vec::new()),
+                None => (Vec::new(), None),
                 Some(plan) => {
                     let scaling_status_code = plan.scaling_status_code();
                     let scaling_status_message = plan.scaling_status_message();
-                    let page: Vec<ScalingPlanResource> = plan
+
+                    // Every resource the plan covers, ordered by the identity that
+                    // addresses it, so that ordering is fixed by the resources themselves
+                    // and a page boundary keeps its meaning across a rewrite of the
+                    // instruction list. Each instruction's POSITION in the plan's own
+                    // list travels along: that is what names its policies apart.
+                    let mut covered: Vec<(String, usize, &ScalingInstruction)> = plan
                         .scaling_instructions
                         .iter()
                         .enumerate()
-                        .skip(start)
-                        .take(page_size)
                         .map(|(resource, instruction)| {
+                            (
+                                crate::state::resource_identity_key(instruction),
+                                resource,
+                                instruction,
+                            )
+                        })
+                        .collect();
+                    covered.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+
+                    // One resource more than the page is taken, so "is there another
+                    // page?" is answered from state rather than guessed — the same way
+                    // the sibling read over the plans themselves answers it.
+                    let mut page: Vec<(String, usize, &ScalingInstruction)> = covered
+                        .into_iter()
+                        .filter(|(identity, _, _)| {
+                            after.as_ref().is_none_or(|last| identity > last)
+                        })
+                        .take(page_size + 1)
+                        .collect();
+                    let next_token = if page.len() > page_size {
+                        page.truncate(page_size);
+                        page.last().map(|(identity, _, _)| {
+                            crate::state::encode_cursor(CURSOR_KIND, identity)
+                        })
+                    } else {
+                        None
+                    };
+
+                    let resources: Vec<ScalingPlanResource> = page
+                        .into_iter()
+                        .map(|(_, resource, instruction)| {
                             // "AWS Auto Scaling creates target tracking scaling policies
                             // based on the scaling instructions" — so the policies on a
                             // resource are those its own instruction calls for, reported
@@ -224,13 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             }
                         })
                         .collect();
-                    (plan.scaling_instructions.len(), page)
+                    (resources, next_token)
                 }
             };
-
-        let returned_through = start.saturating_add(scaling_plan_resources.len());
-        let next_token = (returned_through < total)
-            .then(|| crate::state::encode_cursor(CURSOR_KIND, &returned_through.to_string()));
 
         Ok(DescribeScalingPlanResourcesOutput {
             scaling_plan_resources: Some(scaling_plan_resources),

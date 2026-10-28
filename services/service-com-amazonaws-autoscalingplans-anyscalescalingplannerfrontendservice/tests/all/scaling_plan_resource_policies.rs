@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::scaling_plan_lifecycle::{stack_source, Emulator};
+use crate::scaling_plan_lifecycle::{resource_identity, stack_source, Emulator};
 
 /// The one `PolicyType` the model lists
 /// (`smithy_query(query="shape",shape="PolicyType")`), mirrored in
@@ -45,17 +45,20 @@ fn predefined(metric: &str, target: f64) -> Value {
 
 /// One row of the catalog table: the scalable resource an instruction names, and the
 /// target tracking configurations that instruction asks for.
-struct ResourceCase {
+///
+/// `pub(crate)` with [`resource_cases`], so a suite that needs a plan covering the whole
+/// catalog of scalable resources takes this one rather than writing a second copy of it.
+pub(crate) struct ResourceCase {
     label: &'static str,
-    namespace: &'static str,
-    resource_id: &'static str,
-    dimension: &'static str,
+    pub(crate) namespace: &'static str,
+    pub(crate) resource_id: &'static str,
+    pub(crate) dimension: &'static str,
     configurations: Vec<Value>,
 }
 
 impl ResourceCase {
     /// This row as the `ScalingInstruction` a plan is created with.
-    fn instruction(&self) -> Value {
+    pub(crate) fn instruction(&self) -> Value {
         json!({
             "ServiceNamespace": self.namespace,
             "ResourceId": self.resource_id,
@@ -80,7 +83,7 @@ impl ResourceCase {
 /// Rows also differ along the NUMBER of configurations the resource carries and the FORM
 /// of the metric each tracks (predefined vs customized), and the identities are pairwise
 /// distinct, so one plan can cover every row at once.
-fn resource_cases() -> Vec<ResourceCase> {
+pub(crate) fn resource_cases() -> Vec<ResourceCase> {
     vec![
         ResourceCase {
             label: "an Auto Scaling group tracking average CPU",
@@ -323,8 +326,24 @@ async fn policies_travel_with_their_resource_on_every_page_of_a_paged_read() {
             "case page {}: MaxResults 1 reports one resource, got {page:?}",
             paged.len()
         );
-        let case = &cases[paged.len()];
-        assert_policies(case.label, &page[0], &case.configurations);
+        // The row this page reports is found by the identity that addresses the
+        // resource, not by the page's position in the walk: the resources are reported
+        // in the order of that identity, which the order the rows are written in need
+        // not match.
+        let reported = &page[0];
+        let identity = resource_identity(reported);
+        let case = cases
+            .iter()
+            .find(|case| {
+                identity
+                    == (
+                        case.namespace.to_string(),
+                        case.resource_id.to_string(),
+                        case.dimension.to_string(),
+                    )
+            })
+            .unwrap_or_else(|| panic!("case paging: no row names the resource {reported:?}"));
+        assert_policies(case.label, reported, &case.configurations);
         paged.extend(page);
         next_token = body
             .get("NextToken")

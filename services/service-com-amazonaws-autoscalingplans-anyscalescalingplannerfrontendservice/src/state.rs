@@ -935,6 +935,28 @@ fn keep_tracked_target_values(
 /// instruction per, and the one the update merge matches on.
 pub type ResourceIdentity<'a> = (&'a str, &'a str, &'a str);
 
+/// The [`ResourceIdentity`] of `instruction`, rendered as one flat string.
+///
+/// A paged read of the resources a plan covers has to address one resource by something
+/// that stays with it while the plan's instruction list is rewritten, and this is that
+/// address: the same triple [`validate_scaling_instructions`] holds one instruction per
+/// and the update merge pairs instructions by, written out as a single comparable value
+/// so it can both ORDER the resources a plan covers and travel in a `NextToken`.
+///
+/// A `ResourceId` is caller-supplied text under no modelled pattern beyond
+/// `^[\u0020-\uD7FF…]*$`, separator characters included, so each part reaches the key
+/// through [`escape_key_part`] and two different resources cannot render one key —
+/// which, since the key orders the walk, is what keeps the order total.
+pub fn resource_identity_key(instruction: &ScalingInstruction) -> String {
+    let (namespace, resource_id, dimension) = resource_identity(instruction);
+    format!(
+        "{}/{}/{}",
+        escape_key_part(namespace),
+        escape_key_part(resource_id),
+        escape_key_part(dimension)
+    )
+}
+
 /// The [`ResourceIdentity`] of `instruction`.
 fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
     (

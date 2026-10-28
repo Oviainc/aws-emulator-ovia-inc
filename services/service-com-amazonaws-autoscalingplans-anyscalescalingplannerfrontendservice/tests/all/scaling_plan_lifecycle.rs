@@ -221,6 +221,25 @@ pub(crate) fn simple_instructions() -> Vec<Value> {
     )]
 }
 
+/// The `(ServiceNamespace, ResourceId, ScalableDimension)` triple one scalable resource
+/// is addressed by — "Each scaling instruction applies to one resource"
+/// (`smithy_query(query="shape",shape="ScalingInstruction")`).
+///
+/// `pub(crate)` so every suite reads that identity off a `ScalingInstruction`, or off
+/// the `ScalingPlanResource` derived from it, the same way.
+pub(crate) type ResourceIdentity = (String, String, String);
+
+/// The [`ResourceIdentity`] a scaling instruction — or the scaling plan resource derived
+/// from it — names, read off the three members both shapes carry.
+pub(crate) fn resource_identity(value: &Value) -> ResourceIdentity {
+    let member = |name: &str| value[name].as_str().unwrap_or_default().to_string();
+    (
+        member("ServiceNamespace"),
+        member("ResourceId"),
+        member("ScalableDimension"),
+    )
+}
+
 /// A CloudFormation-stack application source, distinct per `n`.
 pub(crate) fn stack_source(n: usize) -> Value {
     json!({
@@ -421,7 +440,8 @@ async fn a_created_plan_is_read_back_exactly_as_created() {
             );
         }
 
-        // One ScalingPlanResource per stored instruction, in the stored order.
+        // One ScalingPlanResource per stored instruction, addressed by the identity
+        // triple that instruction names its one scalable resource by.
         let resources = emulator
             .ok(
                 "DescribeScalingPlanResources",
@@ -438,17 +458,19 @@ async fn a_created_plan_is_read_back_exactly_as_created() {
             case.instructions.len(),
             "case {label:?}: expected one resource per instruction, got {resources:?}"
         );
-        for (index, (resource, source_instruction)) in
-            resources.iter().zip(case.instructions.iter()).enumerate()
-        {
-            for member in ["ServiceNamespace", "ResourceId", "ScalableDimension"] {
-                assert_eq!(
-                    resource.get(member),
-                    source_instruction.get(member),
-                    "case {label:?} resource {index}: {member} must come from the instruction, \
-                     got {resource:?}"
-                );
-            }
+        // Every instruction's resource is reported, ordered by the identity that
+        // addresses it — the order a paged walk resumes in, and not the order the
+        // instructions happen to be written in.
+        let reported: Vec<ResourceIdentity> = resources.iter().map(resource_identity).collect();
+        let mut expected: Vec<ResourceIdentity> =
+            case.instructions.iter().map(resource_identity).collect();
+        expected.sort();
+        assert_eq!(
+            reported, expected,
+            "case {label:?}: each instruction's resource must be reported once, in the \
+             order of the identity that addresses it, got {resources:?}"
+        );
+        for (index, resource) in resources.iter().enumerate() {
             assert_eq!(
                 resource.get("ScalingPlanName"),
                 Some(&json!(case.name)),
