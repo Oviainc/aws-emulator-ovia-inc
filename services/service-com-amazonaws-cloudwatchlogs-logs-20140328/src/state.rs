@@ -161,6 +161,10 @@ pub mod emf;
 /// Metric extraction from an ingested log event through a log group's metric filters.
 pub mod metric_filters;
 
+/// Delivery of an ingested log event to the destinations of its log group's subscription
+/// filters.
+pub mod subscription_delivery;
+
 /// The scheduled query CloudWatch manages on a log alarm's behalf.
 pub mod log_alarm_queries;
 

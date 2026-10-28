@@ -16,7 +16,10 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` beyond the workspace default: the subscription fan-out suite awaits the
+# clock-owed CREATING -> ACTIVE span of the Kinesis stream it delivers to with
+# `tokio::time::sleep`.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -34,6 +37,24 @@ regex = "1.12"
 # emulator's own metric store, which is reached through the shared engine and needs the
 # owning service's state TYPE.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The GZIP framing a subscription filter's destination is handed the delivered log events
+# in ("they are Base64 encoded and compressed with the GZIP format").
+flate2 = "1"
+# `arn`: the one reading of a caller-supplied resource ARN, used to resolve which service
+# and Region a subscription filter's `destinationArn` names.
+service-common = { path = "../common" }
+# The AWS SDKs for the services `PutSubscriptionFilter` documents as subscription
+# destinations, each driven over the in-process callback
+# (`OperationContext::callback`): an ingested log event a filter matches is delivered to
+# the Kinesis data stream, Firehose delivery stream or Lambda function its
+# `destinationArn` names. Only the generated clients are needed — the emulator supplies
+# the transport.
+aws-sdk-kinesis = { version = "1", default-features = false }
+# Pinned: from 1.127.0 this client requires `aws-smithy-http` 0.64.3, which the
+# workspace's signing stack does not resolve to; 1.126.0 is the newest release that builds
+# against the `aws-smithy-http` this lock already holds.
+aws-sdk-firehose = { version = "=1.126.0", default-features = false }
+aws-sdk-lambda = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -44,6 +65,10 @@ sha2 = { workspace = true }
 # back the datapoints this service's metric filters extracted. Already a dependency of
 # `src/`; an integration test reaches it only through this list.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# A subscription filter's Kinesis destination is a REAL stream of the Kinesis emulator, so
+# the fan-out suite mounts that service beside this one on the same engine and reads the
+# delivered records back off the stream.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 
 [lints]
 workspace = true

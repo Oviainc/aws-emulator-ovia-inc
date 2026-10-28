@@ -1031,6 +1031,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-firehose"
+version = "1.126.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73541405f78797f241b136a05defa6ac9c56e7296a6b93122d19840a75ae5683"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-iam"
 version = "1.131.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7462,16 +7487,22 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-firehose",
+ "aws-sdk-kinesis",
+ "aws-sdk-lambda",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
  "csv",
+ "flate2",
  "hex",
  "http",
  "regex",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-kinesis-kinesis-20131202",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",

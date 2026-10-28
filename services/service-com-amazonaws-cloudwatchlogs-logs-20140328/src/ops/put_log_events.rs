@@ -7,7 +7,9 @@
 //! `rejectedLogEventsInfo`, and mints the stream's next sequence token. Every event it
 //! stores also publishes the CloudWatch metric data the log group's metric filters extract
 //! from it ([`crate::state::metric_filters`]) and the metrics an Embedded Metric Format
-//! message declares ([`crate::state::emf`]). This is the ONLY file to touch for this
+//! message declares ([`crate::state::emf`]), and is DELIVERED to the destination of every
+//! subscription filter of its log group whose `filterPattern` matches it
+//! ([`crate::state::subscription_delivery`]). This is the ONLY file to touch for this
 //! operation.
 //!
 //! THE INGESTION WINDOW is per event, not per batch: an event more than
@@ -285,8 +287,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation needs none of it.
-        //
+        // `ctx` carries request metadata: the Region the credential scope names, which is
+        // where a subscription filter's destination is reached when the destination's own
+        // ARN names no Region.
+        let region = crate::state::request_region(ctx.parts());
+        // The ingestion itself holds the store's guard, so it is done in a SYNCHRONOUS
+        // step ([`PutLogEvents::ingest`]) and the guard is gone by the time the deliveries
+        // it resolved are handed over below: a lock guard must not be held across an
+        // in-process call into another service.
+        let (output, deliveries) = self.ingest(&input)?;
+        // A stored event is also what a SUBSCRIPTION FILTER of this log group delivers:
+        // "you can subscribe to a real-time stream of log events ingested through
+        // PutLogEvents and have them delivered to a specific destination"
+        // (`PutSubscriptionFilter`).
+        crate::state::subscription_delivery::deliver(ctx, &region, deliveries).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng> {
+    /// Admit the batch and store what it admits, answering the operation's output together
+    /// with the subscription-filter envelopes the stored events owe.
+    ///
+    /// SYNCHRONOUS on purpose: every read and write of the log store happens here, so the
+    /// store's guard cannot outlive this call and no in-process call to another service is
+    /// made while it is held.
+    fn ingest(
+        &self,
+        input: &PutLogEventsInput,
+    ) -> Result<
+        (
+            PutLogEventsOutput,
+            Vec<crate::state::subscription_delivery::Delivery>,
+        ),
+        PutLogEventsError,
+    > {
         // Two input members are deliberately accepted and not stored:
         // * `sequenceToken` — the model states it "is now ignored in PutLogEvents
         //   actions", which are "accepted and never return InvalidSequenceTokenException
@@ -297,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   accepted without a `rejectedEntityInfo`, which the model reserves for a
         //   REJECTED entity ("Only returned when the entity is rejected"), and storing it
         //   belongs with the operation that reads it back.
-        let _ = (ctx, &input.sequence_token, &input.entity);
+        let _ = (&input.sequence_token, &input.entity);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutLogEventsError::from(PutLogEventsErrorModeled::ServiceUnavailableException(
@@ -465,6 +500,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // unique for the life of the store, and persisted on the stream below.
         let next_sequence_token = crate::state::mint_sequence_token(store.take_ingestion_seq());
 
+        // The envelopes this batch owes the log group's SUBSCRIPTION FILTERS, resolved
+        // here — before anything is written and under the same guard the filters were read
+        // through — so a batch is fanned out through the filters the group held when it
+        // arrived. The deliveries themselves are made below, with no guard held.
+        let deliveries = crate::state::subscription_delivery::deliveries(
+            &store,
+            &input.log_group_name,
+            &input.log_stream_name,
+            &batch,
+        );
+
         // Both lookups succeeded above under this same lock, so neither `else` arm is
         // reachable; each answers with the error that resolution would have given.
         let Some(group) = store.log_groups.get_mut(&input.log_group_name) else {
@@ -549,10 +595,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         crate::state::emf::publish(&*self.engine, &extracted);
 
-        Ok(PutLogEventsOutput {
-            next_sequence_token: Some(next_sequence_token),
-            rejected_log_events_info,
-            rejected_entity_info: None,
-        })
+        Ok((
+            PutLogEventsOutput {
+                next_sequence_token: Some(next_sequence_token),
+                rejected_log_events_info,
+                rejected_entity_info: None,
+            },
+            deliveries,
+        ))
     }
 }
