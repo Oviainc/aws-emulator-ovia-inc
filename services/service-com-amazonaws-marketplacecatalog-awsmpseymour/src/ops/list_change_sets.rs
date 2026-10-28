@@ -250,14 +250,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `MaxResults` is modelled `@range(min: 1, max: 20)`, and the page-size
-        // rule — serve a size inside that range, refuse one outside it, serve
-        // the largest page the range allows when the member is absent — is
-        // `crate::state::page_size`, so no request can reach the paging
-        // arithmetic with a size the model does not allow.
+        // `MaxResults` is modelled `@range(min: 1, max: 20)` and documents the
+        // page an absent member serves, and the page-size rule — serve a size
+        // inside that range, refuse one outside it, serve the documented default
+        // when the member is absent — is `crate::state::page_size`, so no request
+        // can reach the paging arithmetic with a size the model does not allow.
         let page_size = match crate::state::page_size(
             "ListChangeSets",
             "change sets",
+            crate::state::LIST_CHANGE_SETS_PAGE_DEFAULT,
             crate::state::LIST_CHANGE_SETS_PAGE_LIMIT,
             input.max_results,
         ) {

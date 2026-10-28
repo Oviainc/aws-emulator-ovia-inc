@@ -206,6 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = match crate::state::page_size(
             "ListAssessments",
             "assessments",
+            crate::state::LIST_ASSESSMENTS_PAGE_DEFAULT,
             crate::state::LIST_ASSESSMENTS_PAGE_LIMIT,
             Some(input.max_results),
         ) {

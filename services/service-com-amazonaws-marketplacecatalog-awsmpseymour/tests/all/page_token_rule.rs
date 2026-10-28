@@ -349,8 +349,9 @@ async fn every_paginated_operation_resumes_at_a_token_it_issued() {
     let (router, assessment_id) = populated().await;
 
     for row in paginated(&assessment_id) {
-        // No `MaxResults`: the largest page the operation's own range allows (or the
-        // default its model declares), so the whole list arrives in one answer.
+        // No `MaxResults`: the page the operation's own member documents for an absent
+        // one, which is larger than this suite's list, so the whole list arrives in one
+        // answer.
         let whole = page(&router, &row, None, None).await;
         assert_eq!(
             whole.status, 200,

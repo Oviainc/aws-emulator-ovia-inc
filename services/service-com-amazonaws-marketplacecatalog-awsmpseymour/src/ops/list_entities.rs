@@ -348,12 +348,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(fault) => return Err(ListEntitiesErrorModeled::ValidationException(fault).into()),
         };
 
-        // `MaxResults` is modelled `@range(min: 1, max: 50)`, judged by the one
+        // `MaxResults` is modelled `@range(min: 1, max: 50)` and documented "if a
+        // value isn't provided, the default value is 20", judged by the one
         // page-size rule in `crate::state::page_size`, so no request can reach
-        // the paging arithmetic with a size the model does not allow.
+        // the paging arithmetic with a size the model does not allow, and one
+        // naming no `MaxResults` is served the documented default rather than the
+        // modelled maximum.
         let page_size = match crate::state::page_size(
             "ListEntities",
             "entities",
+            crate::state::LIST_ENTITIES_PAGE_DEFAULT,
             crate::state::LIST_ENTITIES_PAGE_LIMIT,
             input.max_results,
         ) {

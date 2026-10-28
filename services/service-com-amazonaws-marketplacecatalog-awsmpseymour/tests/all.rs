@@ -27,6 +27,8 @@ mod change_set_failures;
 mod change_set_lifecycle;
 #[path = "all/change_type_validation.rs"]
 mod change_type_validation;
+#[path = "all/default_page_size.rs"]
+mod default_page_size;
 #[path = "all/delete_resource_policy_existence.rs"]
 mod delete_resource_policy_existence;
 #[path = "all/documented_entity_types.rs"]

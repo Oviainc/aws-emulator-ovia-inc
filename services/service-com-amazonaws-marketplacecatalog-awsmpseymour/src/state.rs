@@ -69,14 +69,27 @@ pub const CHANGE_SET_APPLYING: Duration = Duration::from_millis(250);
 /// what stops the state growing without end.
 pub const CHANGE_SET_QUOTA: usize = 1_000;
 
-/// The largest page `ListChangeSets` serves, and the page it serves when the
-/// request names no `MaxResults`: `ListChangeSetsRequest$MaxResults` is
-/// `@range(min: 1, max: 20)`.
+/// The largest page `ListChangeSets` serves: `ListChangeSetsRequest$MaxResults`
+/// is `@range(min: 1, max: 20)`.
 pub const LIST_CHANGE_SETS_PAGE_LIMIT: i32 = 20;
 
-/// The same bound for `ListEntities`: `ListEntitiesRequest$MaxResults` is
+/// The page `ListChangeSets` serves when the request names no `MaxResults`:
+/// `ListChangeSetsRequest$MaxResults` documents "By default, this value is 20".
+/// The member carries no `@default`, so this handler applies it; here it happens
+/// to coincide with [`LIST_CHANGE_SETS_PAGE_LIMIT`].
+pub const LIST_CHANGE_SETS_PAGE_DEFAULT: i32 = 20;
+
+/// The largest page `ListEntities` serves: `ListEntitiesRequest$MaxResults` is
 /// `@range(min: 1, max: 50)`.
 pub const LIST_ENTITIES_PAGE_LIMIT: i32 = 50;
+
+/// The page `ListEntities` serves when the request names no `MaxResults`:
+/// `ListEntitiesRequest$MaxResults` documents "Specifies the upper limit of the
+/// elements on a single page. If a value isn't provided, the default value is
+/// 20". The member carries no `@default`, so this handler applies it — and it is
+/// well below [`LIST_ENTITIES_PAGE_LIMIT`], the largest page a request may ASK
+/// for.
+pub const LIST_ENTITIES_PAGE_DEFAULT: i32 = 20;
 
 /// The `Filter$Name` values `ListChangeSets` accepts, from `Filter$ValueList`'s
 /// own documentation ("The supported filter names and associated `ValueList`s is
@@ -411,10 +424,20 @@ pub const ENTITY_PAGE_PREFIX: &str = "ENT";
 /// is 20"), which the boundary applies before a handler runs.
 pub const LIST_ASSESSMENTS_PAGE_LIMIT: i32 = 100;
 
+/// The page `ListAssessments` serves when the request names no `MaxResults`:
+/// the `@default(20)` on `ListAssessmentsRequest$MaxResults`. The boundary
+/// applies it, so the handler is handed this value rather than nothing.
+pub const LIST_ASSESSMENTS_PAGE_DEFAULT: i32 = 20;
+
 /// The largest page `DescribeAssessment` serves of one assessment's
 /// `ControlAssessments`: `DescribeAssessmentMaxResultInteger` is
 /// `@range(min: 1, max: 100)`, `@default(50)`.
 pub const DESCRIBE_ASSESSMENT_PAGE_LIMIT: i32 = 100;
+
+/// The `ControlAssessments` page `DescribeAssessment` serves when the request
+/// names no `MaxResults`: the `@default(50)` on
+/// `DescribeAssessmentRequest$MaxResults`, applied by the boundary.
+pub const DESCRIBE_ASSESSMENT_PAGE_DEFAULT: i32 = 50;
 
 /// The `NextToken` prefix `ListAssessments` pages with.
 pub const ASSESSMENT_PAGE_PREFIX: &str = "ASMT";
@@ -1341,24 +1364,28 @@ pub fn paginate<T>(all: Vec<T>, offset: usize, page_size: usize, prefix: &str) -
 /// `ValidationException` that refuses it.
 ///
 /// Every paginated operation of this service models `MaxResults` with a
-/// `@range(min: 1, max: <limit>)`, so a requested size inside that range is the
-/// size served, one outside it is refused under the member it is about, and a
-/// request naming none serves the largest page the range allows. This is the one
-/// place that decision is made, so each paginated operation judges a page size
-/// the same way: `operation` is the operation being called, `items` the noun it
-/// pages (what one page holds) and `limit` the maximum its own range declares.
+/// `@range(min: 1, max: <limit>)` and documents the page it serves when the
+/// request names none, so a requested size inside that range is the size served,
+/// one outside it is refused under the member it is about, and a request naming
+/// none serves that documented default — which is the maximum only where the
+/// operation publishes the same number for both. This is the one place that
+/// decision is made, so each paginated operation judges a page size the same way:
+/// `operation` is the operation being called, `items` the noun it pages (what one
+/// page holds), `default` the page its own member documents for an absent
+/// `MaxResults` and `limit` the maximum its own range declares.
 ///
-/// `requested` is `None` for the operations whose `MaxResults` is optional; the
-/// ones that model a `@default` are handed the value the boundary already
-/// applied.
+/// `requested` is `None` for the operations whose `MaxResults` is optional and
+/// carries no `@default`, so the handler owns the default; the ones that model a
+/// `@default` are handed the value the boundary already applied.
 pub fn page_size(
     operation: &str,
     items: &str,
+    default: i32,
     limit: i32,
     requested: Option<i32>,
 ) -> Result<usize, ValidationException> {
     let serving = match requested {
-        None => limit,
+        None => default,
         Some(requested) if (1..=limit).contains(&requested) => requested,
         Some(requested) => {
             return Err(validation(
