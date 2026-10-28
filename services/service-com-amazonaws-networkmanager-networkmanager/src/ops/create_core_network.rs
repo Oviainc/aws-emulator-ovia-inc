@@ -205,41 +205,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
         // same request answers the record the first call minted instead of minting a
-        // second core network; the same token asking for something else is a conflict.
-        if let Some(token) = input
-            .client_token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-        {
-            if let Some(existing) = store
-                .core_networks
-                .values()
-                .find(|record| record.client_token.as_deref() == Some(token))
-            {
-                let same_request = existing.global_network_id == input.global_network_id
+        // second core network; the same token asking for something else is a conflict. The
+        // walk itself — the token normalisation, the store lookup and the replay-or-refuse
+        // branch — is [`crate::state::replay_or_conflict`], the one every tokened operation
+        // of this service goes through, so what is left here is only what makes a stored
+        // core network THIS request.
+        let client_token = crate::state::normalized_client_token(input.client_token);
+        if let Some(existing) = crate::state::replay_or_conflict(
+            client_token.as_deref(),
+            store.core_networks.values(),
+            |existing| {
+                existing.global_network_id == input.global_network_id
                     && existing.description == input.description
                     && existing.created_policy_document() == input.policy_document.as_deref()
                     && crate::state::same_tags(
                         &existing.tags,
                         input.tags.as_deref().unwrap_or_default(),
-                    );
-                if same_request {
-                    return Ok(CreateCoreNetworkOutput {
-                        core_network: Some(existing.to_shape(now)),
-                    });
-                }
-                return Err(CreateCoreNetworkErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "client token {token:?} already created core network {}, with a different request",
-                            existing.id
-                        ),
-                        resource_id: existing.id.clone(),
-                        resource_type: crate::state::CORE_NETWORK_KIND.to_string(),
-                    },
-                )
-                .into());
-            }
+                    )
+            },
+            |existing| crate::state::ClientTokenConflict {
+                effect: format!("created core network {}", existing.id),
+                resource_id: existing.id.clone(),
+                resource_type: crate::state::CORE_NETWORK_KIND.to_string(),
+            },
+        )
+        .map_err(CreateCoreNetworkErrorModeled::ConflictException)?
+        {
+            return Ok(CreateCoreNetworkOutput {
+                core_network: Some(existing.to_shape(now)),
+            });
         }
 
         // A global network holds a single core network, so a second create against the
@@ -279,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             topology: topology.unwrap_or_default(),
             updating_until: None,
             created_with_policy_document: input.policy_document.is_some(),
-            client_token: input.client_token.filter(|token| !token.is_empty()),
+            client_token,
             tags: input.tags.unwrap_or_default(),
         };
         // The document a create carries becomes the core network's FIRST policy version,

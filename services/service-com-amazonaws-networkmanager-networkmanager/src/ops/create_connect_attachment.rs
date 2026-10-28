@@ -268,18 +268,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
         // same request answers the record the first call minted instead of minting a second
-        // attachment; the same token asking for something else is a conflict.
-        if let Some(token) = input
-            .client_token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-        {
-            if let Some(existing) = store
-                .attachments
-                .values()
-                .find(|record| record.client_token.as_deref() == Some(token))
-            {
-                let same_request = existing.core_network_id == input.core_network_id
+        // attachment; the same token asking for something else is a conflict. The walk
+        // itself — the token normalisation, the store lookup and the replay-or-refuse
+        // branch — is [`crate::state::replay_or_conflict`], the one every tokened operation
+        // of this service goes through, so what is left here is only what makes a stored
+        // attachment THIS request.
+        let client_token = crate::state::normalized_client_token(input.client_token);
+        if let Some(existing) = crate::state::replay_or_conflict(
+            client_token.as_deref(),
+            store.attachments.values(),
+            |existing| {
+                existing.core_network_id == input.core_network_id
                     && existing.edge_location == input.edge_location
                     && existing.routing_policy_label == input.routing_policy_label
                     && match &existing.detail {
@@ -300,24 +299,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && crate::state::same_tags(
                         &existing.tags,
                         input.tags.as_deref().unwrap_or_default(),
-                    );
-                if same_request {
-                    return Ok(CreateConnectAttachmentOutput {
-                        connect_attachment: existing.to_connect_attachment(now),
-                    });
-                }
-                return Err(CreateConnectAttachmentErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "client token {token:?} already created attachment {}, with a different request",
-                            existing.id
-                        ),
-                        resource_id: existing.id.clone(),
-                        resource_type: crate::state::ATTACHMENT_KIND.to_string(),
-                    },
-                )
-                .into());
-            }
+                    )
+            },
+            |existing| crate::state::ClientTokenConflict {
+                effect: format!("created attachment {}", existing.id),
+                resource_id: existing.id.clone(),
+                resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+            },
+        )
+        .map_err(CreateConnectAttachmentErrorModeled::ConflictException)?
+        {
+            return Ok(CreateConnectAttachmentOutput {
+                connect_attachment: existing.to_connect_attachment(now),
+            });
         }
 
         // A quota bounds how many attachments one core network can be made to hold: at the
@@ -368,7 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attachment_policy_rule_number: claim.rule_number,
             segment_name: claim.segment_name,
             network_function_group_name: claim.network_function_group_name,
-            client_token: input.client_token.filter(|token| !token.is_empty()),
+            client_token,
             tags: input.tags.unwrap_or_default(),
             detail: crate::state::AttachmentDetail::Connect {
                 transport_attachment_id: input.transport_attachment_id,

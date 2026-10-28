@@ -51,6 +51,8 @@ mod connection_group_update;
 mod connection_groups;
 #[path = "all/continuous_deployment_policies.rs"]
 mod continuous_deployment_policies;
+#[path = "all/continuous_deployment_policy_config_read.rs"]
+mod continuous_deployment_policy_config_read;
 #[path = "all/continuous_deployment_policy_delete.rs"]
 mod continuous_deployment_policy_delete;
 #[path = "all/create_location_header.rs"]
