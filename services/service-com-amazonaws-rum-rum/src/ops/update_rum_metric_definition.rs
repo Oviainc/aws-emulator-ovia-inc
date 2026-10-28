@@ -174,6 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored.
         let destination_arn = crate::state::declared_arn(input.destination_arn.as_deref());
 
+        // The modelled constraints of the definition's `DimensionKeys` that the boundary
+        // walk leaves unapplied — the map KEY's `@length`, which it applies to no map key,
+        // and the VALUE's look-around `@pattern`, which its engine cannot compile. Judged
+        // FIRST, because that walk runs in front of everything a handler judges.
+        if let Some(message) = crate::state::dimension_keys_refusal(&input.metric_definition) {
+            return Err(UpdateRumMetricDefinitionErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
         // The prose-only pairing every metrics call of this service shares: an Evidently
         // destination is identified by an experiment ARN and a CloudWatch one carries
         // none.

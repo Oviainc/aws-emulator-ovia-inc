@@ -11,16 +11,23 @@
 //! # What this applies
 //!
 //! Nothing here invents a constraint. Every check runs a `@length` bound or a `@pattern`
-//! the model declares ([`ConstrainedString::constraints`]), for the shapes whose pattern
-//! the FRAMEWORK's boundary walk cannot apply at all: it compiles a `@pattern` with the
-//! `regex` crate, which has no look-around, and treats a pattern it cannot compile as
-//! matching (`pattern_matches` in `vendor/smithy-schema-server/src/constraints.rs`). Three
-//! of this service's string shapes are written with look-around, so their patterns would
-//! otherwise never be applied to anything:
+//! the model declares ([`ConstrainedString::constraints`]), for the shapes the FRAMEWORK's
+//! boundary walk leaves unapplied. A shape is left unapplied there for either of two
+//! reasons:
 //!
-//! * `AppMonitorDomain` — `(?=…)` / `(?!…)` guards around the host-name grammar;
-//! * `AppMonitorName` — a leading `(?!\.)`;
-//! * `TagKey` — a leading `(?!aws:)`.
+//! * its `@pattern` is written with LOOK-AROUND, which the `regex` crate the walk compiles a
+//!   pattern with cannot express — and a pattern that fails to compile is treated as
+//!   matching (`pattern_matches` in `vendor/smithy-schema-server/src/constraints.rs`), so
+//!   such a pattern would otherwise never be applied to anything:
+//!   * `AppMonitorDomain` — `(?=…)` / `(?!…)` guards around the host-name grammar;
+//!   * `AppMonitorName` — a leading `(?!\.)`;
+//!   * `TagKey` — a leading `(?!aws:)`;
+//!   * `DimensionName` — a leading `(?!:)` in front of the non-blank run `.*[^\s].*`;
+//! * the shape is reached only as a MAP KEY, which the walk does not validate at all — it
+//!   captures the key as the path segment of the entry's VALUE and moves on ("the key itself
+//!   is not a constrained leaf"), so EVERY constraint the key shape declares is unapplied
+//!   there, its `@length` included: `TagKey` again, and `DimensionKey`, whose `@length` is
+//!   the only constraint it declares.
 //!
 //! Each pattern is applied TERM BY TERM, in linear time, by the functions behind
 //! [`matches_pattern`] — which say why there, and which map the terms of the model's own
@@ -111,10 +118,10 @@ const ELEMENT_SET_OPEN: &str = "Member must satisfy constraint: [";
 // The constraints this service applies itself
 // =============================================================================
 
-/// A string shape of this service whose modelled `@pattern` the boundary walk cannot
-/// apply, because it is written with look-around (see the module docs). Every member
-/// targeting one of these shapes is checked by the operation that accepts it, before it
-/// writes anything.
+/// A string shape of this service whose modelled constraints the boundary walk leaves
+/// unapplied — a `@pattern` written with look-around, or a shape reached as a map KEY (see
+/// the module docs). Every member targeting one of these shapes is checked by the operation
+/// that accepts it, before it writes anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstrainedString {
     /// `AppMonitorName`: the name a create gives an app monitor.
@@ -127,6 +134,16 @@ pub enum ConstrainedString {
     /// captures the key as the path segment of the entry's VALUE), so this shape is
     /// unapplied there twice over.
     TagKey,
+    /// `DimensionKey`: the key shape of `DimensionKeysMap`, which the `DimensionKeys` of
+    /// every metric definition targets — the dotted field path a dimension's value is read
+    /// out of the matched event. A map key is not a constrained leaf for the boundary walk,
+    /// so the `@length` this shape declares — the only constraint it declares — is unapplied
+    /// there.
+    DimensionKey,
+    /// `DimensionName`: the value shape of `DimensionKeysMap` — the CloudWatch dimension
+    /// name an entry maps its field path to. Its `@pattern` opens with a negative
+    /// look-ahead, so the boundary walk admits any value for it.
+    DimensionName,
 }
 
 /// The modelled constraints of one string shape: its `@length` bounds and its `@pattern`
@@ -141,15 +158,17 @@ pub struct StringConstraints {
     pub min_length: i64,
     /// `@length`'s inclusive maximum, in characters.
     pub max_length: i64,
-    /// The `@pattern` source, verbatim from the model.
-    pub pattern: &'static str,
+    /// The `@pattern` source, verbatim from the model, or `None` for a shape that declares
+    /// no `@pattern` at all — a `@length` alone is still unapplied at the boundary when the
+    /// shape is reached as a map key.
+    pub pattern: Option<&'static str>,
 }
 
 impl ConstrainedString {
     /// The constraints the model declares on this shape.
     ///
     /// Source: `smithy_query(query="shape",
-    /// shape="AppMonitorName,AppMonitorDomain,TagKey")` against
+    /// shape="AppMonitorName,AppMonitorDomain,TagKey,DimensionKey,DimensionName")` against
     /// `services/service-com-amazonaws-rum-rum/smithy-model/com-amazonaws-rum-rum.json`.
     #[must_use]
     pub const fn constraints(self) -> StringConstraints {
@@ -157,17 +176,27 @@ impl ConstrainedString {
             Self::AppMonitorName => StringConstraints {
                 min_length: 1,
                 max_length: 255,
-                pattern: r"^(?!\.)[\.\-_#A-Za-z0-9]+$",
+                pattern: Some(r"^(?!\.)[\.\-_#A-Za-z0-9]+$"),
             },
             Self::AppMonitorDomain => StringConstraints {
                 min_length: 1,
                 max_length: 253,
-                pattern: r"^(localhost)$|^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|(?=^[a-zA-Z0-9\.\*-]{4,253}$)(?!.*\.-)(?!.*-\.)(?!.*\.\.)(?!.*[^\.]{64,})^(\*\.)?(?![-\.\*])[^\*]{1,}\.(\*|(?!.*--)(?=.*[a-zA-Z])[^\*]{1,}[^\*-])$",
+                pattern: Some(r"^(localhost)$|^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|(?=^[a-zA-Z0-9\.\*-]{4,253}$)(?!.*\.-)(?!.*-\.)(?!.*\.\.)(?!.*[^\.]{64,})^(\*\.)?(?![-\.\*])[^\*]{1,}\.(\*|(?!.*--)(?=.*[a-zA-Z])[^\*]{1,}[^\*-])$"),
             },
             Self::TagKey => StringConstraints {
                 min_length: 1,
                 max_length: 128,
-                pattern: r"^(?!aws:)[a-zA-Z+-=._:/]+$",
+                pattern: Some(r"^(?!aws:)[a-zA-Z+-=._:/]+$"),
+            },
+            Self::DimensionKey => StringConstraints {
+                min_length: 1,
+                max_length: 280,
+                pattern: None,
+            },
+            Self::DimensionName => StringConstraints {
+                min_length: 1,
+                max_length: 255,
+                pattern: Some(r"^(?!:).*[^\s].*"),
             },
         }
     }
@@ -196,6 +225,10 @@ fn matches_pattern(shape: ConstrainedString, value: &str) -> bool {
         ConstrainedString::AppMonitorName => is_app_monitor_name(value),
         ConstrainedString::AppMonitorDomain => is_app_monitor_domain(value),
         ConstrainedString::TagKey => is_tag_key(value),
+        ConstrainedString::DimensionName => is_dimension_name(value),
+        // `DimensionKey` declares no `@pattern`, so it has no pattern term to apply and
+        // [`string_violation`] never asks: its `@length` is its whole constraint set.
+        ConstrainedString::DimensionKey => true,
     }
 }
 
@@ -210,6 +243,33 @@ fn is_app_monitor_name(name: &str) -> bool {
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || ".-_#".contains(character))
 }
+
+/// Whether `name` satisfies `DimensionName`'s `@pattern`, `^(?!:).*[^\s].*`: it does not
+/// open with the colon the negative look-ahead excludes, and it carries at least one
+/// character that is not whitespace — the `[^\s]` the pattern's two `.*` runs surround. Both
+/// terms are anchored at the start of the value by the `^`, and `.` matches no line break,
+/// so the non-whitespace character has to stand on the value's FIRST line.
+fn is_dimension_name(name: &str) -> bool {
+    // `split_once` hands back the head before the FIRST line break, and the whole value when
+    // it carries none.
+    let first_line = name
+        .split_once(LINE_BREAK)
+        .map_or(name, |(head, _)| head);
+    !name.starts_with(DIMENSION_NAME_EXCLUDED_PREFIX)
+        && first_line
+            .chars()
+            .any(|character| !character.is_whitespace())
+}
+
+/// The prefix `DimensionName`'s leading `(?!:)` excludes. Applied as a `starts_with`, which
+/// is what a negative look-ahead anchored at the start of the pattern says.
+const DIMENSION_NAME_EXCLUDED_PREFIX: char = ':';
+
+/// The one character a regex `.` does not match, which is what bounds `.*[^\s].*` to the
+/// first line of the value it is anchored at the start of. The line break of the engine the
+/// model's patterns are applied with here; an engine that also treats a carriage return or
+/// one of Unicode's line separators that way would bound the run one character earlier.
+const LINE_BREAK: char = '\n';
 
 /// Whether `key` satisfies `TagKey`'s `@pattern`, `^(?!aws:)[a-zA-Z+-=._:/]+$`: it is
 /// outside the reserved namespace the negative look-ahead excludes AND it is a non-empty
@@ -356,10 +416,14 @@ pub fn string_violation(shape: ConstrainedString, path: &str, value: &str) -> Op
         ViolationKind::MinLength(constraints.min_length)
     } else if length > constraints.max_length {
         ViolationKind::MaxLength(constraints.max_length)
-    } else if !matches_pattern(shape, value) {
-        ViolationKind::Pattern(constraints.pattern.to_string())
     } else {
-        return None;
+        // A shape that declares no `@pattern` has nothing left to fail once its bounds hold.
+        match constraints.pattern {
+            Some(pattern) if !matches_pattern(shape, value) => {
+                ViolationKind::Pattern(pattern.to_string())
+            }
+            _ => return None,
+        }
     };
     Some(Violation {
         path: path.to_string(),

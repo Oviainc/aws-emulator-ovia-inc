@@ -1512,11 +1512,138 @@ pub fn metric_destination_not_found(
     ResourceNotFoundException { message }
 }
 
+/// The dotted member path the framework's walk reports a violation inside the
+/// `MetricDefinition` member at — the member the single-definition update carries a
+/// definition by.
+const METRIC_DEFINITION_PATH: &str = "metricDefinition";
+
+/// The dotted member path the walk reports the `MetricDefinitions` LIST at — the member the
+/// batch create carries its definitions by.
+const METRIC_DEFINITIONS_PATH: &str = "metricDefinitions";
+
+/// The path segment a definition's dimension map is reported under: the lowerCamel spelling
+/// of `MetricDefinitionRequest$DimensionKeys`.
+const DIMENSION_KEYS_MEMBER: &str = "dimensionKeys";
+
+/// Why the `DimensionKeys` of the ONE definition a request carries break what
+/// `DimensionKeysMap` declares, or `None` when every entry satisfies it.
+///
+/// For the operation that carries a definition by the `MetricDefinition` member; the batch
+/// form is [`metric_definitions_dimension_keys_refusal`], and both apply the one set of
+/// constraints ([`dimension_keys_violations`]) because those are the map's, declared once on
+/// the shape every `DimensionKeys` member targets.
+#[must_use]
+pub fn dimension_keys_refusal(definition: &MetricDefinitionRequest) -> Option<String> {
+    constraint_refusal(&dimension_keys_violations(
+        METRIC_DEFINITION_PATH,
+        definition,
+    ))
+}
+
+/// The same, for every definition of the `MetricDefinitions` LIST a batch request carries,
+/// each judged at the path the walk reports that element's members at.
+///
+/// A modelled constraint is the REQUEST's to satisfy and not one definition's: the boundary
+/// walk refuses the WHOLE call for a constraint it can apply — a dimension name outside
+/// `DimensionName`'s `@length` is refused that way today — so a constraint of the same map
+/// that the walk cannot apply refuses the whole call too, rather than failing one entry of
+/// the batch the way the prose rules in [`metric_definition_refusal`] do. Every offending
+/// entry of every definition is stated, which is what the walk accumulating one violation
+/// per leaf would have stated.
+#[must_use]
+pub fn metric_definitions_dimension_keys_refusal(
+    definitions: &[MetricDefinitionRequest],
+) -> Option<String> {
+    let violations: Vec<::aws_smithy_schema_server::constraints::Violation> = definitions
+        .iter()
+        .enumerate()
+        .flat_map(|(index, definition)| {
+            let path = format!(
+                "{METRIC_DEFINITIONS_PATH}.{}",
+                ::aws_smithy_schema_server::constraints::path::element(index + 1)
+            );
+            dimension_keys_violations(&path, definition)
+        })
+        // The bound the framework's own walk collects to
+        // (`service_common::validation::MAX_VIOLATIONS`): a request past it is refused with
+        // the violations found so far, so neither the work this does nor the message it
+        // states is sized by how many definitions a caller sent.
+        .take(service_common::validation::MAX_VIOLATIONS)
+        .collect();
+    constraint_refusal(&violations)
+}
+
+/// Every constraint the entries of `definition`'s `DimensionKeys` break, at the paths the
+/// framework's walk spells those positions as, where `path` is the path of the definition
+/// itself.
+///
+/// BOTH shapes of `DimensionKeysMap` are applied here, for the two reasons the boundary walk
+/// leaves them unapplied (`crate::state::validation`): the KEY's `@length`, because the walk
+/// validates no map key at all, and the VALUE's `@length` and `@pattern`, whose pattern opens
+/// with a negative look-ahead the walk's engine cannot compile — and a pattern it cannot
+/// compile is treated as matching, so a dimension name outside it would otherwise be stored.
+/// The CHECKS are [`validation`]'s, which is the one place this service applies a modelled
+/// `@length` or `@pattern` itself.
+///
+/// The entries are judged in SORTED key order, and an entry's key before its value, which is
+/// the order the walk writes an entry in — so which clause a refusal states first is fixed by
+/// the request rather than by a `HashMap`'s iteration order.
+fn dimension_keys_violations(
+    path: &str,
+    definition: &MetricDefinitionRequest,
+) -> Vec<::aws_smithy_schema_server::constraints::Violation> {
+    let mut entries: Vec<(&str, &str)> = definition
+        .dimension_keys
+        .iter()
+        .flatten()
+        .map(|(field, dimension)| (field.as_str(), dimension.as_str()))
+        .collect();
+    entries.sort_unstable();
+    entries
+        .into_iter()
+        .flat_map(|(field, dimension)| {
+            // An entry is reported at the key the CALLER chose: that is the segment the walk
+            // spells a terminal map value with (`begin_collection_child` in
+            // `vendor/smithy-schema-server/src/constraints.rs`), and it is the position both
+            // halves of the entry hold.
+            let entry = format!("{path}.{DIMENSION_KEYS_MEMBER}.{field}");
+            [
+                validation::string_violation(
+                    validation::ConstrainedString::DimensionKey,
+                    &entry,
+                    field,
+                ),
+                validation::string_violation(
+                    validation::ConstrainedString::DimensionName,
+                    &entry,
+                    dimension,
+                ),
+            ]
+        })
+        .flatten()
+        .collect()
+}
+
+/// The words this service states a constraint refusal in ([`validation::message`]), or `None`
+/// when `violations` is empty and there is nothing to state.
+///
+/// The checks here have the request's MAPS rather than its lists, and a clause is nested into
+/// a list member's own clause only for a violation on a LIST element, so no rendered list is
+/// passed through.
+fn constraint_refusal(
+    violations: &[::aws_smithy_schema_server::constraints::Violation],
+) -> Option<String> {
+    validation::message(violations, &HashMap::new())
+}
+
 /// Why this `MetricDefinitionRequest` is not a metric definition this service can store,
 /// or `None` when it is one.
 ///
-/// The modelled constraints (every member's length, the namespace's pattern) are refused
-/// before a handler runs. What is left are the rules the model states in PROSE, which is
+/// The modelled constraints of the members the boundary walk reaches (their length, the
+/// namespace's pattern) are refused before a handler runs, and the ones it leaves unapplied
+/// — the `DimensionKeys` map's key and value shapes — are refused by
+/// [`dimension_keys_refusal`] in front of this. What is left are the rules the model states
+/// in PROSE, which is
 /// why they live here: every operation that accepts a definition — the batch create, where
 /// one bad definition fails alone, and the update, where it fails the call — judges a
 /// definition exactly the same way.

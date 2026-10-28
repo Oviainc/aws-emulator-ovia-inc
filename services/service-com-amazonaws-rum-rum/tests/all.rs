@@ -37,6 +37,8 @@ mod cw_log_delivery;
 mod cw_log_event_copies;
 #[path = "all/deobfuscation_source_maps.rs"]
 mod deobfuscation_source_maps;
+#[path = "all/dimension_keys_constraints.rs"]
+mod dimension_keys_constraints;
 #[path = "all/list_app_monitors_page_size.rs"]
 mod list_app_monitors_page_size;
 #[path = "all/list_tags_for_resource.rs"]
