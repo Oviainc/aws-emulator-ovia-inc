@@ -14,6 +14,12 @@
 //! outcome is owed to the clock exactly as the outcome a successful reply continues to
 //! is, and one token answers one task, so no later reply resolves it.
 //!
+//! An execution of a state machine on a customer managed KMS key has the `error` and
+//! `cause` this reply carries SEALED under that key, so a reply that carries either is
+//! refused with `KmsAccessDeniedException` unless KMS lets this caller have the key
+//! used for it — and one that carries neither needs nothing of the key
+//! ([`crate::state::encryption`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -164,10 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // any KMS permissions in the execution role if the caller provides a null value
         // for both error and cause fields", so a reply that carries neither reports the
         // same failure as one that carries both. Whether the token is one this service
-        // issued is not modelled, so it is checked here. `ctx` carries no value this
-        // operation reads: a task token names its task, its execution and its region on
-        // its own.
-        let _ = ctx;
+        // issued is not modelled, so it is checked here. No member of the request is
+        // read off `ctx`: a task token names its task, its execution and its region on
+        // its own. What `ctx` IS read for is the CALLER, which the key sealing the
+        // reported fields is used on behalf of.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
@@ -185,6 +191,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // "For an execution with encryption enabled, Step Functions will encrypt the
+        // error and cause fields using the KMS key for the execution role", and "a
+        // caller can mark a task as fail without using any KMS permissions in the
+        // execution role if the caller provides a null value for both error and cause
+        // fields because no data needs to be encrypted": a reply that carries either
+        // field has that field SEALED under the execution's customer managed key, so
+        // KMS decides whether this caller may have the key used for it, and a reply
+        // that carries neither asks nothing of the key. The decision is made with no
+        // store of this service locked.
+        if input.error.is_some() || input.cause.is_some() {
+            if let Some(why) = crate::state::encryption::task_reply_write_denied(
+                &*self.engine,
+                ctx,
+                &input.task_token,
+            ) {
+                return Err(SendTaskFailureErrorModeled::KmsAccessDeniedException(
+                    KmsAccessDeniedException { message: Some(why) },
+                )
+                .into());
+            }
+        }
 
         let now = crate::state::now();
         let mut store = state.lock();

@@ -13,6 +13,39 @@
 //!
 //! The wire harness itself (`router`, `call`, `create_model`, …) lives in
 //! `super::asset_lifecycle`, which is this crate's harness module.
+//!
+//! [`ensure_workspace`] lives here for the same reason: every workspace-scoped
+//! create resolves its `workspaceName` through the workspace registry, so a suite
+//! working inside a workspace opens it first, and one definition of that step is
+//! what keeps the suites from drifting on it.
+
+use serde_json::json;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// Open workspace `name` unless this router already holds it.
+///
+/// `CreateWorkspace` is what puts a workspace in the registry every
+/// workspace-scoped create resolves against, so a suite that creates a pipeline,
+/// task, dataset or export job inside a workspace calls this first. A second call
+/// for a name already open is the modelled conflict (HTTP 409), which leaves the
+/// workspace exactly as this caller needs it — so a per-create helper can call it
+/// unconditionally without tracking what it has already opened.
+pub(crate) async fn ensure_workspace(router: &MultiServiceRouter, name: &str) {
+    let (status, body) = crate::asset_lifecycle::call(
+        router,
+        "POST",
+        "/workspaces",
+        Some(json!({
+            "workspaceName": name,
+            "encryptionConfiguration": { "encryptionType": "SITEWISE_DEFAULT_ENCRYPTION" },
+        })),
+    )
+    .await;
+    assert!(
+        status == 200 || status == 409,
+        "workspace {name:?}: expected it to be open, got {status} {body}"
+    );
+}
 
 /// The current second in the Unix epoch.
 pub fn now_seconds() -> i64 {

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableLDAPS
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableLDAPS`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableLDAPS::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deactivates LDAP secure calls for a stored directory, by recording the
+//! [`crate::state::LDAPS_STATUS_DISABLED`] status for the requested `LDAPSType`. The
+//! modelled `LDAPSStatus` enum carries no transient value on the way down — there is no
+//! `Disabling` — so the deactivation settles the instant it is recorded and owes the
+//! clock nothing. `DescribeLDAPSSettings` is what reports that status.
+//!
+//! The modelled constraints (the `DirectoryId` pattern, the `LDAPSType` enum values) are
+//! refused by the framework's boundary validator BEFORE this handler runs, so a
+//! well-formed request reaches directory resolution: an id no directory is stored under
+//! is refused with `DirectoryDoesNotExistException`, a directory that is not in service
+//! (still being built by the transition its create owes, or otherwise outside `Active`)
+//! with `DirectoryUnavailableException`, a directory type that serves no LDAPS endpoint
+//! with `UnsupportedOperationException`, and LDAP security that is not active — never
+//! enabled, still being enabled, or already deactivated — with
+//! `InvalidLDAPSStatusException`, the error whose own documentation reads "The LDAP
+//! activities could not be performed because they are limited by the LDAPS status".
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +155,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableLDAPS` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableLDAPSErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableLDAPS"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The setting hangs off the directory the request names, so an id naming no
+        // stored directory is refused and records nothing.
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                DisableLDAPSErrorModeled::DirectoryDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // Deactivating LDAP secure calls changes the directory's own security
+        // configuration, so it needs a directory that is in service, exactly as
+        // activating it does. The diagnostic is this service's shared one for a directory
+        // a call cannot reach: the requested id and nothing about the stage it is in.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(DisableLDAPSErrorModeled::DirectoryUnavailableException(
+                crate::state::refusal(crate::state::directory_unavailable(&input.directory_id)),
+            )
+            .into());
+        }
+
+        // A directory type that serves no LDAPS endpoint has no switch to deactivate
+        // either, so the request asks for something that type does not support.
+        if !directory.supports_ldaps() {
+            return Err(DisableLDAPSErrorModeled::UnsupportedOperationException(
+                crate::state::refusal(format!(
+                    "DirectoryId {id} names a {directory_type} directory; LDAP secure calls \
+                     are supported for {supported} directories only",
+                    id = input.directory_id,
+                    directory_type = directory.directory_type,
+                    supported = crate::state::LDAPS_SUPPORTED_DIRECTORY_TYPES.join(" and ")
+                )),
+            )
+            .into());
+        }
+
+        // There is a switch to turn off only where LDAP secure calls are active: a
+        // directory nothing enabled LDAPS for carries no setting at all, one still being
+        // enabled has not finished the transition its enable started, and one already
+        // deactivated is in the state this request asks for. In each case the activity
+        // asked for is limited by the status the setting carries, which is the modelled
+        // refusal for exactly that.
+        let current = directory
+            .ldaps_settings
+            .get(&input.r#type)
+            .map(|setting| setting.status.clone());
+        if current.as_deref() != Some(crate::state::LDAPS_STATUS_ENABLED) {
+            return Err(DisableLDAPSErrorModeled::InvalidLDAPSStatusException(
+                crate::state::refusal(match current {
+                    Some(status) => format!(
+                        "Directory {id} LDAPS of type {ldaps_type} is {status}, not {enabled}",
+                        id = input.directory_id,
+                        ldaps_type = input.r#type,
+                        enabled = crate::state::LDAPS_STATUS_ENABLED
+                    ),
+                    None => format!(
+                        "Directory {id} has no LDAPS of type {ldaps_type} to disable",
+                        id = input.directory_id,
+                        ldaps_type = input.r#type
+                    ),
+                }),
+            )
+            .into());
+        }
+
+        // The request is accepted. The deactivation is in force the instant this call
+        // answers, and nothing but this call has changed the status, so there is no state
+        // change to describe in `LDAPSStatusReason`.
+        directory.ldaps_settings.insert(
+            input.r#type.clone(),
+            crate::state::LdapsSetting {
+                status: crate::state::LDAPS_STATUS_DISABLED.to_string(),
+                status_reason: None,
+                last_updated: now,
+                status_due_at: None,
+            },
+        );
+
+        Ok(DisableLDAPSOutput {})
     }
 }

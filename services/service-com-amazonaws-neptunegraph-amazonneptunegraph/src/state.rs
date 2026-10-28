@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AccessDeniedException, ConflictException, ExportFilter, ImportOptions,
-    ResourceNotFoundException, VectorSearchConfiguration,
+    ResourceNotFoundException, ValidationException, VectorSearchConfiguration,
 };
 
 /// The ARN namespace (and SigV4 signing name) of this service, from the model's
@@ -178,6 +178,20 @@ impl GraphStatus {
     /// request that would start another transition is a conflict.
     pub const fn is_at_rest(self) -> bool {
         matches!(self, Self::Available | Self::Stopped)
+    }
+
+    /// Whether a graph in this status is SERVING: whether the graph's OWN endpoint —
+    /// the per-graph data plane every operation the model binds to the host prefix
+    /// `{graphIdentifier}.` is reached through — answers at all.
+    ///
+    /// A graph serves only while it is `AVAILABLE`: one that is provisioning,
+    /// reconfiguring, importing, snapshotting, starting, stopped or on its way out has
+    /// no data plane behind that endpoint, so there is nothing there to read a summary,
+    /// a query listing or one query's status from, and nothing to cancel a query on.
+    /// Stated once here so every operation on that endpoint applies the same
+    /// precondition.
+    pub const fn is_serving(self) -> bool {
+        matches!(self, Self::Available)
     }
 }
 
@@ -2799,6 +2813,39 @@ pub fn graph_state_conflict(action: &str, status: GraphStatus) -> ConflictExcept
         // that simply does not permit the transition is not a concurrent modification
         // of the graph, so the member is left absent.
         reason: None,
+    }
+}
+
+/// The modelled `ValidationException` for a call on the graph's OWN data plane — an
+/// operation the model binds to the host prefix `{graphIdentifier}.`
+/// (`GetGraphSummary`, `ListQueries`, `GetQuery`, `CancelQuery`) — made while that
+/// graph is not serving ([`GraphStatus::is_serving`]).
+///
+/// `action` is what the endpoint had nothing to do it with, worded from the operation
+/// asking ("summarise", "list queries on"), and `status` is the status that was read.
+/// None of those operations declares a `ConflictException`
+/// (`smithy_query(query="operation",operation="GetGraphSummary,ListQueries,GetQuery,CancelQuery")`
+/// -> errors), so the one client error they all do model carries the refusal, and it
+/// names the graph as well as the status: the request addressed the graph as the HOST
+/// it was sent to, so which graph was not serving is a fact the caller needs back.
+/// Written once here and reached by every one of those gates, so no two of them word
+/// the same refusal differently.
+pub fn graph_data_plane_unavailable(
+    graph_id: &str,
+    status: GraphStatus,
+    action: &str,
+) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "graph {graph_id} is in status {} and has no serving data plane to {action}",
+            status.as_wire()
+        ),
+        // The other modelled `reason` values all name something wrong with the INPUT —
+        // malformed, illegal or oversized — or one cancelled query
+        // (`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`), and a well-formed
+        // request the graph's state leaves nothing to answer is none of those, so it is
+        // reported as the bad request it is.
+        reason: Some("BAD_REQUEST".to_string()),
     }
 }
 

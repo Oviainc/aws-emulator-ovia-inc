@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableLDAPS
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableLDAPS`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableLDAPS::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Activates LDAP secure calls for a stored directory, by recording the `LDAPSStatus`
+//! transition the enable starts: the directory's LDAP security for the requested
+//! `LDAPSType` enters the transient [`crate::state::LDAPS_STATUS_ENABLING`], and the
+//! clock — not a later call — settles it on [`crate::state::LDAPS_STATUS_ENABLED`] once
+//! [`crate::state::TRANSITION_SPAN`] has elapsed. `DescribeLDAPSSettings` is what
+//! reports that status.
+//!
+//! LDAPS secures the traffic between a directory server and its clients with a
+//! certificate the directory holds, so the switch can only be activated where there is
+//! such a certificate in service: a directory holding no registered
+//! [`crate::state::CERTIFICATE_TYPE_CLIENT_LDAPS`] certificate is refused with
+//! `NoAvailableCertificateException`, the error whose own documentation reads "at least
+//! one valid certificate must be registered in the system".
+//!
+//! The modelled constraints (the `DirectoryId` pattern, the `LDAPSType` enum values) are
+//! refused by the framework's boundary validator BEFORE this handler runs, so a
+//! well-formed request reaches directory resolution: an id no directory is stored under
+//! is refused with `DirectoryDoesNotExistException`, a directory that is not in service
+//! (still being built by the transition its create owes, or otherwise outside `Active`)
+//! with `DirectoryUnavailableException`, a directory type that serves no LDAPS endpoint
+//! with `UnsupportedOperationException`, and LDAP security that is already active — or
+//! already on its way there — with `InvalidLDAPSStatusException`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +164,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableLDAPS` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableLDAPSErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableLDAPS"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.advance_clock(now);
+
+        // The setting hangs off the directory the request names, so an id naming no
+        // stored directory is refused and records nothing.
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| {
+                EnableLDAPSErrorModeled::DirectoryDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
+            })?;
+
+        // Activating LDAP secure calls changes the directory's own security
+        // configuration, so it needs a directory that is in service: one still being
+        // built by the transition its create owes is unavailable, which is the modelled
+        // refusal for exactly that. The diagnostic is this service's shared one for a
+        // directory a call cannot reach: the requested id and nothing about the stage it
+        // is in.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(EnableLDAPSErrorModeled::DirectoryUnavailableException(
+                crate::state::refusal(crate::state::directory_unavailable(&input.directory_id)),
+            )
+            .into());
+        }
+
+        // LDAPS secures the LDAP traffic a directory server exchanges with its clients,
+        // so a directory type that serves no LDAPS endpoint cannot have the switch
+        // activated at all — the modelled refusal for a request a type does not support.
+        // NOT dead code: `CreateDirectory` persists a Simple AD directory today, so this
+        // branch is reachable from the wire.
+        if !directory.supports_ldaps() {
+            return Err(EnableLDAPSErrorModeled::UnsupportedOperationException(
+                crate::state::refusal(format!(
+                    "DirectoryId {id} names a {directory_type} directory; LDAP secure calls \
+                     are supported for {supported} directories only",
+                    id = input.directory_id,
+                    directory_type = directory.directory_type,
+                    supported = crate::state::LDAPS_SUPPORTED_DIRECTORY_TYPES.join(" and ")
+                )),
+            )
+            .into());
+        }
+
+        // LDAP security that is already active — or already on its way there under the
+        // transition an earlier enable started — is in the state this request asks for,
+        // so the enable is refused rather than silently restarting that transition. The
+        // LDAP activities this request asks for are limited by the status the setting
+        // already carries, which is the modelled refusal for exactly that.
+        if let Some(existing) = directory.ldaps_settings.get(&input.r#type) {
+            if existing.status == crate::state::LDAPS_STATUS_ENABLING
+                || existing.status == crate::state::LDAPS_STATUS_ENABLED
+            {
+                return Err(EnableLDAPSErrorModeled::InvalidLDAPSStatusException(
+                    crate::state::refusal(format!(
+                        "Directory {id} LDAPS of type {ldaps_type} is already {status}",
+                        id = input.directory_id,
+                        ldaps_type = input.r#type,
+                        status = existing.status
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // The switch is served by a certificate the directory holds: without one in
+        // service there is nothing to secure the LDAP calls with, which is the modelled
+        // refusal whose own documentation reads "at least one valid certificate must be
+        // registered in the system". A registration still being made does not count —
+        // it is in service only once the transition its register owes falls due.
+        if !directory.has_certificate_in_service(crate::state::CERTIFICATE_TYPE_CLIENT_LDAPS) {
+            return Err(EnableLDAPSErrorModeled::NoAvailableCertificateException(
+                crate::state::refusal(format!(
+                    "LDAPS cannot be enabled for directory {id} because at least one valid \
+                     {certificate_type} certificate must be registered in the system",
+                    id = input.directory_id,
+                    certificate_type = crate::state::CERTIFICATE_TYPE_CLIENT_LDAPS
+                )),
+            )
+            .into());
+        }
+
+        // The request is accepted. LDAP secure calls are not in service the instant this
+        // call answers: the move to `Enabled` is owed by the clock, like a create's stage
+        // transition. Nothing but the clock has changed this status, so there is no state
+        // change to describe in `LDAPSStatusReason`.
+        directory.ldaps_settings.insert(
+            input.r#type.clone(),
+            crate::state::LdapsSetting {
+                status: crate::state::LDAPS_STATUS_ENABLING.to_string(),
+                status_reason: None,
+                last_updated: now,
+                status_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            },
+        );
+
+        Ok(EnableLDAPSOutput {})
     }
 }

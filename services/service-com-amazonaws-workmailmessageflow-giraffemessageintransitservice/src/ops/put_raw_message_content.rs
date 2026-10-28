@@ -592,8 +592,9 @@ type HeaderBlock = Vec<HeaderField>;
 /// block beyond [`MAX_HEADER_BLOCK_OCTETS`] or [`MAX_HEADER_FIELDS`]. Those
 /// ceilings sit far above anything a mail system accepts, so they refuse nothing
 /// the real service takes. What they buy is that every scan here is bounded: the
-/// ones before them are linear in the content and allocate nothing, and the one
-/// that takes the block apart runs only inside them.
+/// ones before them are linear in the content and allocate nothing, and the walk
+/// that reads the block ([`bounded_header_block`]) stops at them, so the fields
+/// are taken apart out of a block that is already inside them.
 ///
 /// The fields this read come back, so the content is taken apart ONCE per request:
 /// the comparison [`immutable_header_conflict`] makes against the message in
@@ -625,13 +626,15 @@ fn validate_mime(content: &[u8]) -> Result<HeaderBlock, String> {
         ));
     }
 
-    // Decided BEFORE the block is taken apart, so no content beyond the ceilings
-    // is ever read into fields.
-    if let Some(reason) = oversize_header_block(content) {
+    // ONE walk of the header block, in [`bounded_header_block`]: it decides the
+    // ceilings and hands back the lines it read, so no content beyond them is
+    // taken apart into fields and the block is walked once per request.
+    let block = bounded_header_block(content);
+    if let Some(reason) = block.past_ceiling {
         return Err(reason);
     }
 
-    let fields = header_fields(content);
+    let fields = header_fields_of(&block.lines);
     let counts = field_counts(&fields);
 
     let missing: Vec<&str> = REQUIRED_HEADERS
@@ -668,39 +671,76 @@ fn oversize_content(octets: usize) -> String {
     )
 }
 
-/// Why `content`'s header block is beyond what this emulator reads, and `None`
-/// when the block is inside both of the ceilings [`MAX_HEADER_BLOCK_OCTETS`] and
-/// [`MAX_HEADER_FIELDS`] state.
+/// A message's header block as far as this emulator reads it: the block's header
+/// lines, and why the block runs past a ceiling when it does.
 ///
-/// The block is the content up to the first empty line, so it is the caller who
-/// decides how long it is and how many lines it carries. This walks it without
-/// allocating anything and stops at the first ceiling it crosses, so the walk is
-/// bounded by the ceiling rather than by the content.
-fn oversize_header_block(content: &[u8]) -> Option<String> {
+/// What [`bounded_header_block`] hands back, and the one thing both halves of this
+/// module's header handling work from: [`validate_mime`] answers
+/// [`Self::past_ceiling`] to the caller, and [`header_fields_of`] takes
+/// [`Self::lines`] apart into fields.
+struct BoundedHeaderBlock<'a> {
+    /// The block's header lines, in the order the message carries them, each
+    /// without the CR that ended it and never the empty line that closes the
+    /// block. The lines BORROW the content, so holding them copies no octet.
+    lines: Vec<&'a [u8]>,
+    /// Why the block is past one of the ceilings [`MAX_HEADER_BLOCK_OCTETS`] and
+    /// [`MAX_HEADER_FIELDS`] state — the `message` of the refusal — and `None`
+    /// when it is inside both, in which case [`Self::lines`] is the WHOLE block.
+    past_ceiling: Option<String>,
+}
+
+/// `content`'s header block, read up to the ceilings [`MAX_HEADER_BLOCK_OCTETS`]
+/// and [`MAX_HEADER_FIELDS`] state.
+///
+/// The ONE place this module walks a header block, so the rule is stated once: the
+/// block is the content up to the first empty line, a line's octets are its own
+/// plus the one line feed that ended it, the empty line closes the block and
+/// belongs to neither ceiling, and the second ceiling counts the block's LINES —
+/// every line standing before that empty line, a folded continuation among them —
+/// and not the fields they parse into.
+///
+/// It is the caller who decides how long the block is and how many lines it
+/// carries, so the walk stops at the first ceiling it crosses: what comes back is
+/// bounded by the ceilings rather than by the content, at most
+/// [`MAX_HEADER_FIELDS`] borrowed line slices spanning at most
+/// [`MAX_HEADER_BLOCK_OCTETS`] octets.
+fn bounded_header_block(content: &[u8]) -> BoundedHeaderBlock<'_> {
+    let mut lines: Vec<&[u8]> = Vec::new();
     let mut octets = 0usize;
-    let mut lines = 0usize;
-    for line in content.split(|byte| *byte == b'\n') {
-        if line.strip_suffix(b"\r").unwrap_or(line).is_empty() {
-            // The end of the header block.
-            return None;
+    for raw in content.split(|byte| *byte == b'\n') {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            // The end of the header block: the empty line closes the block and is
+            // no part of it, so neither it nor its octets count towards a ceiling.
+            break;
         }
         // The LF that ended the line belongs to the block as well.
-        octets = octets.saturating_add(line.len()).saturating_add(1);
-        lines += 1;
+        octets = octets.saturating_add(raw.len()).saturating_add(1);
         if octets > MAX_HEADER_BLOCK_OCTETS {
-            return Some(format!(
-                "The message's header block is longer than the {MAX_HEADER_BLOCK_OCTETS} octets \
-                 this emulator will read."
-            ));
+            return BoundedHeaderBlock {
+                lines,
+                past_ceiling: Some(format!(
+                    "The message's header block is longer than the {MAX_HEADER_BLOCK_OCTETS} \
+                     octets this emulator will read."
+                )),
+            };
         }
-        if lines > MAX_HEADER_FIELDS {
-            return Some(format!(
-                "The message's header block carries more than the {MAX_HEADER_FIELDS} header \
-                 lines this emulator will read."
-            ));
+        if lines.len() == MAX_HEADER_FIELDS {
+            // This line is one more than the ceiling admits.
+            return BoundedHeaderBlock {
+                lines,
+                past_ceiling: Some(format!(
+                    "The message's header block carries more than the {MAX_HEADER_FIELDS} header \
+                     lines this emulator will read."
+                )),
+            };
         }
+        lines.push(line);
     }
-    None
+    BoundedHeaderBlock {
+        lines,
+        past_ceiling: None,
+    }
 }
 
 /// Why `updated` may not replace `current`, when it changes the value of a header
@@ -790,26 +830,21 @@ fn field_counts<'a>(fields: &'a [HeaderField]) -> ::std::collections::BTreeMap<&
 /// or two different values, as one. Only [`trim_wsp`] comes off either half, so
 /// every octet that is not RFC 5322 whitespace belongs to the name or the value.
 ///
-/// Reading stops at the ceilings [`MAX_HEADER_BLOCK_OCTETS`] and
-/// [`MAX_HEADER_FIELDS`] state, so what this holds is bounded however long the
-/// content is. Content this operation installs is inside those ceilings —
-/// [`oversize_header_block`] refuses it otherwise, before anything is read — so
-/// only content that reached the store by another route can have a block that
-/// ends here rather than at its empty line.
+/// Reading stops where [`bounded_header_block`] stops, so what this holds is
+/// bounded however long the content is. Content this operation installs is inside
+/// those ceilings — [`validate_mime`] refuses it otherwise, out of the same walk —
+/// so only content that reached the store by another route can have a block that
+/// ends at a ceiling rather than at its empty line.
 fn header_fields(content: &[u8]) -> HeaderBlock {
+    header_fields_of(&bounded_header_block(content).lines)
+}
+
+/// The fields `lines` carries, as [`header_fields`] describes them: `lines` is a
+/// header block [`bounded_header_block`] read, so the ceilings and the end of the
+/// block are already decided there and this only takes the lines apart.
+fn header_fields_of(lines: &[&[u8]]) -> HeaderBlock {
     let mut fields: HeaderBlock = Vec::new();
-    let mut octets = 0usize;
-    for line in content.split(|byte| *byte == b'\n') {
-        // The LF that ended the line belongs to the block as well.
-        octets = octets.saturating_add(line.len()).saturating_add(1);
-        if octets > MAX_HEADER_BLOCK_OCTETS || fields.len() >= MAX_HEADER_FIELDS {
-            break;
-        }
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            // The end of the header block.
-            break;
-        }
+    for line in lines {
         if is_folded_continuation(line) {
             // A folded continuation of the field above: unfolding removes the line
             // break and keeps the rest of the line, including its leading

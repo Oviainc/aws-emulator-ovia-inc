@@ -54,6 +54,9 @@ pub(crate) const FILTERED_EVENTS: &str = "/list-filtered-transaction-events";
 /// [`FILTERED_EVENTS`].
 pub(crate) const TRANSACTION_EVENTS: &str = "/list-transaction-events";
 
+/// The route `ListTransactions` is bound to (`@http(uri:)`); see [`FILTERED_EVENTS`].
+pub(crate) const TRANSACTIONS: &str = "/list-transactions";
+
 /// The top-level `message` this service's `ValidationException` carries for a request it
 /// refuses on a rule the MODEL cannot express (a combination of members, an ordering
 /// between two of them, a continuation token it never issued), with the per-rule detail
@@ -592,11 +595,18 @@ async fn list_transactions_returns_exactly_the_stored_transactions_of_each_addre
         for address in network.addresses() {
             let case = format!("{}/{address}", network.network);
             let expected = network.hashes_for(&address);
+            // The whole stored history is reached by OPTING IN to what has not reached
+            // finality: a request carrying no `confirmationStatusFilter` lists only what
+            // has (`finality_default.rs` owns that rule).
             let items = drained(
                 &emulator,
                 "/list-transactions",
                 "transactions",
-                &json!({"network": network.network, "address": address}),
+                &json!({
+                    "network": network.network,
+                    "address": address,
+                    "confirmationStatusFilter": {"include": ["FINAL", "NONFINAL"]},
+                }),
             )
             .await;
             let got = hashes(&items);
@@ -678,7 +688,13 @@ async fn list_transactions_honours_sort_order_the_confirmation_filter_and_the_wi
     for network in emulator.fixture() {
         let address = network.busiest_address();
         let ascending = network.hashes_for(&address);
-        let base = json!({"network": network.network, "address": address});
+        // Every row below is about the whole stored history, so the base request opts in
+        // to what has not reached finality; the finality filter's own rows overwrite it.
+        let base = json!({
+            "network": network.network,
+            "address": address,
+            "confirmationStatusFilter": {"include": ["FINAL", "NONFINAL"]},
+        });
         let case = format!("{}/{address}", network.network);
 
         // `ListTransactionsSort$sortOrder`: absent defaults to ASCENDING.
