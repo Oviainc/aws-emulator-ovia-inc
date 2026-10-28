@@ -434,6 +434,7 @@ async fn a_user_holding_an_access_key_cannot_be_deleted() {
             status, 200,
             "case {case:?}: CreateUser must succeed again, got {status}: {body}"
         );
+        grant_get_user(&router, &case, stored_name).await;
         let (status, created) =
             call(&router, "CreateAccessKey", &[("UserName", requested_name)]).await;
         assert_eq!(

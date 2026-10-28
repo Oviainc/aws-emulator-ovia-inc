@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `VpcEndpointId`, stores a `VpcEndpointRecord` in [`crate::state`]
+//! holding the VPC, subnets and security groups the request named, and answers that stored
+//! record in the non-terminal `PENDING` status it settles out of — refusing an endpoint
+//! name already taken and a create past the account's endpoint bound, and replaying the
+//! record a spent `clientToken` first created.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcEndpoint"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVpcEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // A replayed `clientToken` is a retry of the call that created the endpoint, so it
+        // answers that endpoint instead of creating or conflicting with a second one. The
+        // replay is scoped to the name THIS request carries: a token spent again on a
+        // different `name` is a request for another endpoint, which is still created rather
+        // than answered with the first one.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = store
+                .replayed_vpc_endpoint(Self::NAME, token)
+                .filter(|record| record.name == input.name)
+                .map(crate::state::VpcEndpointRecord::create_detail);
+            if let Some(detail) = replayed {
+                return Ok(CreateVpcEndpointOutput {
+                    create_vpc_endpoint_detail: Some(detail),
+                });
+            }
+        }
+
+        // An endpoint name identifies one endpoint in the account, so a name already taken
+        // is the conflict `ConflictException` describes: "thrown when a resource with the
+        // same name already exists or is being created".
+        if store.vpc_endpoint_by_name(&input.name).is_some() {
+            return Err(CreateVpcEndpointErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "A VPC endpoint with name '{}' already exists.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if store.vpc_endpoints.len() >= crate::state::MAX_VPC_ENDPOINTS {
+            return Err(
+                CreateVpcEndpointErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "Maximum number of VPC endpoints exceeded: {}",
+                            crate::state::MAX_VPC_ENDPOINTS
+                        ),
+                        resource_id: Some(input.name.clone()),
+                        resource_type: Some(crate::state::VPC_ENDPOINT_RESOURCE_TYPE.to_string()),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_vpc_endpoint_id();
+        let mut record = crate::state::VpcEndpointRecord {
+            id: id.clone(),
+            name: input.name,
+            vpc_id: input.vpc_id,
+            subnet_ids: input.subnet_ids,
+            security_group_ids: input.security_group_ids.unwrap_or_default(),
+            // Overwritten by `begin_transition` below, which is what owes the move to
+            // `ACTIVE`.
+            status: crate::state::VPC_ENDPOINT_PENDING.to_string(),
+            created_date: crate::state::now_epoch_millis(),
+            pending_status: None,
+        };
+        // The endpoint is returned in the non-terminal `PENDING` status and reaches
+        // `ACTIVE` on its own a moment later, with nobody calling.
+        record.begin_transition(
+            crate::state::VPC_ENDPOINT_PENDING,
+            crate::state::VPC_ENDPOINT_ACTIVE,
+        );
+        store.insert_vpc_endpoint(record);
+        if let Some(token) = input.client_token.as_deref() {
+            store.remember_token(Self::NAME, token, &id);
+        }
+
+        // Answered from the STORED record, so the create cannot report anything a later
+        // `BatchGetVpcEndpoint` would not.
+        let stored = store.vpc_endpoints.get(&id).ok_or_else(|| {
+            CreateVpcEndpointError::from(CreateVpcEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            ))
+        })?;
+        Ok(CreateVpcEndpointOutput {
+            create_vpc_endpoint_detail: Some(stored.create_detail()),
+        })
     }
 }
