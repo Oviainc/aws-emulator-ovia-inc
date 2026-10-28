@@ -33,6 +33,8 @@ mod is_authorized_with_token;
 mod list_identity_sources;
 #[path = "all/list_policy_store_aliases.rs"]
 mod list_policy_store_aliases;
+#[path = "all/list_policy_templates.rs"]
+mod list_policy_templates;
 #[path = "all/policy_store_alias.rs"]
 mod policy_store_alias;
 #[path = "all/policy_store_authorization.rs"]
