@@ -439,9 +439,9 @@
 //! keyed by the ASN as the API spells it (`Byoasn$Asn` is a `String`, not a number), which
 //! is the only name `AssociateIpamByoasn`, `DisassociateIpamByoasn` and
 //! `DeprovisionIpamByoasn` take for one. `ProvisionIpamByoasn` is the operation that brings
-//! an ASN to IPAM and `DeprovisionIpamByoasn` the one that gives it back; both are still
-//! scaffolds, so a fresh account holds none — which is why `AssociateIpamByoasn` answers
-//! [`INVALID_BYOASN_NOT_FOUND`] for every ASN until one of them is written, exactly as the
+//! an ASN to IPAM and `DeprovisionIpamByoasn` the one that gives it back; the provision is
+//! still a scaffold, so a fresh account holds none — which is why `AssociateIpamByoasn`
+//! answers [`INVALID_BYOASN_NOT_FOUND`] for every ASN until one is written, exactly as the
 //! real service does for an ASN that has not been brought to IPAM.
 //!
 //! The ASSOCIATION of such an ASN with a BYOIP range lives on the RANGE, in
@@ -455,13 +455,18 @@
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] on the same clock and
 //! span as every other move this store owes.
 //!
-//! The WRITERS of the ASN store itself — [`ComAmazonawsEc2Amazonec2State::insert_byoasn`],
+//! The ASN store has ONE insert — [`ComAmazonawsEc2Amazonec2State::insert_byoasn`], behind
 //! [`ComAmazonawsEc2Amazonec2State::has_byoasn_capacity`] and [`byoasn_payload_bytes`] —
-//! have no caller in `ops/` yet, because the operation that brings an ASN to IPAM is one of
-//! the scaffolds named above: no API path writes `byoasns`, and the only writer today is a
-//! test seeding one. They are the same ceiling-and-budget contract every other store of
-//! this module is written through, so the operation that does bring an ASN to IPAM has one
-//! bounded insert to call rather than a second arrangement to invent.
+//! the same ceiling-and-budget contract every other store of this module is written
+//! through, so an ASN cannot be filed two ways and a key a REQUEST names cannot grow this
+//! process's memory without bound. `DeprovisionIpamByoasn` gives an ASN back through
+//! [`ComAmazonawsEc2Amazonec2State::begin_byoasn_release`], which leaves it in the
+//! non-terminal `pending-deprovision` with the clock owing the outcome; WHAT that release
+//! ends as is decided at the due instant, from the associations the ASN still holds THEN
+//! ([`ComAmazonawsEc2Amazonec2State::byoip_cidrs_associated_with_asn`]), exactly as an
+//! address range's release is decided from the addresses still allocated out of it. The
+//! operation that brings an ASN to IPAM is still a scaffold, so the only other writer today
+//! is a test seeding one.
 //!
 //! ## Public IPv4 address pools
 //!
@@ -7554,20 +7559,61 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.pending = None;
             }
         }
-        // The end of bringing one ASN to IPAM: an ASN `ProvisionIpamByoasn` left in
-        // `pending-provision` reaches the state that provision was headed for, at the
+        // The end of bringing one ASN to IPAM, and the end of giving one back: an ASN
+        // `ProvisionIpamByoasn` left in `pending-provision`, or one `DeprovisionIpamByoasn`
+        // left in `pending-deprovision`, reaches the state that call was headed for, at the
         // instant it was owed whether or not anybody called — the same contract as the
         // address ranges above.
-        for record in self.byoasns.values_mut() {
-            if let Some(state) = record
-                .pending
-                .as_ref()
-                .and_then(|pending| pending.due_by(now))
-                .map(str::to_string)
-            {
-                record.byoasn.state = Some(state);
-                record.pending = None;
+        //
+        // WHAT a release ends as is decided HERE, at the due instant, from the associations
+        // the ASN still holds THEN: "This action can only be called after any BYOIP CIDR
+        // associations are removed from your Amazon Web Services account with
+        // DisassociateIpamByoasn" (`DeprovisionIpamByoasn`), so a caller that clears the last
+        // association while the ASN is `pending-deprovision` still gets its release, and one
+        // that leaves an association in place gets `failed-deprovision` carrying why — the
+        // same way a range's release is decided from the addresses allocated out of it.
+        let due_byoasns: Vec<String> = self
+            .byoasns
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.due_by(now).is_some())
+            })
+            .map(|(asn, _)| asn.clone())
+            .collect();
+        for asn in due_byoasns {
+            let Some(headed_for) = self
+                .byoasns
+                .get(&asn)
+                .and_then(|record| record.pending.as_ref())
+                .map(|pending| pending.to.clone())
+            else {
+                continue;
+            };
+            // Only a RELEASE has an outcome to decide; every other move the clock owes an
+            // ASN lands where it was headed.
+            let held = if headed_for == ASN_STATE_DEPROVISIONED {
+                self.byoip_cidrs_associated_with_asn(&asn)
+            } else {
+                Vec::new()
+            };
+            let Some(record) = self.byoasns.get_mut(&asn) else {
+                continue;
+            };
+            if held.is_empty() {
+                record.byoasn.state = Some(headed_for);
+            } else {
+                // The ASN stays the account's, carrying why in its `StatusMessage` ("The
+                // status message", `Byoasn$StatusMessage`), and can be given back again once
+                // the caller has cleared what held it. The message is bounded by what the
+                // store holds, so it is rewritten in place rather than re-charged against
+                // the byte budget, exactly as a range's failed release is.
+                record.byoasn.state = Some(ASN_STATE_FAILED_DEPROVISION.to_string());
+                record.byoasn.status_message = Some(byoasn_release_failure(&held));
             }
+            record.pending = None;
         }
         // The end of one ASN-and-range association: "After the association succeeds, the
         // ASN is eligible for advertisement" (`AssociateIpamByoasn`), so an association
@@ -19617,6 +19663,49 @@ pub fn invalid_cidr_not_found<E>(cidr: &str) -> Scaffolded<E> {
 /// itself is provisioned (`ProvisionIpamByoasn`, "Tutorial: Bring your ASN to IPAM").
 pub const ASN_STATE_PROVISIONED: &str = "provisioned";
 
+/// The `AsnState` of an ASN whose provision did not complete.
+pub const ASN_STATE_FAILED_PROVISION: &str = "failed-provision";
+
+/// The `AsnState` of an ASN whose provision is still under way: the state
+/// `ProvisionIpamByoasn` hands one back in, before the clock has finished bringing it to
+/// IPAM.
+pub const ASN_STATE_PENDING_PROVISION: &str = "pending-provision";
+
+/// The `AsnState` of an ASN whose release is under way: the state
+/// `DeprovisionIpamByoasn` hands one back in, since the account has asked for the ASN back
+/// but AWS has not finished giving it up.
+pub const ASN_STATE_PENDING_DEPROVISION: &str = "pending-deprovision";
+
+/// The `AsnState` of an ASN the account has finished giving back.
+pub const ASN_STATE_DEPROVISIONED: &str = "deprovisioned";
+
+/// The `AsnState` of an ASN whose release did not complete, so the ASN is still the
+/// account's and can be given back again.
+pub const ASN_STATE_FAILED_DEPROVISION: &str = "failed-deprovision";
+
+/// The `AsnState`s an ASN can be DEPROVISIONED from.
+///
+/// Stated as the states where the ASN is the account's and sitting still: it finished being
+/// brought to IPAM ([`ASN_STATE_PROVISIONED`]), or a provision or an earlier release of it
+/// failed and the ASN is the caller's to clear ([`ASN_STATE_FAILED_PROVISION`],
+/// [`ASN_STATE_FAILED_DEPROVISION`]). What is left out are the states where the ASN is part
+/// way through a move the clock has not finished ([`ASN_STATE_PENDING_PROVISION`],
+/// [`ASN_STATE_PENDING_DEPROVISION`]) and the one where it has already been given back
+/// ([`ASN_STATE_DEPROVISIONED`]): the caller has to wait for the first and has nothing left
+/// to release in the second. Every word here is one of `AsnState`'s own values
+/// (`ASN_STATE_VALUES` in `ops::types`), and the set is the ASN's form of
+/// [`RELEASABLE_BYOIP_CIDR_STATES`].
+pub const RELEASABLE_ASN_STATES: &[&str] = &[
+    ASN_STATE_PROVISIONED,
+    ASN_STATE_FAILED_PROVISION,
+    ASN_STATE_FAILED_DEPROVISION,
+];
+
+/// Can an ASN in `state` be deprovisioned? See [`RELEASABLE_ASN_STATES`].
+pub fn asn_state_is_releasable(state: &str) -> bool {
+    RELEASABLE_ASN_STATES.contains(&state)
+}
+
 /// The `AsnAssociationState` of an association that has been accepted and is not in force
 /// yet — the state `AssociateIpamByoasn` hands one back in, since "AFTER the association
 /// succeeds, the ASN is eligible for advertisement" (`AssociateIpamByoasn`).
@@ -19769,6 +19858,37 @@ pub fn byoasn_payload_bytes(record: &ByoasnRecord) -> usize {
         .saturating_add(byoasn.status_message.as_deref().map_or(0, str::len))
 }
 
+/// The `StatusMessage` a release that failed because the ASN is still associated with BYOIP
+/// address ranges carries, naming the ranges that held it so the caller can clear them from
+/// this text alone: "This action can only be called after any BYOIP CIDR associations are
+/// removed from your Amazon Web Services account with DisassociateIpamByoasn"
+/// (`DeprovisionIpamByoasn`).
+///
+/// Built from the store, never from a recording, and the ONE wording of that outcome — the
+/// form [`byoip_cidr_release_failure`] gives the same outcome for an address range.
+///
+/// The COUNT is always exact and the ranges are named up to
+/// [`MAX_BYOIP_CIDRS_NAMED_IN_STATUS`], so the text one stored ASN carries stays a bounded
+/// size however many ranges the account associated with it.
+pub fn byoasn_release_failure(held: &[String]) -> String {
+    let named: Vec<&str> = held
+        .iter()
+        .take(MAX_BYOIP_CIDRS_NAMED_IN_STATUS)
+        .map(String::as_str)
+        .collect();
+    let rest = if held.len() > named.len() { ", ..." } else { "" };
+    format!(
+        "Deprovisioning failed: the ASN is still associated with {count} BYOIP CIDR(s) \
+         ({cidrs}{rest}). Disassociate them and try again.",
+        count = held.len(),
+        cidrs = named.join(", "),
+    )
+}
+
+/// How many address ranges a failed release names in the ASN's `StatusMessage`, which the
+/// store then holds for as long as it holds the ASN.
+const MAX_BYOIP_CIDRS_NAMED_IN_STATUS: usize = 5;
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another BYOASN fits inside the store's ceiling
     /// ([`MAX_STORED_RECORDS_PER_STORE`]), the contract [`Self::has_byoip_cidr_capacity`]
@@ -19817,6 +19937,75 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(charge);
         self.byoasns.insert(asn, record);
         true
+    }
+
+    /// The canonical BYOIP address ranges that still HOLD an association for the ASN `asn`,
+    /// in the store's own key order.
+    ///
+    /// "This action can only be called after any BYOIP CIDR associations are removed from
+    /// your Amazon Web Services account with DisassociateIpamByoasn"
+    /// (`DeprovisionIpamByoasn`) is a question about the associations the RANGES carry, so it
+    /// is answered from the range store — where an association lives
+    /// (`ByoipCidr$AsnAssociations`) — rather than from a count kept beside the ASN, which
+    /// could drift from it. A pair whose association is not there
+    /// ([`UNHELD_ASN_ASSOCIATION_STATES`]) holds none, so it holds no release up.
+    pub fn byoip_cidrs_associated_with_asn(&self, asn: &str) -> Vec<String> {
+        self.byoip_cidrs
+            .iter()
+            .filter(|(_, record)| {
+                record
+                    .byoip_cidr
+                    .asn_associations
+                    .iter()
+                    .flatten()
+                    .any(|association| {
+                        association.asn.as_deref() == Some(asn)
+                            && association
+                                .state
+                                .as_deref()
+                                .is_some_and(asn_association_is_held)
+                    })
+            })
+            .map(|(cidr, _)| cidr.clone())
+            .collect()
+    }
+
+    /// Start giving the ASN `asn` back: move it to [`ASN_STATE_PENDING_DEPROVISION`] and
+    /// record the release the clock owes it, answering the ASN as the caller is told about
+    /// it.
+    ///
+    /// The release is NOT applied here. "Deprovisions your Autonomous System Number (ASN)
+    /// from your Amazon Web Services account" (`DeprovisionIpamByoasn`) is work AWS reports
+    /// as under way — `AsnState` carries `pending-deprovision` for exactly that — so it ends
+    /// [`TRANSITION_DELAY`] later through [`Self::materialize_due_transitions`], which is
+    /// also where WHAT it ends as is decided; a caller that reads the ASN straight back
+    /// still sees it `pending-deprovision`. The same contract
+    /// [`Self::begin_byoip_cidr_release`] has for an address range.
+    ///
+    /// An `asn` the account has not brought to IPAM answers [`byoasn_not_found`], so this
+    /// write cannot reach an ASN the store does not hold even if a caller skipped that
+    /// check. The record is re-filed through [`Self::insert_byoasn`], the one insert that
+    /// keeps the byte budget in step with what the store holds, so the longer state word
+    /// cannot take the store past [`MAX_STORED_BYTES`] uncharged.
+    pub fn begin_byoasn_release<E>(&mut self, asn: &str) -> Result<Byoasn, Scaffolded<E>> {
+        let Some(mut record) = self.byoasns.get(asn).cloned() else {
+            return Err(byoasn_not_found(asn));
+        };
+        record.byoasn.state = Some(ASN_STATE_PENDING_DEPROVISION.to_string());
+        // Whatever an earlier move had to report about the ASN says nothing about this
+        // release, whose own outcome is reported at its due instant.
+        record.byoasn.status_message = None;
+        // The release supersedes whatever move was owed the ASN: one being given back is not
+        // going to land in the state an earlier provision was moving it to.
+        record.pending = Some(PendingStateMove::starting_now(ASN_STATE_DEPROVISIONED));
+        let byoasn = record.byoasn.clone();
+        if !self.insert_byoasn(record) {
+            return Err(resource_limit_exceeded(format!(
+                "The release of the ASN '{asn}' does not fit inside this emulator's storage \
+                 budget"
+            )));
+        }
+        Ok(byoasn)
     }
 
     /// The BYOIP range `cidr` as the BYOASN operations see it: the record the store holds for

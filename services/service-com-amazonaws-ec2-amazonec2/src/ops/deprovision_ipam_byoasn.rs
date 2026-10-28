@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeprovisionIpamByoasn
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeprovisionIpamByoasn`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeprovisionIpamByoasn::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Gives one Autonomous System Number the account brought to IPAM back, out of the IPAM the
+//! request names: the ASN is left in the non-terminal `pending-deprovision` `AsnState` and
+//! answered in it, with [`crate::state`] owing the end of the release on the clock. An IPAM
+//! the account holds none of is refused with the IPAM's own `NotFound`, an ASN that IPAM
+//! holds none of with the ASN's own, and an ASN part way through another move or already
+//! given back as being in the wrong state.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +135,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeprovisionIpamByoasn` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeprovisionIpamByoasnErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — the IPAM and
+        // the ASN are each named in the request, and the ASNs this store holds are the
+        // account's rather than a Region's. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun arm
+        // below: "not an id of this kind at all" is a malformed request rather than a
+        // resource that does not exist, which is the order every resource of this crate asks
+        // the two questions in (`crate::state::require_well_formed_id`). Both members are
+        // modelled `@required` and `clientOptional`, so each reaches this handler as an empty
+        // string when the request carried it empty, which is a missing parameter rather than
+        // an unknown resource.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeprovisionIpamByoasn"))
+        // The IPAM is read first, and resolved first below: an ASN is brought to an IPAM and
+        // held under it (`Byoasn$IpamId`), so the IPAM is the CONTAINER this call acts inside
+        // and an ASN of it is only reachable once that container is — the order
+        // `crate::ops::create_ipam_scope` resolves its own container in.
+        let ipam_id = input.ipam_id.as_str();
+        if ipam_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter IpamId",
+            ));
+        }
+        state::require_well_formed_id(
+            state::IPAM_ID_PREFIX,
+            ipam_id,
+            state::INVALID_IPAM_ID_MALFORMED,
+        )?;
+        // "An ASN" (`DeprovisionIpamByoasnRequest$Asn`), held to the one definition of what
+        // an ASN is this crate has.
+        state::require_well_formed_byoasn("Asn", &input.asn)?;
+        let asn = input.asn.as_str();
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`DryRun`): the flag asks about
+        // PERMISSION, not about the resources the request names, so it is answered once the
+        // request's own form has been checked and before anything is resolved. Every caller
+        // of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // Moves owed earlier fell due whether or not anybody called, so whether this request
+        // is admissible is asked of the states things are ACTUALLY in: an ASN whose provision
+        // has completed is the account's to give back, and one whose release has completed
+        // has nothing left to release.
+        store.materialize_due_transitions();
+
+        // "The IPAM ID" (`DeprovisionIpamByoasnRequest$IpamId`): an IPAM this account holds
+        // none of is refused with the IPAM's own `NotFound` code, whatever the ASN turns out
+        // to be — there is no IPAM to give an ASN back from.
+        if !store.ipams.contains_key(ipam_id) {
+            return Err(state::invalid_ipam_id_not_found(ipam_id));
+        }
+
+        // "Provisions your Autonomous System Number (ASN) for use in your Amazon Web Services
+        // account" (`ProvisionIpamByoasn`) is what brings an ASN to IPAM, and only an ASN the
+        // account has brought to THE IPAM THE REQUEST NAMES is one this call can give back:
+        // an ASN held under another IPAM is not in that one, so it is as absent to this call
+        // as one the account never brought at all.
+        let Some(record) = store
+            .byoasns
+            .get(asn)
+            .filter(|record| record.byoasn.ipam_id.as_deref() == Some(ipam_id))
+        else {
+            return Err(state::byoasn_not_found(asn));
+        };
+        // "The provisioning state of the BYOASN" (`Byoasn$State`): an ASN part way through a
+        // move the clock has not finished, and one already given back, is not an ASN this
+        // call can release — the resource exists but is not in a state that admits the
+        // request, which is `IncorrectState`.
+        let asn_state = record.state().to_string();
+        if !state::asn_state_is_releasable(&asn_state) {
+            return Err(state::incorrect_state_of("ASN", asn, &asn_state));
+        }
+
+        // "This action can only be called after any BYOIP CIDR associations are removed from
+        // your Amazon Web Services account with DisassociateIpamByoasn": AWS takes the
+        // request anyway and reports the outcome on the ASN — `AsnState` carries
+        // `failed-deprovision` for a release that did not take — so the associations the ASN
+        // holds decide how the release ENDS, which is why they are read at the due instant,
+        // in `materialize_due_transitions`, and not here. The same place
+        // `crate::ops::deprovision_byoip_cidr` leaves the addresses that hold a range's
+        // release up.
+
+        // The ASN moves to `pending-deprovision` and the clock owes it the end of the
+        // release; the caller is told the ASN as it now stands.
+        let byoasn = store.begin_byoasn_release(asn)?;
+        Ok(DeprovisionIpamByoasnOutput {
+            byoasn: Some(byoasn),
+        })
     }
 }

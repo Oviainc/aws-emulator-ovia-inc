@@ -824,3 +824,8 @@ mod enclave_certificate_iam_roles;
 // `describe_network_acls`).
 #[path = "all/network_acls.rs"]
 mod network_acls;
+// Appended at the END of this file, for the reason the header gives. Giving one ASN brought
+// to IPAM back out of the IPAM that holds it: what `DeprovisionIpamByoasn` leaves the store
+// holding, what the clock then decides the release ended as, and what it refuses.
+#[path = "all/ipam_byoasn_deprovisioning.rs"]
+mod ipam_byoasn_deprovisioning;
