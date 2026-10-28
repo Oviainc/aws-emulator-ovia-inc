@@ -10,6 +10,13 @@
 //! an ARN no stored resource answers to is
 //! refused with the modelled 404 `ResourceNotFoundException`.
 //!
+//! A resource whose teardown has already been accepted is not a target for this
+//! write either: it is on its way out, so an ARN naming it is refused with the
+//! same 404
+//! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::resolve_tagged_resource_for_mutation`]),
+//! exactly as `UpdateProbe` refuses an update of it, while the reads of the
+//! service keep reporting it until the clock has carried its teardown through.
+//!
 //! A key AWS reserves for its own tags
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is not a key a caller may assign,
 //! so a request naming one is refused with the modelled 400
@@ -119,9 +126,11 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
-/// The modelled 404 for an ARN no stored monitor or probe carries. The wording
-/// matches `UntagResource`'s: the two operations resolve their `resourceArn` the
-/// same way, so they refuse an unresolvable one the same way.
+/// The modelled 404 for an ARN this write reaches no resource through — one no
+/// stored monitor or probe carries, and one naming a resource whose teardown has
+/// been accepted. The wording matches `UntagResource`'s: the two operations
+/// resolve their `resourceArn` the same way, so they refuse an ARN they reach
+/// nothing through the same way.
 fn not_found(resource_arn: &str) -> TagResourceError {
     TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!("no monitor or probe with ARN {resource_arn} exists")),
@@ -205,8 +214,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN is resolved against the store — the same write every read of this
         // service performs.
         store.settle_monitors_in(&region, now);
+        // A resource whose teardown has been accepted is on its way out, and
+        // its teardown is irreversible, so it is no longer a target for a call
+        // that would change what it still reports: the ARN names a resource
+        // this service is giving up, which is what the not-found answer tells
+        // the caller. Reads still report it, with the tags it still carries,
+        // until the clock has carried the teardown through.
         let target = store
-            .resolve_tagged_resource(&region, &input.resource_arn)
+            .resolve_tagged_resource_for_mutation(&region, &input.resource_arn)
             .ok_or_else(|| not_found(&input.resource_arn))?;
         let tags = store.tags_mut(&target).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {

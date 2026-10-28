@@ -58,8 +58,9 @@ const MAX_SAMPLES: usize = 100;
 /// Longer than the FIRST stage of a probe's teardown and shorter than the whole
 /// of it, so a read after this sleep observes a probe whose teardown has
 /// completed while its record is still readable. A blocking sleep, for the
-/// reason given on `PAST_ACTIVATION`.
-const PAST_FIRST_TEARDOWN_STAGE: Duration = Duration::from_millis(400);
+/// reason given on `PAST_ACTIVATION`. `pub(crate)`, so a suite that has to reach
+/// the second teardown stage waits the same span.
+pub(crate) const PAST_FIRST_TEARDOWN_STAGE: Duration = Duration::from_millis(400);
 
 /// A pause short enough to leave a freshly created probe still provisioning
 /// (its activation span is longer than this) and long enough that two instants
@@ -85,7 +86,14 @@ fn must_list_probe(monitor: &Value, probe_id: &str) -> Value {
         .unwrap_or_else(|| panic!("the monitor must list probe {probe_id}, got {monitor:?}"))
 }
 
-async fn get_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (u16, Value) {
+/// `GET /monitors/{monitorName}/probes/{probeId}` — `GetProbe`. `pub(crate)`,
+/// so a suite that reads a draining probe back reuses this one rather than
+/// keeping a copy of its own.
+pub(crate) async fn get_probe(
+    router: &MultiServiceRouter,
+    name: &str,
+    probe_id: &str,
+) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -95,7 +103,13 @@ async fn get_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (
     .await
 }
 
-async fn delete_probe(router: &MultiServiceRouter, name: &str, probe_id: &str) -> (u16, Value) {
+/// `DELETE /monitors/{monitorName}/probes/{probeId}` — the call that starts a
+/// probe's teardown. `pub(crate)` for the same reason as [`get_probe`].
+pub(crate) async fn delete_probe(
+    router: &MultiServiceRouter,
+    name: &str,
+    probe_id: &str,
+) -> (u16, Value) {
     call(
         router,
         "DELETE",
@@ -121,8 +135,9 @@ async fn update_probe(
 }
 
 /// Create a monitor holding one probe built from `probe` (a bare probe body) and
-/// answer the probe's minted id and ARN.
-async fn probe_fixture(
+/// answer the probe's minted id and ARN. `pub(crate)`, so a suite that needs a
+/// probe to tear down reuses this fixture.
+pub(crate) async fn probe_fixture(
     router: &MultiServiceRouter,
     name: &str,
     probe: &str,
