@@ -81,6 +81,8 @@ mod minute_usage;
 mod mission_profile_deletion;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/owed_transition_spans.rs"]
+mod owed_transition_spans;
 #[path = "all/program_track_reference_integrity.rs"]
 mod program_track_reference_integrity;
 #[path = "all/recording_bucket_refusal_message.rs"]
