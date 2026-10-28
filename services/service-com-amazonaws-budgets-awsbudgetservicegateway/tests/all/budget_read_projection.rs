@@ -40,7 +40,9 @@ fn the_services_own_status_constants_are_the_modelled_values() {
     );
 }
 
-use super::budget_lifecycle::{caller_account, call, router, router_with_engine, same};
+use super::budget_lifecycle::{
+    caller_account, call, limit_amount_for, router, router_with_engine, same,
+};
 
 /// `06/15/87 00:00 UTC` — the end date `TimePeriod$End` documents for a budget created
 /// without one ("If you didn't specify an end date, Amazon Web Services set your end
@@ -557,7 +559,9 @@ async fn a_read_reports_the_cost_types_and_health_status_the_service_stamped() {
             let account_id = caller_account();
             let mut budget = json!({
                 "BudgetName": format!("cost-types-{budget_type}"),
-                "BudgetLimit": {"Amount": "5", "Unit": "USD"},
+                // The amount a budget of this type may carry ([`limit_amount_for`]):
+                // this table is about cost types and health status, not the limit.
+                "BudgetLimit": {"Amount": limit_amount_for(budget_type, "5"), "Unit": "USD"},
                 "TimeUnit": "MONTHLY",
                 "BudgetType": budget_type
             });
@@ -660,7 +664,9 @@ async fn last_updated_time_is_the_stored_write_time_not_the_time_of_the_read() {
         let name = format!("stamped-{time_unit}");
         let budget = json!({
             "BudgetName": &name,
-            "BudgetLimit": {"Amount": "1", "Unit": "USD"},
+            // The amount a budget of this type may carry ([`limit_amount_for`]): this
+            // table is about the stored write time, not about the limit.
+            "BudgetLimit": {"Amount": limit_amount_for(budget_type, "1"), "Unit": "USD"},
             "TimeUnit": time_unit,
             "BudgetType": budget_type
         });

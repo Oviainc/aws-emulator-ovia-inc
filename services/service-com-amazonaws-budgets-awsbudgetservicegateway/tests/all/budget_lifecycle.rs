@@ -121,6 +121,27 @@ pub(crate) fn caller_account() -> String {
     engine::emulator_account_id().to_string()
 }
 
+/// The `Spend$Amount` a budget of `budget_type` may be given a `BudgetLimit` of, for a
+/// table that spans the whole `BudgetType` catalog and is not about the limit itself:
+/// `wanted` for a type that takes any amount, and the single documented value for the
+/// four utilization or coverage types — "RI and Savings Plans utilization or coverage
+/// budgets default to `100`. This is the only valid value for RI or Savings Plans
+/// utilization or coverage budgets" (`Budget$BudgetLimit`).
+///
+/// The budget types and the value are written out here from that sentence rather than
+/// read out of the service's own constants, so a suite that uses this helper still states
+/// its own expectation. The rule itself is asserted by
+/// `tests/all/percentage_budget_limit_amount.rs`.
+///
+/// `pub(crate)` so every suite in this test target shares the one helper.
+pub(crate) fn limit_amount_for<'a>(budget_type: &str, wanted: &'a str) -> &'a str {
+    match budget_type {
+        "RI_UTILIZATION" | "RI_COVERAGE" | "SAVINGS_PLANS_UTILIZATION"
+        | "SAVINGS_PLANS_COVERAGE" => "100",
+        _ => wanted,
+    }
+}
+
 /// The instant `YYYY-MM-DDThh:mm:ssZ` names, in epoch seconds — so a suite writes a
 /// budget timestamp as the date it is rather than as an epoch literal, and the calendar
 /// is the runtime's own.
@@ -281,7 +302,9 @@ fn lifecycle_rows() -> Vec<Row> {
             }]),
             updated: json!({
                 "BudgetName": "sp-coverage",
-                "BudgetLimit": {"Amount": "90", "Unit": "PERCENT"},
+                // A coverage budget's limit has one valid amount, so this update varies
+                // its UNIT, which `Budget$BudgetLimit` leaves unconstrained.
+                "BudgetLimit": {"Amount": "100", "Unit": "PERCENTAGE"},
                 "TimeUnit": "ANNUALLY",
                 "BudgetType": "SAVINGS_PLANS_COVERAGE",
                 "FilterExpression": {"Not": {"Tags": {"Key": "team", "Values": ["platform"]}}},
@@ -581,7 +604,9 @@ async fn every_modelled_time_unit_and_budget_type_round_trips() {
             let name = format!("b-{index}-{budget_type}");
             let budget = json!({
                 "BudgetName": &name,
-                "BudgetLimit": {"Amount": "1", "Unit": "USD"},
+                // The amount a budget of this type may carry ([`limit_amount_for`]):
+                // this table is about the type and the time unit, not about the limit.
+                "BudgetLimit": {"Amount": limit_amount_for(budget_type, "1"), "Unit": "USD"},
                 "TimeUnit": time_unit,
                 "BudgetType": budget_type
             });
