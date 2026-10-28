@@ -12,13 +12,17 @@
 //! what an earlier one wrote; the resulting set is what an independent `GetAsset` of the
 //! same identifier reports; an identifier that resolves to no asset is refused with the
 //! modelled `EntityNotFoundException`, worded the one way this service's asset surface
-//! words that miss; and the association is to the term ID, so the glossary term namespace
-//! is not cross-locked with it.
+//! words that miss; EVERY term id the request names is resolved against the glossary term
+//! namespace before anything is merged, so an id the catalog holds no live term under
+//! refuses the whole association with the modelled `InvalidInputException` and associates
+//! nothing; and a DELETE of a term rewrites no asset record, so an asset keeps an id an
+//! earlier association had already written.
 //!
 //! The suites are tables whose rows differ along what the rule generalises over: the number
 //! of term ids one request names, whether they are already held, the form and length of the
 //! asset identifier, how many associations are stacked onto one asset, how an identifier
-//! misses, and how many associations are in flight against one asset at once.
+//! misses, how a term id fails to resolve and where in the request's list it sits, and how
+//! many associations are in flight against one asset at once.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -556,7 +560,256 @@ async fn an_association_naming_an_item_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// The glossary term namespace is not cross-locked with the association
+// Every term id the request names is resolved before anything is merged
+// ---------------------------------------------------------------------------
+
+/// Associate `terms` with `asset` and return the refusal body, asserting the modelled 400
+/// `InvalidInputException` and that the asset's term set is exactly `unchanged` afterwards.
+async fn refused_association(
+    router: &MultiServiceRouter,
+    case: &str,
+    asset: &str,
+    terms: &[String],
+    unchanged: &[String],
+) -> Value {
+    let (status, body) = call(
+        router,
+        "AssociateGlossaryTerms",
+        &json!({ "AssetIdentifier": asset, "GlossaryTermIdentifiers": terms }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case}: associating {terms:?} must answer 400, got {status} with {body}"
+    );
+    assert!(
+        error_code(&body).contains("InvalidInputException"),
+        "case {case}: expected InvalidInputException, got {body}"
+    );
+    let held = read_terms(router, asset).await;
+    assert_eq!(
+        held, unchanged,
+        "case {case}: a refused association must change nothing; expected {unchanged:?}, got \
+         {held:?}"
+    );
+    body
+}
+
+/// The `Message` an association refuses an unresolvable term id with, pinned exactly: this
+/// surface's refusal text is itself a JSON document carrying the sentence under a `Message`
+/// key, and the id that resolved to nothing is its one variable part, taken verbatim from
+/// the request.
+fn expected_term_miss_message(identifier: &str) -> String {
+    format!(r#"{{"Message":"Glossary term not found: {identifier}"}}"#)
+}
+
+/// A term id the catalog holds no live term under is refused with HTTP 400
+/// `InvalidInputException`, worded the one way this surface words that miss, and nothing is
+/// associated.
+///
+/// The rows differ along HOW the id fails to resolve: never minted at all, minted and then
+/// deleted, the id of a resource of another kind in this same service (a glossary, a form
+/// type, an asset type, an asset), and a live term's id perturbed (recased, truncated,
+/// extended). `GlossaryTermId` carries no length or pattern constraint of its own
+/// (`smithy_query shape=GlossaryTermIdList`), so each of these is a well-formed request that
+/// only state can refuse.
+#[tokio::test]
+async fn associating_a_term_the_catalog_does_not_hold_is_refused() {
+    let router = emulator();
+    let form = form_type(&router, "ResolveForm").await;
+    let asset_type_id = asset_type(&router, "ResolveAssetType", &form).await;
+    put_asset(&router, "resolve-asset", &asset_type_id).await;
+    let glossary_id = glossary(&router, "ResolveGlossary").await;
+
+    let live = glossary_term(&router, &glossary_id, "Live").await;
+    let deleted = glossary_term(&router, &glossary_id, "Doomed").await;
+    ok(
+        &router,
+        "DeleteGlossaryTerm",
+        &json!({ "Identifier": &deleted }),
+    )
+    .await;
+
+    // (case, the id that must not resolve)
+    let rows: Vec<(&str, String)> = vec![
+        ("never minted", "no-such-glossary-term".to_string()),
+        ("minted and then deleted", deleted.clone()),
+        ("the id of a glossary", glossary_id.clone()),
+        ("the id of a form type", form.clone()),
+        ("the id of an asset type", asset_type_id.clone()),
+        ("the id of an asset", "resolve-asset".to_string()),
+        ("a live term's id recased", live.to_uppercase()),
+        ("a live term's id truncated", live[..live.len() - 1].to_string()),
+        ("a live term's id extended", format!("{live}0")),
+    ];
+
+    for (case, identifier) in &rows {
+        let body = refused_association(
+            &router,
+            case,
+            "resolve-asset",
+            std::slice::from_ref(identifier),
+            &[],
+        )
+        .await;
+        let expected = expected_term_miss_message(identifier);
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case}: expected Message {expected:?}, got {body}"
+        );
+    }
+
+    // The live term still associates, so the refusals above are misses in the term
+    // namespace and not a broken association.
+    let body = associate(
+        &router,
+        "the live term",
+        "resolve-asset",
+        std::slice::from_ref(&live),
+    )
+    .await;
+    assert_eq!(
+        reported_terms("the live term", &body),
+        vec![live.clone()],
+        "case the live term: the association must be served, got {body}"
+    );
+
+    // ...and the asset STILL carries the id of a term deleted after being associated: the
+    // resolution governs what a new association may name, not what an old one wrote.
+    let kept = glossary_term(&router, &glossary_id, "Kept").await;
+    associate(
+        &router,
+        "a term associated and then deleted",
+        "resolve-asset",
+        std::slice::from_ref(&kept),
+    )
+    .await;
+    ok(&router, "DeleteGlossaryTerm", &json!({ "Identifier": &kept })).await;
+    let held = read_terms(&router, "resolve-asset").await;
+    assert!(
+        held.contains(&kept),
+        "case a term associated and then deleted: the asset must keep the id it was given, \
+         got {held:?}"
+    );
+    // Re-associating that same id is refused all the same, which is the whole point: the
+    // association is the authoritative check that the term is still live.
+    let body = refused_association(
+        &router,
+        "re-associating a deleted term",
+        "resolve-asset",
+        std::slice::from_ref(&kept),
+        &held,
+    )
+    .await;
+    let expected = expected_term_miss_message(&kept);
+    assert_eq!(
+        error_message(&body),
+        expected,
+        "case re-associating a deleted term: expected Message {expected:?}, got {body}"
+    );
+}
+
+/// One unresolvable id refuses the WHOLE request, however many held ids it is sent beside
+/// and wherever in the list it sits, and the refusal names the FIRST id that resolved to
+/// nothing in request order. Nothing the request named is merged.
+///
+/// The rows differ along the length of the identifier list (one, two, and the modelled
+/// maximum of ten), where the unresolvable ids sit in it, and how many of them there are.
+#[tokio::test]
+async fn one_unresolvable_id_refuses_the_whole_association() {
+    let router = emulator();
+    let fixture = catalog(&router, "partial-asset").await;
+
+    let mut live: Vec<String> = Vec::new();
+    for index in 0..MAX_ASSET_GLOSSARY_TERMS {
+        live.push(glossary_term(&router, &fixture.glossary, &format!("Live{index}")).await);
+    }
+    let absent: Vec<String> = (0..3)
+        .map(|index| format!("absent-term-{index}"))
+        .collect();
+
+    // The asset starts out carrying one term, so a refused association is seen to leave the
+    // set it found rather than merely to leave it empty.
+    let anchor = glossary_term(&router, &fixture.glossary, "Anchor").await;
+    associate(
+        &router,
+        "the anchor",
+        &fixture.asset,
+        std::slice::from_ref(&anchor),
+    )
+    .await;
+    let unchanged = vec![anchor.clone()];
+
+    // (case, the ids the request names, the id the refusal must name)
+    let rows: Vec<(&str, Vec<String>, String)> = vec![
+        (
+            "the only id",
+            vec![absent[0].clone()],
+            absent[0].clone(),
+        ),
+        (
+            "first of two, the second held",
+            vec![absent[0].clone(), live[0].clone()],
+            absent[0].clone(),
+        ),
+        (
+            "last of two, the first held",
+            vec![live[0].clone(), absent[1].clone()],
+            absent[1].clone(),
+        ),
+        (
+            "in the middle of the modelled maximum",
+            {
+                let mut ids = live.clone();
+                ids[MAX_ASSET_GLOSSARY_TERMS / 2] = absent[2].clone();
+                ids
+            },
+            absent[2].clone(),
+        ),
+        (
+            "three unresolvable ids: the first in request order is named",
+            vec![
+                live[1].clone(),
+                absent[2].clone(),
+                absent[0].clone(),
+                absent[1].clone(),
+            ],
+            absent[2].clone(),
+        ),
+        (
+            "the same unresolvable id twice",
+            vec![absent[1].clone(), absent[1].clone(), live[2].clone()],
+            absent[1].clone(),
+        ),
+    ];
+
+    for (case, requested, named) in &rows {
+        let body =
+            refused_association(&router, case, &fixture.asset, requested, &unchanged).await;
+        let expected = expected_term_miss_message(named);
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case}: expected Message {expected:?}, got {body}"
+        );
+    }
+
+    // Every id of the last row's request resolves once the absent ones are dropped, so the
+    // refusals above were about the unresolvable ids alone.
+    let served: Vec<String> = live[..3].to_vec();
+    let body = associate(&router, "only held ids", &fixture.asset, &served).await;
+    let mut expected = unchanged.clone();
+    expected.extend(served.iter().cloned());
+    assert_eq!(
+        reported_terms("only held ids", &body),
+        expected,
+        "case only held ids: the association must be served, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A delete rewrites no asset record
 // ---------------------------------------------------------------------------
 
 /// An association and the DELETE of a term it named are independent: both are served, the

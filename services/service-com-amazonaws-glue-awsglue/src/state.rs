@@ -2383,11 +2383,32 @@ impl ComAmazonawsGlueAwsglueState {
     /// The one place a term leaves the namespace, resolving the identifier the way
     /// [`Self::glossary_term`] does — the `GlossaryTermId` is the whole address — so the
     /// delete and the reads cannot disagree about which record an identifier names. Only
-    /// the term record is removed: an asset an association put this id on keeps it
-    /// ([`AssetEntry::glossary_terms`]), because the association is to the id and the two
-    /// surfaces are not cross-locked.
+    /// the term record is removed: an asset an association ALREADY put this id on keeps it
+    /// ([`AssetEntry::glossary_terms`]), because the delete rewrites no other namespace's
+    /// records. A NEW association naming the removed id is a different question and is
+    /// refused, because an association resolves the ids it names against this namespace
+    /// first ([`Self::first_unheld_glossary_term`]).
     pub fn remove_glossary_term(&mut self, id: &str) -> Option<GlossaryTermEntry> {
         self.glossary_terms.remove(id)
+    }
+
+    /// The first of `identifiers` this store holds no glossary term under, in the order the
+    /// request named them, and `None` when every one of them resolves to a live term.
+    ///
+    /// This is how an operation that writes a REFERENCE to a glossary term resolves the
+    /// references it was given before it writes any of them: each id is resolved the one way
+    /// every operation addressing a term resolves one ([`Self::glossary_term`]), so a term
+    /// that was never created and a term that has since been deleted are the same miss here.
+    /// The FIRST miss is reported, in request order, so a refusal that names one id names
+    /// the same id however many of the request's ids miss.
+    pub fn first_unheld_glossary_term<'ids>(
+        &self,
+        identifiers: &'ids [String],
+    ) -> Option<&'ids str> {
+        identifiers
+            .iter()
+            .map(String::as_str)
+            .find(|identifier| self.glossary_term(identifier).is_none())
     }
 
     /// The term carrying this `Name` within the glossary `glossary_id` names, or `None`
@@ -6454,7 +6475,17 @@ pub fn workflow_update_names_a_change(input: &UpdateWorkflowInput) -> bool {
 /// ([`ComAmazonawsGlueAwsglueState::form_type_by_reference`]), so two of them cannot
 /// disagree about how the one miss is worded.
 pub fn form_type_not_found_message(identifier: &str) -> String {
-    let sentence = format!("Metadata form type {identifier} not found.");
+    catalog_refusal_document(&format!("Metadata form type {identifier} not found."))
+}
+
+/// `sentence` as the business-catalog surface puts a refusal on the wire: a JSON document
+/// carrying it under a `Message` key.
+///
+/// One copy, shared by every message builder of that surface below, so the DOCUMENT shape
+/// cannot drift between them while each keeps the sentence its own refusal words. Rendered
+/// by `serde_json`, so a sentence carrying a quote or a backslash still yields a
+/// well-formed document.
+fn catalog_refusal_document(sentence: &str) -> String {
     serde_json::json!({ "Message": sentence }).to_string()
 }
 
@@ -6475,8 +6506,7 @@ pub fn form_type_not_found_message(identifier: &str) -> String {
 /// create that puts a term inside one — so two of them cannot disagree about how the one
 /// miss is worded.
 pub fn glossary_not_found_message(identifier: &str) -> String {
-    let sentence = format!("Business glossary {identifier} not found.");
-    serde_json::json!({ "Message": sentence }).to_string()
+    catalog_refusal_document(&format!("Business glossary {identifier} not found."))
 }
 
 /// A stored form type: the schema for structured metadata `PutFormType` registers in the
@@ -6625,8 +6655,7 @@ pub fn asset_type_not_found_message(identifier: &str) -> String {
 /// term association that addresses one — so two of them cannot disagree about how the one
 /// miss is worded.
 pub fn asset_not_found_message(identifier: &str) -> String {
-    let sentence = format!("Asset not found: {identifier}");
-    serde_json::json!({ "Message": sentence }).to_string()
+    catalog_refusal_document(&format!("Asset not found: {identifier}"))
 }
 
 /// The message the catalog's business glossary surface refuses an identifier it holds no
@@ -6643,8 +6672,22 @@ pub fn asset_not_found_message(identifier: &str) -> String {
 /// ([`ComAmazonawsGlueAwsglueState::glossary_term`]), so two of them cannot disagree about
 /// how the one miss is worded.
 pub fn glossary_term_not_found_message(identifier: &str) -> String {
-    let sentence = format!("Business glossary term {identifier} not found.");
-    serde_json::json!({ "Message": sentence }).to_string()
+    catalog_refusal_document(&format!("Business glossary term {identifier} not found."))
+}
+
+/// The message the catalog refuses a request that asks to associate a glossary term this
+/// store holds none of with: the value of that refusal's `InvalidInputException$Message`.
+///
+/// The refusal is the ASSET surface's reading of a reference it cannot resolve, so it is
+/// worded the way that surface words a miss ([`asset_not_found_message`]) rather than the
+/// way the term's own reader words one: the text is a JSON document carrying the sentence
+/// under a `Message` key, and the sentence names the kind of thing that was looked for and
+/// then the identifier that resolved to nothing.
+///
+/// `identifier` is the text's one variable part and is the entry of the request's
+/// identifier list that resolved to nothing, taken verbatim.
+pub fn unassociable_glossary_term_message(identifier: &str) -> String {
+    catalog_refusal_document(&format!("Glossary term not found: {identifier}"))
 }
 
 /// The message the catalog refuses the delete of a form type an ASSET TYPE still
@@ -6667,11 +6710,10 @@ pub fn form_type_dependency_message(form_type_name: &str, asset_type_names: &[St
         .map(|asset_type| format!("gluetype glueAsset#glue_{account_id}#{asset_type}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let sentence = format!(
+    catalog_refusal_document(&format!(
         "Form type {form_type_name} cannot be deleted because of the following \
          dependencies: {dependencies}"
-    );
-    serde_json::json!({ "Message": sentence }).to_string()
+    ))
 }
 
 /// A stored asset: one catalog entity `PutAsset` registers as an instance of an asset

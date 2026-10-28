@@ -10,13 +10,21 @@
 //! holds no asset under is refused with the modelled `EntityNotFoundException` rather than
 //! creating anything.
 //!
-//! Three things this association does NOT do:
+//! Every entry of `GlossaryTermIdentifiers` is RESOLVED against the glossary term
+//! namespace ([`crate::state::ComAmazonawsGlueAwsglueState::first_unheld_glossary_term`])
+//! before the asset is touched, so an id this account holds no live term under — one never
+//! created, or one a `DeleteGlossaryTerm` has since removed — makes the whole call fail
+//! with the modelled `InvalidInputException` and associates nothing. Resolving happens
+//! BEFORE the merge, so a request naming one unresolvable id among several leaves the
+//! asset's term set exactly as it was.
 //!
-//! * It does not resolve the term ids against the glossary term namespace. The
-//!   association is to the ID: the behaviour recorded for a term deleted after being
-//!   associated is that the term's own reader misses while the asset still names the id,
-//!   so the two surfaces are not cross-locked and the association stores what the request
-//!   sent.
+//! That resolution is about what a NEW association may name, not about the ids an asset
+//! already carries: deleting a term rewrites no asset record, so an asset keeps an id its
+//! earlier association wrote and `GetAsset` goes on reporting it while the term's own
+//! reader misses.
+//!
+//! Two things this association does NOT do:
+//!
 //! * It does not replace the asset's set. A term the asset already carries keeps its
 //!   place, which is why the same association sent twice — a retry under one
 //!   `ClientToken`, say — leaves exactly one entry and reports the same set: the merge is
@@ -234,6 +242,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+
+        // The terms the request names are REFERENCES into another namespace, and an
+        // association may not write a reference that resolves to nothing: every id is
+        // resolved against the glossary term store first, so an id this account holds no
+        // live term under — never created, or deleted since an earlier association named it
+        // — refuses the whole call with the modelled `InvalidInputException` before anything
+        // is merged. The refusal names the FIRST id that resolved to nothing, in the order
+        // the request listed them. No recording pins whether this resolution or the asset's
+        // own comes first, so it is done here, where nothing has been mutated yet.
+        if let Some(unheld) = store.first_unheld_glossary_term(&input.glossary_term_identifiers) {
+            return Err(AssociateGlossaryTermsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::unassociable_glossary_term_message(unheld)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         // The asset the association targets has to be one this account holds, and it is
         // resolved ONCE, mutably, under the lock the merge happens under — so the record
