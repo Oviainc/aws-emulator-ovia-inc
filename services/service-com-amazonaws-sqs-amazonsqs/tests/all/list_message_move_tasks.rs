@@ -8,9 +8,11 @@
 //! recorded under the source queue the request names and no other queue's, most recent
 //! first, at most `MaxResults` of them (default 1, upper limit 10), each entry's handle,
 //! queues, status and `ApproximateNumberOfMessages*` counts read off the task record and
-//! the clock — and reporting them changes nothing a later caller sees. A `SourceArn` that
-//! names no queue of this account, and a `MaxResults` outside the documented range, are
-//! refused.
+//! the clock — each member populated only in the condition the model documents it for, so
+//! the handle appears exactly while the task is `RUNNING` and `DestinationArn` only for a
+//! task whose start named one. Reporting them changes nothing a later caller sees. A
+//! `SourceArn` that names no queue of this account, and a `MaxResults` outside the
+//! documented range, are refused.
 //!
 //! Each table spans the class the rule generalises over rather than one example: the
 //! listing rows walk the recorded task count (none, one, several) crossed with the
@@ -128,6 +130,29 @@ fn now_millis() -> i64 {
     .expect("an instant that counts in an i64")
 }
 
+/// Assert the rule the handle member carries: "When this field is returned in the response
+/// of the `ListMessageMoveTasks` action, it is only populated for tasks that are in RUNNING
+/// status" (`ListMessageMoveTasksResultEntry$TaskHandle`) — so an entry reports the handle
+/// its start answered with exactly while it is running, and nothing once it has left that
+/// status.
+fn assert_reported_handle(case: &str, entry: &Value, started_handle: &str) {
+    let reported = entry.get("TaskHandle").and_then(Value::as_str);
+    let status = text(entry, "Status");
+    if status == "RUNNING" {
+        assert_eq!(
+            reported,
+            Some(started_handle),
+            "case {case}: expected a RUNNING task to report the handle its start answered \
+             with, got {entry}"
+        );
+    } else {
+        assert!(
+            reported.is_none(),
+            "case {case}: expected a task in {status} to report no handle, got {entry}"
+        );
+    }
+}
+
 /// A listing reports the tasks recorded under the named source queue, most recent first,
 /// bounded by `MaxResults` (default 1, upper limit 10), with each entry's queues and
 /// handle read off the task record.
@@ -156,24 +181,23 @@ async fn a_listing_reports_the_most_recent_tasks_of_its_source_queue_newest_firs
         let router = emulator();
         let prefix = format!("listing-{index}");
         let (_, dead_letter_arn, _) = dead_letter_queue(&router, &prefix).await;
-        // The one queue that drives its messages to the dead-letter queue is where a task
-        // that names no destination sends them back to.
-        let destination_arn = expected_arn(&format!("{prefix}-source"));
 
-        let before = now_millis();
-        let mut handles: Vec<String> = Vec::with_capacity(*started);
+        // Each task is identified by the window of epoch milliseconds its start call fell
+        // in rather than by the handle it answered with: a handle is reported only while
+        // the task is RUNNING, and a start waits out the task before it, so the older
+        // tasks of a row have left that status by the time the listing is read.
+        let mut starts: Vec<(i64, i64, String)> = Vec::with_capacity(*started);
         for task in 0..*started {
-            handles.push(
-                start_task(
-                    &router,
-                    &format!("{case}: task {task}"),
-                    &dead_letter_arn,
-                    None,
-                )
-                .await,
-            );
+            let before = now_millis();
+            let handle = start_task(
+                &router,
+                &format!("{case}: task {task}"),
+                &dead_letter_arn,
+                None,
+            )
+            .await;
+            starts.push((before, now_millis(), handle));
         }
-        let after = now_millis();
 
         let listed = list(&router, &dead_letter_arn, *max_results).await;
         assert_eq!(
@@ -183,29 +207,33 @@ async fn a_listing_reports_the_most_recent_tasks_of_its_source_queue_newest_firs
         );
 
         // "Gets the MOST RECENT message movement tasks (up to 10)": the newest task is the
-        // first entry, so the reported handles are the last `expected` started, reversed.
-        let expected_handles: Vec<String> =
-            handles.iter().rev().take(*expected).cloned().collect();
-        assert_eq!(
-            listed
-                .iter()
-                .map(|entry| text(entry, "TaskHandle"))
-                .collect::<Vec<String>>(),
-            expected_handles,
-            "case {case}: expected the most recent handles newest first, got {listed:?}"
-        );
-
-        let mut previous_timestamp = i64::MAX;
-        for entry in &listed {
+        // first entry, so the entries are the last `expected` started, newest first.
+        for (position, entry) in listed.iter().enumerate() {
+            let (before, after, handle) = &starts[started - 1 - position];
+            let started_timestamp = number(entry, "StartedTimestamp");
+            assert!(
+                (*before..=*after).contains(&started_timestamp),
+                "case {case}: expected entry {position} to be the task started in \
+                 {before}..={after}, got {entry}"
+            );
             assert_eq!(
-                (text(entry, "SourceArn"), text(entry, "DestinationArn")),
-                (dead_letter_arn.clone(), destination_arn.clone()),
-                "case {case}: expected the queues the task resolved, got {entry}"
+                text(entry, "SourceArn"),
+                dead_letter_arn,
+                "case {case}: expected the source queue the task resolved, got {entry}"
+            );
+            // "The ARN of the destination queue IF IT HAS BEEN SPECIFIED in the
+            // StartMessageMoveTask request. If a DestinationArn has not been specified ...
+            // this field value will be NULL"
+            // (ListMessageMoveTasksResultEntry$DestinationArn): these starts named none.
+            assert!(
+                entry.get("DestinationArn").is_none(),
+                "case {case}: a start that named no destination reports none, got {entry}"
             );
             assert!(
                 REACHABLE_STATUSES.contains(&text(entry, "Status").as_str()),
                 "case {case}: expected one of {REACHABLE_STATUSES:?}, got {entry}"
             );
+            assert_reported_handle(case, entry, handle);
             // A task that took no message has nothing left to move and has moved nothing,
             // whatever the clock has done since.
             assert_eq!(
@@ -224,16 +252,6 @@ async fn a_listing_reports_the_most_recent_tasks_of_its_source_queue_newest_firs
                 entry.get("FailureReason").is_none(),
                 "case {case}: a task that has not failed reports no reason, got {entry}"
             );
-            let started_timestamp = number(entry, "StartedTimestamp");
-            assert!(
-                (before..=after).contains(&started_timestamp),
-                "case {case}: expected a StartedTimestamp in {before}..={after}, got {entry}"
-            );
-            assert!(
-                started_timestamp <= previous_timestamp,
-                "case {case}: expected the entries newest first, got {listed:?}"
-            );
-            previous_timestamp = started_timestamp;
         }
     }
 }
@@ -346,14 +364,13 @@ async fn a_listing_naming_no_queue_or_asking_outside_the_result_range_is_refused
                 status, 200,
                 "case {case}: expected HTTP 200, got {status} with {parsed}"
             );
+            let listed = results(&parsed);
             assert_eq!(
-                results(&parsed)
-                    .iter()
-                    .map(|entry| text(entry, "TaskHandle"))
-                    .collect::<Vec<String>>(),
-                vec![handle.clone()],
+                listed.len(),
+                1,
                 "case {case}: expected the recorded task, got {parsed}"
             );
+            assert_reported_handle(case, &listed[0], &handle);
             continue;
         }
         assert_eq!(
@@ -395,11 +412,7 @@ async fn a_tasks_reported_progress_follows_the_record_and_the_clock() {
             .first()
             .cloned()
             .unwrap_or_else(|| panic!("case the running task: expected one entry, got {listed:?}"));
-        assert_eq!(
-            text(&entry, "TaskHandle"),
-            handle,
-            "case the running task: expected the handle the start returned, got {entry}"
-        );
+        assert_reported_handle("the running task", &entry, &handle);
         assert_eq!(
             entry.get("MaxNumberOfMessagesPerSecond").and_then(Value::as_i64),
             Some(rate),
@@ -470,26 +483,41 @@ async fn a_tasks_reported_progress_follows_the_record_and_the_clock() {
     );
 }
 
+/// One row of the per-source-queue table: the case, the queue listed, and the
+/// `(handle, size started over)` of every task that queue must report.
+type OwnTaskRow<'a> = (&'a str, &'a String, Vec<(String, i64)>);
+
 /// "Under a SPECIFIC source queue": a task is listed under the queue it moves messages
 /// from and under no other, and reading one queue's tasks does not change what the next
 /// read of either queue sees.
 #[tokio::test]
 async fn a_task_is_listed_only_under_the_source_queue_it_moves_from() {
     let router = emulator();
-    let (_, first_arn, _) = dead_letter_queue(&router, "own-tasks-first").await;
-    let (_, second_arn, _) = dead_letter_queue(&router, "own-tasks-second").await;
+    let (first_url, first_arn, _) = dead_letter_queue(&router, "own-tasks-first").await;
+    let (second_url, second_arn, _) = dead_letter_queue(&router, "own-tasks-second").await;
     // A queue that is nobody's dead-letter target can have no task started from it, so it
     // has none to report either.
     let plain_arn = expected_arn("own-tasks-plain");
     create_ok(&router, "own-tasks-plain", &json!({})).await;
 
+    // The two queues hold a different number of messages, so the size each task was
+    // started over tells the two tasks apart for as long as they are recorded — a handle
+    // identifies a task only while it is running.
+    send_all(&router, &first_url, &["the first queue's only message".to_string()]).await;
+    send_all(
+        &router,
+        &second_url,
+        &["second #0".to_string(), "second #1".to_string()],
+    )
+    .await;
+
     let first = start_task(&router, "the first queue's task", &first_arn, None).await;
     let second = start_task(&router, "the second queue's task", &second_arn, None).await;
 
-    // (case, the queue listed, the handles it must report)
-    let rows: &[(&str, &String, Vec<String>)] = &[
-        ("the first dead-letter queue", &first_arn, vec![first.clone()]),
-        ("the second dead-letter queue", &second_arn, vec![second.clone()]),
+    // (case, the queue listed, the (handle, size started over) of every task it reports)
+    let rows: &[OwnTaskRow] = &[
+        ("the first dead-letter queue", &first_arn, vec![(first.clone(), 1)]),
+        ("the second dead-letter queue", &second_arn, vec![(second.clone(), 2)]),
         ("a queue no task was started from", &plain_arn, Vec::new()),
     ];
 
@@ -499,19 +527,24 @@ async fn a_task_is_listed_only_under_the_source_queue_it_moves_from() {
         for (case, source_arn, expected) in rows {
             let listed = list(&router, source_arn, Some(10)).await;
             assert_eq!(
-                listed
-                    .iter()
-                    .map(|entry| text(entry, "TaskHandle"))
-                    .collect::<Vec<String>>(),
-                *expected,
-                "case {case} on pass {pass}: expected {expected:?}, got {listed:?}"
+                listed.len(),
+                expected.len(),
+                "case {case} on pass {pass}: expected {} entries, got {listed:?}",
+                expected.len()
             );
-            for entry in &listed {
+            for (entry, (handle, to_move)) in listed.iter().zip(expected.iter()) {
                 assert_eq!(
                     text(entry, "SourceArn"),
                     **source_arn,
                     "case {case} on pass {pass}: expected the queue listed, got {entry}"
                 );
+                assert_eq!(
+                    number(entry, "ApproximateNumberOfMessagesToMove"),
+                    *to_move,
+                    "case {case} on pass {pass}: expected the task started over {to_move} \
+                     messages, got {entry}"
+                );
+                assert_reported_handle(&format!("{case} on pass {pass}"), entry, handle);
             }
         }
     }
