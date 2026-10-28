@@ -3,7 +3,7 @@
 //! @op ListConnectors
 //! Reports one `ConnectorSummary` per stored connector, filtered by `connectorNamePrefix`,
 //! paged by `maxResults` with an opaque `nextToken`, so paging through the connectors
-//! returns each one exactly once. A token this service did not emit is a
+//! returns each one exactly once. A token this listing did not emit is a
 //! `BadRequestException`.
 //!
 //! ## Shape of an operation
@@ -185,8 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|connector| (connector.arn.clone(), connector))
             .collect();
 
-        let Ok(page) = crate::state::page(keyed, input.max_results, input.next_token.as_deref())
-        else {
+        // The token resumes THIS listing — this operation over this region's
+        // connectors — so one another listing minted is refused rather than
+        // honoured against a key space it says nothing about.
+        let Ok(page) = crate::state::page(
+            keyed,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::regional(Self::NAME, &region),
+        ) else {
             // The rejected member is `nextToken`, and the message says so: a
             // kafkaconnect validation message names the parameter it refused.
             return Err(ListConnectorsErrorModeled::BadRequestException(BadRequestException {

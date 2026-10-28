@@ -5,7 +5,7 @@
 //! the request names, oldest first, paged by `maxResults` with an opaque `nextToken`, so
 //! paging through a connector's operations returns each one exactly once. A well-formed
 //! `connectorArn` this emulator does not hold is a `NotFoundException`; a `connectorArn`
-//! that is not an ARN of this service, and a token this service did not
+//! that is not an ARN of this service, and a token this listing did not
 //! emit, are both a `BadRequestException`.
 //!
 //! ## Shape of an operation
@@ -205,8 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // per operation stored.
         let keyed = state.connector_operations_of(&input.connector_arn);
 
-        let Ok(page) = crate::state::page(keyed, input.max_results, input.next_token.as_deref())
-        else {
+        // The token resumes THIS listing — this operation over the operations of
+        // the connector it names — so one minted by another listing, or by this
+        // one against another connector, is refused rather than honoured against
+        // a key space it says nothing about.
+        let Ok(page) = crate::state::page(
+            keyed,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::Listing::of_resource(Self::NAME, &input.connector_arn),
+        ) else {
             // The rejected member is `nextToken`, and the message says so: a
             // kafkaconnect validation message names the parameter it refused.
             return Err(ListConnectorOperationsErrorModeled::BadRequestException(

@@ -23,8 +23,10 @@ use sha2::Digest;
 #[allow(unused_imports)]
 use crate::ops::types::*;
 
-/// The marker every `nextToken` this service issues carries, so a token it did
-/// not issue is refused rather than honoured as a resume point.
+/// The marker every `nextToken` this service issues carries, ahead of the
+/// discriminator of the listing that issued it ([`Listing::token_prefix`]), so a
+/// token this service did not issue — or one another of its listings issued — is
+/// refused rather than honoured as a resume point.
 const PAGE_TOKEN_MARKER: &str = "kafkaconnect:v1:";
 
 /// The region an ARN carries when the caller signed with no credential scope the
@@ -2240,17 +2242,76 @@ pub struct Page<T> {
     pub next_token: Option<String>,
 }
 
-/// A `nextToken` the service did not emit.
+/// A `nextToken` that is not a resume point for the listing it was handed to:
+/// one the service never emitted, or one another listing emitted.
 #[derive(Debug)]
 pub struct BadPageToken;
 
+/// WHICH listing a `nextToken` resumes.
+///
+/// A token is a resume point for exactly ONE listing — the operation that minted
+/// it, over the key space that call paged. No two of this service's listings
+/// page one key space: each kind of resource is keyed by its own ARN kind, a
+/// connector's operations are keyed by their creation instant, and a listing
+/// only ever covers the resources of the region it is answered through. So a
+/// token carries the listing that minted it and [`page`] refuses one minted
+/// anywhere else, instead of comparing a key from a foreign key space against
+/// its own keys — which silently truncates a page (every key sorting past the
+/// foreign one is dropped) or silently replays one (none of them does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listing<'a> {
+    /// The operation that both mints and accepts the token: its wire name.
+    operation: &'a str,
+    /// The key space that operation paged: what distinguishes two listings of
+    /// the same operation from each other.
+    scope: &'a str,
+}
+
+impl<'a> Listing<'a> {
+    /// A listing of every resource of one kind in ONE region: two regions hold
+    /// independent resources, so each region's listing has its own key space.
+    pub fn regional(operation: &'a str, region: &'a str) -> Self {
+        Self {
+            operation,
+            scope: region,
+        }
+    }
+
+    /// A listing of what is stored against one parent resource, named by its
+    /// ARN — which carries the region too, so it scopes the listing by itself.
+    pub fn of_resource(operation: &'a str, parent_arn: &'a str) -> Self {
+        Self {
+            operation,
+            scope: parent_arn,
+        }
+    }
+
+    /// The prefix a token this listing minted carries, behind the service-wide
+    /// marker: a fixed-width digest of the listing's identity.
+    ///
+    /// A digest rather than the identity itself, so no listing's prefix can be a
+    /// prefix of another's however the scope happens to be punctuated, and so a
+    /// token's length says nothing about the resource it resumes after.
+    fn token_prefix(&self) -> String {
+        let digest = sha2::Sha256::digest(format!("{}\n{}", self.operation, self.scope).as_bytes());
+        format!("{PAGE_TOKEN_MARKER}{}:", hex::encode(&digest[..8]))
+    }
+}
+
 /// Page `keyed` — `(sort key, item)` pairs, one per stored resource — honouring
-/// `max_results` and resuming after `next_token`.
+/// `max_results` and resuming after `next_token`, a token `listing` minted.
 ///
 /// The key is the resource's ARN: unique and stable, so sorting by it gives both
 /// a total order and a resume point that survives a resource being created or
-/// deleted between two pages. The token is opaque (hex of that key), as the
-/// model's `@paginated` contract requires: a client only ever echoes it back.
+/// deleted between two pages. The token is opaque (hex of that key behind
+/// `listing`'s own prefix), as the model's `@paginated` contract requires: a
+/// client only ever echoes it back.
+///
+/// A token that is not a resume point for `listing` — one the service never
+/// emitted, or one a DIFFERENT listing emitted — is [`BadPageToken`], which
+/// every caller answers as the modelled `BadRequestException`. It is never
+/// honoured as a resume point: a key from another listing's key space would
+/// hide, or replay, the resources this listing holds.
 ///
 /// `max_results` is clamped rather than refused because a value outside the
 /// `MaxResults` shape's `range 1..100` never reaches here: the framework refuses
@@ -2261,9 +2322,10 @@ pub fn page<T>(
     mut keyed: Vec<(String, T)>,
     max_results: Option<i32>,
     next_token: Option<&str>,
+    listing: Listing<'_>,
 ) -> Result<Page<T>, BadPageToken> {
     let resume_after = match next_token {
-        Some(token) => Some(decode_page_token(token)?),
+        Some(token) => Some(decode_page_token(token, listing)?),
         None => None,
     };
     let page_size = max_results
@@ -2280,7 +2342,7 @@ pub fn page<T>(
             continue;
         }
         if items.len() == page_size {
-            next = Some(encode_page_token(&key));
+            next = Some(encode_page_token(&key, listing));
             break;
         }
         items.push(item);
@@ -2291,21 +2353,21 @@ pub fn page<T>(
     })
 }
 
-/// The opaque form of a resume key: the key behind a marker only this service
-/// writes, hex-encoded. The marker is what makes a forged token detectable —
-/// without it any hex string would decode to "some" resume key and be honoured
-/// as a silent resume point.
-fn encode_page_token(key: &str) -> String {
-    hex::encode(format!("{PAGE_TOKEN_MARKER}{key}"))
+/// The opaque form of a resume key: the key behind a prefix only `listing`
+/// writes, hex-encoded. The prefix is what makes a token from somewhere else
+/// detectable — without it any hex string would decode to "some" resume key and
+/// be honoured as a silent resume point.
+fn encode_page_token(key: &str, listing: Listing<'_>) -> String {
+    hex::encode(format!("{}{key}", listing.token_prefix()))
 }
 
 /// The resume key inside an opaque token, or [`BadPageToken`] when the token is
-/// not one this service emitted.
-fn decode_page_token(token: &str) -> Result<String, BadPageToken> {
+/// not one `listing` emitted.
+fn decode_page_token(token: &str, listing: Listing<'_>) -> Result<String, BadPageToken> {
     let bytes = hex::decode(token).map_err(|_| BadPageToken)?;
     let decoded = String::from_utf8(bytes).map_err(|_| BadPageToken)?;
     decoded
-        .strip_prefix(PAGE_TOKEN_MARKER)
+        .strip_prefix(&listing.token_prefix())
         .map(ToString::to_string)
         .ok_or(BadPageToken)
 }
