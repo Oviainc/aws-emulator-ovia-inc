@@ -395,8 +395,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_values.as_ref(),
         )
         .check_all_referenced(&[
-            input.filter_expression.as_deref(),
-            input.projection_expression.as_deref(),
+            ("FilterExpression", input.filter_expression.as_deref()),
+            ("ProjectionExpression", input.projection_expression.as_deref()),
         ])
         .map_err(lift)?;
         // Which member names the index is a fact of the request, so what each reported

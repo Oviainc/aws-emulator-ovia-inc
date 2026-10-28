@@ -14,7 +14,7 @@
 //! 2. `GetPrimaryEmailUpdateStatus` reports the status of the MOST RECENT update
 //!    of the resolved account (the one the request names, else the caller's
 //!    own); an account with no update has no status to report and is refused
-//!    with HTTP 404 `ResourceNotFoundException`, never a 501 and never an
+//!    with HTTP 400 `ValidationException`, never a 501 and never an
 //!    invented status.
 //!
 //! Each table spans the class rather than one recorded request: the status read
@@ -156,7 +156,7 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
 }
 
 /// An account with no primary email update ever started has no status to
-/// report: the read is refused with HTTP 404 `ResourceNotFoundException` when
+/// report: the read is refused with HTTP 400 `ValidationException` when
 /// the request names no account, while an account the store does not know — and
 /// the caller's own id, which this member cannot name — are the 403 instead.
 #[tokio::test]
@@ -166,8 +166,8 @@ async fn a_status_read_with_no_update_started_is_refused() {
         (
             "no AccountId at all, so the caller's own account",
             json!({}),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "the caller's own account named explicitly",
@@ -231,7 +231,7 @@ async fn starting_an_update_on_the_callers_own_account_is_denied() {
 
         // Nothing was recorded: the caller's own account still has no update.
         let status = get_primary_email_update_status(&router, json!({})).await;
-        assert_refused(case, &status, 404, "ResourceNotFoundException");
+        assert_refused(case, &status, 400, "ValidationException");
     }
 }
 
@@ -323,8 +323,8 @@ async fn an_update_started_on_a_member_account_round_trips() {
     assert_refused(
         "the caller's own account after member updates",
         &own,
-        404,
-        "ResourceNotFoundException",
+        400,
+        "ValidationException",
     );
 }
 

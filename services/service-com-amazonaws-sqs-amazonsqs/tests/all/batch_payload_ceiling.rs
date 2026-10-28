@@ -10,12 +10,14 @@
 //! modelled `BatchRequestTooLong` — HTTP 400, naming the limit and the number of bytes the
 //! request sent — whatever shape it has, and nothing it carried is enqueued. A client
 //! catching that error therefore matches, which a bare transport status carrying no error
-//! document never lets it do.
+//! document never lets it do. A request so far past the limit that it no longer fits the
+//! body this service reads at all is the transport's to refuse, which
+//! `request_size_transport_bound.rs` pins from the other side.
 //!
 //! The table spans what the rule generalises over: how the over-limit payload is divided
-//! (two large entries, four, ten small ones, and ten maximum-size ones — the largest batch
-//! a client can spell), and the boundary itself, where a batch filling the ceiling exactly
-//! is accepted and one byte more is refused.
+//! (two large entries, four, ten small ones, and one maximum-size message beside a small
+//! one), and the boundary itself, where a batch filling the ceiling exactly is accepted and
+//! one byte more is refused.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
@@ -74,26 +76,34 @@ fn message_of(body: &Value) -> String {
 /// however the payload is divided.
 #[tokio::test]
 async fn an_over_limit_aggregate_is_refused_as_a_modeled_batch_error() {
-    // (case, how many entries, how many bytes each) — each entry is well inside the
-    // queue's own `MaximumMessageSize`, which is the ceiling for ONE message, so what
-    // every row breaks is the AGGREGATE.
-    let rows: Vec<(String, usize, usize)> = vec![
-        ("two entries of half the ceiling each".to_string(), 2, ceiling() / 2 + 1),
-        ("four entries of a third each".to_string(), 4, ceiling() / 3 + 1),
+    // (case, the entries, the message bytes they add up to) — each entry is well inside
+    // the queue's own `MaximumMessageSize`, which is the ceiling for ONE message, so what
+    // every row breaks is the AGGREGATE. Every row stays inside the body this service
+    // reads, so the answer is the operation's and not the transport's.
+    let rows: Vec<(String, Value, usize)> = vec![
         (
-            format!("{MAX_BATCH_ENTRIES} entries one tenth of the ceiling each"),
-            MAX_BATCH_ENTRIES,
-            ceiling() / MAX_BATCH_ENTRIES + 1,
+            "two entries of half the ceiling each".to_string(),
+            entries(2, ceiling() / 2 + 1),
+            2 * (ceiling() / 2 + 1),
         ),
         (
-            format!("{MAX_BATCH_ENTRIES} maximum-size entries, the largest batch there is"),
-            MAX_BATCH_ENTRIES,
-            ceiling(),
+            "four entries of a quarter each".to_string(),
+            entries(4, ceiling() / 4 + 1),
+            4 * (ceiling() / 4 + 1),
+        ),
+        (
+            format!("{MAX_BATCH_ENTRIES} entries one tenth of the ceiling each"),
+            entries(MAX_BATCH_ENTRIES, ceiling() / MAX_BATCH_ENTRIES + 1),
+            MAX_BATCH_ENTRIES * (ceiling() / MAX_BATCH_ENTRIES + 1),
+        ),
+        (
+            "one maximum-size message beside a small one".to_string(),
+            two_entries(ceiling(), 1_024),
+            ceiling() + 1_024,
         ),
     ];
 
-    for (case, count, bytes) in rows {
-        let total = count * bytes;
+    for (case, batch, total) in rows {
         assert!(
             total > ceiling(),
             "case {case}: the row must be over the ceiling, got {total} bytes"
@@ -103,7 +113,7 @@ async fn an_over_limit_aggregate_is_refused_as_a_modeled_batch_error() {
         let (status, body) = call(
             &router,
             "SendMessageBatch",
-            &json!({ "QueueUrl": url, "Entries": entries(count, bytes) }),
+            &json!({ "QueueUrl": url, "Entries": batch }),
         )
         .await;
         assert_eq!(
@@ -185,12 +195,12 @@ async fn a_batch_at_the_ceiling_is_accepted_and_one_byte_more_is_not() {
 async fn the_refusal_carries_the_services_own_error_document() {
     let router = emulator();
     let url = create_ok(&router, "aggregate-envelope", &json!({})).await;
-    // Well past the ceiling and still a batch the service judges: four entries, each
-    // inside the per-message bound.
+    // Past the ceiling and still a batch the service judges: four entries, each inside the
+    // per-message bound, adding up to just over the limit.
     let (status, body) = call(
         &router,
         "SendMessageBatch",
-        &json!({ "QueueUrl": url, "Entries": entries(4, ceiling() / 3 + 1) }),
+        &json!({ "QueueUrl": url, "Entries": entries(4, ceiling() / 4 + 1) }),
     )
     .await;
     assert_eq!(

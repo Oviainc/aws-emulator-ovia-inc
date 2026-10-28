@@ -222,7 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ExpressionAttributeNames` entry no projection references makes the whole
         // request invalid.
         crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None)
-            .check_all_referenced(&[input.projection_expression.as_deref()])
+            .check_all_referenced(&[(
+                "ProjectionExpression",
+                input.projection_expression.as_deref(),
+            )])
             .map_err(lift)?;
         if let Some(expression) = input.projection_expression.as_deref() {
             // The member is VALIDATED whether or not projecting is served: whether the
