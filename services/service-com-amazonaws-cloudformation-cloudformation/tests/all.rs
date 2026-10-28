@@ -45,6 +45,8 @@ mod delete_canceled_export_in_use;
 mod delete_stack_export_in_use;
 #[path = "all/delete_stack_instances.rs"]
 mod delete_stack_instances;
+#[path = "all/denied_replacement_identity.rs"]
+mod denied_replacement_identity;
 #[path = "all/detect_resource_drift.rs"]
 mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]
@@ -173,6 +175,8 @@ mod sam_deployed_resources;
 mod sam_transform;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/section_loop_expansion.rs"]
+mod section_loop_expansion;
 #[path = "all/stack_delete_failure_reason.rs"]
 mod stack_delete_failure_reason;
 #[path = "all/stack_event_timeline.rs"]
