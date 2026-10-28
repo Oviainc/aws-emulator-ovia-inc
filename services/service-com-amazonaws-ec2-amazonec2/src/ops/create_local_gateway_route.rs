@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLocalGatewayRoute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLocalGatewayRoute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes one static route into the local gateway route table the request
+//! names, pointed at the one target the request names, and answers that route as the store
+//! now holds it. A route has no id of its own — it is named by the DESTINATION it matches
+//! inside one route table — so the destination is what the route is keyed by, and a table
+//! that already holds a route for it has nothing to create. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLocalGatewayRoute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The refusals, in the order the service answers them: a request that carries no route
+//! table id is `MissingParameter`, something that is not a `LocalGatewayRoutetableId` at
+//! all is `InvalidLocalGatewayRouteTableID.Malformed`, a destination that names neither
+//! member, both of them, or a value of the wrong form is `MissingParameter` /
+//! `InvalidParameterCombination` / `InvalidParameterValue`, and a target that names neither
+//! or both of the two the operation documents ("You must specify one of the following
+//! targets: LocalGatewayVirtualInterfaceGroupId NetworkInterfaceId") is refused the same
+//! two ways — all of that being the request's own FORM, read before anything is resolved;
+//! a `DryRun` request a caller holds the permissions for is then `DryRunOperation` and
+//! writes nothing, because the flag asks whether the CALLER MAY make the request ("without
+//! actually making the request", `DryRun`) rather than anything about the named resources;
+//! then a well-formed route table id this account holds no table for is
+//! `InvalidLocalGatewayRouteTableID.NotFound`, a target id the account holds no virtual
+//! interface group or network interface for is that resource's own `.NotFound`, and a
+//! destination the table already holds a route for is `RouteAlreadyExists`.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +88,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +157,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLocalGatewayRoute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLocalGatewayRouteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLocalGatewayRoute"))
+        // `ctx` carries request metadata only; this operation reads none of it — every fact
+        // the stored route reports comes from the request or from the route table it is
+        // written into, whose own ARN names the Region it belongs to. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved. "The ID of the local
+        // gateway route table" is `@required` but modelled `clientOptional`, so a request
+        // that left it out reaches this handler as an empty string rather than being refused
+        // by the boundary validator: a parameter the request did not carry is EC2's
+        // `MissingParameter`.
+        let route_table_id = input.local_gateway_route_table_id.as_str();
+        if route_table_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter localGatewayRouteTableId",
+            ));
+        }
+        // Something that is not a `LocalGatewayRoutetableId` at all is refused through the
+        // crate's one form check for that id — the same one the resolver below makes before
+        // it looks the id up — so this operation's earlier reading of the FORM cannot drift
+        // from the resolver's.
+        state::require_well_formed_local_gateway_route_table_id(route_table_id)?;
+        // "Creates a static route for the specified local gateway route table": the route is
+        // named by the destination it matches, read by the crate's one reader of that pair of
+        // members, so this operation refuses a destination exactly as the modify and delete
+        // of a route do.
+        let destination = state::require_local_gateway_route_destination(
+            input.destination_cidr_block.as_deref(),
+            input.destination_prefix_list_id.as_deref(),
+        )?;
+        // "You must specify one of the following targets: LocalGatewayVirtualInterfaceGroupId
+        // NetworkInterfaceId" (`CreateLocalGatewayRoute`): exactly one, so a request that
+        // names both is refused for the combination and one that names neither for the
+        // parameter it is missing — the two refusals a destination that names neither member
+        // or both gets, for the same reason.
+        let target = match (
+            input.local_gateway_virtual_interface_group_id.as_deref(),
+            input.network_interface_id.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(state::invalid_parameter_combination(
+                    "You cannot use localGatewayVirtualInterfaceGroupId and \
+                     networkInterfaceId in the same request",
+                ));
+            }
+            (None, None) => {
+                return Err(state::missing_parameter(
+                    "The request must contain the parameter \
+                     localGatewayVirtualInterfaceGroupId or networkInterfaceId",
+                ));
+            }
+            (Some(group_id), None) => Target::VirtualInterfaceGroup(group_id),
+            (None, Some(interface_id)) => Target::NetworkInterface(interface_id),
+        };
+        // A target id that is not an id of its resource at all is `.Malformed` BEFORE
+        // anything is looked up, the order this service answers the route table's own two
+        // refusals in: there is nothing to resolve.
+        match target {
+            Target::VirtualInterfaceGroup(group_id) => {
+                if !state::local_gateway_virtual_interface_group_id_is_well_formed(group_id) {
+                    return Err(
+                        state::invalid_local_gateway_virtual_interface_group_id_malformed(
+                            group_id,
+                        ),
+                    );
+                }
+            }
+            Target::NetworkInterface(interface_id) => {
+                if !state::network_interface_id_is_well_formed(interface_id) {
+                    return Err(state::invalid_network_interface_id_malformed(interface_id));
+                }
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request" (`DryRun`): a question about the CALLER, answered once the
+        // request's own form has been read and before anything is resolved or written; every
+        // caller of this emulator is permitted.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this write reads it.
+        store.materialize_due_transitions();
+
+        // The route TABLE before the target: the route goes IN that table, so an id this
+        // account holds no table for leaves nothing to create a route in whatever the target
+        // turns out to be, and a client can tell "no such route table" from "no such
+        // target".
+        state::require_known_local_gateway_route_table(&store, route_table_id)?;
+        // The target next: the route sends traffic to it, so an id the account holds no such
+        // resource for is refused with that resource's own `.NotFound` rather than stored as
+        // a route pointing at nothing. The virtual interface group is resolved through the
+        // crate's one reader of that id; a network interface through the store the account's
+        // interfaces live in.
+        match target {
+            Target::VirtualInterfaceGroup(group_id) => {
+                state::require_known_local_gateway_virtual_interface_group(&store, group_id)?;
+            }
+            Target::NetworkInterface(interface_id) => {
+                if !store.network_interfaces.contains_key(interface_id) {
+                    return Err(state::invalid_network_interface_id_not_found(interface_id));
+                }
+            }
+        }
+
+        // A route IS the destination it matches inside one table, so a table that already
+        // holds a route for that destination has nothing to create: a second one would give
+        // one destination two routes. EC2's own code for a route that is already there, and
+        // the stored route is left exactly as it was.
+        if store
+            .local_gateway_route(route_table_id, destination.key())
+            .is_some()
+        {
+            return Err(state::local_gateway_route_already_exists(destination.key()));
+        }
+
+        // The route itself. "Creates a STATIC route" fixes its type, and a route this call
+        // just introduced is not carrying traffic yet, so it starts in the TRANSIENT
+        // `pending` state with the clock owing it `active` one TRANSITION_DELAY later — a
+        // caller that searches the table straight after this call still sees `pending`. The
+        // table's ARN and the owning account are read off the STORED table by the insert,
+        // never taken from the request, and `SubnetId`/`CoipPoolId` are left unset: they
+        // describe a route the local gateway itself knows about rather than a static route a
+        // caller named a target for.
+        let (local_gateway_virtual_interface_group_id, network_interface_id) = match target {
+            Target::VirtualInterfaceGroup(group_id) => (Some(group_id.to_string()), None),
+            Target::NetworkInterface(interface_id) => (None, Some(interface_id.to_string())),
+        };
+        let route = store
+            .insert_local_gateway_route(state::LocalGatewayRouteSpec {
+                local_gateway_route_table_id: route_table_id.to_string(),
+                destination,
+                local_gateway_virtual_interface_group_id,
+                network_interface_id,
+                subnet_id: None,
+                coip_pool_id: None,
+                route_type: state::LOCAL_GATEWAY_ROUTE_TYPE_STATIC.to_string(),
+                state: state::LOCAL_GATEWAY_ROUTE_STATE_PENDING.to_string(),
+                becomes: Some(state::LOCAL_GATEWAY_ROUTE_STATE_ACTIVE.to_string()),
+            })
+            .ok_or_else(|| state::local_gateway_route_limit_exceeded(route_table_id))?;
+
+        // "Information about the route" (`CreateLocalGatewayRouteResult$Route`): the route as
+        // it was STORED, so this operation and `SearchLocalGatewayRoutes` cannot report one
+        // route differently.
+        Ok(CreateLocalGatewayRouteOutput {
+            route: Some(route),
+        })
     }
+}
+
+/// What the route sends traffic matching its destination to: exactly one of the two targets
+/// the operation documents ("You must specify one of the following targets:
+/// LocalGatewayVirtualInterfaceGroupId NetworkInterfaceId").
+///
+/// The choice is read ONCE, out of the pair of members the request carries, so every step
+/// after it — the form of the id, the lookup that resolves it, and the member the stored
+/// route reports it in — asks the same question of the same answer.
+#[derive(Debug, Clone, Copy)]
+enum Target<'a> {
+    /// "The ID of the virtual interface group" (`$LocalGatewayVirtualInterfaceGroupId`).
+    VirtualInterfaceGroup(&'a str),
+    /// "The ID of the network interface" (`$NetworkInterfaceId`).
+    NetworkInterface(&'a str),
 }

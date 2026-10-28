@@ -1,15 +1,19 @@
 Issue-Severity: CRITICAL
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: events.oauth-connection-non-https-authorization-endpoint-rejected events.api-destination-oauth-connection-fetches-a-client-credentials-token-and-sends-it-as-the-bearer-header
+Issue-Trace-Ids: events.oauth-connection-non-https-authorization-endpoint-rejected
 Issue-Shape-Id: com.amazonaws.eventbridge#AWSEvents
 Issue-Key: events.oauth-connection-non-https-authorization-endpoint-rejected|run#8|AssertionError|assert (code, message) == ("ValidationException", expected), (
-Issue-Key: events.api-destination-oauth-connection-fetches-a-client-credentials-token-and-sends-it-as-the-bearer-header|_create_connection#5|Timeout|time.sleep(3)
 Issue-Commit: 74cfda6b1b1701e11661fc7b5d0b64a8c57e063b
 
 # EventBridge connections: CreateConnection's non-HTTPS AuthorizationEndpoint refusal message is rewritten, and an OAUTH_CLIENT_CREDENTIALS api-destination never fetches a token or issues the event request (2 causes)
 
 > _Note: this issue was identified against the code base at commit `74cfda6b1b1701e11661fc7b5d0b64a8c57e063b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Resolution
+Fixed (cause 1 of 2). Every refusal of a call on the connection resource now opens with the clause naming the call that could not be served — `Failed to <verb> the connection(s).` for that operation's own verb — and then states the reason, naming the member whose value was rejected rather than the block that carries it: a non-HTTPS OAuth authorization endpoint is refused with `Failed to create the connection(s). Parameter AuthorizationEndpoint is not valid. Reason: Endpoint '<endpoint as submitted>' is invalid, please provide a valid HTTPS endpoint URL.`, and the read that follows a refused create answers `Failed to describe the connection(s). Connection '<name>' does not exist.` `UpdateConnection` refuses the same values in the words of its own call, and the api-destination writes that resolve a `ConnectionArn` open with their own call's clause. Covered by `services/service-com-amazonaws-eventbridge-awsevents/tests/all/connection_refusal_wording.rs` (a table over seven non-HTTPS endpoint forms through both writers, the accepted HTTPS forms, and a row per operation and refusal kind of the resource).
+
+This report was filed with TWO causes. The second — an `OAUTH_CLIENT_CREDENTIALS` connection never performing the client-credentials token exchange, so an api-destination target never delivers — is NOT fixed: a handler's only transport is the in-process emulator transport, which dispatches to what this emulator itself hosts and opens no socket, so the token endpoint a caller stores outside the emulator cannot be reached. It was re-filed, with its own `Issue-Key`, as `issues/things-that-do-not-work/20261027T200000Z-events-eventbridge-an-oauth-client-credentials-connection-never-fetches-a-token-so-its-api-destination-never-delivers.md` so that it stays open work rather than being recorded here as working. Only cause 1's trace and key are kept above.
 
 ## Operation
 CreateConnection

@@ -3214,6 +3214,12 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         // idempotent). The pass bound is also what stops a CYCLE of composite alarms: "the
         // evaluation of composite alarms stops if CloudWatch detects a cycle in the
         // evaluation path."
+        // The composite alarms are a PASS of their own, owed its first evaluation whatever the
+        // metric-alarm pass before it has already spent
+        // ([`alarm_evaluation::EvaluationBudget::start_pass`]), so a store whose metric alarms
+        // keep one request busy cannot leave its composite alarms in the state their last
+        // write left behind.
+        budget.start_pass();
         let passes = self
             .composite_alarms
             .len()
@@ -3230,25 +3236,44 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     }
 
     /// One evaluation pass over every composite alarm, reporting whether any alarm's state
-    /// value changed. Alarms are visited in name order, so the pass is deterministic, and the
-    /// pass stops as soon as `nodes` or the request's own `budget` is spent.
+    /// value changed. Alarms are visited in the order their evaluations came due
+    /// ([`alarm_evaluation::due_order`]), and the pass stops as soon as `nodes` or the
+    /// request's own `budget` is spent.
+    ///
+    /// Only an alarm whose evaluation the clock has already made DUE is charged, so the one
+    /// evaluation a pass is owed is spent on an alarm that has one to settle rather than on
+    /// whichever name happens to come first.
     fn evaluate_composite_alarms_once(
         &mut self,
         now_secs: f64,
         nodes: &mut usize,
         budget: &mut alarm_evaluation::EvaluationBudget,
     ) -> bool {
-        let mut names: Vec<String> = self.composite_alarms.keys().cloned().collect();
-        names.sort();
+        let ordered = alarm_evaluation::due_order(
+            self.composite_alarms
+                .iter()
+                .map(|(name, stored)| (name.as_str(), stored.evaluation_due_secs)),
+        );
         let mut changed = false;
-        for name in names {
+        for name in ordered {
             if *nodes == 0 || budget.spent() {
                 break;
             }
+            if !self.composite_alarm_evaluation_due(&name, now_secs) {
+                continue;
+            }
             budget.charge_alarm();
             changed |= self.evaluate_composite_alarm(&name, now_secs, nodes);
+            budget.settled_one();
         }
         changed
+    }
+
+    /// Whether the composite alarm `name` has an evaluation the clock has already made due.
+    fn composite_alarm_evaluation_due(&self, name: &str, now_secs: f64) -> bool {
+        self.composite_alarms
+            .get(name)
+            .is_some_and(|stored| now_secs >= stored.evaluation_due_secs)
     }
 
     /// Evaluate ONE composite alarm, reporting whether its state value changed.

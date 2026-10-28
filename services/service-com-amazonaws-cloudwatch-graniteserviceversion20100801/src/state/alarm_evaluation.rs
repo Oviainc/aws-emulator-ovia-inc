@@ -185,7 +185,10 @@ const MAX_DATAPOINTS_FOLDED_PER_REQUEST: usize = 200_000;
 ///
 /// The wall-clock half of the budget, so the work is bounded in TIME as well as in counts,
 /// however cheap or expensive each charged unit turns out to be. Short enough to stay a small
-/// part of any request's own latency; what it does not reach stays due for the next call.
+/// part of any request's own latency; what it does not reach stays due for the next call. It
+/// bounds what a pass does AFTER its first evaluation, never whether that first one runs
+/// ([`EvaluationBudget::spent`]), because a span this short can be gone before a pass has
+/// begun — the wait for the store's lock, and the scheduler, are not under the pass's control.
 const EVALUATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The work ONE request may spend materialising the alarm evaluations the clock has already
@@ -197,7 +200,9 @@ const EVALUATION_DEADLINE: std::time::Duration = std::time::Duration::from_milli
 /// for that stage and the settle that follows the write charges one more, so a request's
 /// evaluation work is bounded by a small fixed number of these budgets rather than by what
 /// the store holds. An evaluation a budget stops is left due for the next call rather than
-/// answered from nothing.
+/// answered from nothing — which is only true while every pass the budget bounds settles one
+/// of them, so each pass is owed its first evaluation before the bounds answer at all
+/// ([`EvaluationBudget::start_pass`], [`EvaluationBudget::spent`]).
 #[derive(Debug)]
 pub struct EvaluationBudget {
     /// How many more alarms this request may evaluate.
@@ -206,6 +211,8 @@ pub struct EvaluationBudget {
     datapoints: usize,
     /// When this request stops evaluating, whatever is left of the counts above.
     deadline: std::time::Instant,
+    /// Whether the pass this budget is bounding has settled an evaluation yet.
+    settled_in_pass: bool,
 }
 
 impl Default for EvaluationBudget {
@@ -222,18 +229,46 @@ impl EvaluationBudget {
             alarms: MAX_ALARMS_EVALUATED_PER_REQUEST,
             datapoints: MAX_DATAPOINTS_FOLDED_PER_REQUEST,
             deadline: std::time::Instant::now() + EVALUATION_DEADLINE,
+            settled_in_pass: false,
         }
     }
 
+    /// Begin one PASS over the alarms this budget bounds. The pass is owed its first
+    /// evaluation: until that one is settled, this budget is not spent ([`Self::spent`]).
+    pub(super) fn start_pass(&mut self) {
+        self.settled_in_pass = false;
+    }
+
     /// Whether this request has spent its budget and must stop evaluating.
+    ///
+    /// A bound on the work one request may do DEFERS the evaluations it stops: they stay due,
+    /// and the next call carries them. That holds only while every pass makes progress — a
+    /// pass stopped before its first evaluation defers nothing, it starves it, and a pass can
+    /// be stopped that early by a clock it does not control, since the time the wait for the
+    /// store's lock and the scheduler took before the pass began is time off this budget. Were
+    /// one pass after another stopped that way, an evaluation the clock has made due would
+    /// never be materialised at all and the alarm would keep the state its last write left
+    /// behind for as long as the load lasted. So the bounds answer from a pass's SECOND
+    /// evaluation onwards, and one request pays for at most one evaluation per pass beyond
+    /// them — each still bounded on its own by what one alarm's fold may visit.
     #[must_use]
     pub fn spent(&self) -> bool {
-        self.alarms == 0 || self.datapoints == 0 || std::time::Instant::now() >= self.deadline
+        self.settled_in_pass
+            && (self.alarms == 0
+                || self.datapoints == 0
+                || std::time::Instant::now() >= self.deadline)
     }
 
     /// Charge one alarm's evaluation.
     pub(super) fn charge_alarm(&mut self) {
         self.alarms = self.alarms.saturating_sub(1);
+    }
+
+    /// Record that this pass has settled one alarm's evaluation, whatever that evaluation
+    /// computed — from here on the pass is bounded again. Recorded AFTER the evaluation rather
+    /// than before it, so the one evaluation a pass is owed is a whole one.
+    pub(super) fn settled_one(&mut self) {
+        self.settled_in_pass = true;
     }
 
     /// Charge the datapoints one fold is about to visit. Saturating: the fold that exhausts
@@ -351,6 +386,30 @@ fn evaluated_periods(alarm: &MetricAlarm) -> Option<usize> {
 /// ([`EVALUATION_RANGE_FACTOR`]).
 fn evaluation_range_periods(evaluation_periods: usize) -> usize {
     evaluation_periods.saturating_mul(EVALUATION_RANGE_FACTOR)
+}
+
+/// The names of `alarms` in the order their evaluations came DUE: oldest first, and by name
+/// between two owed one at the same instant.
+///
+/// The one definition of that order, so the metric-alarm pass
+/// ([`State::evaluate_metric_alarms`]) and the composite-alarm pass
+/// ([`super::ComAmazonawsCloudwatchGraniteserviceversion20100801State::evaluate_composite_alarms`])
+/// cannot settle the alarms a request pays for in two different orders. Oldest first is what
+/// makes the alarm that has waited longest the one a request whose budget stops it early still
+/// settles; the name tie-break is what keeps the pass deterministic.
+pub(super) fn due_order<'name>(
+    alarms: impl Iterator<Item = (&'name str, f64)>,
+) -> Vec<String> {
+    let mut ordered: Vec<(&str, f64)> = alarms.collect();
+    ordered.sort_by(|(left_name, left_due), (right_name, right_due)| {
+        left_due
+            .total_cmp(right_due)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    ordered
+        .into_iter()
+        .map(|(name, _due)| name.to_string())
+        .collect()
 }
 
 /// Whether `datum` is one the alarm's `Unit` selects ([`alarm_grades_unit`]).
@@ -535,13 +594,19 @@ impl State {
     /// Materialise every metric-alarm evaluation the clock has already made due, within what
     /// `budget` lets this request pay for.
     ///
-    /// Alarms are visited in name order, so the pass is deterministic. Each alarm's
-    /// evaluation reads only the metric store and the clock, so the order never changes the
-    /// outcome, and an alarm the budget does not reach stays due for the next call.
+    /// Alarms are visited in the order their evaluations came due ([`due_order`]). Each
+    /// alarm's evaluation reads only the metric store and the clock, so the order never
+    /// changes the outcome, and an alarm the budget does not reach stays due for the next
+    /// call — while the pass settles the first due alarm it finds whatever the budget already
+    /// holds ([`EvaluationBudget::start_pass`]), so what it defers is never everything.
     pub fn evaluate_metric_alarms(&mut self, now_secs: f64, budget: &mut EvaluationBudget) {
-        let mut names: Vec<String> = self.alarms.keys().cloned().collect();
-        names.sort();
-        for name in names {
+        budget.start_pass();
+        let ordered = due_order(
+            self.alarms
+                .iter()
+                .map(|(name, stored)| (name.as_str(), stored.evaluation_due_secs)),
+        );
+        for name in ordered {
             if budget.spent() {
                 break;
             }
@@ -574,8 +639,13 @@ impl State {
             stored.evaluation_due_secs = now_secs + EVALUATION_DELAY_SECS;
         }
         let Some(evaluation) = self.metric_alarm_evaluation(&alarm, now_secs, budget) else {
+            // This pass has paid for one alarm's evaluation, so what remains of the budget
+            // bounds it again — whether the evaluation computed a state or this is an alarm
+            // this engine computes nothing for.
+            budget.settled_one();
             return;
         };
+        budget.settled_one();
         if alarm.state_value.as_deref() == Some(evaluation.state) {
             return;
         }

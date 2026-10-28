@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.api_destination(&input.name).is_none() {
             return Err(UpdateApiDestinationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::no_such_api_destination("update", &input.name)),
+                    message: Some(crate::state::no_such_api_destination(VERB, &input.name)),
                 },
             )
             .into());
@@ -208,10 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.connection_by_arn(arn).is_none() {
                 return Err(UpdateApiDestinationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "{} {}",
-                            crate::state::api_destination_call_failed("update"),
-                            crate::state::no_such_connection(arn)
+                        message: Some(crate::state::api_destination_refusal(
+                            VERB,
+                            &crate::state::connection_does_not_exist(arn),
                         )),
                     },
                 )
@@ -281,4 +280,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The verb of THIS call, as the clause every refusal of it that names the call
+/// opens with ([`crate::state::api_destination_refusal`]).
+const VERB: &str = "update";
 

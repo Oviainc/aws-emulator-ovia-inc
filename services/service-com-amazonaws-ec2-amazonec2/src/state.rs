@@ -6532,7 +6532,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// `succeeded` ([`NatGatewayAddressTransition`]), and a `running` Network Access Scope
     /// analysis reaching its terminal `AnalysisStatus`. So is an `associating` local gateway
     /// route table / VPC association reaching `associated`, an `associating` local gateway
-    /// route table / virtual interface group association reaching it too, and a Client VPN
+    /// route table / virtual interface group association reaching it too, a `pending` local
+    /// gateway route reaching `active`, and a Client VPN
     /// target network association moving `associating` -> `associated`. So is a `pending`
     /// permission over a network interface reaching `granted`, a PTR record update owed
     /// on an Elastic IP address's `domain-name` attribute reaching that record
@@ -6815,6 +6816,23 @@ impl ComAmazonawsEc2Amazonec2State {
             if let Some(state) = due {
                 record.view.state = Some(state);
                 record.pending = None;
+            }
+        }
+        // A route `CreateLocalGatewayRoute` answered as `pending` is carrying traffic once
+        // its due instant has passed, whether or not anybody called — the same contract as
+        // the `pending` VPC above. A route is reached only through the table it is in, so
+        // the moves are applied table by table.
+        for table in self.local_gateway_route_tables.values_mut() {
+            for record in table.routes.values_mut() {
+                let due = record
+                    .pending
+                    .as_ref()
+                    .and_then(|pending| pending.due_by(now))
+                    .map(str::to_string);
+                if let Some(state) = due {
+                    record.view.state = Some(state);
+                    record.pending = None;
+                }
             }
         }
         // The end of a release `DeprovisionByoipCidr` started: at its due instant the
@@ -11207,6 +11225,12 @@ pub const INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_NOT_FOUND: &str =
 /// a client can tell "no such route table" from "no such route in it".
 pub const INVALID_ROUTE_NOT_FOUND: &str = "InvalidRoute.NotFound";
 
+/// `RouteAlreadyExists` (HTTP 400): the route table already holds a route for the
+/// destination the request named, so there is nothing to create. EC2's own code for it ("a
+/// route for the specified CIDR block already exists in this route table", EC2 API error
+/// codes), the counterpart of [`INVALID_ROUTE_NOT_FOUND`].
+pub const ROUTE_ALREADY_EXISTS: &str = "RouteAlreadyExists";
+
 /// Whether `id` is a well-formed local gateway route table id — one EC2 could have issued.
 ///
 /// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
@@ -11263,6 +11287,21 @@ pub fn invalid_local_gateway_route_table_id_not_found<E>(id: &str) -> Scaffolded
     )
 }
 
+/// Refuse something that is not a local gateway route table id at all, for a handler that
+/// has to read the request's own FORM before it resolves anything — a `DryRun` is answered
+/// only once that form has been read, and a malformed id is a malformed REQUEST rather than
+/// a missing resource.
+///
+/// The one form check [`require_known_local_gateway_route_table`] itself makes before it
+/// looks an id up, so an operation that needs it earlier asks the same question of the same
+/// reader.
+pub fn require_well_formed_local_gateway_route_table_id<E>(id: &str) -> Result<(), Scaffolded<E>> {
+    if !local_gateway_route_table_id_is_well_formed(id) {
+        return Err(invalid_local_gateway_route_table_id_malformed(id));
+    }
+    Ok(())
+}
+
 /// Refuse a `LocalGatewayRouteTableId` this service cannot resolve: a malformed one before
 /// an unknown one, the order [`require_well_formed_id`] documents.
 ///
@@ -11273,9 +11312,7 @@ pub fn require_known_local_gateway_route_table<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     id: &str,
 ) -> Result<(), Scaffolded<E>> {
-    if !local_gateway_route_table_id_is_well_formed(id) {
-        return Err(invalid_local_gateway_route_table_id_malformed(id));
-    }
+    require_well_formed_local_gateway_route_table_id(id)?;
     if !store.local_gateway_route_tables.contains_key(id) {
         return Err(invalid_local_gateway_route_table_id_not_found(id));
     }
@@ -11291,6 +11328,34 @@ pub fn local_gateway_route_not_found<E>(route_table_id: &str, destination: &str)
         format!(
             "The route '{destination}' does not exist in the local gateway route table \
              '{route_table_id}'"
+        ),
+    )
+}
+
+/// Refuse a destination the named local gateway route table already holds a route for: HTTP
+/// 400 [`ROUTE_ALREADY_EXISTS`], worded the way AWS words a route that is already there and
+/// built from the destination the request named.
+pub fn local_gateway_route_already_exists<E>(destination: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        ROUTE_ALREADY_EXISTS,
+        400,
+        format!("The route identified by {destination} already exists."),
+    )
+}
+
+/// Refuse a route create this store cannot take: HTTP 400 [`ROUTE_LIMIT_EXCEEDED`], the
+/// code EC2 answers a route table that can hold no more routes, naming the two bounds this
+/// emulator holds a route against ([`MAX_LOCAL_GATEWAY_ROUTES_PER_TABLE`] and
+/// [`MAX_STORED_BYTES`]) the way the association stores name theirs.
+pub fn local_gateway_route_limit_exceeded<E>(route_table_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        ROUTE_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The local gateway route table '{route_table_id}' holds at most \
+             {MAX_LOCAL_GATEWAY_ROUTES_PER_TABLE} routes, and this emulator at most \
+             {MAX_STORED_BYTES} bytes of caller-supplied data; this request would take it \
+             past one of the two"
         ),
     )
 }
@@ -11339,7 +11404,10 @@ impl LocalGatewayRouteDestination {
 ///   model marks neither member required (so the boundary validator passes the request);
 /// * a `DestinationCidrBlock` that is not an address prefix, or a
 ///   `DestinationPrefixListId` that is not a prefix list id — `InvalidParameterValue`,
-///   naming the member and what it accepts.
+///   naming the parameter and the form it takes, in the one wording this service answers a
+///   rejected parameter VALUE with ("Value (…) for parameter … is invalid. …", the wording
+///   the other two route creates of this service answer a destination that is not a CIDR
+///   block with, and [`invalid_id_parameter_value`] for an id parameter).
 pub fn require_local_gateway_route_destination<E>(
     destination_cidr_block: Option<&str>,
     destination_prefix_list_id: Option<&str>,
@@ -11352,8 +11420,8 @@ pub fn require_local_gateway_route_destination<E>(
         (Some(cidr_block), None) => {
             if !cidr_block_is_well_formed(cidr_block) {
                 return Err(invalid_parameter_value(format!(
-                    "Invalid value '{cidr_block}' for destinationCidrBlock. \
-                     It must be an address range in CIDR notation"
+                    "Value ({cidr_block}) for parameter destinationCidrBlock is invalid. \
+                     This is not a valid CIDR block."
                 )));
             }
             Ok(LocalGatewayRouteDestination::CidrBlock(
@@ -11362,18 +11430,19 @@ pub fn require_local_gateway_route_destination<E>(
         }
         (None, Some(prefix_list_id)) => {
             if !prefix_list_id_is_well_formed(prefix_list_id) {
-                return Err(invalid_parameter_value(format!(
-                    "Invalid value '{prefix_list_id}' for destinationPrefixListId. \
-                     It must be a prefix list ID of the form \
-                     '{PREFIX_LIST_ID_PREFIX}-xxxxxxxx'"
-                )));
+                return Err(invalid_id_parameter_value(
+                    "destinationPrefixListId",
+                    prefix_list_id,
+                    PREFIX_LIST_ID_PREFIX,
+                ));
             }
             Ok(LocalGatewayRouteDestination::PrefixListId(
                 prefix_list_id.to_string(),
             ))
         }
         (None, None) => Err(missing_parameter(
-            "Either destinationCidrBlock or destinationPrefixListId must be specified",
+            "The request must contain the parameter destinationCidrBlock or \
+             destinationPrefixListId",
         )),
     }
 }
@@ -11392,7 +11461,23 @@ pub struct LocalGatewayRouteTableRecord {
     /// The routes in the table, by the destination that names each one
     /// ([`LocalGatewayRouteDestination::key`]). Ordered by destination, the stable order a
     /// search of the routes reports and pages over.
-    pub routes: BTreeMap<String, crate::ops::types::LocalGatewayRoute>,
+    pub routes: BTreeMap<String, LocalGatewayRouteRecord>,
+}
+
+/// One stored local gateway route: the modelled shape every reader of it reports, plus the
+/// move the clock owes it.
+///
+/// The modelled shape itself rather than a parallel record, for the reason
+/// [`LocalGatewayRouteTableVpcAssociationRecord`] holds one; the pending move lives beside
+/// it because `LocalGatewayRoute` carries no member for when the route's next state falls
+/// due.
+#[derive(Debug, Clone)]
+pub struct LocalGatewayRouteRecord {
+    /// The route as the model shapes it, carrying the state reached so far.
+    pub view: crate::ops::types::LocalGatewayRoute,
+    /// The move a route still `pending` owes; `None` for one in a state the clock owes
+    /// nothing on.
+    pub pending: Option<PendingStateMove>,
 }
 
 /// What one local gateway route table is written with: the local gateway and Outpost it
@@ -11590,6 +11675,10 @@ pub struct LocalGatewayRouteSpec {
     /// "The state of the route" (`LocalGatewayRoute$State`), one of
     /// [`crate::ops::types::LOCAL_GATEWAY_ROUTE_STATE_VALUES`].
     pub state: String,
+    /// The state the clock owes this route, [`TRANSITION_DELAY`] from the write; `None` for
+    /// one written in a state nothing is owed on — the contract
+    /// [`LocalGatewayRouteTableVpcAssociationSpec::becomes`] writes out.
+    pub becomes: Option<String>,
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -11660,6 +11749,7 @@ impl ComAmazonawsEc2Amazonec2State {
             .get(route_table_id)?
             .routes
             .get(destination)
+            .map(|record| &record.view)
     }
 
     /// Store one route in the local gateway route table its spec names, and answer it as
@@ -11708,7 +11798,13 @@ impl ComAmazonawsEc2Amazonec2State {
         self.local_gateway_route_tables
             .get_mut(&spec.local_gateway_route_table_id)?
             .routes
-            .insert(spec.destination.key().to_string(), route.clone());
+            .insert(
+                spec.destination.key().to_string(),
+                LocalGatewayRouteRecord {
+                    view: route.clone(),
+                    pending: spec.becomes.map(PendingStateMove::starting_now),
+                },
+            );
         self.add_stored_bytes(payload_bytes);
         Some(route)
     }
@@ -11730,7 +11826,8 @@ impl ComAmazonawsEc2Amazonec2State {
             .local_gateway_route_tables
             .get_mut(route_table_id)?
             .routes
-            .remove(destination)?;
+            .remove(destination)?
+            .view;
         self.release_stored_bytes(local_gateway_route_payload_bytes(&route));
         route.state = Some(LOCAL_GATEWAY_ROUTE_STATE_DELETED.to_string());
         Some(route)

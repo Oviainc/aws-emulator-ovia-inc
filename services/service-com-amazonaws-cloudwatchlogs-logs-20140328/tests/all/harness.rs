@@ -231,6 +231,23 @@ pub fn batch(events: &[(i64, &str)]) -> Value {
     )
 }
 
+/// The `message` values of a `GetLogEvents` page, in the order returned. Shared here
+/// because every suite that reads events back compares them by message.
+pub fn messages(page: &Value) -> Vec<String> {
+    page.get("events")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("GetLogEvents must return events, got {page}"))
+        .iter()
+        .map(|event| {
+            event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("every event carries a message, got {event}"))
+                .to_string()
+        })
+        .collect()
+}
+
 /// Record, in the store, that the detector under `arn` has REPORTED the anomaly `anomaly`
 /// of the pattern `pattern` — what a detection pass over the watched group's events writes.
 ///

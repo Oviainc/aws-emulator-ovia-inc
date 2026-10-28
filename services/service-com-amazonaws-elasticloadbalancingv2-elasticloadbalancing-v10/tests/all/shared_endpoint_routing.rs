@@ -52,14 +52,14 @@ use super::provisioning_loop::{encode, first_text, p, Reply};
 
 /// The signing name, endpoint prefix and ARN namespace both models declare, and so the
 /// routing key an AWS SDK client of either API sends.
-const SHARED_KEY: &str = "elasticloadbalancing";
+pub(crate) const SHARED_KEY: &str = "elasticloadbalancing";
 
 /// The routing key that names THIS model directly, without the shared front door.
-const V2_KEY: &str = "elasticloadbalancingv2";
+pub(crate) const V2_KEY: &str = "elasticloadbalancingv2";
 
 /// The region every request below is signed for; the ARNs and DNS names both services
 /// mint belong to it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// This model's API version, read from the constant the front door that owns the shared
 /// key routes on, so the suite cannot drift from the rule it tests.
@@ -74,7 +74,11 @@ const CLASSIC_VERSION: &str =
 /// The emulator under test: ONE shared engine with BOTH Elastic Load Balancing services
 /// mounted on the multi-service router, exactly as the production router assembles them.
 /// The ambiguity this suite is about exists only when both are mounted.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because `declared_action_set.rs`, in this same test binary, drives the whole
+/// declared action set through these same two front doors: one assembly for the crate, so
+/// no suite can drift on how the two services are mounted.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router
@@ -86,7 +90,10 @@ fn emulator() -> MultiServiceRouter {
 
 /// Send one `awsQuery` request: the routing key it is signed for, the `Action`, the
 /// `Version` its envelope names (or none at all), and the operation's own form fields.
-async fn call(
+///
+/// `pub(crate)` for the same reason [`emulator`] is: one request builder for the two suites
+/// that address these front doors.
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     key: &str,
     action: &str,
