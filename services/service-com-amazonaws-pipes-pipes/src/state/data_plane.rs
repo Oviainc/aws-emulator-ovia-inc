@@ -51,7 +51,13 @@
 //! first whether the policies in force on that role let it make the call it is about to
 //! make ([`super::execution_role`]): a call the role may not make is that stage FAILING —
 //! the source records stay where they are and the pipe tries again — and never a call
-//! that happens anyway.
+//! that happens anyway. WHICH role that is is read from the pipe's own record at the
+//! moment of each call ([`LiveRecord`]), never captured for the length of a batch, so a
+//! role switched while a batch is in flight authorizes every call the pipe has not made
+//! yet: nothing is delivered or deleted as an identity the record no longer carries. The
+//! rest of the configuration is read the same way, as what the record says NOW: a batch
+//! polled under a configuration the pipe has since left is not moved under it, and stays
+//! on the source for the configuration it now carries to move.
 //!
 //! What each pass came to is published as the pipe's OWN CloudWatch metrics
 //! ([`super::metrics`]), for every minute the pipe is running: that series is the only
@@ -308,6 +314,15 @@ async fn poll_pipe(
     let pipe_name = claim.pipe.clone();
     // A handle of its own, so the store can be locked while the claim is borrowed.
     let state = ::engine::ServiceState::clone(&claim.state);
+    // The questions each stage asks before it calls, and the one its polled records are
+    // checked against, are all asked of the record itself. This outlives any one pass,
+    // because what a call is made as — and what it is made under — is what the pipe
+    // carries when it is made, not what it carried when the batch began.
+    let record = LiveRecord {
+        iam: iam.as_ref(),
+        pipes: &state,
+        pipe: &pipe_name,
+    };
     let mut clients = Clients::default();
     let mut failures = 0u32;
     loop {
@@ -336,13 +351,25 @@ async fn poll_pipe(
                 // A RUNNING pipe publishes for every minute it runs, so its counters
                 // exist and read 0 for a minute in which nothing of their kind happened.
                 metrics.open_window();
-                match move_one_batch(callback, &mut clients, iam.as_ref(), &run).await {
+                match move_one_batch(callback, &mut clients, &record, &run).await {
                     Batch::Moved { events } => {
                         metrics.count(super::metrics::EVENT_COUNT_METRIC, events);
                         failures = 0;
                     }
                     Batch::Idle => {
                         failures = 0;
+                        ::tokio::time::sleep(POLL_INTERVAL).await;
+                    }
+                    Batch::Superseded => {
+                        // Nothing was handed to a stage and nothing was asked of one, so
+                        // this is neither work done nor work that failed: the next pass
+                        // reads the configuration the pipe now carries.
+                        failures = 0;
+                        ::tracing::debug!(
+                            pipe = %pipe_name,
+                            "a pipe was reconfigured while a batch was in flight; the \
+                             records stay on the source for the new configuration to move"
+                        );
                         ::tokio::time::sleep(POLL_INTERVAL).await;
                     }
                     Batch::Failed {
@@ -458,6 +485,12 @@ enum Batch {
     Moved { events: usize },
     /// The source held nothing.
     Idle,
+    /// The pipe was RECONFIGURED while this batch was being polled, so the configuration
+    /// it was polled under is not the one the pipe carries any more: nothing was handed
+    /// to a stage and nothing was counted. The records stay on the source and reappear
+    /// when their visibility timeout lapses, for a later pass to move under the record as
+    /// it then reads.
+    Superseded,
     /// A stage failed; the source records are left for the next pass (and reappear on
     /// the queue when their visibility timeout lapses). `events` is how many events the
     /// failed execution had taken from its source, which entered the pipe whether or not
@@ -473,19 +506,16 @@ enum Batch {
 /// the target, and delete the source records that were delivered.
 ///
 /// Every one of those calls is made AS THE PIPE'S EXECUTION ROLE, so each is preceded by
-/// the one question [`RoleGate`] answers: may that role make this call on this resource?
-/// A call it may not make is the stage FAILING rather than the call happening.
+/// the one question [`LiveRecord::refusal`] answers: may the role the pipe carries AT THAT
+/// MOMENT make this call on this resource? A call it may not make is the stage FAILING
+/// rather than the call happening.
 async fn move_one_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
-    iam: Option<&::engine::ServiceState<super::execution_role::IamState>>,
+    record: &LiveRecord<'_>,
     run: &SqsSourcedPipe,
 ) -> Batch {
-    let gate = RoleGate {
-        iam,
-        role_arn: &run.role_arn,
-    };
-    if let Some(detail) = gate.refusal(RECEIVE_MESSAGE_ACTION, &run.source_arn) {
+    if let Some(detail) = record.refusal(RECEIVE_MESSAGE_ACTION, &run.source_arn) {
         return Batch::Failed {
             stage: Stage::Source,
             events: 0,
@@ -504,6 +534,13 @@ async fn move_one_batch(
     };
     if polled.is_empty() {
         return Batch::Idle;
+    }
+    // One batch is moved under ONE configuration, and it is the pipe's own: records polled
+    // under a configuration the pipe has since left are not handed to the stages that
+    // configuration named, so nothing is delivered or deleted on behalf of a record that
+    // no longer reads that way.
+    if !record.still_configured_as(run) {
+        return Batch::Superseded;
     }
     let taken = polled.len();
 
@@ -531,7 +568,7 @@ async fn move_one_batch(
                 }
             };
             if let Some(detail) =
-                gate.refusal(enrichment.invocation_action(), enrichment.arn())
+                record.refusal(enrichment.invocation_action(), enrichment.arn())
             {
                 return Batch::Failed {
                     stage: Stage::Enrichment,
@@ -556,7 +593,7 @@ async fn move_one_batch(
     // so the role is asked about it once for the batch — and only when there is an event
     // to deliver, because a batch the enrichment emptied makes no target call at all.
     if !events.is_empty() {
-        if let Some(detail) = gate.refusal(run.target.delivery_action(), &run.target_arn) {
+        if let Some(detail) = record.refusal(run.target.delivery_action(), &run.target_arn) {
             return Batch::Failed {
                 stage: Stage::Target,
                 events: taken,
@@ -597,7 +634,7 @@ async fn move_one_batch(
     // fails, only means the record reappears and is delivered again, which is the
     // at-least-once the service promises.
     let queue = run.source_queue.clone();
-    if let Some(detail) = gate.refusal(DELETE_MESSAGE_ACTION, &run.source_arn) {
+    if let Some(detail) = record.refusal(DELETE_MESSAGE_ACTION, &run.source_arn) {
         ::tracing::warn!(
             queue = %queue,
             detail = %detail,
@@ -630,21 +667,55 @@ async fn move_one_batch(
 /// The one question each stage asks before it makes its call: may this pipe's execution
 /// role perform it?
 ///
-/// The decision itself is [`super::execution_role::call_refusal`] — this holds only what
-/// it is asked about (the role the record carries now, and the IAM store of this engine)
-/// and takes the IAM guard for the length of that one decision, so no call leaves this
-/// process while it is held.
-struct RoleGate<'a> {
+/// The pipe's own record, read at the moment a decision needs it rather than kept for the
+/// length of a pass.
+///
+/// Two decisions are taken from it, and both are about what the record says NOW: may the
+/// execution role it carries make the call a stage is about to make
+/// ([`Self::refusal`], decided by [`super::execution_role::call_refusal`]), and is the
+/// configuration a batch in flight was polled under still the pipe's
+/// ([`Self::still_configured_as`]). This holds only where those are read FROM — the pipes
+/// store this poller runs in and the IAM store of the same engine — and takes each guard
+/// for the length of one decision, so no call leaves this process while either is held.
+struct LiveRecord<'a> {
     iam: Option<&'a ::engine::ServiceState<super::execution_role::IamState>>,
-    role_arn: &'a str,
+    pipes: &'a ::engine::ServiceState<ComAmazonawsPipesPipesState>,
+    pipe: &'a str,
 }
 
-impl RoleGate<'_> {
+impl LiveRecord<'_> {
+    /// The execution role the pipe carries NOW, or `None` when the store holds no such
+    /// pipe any more.
+    fn role_arn(&self) -> Option<String> {
+        self.pipes
+            .lock()
+            .pipes
+            .get(self.pipe)
+            .map(|pipe| pipe.role_arn.clone())
+    }
+
+    /// Whether the pipe's record still asks for exactly what `run` was resolved from —
+    /// `false` once a call has reconfigured it, and for a pipe the store no longer holds.
+    fn still_configured_as(&self, run: &SqsSourcedPipe) -> bool {
+        let store = self.pipes.lock();
+        store
+            .pipes
+            .get(self.pipe)
+            .is_some_and(|pipe| resolve_run(pipe).is_ok_and(|current| &current == run))
+    }
+
     /// Why the role may not perform `action` on `resource`, or `None` when nothing of the
     /// kind can be shown and the call goes ahead.
     fn refusal(&self, action: &str, resource: &str) -> Option<String> {
+        let Some(role_arn) = self.role_arn() else {
+            return Some(format!(
+                "no record of the pipe {} is stored, so no execution role is in force \
+                 for {action} on {resource}",
+                self.pipe
+            ));
+        };
         let iam = self.iam?;
-        super::execution_role::call_refusal(self.role_arn, action, resource, &iam.lock())
+        super::execution_role::call_refusal(&role_arn, action, resource, &iam.lock())
     }
 }
 
@@ -1140,6 +1211,15 @@ fn json_string_body(text: &str) -> String {
 
 /// An Amazon SQS-sourced pipe, as the stages above read it: what the poller moves for
 /// one pipe, resolved from the stored record.
+///
+/// It carries no `RoleArn`: the identity each stage's call is made as is read from the
+/// record when that call is made ([`LiveRecord::refusal`]), not resolved with the rest of
+/// the configuration.
+///
+/// `PartialEq` because a batch is moved under ONE configuration: what the record resolves
+/// to now is compared with what the batch was polled under
+/// ([`LiveRecord::still_configured_as`]).
+#[derive(PartialEq, Eq)]
 struct SqsSourcedPipe {
     /// The queue url the source ARN addresses.
     source_queue: String,
@@ -1147,9 +1227,6 @@ struct SqsSourcedPipe {
     source_arn: String,
     /// The Region the source ARN names — the one its records are polled in and report.
     source_region: String,
-    /// `RoleArn`: the role every stage's call is made as, read off the record each pass so
-    /// a pipe whose role was switched is judged by the one it carries now.
-    role_arn: String,
     /// `BatchSize`: the most records one batch holds.
     batch_size: usize,
     /// `MaximumBatchingWindowInSeconds`, as a span.
@@ -1168,6 +1245,7 @@ struct SqsSourcedPipe {
 }
 
 /// The enrichment a batch is handed to, by the resource its ARN names.
+#[derive(PartialEq, Eq)]
 enum Enrichment {
     /// A Lambda function, invoked with the batch as its payload.
     LambdaFunction { arn: String, region: String },
@@ -1196,6 +1274,7 @@ impl Enrichment {
 }
 
 /// The target an event is delivered to, by the resource its ARN names.
+#[derive(PartialEq, Eq)]
 enum Target {
     /// An Amazon SQS queue: one `SendMessage` per event.
     Queue {
@@ -1290,7 +1369,6 @@ fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
         source_queue,
         source_arn: pipe.source.clone(),
         source_region,
-        role_arn: pipe.role_arn.clone(),
         batch_size,
         batching_window,
         enrichment,

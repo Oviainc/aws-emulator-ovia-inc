@@ -5,7 +5,12 @@
 //! Reports the instances Linux subscription discovery has found for this account,
 //! straight from the discovered-instance store in `crate::state` — the same records
 //! `ListLinuxSubscriptions` aggregates into subscriptions, so the two lists cannot
-//! disagree. A pure read — nothing here writes.
+//! disagree.
+//!
+//! The report MATERIALIZES the discovery pass the account's settings ask for
+//! (`crate::state::discovery`) before it reads that store, exactly as the sibling list
+//! does: discovery reads the EC2 inventory of the configured source Regions whether or not
+//! anybody calls.
 //!
 //! Every discovered record is reported, whatever its `Status`: the modelled
 //! `Instance$Status` member and the documented `Status` filter are what select an
@@ -152,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListLinuxSubscriptionInstancesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -165,7 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filters = input.filters.clone().unwrap_or_default();
         crate::state::validate_filters(&filters, FILTER_NAMES).map_err(into_error)?;
 
-        // A pure read: the page is built from the stored records, and nothing is written.
+        // The same discovery pass the sibling list materializes: both report from the ONE
+        // store of discovered instances, so neither can be shown an inventory the other was
+        // not. As there, a request continuing a walk runs no pass: its cursor is a position
+        // in the list the previous page reported.
+        if input.next_token.is_none() {
+            crate::state::discovery::refresh_discovered_instances(&*self.engine, ctx).await;
+        }
+
+        // A pure read of the store: the page is built from the records discovery has
+        // written, and nothing here writes.
         let state = state.lock();
         let selected: Vec<crate::state::DiscoveredInstanceRecord> = state
             .discovered_instances_in_order()

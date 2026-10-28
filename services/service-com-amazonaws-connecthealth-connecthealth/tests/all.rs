@@ -27,6 +27,8 @@ mod domain_web_app_identity;
 mod encryption_context_projection;
 #[path = "all/error_detail_member.rs"]
 mod error_detail_member;
+#[path = "all/list_domains_account_scope.rs"]
+mod list_domains_account_scope;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/pagination_token_issuance.rs"]
