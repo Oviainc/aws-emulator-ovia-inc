@@ -19,7 +19,10 @@ use service_com_amazonaws_kafka_kafka::state::{
     MAX_REVISIONS_PER_CONFIGURATION, MAX_SERVER_PROPERTIES_BYTES,
 };
 
-use super::kafka_harness::{reported_server_properties, Emulator, Reply};
+use super::kafka_harness::{
+    assert_configuration_arn_resolves_to_nothing, reported_server_properties, Emulator, Reply,
+    REGION,
+};
 
 /// The description a create below stores with revision 1.
 const CREATED_DESCRIPTION: &str = "created";
@@ -274,15 +277,15 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
     }
 
     // One revision per call and no more: the history holds exactly the create's
-    // revision plus one per update, so the first number past it is absent.
+    // revision plus one per update, so the first number past it resolves to
+    // nothing and is refused as the family's unresolvable reference.
     let past_the_end = stored.len() as i64 + 1;
     let missing = describe_revision(&emulator, &arn, past_the_end).await;
-    assert_eq!(
-        (missing.status, missing.error_code()),
-        (404, "NotFoundException"),
-        "case revision={past_the_end}: a revision no update stored must not be found, got {} {}",
-        missing.status,
-        missing.body
+    assert_configuration_arn_resolves_to_nothing(
+        &missing,
+        &format!("revision={past_the_end}"),
+        &arn,
+        REGION,
     );
 }
 
@@ -429,8 +432,11 @@ async fn an_unknown_or_malformed_arn_is_refused_by_update_and_by_the_revision_re
     );
 }
 
-/// RULE: revisions are numbered from 1, so a revision number below that is a bad
-/// request (400) and one above the stored history is not found (404).
+/// RULE: a revision number the configuration never issued resolves to no
+/// revision, so a read of it is refused exactly as an `Arn` that resolves to no
+/// configuration is — one 400 `BadRequestException` carrying the family's fixed
+/// unresolved-reference sentence — whether the number is above the stored
+/// history or below the 1 a create stores.
 #[tokio::test]
 async fn a_revision_number_outside_the_stored_history_is_refused() {
     let emulator = Emulator::new();
@@ -446,24 +452,35 @@ async fn a_revision_number_outside_the_stored_history_is_refused() {
     }
     let latest = updates as i64 + 1;
 
-    // Each published bound of the stored range, and one past each of them.
-    let candidates: Vec<(i64, u16, &str)> = vec![
-        (-1, 400, "BadRequestException"),
-        (0, 400, "BadRequestException"),
-        (1, 200, ""),
-        (latest, 200, ""),
-        (latest + 1, 404, "NotFoundException"),
-        (i64::MAX, 404, "NotFoundException"),
+    // Each bound of the stored range, and one past each of them: `true` is a
+    // revision the history holds, `false` one it does not.
+    let candidates: Vec<(i64, bool)> = vec![
+        (i64::MIN, false),
+        (-1, false),
+        (0, false),
+        (1, true),
+        (latest, true),
+        (latest + 1, false),
+        (i64::MAX, false),
     ];
-    for (revision, status, code) in &candidates {
+    for (revision, held) in &candidates {
         let reply = describe_revision(&emulator, &arn, *revision).await;
-        assert_eq!(
-            (reply.status, reply.error_code()),
-            (*status, *code),
-            "case revision={revision}: expected {status} {code}, got {} {}",
-            reply.status,
-            reply.body
-        );
+        if *held {
+            assert_eq!(
+                (reply.status, reply.at("/revision").as_i64()),
+                (200, Some(*revision)),
+                "case revision={revision}: expected the stored revision, got {} {}",
+                reply.status,
+                reply.body
+            );
+        } else {
+            assert_configuration_arn_resolves_to_nothing(
+                &reply,
+                &format!("revision={revision}"),
+                &arn,
+                REGION,
+            );
+        }
     }
 }
 

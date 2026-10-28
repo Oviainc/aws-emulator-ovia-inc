@@ -41,6 +41,8 @@ mod configuration_lifecycle;
 mod configuration_revision_listing;
 #[path = "all/configuration_revision_properties.rs"]
 mod configuration_revision_properties;
+#[path = "all/configuration_revision_refusal.rs"]
+mod configuration_revision_refusal;
 #[path = "all/configuration_revisions.rs"]
 mod configuration_revisions;
 #[path = "all/connectivity_update.rs"]

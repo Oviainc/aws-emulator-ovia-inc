@@ -4,11 +4,15 @@
 //! Reports one stored revision of an MSK configuration: the `server.properties`
 //! body, description and instant that revision was stored with.
 //!
-//! An `Arn` this endpoint resolves to no configuration — malformed, absent,
-//! already deleted, or another region's — is the configuration family's one
+//! The pair this operation is asked for — an `Arn` and one `Revision` of it —
+//! either resolves to a stored revision or is the configuration family's one
 //! unresolvable-reference `BadRequestException`
 //! ([`crate::state::configuration_arn_not_found`]), the same refusal the delete
-//! and the other configuration readers answer.
+//! and the other configuration readers answer. It is that one refusal whether
+//! the `Arn` resolves to no configuration (malformed, absent, already deleted,
+//! or another region's) or the configuration it resolves to holds no revision of
+//! the number asked for: neither reference resolves, so neither is reported as
+//! the missing resource the other resource families answer with.
 //!
 //! ## Shape of an operation
 //!
@@ -170,49 +174,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ACTIVE` and its revisions never change once stored, so the clock owes
         // this read no transition to materialise.
         let state = state.lock();
-        // ONE condition, one refusal: an `Arn` that resolves to no
-        // configuration of this endpoint's region is the configuration family's
-        // unresolvable-reference bad request, whether it is malformed, absent,
-        // already deleted, or another region's. The configuration is resolved
-        // FIRST, so a request that names no configuration is told that rather
-        // than being judged on the revision it asked of nothing.
-        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
+        // ONE condition, one refusal: the `Arn` and `Revision` this request
+        // carries name one stored revision or they name nothing, and naming
+        // nothing is the configuration family's unresolvable-reference bad
+        // request. It covers every way the pair fails to resolve — an `Arn` that
+        // is malformed, absent, already deleted or another region's, and a
+        // revision number an existing configuration never issued, whether it is
+        // past its history or below the 1 a create stores — so no caller can
+        // tell which half of the reference was wrong, and a revision this
+        // endpoint does not hold is never reported as the missing resource the
+        // other resource families answer with.
+        let revision = state
+            .configuration_in(&region, &input.arn)
+            .and_then(|configuration| configuration.revision(input.revision));
+        let Some(revision) = revision else {
             return Err(DescribeConfigurationRevisionErrorModeled::BadRequestException(
                 crate::state::configuration_arn_not_found(),
             )
             .into());
-        };
-        // Revision numbers start at 1 (the revision a create stores), so a
-        // number below that identifies no revision of any configuration — a
-        // request this operation cannot parse rather than a revision it cannot
-        // find.
-        if input.revision < 1 {
-            return Err(
-                DescribeConfigurationRevisionErrorModeled::BadRequestException(
-                    BadRequestException {
-                        invalid_parameter: Some("Revision".to_string()),
-                        message: Some(format!(
-                            "{} is not a valid configuration revision: revisions are numbered from 1.",
-                            input.revision
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-        // The configuration is there but holds no such revision, so the refusal
-        // names the member actually at fault.
-        let Some(revision) = configuration.revision(input.revision) else {
-            return Err(
-                DescribeConfigurationRevisionErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("Revision".to_string()),
-                    message: Some(crate::state::configuration_revision_missing_message(
-                        &input.arn,
-                        input.revision,
-                    )),
-                })
-                .into(),
-            );
         };
         Ok(DescribeConfigurationRevisionOutput {
             arn: Some(input.arn),

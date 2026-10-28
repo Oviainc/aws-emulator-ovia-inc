@@ -265,7 +265,8 @@ async fn the_revision_reader_is_served_rather_than_refused_as_unimplemented() {
 
     // The revision the store holds, and one past it: each is answered by this
     // operation's own channel, so neither error code is the scaffold's.
-    let candidates: Vec<(&str, i64, &str)> = vec![("stored", 1, ""), ("absent", 2, "NotFoundException")];
+    let candidates: Vec<(&str, i64, &str)> =
+        vec![("stored", 1, ""), ("absent", 2, "BadRequestException")];
     for (case, revision, code) in candidates {
         let reply = emulator.describe_configuration_revision(&arn, revision).await;
         assert_eq!(

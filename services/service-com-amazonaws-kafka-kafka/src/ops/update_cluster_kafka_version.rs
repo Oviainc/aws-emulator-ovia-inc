@@ -282,27 +282,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request names has to be one this region actually holds: the stored
         // reference is what every reader then reports as the cluster's
         // `ConfigurationArn` and `ConfigurationRevision`.
+        // A reference that does not resolve is the configuration family's one
+        // unresolvable-reference bad request, whether the `Arn` names no
+        // configuration of this region or the configuration it names holds no
+        // revision of the number given: the same refusal the configuration
+        // readers answer, so the two cannot drift apart.
         if let Some(configuration_info) = input.configuration_info.as_ref() {
-            let Some(configuration) = state.configuration_in(&region, &configuration_info.arn)
-            else {
+            let resolved = state
+                .configuration_in(&region, &configuration_info.arn)
+                .and_then(|configuration| configuration.revision(configuration_info.revision));
+            if resolved.is_none() {
                 return Err(UpdateClusterKafkaVersionErrorModeled::BadRequestException(
                     crate::state::configuration_arn_not_found(),
                 )
                 .into());
-            };
-            if configuration.revision(configuration_info.revision).is_none() {
-                return Err(
-                    UpdateClusterKafkaVersionErrorModeled::BadRequestException(
-                        BadRequestException {
-                            invalid_parameter: Some("Revision".to_string()),
-                            message: Some(crate::state::configuration_revision_missing_message(
-                                &configuration_info.arn,
-                                configuration_info.revision,
-                            )),
-                        },
-                    )
-                    .into(),
-                );
             }
         }
 

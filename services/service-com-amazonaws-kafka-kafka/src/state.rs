@@ -1320,45 +1320,39 @@ pub const CONFIGURATION_STATE_ACTIVE: &str = "ACTIVE";
 /// `DELETING`.
 pub const CONFIGURATION_STATE_DELETING: &str = "DELETING";
 
-/// What Amazon MSK answers any configuration operation whose `Arn` names no
-/// configuration it holds.
+/// What Amazon MSK answers any configuration operation whose configuration
+/// reference — its `Arn`, or that `Arn` together with the `Revision` of it being
+/// named — resolves to nothing it holds.
 ///
 /// A CONSTANT of the service, not built from the request: every operation of the
-/// configuration family reports an ARN it cannot resolve as a bad request with
-/// this one fixed sentence — not as the `NotFoundException` the other resource
-/// families answer — which is what the behavioural corpus records the real
-/// service answering. The parameter at fault is named by
+/// configuration family reports a reference it cannot resolve as a bad request
+/// with this one fixed sentence — not as the `NotFoundException` the other
+/// resource families answer — which is what the behavioural corpus records the
+/// real service answering, for a configuration that was never minted or already
+/// deleted and for a revision number of an existing configuration that was never
+/// issued alike. The parameter at fault is named by
 /// `BadRequestException$InvalidParameter`, not by the message.
 pub const CONFIGURATION_ARN_NOT_FOUND_MESSAGE: &str = "Configuration ARN does not exist.";
 
-/// The refusal every configuration operation answers an `Arn` that resolves to
-/// no configuration of the endpoint's region with: a `BadRequestException`
-/// (HTTP 400) carrying [`CONFIGURATION_ARN_NOT_FOUND_MESSAGE`] and naming `Arn`
-/// as the parameter at fault.
+/// The refusal every configuration operation answers a configuration reference
+/// that resolves to nothing this endpoint's region holds with: a
+/// `BadRequestException` (HTTP 400) carrying
+/// [`CONFIGURATION_ARN_NOT_FOUND_MESSAGE`] and naming `Arn` as the parameter at
+/// fault. The reference is the `Arn` alone where the operation names only a
+/// configuration, and the `Arn` plus the `Revision` where it names one revision
+/// of one, since a revision number the configuration never issued resolves to a
+/// revision just as little as an absent configuration resolves to a
+/// configuration.
 ///
-/// Built HERE rather than in each handler so the readers, the update and the
-/// delete cannot drift apart on how an unresolvable configuration reference is
-/// reported: one condition, one envelope, whichever operation met it.
+/// Built HERE rather than in each handler so the readers, the update, the delete
+/// and the cluster updates that apply a configuration cannot drift apart on how
+/// an unresolvable configuration reference is reported: one condition, one
+/// envelope, whichever operation met it.
 pub fn configuration_arn_not_found() -> BadRequestException {
     BadRequestException {
         invalid_parameter: Some("Arn".to_string()),
         message: Some(CONFIGURATION_ARN_NOT_FOUND_MESSAGE.to_string()),
     }
-}
-
-/// How a request naming a revision a stored configuration does not hold is
-/// described: the configuration it named, and the revision number that resolves
-/// to nothing in it.
-///
-/// One wording, built here, so every operation that resolves a configuration
-/// REVISION — the revision reader and the cluster updates that apply a
-/// configuration to a cluster — says the same thing about that condition. Each
-/// reports it in the envelope its own resource class answers with: the reader,
-/// whose `Revision` is the resource it was asked for, as a not-found; a cluster
-/// update, whose resource is the cluster and whose configuration reference is a
-/// request member, as a bad request.
-pub fn configuration_revision_missing_message(arn: &str, revision: i64) -> String {
-    format!("Configuration {arn} has no revision {revision}")
 }
 
 /// How this emulator refuses a delete of a configuration a cluster still uses:
