@@ -421,6 +421,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         cloudwatch.as_ref(),
                         &crate::ops::put_events::Handover {
                             event_id: &event.event_id,
+                            bus: &destination_bus,
                             rule: &rule.name,
                             rule_arn: &rule_arn,
                             target,

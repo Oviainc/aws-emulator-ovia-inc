@@ -19,10 +19,11 @@
 //! came of handing that event to each target of each matched rule is appended to
 //! [`ComAmazonawsEventbridgeAwseventsState::invocations`]. Whether EventBridge
 //! may invoke a target at all is decided against the account's OWN IAM records
-//! ([`delivery_refusal`]), and an invocation it may not make is counted on the
-//! rule's `FailedInvocations` metric in the CloudWatch store
-//! ([`count_failed_invocation`]) — both reached through the same shared engine
-//! this service's store lives in, so there is one copy of each fact.
+//! ([`delivery_refusal`]), and what came of each handover is counted on the
+//! rule's own `Invocations` or `FailedInvocations` metric in the CloudWatch store
+//! ([`count_invocation`], [`count_failed_invocation`]) — both reached through the
+//! same shared engine this service's store lives in, so there is one copy of each
+//! fact.
 //!
 //! Beside the bus tree, EventBridge owns the CONNECTION resource
 //! ([`ConnectionRecord`]): the authorization type and credentials
@@ -824,8 +825,8 @@ pub enum InvocationOutcome {
 #[derive(Debug, Clone)]
 pub struct TargetInvocation {
     pub event_id: String,
-    /// The rule whose pattern matched, which is what `FailedInvocations` is
-    /// dimensioned by.
+    /// The rule whose pattern matched, which with its bus is what the rule's
+    /// invocation metrics are dimensioned by.
     pub rule: String,
     pub target_id: String,
     pub target_arn: String,
@@ -856,9 +857,17 @@ pub const METRIC_NAMESPACE: &str = "AWS/Events";
 /// The EventBridge metric counting events a rule could not deliver to a target.
 pub const FAILED_INVOCATIONS_METRIC: &str = "FailedInvocations";
 
-/// The dimension `FailedInvocations` is reported per: the rule whose target
-/// could not be invoked.
+/// The EventBridge metric counting the target invocations a rule made.
+pub const INVOCATIONS_METRIC: &str = "Invocations";
+
+/// One of the two dimensions a rule's invocation metrics are reported per: the
+/// rule whose target was invoked.
 pub const RULE_NAME_DIMENSION: &str = "RuleName";
+
+/// The other: the event bus that rule is on, without which the series would not
+/// name one rule — a rule's identity is the bus it belongs to plus its name
+/// (`rule_arn`), so two buses may each hold a rule of the same name.
+pub const EVENT_BUS_NAME_DIMENSION: &str = "EventBusName";
 
 /// The `StandardUnit` a count of invocations is published in.
 pub const METRIC_UNIT_COUNT: &str = "Count";
@@ -3349,25 +3358,57 @@ pub fn cloudwatch_state<Eng: Send + Sync + 'static>(
 /// Count ONE undeliverable event on the rule's `FailedInvocations` metric.
 ///
 /// "FailedInvocations: the number of invocations that failed permanently"
-/// (EventBridge's published metrics), in the `AWS/Events` namespace and
-/// dimensioned by `RuleName`. The datapoint is appended to the CloudWatch store
-/// directly rather than sent through `PutMetricData`: CloudWatch reserves the
-/// `AWS/` namespaces for the services that own them ("you should not specify a
-/// namespace that begins with `AWS/`", `PutMetricData$Namespace`), so a service's
-/// own metric never travels over that API. It goes into the very store
-/// `ListMetrics` and `GetMetricStatistics` read, through CloudWatch's own
-/// bounded append, so one metric and its reader cannot disagree.
-pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, rule: &str) {
+/// (EventBridge's published metrics).
+pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule: &str) {
+    count_rule_invocation(cloudwatch, FAILED_INVOCATIONS_METRIC, bus, rule);
+}
+
+/// Count ONE invocation a rule's target accepted on the rule's `Invocations`
+/// metric.
+///
+/// "Invocations: the number of times a target is invoked for a rule in response
+/// to an event" (EventBridge's published metrics) — the counterpart of
+/// [`count_failed_invocation`], so a rule that is delivering and one that is
+/// failing are both visible in the same namespace.
+pub fn count_invocation(cloudwatch: &mut CloudWatchState, bus: &str, rule: &str) {
+    count_rule_invocation(cloudwatch, INVOCATIONS_METRIC, bus, rule);
+}
+
+/// Append one observation of the value 1 to `metric` for the rule `rule` of the
+/// bus `bus`.
+///
+/// The series is in the `AWS/Events` namespace and dimensioned by BOTH
+/// [`EVENT_BUS_NAME_DIMENSION`] and [`RULE_NAME_DIMENSION`], which is the rule's
+/// whole identity: "CloudWatch treats each unique combination of dimensions as a
+/// separate metric" (`GetMetricStatistics$Dimensions`), so a series keyed on the
+/// name alone would merge the rules of two buses into one.
+///
+/// The datapoint is appended to the CloudWatch store directly rather than sent
+/// through `PutMetricData`: CloudWatch reserves the `AWS/` namespaces for the
+/// services that own them ("you should not specify a namespace that begins with
+/// `AWS/`", `PutMetricData$Namespace`), so a service's own metric never travels
+/// over that API. It goes into the very store `ListMetrics` and
+/// `GetMetricStatistics` read, through CloudWatch's own bounded append, so one
+/// metric and its reader cannot disagree.
+fn count_rule_invocation(
+    cloudwatch: &mut CloudWatchState,
+    metric: &str,
+    bus: &str,
+    rule: &str,
+) {
     use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as metrics;
 
     let key = metrics::MetricKey {
         namespace: METRIC_NAMESPACE.to_string(),
-        metric_name: FAILED_INVOCATIONS_METRIC.to_string(),
-        dimensions: [(RULE_NAME_DIMENSION.to_string(), rule.to_string())]
-            .into_iter()
-            .collect(),
+        metric_name: metric.to_string(),
+        dimensions: [
+            (EVENT_BUS_NAME_DIMENSION.to_string(), bus.to_string()),
+            (RULE_NAME_DIMENSION.to_string(), rule.to_string()),
+        ]
+        .into_iter()
+        .collect(),
     };
-    // One failed invocation: a single observation of the value 1, at standard
+    // One invocation: a single observation of the value 1, at standard
     // (60-second) storage resolution, counted in `Count` — the unit the metric
     // is published in.
     let datum = metrics::StoredDatum {
@@ -3381,9 +3422,10 @@ pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, rule: &str) {
     };
     if cloudwatch.append_datapoints(key, vec![datum]).is_err() {
         ::tracing::warn!(
+            %bus,
             %rule,
-            "the CloudWatch store is at capacity; a failed EventBridge invocation \
-             could not be counted on {FAILED_INVOCATIONS_METRIC}"
+            "the CloudWatch store is at capacity; an EventBridge target invocation \
+             could not be counted on {metric}"
         );
     }
 }

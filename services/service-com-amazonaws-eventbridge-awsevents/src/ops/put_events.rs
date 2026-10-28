@@ -17,8 +17,9 @@
 //! carrying the whole event envelope. For the kinds AWS invokes under the
 //! target's `RoleArn` it acts as that role, so a role it cannot assume or whose
 //! policies withhold the call is a delivery that fails: the event is sent to the
-//! target's dead-letter queue and counted on `FailedInvocations`. What came of
-//! every handover is recorded in
+//! target's dead-letter queue and counted on `FailedInvocations`, where one the
+//! target accepted is counted on `Invocations` — each per rule of its bus. What
+//! came of every handover is recorded in
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
 //! [`deliver`]).
 //!
@@ -416,6 +417,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         cloudwatch.as_ref(),
                         &Handover {
                             event_id: &dispatch.event_id,
+                            bus: &dispatch.bus,
                             rule: &rule.name,
                             rule_arn: &rule_arn,
                             target,
@@ -775,8 +777,8 @@ fn evaluate(
 /// order, which is the order the event is delivered in.
 ///
 /// The rule a target belongs to is kept rather than flattened away: the rule is
-/// what a delivery failure is accounted against
-/// (`crate::state::FAILED_INVOCATIONS_METRIC` is dimensioned by
+/// what a delivery failure is accounted against (its invocation metrics are
+/// dimensioned by `crate::state::EVENT_BUS_NAME_DIMENSION` and
 /// `crate::state::RULE_NAME_DIMENSION`) and what a dead-letter message names.
 ///
 /// `None` when the entry exhausted its matching budget, so the caller reports
@@ -831,6 +833,10 @@ struct Dispatch {
 /// target, carrying which text.
 pub(crate) struct Handover<'a> {
     pub(crate) event_id: &'a str,
+    /// The event bus the rule is on, which with the rule's name is what the
+    /// rule's invocation metrics are dimensioned by (see
+    /// [`crate::state::count_invocation`]).
+    pub(crate) bus: &'a str,
     pub(crate) rule: &'a str,
     pub(crate) rule_arn: &'a str,
     pub(crate) target: &'a CompiledTarget,
@@ -1134,7 +1140,8 @@ impl DeliveryBudget {
 /// The rule AWS follows: for every target of a rule whose `EventPattern`
 /// matched, EventBridge makes the API call that target's service is invoked by,
 /// carrying the whole event envelope, and an invocation it cannot make is sent to
-/// the target's dead-letter queue and counted on `FailedInvocations`. WHICH
+/// the target's dead-letter queue and counted on `FailedInvocations` while one
+/// the target accepted is counted on `Invocations`. WHICH
 /// identity it makes that call as depends on the target kind, and so does whether
 /// the target's `RoleArn` governs it at all: "for EC2 instances, Kinesis data
 /// streams, Step Functions state machines and API Gateway APIs, EventBridge
@@ -1267,8 +1274,11 @@ pub(crate) async fn deliver(
                 .await;
             }
         }
-        count_failed_invocation(cloudwatch, handover.rule);
     }
+    // Every handover that reached the target's API is counted on the rule's own
+    // invocation metrics, whichever way it went — a rule that is delivering is
+    // as observable as one that is failing.
+    count_invocation(cloudwatch, handover, &outcome);
     Some(outcome)
 }
 
@@ -1963,21 +1973,37 @@ async fn dead_letter(
     }
 }
 
-/// Count one undeliverable event on the rule's `FailedInvocations` metric.
+/// Count what came of ONE handover on the rule's own invocation metrics.
+///
+/// WHICH metric follows from the outcome: a target whose API call accepted the
+/// event is counted on `Invocations`, and one whose invocation was permanently
+/// refused on `FailedInvocations`. A handover that was NOT ATTEMPTED is counted
+/// on neither — nothing was invoked, and a gap in this emulator is not a failure
+/// AWS reports.
 ///
 /// The decision is EventBridge's; where the metric LIVES and how it is appended
-/// is CloudWatch's, so the write itself is
+/// is CloudWatch's, so the write itself is [`crate::state::count_invocation`] /
 /// [`crate::state::count_failed_invocation`] over the CloudWatch store in this
 /// same engine. `None` is a deployment with no CloudWatch mounted, which is
 /// nothing to count on.
-fn count_failed_invocation(
+fn count_invocation(
     cloudwatch: Option<&::engine::ServiceState<crate::state::CloudWatchState>>,
-    rule: &str,
+    handover: &Handover<'_>,
+    outcome: &crate::state::InvocationOutcome,
 ) {
     let Some(cloudwatch) = cloudwatch else {
         return;
     };
-    crate::state::count_failed_invocation(&mut cloudwatch.lock(), rule);
+    let (bus, rule) = (handover.bus, handover.rule);
+    match outcome {
+        crate::state::InvocationOutcome::Invoked => {
+            crate::state::count_invocation(&mut cloudwatch.lock(), bus, rule);
+        }
+        crate::state::InvocationOutcome::Failed { .. } => {
+            crate::state::count_failed_invocation(&mut cloudwatch.lock(), bus, rule);
+        }
+        crate::state::InvocationOutcome::NotAttempted(_) => {}
+    }
 }
 
 /// The queue url of an SQS queue ARN, or `None` when the ARN names something else.

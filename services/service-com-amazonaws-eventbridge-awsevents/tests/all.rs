@@ -85,6 +85,8 @@ mod replay_name_opt_out;
 mod reserved_event_source;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/rule_invocation_metrics.rs"]
+mod rule_invocation_metrics;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
 #[path = "all/rule_state_control.rs"]

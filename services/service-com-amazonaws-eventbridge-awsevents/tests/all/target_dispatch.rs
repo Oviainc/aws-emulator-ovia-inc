@@ -34,8 +34,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    ComAmazonawsEventbridgeAwseventsState, InvocationOutcome, FAILED_INVOCATIONS_METRIC,
-    METRIC_NAMESPACE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
+    ComAmazonawsEventbridgeAwseventsState, InvocationOutcome, DEFAULT_EVENT_BUS_NAME,
+    EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, METRIC_NAMESPACE,
+    RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
 };
 use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
@@ -150,7 +151,7 @@ async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value)
     rpc(emulator, "sqs", "AmazonSQS", "1.0", operation, body).await
 }
 
-async fn sfn(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn sfn(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(
         emulator,
         "states",
@@ -844,25 +845,31 @@ pub(crate) async fn read_shards_until(
     }
 }
 
-/// The `Sum` of the rule's `FailedInvocations` over a window around now, and the
-/// series CloudWatch holds in EventBridge's namespace.
-async fn failed_invocations(emulator: &Emulator, rule: &str) -> (f64, Vec<Value>) {
-    let (status, listed) = cloudwatch(
-        emulator,
-        "ListMetrics",
-        &json!({ "Namespace": METRIC_NAMESPACE }),
-    )
-    .await;
-    assert_eq!(status, 200, "ListMetrics answered {status} {listed}");
-    let series = listed["Metrics"].as_array().cloned().unwrap_or_default();
+/// The dimensions a rule's invocation metrics are reported under: the bus the
+/// rule is on and the rule's name.
+pub(crate) fn rule_dimensions(bus: &str, rule: &str) -> Value {
+    json!([
+        { "Name": EVENT_BUS_NAME_DIMENSION, "Value": bus },
+        { "Name": RULE_NAME_DIMENSION, "Value": rule },
+    ])
+}
+
+/// The `Sum` of `metric` for the rule `rule` of the bus `bus`, over a window
+/// around now, in EventBridge's own namespace.
+pub(crate) async fn metric_sum(
+    emulator: &Emulator,
+    metric: &str,
+    bus: &str,
+    rule: &str,
+) -> f64 {
     let now = epoch_seconds();
     let (status, stats) = cloudwatch(
         emulator,
         "GetMetricStatistics",
         &json!({
             "Namespace": METRIC_NAMESPACE,
-            "MetricName": FAILED_INVOCATIONS_METRIC,
-            "Dimensions": [{ "Name": RULE_NAME_DIMENSION, "Value": rule }],
+            "MetricName": metric,
+            "Dimensions": rule_dimensions(bus, rule),
             "StartTime": now - 300.0,
             "EndTime": now + 300.0,
             "Period": 600,
@@ -871,7 +878,7 @@ async fn failed_invocations(emulator: &Emulator, rule: &str) -> (f64, Vec<Value>
     )
     .await;
     assert_eq!(status, 200, "GetMetricStatistics answered {status} {stats}");
-    let sum = stats["Datapoints"]
+    stats["Datapoints"]
         .as_array()
         .map(|points| {
             points
@@ -879,8 +886,35 @@ async fn failed_invocations(emulator: &Emulator, rule: &str) -> (f64, Vec<Value>
                 .filter_map(|point| point["Sum"].as_f64())
                 .sum::<f64>()
         })
-        .unwrap_or_default();
-    (sum, series)
+        .unwrap_or_default()
+}
+
+/// Every series CloudWatch holds in EventBridge's namespace.
+pub(crate) async fn published_series(emulator: &Emulator) -> Vec<Value> {
+    let (status, listed) = cloudwatch(
+        emulator,
+        "ListMetrics",
+        &json!({ "Namespace": METRIC_NAMESPACE }),
+    )
+    .await;
+    assert_eq!(status, 200, "ListMetrics answered {status} {listed}");
+    listed["Metrics"].as_array().cloned().unwrap_or_default()
+}
+
+/// What the rule's two invocation metrics count, and the series CloudWatch holds
+/// in EventBridge's namespace: `(Invocations, FailedInvocations, series)`.
+async fn invocation_metrics(emulator: &Emulator, rule: &str) -> (f64, f64, Vec<Value>) {
+    let series = published_series(emulator).await;
+    let invoked =
+        metric_sum(emulator, INVOCATIONS_METRIC, DEFAULT_EVENT_BUS_NAME, rule).await;
+    let failed = metric_sum(
+        emulator,
+        FAILED_INVOCATIONS_METRIC,
+        DEFAULT_EVENT_BUS_NAME,
+        rule,
+    )
+    .await;
+    (invoked, failed, series)
 }
 
 /// One row of the role table: why the role does or does not bar the delivery.
@@ -999,7 +1033,7 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
             .map(|(_, _, outcome)| outcome.clone())
             .unwrap_or_else(|| panic!("case {:?}: nothing was recorded", row.case));
         let dead_letters = drain(&emulator, &dead_letter_url).await;
-        let (sum, series) = failed_invocations(&emulator, "guarded").await;
+        let (invoked, sum, series) = invocation_metrics(&emulator, "guarded").await;
         match row.expected {
             Expected::Invoked => {
                 assert_eq!(
@@ -1018,9 +1052,20 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                     "case {:?}: a delivered event counts no failed invocation, got {sum}",
                     row.case
                 );
-                assert!(
-                    series.is_empty(),
-                    "case {:?}: no series is published for a delivery that worked, got {series:?}",
+                assert_eq!(
+                    invoked, 1.0,
+                    "case {:?}: a delivered event counts one invocation, got {invoked} \
+                     over the series {series:?}",
+                    row.case
+                );
+                assert_eq!(
+                    series,
+                    vec![json!({
+                        "Namespace": METRIC_NAMESPACE,
+                        "MetricName": INVOCATIONS_METRIC,
+                        "Dimensions": rule_dimensions(DEFAULT_EVENT_BUS_NAME, "guarded"),
+                    })],
+                    "case {:?}: expected the rule's own Invocations series, got {series:?}",
                     row.case
                 );
                 let delivered = observe.read(&emulator).await;
@@ -1092,11 +1137,17 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                     row.case
                 );
                 assert_eq!(
+                    invoked, 0.0,
+                    "case {:?}: an undeliverable event counts no invocation, got {invoked} \
+                     over the series {series:?}",
+                    row.case
+                );
+                assert_eq!(
                     series,
                     vec![json!({
                         "Namespace": METRIC_NAMESPACE,
                         "MetricName": FAILED_INVOCATIONS_METRIC,
-                        "Dimensions": [{ "Name": RULE_NAME_DIMENSION, "Value": "guarded" }],
+                        "Dimensions": rule_dimensions(DEFAULT_EVENT_BUS_NAME, "guarded"),
                     })],
                     "case {:?}: expected the rule's own FailedInvocations series, got {series:?}",
                     row.case
