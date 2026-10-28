@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Patches a workflow this account holds ([`crate::state::WorkflowEntry::apply_update`]):
+//! `Name` addresses the record, each other member the request carries replaces the stored
+//! one, and a member the request omits is left as it was. The update answers with the name
+//! it wrote to; `GetWorkflow` reads the patched record back.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on — exactly as
+            // `CreateWorkflow` reports it.
+            return Err(UpdateWorkflowErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue workflow store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The workflow this request addresses is resolved FIRST: a `Name` ("Name of the
+        // workflow to be updated") this account holds no workflow under is a miss whatever
+        // else the request carries, so identity is settled before anything is written.
+        let mut store = state.lock();
+        let Some(entry) = store.workflow_mut(&input.name) else {
+            return Err(UpdateWorkflowErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::workflow_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` and every member's length, pattern and type are refused at
+        // the boundary, and the model constrains nothing else this update carries — so the
+        // only check left is the miss the STORE answers, above.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkflow"))
+        // A request that names no member to change asks for no change: nothing is written,
+        // so the workflow's `LastModifiedOn` is left where the last write that did change
+        // something put it.
+        if crate::state::workflow_update_names_a_change(&input) {
+            entry.apply_update(&input, ::std::time::SystemTime::now());
+            ::tracing::info!(
+                operation = "UpdateWorkflow",
+                workflow = %input.name,
+                "updated a Glue workflow"
+            );
+        }
+
+        // "The name of the workflow which was specified in input" — the record the write
+        // landed on, which is what a later read addresses it by.
+        Ok(UpdateWorkflowOutput {
+            name: Some(input.name),
+        })
     }
 }
