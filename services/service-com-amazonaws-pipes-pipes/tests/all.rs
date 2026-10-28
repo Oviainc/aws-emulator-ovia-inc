@@ -21,6 +21,8 @@ mod pipe_data_plane;
 mod pipe_fifo_delivery;
 #[path = "all/pipe_description.rs"]
 mod pipe_description;
+#[path = "all/pipe_execution_role.rs"]
+mod pipe_execution_role;
 #[path = "all/pipe_lifecycle.rs"]
 mod pipe_lifecycle;
 #[path = "all/pipe_lifecycle_conflicts.rs"]

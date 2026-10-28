@@ -99,6 +99,8 @@ mod start_experiment_run;
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]
 mod stop_deployment;
+#[path = "all/stop_experiment_run.rs"]
+mod stop_experiment_run;
 #[path = "all/update_application.rs"]
 mod update_application;
 #[path = "all/update_configuration_profile.rs"]
