@@ -77,6 +77,8 @@ mod resource_permission_reads;
 mod resource_permissions;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/settings_destroyed_databases.rs"]
+mod settings_destroyed_databases;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/sub_check_result_cursor.rs"]
