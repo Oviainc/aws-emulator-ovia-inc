@@ -125,6 +125,12 @@ pub struct RequestedWindow {
 /// span ([`period_validation_message`]), a request naming all three members, or a
 /// COMPLETED pair of bounds that is no interval ([`validate_interval`], so a zero-length
 /// `period` is refused as the zero-width window it names).
+///
+/// WHICH single member a request may name on its own is the calling operation's rule, not
+/// this one: `GetProfile`'s two bound members each document a companion they require, while
+/// `BatchGetFrameMetricData`'s document none and that handler completes an open side
+/// itself. So this read states only what the trio MEANS, and an operation whose members
+/// carry such a rule applies it before asking.
 pub fn requested_window(
     start_time: Option<DateTime>,
     end_time: Option<DateTime>,

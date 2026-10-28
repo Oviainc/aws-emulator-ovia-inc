@@ -15,7 +15,7 @@
 //!
 //! Rows vary what the rule generalises over: how the range is NAMED (both bounds, a start
 //! completed forwards by a period, an end completed backwards by a period, a period alone,
-//! a single open bound, nothing at all), its WIDTH (two months, twice the limit, one
+//! nothing at all), its WIDTH (two months, twice the limit, one
 //! second over it, one millisecond over it, exactly the limit, a day, a millisecond), how
 //! the length is SPELLED (days, hours, minutes, a fraction of a second, every field at
 //! once) and where on the time axis the range sits (pre-epoch, across the epoch, a later
@@ -70,7 +70,9 @@ enum Named {
         end: &'static str,
         period: &'static str,
     },
-    /// A request that names no pair: a period on its own, one open bound, or nothing.
+    /// A request that names no pair: a period on its own, or nothing at all. A single
+    /// BOUND is not one of these — this operation's bound members require a companion,
+    /// which is [`crate::get_profile_window_companion`]'s rule.
     Open { query: &'static str },
 }
 
@@ -364,20 +366,9 @@ fn rows() -> Vec<Row> {
             },
             expected: Expected::Allowed,
         },
-        Row {
-            label: "a start alone, which names no length",
-            named: Named::Open {
-                query: "?startTime=2000-01-01T00:00:00Z",
-            },
-            expected: Expected::Allowed,
-        },
-        Row {
-            label: "an end alone, which names no length",
-            named: Named::Open {
-                query: "?endTime=2099-01-01T00:00:00Z",
-            },
-            expected: Expected::Allowed,
-        },
+        // A single BOUND names no length either, but it is refused before this rule is
+        // reached: the operation's bound members must be accompanied by the other bound or
+        // by `period` ([`crate::get_profile_window_companion`]), so it is no row here.
         Row {
             label: "no parameters at all",
             named: Named::Open { query: "" },

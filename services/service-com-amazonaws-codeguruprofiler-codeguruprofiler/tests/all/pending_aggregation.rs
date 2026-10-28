@@ -17,14 +17,15 @@
 //!
 //! Rows vary what the rule generalises over: how the requested window is expressed (no
 //! parameters, each of the three modelled aggregation periods alone, both bounds, each
-//! bound alone), the payload's size and bytes, the media type it was posted under, and
-//! how many profiles the group holds.
+//! bound with the window's length), the payload's size and bytes, the media type it was
+//! posted under, and how many profiles the group holds.
 //!
 //! The harness is the one [`crate::profiling_group_lifecycle`] already builds, and the
 //! aggregation is let fall due through the one shared helper every suite uses.
 
 use crate::profiling_group_lifecycle::{
     Answer, Harness, PROFILE_START_MILLIS, ion_profile, json_profile, servable_window,
+    servable_window_from_start, servable_window_to_end,
 };
 
 /// The fixed text a 404 about absent profile DATA carries
@@ -148,15 +149,18 @@ fn rows() -> Vec<Row> {
             posts: 3,
         },
         Row {
-            label: "a start bound alone",
-            query: format!("?startTime={WIDE_START}"),
+            label: "a start bound and a length",
+            // A `GetProfile` bound must be accompanied by the other bound or by the
+            // window's length, so a servable window named from ONE bound names the length
+            // too ([`crate::get_profile_window_companion`] owns that rule).
+            query: servable_window_from_start(),
             content_type: "application/json",
             filler: 0,
             posts: 1,
         },
         Row {
-            label: "an end bound alone",
-            query: format!("?endTime={WIDE_END}"),
+            label: "an end bound and a length",
+            query: servable_window_to_end(),
             content_type: "application/x-amzn-ion",
             filler: 0,
             posts: 2,

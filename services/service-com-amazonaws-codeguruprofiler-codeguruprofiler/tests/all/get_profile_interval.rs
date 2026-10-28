@@ -13,8 +13,8 @@
 //! aggregated profile.
 //!
 //! Rows vary what the rule generalises over: how the window was NAMED (both bounds, a
-//! start completed forwards by a period, an end completed backwards by a period, a single
-//! open bound, a period alone), the direction and width of the resulting pair (a day, a
+//! start completed forwards by a period, an end completed backwards by a period, a period
+//! alone), the direction and width of the resulting pair (a day, a
 //! second, a millisecond, nothing at all), the spelling of a zero-length duration, and
 //! where on the time axis the bounds sit (pre-epoch, the epoch itself, a later instant).
 //! The sibling [`crate::interval_validation`] table asserts the same rule across every
@@ -64,7 +64,9 @@ enum Window {
         end: &'static str,
         period: &'static str,
     },
-    /// A request that names no pair at all: one open bound, or a period on its own.
+    /// A request that names no pair at all: a period on its own, or nothing. A single
+    /// BOUND is not one of these — this operation's bound members require a companion,
+    /// which is [`crate::get_profile_window_companion`]'s rule.
     Open { query: &'static str },
 }
 
@@ -279,20 +281,9 @@ fn rows() -> Vec<Row> {
             },
             expected: Expected::Accepted,
         },
-        Row {
-            label: "a start alone, leaving the end open",
-            window: Window::Open {
-                query: "?startTime=2026-01-01T00:00:00Z",
-            },
-            expected: Expected::Accepted,
-        },
-        Row {
-            label: "an end alone, leaving the start open",
-            window: Window::Open {
-                query: "?endTime=2026-01-01T00:00:00Z",
-            },
-            expected: Expected::Accepted,
-        },
+        // A single bound names no pair either, but it never reaches this rule: the
+        // operation's bound members must be accompanied by the other bound or by `period`
+        // ([`crate::get_profile_window_companion`]), so it is no row here.
         Row {
             label: "a period alone, which names no pair",
             window: Window::Open {

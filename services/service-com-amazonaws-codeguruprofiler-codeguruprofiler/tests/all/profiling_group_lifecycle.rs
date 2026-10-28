@@ -134,6 +134,32 @@ pub(crate) fn servable_window() -> String {
     )
 }
 
+/// The ISO 8601 length of the window [`servable_window`] names, for the two namings below.
+const SERVABLE_WINDOW_LENGTH: &str = "P2D";
+
+/// The SAME window [`servable_window`] names, named instead with its START and its LENGTH
+/// — the other way the operation's doc allows a window to be named ("Used with `startTime`
+/// or `endTime` to specify the time range for the returned aggregated profile",
+/// `smithy_query(query="doc", shape="GetProfileRequest", member="period")`). `pub(crate)`
+/// for the same reason as [`servable_window`]: a suite that needs this naming of a servable
+/// window takes it from here.
+pub(crate) fn servable_window_from_start() -> String {
+    let now = aws_smithy_types::DateTime::from(std::time::SystemTime::now()).secs();
+    format!(
+        "?startTime={}&period={SERVABLE_WINDOW_LENGTH}",
+        iso_second(now - DAY_SECONDS)
+    )
+}
+
+/// The same window again, named with its END and its LENGTH.
+pub(crate) fn servable_window_to_end() -> String {
+    let now = aws_smithy_types::DateTime::from(std::time::SystemTime::now()).secs();
+    format!(
+        "?endTime={}&period={SERVABLE_WINDOW_LENGTH}",
+        iso_second(now + DAY_SECONDS)
+    )
+}
+
 /// One HTTP answer, reduced to what these tests assert on. `pub(crate)` so the other
 /// suites in this test target drive the same harness instead of forking it.
 pub(crate) struct Answer {
@@ -1323,7 +1349,9 @@ async fn get_profile_selects_by_the_requested_time_range() {
         .expect("the post must be recorded");
 
     // Rows: each way the operation's doc allows a window to be named. A window that
-    // contains the receipt time serves the profile; one that does not is a 404.
+    // contains the receipt time serves the profile; one that does not is a 404. A LONE
+    // bound is not one of those ways — the bound members each require a companion — and is
+    // refused; [`crate::get_profile_window_companion`] owns that rule.
     let cases: Vec<(&str, String, u16)> = vec![
         ("no parameters", String::new(), 200),
         (
@@ -1332,24 +1360,26 @@ async fn get_profile_selects_by_the_requested_time_range() {
             200,
         ),
         (
-            "a start before the profile",
+            "a start and a length around the profile",
+            servable_window_from_start(),
+            200,
+        ),
+        (
+            "an end and a length around the profile",
+            servable_window_to_end(),
+            200,
+        ),
+        // The bound members' own rule: "If you specify startTime, then you must also
+        // specify period or endTime, but not both", and the mirror sentence on `endTime`.
+        (
+            "a start alone, with neither companion",
             "?startTime=2000-01-01T00:00:00Z".to_string(),
-            200,
+            400,
         ),
         (
-            "a start after the profile",
-            "?startTime=2999-01-01T00:00:00Z".to_string(),
-            404,
-        ),
-        (
-            "an end after the profile",
+            "an end alone, with neither companion",
             "?endTime=2999-01-01T00:00:00Z".to_string(),
-            200,
-        ),
-        (
-            "an end before the profile",
-            "?endTime=2000-01-01T00:00:00Z".to_string(),
-            404,
+            400,
         ),
         // A PAIR of bounds around the profile, within the maximum range the operation's
         // doc allows ("The maximum time range allowed is 7 days"), which is what

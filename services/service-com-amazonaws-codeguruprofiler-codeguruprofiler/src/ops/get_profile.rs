@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfile
-//! Returns the AGGREGATED profile of a group over a requested window — no wider than the
-//! maximum time range the operation's doc allows — in the
+//! Returns the AGGREGATED profile of a group over a requested window — named with a
+//! combination of the window members the operation's doc allows, and no wider than the
+//! maximum time range it allows — in the
 //! representation the request accepts and bounded to the call-stack depth it asks for:
 //! the bytes exactly as `PostAgentProfile` uploaded them when the caller accepts the
 //! representation their bytes are a document in and asks for no depth bound, and
@@ -141,6 +142,22 @@ const MAX_TIME_RANGE_TEXT: &str = "P7D";
 /// refusal.
 const TIME_RANGE_SUBJECT: &str = "the time range for the requested aggregated profile";
 
+/// What this operation says when a request names ONE of the two bounds of the window and
+/// none of the companions the model allows beside it: `named` is the bound the request
+/// carried and `companion` the other one, so the sentence tells the caller which member it
+/// has to add.
+///
+/// SOURCE: the two bound members state the rule themselves — "If you specify `startTime`,
+/// then you must also specify `period` or `endTime`, but not both"
+/// (`smithy_query(query="doc", shape="GetProfileRequest", member="startTime")`) and the
+/// mirror sentence on `endTime` — which is why the two bounds share one sentence with the
+/// member names swapped.
+fn companion_required_message(named: &str, companion: &str) -> String {
+    format!(
+        "If you specify {named}, then you must also specify period or {companion}, but not both"
+    )
+}
+
 /// The time window a `GetProfile` request selects over, as (start, end) bounds either
 /// of which may be open.
 ///
@@ -154,6 +171,14 @@ const TIME_RANGE_SUBJECT: &str = "the time range for the requested aggregated pr
 /// the LATEST profile — and the range the request ends up naming is no longer than
 /// [`MAX_TIME_RANGE`], which the service's one window-length rule
 /// ([`crate::state::validate_window_length`]) bounds it by.
+///
+/// On top of that shared reading, THIS operation's bound members carry a mutual-companion
+/// rule the others' do not ([`companion_required_message`]): a request that names one
+/// bound must also name one of the two companions — the window's length, or the other
+/// bound — so the only member this operation serves on its own is `period`. A bound on its
+/// own is refused rather than served as a half-open range, which is also what keeps every
+/// window this operation selects over inside [`MAX_TIME_RANGE`]: a request that got past
+/// here either names a PAIR of bounds, whose distance is bounded, or no bound at all.
 #[allow(clippy::type_complexity)]
 fn requested_window(
     input: &GetProfileInput,
@@ -164,6 +189,22 @@ fn requested_window(
     ),
     GetProfileError,
 > {
+    // Decided on the members as the REQUEST gave them, before the trio is read into a
+    // window: it is about which members were named, not about the instants they name.
+    match (input.start_time, input.end_time, input.period.as_deref()) {
+        (Some(_), None, None) => {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                companion_required_message("startTime", "endTime"),
+            ));
+        }
+        (None, Some(_), None) => {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                companion_required_message("endTime", "startTime"),
+            ));
+        }
+        _ => {}
+    }
+
     let window = crate::state::requested_window(
         input.start_time,
         input.end_time,

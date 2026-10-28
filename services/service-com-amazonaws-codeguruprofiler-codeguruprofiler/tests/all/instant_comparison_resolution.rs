@@ -13,7 +13,8 @@
 //!
 //! Rows vary what the rule generalises over: which operation makes the comparison
 //! (`GetProfile`'s window filter, `ListFindingsReports`' range filter and its stable
-//! order), which bounds the request names (both, each alone), the sub-second part of the
+//! order), which bounds the request names (both, or one with the window's length), the
+//! sub-second part of the
 //! stored instant (none, one nanosecond, the last nanosecond of a second, a half
 //! second), the SIGN and size of the gap between the stored instant and the bound (one
 //! nanosecond, hundreds of nanoseconds, a whole second), and whether that gap crosses a
@@ -85,6 +86,9 @@ fn parsed(rendered: &str) -> (i64, u32) {
 }
 
 /// One `GetProfile` window, as nanosecond offsets from the stored receipt time.
+///
+/// A row that names ONE bound names the window's LENGTH beside it ([`COMPANION_PERIOD`]),
+/// because this operation's bound members require a companion.
 #[derive(Debug)]
 struct WindowCase {
     label: &'static str,
@@ -94,10 +98,18 @@ struct WindowCase {
     start_offset: Option<i64>,
     /// `endTime`, likewise.
     end_offset: Option<i64>,
-    /// Whether the receipt is inside the window the two bounds name, so the stored
+    /// Whether the receipt is inside the window the request names, so the stored
     /// profile must be served.
     served: bool,
 }
+
+/// The window LENGTH a row naming a single bound names beside it: a `GetProfile` bound must
+/// be accompanied by the other bound or by `period`
+/// ([`crate::get_profile_window_companion`]), so a row about ONE bound completes the window
+/// with this length — forwards from a start, backwards from an end. One second: far wider
+/// than the nanosecond offsets the rows vary by, so what each row still turns on is the
+/// exactness of the comparison at the named bound.
+const COMPANION_PERIOD: &str = "PT1S";
 
 impl WindowCase {
     fn query(&self, receipt: (i64, u32)) -> String {
@@ -107,6 +119,9 @@ impl WindowCase {
         }
         if let Some(offset) = self.end_offset {
             parameters.push(format!("endTime={}", iso_at(shifted(receipt, offset))));
+        }
+        if parameters.len() == 1 {
+            parameters.push(format!("period={COMPANION_PERIOD}"));
         }
         if parameters.is_empty() {
             String::new()
@@ -228,28 +243,28 @@ fn window_cases() -> Vec<WindowCase> {
             served: true,
         },
         WindowCase {
-            label: "a start bound alone, one nanosecond after the receipt",
+            label: "a start bound with a length, one nanosecond after the receipt",
             receipt_nanos: 7,
             start_offset: Some(1),
             end_offset: None,
             served: false,
         },
         WindowCase {
-            label: "a start bound alone, at the receipt",
+            label: "a start bound with a length, at the receipt",
             receipt_nanos: 7,
             start_offset: Some(0),
             end_offset: None,
             served: true,
         },
         WindowCase {
-            label: "an end bound alone, one nanosecond before the receipt",
+            label: "an end bound with a length, one nanosecond before the receipt",
             receipt_nanos: 7,
             start_offset: None,
             end_offset: Some(-1),
             served: false,
         },
         WindowCase {
-            label: "an end bound alone, at the receipt",
+            label: "an end bound with a length, at the receipt",
             receipt_nanos: 7,
             start_offset: None,
             end_offset: Some(0),
