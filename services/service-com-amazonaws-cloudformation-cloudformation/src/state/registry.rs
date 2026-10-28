@@ -584,19 +584,23 @@ impl StoredExtension {
     /// given account and Region", so there is one configuration per alias, not a history),
     /// keeping its place and its ARN. A new alias is added, and the oldest is reclaimed past
     /// [`MAX_TYPE_CONFIGURATIONS`] so the record cannot grow without limit.
+    ///
+    /// What is stored is the document as the registry can hold it
+    /// ([`ascii_configuration`]), which is what a later read reports.
     pub fn set_configuration(
         &mut self,
         alias: &str,
         configuration: &str,
         now: SystemTime,
     ) -> String {
+        let configuration = ascii_configuration(configuration);
         let arn = type_configuration_arn(&self.region, &self.type_kind, &self.type_name, alias);
         if let Some(held) = self
             .configurations
             .iter_mut()
             .find(|held| held.alias == alias)
         {
-            held.configuration = configuration.to_string();
+            held.configuration = configuration;
             held.last_updated = now;
             return held.arn.clone();
         }
@@ -608,7 +612,7 @@ impl StoredExtension {
         self.configurations.push(StoredTypeConfiguration {
             alias: alias.to_string(),
             arn: arn.clone(),
-            configuration: configuration.to_string(),
+            configuration,
             last_updated: now,
         });
         arn
@@ -1067,4 +1071,20 @@ fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
         configurations: Vec::new(),
         versions: vec![version],
     }
+}
+
+/// The configuration document the registry holds for what one `SetTypeConfiguration` call
+/// submitted: the submitted text with every codepoint outside ASCII replaced by one `?`.
+///
+/// CloudFormation stores an extension's configuration data as ASCII text, so a document that
+/// carries a codepoint outside it reads back with that codepoint replaced one-for-one — the
+/// document's STRUCTURE is untouched (every delimiter, name and nesting level survives,
+/// because each of those is ASCII already) and only the characters it cannot hold change.
+/// Applied at the WRITE, so what a read reports is what the registry holds rather than a
+/// second transformation a read invented.
+pub fn ascii_configuration(configuration: &str) -> String {
+    configuration
+        .chars()
+        .map(|character| if character.is_ascii() { character } else { '?' })
+        .collect()
 }

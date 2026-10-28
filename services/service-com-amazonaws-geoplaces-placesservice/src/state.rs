@@ -942,6 +942,7 @@ fn lookup_language<'a, T>(
         {
             return Some((tag.as_str(), value));
         }
+        // No subtag left to drop: the requested language matches nothing in the table.
         let cut = candidate.rfind('-')?;
         candidate = &candidate[..cut];
     }

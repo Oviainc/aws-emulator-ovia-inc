@@ -25,6 +25,83 @@
 //! carrying none was verified through the account's own Amazon Web Services Marketplace
 //! account, the other identity an account can be verified by. [`StoredPublisher::connection_arn`]
 //! is therefore what [`StoredPublisher::identity_provider`] is computed from.
+//!
+//! ## What an account has to BE before it can register
+//!
+//! Accepting the terms is a property of the REQUEST; being allowed to publish at all is a
+//! property of the ACCOUNT. CloudFormation registers a publisher only for an account that is
+//! already enrolled as an Amazon Web Services Marketplace seller, and that enrollment is
+//! made outside this API — no operation performs it and none reports it — so it is a property
+//! of the emulated account rather than a record a call could write
+//! ([`MarketplaceSellerEnrollment`]). An account that is not enrolled is refused with the
+//! registry's own modelled `CFNRegistryException` and [`NOT_A_MARKETPLACE_SELLER`], writing
+//! nothing: that refusal is the only signal the API gives that the enrollment is missing, and
+//! it is what keeps every operation asking "is this account a publisher"
+//! (`DescribePublisher`, `TestType`, `PublishType`) answering the not-a-publisher refusal.
+
+/// The sentence a publisher registration from an account that is not an enrolled Amazon Web
+/// Services Marketplace seller is refused with.
+///
+/// Entirely FIXED text: no part of it comes from the request or from the store, like the
+/// registry's other account-level refusals.
+pub const NOT_A_MARKETPLACE_SELLER: &str =
+    "You must be a valid AWS Marketplace Seller to be registered as a publisher";
+
+/// The environment variable an operator uses to say that this emulated account IS enrolled
+/// as an Amazon Web Services Marketplace seller, read once when this service's store is
+/// created.
+///
+/// The enrollment is a console-only step outside this API, so there is no operation that
+/// could grant it and no request member that could carry it. Unset means NOT enrolled,
+/// which is what an account that never enrolled has: a publisher registration from it is
+/// refused with [`NOT_A_MARKETPLACE_SELLER`].
+pub const MARKETPLACE_SELLER_ENV: &str = "CLOUDFORMATION_MARKETPLACE_SELLER";
+
+/// Whether `setting` says this account is an enrolled seller: `1`, `true`, `yes` or `on` in
+/// any case says so, and anything else — including an empty value or a typo — says nothing
+/// rather than being guessed at.
+pub fn parse_marketplace_seller(setting: &str) -> bool {
+    matches!(
+        setting.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Whether the account this emulator stands for is enrolled as an Amazon Web Services
+/// Marketplace seller.
+///
+/// A type of its own rather than a bare `bool`, so the state struct keeps its derived
+/// `Default` while this one field defaults to what [`MARKETPLACE_SELLER_ENV`] says — and so
+/// a caller cannot pass the flag to the gate by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketplaceSellerEnrollment(bool);
+
+impl MarketplaceSellerEnrollment {
+    /// An account the operator has said is an enrolled seller.
+    pub const fn enrolled() -> Self {
+        Self(true)
+    }
+
+    /// An account nobody has said anything about, which is an account that never enrolled.
+    pub const fn not_enrolled() -> Self {
+        Self(false)
+    }
+
+    /// Whether this account may be registered as an extension publisher at all.
+    pub const fn is_enrolled(self) -> bool {
+        self.0
+    }
+}
+
+impl Default for MarketplaceSellerEnrollment {
+    /// Not enrolled unless [`MARKETPLACE_SELLER_ENV`] says otherwise.
+    fn default() -> Self {
+        Self(
+            ::std::env::var(MARKETPLACE_SELLER_ENV)
+                .is_ok_and(|setting| parse_marketplace_seller(&setting)),
+        )
+    }
+}
 
 /// The model's `PublisherStatus` enum, "whether the publisher is verified": `VERIFIED |
 /// UNVERIFIED`. A registered publisher is `VERIFIED` — "currently, all registered

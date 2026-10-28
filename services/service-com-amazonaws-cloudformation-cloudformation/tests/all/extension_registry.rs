@@ -37,7 +37,10 @@ use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
 use service_com_amazonaws_cloudformation_cloudformation::state::template::IMPLEMENTED_RESOURCE_TYPES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::stack_lifecycle::{call, member, router_with_engine, store, xml_text, xml_texts, REGION};
+use crate::stack_lifecycle::{
+    call, enroll_as_a_marketplace_seller, member, router_with_engine, store, xml_text, xml_texts,
+    REGION,
+};
 
 /// Another Region's registry, for the row that reads a record registered elsewhere.
 pub(crate) const OTHER_REGION: &str = "us-west-2";
@@ -186,9 +189,13 @@ fn other_region_resource() -> StoredExtension {
 /// A router over a store seeded with every record above.
 ///
 /// This crate's ONE registry fixture: `list_types.rs` lists the same records this suite
-/// describes one at a time, so the two reads are held to one set of records.
+/// describes one at a time, so the two reads are held to one set of records. The account is
+/// an enrolled Amazon Web Services Marketplace seller, which is what the suites that
+/// register a publisher over this fixture (`publish_type.rs`, `type_testing.rs`) require of
+/// the account registering.
 pub(crate) fn router_with_registry() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = router_with_engine();
+    enroll_as_a_marketplace_seller(&engine);
     {
         let state = store(&engine);
         state.lock().extensions = vec![

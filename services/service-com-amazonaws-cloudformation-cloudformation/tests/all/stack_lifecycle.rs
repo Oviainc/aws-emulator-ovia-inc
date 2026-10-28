@@ -25,9 +25,9 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 pub(crate) use crate::harness::{
-    call, call_in, create_stack, get_template, list_imports_ok, member, router,
-    router_with_engine, store, wait_for_the_transition, xml_blocks, xml_text, xml_texts,
-    xml_unescape, REGION,
+    call, call_in, create_stack, enroll_as_a_marketplace_seller, get_template, list_imports_ok,
+    member, router, router_with_engine, store, wait_for_the_transition, xml_blocks, xml_text,
+    xml_texts, xml_unescape, REGION,
 };
 
 /// The emulator's canonical account id, as every ARN it emits carries.

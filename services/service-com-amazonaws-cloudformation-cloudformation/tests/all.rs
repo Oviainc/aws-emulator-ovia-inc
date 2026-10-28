@@ -127,6 +127,8 @@ mod provisioned_resources;
 mod publish_type;
 #[path = "all/published_type_schema.rs"]
 mod published_type_schema;
+#[path = "all/publisher_eligibility.rs"]
+mod publisher_eligibility;
 #[path = "all/publisher_reads.rs"]
 mod publisher_reads;
 #[path = "all/publisher_registration.rs"]
@@ -219,6 +221,8 @@ mod template_stages_and_resource_events;
 mod template_summary;
 #[path = "all/template_validation.rs"]
 mod template_validation;
+#[path = "all/third_party_extensions.rs"]
+mod third_party_extensions;
 #[path = "all/type_configurations.rs"]
 mod type_configurations;
 #[path = "all/type_deactivation.rs"]

@@ -12,6 +12,25 @@ Issue-Commit: 7ec46f8e53e7b4a82f0a526dc76e942bfb70fd11
 
 > _Note: this issue was identified against the code base at commit `7ec46f8e53e7b4a82f0a526dc76e942bfb70fd11`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution: Cause 1 is fixed — `RegisterPublisher` refuses an account that is not an
+> enrolled AWS Marketplace seller with the modelled 400 `CFNRegistryException`, writing
+> nothing, so the `DescribePublisher`/`TestType`/`PublishType` refusals downstream of the
+> publisher record are reachable again. Of Cause 2, the two rules the recording states about
+> an ACTIVATED extension are fixed — `ActivateType` requires an `ExecutionRoleArn` for a
+> public `RESOURCE` extension, and a stored extension configuration is held as ASCII with
+> each codepoint outside ASCII replaced by one `?` — but the SEEDED `PUBLIC`/`THIRD_PARTY`
+> catalogue its "Fix" line asks for is DECLINED and remains open: AWS's public third-party
+> registry is live catalogue data (the publishers, their extension names, their
+> CloudFormation-minted publisher ids and each one's vendor-specific configuration schema)
+> that this emulator holds nothing behind, and a hand-written stand-in would be records
+> nothing stands behind — which is exactly what `state/registry.rs` bounds `aws_published`
+> by `template::IMPLEMENTED_RESOURCE_TYPES` to avoid. The only faithful route to a
+> third-party public record stays the one an account really writes (`RegisterType` ->
+> `TestType` -> `RegisterPublisher` -> `PublishType` -> `ActivateType`), which the
+> separately-filed `RegisterType` scaffold-stub issue is what blocks today; so
+> `cloudformation.type-configuration-nested-json-structure-preserved` still finds no
+> candidate type._
+
 ## Operation
 RegisterPublisher
 

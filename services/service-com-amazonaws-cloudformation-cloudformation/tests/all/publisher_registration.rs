@@ -12,6 +12,10 @@
 //! identity the registration was verified by; a publisher the store holds no registration
 //! for is answered with that same modelled refusal rather than with a record.**
 //!
+//! Every case here runs as an account that IS an enrolled Amazon Web Services Marketplace
+//! seller, which is the OTHER condition of registering: the gate on it, and what an account
+//! that is not one is answered, is `publisher_eligibility.rs`.
+//!
 //! The table spans the class the rule generalises over: every form the acceptance member
 //! can take (absent, false, true), every form the identity verification can take (none, a
 //! connection in each of the two services a connection ARN names), the Region the call is
@@ -22,7 +26,9 @@
 //! through the wire harness `stack_lifecycle.rs` builds, so what it asserts is what a
 //! client calling these two operations sees.
 
-use crate::stack_lifecycle::{call, call_in, member, router_with_engine, store, xml_text};
+use crate::stack_lifecycle::{
+    call, call_in, enroll_as_a_marketplace_seller, member, router_with_engine, store, xml_text,
+};
 use service_com_amazonaws_cloudformation_cloudformation::ops::types::{
     IDENTITY_PROVIDER_VALUES, PUBLISHER_STATUS_VALUES,
 };
@@ -30,6 +36,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::publisher::{
     identity_provider, publisher_status,
 };
 use smithy_server_runtime::MultiServiceRouter;
+use std::sync::Arc;
 
 /// Another Region, for the rows that hold the registration to applying "to your account in
 /// all Amazon Web Services Regions".
@@ -48,6 +55,16 @@ const CODESTAR_CONNECTION_ARN: &str =
 const CODECONNECTIONS_ARN: &str =
     "arn:aws-us-gov:codeconnections:us-gov-west-1:000000000000:connection/\
      66666666-7777-8888-9999-aaaaaaaaaaaa";
+
+/// The router AND the engine behind it, over an account that IS an enrolled Amazon Web
+/// Services Marketplace seller: being one is what `RegisterPublisher` requires of the
+/// account registering, and the refusal an account that is not one gets is
+/// `publisher_eligibility.rs`.
+fn router_over_an_enrolled_seller() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = router_with_engine();
+    enroll_as_a_marketplace_seller(&engine);
+    (router, engine)
+}
 
 async fn register_publisher(
     router: &MultiServiceRouter,
@@ -112,7 +129,7 @@ fn unaccepted_registrations() -> Vec<(&'static str, Vec<(String, String)>)> {
 
 #[tokio::test]
 async fn a_registration_that_does_not_accept_the_terms_is_refused_and_stores_nothing() {
-    let (router, engine) = router_with_engine();
+    let (router, engine) = router_over_an_enrolled_seller();
 
     // Before any registration there is nothing to describe: a read is refused rather than
     // answered with a publisher nothing stands behind.
@@ -141,7 +158,7 @@ async fn a_registration_that_does_not_accept_the_terms_is_refused_and_stores_not
 
 #[tokio::test]
 async fn registering_mints_one_account_wide_publisher_id_a_read_reports_back() {
-    let (router, engine) = router_with_engine();
+    let (router, engine) = router_over_an_enrolled_seller();
 
     let (status_code, body) =
         register_publisher(&router, &[member("AcceptTermsAndConditions", "true")]).await;
@@ -285,7 +302,7 @@ async fn the_reported_identity_provider_is_the_one_the_registration_was_verified
     ] {
         // A fresh store per row: an account registers once, so each form of registration is
         // the FIRST one its own account made.
-        let (router, engine) = router_with_engine();
+        let (router, engine) = router_over_an_enrolled_seller();
         let mut members = vec![member("AcceptTermsAndConditions", "true")];
         if let Some(connection_arn) = connection_arn {
             members.push(member("ConnectionArn", connection_arn));
@@ -336,7 +353,7 @@ async fn the_reported_identity_provider_is_the_one_the_registration_was_verified
 
 #[tokio::test]
 async fn a_publisher_read_changes_nothing_a_later_caller_sees() {
-    let (router, engine) = router_with_engine();
+    let (router, engine) = router_over_an_enrolled_seller();
     let (status_code, body) =
         register_publisher(&router, &[member("AcceptTermsAndConditions", "true")]).await;
     assert_eq!(

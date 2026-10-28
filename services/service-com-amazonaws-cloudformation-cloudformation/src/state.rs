@@ -4289,6 +4289,15 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// namespaced by Region; it belongs to no stack, so it is neither settled nor
     /// reclaimed with one.
     pub publisher: Option<publisher::StoredPublisher>,
+    /// Whether this account is enrolled as an Amazon Web Services Marketplace seller, which
+    /// is what `RegisterPublisher` requires of its caller
+    /// ([`publisher::MarketplaceSellerEnrollment`]).
+    ///
+    /// Not a record any operation writes: the enrollment is made outside this API, so it is a
+    /// property of the emulated account — `false` for an account nobody enrolled, which is
+    /// the default, and [`publisher::MARKETPLACE_SELLER_ENV`] is how an operator says this
+    /// emulated account is one of the accounts that already enrolled.
+    pub marketplace_seller: publisher::MarketplaceSellerEnrollment,
     /// Every drift-detection operation this service has run, in the order they were
     /// started, so `DescribeStackDriftDetectionStatus` reads back the result of the id
     /// `DetectStackDrift` handed out. Bounded at [`MAX_DRIFT_DETECTIONS`], oldest
@@ -5320,8 +5329,21 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// and the operation is `@idempotent`, so registering again re-verifies the account's
     /// identity — the record carries the verification the latest registration supplied —
     /// without handing out a second id.
-    pub fn register_publisher(&mut self, connection_arn: Option<String>) -> String {
-        match &mut self.publisher {
+    ///
+    /// `Err` carries [`publisher::NOT_A_MARKETPLACE_SELLER`] for an account that is not
+    /// enrolled as an Amazon Web Services Marketplace seller, which is what a publisher
+    /// registration requires of the account registering
+    /// ([`Self::marketplace_seller`]) — and the gate lives HERE, at the one write, so no
+    /// caller can register an ineligible account by reaching the store directly, and a
+    /// refused registration cannot have written anything.
+    pub fn register_publisher(
+        &mut self,
+        connection_arn: Option<String>,
+    ) -> Result<String, &'static str> {
+        if !self.marketplace_seller.is_enrolled() {
+            return Err(publisher::NOT_A_MARKETPLACE_SELLER);
+        }
+        Ok(match &mut self.publisher {
             Some(registered) => {
                 registered.status = publisher::publisher_status::VERIFIED.to_string();
                 registered.connection_arn = connection_arn;
@@ -5334,7 +5356,7 @@ impl ComAmazonawsCloudformationCloudformationState {
                 *none = Some(registered);
                 publisher_id
             }
-        }
+        })
     }
 
     /// The publisher record a request addresses: the one `publisher_id` names, or this
