@@ -13,31 +13,36 @@
 //! ever put, or `DeleteModelInvocationLoggingConfiguration` removed it) the get answers
 //! 200 with no `loggingConfig` member at all.
 //!
-//! A configuration is only ADMITTED when it can be installed without Amazon Bedrock
-//! being passed a role the caller supplied. The CloudWatch Logs destination is the one
-//! destination that needs such a role (`CloudWatchConfig.roleArn` is `@required`, while
-//! `S3Config` declares no role member at all), that pass is not allowed, and so a
-//! `loggingConfig` naming that destination is refused with HTTP 403 and the modelled
-//! `AccessDeniedException` — before anything is stored, so the record in force is left
-//! exactly as it was and no part of the refused configuration is readable afterwards.
+//! A configuration is only ADMITTED when every role it asks Amazon Bedrock to take on is
+//! one this account may hand it. The CloudWatch Logs destination is the one destination
+//! that names such a role (`CloudWatchConfig.roleArn` is `@required`, while `S3Config`
+//! declares no role member at all), and the decision is the ACCOUNT that role ARN names:
+//! `iam:PassRole` is granted by the account that HOLDS the role, so a role of the CALLING
+//! account is installable — the put answers 200 and the get reports the destination back —
+//! while a role whose embedded 12-digit account is another one is refused with HTTP 403 and
+//! the modelled `AccessDeniedException` carrying the recorded sentence, before anything is
+//! stored, so the record in force is left exactly as it was and no part of the refused
+//! configuration is readable afterwards.
 //!
 //! # What the tables below generalise over
 //!
 //! [`cases`] holds one row per independent ADMITTED configuration, along the axes
-//! `LoggingConfig` spans for a role-free configuration: whether it names the S3
-//! destination or no destination at all, whether that destination carries a `keyPrefix`,
-//! and which of the five `*DataDeliveryEnabled` flags are set — all true, all false,
-//! mixed, and omitted entirely. Sizes sit on the published bounds of each member's
-//! `@length` (`bucketName` 3..63, `keyPrefix` ..1024, taken from this service's Smithy
-//! model).
+//! `LoggingConfig` spans: whether it names the S3 destination, the CloudWatch Logs
+//! destination, both, or no destination at all, whether a destination carries a
+//! `keyPrefix` or a `largeDataDeliveryS3Config`, the partition and the account field of an
+//! admitted `roleArn` (including the EMPTY account its published pattern admits, and a
+//! role under a path), and which of the five `*DataDeliveryEnabled` flags are set — all
+//! true, all false, mixed, and omitted entirely. Sizes sit on the published bounds of each
+//! member's `@length` (`bucketName` 3..63, `keyPrefix` ..1024, `logGroupName` 1..512,
+//! `roleArn` ..2048, taken from this service's Smithy model).
 //!
-//! [`cloud_watch_cases`] holds one row per independent configuration that names the
-//! CloudWatch destination, along the axes the refusal must hold across: the partition and
-//! the account field of the `roleArn` (including the EMPTY account its published pattern
-//! admits) and its published `@length` max 2048, `logGroupName` at both ends of its
-//! published `@length` 1..512, whether the destination carries a
-//! `largeDataDeliveryS3Config`, whether an `s3Config` is named beside it, and which flags
-//! are set.
+//! [`cross_account_role_cases`] holds one row per independent configuration whose
+//! CloudWatch destination names a role of ANOTHER account, along the axes the refusal must
+//! hold across: the partition, which other account the ARN carries (including one differing
+//! from this account in a single digit), the role's path and its published `@length` max
+//! 2048, `logGroupName` at both ends of its published `@length` 1..512, whether the
+//! destination carries a `largeDataDeliveryS3Config`, whether a role-free `s3Config` is
+//! named beside it, and which flags are set.
 //!
 //! [`a_value_past_every_bound_is_refused_and_changes_nothing`] drives one value PAST each
 //! published bound plus a `roleArn` outside the member's published pattern: those are
@@ -48,11 +53,18 @@
 
 use serde_json::{json, Value};
 
-use crate::support::{emulator, Emulator, Reply};
+use crate::support::{emulator, Emulator, Reply, ACCOUNT};
 
-/// A role ARN inside `RoleArn`'s published pattern
-/// (`^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`, from this service's Smithy model).
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/BedrockInvocationLogging";
+/// A role ARN of the CALLING account, inside `RoleArn`'s published pattern
+/// (`^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`, from this service's Smithy model) —
+/// the pass this account may make.
+fn role_arn() -> String {
+    format!("arn:aws:iam::{ACCOUNT}:role/BedrockInvocationLogging")
+}
+
+/// A 12-digit account id that is NOT the calling account, so a role ARN carrying it names
+/// a role no principal of this account can pass.
+const OTHER_ACCOUNT: &str = "123456789012";
 
 /// The sentence Amazon Bedrock refuses a role it may not be passed with, spelled as the
 /// rest of this tree records AWS spelling the same denial.
@@ -141,31 +153,11 @@ fn cases() -> Vec<Case> {
             }),
         },
         Case {
-            name: "no destination and no flags at all",
-            logging_config: json!({}),
-        },
-    ]
-}
-
-/// The configurations that can only be installed by passing Amazon Bedrock a
-/// caller-supplied role, and so are refused whatever role they name.
-fn cloud_watch_cases() -> Vec<Case> {
-    vec![
-        Case {
-            name: "cloudwatch only, no flags",
+            name: "the recorded shape: a same-account cloudwatch role with the text flag on",
             logging_config: json!({
                 "cloudWatchConfig": {
                     "logGroupName": "aws/bedrock/modelinvocations",
-                    "roleArn": ROLE_ARN,
-                },
-            }),
-        },
-        Case {
-            name: "the recorded shape: cloudwatch with the text flag on",
-            logging_config: json!({
-                "cloudWatchConfig": {
-                    "logGroupName": "aws/bedrock/modelinvocations",
-                    "roleArn": ROLE_ARN,
+                    "roleArn": role_arn(),
                 },
                 "textDataDeliveryEnabled": true,
                 "imageDataDeliveryEnabled": false,
@@ -173,11 +165,107 @@ fn cloud_watch_cases() -> Vec<Case> {
             }),
         },
         Case {
-            name: "cloudwatch with large-data s3 overflow and a key prefix",
+            name: "a same-account cloudwatch role, no flags",
             logging_config: json!({
                 "cloudWatchConfig": {
                     "logGroupName": "aws/bedrock/modelinvocations",
-                    "roleArn": ROLE_ARN,
+                    "roleArn": role_arn(),
+                },
+            }),
+        },
+        Case {
+            name: "cloudwatch with large-data s3 overflow beside an s3 destination",
+            logging_config: json!({
+                "cloudWatchConfig": {
+                    "logGroupName": "aws/bedrock/modelinvocations",
+                    "roleArn": role_arn(),
+                    "largeDataDeliveryS3Config": {
+                        "bucketName": "bedrock-large-data",
+                        "keyPrefix": "overflow/",
+                    },
+                },
+                "s3Config": {
+                    "bucketName": "bedrock-invocation-logs",
+                    "keyPrefix": "prod/bedrock/",
+                },
+                "textDataDeliveryEnabled": true,
+                "videoDataDeliveryEnabled": true,
+                "audioDataDeliveryEnabled": true,
+            }),
+        },
+        Case {
+            name: "a role ARN with the EMPTY account its pattern admits, which names no \
+                   other account",
+            logging_config: json!({
+                "cloudWatchConfig": {
+                    // `logGroupName` @length min 1.
+                    "logGroupName": "g",
+                    "roleArn": "arn:aws:iam:::role/r",
+                    "largeDataDeliveryS3Config": { "bucketName": "abc" },
+                },
+            }),
+        },
+        Case {
+            name: "a same-account role under a path, in another partition, logGroupName at \
+                   its longest length",
+            logging_config: json!({
+                "cloudWatchConfig": {
+                    // `logGroupName` @length max 512.
+                    "logGroupName": repeat('g', 512),
+                    "roleArn": format!("arn:aws-cn:iam::{ACCOUNT}:role/service-role/delivery"),
+                },
+                "embeddingDataDeliveryEnabled": true,
+            }),
+        },
+        Case {
+            name: "a same-account role ARN at its longest published length",
+            logging_config: json!({
+                "cloudWatchConfig": {
+                    "logGroupName": "logs/bedrock",
+                    // `roleArn` @length max 2048, counting the 31 characters of
+                    // `arn:aws:iam::000000000000:role/`.
+                    "roleArn": format!("arn:aws:iam::{ACCOUNT}:role/{}", repeat('r', 2017)),
+                },
+            }),
+        },
+        Case {
+            name: "no destination and no flags at all",
+            logging_config: json!({}),
+        },
+    ]
+}
+
+/// The configurations whose CloudWatch destination names a role of ANOTHER account, which
+/// no principal of the calling account can pass to Amazon Bedrock.
+fn cross_account_role_cases() -> Vec<Case> {
+    vec![
+        Case {
+            name: "another account's role, no flags",
+            logging_config: json!({
+                "cloudWatchConfig": {
+                    "logGroupName": "aws/bedrock/modelinvocations",
+                    "roleArn": format!("arn:aws:iam::{OTHER_ACCOUNT}:role/logging"),
+                },
+            }),
+        },
+        Case {
+            name: "another account's role, with the text flag on",
+            logging_config: json!({
+                "cloudWatchConfig": {
+                    "logGroupName": "aws/bedrock/modelinvocations",
+                    "roleArn": format!("arn:aws:iam::{OTHER_ACCOUNT}:role/logging"),
+                },
+                "textDataDeliveryEnabled": true,
+                "imageDataDeliveryEnabled": false,
+                "embeddingDataDeliveryEnabled": false,
+            }),
+        },
+        Case {
+            name: "another account's role with large-data s3 overflow",
+            logging_config: json!({
+                "cloudWatchConfig": {
+                    "logGroupName": "aws/bedrock/modelinvocations",
+                    "roleArn": format!("arn:aws:iam::{OTHER_ACCOUNT}:role/service-role/logging"),
                     "largeDataDeliveryS3Config": {
                         "bucketName": "bedrock-large-data",
                         "keyPrefix": "overflow/",
@@ -203,18 +291,18 @@ fn cloud_watch_cases() -> Vec<Case> {
             }),
         },
         Case {
-            name: "a role ARN with the EMPTY account its pattern admits",
+            name: "an account differing from the caller's in a single digit",
             logging_config: json!({
                 "cloudWatchConfig": {
                     // `logGroupName` @length min 1.
                     "logGroupName": "g",
-                    "roleArn": "arn:aws:iam:::role/r",
+                    "roleArn": "arn:aws:iam::000000000001:role/r",
                     "largeDataDeliveryS3Config": { "bucketName": "abc" },
                 },
             }),
         },
         Case {
-            name: "a role ARN in another partition, logGroupName at its longest length",
+            name: "another account in another partition, logGroupName at its longest length",
             logging_config: json!({
                 "cloudWatchConfig": {
                     // `logGroupName` @length max 512.
@@ -224,13 +312,13 @@ fn cloud_watch_cases() -> Vec<Case> {
             }),
         },
         Case {
-            name: "a role ARN at its longest published length",
+            name: "another account's role ARN at its longest published length",
             logging_config: json!({
                 "cloudWatchConfig": {
                     "logGroupName": "logs/bedrock",
                     // `roleArn` @length max 2048, counting the 31 characters of
-                    // `arn:aws:iam::000000000000:role/`.
-                    "roleArn": format!("arn:aws:iam::000000000000:role/{}", repeat('r', 2017)),
+                    // `arn:aws:iam::123456789012:role/`.
+                    "roleArn": format!("arn:aws:iam::{OTHER_ACCOUNT}:role/{}", repeat('r', 2017)),
                 },
             }),
         },
@@ -376,17 +464,17 @@ async fn a_delete_leaves_no_configuration_and_repeats_cleanly() {
 }
 
 #[tokio::test]
-async fn a_destination_whose_role_must_be_passed_is_refused_and_installs_nothing() {
+async fn a_role_of_another_account_is_refused_and_installs_nothing() {
     let emulator = emulator();
 
     // With nothing configured at all first: the refusal must not install the
     // configuration it refused, so the account is still unconfigured afterwards.
-    for case in cloud_watch_cases() {
+    for case in cross_account_role_cases() {
         let reply = put(&emulator, &case.logging_config).await;
         assert_eq!(
             reply.status, 403,
-            "case {} (unconfigured account): a destination whose role must be passed is \
-             refused 403, got {} {:?}",
+            "case {} (unconfigured account): a role of another account may not be passed, so \
+             the put is refused 403, got {} {:?}",
             case.name, reply.status, reply.body
         );
         assert_eq!(
@@ -426,12 +514,12 @@ async fn a_destination_whose_role_must_be_passed_is_refused_and_installs_nothing
         "the baseline put must answer 200, got {} {:?}",
         baseline.status, baseline.body
     );
-    for case in cloud_watch_cases() {
+    for case in cross_account_role_cases() {
         let reply = put(&emulator, &case.logging_config).await;
         assert_eq!(
             reply.status, 403,
-            "case {} (configured account): a destination whose role must be passed is \
-             refused 403, got {} {:?}",
+            "case {} (configured account): a role of another account may not be passed, so \
+             the put is refused 403, got {} {:?}",
             case.name, reply.status, reply.body
         );
         assert_eq!(
@@ -453,11 +541,88 @@ async fn a_destination_whose_role_must_be_passed_is_refused_and_installs_nothing
 }
 
 #[tokio::test]
+async fn only_the_role_arns_account_decides_a_cloudwatch_destination() {
+    // Two puts of the SAME configuration differing in NOTHING but the account the
+    // `roleArn` carries: the caller's own account is installable, every other account is
+    // refused, so the two cases are distinguishable. The role name, the partition and the
+    // log group are held fixed across the pair, which is what makes the account the only
+    // thing the decision can be reading.
+    let accounts: Vec<(&str, String, bool)> = vec![
+        ("the caller's own account", ACCOUNT.to_string(), true),
+        ("the empty account the pattern admits", String::new(), true),
+        ("another account", OTHER_ACCOUNT.to_string(), false),
+        (
+            "an account differing in a single digit",
+            "000000000001".to_string(),
+            false,
+        ),
+        (
+            "an account differing in its first digit",
+            "100000000000".to_string(),
+            false,
+        ),
+    ];
+
+    for (case, account, installable) in accounts {
+        // A fresh emulator per row, so each decision is read against an empty store.
+        let emulator = emulator();
+        let logging_config = json!({
+            "cloudWatchConfig": {
+                "logGroupName": "aws/bedrock/modelinvocations",
+                "roleArn": format!("arn:aws:iam::{account}:role/BedrockInvocationLogging"),
+            },
+            "textDataDeliveryEnabled": true,
+        });
+        let reply = put(&emulator, &logging_config).await;
+        let after = get(&emulator).await;
+        if installable {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: a role of the calling account may be passed, so the put \
+                 answers 200, got {} {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                after.get("loggingConfig"),
+                logging_config,
+                "case {case:?}: the installed configuration must be reported back, got {:?}",
+                after.get("loggingConfig")
+            );
+        } else {
+            assert_eq!(
+                reply.status, 403,
+                "case {case:?}: a role of another account may not be passed, so the put is \
+                 refused 403, got {} {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("AccessDeniedException"),
+                "case {case:?}: the refusal is an AccessDeniedException, got {:?}",
+                reply.error
+            );
+            assert_eq!(
+                reply.get("message"),
+                json!(PASS_ROLE_REFUSAL),
+                "case {case:?}: expected the pass-role refusal {PASS_ROLE_REFUSAL:?}, got {:?}",
+                reply.get("message")
+            );
+            assert_eq!(
+                after.get("loggingConfig"),
+                Value::Null,
+                "case {case:?}: a refused put installs nothing, got {:?}",
+                after.get("loggingConfig")
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_value_past_every_bound_is_refused_and_changes_nothing() {
     // Each row drives ONE member past the bound its Smithy model declares, or outside
     // the pattern it declares; the bounds themselves are exercised in `cases()` and
-    // `cloud_watch_cases()`. A value outside a member's published form is refused for
-    // that form — 400 `ValidationException` — ahead of any pass-role decision, so the
+    // `cross_account_role_cases()`. A value outside a member's published form is refused
+    // for that form — 400 `ValidationException` — ahead of any pass-role decision, so the
     // cloudwatch rows here are refused 400 rather than 403.
     let refused: Vec<(&str, Value)> = vec![
         (
@@ -465,14 +630,14 @@ async fn a_value_past_every_bound_is_refused_and_changes_nothing() {
             json!({
                 "cloudWatchConfig": {
                     "logGroupName": repeat('g', 513),
-                    "roleArn": ROLE_ARN,
+                    "roleArn": role_arn(),
                 },
             }),
         ),
         (
             "logGroupName one under @length min 1",
             json!({
-                "cloudWatchConfig": { "logGroupName": "", "roleArn": ROLE_ARN },
+                "cloudWatchConfig": { "logGroupName": "", "roleArn": role_arn() },
             }),
         ),
         (

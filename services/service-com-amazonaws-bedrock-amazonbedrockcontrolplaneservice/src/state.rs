@@ -2953,8 +2953,8 @@ pub struct AccountDataRetention {
     pub updated_at: SystemTime,
 }
 
-/// Amazon Bedrock's answer when it is asked to take on a role the caller supplied, and the
-/// principal that would take it on is not a principal of that role's account.
+/// Amazon Bedrock's answer when it is asked to take on a role the caller may not hand it:
+/// the `iam:PassRole` the request would make is one this account does not hold.
 ///
 /// The one sentence, with no variable part: the denial names neither the role nor the
 /// destination, so there is nothing of the request to fill in. It is spelled the way the
@@ -2963,7 +2963,7 @@ pub struct AccountDataRetention {
 pub const CROSS_ACCOUNT_PASS_ROLE_DENIED: &str = "Cross-account pass role is not allowed.";
 
 /// Why Amazon Bedrock may not be passed the role a model invocation logging `config` names,
-/// or `None` when `config` needs no role passed to it.
+/// or `None` when every role it names may be passed — which is the ordinary case.
 ///
 /// A destination that names a role the CALLER supplied needs an `iam:PassRole` step before
 /// any log event can be written, and the only such destination is CloudWatch Logs: its
@@ -2972,22 +2972,28 @@ pub const CROSS_ACCOUNT_PASS_ROLE_DENIED: &str = "Cross-account pass role is not
 /// (`smithy_query(query="shape",shape="CloudWatchConfig")`). `S3Config` declares no role
 /// member at all, so an S3-only configuration — and one naming no destination — passes no
 /// role, has no `iam:PassRole` step to authorize, and is admitted; whether the account may
-/// write to a named bucket is not a decision about a passed role, and the corpus records
-/// those puts being accepted.
+/// write to a named bucket is not a decision about a passed role.
 ///
-/// The decision for the CloudWatch destination compares the role's account against the
-/// principal the role would be passed TO, and that side is fixed: the log events of that
-/// destination are written by Amazon Bedrock's own log-delivery principal, which is a
-/// principal of no caller's account. So the two sides differ for every value the member can
-/// carry — including a role of the very account making the call, which the corpus records
-/// being refused all the same — and reading the ARN could not change the answer. Hence a
-/// denial for that destination and no role-ARN parse: 403 `AccessDeniedException`, and no
-/// configuration installed, which is what every recording of such a put shows.
+/// The decision for the CloudWatch destination is the ACCOUNT the value names:
+/// `iam:PassRole` is granted by the account that HOLDS the role, so a principal of this
+/// account can hand Amazon Bedrock a role of its own account and no role of another one,
+/// whatever that other role trusts. The account is read out of the ARN by the crate's one
+/// IAM-ARN reading ([`::service_common::iam_role::role_name`]), which answers the role's
+/// name only for a role of THIS account and treats the EMPTY account field the member's
+/// published pattern admits (`^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`) as this
+/// account, since a value naming no account names no other one. The pattern itself is
+/// refused by the constraint walk ahead of this gate, so a value that reaches here and
+/// reads as no role of this account is one whose embedded 12-digit account is another's.
+///
+/// A denied pass is [`CROSS_ACCOUNT_PASS_ROLE_DENIED`] in the modelled
+/// `AccessDeniedException` (`@httpError(403)`) with nothing installed; a pass this account
+/// may make installs the configuration, so the CloudWatch Logs destination is reported back
+/// by the get, cleared by the delete, and honoured where the configuration is enforced.
 pub fn pass_role_denial(config: &LoggingConfig) -> Option<String> {
-    if config.cloud_watch_config.is_some() {
-        return Some(CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string());
-    }
-    None
+    let role_arn = &config.cloud_watch_config.as_ref()?.role_arn;
+    ::service_common::iam_role::role_name(role_arn)
+        .is_none()
+        .then(|| CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string())
 }
 
 /// Why Amazon Bedrock may not be passed the role a model customization job names, or

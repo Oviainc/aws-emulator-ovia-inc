@@ -21,9 +21,12 @@
 //! A well-formed configuration is still not an installable one. A destination that names
 //! a role the CALLER supplied can only be installed by passing Amazon Bedrock that role,
 //! and [`crate::state::pass_role_denial`] takes that decision — for the CloudWatch Logs
-//! destination, the one whose `roleArn` is `@required` — BEFORE anything is stored. A
-//! denied pass is answered with the modelled `AccessDeniedException` (HTTP 403) and leaves
-//! the account singleton exactly as it was, so an independent
+//! destination, the one whose `roleArn` is `@required` — BEFORE anything is stored. That
+//! decision is the ACCOUNT the role ARN names: a role of the CALLING account may be passed,
+//! so its destination is installed and read back, while a role of ANOTHER account may not,
+//! because `iam:PassRole` is granted by the account that holds the role. A denied pass is
+//! answered with the modelled `AccessDeniedException` (HTTP 403) and leaves the account
+//! singleton exactly as it was, so an independent
 //! `GetModelInvocationLoggingConfiguration` reports no part of the refused configuration.
 //! A configuration that passes no role (`s3Config` only, or no destination at all) has no
 //! such decision to take and is stored as given.
