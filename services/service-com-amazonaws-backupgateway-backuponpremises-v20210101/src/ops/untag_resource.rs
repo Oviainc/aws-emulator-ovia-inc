@@ -2,7 +2,8 @@
 
 //! @op UntagResource
 //! Removes the tags a request's `TagKeys` names from the resource an ARN names, in
-//! [`crate::state`]. This is the ONLY file to touch for this operation.
+//! [`crate::state`] — a gateway, a hypervisor or a virtual machine alike. This is the
+//! ONLY file to touch for this operation.
 //!
 //! Removal is BY KEY: a listed key is dropped whatever its value, every other tag stays,
 //! and a key the resource does not carry is nothing to remove — so the call succeeds and
@@ -162,14 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // leaves the set alone — so the call is idempotent and never refuses a key that
         // is not there.
         //
-        // The ARN is resolved against the resource it NAMES — this service tags gateways
-        // and hypervisors alike, so one lookup spans both stores — and an ARN with no
-        // record behind it takes the refusal that resource type carries: the same
+        // The ARN is resolved against the resource it NAMES — this service tags every
+        // resource it holds (a gateway, a hypervisor and a virtual machine of a
+        // hypervisor's inventory), so one lookup spans all three stores, resolving a
+        // machine against the clock exactly as `GetVirtualMachine` does — and an ARN with
+        // no record behind it takes the refusal that resource type carries: the same
         // modelled `ResourceNotFoundException` shape throughout, but a missing hypervisor
         // is answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
         // takes the shape's own 404 (`crate::state::MissingResource`).
-        let Some(resource_arn) = state.remove_resource_tags(&input.resource_arn, &input.tag_keys)
-        else {
+        let Some(resource_arn) = state.remove_resource_tags(
+            &input.resource_arn,
+            &input.tag_keys,
+            ::std::time::SystemTime::now(),
+        ) else {
             let missing = crate::state::MissingResource::for_arn(&input.resource_arn);
             let error =
                 UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

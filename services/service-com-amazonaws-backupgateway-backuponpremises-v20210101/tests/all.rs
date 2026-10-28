@@ -59,6 +59,8 @@ mod put_bandwidth_rate_limit_schedule;
 mod put_hypervisor_property_mappings;
 #[path = "all/regional_listing_scope.rs"]
 mod regional_listing_scope;
+#[path = "all/resource_tagging_spans_every_resource.rs"]
+mod resource_tagging_spans_every_resource;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
 #[path = "all/state_roundtrip.rs"]

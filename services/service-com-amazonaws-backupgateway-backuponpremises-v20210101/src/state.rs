@@ -63,7 +63,13 @@
 //! previous inventory while a sync is still in flight. `GetVirtualMachine` resolves ONE of
 //! those records by its own ARN and reports it in full
 //! ([`StoredVirtualMachine::details`]), including the VMware tags the inventory attached
-//! to it, which no listing carries.
+//! to it, which no listing carries. A machine is as taggable as the other two resources:
+//! the tagging operations resolve their one `ResourceARN` member against every map this
+//! store owns ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::resource_tags`]),
+//! so the AWS tags a client writes on a machine ([`StoredVirtualMachine::tags`], which
+//! are not the VMware tags its inventory reported) live on the record beside the rest of
+//! it, and a resource a read of this service resolves is one the tagging operations
+//! resolve too.
 //!
 //! WHICH machines an inventory holds is this emulator's own answer ([`synced_inventory`]):
 //! it stands in for the on-premises hypervisor as much as for the service, and has no
@@ -149,7 +155,7 @@ pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 ///
 /// The hypervisor is the second resource this service's ARNs name
 /// (`smithy_query(query="shape",shape="GetHypervisorInput")`: `HypervisorArn` targets
-/// `ServerArn`), and the tagging operations take either kind in the one `ResourceARN`
+/// `ServerArn`), and the tagging operations take any of this service's resources in the one `ResourceARN`
 /// member — so they have to tell them apart. See [`MissingResource`].
 pub const HYPERVISOR_RESOURCE_TYPE: &str = "hypervisor";
 
@@ -956,6 +962,14 @@ pub struct StoredVirtualMachine {
     /// MODELLED [`VmwareTag`] shape so a member cannot drift between what is stored and
     /// what is serialised. Empty for a machine whose inventory reported none.
     pub vmware_tags: Vec<VmwareTag>,
+    /// The resource's AWS tags, by key — the same representation [`StoredGateway::tags`]
+    /// and [`StoredHypervisor::tags`] use, so the tagging operations treat every resource
+    /// of this service alike.
+    ///
+    /// Distinct from [`Self::vmware_tags`], which are the tags the machine carries ON its
+    /// hypervisor and reach the store with the rest of the inventory: these are the tags
+    /// `TagResource` writes through this API, and no inventory report sets or clears them.
+    pub tags: BTreeMap<String, String>,
     /// When the sync that discovered this machine REPORTED it — the instant that sync
     /// fell due, which is also the instant it is reported as having succeeded at. Kept
     /// across a re-sync of the same machine ONCE it has fallen due, so re-reporting an
@@ -982,6 +996,11 @@ impl StoredVirtualMachine {
     /// still sees the inventory it had before — none.
     pub fn discovered_as_of(&self, now: SystemTime) -> bool {
         now >= self.discovered_time
+    }
+
+    /// The persisted AWS tags as the modelled `Tags` list, in key order.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        tag_list(&self.tags)
     }
 
     /// This record as the `VirtualMachine` shape `ListVirtualMachines` returns.
@@ -1830,8 +1849,18 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             .find(|machine| {
                 machine.hypervisor_arn == hypervisor_arn && machine.path == inventory.path
             })
-            .map(|machine| (machine.arn.clone(), machine.discovered_time));
-        let (arn, discovered_time) = match known {
+            .map(|machine| {
+                (
+                    machine.arn.clone(),
+                    machine.discovered_time,
+                    machine.tags.clone(),
+                )
+            });
+        // A machine's AWS tags are kept across a re-sync, exactly as its
+        // `discovered_time` is: a tag is written through `TagResource` and belongs to the
+        // resource, so re-reporting the hypervisor's inventory does not clear what a
+        // client tagged the machine with.
+        let (arn, discovered_time, tags) = match known {
             Some(known) => known,
             None => {
                 if self.virtual_machines.len() >= MAX_STORED_VIRTUAL_MACHINES {
@@ -1844,7 +1873,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
                     &arn_region(region),
                     &format!("{VIRTUAL_MACHINE_RESOURCE_TYPE}/{machine_id}"),
                 );
-                (arn, now)
+                (arn, now, BTreeMap::new())
             }
         };
         let record = StoredVirtualMachine {
@@ -1856,6 +1885,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             last_backup_date: inventory.last_backup_date,
             vmware_tags: inventory.vmware_tags,
             discovered_time,
+            tags,
         };
         self.virtual_machines.insert(arn.clone(), record);
         // Read back out of the map, so what a caller gets is the record the store holds.
@@ -1923,13 +1953,26 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// The tagging operations take any of this service's resources in one `ResourceARN`
     /// member, so they resolve it through this one lookup rather than knowing which map
     /// holds which kind: the ARN comes back out of the store, so what a response echoes
-    /// is the key the store holds.
-    pub fn resource_tags(&self, arn: &str) -> Option<(String, Vec<Tag>)> {
+    /// is the key the store holds. EVERY resource this store owns is reachable through it
+    /// — gateway, hypervisor and virtual machine — so a resource a sibling read resolves
+    /// is a resource the tagging operations resolve too, and `None` means the service
+    /// reports no resource under that ARN at all.
+    ///
+    /// `now` is what decides a virtual machine, whose record is part of its hypervisor's
+    /// inventory only from the instant the sync that discovered it fell due
+    /// ([`StoredVirtualMachine::discovered_as_of`]) — the same lookup `GetVirtualMachine`
+    /// and `ListVirtualMachines` resolve a machine through, so the operations cannot
+    /// disagree about which machines exist. A read of tags, like every other read, writes
+    /// nothing.
+    pub fn resource_tags(&self, arn: &str, now: SystemTime) -> Option<(String, Vec<Tag>)> {
         if let Some(gateway) = self.gateways.get(arn) {
             return Some((gateway.arn.clone(), gateway.tag_list()));
         }
-        let hypervisor = self.hypervisors.get(arn)?;
-        Some((hypervisor.arn.clone(), hypervisor.tag_list()))
+        if let Some(hypervisor) = self.hypervisors.get(arn) {
+            return Some((hypervisor.arn.clone(), hypervisor.tag_list()));
+        }
+        let machine = self.virtual_machine_as_of(arn, now)?;
+        Some((machine.arn.clone(), machine.tag_list()))
     }
 
     /// Merge `requested` into the tags of the resource `arn` names, and hand back the ARN
@@ -1937,22 +1980,17 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     ///
     /// `None` for an ARN this store holds no record for; `Err` for tags the model's own
     /// traits cannot refuse ([`merged_tags`]), in which case NOTHING is written. Spans
-    /// both resource types for the same reason as [`resource_tags`].
+    /// every resource type, `now` included, for the same reason as [`Self::resource_tags`].
     pub fn merge_resource_tags(
         &mut self,
         arn: &str,
         requested: &[Tag],
+        now: SystemTime,
     ) -> Option<Result<String, String>> {
-        if let Some(gateway) = self.gateways.get_mut(arn) {
-            return Some(merged_tags(&gateway.tags, requested).map(|merged| {
-                gateway.tags = merged;
-                gateway.arn.clone()
-            }));
-        }
-        let hypervisor = self.hypervisors.get_mut(arn)?;
-        Some(merged_tags(&hypervisor.tags, requested).map(|merged| {
-            hypervisor.tags = merged;
-            hypervisor.arn.clone()
+        let (resource_arn, tags) = self.taggable_mut(arn, now)?;
+        Some(merged_tags(tags, requested).map(|merged| {
+            *tags = merged;
+            resource_arn
         }))
     }
 
@@ -1963,18 +2001,44 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// its value, a key it does not carry leaves the tag set alone (so removing the same
     /// key twice, or one never set, is a no-op that still succeeds), and a repeated key in
     /// one request removes it once. `None` for an ARN this store holds no record for, and
-    /// spans both resource types for the same reason as [`Self::resource_tags`].
-    pub fn remove_resource_tags(&mut self, arn: &str, keys: &[String]) -> Option<String> {
-        let tags = match self.gateways.get_mut(arn) {
-            Some(gateway) => &mut gateway.tags,
-            None => &mut self.hypervisors.get_mut(arn)?.tags,
-        };
+    /// spans every resource type, `now` included, for the same reason as
+    /// [`Self::resource_tags`].
+    pub fn remove_resource_tags(
+        &mut self,
+        arn: &str,
+        keys: &[String],
+        now: SystemTime,
+    ) -> Option<String> {
+        let (resource_arn, tags) = self.taggable_mut(arn, now)?;
         for key in keys {
             tags.remove(key);
         }
         // The ARN comes back out of the store, so what the response echoes is the key the
         // store holds rather than the string the request spelled.
-        self.resource_tags(arn).map(|(resource_arn, _)| resource_arn)
+        Some(resource_arn)
+    }
+
+    /// The ARN `arn` is stored under and the tag map of the resource it names, to WRITE.
+    ///
+    /// The writing half of [`Self::resource_tags`], resolved over the same three maps and
+    /// against the same clock, so a tag write reaches exactly the resources a tag read
+    /// reports and neither operation has to know which map holds which kind.
+    fn taggable_mut(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<(String, &mut BTreeMap<String, String>)> {
+        if let Some(gateway) = self.gateways.get_mut(arn) {
+            return Some((gateway.arn.clone(), &mut gateway.tags));
+        }
+        if let Some(hypervisor) = self.hypervisors.get_mut(arn) {
+            return Some((hypervisor.arn.clone(), &mut hypervisor.tags));
+        }
+        let machine = self
+            .virtual_machines
+            .get_mut(arn)
+            .filter(|machine| machine.discovered_as_of(now))?;
+        Some((machine.arn.clone(), &mut machine.tags))
     }
 }
 

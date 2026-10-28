@@ -60,7 +60,7 @@ fn persisted_tags(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> BTreeMap<S
     service_state(&**engine)
         .expect("the in-memory engine must expose this state")
         .lock()
-        .resource_tags(arn)
+        .resource_tags(arn, std::time::SystemTime::now())
         .map(|(_, tags)| {
             tags.into_iter()
                 .map(|tag| (tag.key, tag.value))

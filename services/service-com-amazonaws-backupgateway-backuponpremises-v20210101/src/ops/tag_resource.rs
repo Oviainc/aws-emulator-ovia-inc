@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! Merges tags into the resource an ARN names, in [`crate::state`]. This is the ONLY
-//! file to touch for this operation.
+//! Merges tags into the resource an ARN names, in [`crate::state`] — a gateway, a
+//! hypervisor or a virtual machine alike. This is the ONLY file to touch for this
+//! operation.
 //!
 //! An ARN with no record behind it is refused as the resource TYPE it names: a missing
 //! hypervisor takes the modelled `ResourceNotFoundException` shape at HTTP 400 with
@@ -157,13 +158,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Tagging MERGES: a key the resource already carries is overwritten, not
         // duplicated, and a key it does not carry is added.
         //
-        // The ARN is resolved against the resource it NAMES — this service tags gateways
-        // and hypervisors alike, so one lookup spans both stores — and an ARN with no
-        // record behind it takes the refusal that resource type carries: the same
+        // The ARN is resolved against the resource it NAMES — this service tags every
+        // resource it holds (a gateway, a hypervisor and a virtual machine of a
+        // hypervisor's inventory), so one lookup spans all three stores, resolving a
+        // machine against the clock exactly as `GetVirtualMachine` does — and an ARN with
+        // no record behind it takes the refusal that resource type carries: the same
         // modelled `ResourceNotFoundException` shape throughout, but a missing hypervisor
         // is answered 400 with `ErrorCode` `HypervisorNotFound` where every other type
         // takes the shape's own 404 (`crate::state::MissingResource`).
-        let Some(merged) = state.merge_resource_tags(&input.resource_arn, &input.tags) else {
+        let Some(merged) = state.merge_resource_tags(
+            &input.resource_arn,
+            &input.tags,
+            ::std::time::SystemTime::now(),
+        ) else {
             let missing = crate::state::MissingResource::for_arn(&input.resource_arn);
             let error = TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
