@@ -70,6 +70,12 @@
 //! releases it, so `GetImageFrame` serves them from the destination once the copy has
 //! completed and finds nothing there before that.
 //!
+//! Because the copy carries that content, a `DELETED` image set named as its source or as
+//! its destination is what is ABSENT rather than what is busy: the deletion took the pixel
+//! data and the DICOM attributes with it, so the copy answers 404
+//! `ResourceNotFoundException` worded by the image-set kind, exactly as the other calls on
+//! an image set's content do ([`crate::state::ImageSet::is_deleted`]).
+//!
 //! ---
 //!
 //! # Modeled contract for `CopyImageSet`
@@ -530,6 +536,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: crate::state::IMAGE_SET_NOT_FOUND_MESSAGE.to_string(),
                 })
             })?;
+        // A DELETED image set is a tombstone: its pixel data and its DICOM attributes went
+        // with the deletion, so a call that carries that CONTENT finds the image set itself
+        // absent rather than busy — the same answer `GetImageSetMetadata`, `GetImageFrame`
+        // and `UpdateImageSetMetadata` give, decided by the one helper that owns the rule
+        // ([`crate::state::ImageSet::is_deleted`]). Before the version and state checks, as
+        // in `UpdateImageSetMetadata`: a record that is gone is not reported as a stale view
+        // of one that is still there.
+        if source.is_deleted() {
+            return Err(CopyImageSetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::IMAGE_SET_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
         if source.latest_version_id() != information.source_image_set.latest_version_id {
             return Err(CopyImageSetErrorModeled::ConflictException(ConflictException {
                 message: crate::state::IMAGE_SET_VERSION_CONFLICT_MESSAGE.to_string(),
@@ -579,6 +600,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             },
                         )
                     })?;
+                // The destination carries the copied content too, so a tombstone is the
+                // same absence there: by the rule the source is decided by.
+                if held.is_deleted() {
+                    return Err(CopyImageSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::IMAGE_SET_NOT_FOUND_MESSAGE.to_string(),
+                        },
+                    )
+                    .into());
+                }
                 if held.latest_version_id() != destination.latest_version_id {
                     return Err(CopyImageSetErrorModeled::ConflictException(ConflictException {
                         message: crate::state::IMAGE_SET_VERSION_CONFLICT_MESSAGE.to_string(),

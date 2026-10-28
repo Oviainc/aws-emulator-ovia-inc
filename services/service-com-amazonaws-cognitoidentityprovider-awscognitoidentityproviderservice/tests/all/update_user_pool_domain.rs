@@ -13,8 +13,8 @@
 //! move, and a changed domain is `UPDATING` until the clock makes it `ACTIVE`
 //! again. Members that configure a custom domain name nothing on a prefix
 //! domain, a branding version the model does not name is refused, and a domain
-//! the named pool does not hold names no resource. Each table row names the case
-//! it asserts.
+//! the named pool does not hold names no resource the service can find. Each
+//! table row names the case it asserts.
 //!
 //! Note on the domain strings below: `DomainType`'s modelled pattern
 //! `^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$` admits no dots, and the framework
@@ -621,23 +621,24 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
             }),
             (400, "InvalidParameterException"),
         ),
-        // The pair `UserPoolId` + `Domain` is what addresses the domain to
-        // update, so a pair that holds no stored domain — whichever half of it
-        // is wrong — is the one bad-parameter refusal.
+        // The pair `UserPoolId` + `Domain` addresses an EXISTING domain record,
+        // so a pair that holds no stored domain — whichever half of it is wrong
+        // — names a resource the service cannot find, not a bad parameter. The
+        // whole class is covered by `update_user_pool_domain_not_found.rs`.
         (
             "a domain the named pool does not hold",
             json!({ "UserPoolId": user_pool_id, "Domain": "never-created", "ManagedLoginVersion": 2 }),
-            (400, "InvalidParameterException"),
+            (404, "ResourceNotFoundException"),
         ),
         (
             "a domain another pool holds",
             json!({ "UserPoolId": other_pool, "Domain": "refusal-prefix", "ManagedLoginVersion": 2 }),
-            (400, "InvalidParameterException"),
+            (404, "ResourceNotFoundException"),
         ),
         (
             "a user pool that does not exist",
             json!({ "UserPoolId": "us-east-1_absent", "Domain": "refusal-prefix" }),
-            (400, "InvalidParameterException"),
+            (404, "ResourceNotFoundException"),
         ),
         (
             "an absent pool whose other members are invalid too",
@@ -646,7 +647,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
                 "Domain": "refusal-prefix",
                 "ManagedLoginVersion": 3,
             }),
-            (400, "InvalidParameterException"),
+            (404, "ResourceNotFoundException"),
         ),
     ] {
         let (status, payload) = call(&router, "UpdateUserPoolDomain", &body).await;
