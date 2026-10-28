@@ -42,7 +42,7 @@ use service_com_amazonaws_sqs_amazonsqs::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{call, create_ok, emulator_over_engine, message_counts, messages, ok};
+use super::support::{call, create_ok, emulator_over_engine, message_counts, messages, ok, REGION};
 
 /// The shortest visibility timeout the parameter takes: "Values range: 0 to 43200"
 /// (`ChangeMessageVisibilityRequest$VisibilityTimeout`).
@@ -182,8 +182,7 @@ fn held_for(engine: &engine::InMemoryEngine, url: &str, aged_by: Duration) {
     let store = engine.state::<ComAmazonawsSqsAmazonsqsState>();
     let mut store = store.lock();
     let queue = store
-        .queues
-        .get_mut(&name)
+        .queue_mut(REGION, &name)
         .unwrap_or_else(|| panic!("case ageing the receive of {url}: no queue named {name}"));
     for message in &mut queue.messages {
         message.last_received_at = Some(base);

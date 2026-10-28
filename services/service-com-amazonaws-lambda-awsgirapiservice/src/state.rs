@@ -3565,6 +3565,9 @@ pub fn event_source_is_mappable_by_this_account(arn: &::service_common::arn::Arn
 /// The `VisibilityTimeout` of the Amazon SQS queue `event_source_arn` names, in seconds,
 /// read out of that queue's own store through the shared engine.
 ///
+/// The ARN carries the Region the queue lives in, so the queue is resolved THERE: a queue
+/// belongs to one Region's namespace, and an ARN of another Region names a different queue.
+///
 /// `None` when nothing here can answer for the queue — the value names no queue of this
 /// account, this engine carries no queue store, or no queue of that name was created — so
 /// there is no configured timeout to compare a function's against, and a mapping on it is
@@ -3576,10 +3579,9 @@ pub fn queue_visibility_timeout_seconds<Eng: Send + Sync + 'static>(
 ) -> Option<i64> {
     use ::service_com_amazonaws_sqs_amazonsqs as sqs;
 
-    let name = sqs::state::queue_name_from_arn(event_source_arn)?;
     let queues = sqs::state::service_state(engine)?;
     let queues = queues.lock();
-    let queue = queues.queues.get(name)?;
+    let queue = queues.queue_by_arn(event_source_arn)?;
     Some(queue.integer(sqs::state::VISIBILITY_TIMEOUT))
 }
 

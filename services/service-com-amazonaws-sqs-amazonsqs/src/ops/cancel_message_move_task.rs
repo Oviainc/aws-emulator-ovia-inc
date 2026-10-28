@@ -172,6 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         let now = SystemTime::now();
+        // A task handle resolves in the region the start call addressed: a task moves one
+        // region's messages between that region's queues, so a handle minted elsewhere
+        // names no task here.
+        let region = sqs::request_region(ctx.parts());
         // Retention lapses, visibility timeouts and the deliveries a task's schedule has
         // already reached are owed by the CLOCK, not by this call: what a task still owes
         // is what is left once everything already due has been applied.
@@ -181,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handle no recorded task answers to names no message movement task. The service
         // words this one for the task rather than for the parameter, so it does not go
         // through the shared `SourceArn`/`DestinationArn` wording.
-        let Some(task) = state.message_move_task(&input.task_handle) else {
+        let Some(task) = state.message_move_task(&region, &input.task_handle) else {
             return Err(CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
                 sqs::unknown_message_move_task(),
             )
@@ -213,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // yet." The count answered is the task's own progress, the same projection
         // `ListMessageMoveTasks` reports for it.
         let moved = state
-            .cancel_message_move_task(&input.task_handle, now)
+            .cancel_message_move_task(&region, &input.task_handle, now)
             .ok_or_else(|| {
                 CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
                     sqs::unknown_message_move_task(),

@@ -183,8 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = store.lock();
 
+        // A queue url resolves in the region the request addressed: this region's queue of
+        // that name, and nothing another region holds.
+        let region = state::request_region(ctx.parts());
         let name = state::queue_name_from_url(&input.queue_url)
-            .filter(|name| store.queues.contains_key(*name))
+            .filter(|name| store.holds_queue(&region, name))
             .map(str::to_string)
             .ok_or_else(|| {
                 TagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
@@ -193,7 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether this caller may tag this queue is decided against the queue's own policy
         // and the caller's identity-based policies, before anything is stored.
         let (queue_arn, policy) = {
-            let queue = &store.queues[&name];
+            let queue = store
+                .queue(&region, &name)
+                .expect("the queue was resolved out of this same store");
             (queue.arn.clone(), queue.policy().map(str::to_string))
         };
         if let Some(denied) = state::authorization::denied(
@@ -206,8 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
         let queue = store
-            .queues
-            .get_mut(&name)
+            .queue_mut(&region, &name)
             .expect("the queue was resolved out of this same store");
         // The tag restrictions the member's documentation points at, checked against
         // the tag set this call would LEAVE the queue with, BEFORE anything is stored:

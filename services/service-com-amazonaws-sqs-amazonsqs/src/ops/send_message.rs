@@ -293,12 +293,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         let now = SystemTime::now();
+        // A queue url resolves in the region the request addressed: this region's queue of
+        // that name, and nothing another region holds.
+        let region = sqs::request_region(ctx.parts());
         // Retention and visibility are owed by the clock, not by this call. Applied
         // across the whole store, so the store-wide byte budget below is measured
         // against what the store actually still holds.
         state.materialise_due(now);
         let store_bytes = state.retained_message_bytes();
-        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+        let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(SendMessageErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
             )

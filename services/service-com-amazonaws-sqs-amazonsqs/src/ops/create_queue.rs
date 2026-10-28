@@ -222,6 +222,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
+        // The region this call addressed, as its SigV4 credential scope names it: the
+        // namespace the new queue's name is unique in, and the region its ARN carries.
+        let region = state::request_region(ctx.parts());
         let supplied = input.attributes.unwrap_or_default();
         // "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
         // queue" — and it is being FIFO that makes the FIFO-only attributes applicable,
@@ -299,6 +302,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(error) = state::attribute_combination_refusal(&attributes) {
             return Err(CreateQueueErrorModeled::InvalidAttributeValue(error).into());
         }
+        // A dead-letter link never crosses an account or a region boundary: a
+        // `RedrivePolicy` whose target is some other namespace's queue could never
+        // deliver, so no queue is created carrying it. The value the request supplied is
+        // what the refusal quotes back.
+        if let Some(why) = supplied
+            .get(state::REDRIVE_POLICY)
+            .and_then(|value| state::redrive_policy_refusal(&region, value))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
 
         let store = state::service_state(&*self.engine).ok_or_else(|| {
             CreateQueueErrorModeled::UnsupportedOperation(state::store_unavailable())
@@ -306,10 +319,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = store.lock();
         let now = ::std::time::SystemTime::now();
 
-        // A request naming an existing queue either asks for nothing different about it,
-        // and is answered with that queue's url, or asks to change it, which is what
-        // `QueueNameExists` reports.
-        if let Some(existing) = store.queues.get(&input.queue_name) {
+        // A request naming an existing queue OF THIS REGION either asks for nothing
+        // different about it, and is answered with that queue's url, or asks to change it,
+        // which is what `QueueNameExists` reports. The same name in another region is
+        // another queue and says nothing about this one.
+        if let Some(existing) = store.queue(&region, &input.queue_name) {
             return match state::recreate_refusal(existing, &attributes, tags.as_ref()) {
                 None => Ok(CreateQueueOutput {
                     queue_url: Some(existing.url.clone()),
@@ -323,9 +337,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A name whose queue was deleted is not available again until the deletion has
         // propagated, whoever asks for it; the refusal states the wait Amazon SQS
-        // documents.
+        // documents. The name was deferred in the region whose queue was deleted, so a
+        // create in another region is not held up by it.
         store.forget_lapsed_deletions(now);
-        if store.deleted_recently(&input.queue_name, now).is_some() {
+        if store.deleted_recently(&region, &input.queue_name, now).is_some() {
             return Err(CreateQueueErrorModeled::QueueDeletedRecently(
                 QueueDeletedRecently {
                     message: Some(state::queue_deleted_recently_message()),
@@ -335,7 +350,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.queues.len() >= state::MAX_QUEUES {
-            // The emulator's own store ceiling. This operation models no quota error,
+            // The emulator's own store ceiling, counted across every region together: the
+            // region a request is served in comes from its own credential scope, so a
+            // per-region count alone would not bound what one caller can make this store
+            // hold. This operation models no quota error,
             // so the refusal rides on `RequestThrottled` — "The request was denied" —
             // the only one of its errors that means the call was turned away rather
             // than that the request was malformed.
@@ -349,10 +367,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = state::request_region(ctx.parts());
         let url = state::queue_url(ctx.parts(), &region, &input.queue_name);
         let queue = state::Queue {
             name: input.queue_name.clone(),
+            region: region.clone(),
             // A create makes a NEW incarnation of the name, whether or not a queue has
             // carried it before: the handles the previous one minted name that one, so
             // presenting one to this queue is presenting a handle of a queue that is gone.
@@ -379,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PurgeQueue` on it is accepted.
             purged_at: None,
         };
-        store.queues.insert(input.queue_name, queue);
+        store.insert_queue(queue);
 
         Ok(CreateQueueOutput {
             queue_url: Some(url),

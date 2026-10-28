@@ -158,7 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListQueuesErrorModeled::UnsupportedOperation(crate::state::store_unavailable())
         })?;
@@ -180,17 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let prefix = input.queue_name_prefix.unwrap_or_default();
-        // `queues` is name-ordered, so a page boundary means the same thing on the
-        // next call.
-        let names: Vec<&String> = state
-            .queues
-            .keys()
-            .filter(|name| name.starts_with(&prefix))
+        // "Gets a list of your queues" of the region this call addressed: a queue belongs
+        // to the region its create addressed, so nothing another region holds is listed
+        // here. `queues_in` is name-ordered, so a page boundary means the same thing on
+        // the next call.
+        let region = crate::state::request_region(ctx.parts());
+        let urls: Vec<String> = state
+            .queues_in(&region)
+            .filter(|queue| queue.name.starts_with(&prefix))
+            .map(|queue| queue.url.clone())
             .collect();
 
         // `NextToken` is this listing's own cursor, under the one cursor rule every paged
         // listing of this service shares: the count of entries already returned.
-        let start = crate::state::count_cursor(input.next_token.as_deref(), names.len())
+        let start = crate::state::count_cursor(input.next_token.as_deref(), urls.len())
             .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
         let page_size = input
             .max_results
@@ -200,13 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the stored queue count; the caller walks the rest with `NextToken`.
             .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
 
-        let page: Vec<String> = names
-            .iter()
-            .skip(start)
-            .take(page_size)
-            .filter_map(|name| state.queues.get(*name).map(|queue| queue.url.clone()))
-            .collect();
-        let next_token = crate::state::next_count_cursor(start, page.len(), names.len());
+        let page: Vec<String> = urls.iter().skip(start).take(page_size).cloned().collect();
+        let next_token = crate::state::next_count_cursor(start, page.len(), urls.len());
 
         Ok(ListQueuesOutput {
             queue_urls: (!page.is_empty()).then_some(page),
