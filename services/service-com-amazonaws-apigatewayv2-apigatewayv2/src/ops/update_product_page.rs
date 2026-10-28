@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProductPage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProductPage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProductPage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: patches the stored [`crate::state::ProductPage`] the URI names — a
+//! `DisplayContent` the request carries replaces the stored content, a request that
+//! carries none leaves the stored page alone — and answers 200 with the stored page. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +145,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProductPage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProductPageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProductPage"))
+        // The page's id and ARN are on its record, so nothing reported here is derived
+        // from the Region this request was signed for.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateProductPage",
+            ));
+        };
+
+        let mut store = state.lock();
+
+        // A product page is addressed UNDER its product
+        // (`PATCH /v2/portalproducts/{PortalProductId}/productpages/{ProductPageId}`), so
+        // an unknown product and an unknown page under a known one both name no page: 404
+        // `NotFoundException`, with the sentence `GetProductPage` refuses an unknown page
+        // with.
+        let stored = store
+            .portal_products
+            .get_mut(&input.portal_product_id)
+            .and_then(|product| product.product_pages.get_mut(&input.product_page_id));
+        let Some(page) = stored else {
+            return Err(UpdateProductPageErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::PRODUCT_PAGE_RESOURCE,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                },
+            )
+            .into());
+        };
+
+        // The update is a PATCH: a member the request carries replaces the stored one, and
+        // a member it omits leaves the stored value exactly as it was. `DisplayContent` is
+        // the page's content as a whole — `Title` and `Body` are both required on the
+        // modelled structure, and the boundary validator has already refused a content
+        // that omits either or oversteps a published length — so one the request carries
+        // replaces the stored content wholesale. The page's id and its ARN are not inputs
+        // of this operation, so the patched record carries them over untouched.
+        let mut modified = false;
+        if let Some(display_content) = input.display_content {
+            page.display_content = display_content;
+            modified = true;
+        }
+
+        // "The timestamp when the product page was last modified" — it advances only when
+        // this request carried a member to apply, so a patch that configures nothing is
+        // not recorded as a modification of the record.
+        if modified {
+            page.last_modified = ::std::time::SystemTime::now();
+        }
+
+        // Report what the STORE now holds, so what this caller is told is what a later
+        // GetProductPage reports.
+        let reported = page.to_wire();
+        Ok(UpdateProductPageOutput {
+            display_content: reported.display_content,
+            last_modified: reported.last_modified,
+            product_page_arn: reported.product_page_arn,
+            product_page_id: reported.product_page_id,
+        })
     }
 }

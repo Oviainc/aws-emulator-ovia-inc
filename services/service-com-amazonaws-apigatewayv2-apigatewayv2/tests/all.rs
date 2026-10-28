@@ -109,6 +109,8 @@ mod portal_update;
 mod probe;
 #[path = "all/product_page_lifecycle.rs"]
 mod product_page_lifecycle;
+#[path = "all/product_page_update.rs"]
+mod product_page_update;
 #[path = "all/product_rest_endpoint_page_deletion.rs"]
 mod product_rest_endpoint_page_deletion;
 #[path = "all/product_rest_endpoint_page_lifecycle.rs"]

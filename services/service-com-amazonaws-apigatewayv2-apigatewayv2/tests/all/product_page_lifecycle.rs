@@ -42,15 +42,15 @@ const LAST_MODIFIED_SLACK_SECONDS: f64 = 10.0;
 /// The published maximum of `DisplayContent$Title`
 /// (`smithy_query(query="shape", shape="DisplayContent")`: `Title` targets
 /// `__stringMin1Max255`).
-const TITLE_MAX_LENGTH: usize = 255;
+pub(crate) const TITLE_MAX_LENGTH: usize = 255;
 
 /// The published maximum of `DisplayContent$Body` (the same member list: `Body` targets
 /// `__stringMin1Max32768`).
-const BODY_MAX_LENGTH: usize = 32_768;
+pub(crate) const BODY_MAX_LENGTH: usize = 32_768;
 
 /// The product-pages collection of one product (`POST|GET
 /// /v2/portalproducts/{PortalProductId}/productpages`).
-fn pages_of(portal_product_id: &str) -> String {
+pub(crate) fn pages_of(portal_product_id: &str) -> String {
     format!("{PRODUCTS}/{portal_product_id}/productpages")
 }
 
