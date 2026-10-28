@@ -77,6 +77,8 @@ mod qev2_idc_applications;
 mod reboot_cluster;
 #[path = "all/redshift_idc_applications.rs"]
 mod redshift_idc_applications;
+#[path = "all/resource_policies.rs"]
+mod resource_policies;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/reserved_node_exchange.rs"]
