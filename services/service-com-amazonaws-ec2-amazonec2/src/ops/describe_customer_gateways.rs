@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCustomerGateways
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCustomerGateways`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the customer gateways the store holds, narrowed by
+//! `CustomerGatewayIds` and by every documented filter, in `CustomerGatewayId` order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCustomerGateways::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! A reporting operation: it writes nothing of its own and only materialises the moves the
+//! clock already owed (a gateway written in a non-terminal state reaching its terminal one),
+//! so two reads of an untouched store answer the same thing.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +77,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+
+use crate::state::{
+    CompiledFilter, CustomerGatewayRecord, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
+    MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS, TAG_FILTER_PREFIX,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -145,18 +152,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCustomerGateways` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCustomerGatewaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCustomerGateways"))
+        // `ctx` carries request metadata only; this operation reads none of it — a customer
+        // gateway is named by id, which is unique across Regions in this store. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // Matching cost is filters x values x held values x stored gateways, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so every
+        // request-controlled factor is capped HERE, before any work proportional to it is done
+        // and before the store is locked — and their PRODUCT is charged to one
+        // [`crate::state::MatchBudget`] below, which is the bound the per-factor caps cannot
+        // give. The same ceilings every sibling describe of this crate applies
+        // (`describe_vpn_gateways.rs`).
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied} filters, above the maximum of {MAX_FILTERS}",
+                supplied = filters.len(),
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any gateway
+        // would have matched it, so an unsupported filter can never read as "no results". Each
+        // value is compiled into its pattern ONCE here, rather than recompiled per candidate.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {supplied} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    supplied = values.len(),
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is bounded
+            // too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {supplied} bytes, above the \
+                     maximum of {MAX_FILTER_VALUE_BYTES}",
+                    supplied = oversize.len(),
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "One or more customer gateway IDs" (`CustomerGatewayIds`): the model publishes no
+        // bound on the list, and every entry is resolved against the store, so the number of
+        // ids one request may name is capped the way every other EC2 describe of this crate
+        // caps a resource-id list.
+        let requested: &[String] = input.customer_gateway_ids.as_deref().unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "CustomerGatewayIds carries {supplied} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                supplied = requested.len(),
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`DescribeCustomerGatewaysRequest$DryRun`): the flag asks about PERMISSION, so it is
+        // answered once the request's own form has been checked and before anything is
+        // resolved; every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this read is allowed to apply — the same call every sibling
+        // describe makes: a gateway written in a non-terminal `CustomerGateway$State` has
+        // reached its terminal one once that instant has passed, whether or not anybody
+        // called, so applying it here changes nothing a later caller would not have seen
+        // anyway.
+        store.materialize_due_transitions();
+
+        // "One or more customer gateway IDs. Default: Describes all your customer gateways"
+        // (`CustomerGatewayIds`): an id that names no gateway of the account is an error, not
+        // an absent row. The ids are held as an ordered SET, so the per-gateway selection
+        // below costs one lookup per candidate rather than a walk of the asked-for list, and a
+        // repeated id cannot multiply the work either.
+        for customer_gateway_id in requested {
+            store.require_customer_gateway(customer_gateway_id)?;
+        }
+        let named_ids: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+
+        // The ids narrow the store, and every filter must then hold ("If you specify multiple
+        // filters, the filters are joined with an AND" — `Filter`). Every comparison is
+        // charged to ONE budget — one step per candidate even when no filter was given, so an
+        // unfiltered scan is counted too — which bounds the PRODUCT of stored gateways,
+        // filters, values, held values and value length however the caller combines them, and
+        // with it how long this holds the store's lock. The store is keyed by
+        // `CustomerGatewayId`, so the report comes back in id order; this operation models no
+        // pagination at all — its request carries neither `MaxResults` nor `NextToken` — so
+        // every selected gateway is reported.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut reported: Vec<CustomerGateway> = Vec::new();
+        for record in store.customer_gateways.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let named = named_ids.is_empty() || named_ids.contains(record.customer_gateway_id());
+            if named
+                && state::matches_every_filter(&compiled, &mut budget, &|name| {
+                    filter_values(record, name)
+                })
+            {
+                reported.push(record.view.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as a
+        // result: the request asked for more filtering than one call will do, and is told so
+        // rather than given a silently truncated report.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them"
+                ),
+            ));
+        }
+
+        Ok(DescribeCustomerGatewaysOutput {
+            customer_gateways: Some(reported),
+        })
+    }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeCustomerGatewaysRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeCustomerGatewaysRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const CUSTOMER_GATEWAY_FILTERS: [&str; 6] = [
+    "bgp-asn",
+    "customer-gateway-id",
+    "ip-address",
+    "state",
+    "tag-key",
+    "type",
+];
+
+/// Is `name` a filter this operation documents? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no tag,
+/// so it is as undocumented as any other misspelling. The tag prefix is the crate's own
+/// [`TAG_FILTER_PREFIX`], so this operation holds no second copy of it.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || CUSTOMER_GATEWAY_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this customer gateway.
+///
+/// A filter naming an attribute the gateway does not carry compares against NO values, so it
+/// selects nothing — which is the answer `ip-address` gives for a gateway identified by
+/// certificate alone, and any absent member gives for its own filter.
+fn filter_values<'a>(record: &'a CustomerGatewayRecord, name: &str) -> Vec<Cow<'a, str>> {
+    let gateway = &record.view;
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return gateway
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        // "The customer gateway's Border Gateway Protocol (BGP) Autonomous System Number
+        // (ASN)": one ASN, reported in `BgpAsn` up to 2,147,483,647 and in `BgpAsnExtended`
+        // above it (`CustomerGateway$BgpAsn`, `CustomerGateway$BgpAsnExtended`), so whichever
+        // member carries it is what this filter compares against.
+        "bgp-asn" => gateway
+            .bgp_asn
+            .as_deref()
+            .into_iter()
+            .chain(gateway.bgp_asn_extended.as_deref())
+            .map(Cow::Borrowed)
+            .collect(),
+        "customer-gateway-id" => text(gateway.customer_gateway_id.as_deref()),
+        "ip-address" => text(gateway.ip_address.as_deref()),
+        "state" => text(gateway.state.as_deref()),
+        "type" => text(gateway.r#type.as_deref()),
+        "tag-key" => gateway
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: [`is_documented_filter`] has already refused every other name. An
+        // attribute nothing is stored for compares against nothing, so it could never widen a
+        // result even if that check were bypassed.
+        _ => Vec::new(),
     }
 }
