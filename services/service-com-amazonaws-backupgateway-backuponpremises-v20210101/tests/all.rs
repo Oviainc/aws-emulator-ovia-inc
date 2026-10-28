@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bandwidth_rate_limit_schedule.rs"]
 mod bandwidth_rate_limit_schedule;
+#[path = "all/bandwidth_rate_limit_schedule_consistency.rs"]
+mod bandwidth_rate_limit_schedule_consistency;
 #[path = "all/default_maintenance_window.rs"]
 mod default_maintenance_window;
 #[path = "all/gateway_activation.rs"]

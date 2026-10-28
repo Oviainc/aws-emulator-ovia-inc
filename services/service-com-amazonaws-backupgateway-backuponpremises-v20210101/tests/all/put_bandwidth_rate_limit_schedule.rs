@@ -47,7 +47,11 @@ use crate::gateway_lifecycle::{build_engine, build_router, call, create, never_c
 /// response renderer, so a bug in either rendering cannot cancel itself out: the request
 /// is built from the typed intervals on one side and the expected response from them on
 /// the other.
-async fn put_schedule(
+///
+/// Shared with the sibling `bandwidth_rate_limit_schedule_consistency` suite, which drives
+/// the same writer over schedules whose intervals do not hold together: one place renders
+/// a `PutBandwidthRateLimitSchedule` request.
+pub(crate) async fn put_schedule(
     router: &MultiServiceRouter,
     arn: &str,
     intervals: &[BandwidthRateLimitInterval],

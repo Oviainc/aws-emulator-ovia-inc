@@ -325,6 +325,132 @@ pub const MAINTENANCE_START_TIME_INVALID_MESSAGE: &str =
     "A maintenance start time is weekly or monthly: DayOfWeek and DayOfMonth cannot both \
      be specified.";
 
+/// `ValidationException$ErrorCode` for a bandwidth rate-limit schedule whose intervals
+/// cannot hold together, and the sentences that state each way they fail to.
+///
+/// A schedule is what ONE gateway appliance applies: "A bandwidth rate limit schedule
+/// consists of one or more bandwidth rate limit intervals. A bandwidth rate limit interval
+/// defines a period of time on one or more days of the week, during which bandwidth rate
+/// limits are specified for uploading"
+/// (`smithy_query(query="shape",shape="BandwidthRateLimitInterval")`), and an interval is
+/// an intra-day window — "The bandwidth rate limit interval ends at the end of the minute.
+/// To end an interval at the end of an hour, use the value `59`" (the `EndMinuteOfHour`
+/// doc) — so no minute of any day of the week may be covered by two rate-limit
+/// specifications, and no interval may end before it starts. The model declares each
+/// member on its own, so the boundary validator cannot express either, and
+/// [`bandwidth_rate_limit_schedule_violation`] enforces both.
+///
+/// `ValidationException$ErrorCode` is documented as "A description of what caused the
+/// validation error" (`smithy_query(query="shape",shape="ValidationException")`) and AWS
+/// publishes no vocabulary for that member, so this value names the condition the way
+/// [`MAINTENANCE_START_TIME_INVALID`] names its own.
+pub const BANDWIDTH_RATE_LIMIT_SCHEDULE_INVALID: &str = "InvalidBandwidthRateLimitSchedule";
+
+/// The minute of the day a `BandwidthRateLimitInterval` hour/minute pair names, so two
+/// endpoints of a window are compared as one number. `HourOfDay` is `@range(min: 0, max:
+/// 23)` and `MinuteOfHour` `@range(min: 0, max: 59)`, both refused at the boundary before a
+/// handler runs, so the product cannot leave the day.
+fn minute_of_day(hour_of_day: i32, minute_of_hour: i32) -> i32 {
+    hour_of_day * 60 + minute_of_hour
+}
+
+/// The lowest day of the week on which `one` and `other` both specify a rate limit for the
+/// same minute, and the first and last minute of the day they share, or `None` when the
+/// two intervals can be applied together.
+///
+/// Both windows are INCLUSIVE of their end minute (the `EndMinuteOfHour` doc: the interval
+/// "ends at the end of the minute"), so two windows clash as soon as one's start is not
+/// past the other's end.
+fn overlapping_day_of_week(
+    one: &BandwidthRateLimitInterval,
+    other: &BandwidthRateLimitInterval,
+) -> Option<(i32, i32, i32)> {
+    let one_start = minute_of_day(one.start_hour_of_day, one.start_minute_of_hour);
+    let one_end = minute_of_day(one.end_hour_of_day, one.end_minute_of_hour);
+    let other_start = minute_of_day(other.start_hour_of_day, other.start_minute_of_hour);
+    let other_end = minute_of_day(other.end_hour_of_day, other.end_minute_of_hour);
+    if one_start > other_end || other_start > one_end {
+        return None;
+    }
+    let day = one
+        .days_of_week
+        .iter()
+        .copied()
+        .filter(|day| other.days_of_week.contains(day))
+        .min()?;
+    Some((day, one_start.max(other_start), one_end.min(other_end)))
+}
+
+/// Why the bandwidth rate-limit schedule `intervals` states cannot be applied, as the
+/// sentence a [`BANDWIDTH_RATE_LIMIT_SCHEDULE_INVALID`] refusal carries — or `None` when
+/// every interval of it holds together and the schedule can be persisted.
+///
+/// Three ways a schedule fails, all one rule — a minute of a day of the week carries at
+/// most one rate limit, and an interval is a window inside one day:
+///
+/// * an interval whose end precedes its start, which is no window of a single day;
+/// * an interval listing a day of the week twice, which states the same minutes twice;
+/// * two intervals sharing a day whose windows overlap, which an appliance cannot apply
+///   at once.
+///
+/// Every member of every interval is already inside the constraints the model declares by
+/// the time a handler can call this, so what is left is how the intervals stand to one
+/// another. AWS publishes no wording for these refusals, so each sentence below is an
+/// example: the requirement is the error shape, its status and the `ErrorCode`, and the
+/// sentence names the intervals and the values that clash — taken from the request — so the
+/// caller can fix it from the refusal alone.
+pub fn bandwidth_rate_limit_schedule_violation(
+    intervals: &[BandwidthRateLimitInterval],
+) -> Option<String> {
+    // Each interval on its own first: an interval that is not a window of one day has no
+    // meaningful overlap with anything else.
+    for (index, interval) in intervals.iter().enumerate() {
+        if minute_of_day(interval.end_hour_of_day, interval.end_minute_of_hour)
+            < minute_of_day(interval.start_hour_of_day, interval.start_minute_of_hour)
+        {
+            return Some(format!(
+                "The bandwidth rate limit interval at position {index} ends at \
+                 {:02}:{:02}, before it starts at {:02}:{:02}: a bandwidth rate limit \
+                 interval is a period of time within one day, so EndHourOfDay and \
+                 EndMinuteOfHour cannot precede StartHourOfDay and StartMinuteOfHour.",
+                interval.end_hour_of_day,
+                interval.end_minute_of_hour,
+                interval.start_hour_of_day,
+                interval.start_minute_of_hour,
+            ));
+        }
+        for (position, day) in interval.days_of_week.iter().enumerate() {
+            if interval.days_of_week[..position].contains(day) {
+                return Some(format!(
+                    "The bandwidth rate limit interval at position {index} lists day \
+                     {day} of the week more than once: DaysOfWeek names each day of the \
+                     week the interval applies to at most once."
+                ));
+            }
+        }
+    }
+
+    // Then every pair, in the order the request listed them, so the same schedule is
+    // always refused for the same pair.
+    for (index, interval) in intervals.iter().enumerate() {
+        for (other_index, other) in intervals.iter().enumerate().skip(index + 1) {
+            if let Some((day, from, through)) = overlapping_day_of_week(interval, other) {
+                return Some(format!(
+                    "The bandwidth rate limit intervals at positions {index} and \
+                     {other_index} both apply on day {day} of the week, from {:02}:{:02} \
+                     through {:02}:{:02}: bandwidth rate limit intervals cannot overlap.",
+                    from / 60,
+                    from % 60,
+                    through / 60,
+                    through % 60,
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 /// `ValidationException$ErrorCode` for a `CreateGateway` whose `ActivationKey` names no
 /// activation this service has issued and not yet redeemed.
 ///
@@ -1407,6 +1533,10 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// ORDER is the order the request listed them in, which is the order a read reports.
     /// Nothing else on the record is touched: setting a schedule is not a maintenance
     /// window and does not move the gateway's other members.
+    ///
+    /// Whether the intervals can HOLD TOGETHER is settled before this is reached — see
+    /// [`bandwidth_rate_limit_schedule_violation`], the refusal the handler answers with —
+    /// so this writes the schedule it is given.
     pub fn set_bandwidth_rate_limit_schedule(
         &mut self,
         arn: &str,

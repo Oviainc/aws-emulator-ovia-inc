@@ -15,6 +15,14 @@
 //! comes back is the store's own key for the record written, never the string the request
 //! carried, and `GetBandwidthRateLimitSchedule` reads back exactly what was stored.
 //!
+//! A schedule is only persisted if the appliance could APPLY it: the intervals it carries
+//! have to hold together as windows of single days that no minute of any day of the week
+//! is covered by twice
+//! ([`crate::state::bandwidth_rate_limit_schedule_violation`]), which the model's
+//! per-member constraints cannot express. One that does not is refused with the modelled
+//! `ValidationException` and nothing is written, so a read never reports a schedule the
+//! gateway could not keep.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -77,7 +85,18 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — A resource that is required for the action
-//!   wasn't found.
+//!   wasn't found: the refusal for a well-formed `GatewayArn` the store holds no gateway
+//!   under, whether it was never created or has been deleted.
+//! * `ValidationException` (HTTP 400) — the refusal for a schedule whose intervals cannot
+//!   hold together on one appliance, `ErrorCode`
+//!   [`crate::state::BANDWIDTH_RATE_LIMIT_SCHEDULE_INVALID`] and the sentence
+//!   [`crate::state::bandwidth_rate_limit_schedule_violation`] states: an interval ending
+//!   before it starts, an interval naming a day of the week twice, or two intervals that
+//!   share a day and overlap. One of the errors this SERVICE models for every operation,
+//!   which `smithy_query(query="operation",operation="PutBandwidthRateLimitSchedule")`
+//!   therefore lists for this one (beside `InternalServerException` and
+//!   `ThrottlingException`) even though the operation shape itself does not — hence
+//!   `extra_errors` below.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -93,13 +112,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `PutBandwidthRateLimitScheduleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+// `extra_errors` widens the set with the errors this SERVICE models for every operation —
+// the ones `smithy_query(query="operation")` reports for this operation by merging the
+// service-common errors in, and which the OPERATION shape in the model does not list
+// itself, so `#[operation_error]` does not generate them. The same widening
+// `put_maintenance_start_time` and `put_hypervisor_property_mappings` do.
 #[smithy_macros::operation_error(
     "com.amazonaws.backupgateway#PutBandwidthRateLimitSchedule",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["ValidationException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum PutBandwidthRateLimitScheduleErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
     InternalServerException(InternalServerException),
 }
 
@@ -168,16 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // One guard spans the lookup and the write, so the record resolved is the record
-        // the schedule is written to.
-        let mut store = state.lock();
-
         // `GatewayArn`'s length and pattern, the size of `BandwidthRateLimitIntervals` and
         // every member of every interval are refused by the boundary validator before
-        // `handle` runs, so reaching here means the input satisfies all of them. What is
-        // left is a fact of the STORE: whether that ARN names a gateway. One that was
-        // never created, or one already deleted, is simply absent — refused the way every
-        // other gateway operation of this service refuses one, with nothing written.
+        // `handle` runs, so reaching here means the input satisfies all of them. What the
+        // model cannot express is how the intervals stand to ONE ANOTHER: a schedule is
+        // what one appliance applies, so an interval has to be a window inside a single
+        // day and no minute of any day of the week may carry two rate limits. A schedule
+        // that fails that is refused as a fact of the REQUEST alone, before the store is
+        // consulted at all, and nothing is written.
         //
         // The interval list is MOVED out of the owned input — the schedule the request
         // carried is the schedule the record is to hold, so there is nothing to copy.
@@ -185,6 +208,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             gateway_arn,
             bandwidth_rate_limit_intervals,
         } = input;
+
+        if let Some(message) =
+            crate::state::bandwidth_rate_limit_schedule_violation(&bandwidth_rate_limit_intervals)
+        {
+            return Err(
+                PutBandwidthRateLimitScheduleErrorModeled::ValidationException(
+                    ValidationException {
+                        error_code: Some(
+                            crate::state::BANDWIDTH_RATE_LIMIT_SCHEDULE_INVALID.to_string(),
+                        ),
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One guard spans the lookup and the write, so the record resolved is the record
+        // the schedule is written to. What is left is a fact of the STORE: whether that ARN
+        // names a gateway. One that was never created, or one already deleted, is simply
+        // absent — refused the way every other gateway operation of this service refuses
+        // one, with nothing written.
+        let mut store = state.lock();
         let Some(updated) =
             store.set_bandwidth_rate_limit_schedule(&gateway_arn, bandwidth_rate_limit_intervals)
         else {
