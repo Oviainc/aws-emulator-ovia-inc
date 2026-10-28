@@ -151,14 +151,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `name` (1..64), `emailAddress` (6..254, `^(.+)@(.+)$`) and the `tags` map's
-        // 0..200 length and value length are modelled in a form the centralized walk
-        // applies, so a value outside them is already a 400 `ValidationException`
-        // before this body runs. The tag KEY pattern is not: the walk captures no
-        // map-key constraints and could not compile this one anyway, so this handler
-        // applies it (see `crate::state::tag_key_rejection`) before it touches the
-        // store, because a create the shape refuses persists nothing.
+        // `name`'s 1..64 length, `emailAddress` (6..254, `^(.+)@(.+)$`) and the `tags`
+        // map's 0..200 length and value length are modelled in a form the centralized
+        // walk applies, so a value outside them is already a 400 `ValidationException`
+        // before this body runs. Two modelled patterns in this input are NOT: the tag
+        // KEY pattern, which the walk captures no map-key constraints for and could not
+        // compile anyway, and `name`'s own `EmailContactName` pattern, whose character
+        // class the walk's regex engine cannot compile either — and a pattern it cannot
+        // compile is treated there as matching every value. So this handler applies both
+        // (see `crate::state::check_email_contact_name` and
+        // `crate::state::tag_key_rejection`) before it touches the store, because a
+        // create the shape refuses persists nothing. `name` is judged first, the order
+        // the walk visits the input's members in.
         let _ = ctx;
+        crate::state::check_email_contact_name("name", &input.name)
+            .map_err(CreateEmailContactErrorModeled::ValidationException)?;
         if let Some(tags) = input.tags.as_ref() {
             crate::state::check_tag_keys("tags", tags.keys().map(String::as_str))
                 .map_err(CreateEmailContactErrorModeled::ValidationException)?;
