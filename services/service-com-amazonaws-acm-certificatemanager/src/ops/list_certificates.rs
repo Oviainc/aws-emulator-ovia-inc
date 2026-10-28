@@ -343,6 +343,13 @@ fn matches_filters(cert: &crate::state::Certificate, input: &ListCertificatesInp
     // exist only once it has been issued, so a pending certificate carries none and
     // any such filter keeps nothing — but that answer comes from the record, not from
     // the filter being unimplemented.
+    //
+    // A certificate whose extensions ARE known and restrict or assert nothing carries
+    // the sentinel name for that (`crate::state::no_key_usage`,
+    // `crate::state::no_extended_key_usage`), so each filter selects it by naming that
+    // sentinel exactly as it selects any other certificate by naming a value it
+    // carries: one stored value, compared one way, so these filters and every
+    // projection of the same certificate cannot disagree about it.
     let excluded_by_usage = includes.key_usage.as_ref().is_some_and(|wanted| {
         !wanted.iter().any(|name| cert.key_usages.contains(name))
     }) || includes.extended_key_usage.as_ref().is_some_and(|wanted| {

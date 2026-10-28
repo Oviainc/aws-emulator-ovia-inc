@@ -363,6 +363,18 @@ fn expected_refusal(status: u16, message: &str) -> String {
 /// what a client reads to decide whether a failed resource is worth retrying.
 const INVALID_REQUEST: &str = "HandlerErrorCode: InvalidRequest";
 
+/// The class a refusal of a service LIMIT is reported under instead, and what the SDK
+/// diagnostic then reports: a condition that can clear on its own is retried to the SDK's
+/// default maximum of attempts, where a refusal of the request itself is raised on the
+/// first.
+const SERVICE_LIMIT_EXCEEDED: &str = "HandlerErrorCode: ServiceLimitExceeded";
+
+/// The attempt count the diagnostic carries for a refusal the SDK does not retry.
+const SINGLE_ATTEMPT: &str = "(SDK Attempt Count: 1)";
+
+/// And for one it does.
+const RETRIED_ATTEMPTS: &str = "(SDK Attempt Count: 3)";
+
 const ROWS: &[Row] = &[
     Row {
         // The OpenSearch-optimized family is offered from OpenSearch 2.11, so an earlier
@@ -540,6 +552,15 @@ async fn a_domain_the_owning_service_refuses_rolls_the_whole_stack_back() {
             "case {case:?}: expected a resource event carrying {expected:?} and \
              {INVALID_REQUEST:?}, got {reasons:?}"
         );
+        // A refusal of the REQUEST is not retried, so the diagnostic reports the one attempt
+        // the call was asked for.
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains(&expected) && reason.contains(SINGLE_ATTEMPT)),
+            "case {case:?}: expected the diagnostic to report a single attempt \
+             ({SINGLE_ATTEMPT:?}), got {reasons:?}"
+        );
 
         // Nothing survives: the domain was never created, and the topic the domain
         // `DependsOn` — created first — is deleted again by the rollback.
@@ -695,6 +716,157 @@ async fn a_domain_the_owning_service_offers_is_created_and_reads_back() {
             (status, error_code(&answer).as_str()),
             (404, "NotFound"),
             "case {case:?}: deleting the stack must delete the topic, got {status} with {answer}"
+        );
+    }
+}
+
+/// The storage declarations the suite deploys: a volume the owning service does not publish
+/// for the instance type the domain runs on, at each end of the published range, and the
+/// sub-type whose maximum is a flat cap. Each row is a `VolumeSize` the owning service's own
+/// `DescribeInstanceTypeLimits` reports as outside its `MinimumVolumeSize` ..
+/// `MaximumVolumeSize` pair for that instance type, which the direct call below re-checks
+/// per row rather than this suite restating the bounds.
+const STORAGE_ROWS: &[(&str, &str, &str, &str, &str, &str)] = &[
+    (
+        "a gp3 volume below the published floor",
+        "sim-osrb-ebs-low",
+        "sim-osrb-ebs-low",
+        "OpenSearch_2.11",
+        r#"{"InstanceType":"t3.small.search","InstanceCount":1}"#,
+        r#"{"EBSEnabled":true,"VolumeType":"gp3","VolumeSize":5}"#,
+    ),
+    (
+        "a gp3 volume over the maximum the instance type publishes",
+        "sim-osrb-ebs-high",
+        "sim-osrb-ebs-high",
+        "Elasticsearch_7.10",
+        r#"{"InstanceType":"m5.large.search","InstanceCount":1}"#,
+        r#"{"EBSEnabled":true,"VolumeType":"gp3","VolumeSize":4096}"#,
+    ),
+    (
+        "a magnetic volume over the flat cap its sub-type publishes",
+        "sim-osrb-ebs-mag",
+        "sim-osrb-ebs-mag",
+        "OpenSearch_2.19",
+        r#"{"InstanceType":"m5.2xlarge.search","InstanceCount":1}"#,
+        r#"{"EBSEnabled":true,"VolumeType":"standard","VolumeSize":400}"#,
+    ),
+];
+
+/// What the owning service answers a DIRECT create of one row's cluster AND storage with:
+/// the status and the message the stack's reason has to be built from.
+async fn direct_storage_refusal(
+    router: &MultiServiceRouter,
+    domain: &str,
+    engine_version: &str,
+    cluster: &str,
+    ebs: &str,
+) -> (u16, String) {
+    let (status, body) = opensearch(
+        router,
+        "POST",
+        "/2021-01-01/opensearch/domain",
+        Some(serde_json::json!({
+            "DomainName": format!("direct-{domain}"),
+            "EngineVersion": engine_version,
+            "ClusterConfig": serde_json::from_str::<Value>(cluster).expect("a JSON object"),
+            "EBSOptions": serde_json::from_str::<Value>(ebs).expect("a JSON object"),
+        })),
+    )
+    .await;
+    let message = body
+        .get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    (status, message)
+}
+
+/// A domain declaring storage the owning service will not provision fails the resource under
+/// the SERVICE-LIMIT class, not the invalid-request one.
+///
+/// This is the class half of the rule this suite is about: what a resource's reason reports
+/// is decided by the error the owning service answered, so a refusal of a published LIMIT
+/// reaches the reason as `ServiceLimitExceeded`, quoting that service's own sentence and the
+/// 409 it answered, and carrying the attempts an SDK makes at a condition it retries — where
+/// the instance-type rows above, refusals of the request itself, reach it as `InvalidRequest`
+/// on a single attempt.
+#[tokio::test]
+async fn a_domain_whose_storage_exceeds_a_published_limit_reports_the_service_limit_class() {
+    let router = build_router();
+
+    for (case, stack, domain, engine_version, cluster, ebs) in STORAGE_ROWS {
+        let topic = format!("{stack}-alerts");
+        let body = format!(
+            r#"{{"Resources":{{
+                 "Alerts":{{"Type":"AWS::SNS::Topic","Properties":{{"TopicName":"{topic}"}}}},
+                 "Domain":{{"Type":"AWS::OpenSearchService::Domain","DependsOn":"Alerts",
+                   "Properties":{{"DomainName":"{domain}","EngineVersion":"{engine_version}",
+                     "ClusterConfig":{cluster},"EBSOptions":{ebs}}}}}}}}}"#
+        );
+        let (status, answer) = cloudformation(
+            &router,
+            "CreateStack",
+            &[("StackName", stack), ("TemplateBody", &body)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from CreateStack, got {status} with {answer}"
+        );
+
+        let described = settle_stack(&router, case, stack).await;
+        assert_eq!(
+            xml_text(&described, "StackStatus"),
+            "ROLLBACK_COMPLETE",
+            "case {case:?}: a Domain that fails to create must roll the whole stack back, got \
+             {described}"
+        );
+
+        // The refusal the resource reports is the one the owning service answers the same
+        // declaration with when a client asks it directly, and that service answers a
+        // published-limit refusal with its modelled 409.
+        let (direct_status, direct_message) =
+            direct_storage_refusal(&router, domain, engine_version, cluster, ebs).await;
+        assert_eq!(
+            direct_status, 409,
+            "case {case:?}: expected the owning service to refuse the storage with its \
+             service-limit status, got {direct_status} with {direct_message:?}"
+        );
+        let reasons = resource_reasons(&router, stack).await;
+        let quoted = format!(
+            "{direct_message} (Service: OpenSearch, Status Code: {direct_status}, Request ID: "
+        );
+        assert!(
+            reasons.iter().any(|reason| reason.contains(&quoted)
+                && reason.contains(RETRIED_ATTEMPTS)
+                && reason.contains(SERVICE_LIMIT_EXCEEDED)),
+            "case {case:?}: expected a resource event carrying {quoted:?}, \
+             {RETRIED_ATTEMPTS:?} and {SERVICE_LIMIT_EXCEEDED:?}, got {reasons:?}"
+        );
+        // And NOT under the invalid-request class, whose own wording the provider puts
+        // inside the quoted message.
+        assert!(
+            !reasons
+                .iter()
+                .any(|reason| reason.contains(INVALID_REQUEST)
+                    || reason.contains("Invalid request provided:")),
+            "case {case:?}: expected no invalid-request classification of a limit refusal, \
+             got {reasons:?}"
+        );
+
+        // Nothing survives: the domain was never created, and the topic it depended on is
+        // deleted again by the rollback.
+        let (status, reported) = describe_domain(&router, domain).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: the refused domain must not exist, got {status} with {reported}"
+        );
+        assert_eq!(
+            topic_arn(&router, case, &topic).await,
+            String::new(),
+            "case {case:?}: the rollback must delete the topic the domain depended on"
         );
     }
 }

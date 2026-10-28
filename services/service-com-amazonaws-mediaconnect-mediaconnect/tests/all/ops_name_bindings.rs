@@ -62,6 +62,11 @@ const ROUTER_INPUT_ARN: &str =
 /// (`smithy_query(query="shape",shape="RouterOutputArn")`).
 const ROUTER_OUTPUT_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerOutput:abc123def456";
+/// An offering ARN. `PurchaseOffering$OfferingArn` targets a plain `String` with no pattern
+/// (`smithy_query(query="operation",operation="PurchaseOffering")`), so any label reaches
+/// the handler; this one is shaped like the ARNs the service mints for an offering.
+const OFFERING_ARN: &str =
+    "arn:aws:mediaconnect:us-east-1:000000000000:offering:collision-case";
 
 /// One expectation about which item a `crate::ops::…` path names.
 struct TypeRow {
@@ -348,13 +353,26 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
             },
         ),
         (
-            // Still a scaffold: it answers the 501 that names it, which is what proves a
-            // request on its own route reaches ITS handler and not a neighbour's — here the
-            // implemented router output routes that share its path prefix.
+            // Implemented: it answers the modelled `NotFoundException` (404) for a router
+            // output ARN this store does not hold — on its own route, under the router
+            // output path prefix the implemented router output routes share.
             "TakeRouterInput",
             "PUT",
             format!("/v1/routerOutput/takeRouterInput/{ROUTER_OUTPUT_ARN}"),
             "{}",
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
+        ),
+        (
+            // Still a scaffold: it answers the 501 that names it, which is what proves a
+            // request on its own route reaches ITS handler and not a neighbour's — here the
+            // implemented offering routes that share its path prefix.
+            "PurchaseOffering",
+            "POST",
+            format!("/v1/offerings/{OFFERING_ARN}"),
+            "{\"reservationName\":\"collision-case\",\"start\":\"2026-01-01T00:00:00Z\"}",
             Reached::ScaffoldedStub,
         ),
         (

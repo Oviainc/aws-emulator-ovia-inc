@@ -188,12 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region's endpoint does not reach — is the modelled 404 before any
         // endpoint under it is looked at, and its text is the one the caller
         // sees.
-        if crate::state::outpost_in(&inventory, &region, &input.outpost_id).is_none() {
-            return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(),
-            )
-            .into());
-        }
+        crate::state::resolve_outpost(&inventory, &region, &input.outpost_id)
+            .map_err(DeleteEndpointErrorModeled::ResourceNotFoundException)?;
 
         // Only the endpoint's own account can delete it: a pair that names no
         // endpoint of this caller's on that Outpost is the modelled 404 — which

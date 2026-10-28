@@ -1,0 +1,52 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch__redshift.e2e-diagnose-redshift-cluster-health-issues-lifecycle
+Issue-Key: cloudwatch__redshift.e2e-diagnose-redshift-cluster-health-issues-lifecycle|phase#7|AssertionError|raise AssertionError(f"[phase {i}/{len(self.phases)} {name}] {exc}") from exc
+Issue-Commit: ed95744dcbaaa36aa6e9433f77a7509d0df7ddaf
+
+# CloudFormation provisioning of AWS::Redshift::ClusterParameterGroup does not register the group under its declared ParameterGroupName, so a dependent AWS::Redshift::Cluster fails with "ClusterParameterGroup not found" and the stack rolls back
+
+> _Note: this issue was identified against the code base at commit `ed95744dcbaaa36aa6e9433f77a7509d0df7ddaf`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateStack
+
+## Description
+One net-new root cause. Service token taken from the failing check id cloudwatch__redshift.e2e-diagnose-redshift-cluster-health-issues-lifecycle (the check declares SERVICES = ["cloudwatch", "redshift"]; the defect sits in the Redshift side of the CloudFormation-driven estate, and the CloudWatch assertions are never reached).
+
+Cause 1 of 1: an AWS::Redshift::ClusterParameterGroup resource that declares an explicit ParameterGroupName is given a CloudFormation-minted physical name instead, and no Redshift cluster parameter group answers under the name that Ref then resolves to. The dependent AWS::Redshift::Cluster resource, whose ClusterParameterGroupName is {"Ref": "<that group>"}, is therefore refused as NotFound and the whole stack rolls back.
+Failing check id: cloudwatch__redshift.e2e-diagnose-redshift-cluster-health-issues-lifecycle
+
+AWS: recorded behavior only for the end-to-end sequence (the Smithy models for redshift and cloudformation describe the operations, not the resource-provider contract). On real AWS, for AWS::Redshift::ClusterParameterGroup the ParameterGroupName property is honoured verbatim when supplied — CloudFormation only generates a "<stack-name>-<logical-id>-<random>" physical name when the name property is OMITTED — and Ref on that resource returns the parameter group name. Redshift's CreateClusterParameterGroup is called with that name, so DescribeClusterParameterGroups answers for it, and the dependent AWS::Redshift::Cluster created with ClusterParameterGroupName = Ref(group) resolves it and reaches available. The stack reaches CREATE_COMPLETE, its Outputs carry GlobalClusterIdentifier/GlobalClusterEndpoint/ParameterGroupName/GlobalHealthAllAlarmName/GlobalHealthLeaderAlarmName, and DescribeClusters shows the cluster's ClusterParameterGroups[0].ParameterGroupName equal to the stack's ParameterGroupName output. The refusal the emulator produces is a genuine AWS error class — Redshift's ClusterParameterGroupNotFoundFault, surfaced by the resource provider as HandlerErrorCode NotFound with message 'ClusterParameterGroup not found: <parameter-group-name>' — but on AWS it is only reachable when the named group really does not exist; here it fires for a group the same stack just created. In that message, 'ClusterParameterGroup not found: ' is the fixed text and the trailing value is the requested parameter group name taken from the request; the emulator fills it with its own minted physical id rather than the declared name.
+
+Emulator: CreateStack for a template whose RedshiftParameterGroup declares ParameterGroupName {"Fn::Sub": "${Token}-pg"} and whose RedshiftClusterGlobal sets ClusterParameterGroupName {"Ref": "RedshiftParameterGroup"} drives the stack to ROLLBACK_COMPLETE. DescribeStackEvents reports the failed resources as ('<stack>', 'The following resource(s) failed to create: [RedshiftClusterGlobal]. ') and ('RedshiftClusterGlobal', 'Resource handler returned message: "ClusterParameterGroup not found: <stack>-RedshiftParameterGroup-<random-suffix>" (RequestToken: ..., HandlerErrorCode: NotFound)'). Two things diverge and are visible in that one message: the Ref resolved to an auto-generated '<stack>-<logical-id>-<suffix>' physical name even though ParameterGroupName was declared, and nothing in Redshift state answers for that name, so the cluster create cannot find it. The check never gets past phase 1 of 4 (deploy), so every later assertion — the cluster being available on the stack's parameter group, the two AWS/Redshift HealthStatus alarms' configuration, the cluster-wide alarm firing, DescribeAlarmsForMetric lookups, the read-only-solve snapshot comparison, and the delete/second-delete arm — is blocked.
+
+Why: a client that deploys Redshift through CloudFormation — the ordinary way clusters are created — cannot create a cluster that references a parameter group from the same template. The stack rolls back, so nothing is provisioned, and the client additionally sees the wrong physical name for its parameter group: Ref and the ParameterGroupName output do not return the name it asked for, so any cross-stack reference, tag lookup, or subsequent ModifyClusterParameterGroup call keyed on the declared name misses. The failure is reported as a resource NotFound, which sends an operator looking for a missing dependency rather than at name resolution.
+
+Fix: the CloudFormation resource provider for AWS::Redshift::ClusterParameterGroup in the cloudformation service crate (its physical-id/name assignment and its Ref/GetAtt resolution) must use the declared ParameterGroupName as the physical id when the property is present, generating '<stack>-<logical-id>-<suffix>' only when it is absent, and must create the group in Redshift state under exactly that name so DescribeClusterParameterGroups and the AWS::Redshift::Cluster provider's ClusterParameterGroupName lookup both resolve it. The AWS::Redshift::Cluster provider must resolve ClusterParameterGroupName against that state and report ClusterParameterGroupNotFoundFault only for a genuinely absent group.
+
+Traces: cloudwatch__redshift.e2e-diagnose-redshift-cluster-health-issues-lifecycle (mismatch, phase 1/4 'deploy'). Note the sibling cloudwatch__redshift check about AWS/Redshift HealthStatus alarms never evaluating is already filed as 20261024T115115Z-cloudwatch-redshift-cloudwatch-alarms-on-aws-redshift-healthstatus-never-evaluate.md; that issue is about alarm evaluation and does not cover this stack-create failure, which happens before any alarm is read.
+
+## Evidence
+Expected (real AWS): CreateStack with the template's RedshiftParameterGroup (AWS::Redshift::ClusterParameterGroup, ParameterGroupFamily redshift-1.0, ParameterGroupName = "${Token}-pg") and RedshiftClusterGlobal (AWS::Redshift::Cluster, ClusterType single-node, ClusterParameterGroupName = {"Ref":"RedshiftParameterGroup"}) reaches CREATE_COMPLETE. DescribeStacks Outputs = {GlobalClusterIdentifier, GlobalClusterEndpoint, ParameterGroupName, GlobalHealthAllAlarmName, GlobalHealthLeaderAlarmName}; ParameterGroupName output == the declared "${Token}-pg"; DescribeClusters(<Token>-global).Clusters[0].ClusterStatus == "available" and ClusterParameterGroups[0].ParameterGroupName == that output.
+
+Actual (emulator): the stack reaches 'ROLLBACK_COMPLETE'. DescribeStackEvents failed-resource reasons:
+  ('<stack>', 'The following resource(s) failed to create: [RedshiftClusterGlobal]. ')
+  ('RedshiftClusterGlobal', 'Resource handler returned message: "ClusterParameterGroup not found: <stack>-RedshiftParameterGroup-<random-suffix>" (RequestToken: <uuid>, HandlerErrorCode: NotFound)')
+Two divergences in that one line: (1) the parameter group's physical name is an auto-minted '<stack>-<logical-id>-<suffix>' although ParameterGroupName was declared in the template, where AWS would use the declared name; (2) no cluster parameter group is resolvable under the name Ref produced, so the cluster create is refused NotFound. The stack name, the random suffix and the RequestToken are per-run values; the fixed text of the handler message is 'ClusterParameterGroup not found: ' followed by the requested parameter group name.
+
+Blocked downstream assertions (never evaluated because deploy is phase 1 of 4): cluster available on the stack's parameter group; GlobalHealthAllAlarm = (Period 60, Threshold 0.5, GreaterThanThreshold, 1 dimension) and GlobalHealthLeaderAlarm = (Period 1800, Threshold 1.0, LessThanThreshold, 2 dimensions); the cluster-wide alarm reaching ALARM from the cluster's own AWS/Redshift HealthStatus datapoints; DescribeAlarmsForMetric on (ClusterIdentifier) and (ClusterIdentifier, NodeID) each returning exactly one alarm; the estate snapshot being unchanged across the read-only solve; DeleteStack reaching DELETE_COMPLETE and a following DescribeStackResources returning ValidationError with message 'Stack with id <stack> does not exist'; and a second delete being a clean no-op.
+
+## Steps to Reproduce
+1. CreateStack with a template containing:
+   - RedshiftParameterGroup: Type AWS::Redshift::ClusterParameterGroup, Properties { ParameterGroupFamily: "redshift-1.0", ParameterGroupName: {"Fn::Sub": "${Token}-pg"}, Description, Parameters: [...] }
+   - RedshiftClusterGlobal: Type AWS::Redshift::Cluster, Properties { ClusterIdentifier: {"Fn::Sub": "${Token}-global"}, ClusterType: "single-node", NodeType: <a single-node type returned by DescribeOrderableClusterOptions, e.g. ra3.large>, DBName, MasterUsername, MasterUserPassword, ClusterParameterGroupName: {"Ref": "RedshiftParameterGroup"}, Encrypted: true, ... }
+   - Outputs exposing {"Ref": "RedshiftParameterGroup"} and {"Ref": "RedshiftClusterGlobal"}.
+2. Poll DescribeStacks(StackName) until a terminal status.
+   Expected: CREATE_COMPLETE.
+   Observed: ROLLBACK_COMPLETE.
+3. DescribeStackEvents(StackName) and read the *_FAILED reasons: RedshiftClusterGlobal reports HandlerErrorCode NotFound with 'ClusterParameterGroup not found: <stack>-RedshiftParameterGroup-<suffix>' — an auto-minted name, not the declared "${Token}-pg".
+4. Independently confirm the naming half: on a stack with only the AWS::Redshift::ClusterParameterGroup resource, DescribeStacks Outputs for {"Ref": "RedshiftParameterGroup"} must be "${Token}-pg", and DescribeClusterParameterGroups must list a group with that ParameterGroupName.
+
+Replay: run_behavioral_suite and re-run check cloudwatch__redshift.e2e-diagnose-redshift-cluster-health-issues-lifecycle.

@@ -461,13 +461,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance type it runs on, and the update is judged on the MERGED record: a
         // request that resizes the volume is checked against the instance type the
         // domain keeps, and one that changes the instance type against the volume it
-        // keeps. A dry run is refused too — it reports what applying the change would
-        // do, and this change cannot be applied.
+        // keeps. A size outside the published range asks for storage the service does
+        // not offer for that instance type, which is the same storage LIMIT the create
+        // path refuses with the modelled `LimitExceededException`. A dry run is refused
+        // too — it reports what applying the change would do, and this change cannot be
+        // applied.
         if let Some(refusal) = crate::state::ebs_volume_size_refusal(
             merged.ebs_options.as_ref(),
             merged.cluster_config.instance_type.as_deref(),
+            &merged.engine_version,
         ) {
-            return Err(UpdateDomainConfigErrorModeled::ValidationException(refusal).into());
+            return Err(UpdateDomainConfigErrorModeled::LimitExceededException(refusal).into());
         }
 
         // The configuration the change would leave the domain with is judged by the

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMLLabelingSetGenerationTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMLLabelingSetGenerationTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMLLabelingSetGenerationTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a run of the active learning workflow over one machine learning transform:
+//! "Starts the active learning workflow for your machine learning transform to improve
+//! the transform's quality by generating label sets and adding labels." The call records
+//! the run of the transform it names, mints the `TaskRunId` that addresses it and answers
+//! that id; the run is then one of the historic runs the transform's task run listing
+//! reports.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +158,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMLLabelingSetGenerationTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMLLabelingSetGenerationTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMLLabelingSetGenerationTaskRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(
+                StartMLLabelingSetGenerationTaskRunErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the Glue machine learning transform store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `TransformId` and `OutputS3Path` are both `@required`, and the id's
+        // `length 1..255` is refused at the boundary — so reaching here, the only question
+        // is whether this account holds the transform the run would be started of. The run
+        // is recorded ON that transform, so an id this account holds none under starts
+        // nothing.
+        let Some(transform) = store.ml_transforms.get_mut(&input.transform_id) else {
+            return Err(
+                StartMLLabelingSetGenerationTaskRunErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::messages::ml_transform_not_found(
+                            &input.transform_id,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The id is minted only once the request is going to be served, so the refusal
+        // above hands out none.
+        let run_id = crate::state::new_ml_task_run_id();
+        // What the run IS, in the modelled shape every reader of it reports: a labelling
+        // set generation task, carrying the one property that kind of task has — "the
+        // Amazon Simple Storage Service (Amazon S3) path where you generate the labeling
+        // set", as the request named it.
+        let properties = TaskRunProperties {
+            task_type: Some(crate::state::ML_TASK_TYPE_LABELING_SET_GENERATION.to_string()),
+            labeling_set_generation_task_run_properties: Some(
+                LabelingSetGenerationTaskRunProperties {
+                    output_s3_path: Some(input.output_s3_path.clone()),
+                },
+            ),
+            // The properties of the other task kinds belong to the runs those starts
+            // record, not to this one.
+            import_labels_task_run_properties: None,
+            export_labels_task_run_properties: None,
+            find_matches_task_run_properties: None,
+        };
+        transform.record_task_run(crate::state::MlTaskRunEntry::start(
+            &input.transform_id,
+            run_id.clone(),
+            properties,
+            now,
+        ));
+        // The transform's own definition is untouched: a start runs a task over the
+        // transform rather than modifying it, and no labelling file has been generated
+        // either — `MLTransform$LabelCount` counts "the labeling files generated by Glue
+        // for this transform", and this run generates none.
+        ::tracing::info!(
+            operation = "StartMLLabelingSetGenerationTaskRun",
+            transform = %input.transform_id,
+            run = %run_id,
+            "started a Glue machine learning labelling set generation task run"
+        );
+
+        Ok(StartMLLabelingSetGenerationTaskRunOutput {
+            // "The unique run identifier that is associated with this task run."
+            task_run_id: Some(run_id),
+        })
     }
 }

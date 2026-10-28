@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // revisions of the resource, so they must not collide.
         let code_artifact_id = crate::state::mint_uuid();
         // The upload target, derived from the recorded artifact (never echoed from the
-        // request alone) and stable for that artifact's lifetime.
+        // request alone) and stable for as long as the artifact is held.
         //
         // `s3Url` is documented as a URL "you can upload the code file you want to scan
         // with the required requestHeaders using any HTTP client" to, so the published
@@ -211,22 +211,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             s3_url,
             request_headers,
             created_at_millis: now,
-            expires_at_millis: now.saturating_add(crate::state::UPLOAD_ARTIFACT_TTL_MILLIS),
+            url_expires_at_millis: now
+                .saturating_add(crate::state::UPLOAD_URL_SIGNATURE_WINDOW_MILLIS),
             // Nothing is uploaded yet: the resource arrives when the caller performs the
             // documented upload to the target minted above.
             upload: None,
         };
         {
-            // Release the targets whose lifetime the clock has already ended before the
-            // quota is measured, so an expired artifact never holds a slot.
-            store.expire_due_artifacts(now);
+            // The store bound is the quota alone: a recorded artifact holds its slot
+            // until the account's artifacts are released, because the identifier it was
+            // handed out under has to keep resolving (see `crate::state`).
             if store.upload_artifacts.len() >= crate::state::UPLOAD_ARTIFACT_QUOTA {
                 return Err(CreateUploadUrlErrorModeled::ThrottlingException(
                     ThrottlingException {
                         error_code: "ThrottlingException".to_string(),
                         message: format!(
                             "this account already holds the maximum of {quota} minted code \
-                             artifacts; scan one or wait for a minted target to expire",
+                             artifacts",
                             quota = crate::state::UPLOAD_ARTIFACT_QUOTA,
                         ),
                         service_code: Some(crate::state::SERVICE_CODE.to_string()),
