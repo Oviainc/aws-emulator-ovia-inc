@@ -208,7 +208,7 @@ fn records(outposts: &Outposts) -> BTreeMap<String, String> {
 #[tokio::test]
 async fn every_get_order_call_is_served_from_the_modelled_outcomes() {
     let outposts = Outposts::new();
-    let (outpost_id, _) = outposts.site_and_outpost("order-served").await;
+    let (outpost_id, _) = outposts.site_and_active_outpost("order-served", "US").await;
     let quote_id = text(&a_quote(&outposts, &outpost_id).await, "QuoteId");
 
     let one_item = create_order(
@@ -328,10 +328,12 @@ async fn every_get_order_call_is_served_from_the_modelled_outcomes() {
 #[tokio::test]
 async fn reading_an_order_reports_the_stored_record_and_changes_nothing_else() {
     let outposts = Outposts::new();
-    let (outpost_id, _) = outposts.site_and_outpost("order-reporting").await;
-    // The Outpost this suite compares before and after a read is owed no transition of
-    // its own: it is installed only by an order's fulfilment, and every row holds the
-    // step that fulfils its order out of reach, so it cannot move under the comparison.
+    let (outpost_id, _) = outposts
+        .site_and_active_outpost("order-reporting", "US")
+        .await;
+    // The Outpost this suite compares before and after a read has already settled in
+    // its terminal lifecycle status, and every row holds the step that fulfils its
+    // order out of reach, so it cannot move under the comparison.
     let quote_id = text(&a_quote(&outposts, &outpost_id).await, "QuoteId");
 
     let created: Vec<(&str, Value)> = vec![

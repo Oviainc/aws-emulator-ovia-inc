@@ -68,13 +68,13 @@ pub(crate) const OUTPOST_ID_MISSING: &str = "OUTPOST_ID_MISSING_ON_QUOTE_ERROR";
 /// See [`OUTPOST_ID_MISSING`].
 const MAXIMUM_ALLOWED_ORDERS: &str = "MAXIMUM_ALLOWED_ORDERS_CHECK_ERROR";
 /// See [`OUTPOST_ID_MISSING`].
-const OUTPOST_ACTIVE: &str = "OUTPOST_ACTIVE_CHECK_ERROR";
+pub(crate) const OUTPOST_ACTIVE: &str = "OUTPOST_ACTIVE_CHECK_ERROR";
 /// See [`OUTPOST_ID_MISSING`].
-const OPERATING_ADDRESS: &str = "OPERATING_ADDRESS_EXISTENCE_CHECK_ERROR";
+pub(crate) const OPERATING_ADDRESS: &str = "OPERATING_ADDRESS_EXISTENCE_CHECK_ERROR";
 /// See [`OUTPOST_ID_MISSING`].
-const SHIPPING_ADDRESS: &str = "SHIPPING_ADDRESS_EXISTENCE_CHECK_ERROR";
+pub(crate) const SHIPPING_ADDRESS: &str = "SHIPPING_ADDRESS_EXISTENCE_CHECK_ERROR";
 /// See [`OUTPOST_ID_MISSING`].
-const COUNTRY_CODE_MISMATCH: &str = "COUNTRY_CODE_MISMATCH_CHECK_ERROR";
+pub(crate) const COUNTRY_CODE_MISMATCH: &str = "COUNTRY_CODE_MISMATCH_CHECK_ERROR";
 
 /// A `QuoteCapacity$Unit` the orderable-instance-type catalog publishes no instance
 /// type for, so no vCPU figure of it exists to price. The rows that use it assert it

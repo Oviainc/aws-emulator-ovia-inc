@@ -167,7 +167,9 @@ fn expire(outposts: &Outposts, quote_id: &str) {
 #[tokio::test]
 async fn deleting_a_quote_removes_it_whatever_its_status_and_identifier_form() {
     let outposts = Outposts::new();
-    let (outpost_id, outpost_arn) = outposts.site_and_outpost("quote-delete").await;
+    let (outpost_id, outpost_arn) = outposts
+        .site_and_active_outpost("quote-delete", "US")
+        .await;
 
     let cases: Vec<(&str, Value, Status, Form)> = vec![
         (
@@ -243,7 +245,9 @@ async fn deleting_a_quote_removes_it_whatever_its_status_and_identifier_form() {
         (
             "an order already submitted from it, deleted by ARN",
             quote_request(
-                "CA",
+                // The country of the site the Outpost stands on: an order is submitted
+                // only from a quote whose country code is that country.
+                "US",
                 json!([{ "QuoteCapacityType": "EBS", "Unit": "TB", "Quantity": 0.5 }]),
                 json!({ "OutpostIdentifier": outpost_id.clone() }),
             ),

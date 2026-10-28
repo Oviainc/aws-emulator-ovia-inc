@@ -37,6 +37,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 };
 
 use crate::quote_lifecycle::{create_quote, request as quote_request};
+use crate::quote_options::option_identifier;
 use crate::site_and_outpost_lifecycle::{
     is_minted_id, refusal, segment, text, without, Outposts, Refusal, ABSENT_OUTPOST_ID,
     OUTPOST_ARN_PREFIX,
@@ -52,9 +53,6 @@ const ABSENT_QUOTE_ID: &str = "oq-00000000000000000";
 
 /// An order id this emulator never mints. See [`ABSENT_QUOTE_ID`].
 const ABSENT_ORDER_ID: &str = "oo-00000000000000000";
-
-/// A `QuoteOptionIdentifier` of the modelled form (`^oqo-[a-f0-9]{17}$`).
-const QUOTE_OPTION_ID: &str = "oqo-abcdef01234567890";
 
 /// Catalog item SKUs of the modelled `SkuCode` form (`^OR-[A-Z0-9]{7}$`), which is
 /// the only thing this API says about a catalog item id a line item may name.
@@ -128,8 +126,15 @@ fn order_request(outpost_identifier: &str, payment_option: &str, overrides: Valu
     body
 }
 
-/// One quote of `outpost_id` that an order can be submitted from, as its `QuoteId`.
-async fn a_quote(outposts: &Outposts, outpost_id: &str) -> String {
+/// One quote of `outpost_id` that an order can be submitted from, as its `QuoteId`
+/// and the `QuoteOptionIdentifier` of the option it offers — the only option an order
+/// can be submitted against, since a quote option is minted with the quote it belongs
+/// to.
+///
+/// The country the quote is for is the country of the site the Outpost stands on
+/// ([`Outposts::site_and_active_outpost`]), one of the checks a quote has to meet
+/// before an order can be submitted from it.
+async fn a_quote(outposts: &Outposts, outpost_id: &str) -> (String, String) {
     let quote = create_quote(
         outposts,
         &quote_request(
@@ -139,7 +144,8 @@ async fn a_quote(outposts: &Outposts, outpost_id: &str) -> String {
         ),
     )
     .await;
-    text(&quote, "QuoteId")
+    let option = option_identifier(&quote, "a quote of the Outpost");
+    (text(&quote, "QuoteId"), option)
 }
 
 /// Put a stored quote in `status`, through the store seam
@@ -190,10 +196,10 @@ fn line_item_ids(order: &Value) -> Vec<String> {
 #[tokio::test]
 async fn create_order_persists_and_get_order_reads_it_back() {
     let outposts = Outposts::new();
-    let (outpost_id, outpost_arn) = outposts.site_and_outpost("order-outpost").await;
+    let (outpost_id, outpost_arn) = outposts.site_and_active_outpost("order-outpost", "US").await;
     // One quote per row that names one: a quote takes exactly one order (rule 3).
-    let quote_by_id = a_quote(&outposts, &outpost_id).await;
-    let quote_by_arn = a_quote(&outposts, &outpost_id).await;
+    let (quote_by_id, option_of_quote_by_id) = a_quote(&outposts, &outpost_id).await;
+    let (quote_by_arn, _) = a_quote(&outposts, &outpost_id).await;
     let twenty: Vec<Value> = (0..20)
         .map(|index| line_item(SKUS[index % SKUS.len()], (index as i64) + 1))
         .collect();
@@ -248,7 +254,7 @@ async fn create_order_persists_and_get_order_reads_it_back() {
                 "NO_UPFRONT",
                 json!({
                     "QuoteIdentifier": quote_by_id.clone(),
-                    "QuoteOptionIdentifier": QUOTE_OPTION_ID,
+                    "QuoteOptionIdentifier": option_of_quote_by_id.clone(),
                 }),
             ),
         ),
@@ -431,8 +437,10 @@ async fn create_order_persists_and_get_order_reads_it_back() {
 #[tokio::test]
 async fn an_order_is_prepared_and_then_moves_to_in_progress_on_the_clock() {
     let outposts = Outposts::new();
-    let (outpost_id, _) = outposts.site_and_outpost("order-progress").await;
-    let quote_id = a_quote(&outposts, &outpost_id).await;
+    let (outpost_id, _) = outposts
+        .site_and_active_outpost("order-progress", "US")
+        .await;
+    let (quote_id, _) = a_quote(&outposts, &outpost_id).await;
     let cases: Vec<(&str, Value)> = vec![
         (
             "one line item",
@@ -538,7 +546,9 @@ async fn an_order_is_prepared_and_then_moves_to_in_progress_on_the_clock() {
 #[tokio::test]
 async fn a_quote_takes_an_order_only_while_it_is_still_created() {
     let outposts = Outposts::new();
-    let (outpost_id, _) = outposts.site_and_outpost("order-from-quote").await;
+    let (outpost_id, _) = outposts
+        .site_and_active_outpost("order-from-quote", "US")
+        .await;
     let cases: Vec<(&str, &str, Option<u16>)> = vec![
         ("a quote an order can be submitted from", QUOTE_STATUS_CREATED, None),
         ("a quote past its own expiry", QUOTE_STATUS_EXPIRED, Some(409)),
@@ -550,7 +560,7 @@ async fn a_quote_takes_an_order_only_while_it_is_still_created() {
     ];
 
     for (case, status, refused) in &cases {
-        let quote_id = a_quote(&outposts, &outpost_id).await;
+        let (quote_id, _) = a_quote(&outposts, &outpost_id).await;
         set_quote_status(&outposts, &quote_id, status);
         let body = order_request(
             &outpost_id,

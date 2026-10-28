@@ -318,7 +318,7 @@ async fn the_price_follows_the_hardware_under_subscription() {
 
     for (index, (case, specs)) in cases.iter().enumerate() {
         let (outpost_id, _) = outposts
-            .site_and_outpost(&format!("renewal-case-{index}"))
+            .site_and_active_outpost(&format!("renewal-case-{index}"), "US")
             .await;
         place_orders(&outposts, &outpost_id, specs, case).await;
         let capacity = subscribed_capacity(specs, &catalog);

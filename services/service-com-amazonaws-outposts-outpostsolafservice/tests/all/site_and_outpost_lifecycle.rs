@@ -168,6 +168,25 @@ pub(crate) async fn install_hardware(outposts: &Outposts, outpost_id: &str) -> S
     order_id
 }
 
+/// Make `outpost_id` an Outpost an order can be submitted from a quote for: settle it
+/// into its terminal `ACTIVE` lifecycle status, with the hardware of its configuration
+/// installed on it.
+///
+/// An Outpost settles there one `OUTPOST_PROVISIONING` after the hardware ordered for
+/// it reached its site, so only the instant that install falls due at is moved —
+/// through the same store seam [`install_hardware`] and [`deliver_orders`] move an
+/// order's instants through, and without placing an order, which would put hardware
+/// under subscription a case did not ask for. The next call materialises the install.
+pub(crate) fn activate_outpost(outposts: &Outposts, outpost_id: &str) {
+    let store = outposts.store();
+    let mut store = store.lock();
+    let record = store
+        .outposts
+        .get_mut(outpost_id)
+        .unwrap_or_else(|| panic!("the create persisted Outpost {outpost_id}"));
+    record.active_at = Some(std::time::Instant::now());
+}
+
 impl Outposts {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -338,6 +357,35 @@ impl Outposts {
             .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
             .await;
         (text(&outpost, "OutpostId"), text(&outpost, "OutpostArn"))
+    }
+
+    /// The same, for a suite that submits an order FROM A QUOTE: a site recording
+    /// both the addresses an order is placed against, in `country`, and an Outpost on
+    /// it that has settled `ACTIVE` ([`activate_outpost`]).
+    ///
+    /// Those are what the requirements a quote must meet before an order can be
+    /// submitted from it are read off — the site's operating and shipping addresses,
+    /// the country of its operating address against the country the quote is for, and
+    /// the Outpost's lifecycle status — so a case about anything OTHER than those
+    /// checks starts from an Outpost that meets them.
+    pub(crate) async fn site_and_active_outpost(
+        &self,
+        name: &str,
+        country: &str,
+    ) -> (String, String) {
+        let site = self
+            .create_site(&json!({
+                "Name": format!("{name}-site"),
+                "OperatingAddress": address(country, "WA", "Seattle"),
+                "ShippingAddress": address(country, "WA", "Kirkland"),
+            }))
+            .await;
+        let outpost = self
+            .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
+            .await;
+        let (outpost_id, outpost_arn) = (text(&outpost, "OutpostId"), text(&outpost, "OutpostArn"));
+        activate_outpost(self, &outpost_id);
+        (outpost_id, outpost_arn)
     }
 
     /// `GetSite`, returning the `Site` it answered with.

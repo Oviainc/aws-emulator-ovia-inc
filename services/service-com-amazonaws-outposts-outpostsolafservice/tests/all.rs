@@ -59,6 +59,8 @@ mod order_cancellation;
 mod order_lifecycle;
 #[path = "all/order_listing.rs"]
 mod order_listing;
+#[path = "all/order_quote_references.rs"]
+mod order_quote_references;
 #[path = "all/orderable_instance_types.rs"]
 mod orderable_instance_types;
 #[path = "all/outpost_assets.rs"]

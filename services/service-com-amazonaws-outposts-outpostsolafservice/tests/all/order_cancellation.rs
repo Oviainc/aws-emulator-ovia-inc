@@ -180,7 +180,9 @@ fn finish_order(outposts: &Outposts, order_id: &str, status: &str, case: &str) {
 #[tokio::test]
 async fn cancelling_an_order_settles_it_and_its_line_items_as_cancelled() {
     let outposts = Outposts::new();
-    let (outpost_id, outpost_arn) = outposts.site_and_outpost("cancel-order").await;
+    let (outpost_id, outpost_arn) = outposts
+        .site_and_active_outpost("cancel-order", "US")
+        .await;
     // One quote per row that takes one: a quote takes exactly one order.
     let quote_alone = a_quote(&outposts, Some(&outpost_id)).await;
     let quote_with_items = a_quote(&outposts, Some(&outpost_id)).await;
@@ -419,7 +421,9 @@ async fn a_cancelled_order_no_longer_holds_up_its_outpost() {
         // A store of its own per row: what holds a call up is what the store holds, so
         // each row starts from an empty one.
         let outposts = Outposts::new();
-        let (outpost_id, _) = outposts.site_and_outpost("held-up-outpost").await;
+        let (outpost_id, _) = outposts
+            .site_and_active_outpost("held-up-outpost", "US")
+            .await;
         let contents = match placed {
             Placed::Directly => json!({ "LineItems": [line_item(SKUS[0], 1)] }),
             Placed::FromQuote => {

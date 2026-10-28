@@ -343,12 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let payment_options = record.quote.requested_payment_options.clone();
         let payment_terms = record.quote.requested_payment_terms.clone();
         let country_code = record.quote.country_code.clone().unwrap_or_default();
-        let outpost_id = record
-            .quote
-            .outpost_arn
-            .as_deref()
-            .and_then(crate::state::outpost_id_in_arn)
-            .map(str::to_string);
+        let outpost_id = record.associated_outpost_id().map(str::to_string);
 
         let derived_options = match reprice {
             true => Some(store.quote_options(

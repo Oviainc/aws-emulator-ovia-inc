@@ -1032,6 +1032,37 @@ pub struct QuoteRecord {
     pub quote: Quote,
 }
 
+impl QuoteRecord {
+    /// The Outpost this quote is ASSOCIATED with, as that Outpost's own `op-…` id.
+    ///
+    /// The association is recorded as the Outpost's `OutpostArn` ([`Quote::outpost_arn`]),
+    /// so the id is read back out of it ([`outpost_id_in_arn`]); a quote associated with
+    /// no Outpost has none. One accessor, so every caller that has to say WHICH Outpost
+    /// a quote belongs to — the submit of an order from it, and the record this store
+    /// keeps of an order outstanding on an Outpost — reads the same value.
+    pub fn associated_outpost_id(&self) -> Option<&str> {
+        self.quote
+            .outpost_arn
+            .as_deref()
+            .and_then(outpost_id_in_arn)
+    }
+
+    /// Whether `quote_option_identifier` is one of the configuration-and-pricing
+    /// options THIS quote offers.
+    ///
+    /// A `QuoteOptionIdentifier` is minted with the quote's options and persisted with
+    /// the quote ([`ComAmazonawsOutpostsOutpostsolafserviceState::quote_options`]), so
+    /// the options this quote reports are the only ones an order can be submitted
+    /// against.
+    pub fn offers_option(&self, quote_option_identifier: &str) -> bool {
+        self.quote
+            .quote_options
+            .iter()
+            .flatten()
+            .any(|option| option.quote_option_identifier.as_deref() == Some(quote_option_identifier))
+    }
+}
+
 /// One piece of UNFINISHED WORK this store holds on a resource: what it is, and the
 /// resource a caller is told the conflict it causes is about.
 ///
@@ -2698,6 +2729,22 @@ fn ordering_requirement(check: &str, status: &str, status_message: String) -> Or
     }
 }
 
+/// The checks of `requirements` a quote does NOT meet, in the order they are
+/// reported.
+///
+/// A requirement is "a requirement that must be met before an order can be submitted
+/// for a quote", so what blocks the submit is the set of checks reporting
+/// [`ORDERING_REQUIREMENT_FAIL`]: a check that passed is met, and one the quote is
+/// exempt from is nothing to meet. A row naming no check says nothing a caller could
+/// act on and blocks nothing.
+pub fn unmet_requirements(requirements: &[OrderingRequirement]) -> Vec<&str> {
+    requirements
+        .iter()
+        .filter(|requirement| requirement.status.as_deref() == Some(ORDERING_REQUIREMENT_FAIL))
+        .filter_map(|requirement| requirement.ordering_requirement_type.as_deref())
+        .collect()
+}
+
 /// The values a quote requested of one of the two payment value sets, or every value
 /// the model declares when it requested none.
 ///
@@ -3937,12 +3984,7 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         outpost_id: &str,
     ) -> Option<&QuoteRecord> {
         all_in_region(&self.quotes, region).find(|record| {
-            let quote_outpost = record
-                .quote
-                .outpost_arn
-                .as_deref()
-                .and_then(outpost_id_in_arn);
-            if quote_outpost != Some(outpost_id)
+            if record.associated_outpost_id() != Some(outpost_id)
                 || record.quote.quote_status.as_deref() != Some(QUOTE_STATUS_ORDER_SUBMITTED)
             {
                 return false;
@@ -5055,6 +5097,11 @@ pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
 /// operations bind. See [`SITE_ID_MEMBER`].
 pub const QUOTE_IDENTIFIER_MEMBER: &str = "quoteIdentifier";
 
+/// The validation-path name of the `QuoteOptionIdentifier` input member `CreateOrder`
+/// names the option of a quote an order is submitted against by. See
+/// [`SITE_ID_MEMBER`].
+pub const QUOTE_OPTION_IDENTIFIER_MEMBER: &str = "quoteOptionIdentifier";
+
 /// The validation-path name of the `OutpostIdentifier` input member the quote and
 /// capacity-task operations take: a DIFFERENT member from the `OutpostId` the
 /// Outpost operations bind, so a refusal about it names it as the request spelled
@@ -5494,6 +5541,54 @@ pub fn renewal_token_report() -> String {
 /// ordered from.
 pub fn quote_status_conflict(quote_id: &str, status: &str) -> String {
     format!("an order cannot be submitted from quote {quote_id}, which is {status}")
+}
+
+/// How this service states that an order cannot be submitted from a quote whose
+/// ordering requirements are not met, naming the checks that are not.
+///
+/// An `OrderingRequirement` is "a requirement that must be met before an order can be
+/// submitted for a quote", so a quote with a check still unmet
+/// ([`unmet_requirements`]) cannot take one. AWS publishes no wording for the refusal,
+/// so the sentence is the emulator's own, worded by the same rule as
+/// [`quote_status_conflict`]: what a caller branches on is the modelled
+/// `ConflictException` code (HTTP 409) and the `ResourceId` naming the quote, while
+/// the message names the modelled checks that are unmet, so the caller knows what to
+/// put right.
+pub fn quote_requirements_conflict(quote_id: &str, unmet: &[&str]) -> String {
+    format!(
+        "an order cannot be submitted from quote {quote_id}, which does not meet {}",
+        unmet.join(", ")
+    )
+}
+
+/// The report an order submitted from a quote associated with ANOTHER Outpost states.
+///
+/// A quote's Outpost association is what makes an order submitted from it an order OF
+/// that Outpost (see [`ORDERING_REQUIREMENT_OUTPOST_ID_MISSING`]), so a request whose
+/// `OutpostIdentifier` and whose quote name different Outposts is a request this
+/// service cannot place: the two members disagree, which is the bad request the
+/// modelled `ValidationException` (HTTP 400) states. AWS publishes no wording for the
+/// refusal, so the sentence is the emulator's own, worded by the same rule as every
+/// other constraint this service reports — the member and the requirement, never the
+/// value.
+pub fn quote_outpost_report() -> String {
+    validation_report(&[clause(
+        QUOTE_IDENTIFIER_MEMBER,
+        "the quote must be associated with the Outpost the order is placed on",
+    )])
+}
+
+/// The report a `QuoteOptionIdentifier` sent without the quote it is an option of
+/// states.
+///
+/// A quote option has no identity outside the quote it was minted with, so an option
+/// named by a request that names no quote names nothing this service could submit an
+/// order against. Worded by the same rule as [`quote_outpost_report`].
+pub fn quote_option_quote_report() -> String {
+    validation_report(&[clause(
+        QUOTE_OPTION_IDENTIFIER_MEMBER,
+        "the quote the quote option belongs to must be specified",
+    )])
 }
 
 /// How this service states that an order cannot be cancelled, because it has already

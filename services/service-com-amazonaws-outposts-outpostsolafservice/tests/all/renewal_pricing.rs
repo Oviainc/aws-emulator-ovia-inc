@@ -140,16 +140,13 @@ pub(crate) async fn published_catalog(outposts: &Outposts) -> Vec<(String, i64)>
     catalog
 }
 
-/// One site and one Outpost on it, as that Outpost's `OutpostId`. An Outpost belongs
-/// to a site, so the site comes first — the same order a real workflow takes.
+/// One site and one Outpost on it, as that Outpost's `OutpostId`, ready to take an
+/// order submitted from a quote: the site records the two addresses an order is placed
+/// against and the Outpost has settled `ACTIVE`, which is what the checks a quote must
+/// meet are read off ([`Outposts::site_and_active_outpost`]).
 async fn an_outpost(outposts: &Outposts, name: &str) -> String {
-    let site = outposts
-        .create_site(&json!({ "Name": format!("{name}-site") }))
-        .await;
-    let outpost = outposts
-        .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
-        .await;
-    text(&outpost, "OutpostId")
+    let (outpost_id, _) = outposts.site_and_active_outpost(name, "US").await;
+    outpost_id
 }
 
 /// Cancel a stored order, over the wire: `CancelOrder` is the call that cancels one,

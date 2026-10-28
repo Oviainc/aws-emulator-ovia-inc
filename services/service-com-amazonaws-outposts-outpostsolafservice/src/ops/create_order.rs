@@ -4,9 +4,11 @@
 //! IMPLEMENTED: mints an `OrderId`, persists the order the request describes against
 //! the Outpost it names, and answers it from what was persisted — which is what
 //! `GetOrder` reads back. Every line item the request sent gets a minted `LineItemId`
-//! and the status a just-submitted item carries; an order taken from a quote records
-//! that quote and moves it to `ORDER_SUBMITTED`, naming this order in the quote's
-//! `SubmittedOrderId`. The order is submitted in the non-terminal `PREPARING` status
+//! and the status a just-submitted item carries; an order taken from a quote is
+//! submitted only from a quote this request resolves against — one offering the quote
+//! option named, associated with the Outpost the order is placed on, and with every
+//! ordering requirement of it met — and records that quote and moves it to
+//! `ORDER_SUBMITTED`, naming this order in the quote's `SubmittedOrderId`. The order is submitted in the non-terminal `PREPARING` status
 //! and the clock carries it through being built and shipped, to the site, and to
 //! being installed ([`crate::state::order_progression`]); that last step is the one
 //! that puts hardware on the Outpost the order was placed on and takes it out of the
@@ -232,11 +234,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A `QuoteOptionIdentifier` is one of the options a QUOTE offers, minted with
+        // that quote and reachable only through it, so a request that names an option
+        // without naming the quote it belongs to names nothing this service holds —
+        // the bad request it is (400 `ValidationException`), rather than an order
+        // carrying a reference nothing can resolve.
+        let quote_option_identifier = crate::state::non_empty(input.quote_option_identifier);
+        if quote_option_identifier.is_some() && quote_id.is_none() {
+            return Err(CreateOrderErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::quote_option_quote_report()),
+                },
+            )
+            .into());
+        }
 
         let mut store = state.lock();
         // Whether a quote can still be ordered from depends on the status it holds
         // NOW, and a quote expires on the clock, so the expiry that was already due
-        // at this instant is materialised before the status is read.
+        // at this instant is materialised before the status is read. The checks a
+        // quote has to meet are read off the Outpost it names and the site that
+        // Outpost stands on, so the Outpost lifecycle transition the clock had
+        // already made due at that same instant is materialised too — exactly as the
+        // two operations that derive those checks do.
+        store.settle_outposts();
         store.settle_quotes();
         // An order is placed ON an Outpost, so an identifier the store holds no
         // Outpost for cannot take one: the not-found error this operation models,
@@ -256,19 +277,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ExpirationDate`, so only a quote still `CREATED` can take one. A second
         // order from the same quote, or one from an expired quote, is the conflict
         // this operation models, naming the quote in `ResourceId`.
+        //
+        // Everything else this request says about that quote is resolved AGAINST it,
+        // before anything is minted: the option the order is submitted against has to
+        // be one the quote offers, and the Outpost the order is placed on has to be
+        // the Outpost the quote is associated with — the association that makes an
+        // order submitted from the quote an order OF an Outpost, and the one this
+        // store keeps its second record of an outstanding order under
+        // (`quote_ordered_from_on_outpost`). The country the quote is for is read
+        // here too, because the checks the quote has to meet are run on it below.
+        let mut quote_country_code = None;
         if let (Some(quote_id), Some(supplied)) = (quote_id.as_deref(), quote_identifier.as_deref())
         {
-            let status = store
-                .quote(&region, quote_id)
-                .map(|record| record.quote.quote_status.clone().unwrap_or_default())
-                .ok_or_else(|| {
-                    CreateOrderErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(crate::state::identifier_not_found(
-                            crate::state::QUOTE_IDENTIFIER_MEMBER,
-                            supplied,
-                        )),
-                    })
-                })?;
+            let record = store.quote(&region, quote_id).ok_or_else(|| {
+                CreateOrderErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::QUOTE_IDENTIFIER_MEMBER,
+                        supplied,
+                    )),
+                })
+            })?;
+            let status = record.quote.quote_status.clone().unwrap_or_default();
             if status != crate::state::QUOTE_STATUS_CREATED {
                 return Err(CreateOrderErrorModeled::ConflictException(ConflictException {
                     message: Some(crate::state::quote_status_conflict(quote_id, &status)),
@@ -281,6 +310,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
+            // An option of another quote, or one no quote ever minted, names no quote
+            // option this service holds: the not-found error this operation models,
+            // worded as the identifier echo of the value AS SUPPLIED.
+            if let Some(quote_option_identifier) = quote_option_identifier.as_deref() {
+                if !record.offers_option(quote_option_identifier) {
+                    return Err(CreateOrderErrorModeled::NotFoundException(NotFoundException {
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::QUOTE_OPTION_IDENTIFIER_MEMBER,
+                            quote_option_identifier,
+                        )),
+                    })
+                    .into());
+                }
+            }
+            // A quote associated with ANOTHER Outpost is a quote for hardware of that
+            // Outpost, so an order placed here cannot be taken from it. A quote
+            // associated with NO Outpost is an unmet check below, not a disagreement
+            // between two members of this request.
+            if record
+                .associated_outpost_id()
+                .is_some_and(|associated| associated != outpost_id)
+            {
+                return Err(CreateOrderErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::quote_outpost_report()),
+                    },
+                )
+                .into());
+            }
+            quote_country_code = Some(record.quote.country_code.clone().unwrap_or_default());
         }
         // See `MAX_RESOURCES`: an order is never released (`GetOrder` must still
         // answer it), so the store this insert grows is capped, and past the cap the
@@ -295,6 +354,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        // An `OrderingRequirement` is "a requirement that must be met before an order
+        // can be submitted for a quote", so the one operation that submits one runs
+        // those checks — through the same helper the two operations that report them
+        // derive them with — and refuses a quote that still has one unmet: the
+        // conflict this operation models, naming the quote in `ResourceId` and the
+        // unmet checks in the message. They are run HERE, at the instant the order is
+        // submitted, so each outcome is the one the store gives now rather than the
+        // one it gave when the quote was priced; the store's entry ceiling is one of
+        // the checks and has the quota error of its own above, so it cannot be
+        // reported as unmet here.
+        if let (Some(quote_id), Some(country_code)) =
+            (quote_id.as_deref(), quote_country_code.as_deref())
+        {
+            let associated = store
+                .quote(&region, quote_id)
+                .and_then(|record| record.associated_outpost_id().map(str::to_string));
+            let requirements =
+                store.ordering_requirements(&region, country_code, associated.as_deref());
+            let unmet = crate::state::unmet_requirements(&requirements);
+            if !unmet.is_empty() {
+                return Err(CreateOrderErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::quote_requirements_conflict(quote_id, &unmet)),
+                    resource_id: Some(quote_id.to_string()),
+                    // As above: the resource this conflict is about is a quote, which
+                    // the modelled `ResourceType` does not name.
+                    resource_type: None,
+                })
+                .into());
+            }
         }
 
         let (order_id, sequence) = store.mint_id("oo");
@@ -331,7 +420,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // same rule `CreateQuote` reports an Outpost association by. A quote
             // option is an option OF that quote, so the id travels as supplied.
             quote_identifier: quote_id.clone(),
-            quote_option_identifier: crate::state::non_empty(input.quote_option_identifier),
+            quote_option_identifier,
             order_id: Some(order_id.clone()),
             // A just-submitted order is received and being prepared, so it reports
             // that non-terminal status until each transition the clock owes falls due;
