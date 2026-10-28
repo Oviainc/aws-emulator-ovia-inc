@@ -11,8 +11,9 @@
 //!
 //! NOTHING IS TRANSCRIBED: no audio is transcribed and no personal health information
 //! is identified, so the `MedicalTranscript.TranscriptFileUri` a completed job reports
-//! names a location nothing writes to (see
-//! [`crate::state::MedicalTranscriptionJobRecord`]). The job RECORD is what this
+//! names a location holding a transcript with no words in it (see
+//! [`crate::state::MedicalTranscriptionJobRecord`] and
+//! [`crate::state::store_job_outputs`]). The job RECORD is what this
 //! emulates.
 //!
 //! The rules the model's own constraint traits cannot express — a `Media.MediaFileUri`
@@ -476,6 +477,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_type: input.r#type,
             // Filled in when the job completes and the transcript location exists.
             transcript: None,
+            // A job that has not finished owes its output location nothing, because it
+            // reports none yet (see `crate::state::due_output_objects`).
+            outputs_stored: false,
             failure_reason: None,
             failure_due,
             creation_time: now,

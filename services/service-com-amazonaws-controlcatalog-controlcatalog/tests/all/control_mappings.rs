@@ -26,11 +26,17 @@ use crate::control_catalog::{drain, error_code, Emulator};
 
 /// The route `ListControlMappings` is bound to, and the member carrying its items
 /// (`POST /list-control-mappings`, `ControlMappings`).
-const MAPPINGS_PATH: &str = "/list-control-mappings";
-const MAPPINGS_KEY: &str = "ControlMappings";
+///
+/// `pub(crate)` so the sibling suites in this test target (see `tests/all.rs`) address
+/// the operation through the one route rather than spelling it again.
+pub(crate) const MAPPINGS_PATH: &str = "/list-control-mappings";
+pub(crate) const MAPPINGS_KEY: &str = "ControlMappings";
 
 /// Every value the modeled `MappingType` enum declares.
-const MAPPING_TYPES: [&str; 3] = ["FRAMEWORK", "COMMON_CONTROL", "RELATED_CONTROL"];
+///
+/// `pub(crate)` so the sibling suites in this test target (see `tests/all.rs`) read the
+/// one list rather than keeping a second copy of it.
+pub(crate) const MAPPING_TYPES: [&str; 3] = ["FRAMEWORK", "COMMON_CONTROL", "RELATED_CONTROL"];
 
 /// Every value the modeled `ControlRelationType` enum declares.
 const RELATION_TYPES: [&str; 3] = ["COMPLEMENTARY", "ALTERNATIVE", "MUTUALLY_EXCLUSIVE"];

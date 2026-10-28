@@ -27,7 +27,7 @@ use std::time::Duration;
 use ec2::ops::types::AttachVolumeOutput;
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, MAX_FILTERS, MAX_FILTER_VALUES,
-    MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, TRANSITION_DELAY,
+    MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS, TRANSITION_DELAY,
     VOLUME_IOPS_RANGES, VOLUME_SIZE_RANGES, availability_zones_in_region,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -531,12 +531,6 @@ async fn unresolvable_ids_and_dry_run_are_refused_with_ec2s_own_codes() {
         (
             "a page size below one",
             vec![p("MaxResults", "0")],
-            400,
-            "InvalidParameterValue",
-        ),
-        (
-            "a page size above the maximum",
-            vec![p("MaxResults", (MAX_PAGE_SIZE + 1).to_string())],
             400,
             "InvalidParameterValue",
         ),

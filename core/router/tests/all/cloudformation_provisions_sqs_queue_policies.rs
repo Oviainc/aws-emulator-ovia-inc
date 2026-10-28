@@ -429,7 +429,7 @@ async fn a_deployed_queue_policy_grants_the_role_and_an_update_revokes_it() {
     // A revision that grants somebody else revokes the role's access, and the document on
     // the queues is the new one.
     let case = "a revision that grants another account instead";
-    let elsewhere = json!(format!("arn:aws:iam::210987654321:root"));
+    let elsewhere = json!("arn:aws:iam::210987654321:root".to_string());
     update_and_settle(
         &router,
         case,

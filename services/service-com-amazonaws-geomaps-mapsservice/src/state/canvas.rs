@@ -270,7 +270,9 @@ impl Canvas {
     /// [`MAX_CANVAS_SIDE`], they always fit the `u16` a JPEG header carries.
     pub fn to_jpeg(&self) -> Vec<u8> {
         let mut rgb = Vec::with_capacity(self.data.len() / 4 * 3);
-        for pixel in self.data.chunks_exact(4) {
+        // `as_chunks::<4>()` splits the buffer into whole RGBA pixels; the remainder is
+        // empty, because the canvas holds four channels per pixel.
+        for pixel in self.data.as_chunks::<4>().0 {
             rgb.extend_from_slice(&pixel[..3]);
         }
         let mut out = Vec::new();

@@ -184,19 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The maximum number of results to return with a single call"
         // (`DescribePrefixListsRequest$MaxResults`). The model declares no `@range` on
-        // the member — it targets a plain `Integer` — so the handler is the only place
-        // the page size can be bounded: a page of none is not a page, and one above the
-        // most this service serves in a page is refused rather than silently cut down.
+        // the member — it targets a plain `Integer` — so the only bound on the page size is
+        // the largest page this operation serves: a value above it is not refused, it is
+        // served as that page with a `NextToken` for the rest (the clamp below). A page of
+        // NONE is not a page, so zero and below is still refused.
         if let Some(max_results) = input.max_results {
             if max_results < 1 {
                 return Err(Scaffolded::invalid_parameter_value(format!(
                     "Invalid value '{max_results}' for maxResults. It must be at least 1"
-                )));
-            }
-            if usize::try_from(max_results).unwrap_or(usize::MAX) > MAX_PAGE_SIZE {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. \
-                     It must be at most {MAX_PAGE_SIZE}"
                 )));
             }
         }
@@ -335,13 +330,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let page = selected.get(from..).unwrap_or_default();
 
-        // A request that names no page size gets the largest page this service serves;
-        // one that names a size has already been refused outside `1..=MAX_PAGE_SIZE`
-        // above, so that check is the single place this bound lives.
+        // A request that names no page size gets the largest page this service serves, and
+        // one that names a size gets at most that same page: the refusal above answered a
+        // page of none, and a size above the largest page asks for it.
         let limit = input
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok())
-            .unwrap_or(MAX_PAGE_SIZE);
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
 
         // "This value is null when there are no more results to return"
         // (`DescribePrefixListsResult$NextToken`): a token only when a prefix list

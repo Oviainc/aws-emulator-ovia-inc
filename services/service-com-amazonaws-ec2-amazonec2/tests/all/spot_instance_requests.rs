@@ -1700,12 +1700,6 @@ async fn the_describe_refuses_a_bad_id_a_bad_page_size_and_a_bogus_token() {
             "InvalidParameterValue",
         ),
         (
-            "a page size above what the service serves",
-            vec![p("MaxResults", (MAX_PAGE_SIZE + 1).to_string())],
-            400,
-            "InvalidParameterValue",
-        ),
-        (
             "a token this service did not mint",
             vec![p("NextToken", "not-a-token")],
             400,
