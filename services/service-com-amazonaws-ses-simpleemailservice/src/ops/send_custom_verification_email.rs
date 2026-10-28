@@ -252,10 +252,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         custom_verification_email_template_name: Some(
                             input.template_name.clone(),
                         ),
-                        message: Some(format!(
-                            "Custom verification email template <{}> does not exist.",
-                            input.template_name
-                        )),
+                        message: Some(
+                            crate::state::missing_custom_verification_email_template_message(
+                                &input.template_name,
+                            ),
+                        ),
                     },
                 )
                 .into(),
@@ -263,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The parts of the stored template this send needs, taken before the
         // store is written to: the address it is sent FROM, and its subject.
-        let from_email_address = template.from_email_address.clone().unwrap_or_default();
+        let from_email_address = template.from_email_address.clone();
         let template_subject = template.template_subject.clone();
 
         // The template's own sender must be a verified identity, which is what
@@ -278,8 +279,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 SendCustomVerificationEmailErrorModeled::FromEmailAddressNotVerifiedException(
                     FromEmailAddressNotVerifiedException {
                         from_email_address: Some(from_email_address.clone()),
-                        message: Some(format!(
-                            "From email address <{from_email_address}> is not verified."
+                        message: Some(crate::state::unverified_from_address_message(
+                            &from_email_address,
                         )),
                     },
                 )
@@ -329,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destinations: vec![address],
             // The subject is the template's, and its content is the template's
             // own, which this log keeps no second copy of.
-            subject: crate::state::logged_text(template_subject.as_deref()),
+            subject: crate::state::logged_text(Some(&template_subject)),
             body: None,
             configuration_set: input.configuration_set_name.clone(),
             tags: Vec::new(),
