@@ -62,7 +62,8 @@
 //!
 //! A statement's `Condition` is evaluated only for the keys the caller puts in the
 //! [`Request::context`] it passes (`rum:alias`, say, which CloudWatch RUM documents for
-//! `PutRumEvents`) and only for the string, ARN, boolean and existence operators below, each
+//! `PutRumEvents`) and only for the string, ARN, boolean, date and existence operators
+//! below, each
 //! of which may carry IAM's `IfExists` suffix ([`IF_EXISTS_SUFFIX`]), under which a key the
 //! request models and carries no value for holds instead of refusing. A clause this CAN decide is
 //! part of whether its statement applies at all, whichever effect the statement states: a
@@ -89,7 +90,20 @@
 //! knows every value of a key FAMILY publishes the family — `aws:PrincipalTag/`, or
 //! `kms:EncryptionContext:`, written up to and including the separator the family's members
 //! are named after it by — which is what lets a statement conditioned on the absence of one
-//! member of that family be decided for a request whose members are all known.
+//! member of that family be decided for a request whose members are all known. A caller
+//! that knows the request's WHOLE context — a simulation, whose context is exactly the
+//! entries its caller supplied — declares that instead
+//! ([`Request::with_complete_context`]), and then every key absent from the context is a
+//! key the request carries no value for, whatever its name.
+//!
+//! ## The keys a decision needed a value for
+//!
+//! A caller that must report which keys the request should have carried — the IAM policy
+//! simulator's `MissingContextValues` — reads them off the decision
+//! ([`Outcome::required_context_keys`]) rather than off the documents: a key is reported
+//! when a clause reached by the request needed a value for it and the request carried
+//! none, so a clause the ABSENCE itself satisfies (a negated operator, an `IfExists`
+//! spelling, `Null` asking for absence) needs nothing and names no key.
 //!
 //! ## Policy variables
 //!
@@ -153,6 +167,44 @@ const NULL_OPERATOR: &str = "Null";
 /// per-component matching would need a wildcard per component. Every pattern that is exact,
 /// or wildcards only within one component, is decided identically either way.
 const ARN_OPERATORS: &[&str] = &["ArnEquals", "ArnNotEquals", "ArnLike", "ArnNotLike"];
+
+/// The date condition operators this evaluator decides: "date condition operators let you
+/// construct Condition elements that restrict access based on comparing a key to a
+/// date/time value", used "with `aws:CurrentTime` key or `aws:EpochTime` key". Like the
+/// string operators, each may be written under a set qualifier and with the `IfExists`
+/// suffix.
+///
+/// Both sides are read as INSTANTS ([`instant`]) rather than as text, so the two forms IAM
+/// admits for the same instant compare equal: "you must specify date/time values with one
+/// of the W3C implementations of the ISO 8601 date formats or in epoch (UNIX) time".
+const DATE_OPERATORS: &[&str] = &[
+    "DateEquals",
+    "DateNotEquals",
+    "DateLessThan",
+    "DateLessThanEquals",
+    "DateGreaterThan",
+    "DateGreaterThanEquals",
+];
+
+/// The instant `text` names, in seconds since the epoch, or `None` when it names none.
+///
+/// The two forms a date condition's value takes are the two IAM admits: epoch seconds, and
+/// an ISO 8601 date-time, whose calendar conversion comes from the maintained library and
+/// whose numeric UTC offset is resolved through the tree's one reader of that offset
+/// ([`super::rfc3339::split_utc_offset`]). Text in neither form names no instant, so a
+/// comparison against it does not hold.
+fn instant(text: &str) -> Option<i64> {
+    if let Ok(epoch_seconds) = text.parse::<i64>() {
+        return Some(epoch_seconds);
+    }
+    let (civil, offset_seconds) = super::rfc3339::split_utc_offset(text)?;
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        &format!("{civil}Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    parsed.secs().checked_sub(offset_seconds)
+}
 
 /// IAM's boolean operator: "`Bool` — lets you construct Condition elements that restrict
 /// access based on comparing a key to `true` or `false`". The two literals are compared
@@ -228,6 +280,16 @@ pub struct Outcome {
     /// included in the result" — the ALLOWING ones when it is [`Decision::Allowed`], and
     /// none when the documents state nothing about the request.
     pub matched: Vec<MatchedStatement>,
+    /// The condition keys the statements ABOUT this request needed a value for and the
+    /// request carried none, folded to one entry per key.
+    ///
+    /// A clause the absence of its key already satisfies needs no value for it — a
+    /// negated operator, an `IfExists` spelling and a `Null` asking for absence all hold
+    /// on a key the request does not carry — so such a key is not named here; a key whose
+    /// clause this evaluator could not decide at all is. Nothing but a `Condition` names a
+    /// key: the keys a statement's other elements interpolate as policy variables are not
+    /// values the request was required to carry.
+    pub required_context_keys: Vec<String>,
 }
 
 /// The access request a decision is made about.
@@ -249,6 +311,11 @@ pub struct Request<'a> {
     /// none" rather than "this emulator does not model the key". Only these get IAM's
     /// empty-set reading under a set qualifier; see the module docs.
     pub published: &'a [&'a str],
+    /// Whether [`Self::context`] is the request's WHOLE condition context, so that EVERY
+    /// key absent from it is a key the request carries no value for — which is what a
+    /// caller holding the whole context declares (see the module docs), and what makes
+    /// every key published rather than only the named ones.
+    pub context_complete: bool,
 }
 
 impl<'a> Request<'a> {
@@ -261,6 +328,7 @@ impl<'a> Request<'a> {
             principals,
             context: &[],
             published: &[],
+            context_complete: false,
         }
     }
 
@@ -275,6 +343,15 @@ impl<'a> Request<'a> {
     #[must_use]
     pub fn with_published_keys(mut self, published: &'a [&'a str]) -> Self {
         self.published = published;
+        self
+    }
+
+    /// The same request, declaring that the context it carries is the WHOLE context: every
+    /// key absent from it is one the request carries no value for. See
+    /// [`Self::context_complete`].
+    #[must_use]
+    pub fn with_complete_context(mut self) -> Self {
+        self.context_complete = true;
         self
     }
 }
@@ -338,20 +415,41 @@ pub fn prepare_documents(documents: &[String]) -> Vec<PreparedDocument> {
 
 /// [`identity_decision`] over documents already read: the SAME rule, and the same answer
 /// for the same documents — the reading is all that is hoisted out.
+///
+/// A caller that asks only for the DECISION collects no
+/// [`Outcome::required_context_keys`]: that report is work the caller does not read, and
+/// this is the entry point a service's request-time gate takes while it holds its store's
+/// lock.
 #[must_use]
 pub fn identity_decision_prepared(
     documents: &[PreparedDocument],
     request: &Request<'_>,
 ) -> Decision {
-    identity_outcome_prepared(documents, request).decision
+    outcome(
+        documents,
+        request,
+        Flavor::Identity,
+        RequiredKeys::unreported(),
+    )
+    .decision
 }
 
 /// What the resource's own resource-based policy says about the request.
+///
+/// The decision alone, so nothing is collected for a report (see
+/// [`identity_decision_prepared`]).
 pub fn resource_decision(document: &str, request: &Request<'_>) -> Decision {
-    resource_outcome_prepared(&PreparedDocument::read(document), request).decision
+    outcome(
+        ::std::slice::from_ref(&PreparedDocument::read(document)),
+        request,
+        Flavor::Resource,
+        RequiredKeys::unreported(),
+    )
+    .decision
 }
 
-/// [`identity_decision_prepared`], with the statements the decision was reached from.
+/// [`identity_decision_prepared`], with the statements the decision was reached from and
+/// the keys it needed a value for.
 ///
 /// For a caller that must also report WHICH documents produced the decision — the IAM
 /// policy simulator attributes an allow or a deny to the policy it came from — rather
@@ -362,14 +460,19 @@ pub fn identity_outcome_prepared(
     documents: &[PreparedDocument],
     request: &Request<'_>,
 ) -> Outcome {
-    outcome(documents, request, Flavor::Identity)
+    outcome(documents, request, Flavor::Identity, RequiredKeys::reported())
 }
 
 /// [`resource_decision`] over a document already read, with the statements the decision
 /// was reached from. The one document is document `0` of the outcome.
 #[must_use]
 pub fn resource_outcome_prepared(document: &PreparedDocument, request: &Request<'_>) -> Outcome {
-    outcome(::std::slice::from_ref(document), request, Flavor::Resource)
+    outcome(
+        ::std::slice::from_ref(document),
+        request,
+        Flavor::Resource,
+        RequiredKeys::reported(),
+    )
 }
 
 /// Whether the request is allowed, given the two decisions.
@@ -501,6 +604,13 @@ impl Expanded {
                 _ => return false,
             }
         }
+    }
+
+    /// This element's characters as TEXT, wildcards included as the characters they are.
+    /// What a comparison that is not a text match at all reads the element through — a
+    /// date clause, whose two sides are instants.
+    fn text(&self) -> String {
+        self.glyphs.iter().map(|(glyph, _)| *glyph).collect()
     }
 
     /// Whether this element matches `value`, by [`wildcard_match`]'s walk over the
@@ -645,10 +755,15 @@ fn single_value<'a>(request: &Request<'a>, key: &str) -> Option<&'a str> {
 /// attribution can never be told a decision the attribution does not support: a `Deny`
 /// among the statements about the request wins over every `Allow`, whichever document and
 /// whichever order they are written in, and is then the only thing the decision came from.
-fn outcome(documents: &[PreparedDocument], request: &Request<'_>, flavor: Flavor) -> Outcome {
+fn outcome(
+    documents: &[PreparedDocument],
+    request: &Request<'_>,
+    flavor: Flavor,
+    mut required: RequiredKeys,
+) -> Outcome {
     let mut applying: Vec<(bool, MatchedStatement)> = Vec::new();
     for (position, document) in documents.iter().enumerate() {
-        collect_applying(document, request, flavor, position, &mut applying);
+        collect_applying(document, request, flavor, position, &mut applying, &mut required);
     }
     let denied = applying.iter().any(|(denies, _)| *denies);
     let decision = match (denied, applying.is_empty()) {
@@ -663,17 +778,86 @@ fn outcome(documents: &[PreparedDocument], request: &Request<'_>, flavor: Flavor
             .filter(|(denies, _)| *denies == denied)
             .map(|(_, matched)| matched)
             .collect(),
+        required_context_keys: required.into_reported(),
+    }
+}
+
+/// How many condition keys ONE decision reports as needed but unsupplied
+/// ([`Outcome::required_context_keys`]).
+///
+/// The keys come from the documents the caller passed, whose number and size the caller
+/// bounds, so the report is bounded here rather than growing with what a document carries:
+/// past this many the rest are not collected at all. It is deliberately well above the
+/// bound a caller reports its own list under (the IAM policy simulator refuses a request
+/// whose documents need more than a hundred), so such a caller can still see that its own
+/// bound was passed rather than being handed a list truncated to it.
+pub const MAX_REQUIRED_CONTEXT_KEYS: usize = 1_000;
+
+/// The keys one decision needed a value for and the request carried none, collected while
+/// the statements are walked.
+///
+/// Folded by case, the way a condition key's name is compared everywhere here, so one key
+/// is one entry — held in a map, so noting a key costs a lookup rather than a scan of what
+/// was noted before — and stopped at [`MAX_REQUIRED_CONTEXT_KEYS`].
+///
+/// A caller that does not report the list collects NOTHING ([`RequiredKeys::unreported`]):
+/// the request-time gate only needs the decision, so it allocates nothing for this on the
+/// path that holds a service's store lock.
+#[derive(Debug)]
+struct RequiredKeys {
+    by_fold: ::std::collections::BTreeMap<String, String>,
+    /// How many keys this collection keeps; `0` collects none at all.
+    cap: usize,
+}
+
+impl RequiredKeys {
+    /// A collection for a caller that reports the keys, bounded by
+    /// [`MAX_REQUIRED_CONTEXT_KEYS`].
+    fn reported() -> Self {
+        Self {
+            by_fold: ::std::collections::BTreeMap::new(),
+            cap: MAX_REQUIRED_CONTEXT_KEYS,
+        }
+    }
+
+    /// A collection for a caller that does not report them, which keeps none.
+    fn unreported() -> Self {
+        Self {
+            by_fold: ::std::collections::BTreeMap::new(),
+            cap: 0,
+        }
+    }
+
+    /// Note `key` as one the clause reached needed a value for, when the request carried
+    /// none (`actual` empty) and the bound has not been reached.
+    fn note(&mut self, key: &str, actual: &[&str]) {
+        if !actual.is_empty() || self.by_fold.len() >= self.cap {
+            return;
+        }
+        self.by_fold
+            .entry(key.to_ascii_lowercase())
+            .or_insert_with(|| key.to_string());
+    }
+
+    /// The keys to report: one entry per key, in a total order, each in the spelling the
+    /// document that named it first used.
+    fn into_reported(self) -> Vec<String> {
+        self.by_fold.into_values().collect()
     }
 }
 
 /// Every statement of ONE document that APPLIES to the request, pushed onto `into` in
 /// document order as `(whether it denies, where it was read from)`.
+///
+/// `required` collects the condition keys the statements about the request needed a value
+/// for and the request carried none ([`Outcome::required_context_keys`]).
 fn collect_applying(
     document: &PreparedDocument,
     request: &Request<'_>,
     flavor: Flavor,
     position: usize,
     into: &mut Vec<(bool, MatchedStatement)>,
+    required: &mut RequiredKeys,
 ) {
     let Some(policy) = document.policy.as_ref() else {
         // Not a policy this can be read out of: it states nothing.
@@ -707,7 +891,7 @@ fn collect_applying(
         // whether the statement applies at all — to a `Deny` as much as to an `Allow`. A
         // clause it CANNOT decide is read fail-closed in both directions: it withholds a
         // grant and keeps a refusal (see the module docs).
-        match conditions_hold(entry, request) {
+        match conditions_hold(entry, request, required) {
             // Decidably false: the statement does not apply, whichever effect it states.
             Some(false) => continue,
             // Undecidable: no grant, but a refusal stands.
@@ -867,9 +1051,12 @@ fn principal_values(value: &::serde_json::Value) -> Option<Vec<&str>> {
 /// `Some(true)` when the statement carries no `Condition` or every clause holds,
 /// `Some(false)` when a clause this evaluator decides does NOT hold (so the statement does
 /// not apply, whichever effect it states), and `None` when a clause cannot be decided at
-/// all — an operator outside [`STRING_OPERATORS`] and [`ARN_OPERATORS`], or a single-valued
+/// all — an operator outside the operator tables, or a single-valued
 /// key the request context does not carry — which the caller reads fail-closed in both
 /// directions.
+///
+/// `required` collects the keys a clause here needed a value for and the request carried
+/// none ([`RequiredKeys::note`]), whether or not the clause could be decided without one.
 ///
 /// A key the request MODELS and carries no value for is a key that really is not present,
 /// which is the case IAM's `IfExists` suffix ([`IF_EXISTS_SUFFIX`]) is about: under it such
@@ -885,30 +1072,39 @@ fn principal_values(value: &::serde_json::Value) -> Option<Vec<&str>> {
 /// no values", and reading the first as the second would turn an undecided `Allow` into a
 /// grant. A multi-valued key under an UNqualified operator is left undecided rather than
 /// compared against one of its values.
-fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Option<bool> {
+fn conditions_hold(
+    statement: &::serde_json::Value,
+    request: &Request<'_>,
+    required: &mut RequiredKeys,
+) -> Option<bool> {
     let Some(clauses) = statement["Condition"].as_object() else {
         // No condition at all holds trivially; an element that is not a map is not a
         // condition this reads, so it cannot be decided.
         return statement["Condition"].is_null().then_some(true);
     };
     let mut held = true;
+    // Whether every clause of this statement could be decided at all. The walk goes on
+    // after one that could not, so the keys the LATER clauses needed a value for are
+    // reported too; the answer is the same `None` an immediate stop would have given.
+    let mut decidable = true;
     for (clause, keys) in clauses {
-        let keys = keys.as_object()?;
+        let Some(keys) = keys.as_object() else {
+            decidable = false;
+            continue;
+        };
         let (qualifier, named) = split_set_qualifier(clause);
         let (operator, absence_holds) = split_if_exists(named);
         let existence = operator == NULL_OPERATOR;
         // The suffix is defined for every operator BUT the existence one, so `NullIfExists`
         // names no operator at all and decides nothing.
-        if existence && absence_holds {
-            return None;
-        }
-        if !existence
-            && operator != BOOL_OPERATOR
-            && !STRING_OPERATORS.contains(&operator)
-            && !ARN_OPERATORS.contains(&operator)
-        {
-            return None;
-        }
+        let implemented = if existence {
+            !absence_holds
+        } else {
+            operator == BOOL_OPERATOR
+                || STRING_OPERATORS.contains(&operator)
+                || ARN_OPERATORS.contains(&operator)
+                || DATE_OPERATORS.contains(&operator)
+        };
         for (key, expected) in keys {
             let actual: Vec<&str> = request
                 .context
@@ -921,27 +1117,42 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
             // value mean "the request carries none" rather than "this emulator does not
             // know".
             let modelled = publishes(request, key);
+            if !implemented {
+                required.note(key, &actual);
+                decidable = false;
+                continue;
+            }
             if existence {
                 // `Null` asks about the key's PRESENCE, so a value is never compared: the
                 // clause holds when the request's answer agrees with what it asserts.
-                if !modelled {
-                    return None;
-                }
-                let asserted_absent = match expected[..] {
-                    [one] => one.eq_ignore_ascii_case("true"),
-                    _ => return None,
+                let asserted_absent = match (modelled, &expected[..]) {
+                    (true, [one]) => one.eq_ignore_ascii_case("true"),
+                    _ => {
+                        required.note(key, &actual);
+                        decidable = false;
+                        continue;
+                    }
                 };
-                held = held && (asserted_absent == actual.is_empty());
+                let holds = asserted_absent == actual.is_empty();
+                if !holds {
+                    required.note(key, &actual);
+                }
+                held = held && holds;
                 continue;
             }
             // A clause's own VALUES may name policy variables, substituted from this same
             // context the way a `Resource` element's are. A value naming a variable the
             // request carries no value for cannot be compared at all, which leaves the
             // statement undecided.
-            let expected: Vec<Expanded> = expected
+            let Some(expected) = expected
                 .into_iter()
                 .map(|value| expand(value, request))
-                .collect::<Option<Vec<Expanded>>>()?;
+                .collect::<Option<Vec<Expanded>>>()
+            else {
+                required.note(key, &actual);
+                decidable = false;
+                continue;
+            };
             let decided = match qualifier {
                 // Unqualified: the key must carry exactly one value for the comparison
                 // to mean what IAM means by it.
@@ -953,12 +1164,20 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
                     // negated condition operator returns true", and a positive one without
                     // the suffix does not hold.
                     [] if modelled => absence_holds || is_negated(operator),
-                    _ => return None,
+                    _ => {
+                        required.note(key, &actual);
+                        decidable = false;
+                        continue;
+                    }
                 },
                 // Under a qualifier, a key with no values is IAM's empty set — but only
                 // where the request DECLARES it models the key; otherwise its absence is
                 // this emulator not modelling it, which decides nothing.
-                Some(_) if actual.is_empty() && !modelled => return None,
+                Some(_) if actual.is_empty() && !modelled => {
+                    required.note(key, &actual);
+                    decidable = false;
+                    continue;
+                }
                 // The suffix answers absence before the set rule does, so a key the request
                 // carries no value for holds under either qualifier.
                 Some(_) if actual.is_empty() && absence_holds => true,
@@ -969,10 +1188,13 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
                     .iter()
                     .any(|value| clause_holds(operator, &expected, value)),
             };
+            if !decided {
+                required.note(key, &actual);
+            }
             held = held && decided;
         }
     }
-    Some(held)
+    decidable.then_some(held)
 }
 
 /// Whether the request DECLARES that it models `key`: its own name is published, or a
@@ -983,19 +1205,22 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
 /// `kms:EncryptionContext:` covers every entry name of a request's encryption context —
 /// which is what a caller that knows ALL the values of a family publishes: it can answer
 /// for a key of that family whether the request carries a value for it, including answering
-/// that it carries none.
+/// that it carries none. A request whose context is COMPLETE
+/// ([`Request::context_complete`]) can answer that for every key there is, so it publishes
+/// them all.
 fn publishes(request: &Request<'_>, key: &str) -> bool {
-    request.published.iter().any(|known| {
-        known.eq_ignore_ascii_case(key)
-            || (known.ends_with(FAMILY_SEPARATORS)
-                && key.len() > known.len()
-                // By `get`, never by a byte-index slice: the key is read verbatim out of a
-                // policy document, so a multi-byte character straddling the family's length
-                // must answer "not covered" rather than panic.
-                && key
-                    .get(..known.len())
-                    .is_some_and(|head| head.eq_ignore_ascii_case(known)))
-    })
+    request.context_complete
+        || request.published.iter().any(|known| {
+            known.eq_ignore_ascii_case(key)
+                || (known.ends_with(FAMILY_SEPARATORS)
+                    && key.len() > known.len()
+                    // By `get`, never by a byte-index slice: the key is read verbatim out
+                    // of a policy document, so a multi-byte character straddling the
+                    // family's length must answer "not covered" rather than panic.
+                    && key
+                        .get(..known.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(known)))
+        })
 }
 
 /// The set qualifier a condition clause's key may be written with, for a request key that
@@ -1049,6 +1274,17 @@ fn clause_holds(operator: &str, expected: &[Expanded], actual: &str) -> bool {
             .any(|value| value.equals(actual, case_sensitive))
     };
     let any_like = || expected.iter().any(|pattern| pattern.matches(actual, true));
+    // Both sides as INSTANTS: a date clause compares the moment each side names, so the
+    // epoch and ISO 8601 spellings of one moment compare equal. A side that names no
+    // instant at all is compared against nothing, so the positive spelling does not hold
+    // on it — and the negated one, which holds exactly where its sibling does not, does.
+    let any_instant = |ordered: fn(i64, i64) -> bool| {
+        instant(actual).is_some_and(|reached| {
+            expected
+                .iter()
+                .any(|value| instant(&value.text()).is_some_and(|stated| ordered(reached, stated)))
+        })
+    };
     match operator {
         "StringEquals" => any_equals(true),
         "StringNotEquals" => !any_equals(true),
@@ -1060,6 +1296,12 @@ fn clause_holds(operator: &str, expected: &[Expanded], actual: &str) -> bool {
         // positive spellings are documented as doing the same comparison.
         "ArnEquals" | "ArnLike" => any_like(),
         "ArnNotEquals" | "ArnNotLike" => !any_like(),
+        "DateEquals" => any_instant(|reached, stated| reached == stated),
+        "DateNotEquals" => !any_instant(|reached, stated| reached == stated),
+        "DateLessThan" => any_instant(|reached, stated| reached < stated),
+        "DateLessThanEquals" => any_instant(|reached, stated| reached <= stated),
+        "DateGreaterThan" => any_instant(|reached, stated| reached > stated),
+        "DateGreaterThanEquals" => any_instant(|reached, stated| reached >= stated),
         // A boolean key carries one of the two literals, compared as such.
         BOOL_OPERATOR => any_equals(false),
         // Unreachable: the caller checks the operator against the two operator tables

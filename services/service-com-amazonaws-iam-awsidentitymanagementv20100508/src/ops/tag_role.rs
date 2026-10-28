@@ -184,9 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; tagging a role depends on nothing in
-        // it — IAM is global, and the role is named in the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The role itself is
+        // named in the request — IAM is global, so no region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagRoleErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -221,6 +221,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // by case", so the role is found under the case-folded name whatever case the
         // request spelled it in.
         let key = crate::state::name_key(&input.role_name);
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is stored, and before the store is consulted for the role, so a
+        // caller that may not change a role's tags learns that it may not rather than
+        // whether the account holds that role. The tags this call WRITES are handed to the
+        // gate, because they are part of the request a statement may be conditioned on
+        // (`aws:RequestTag/<key>`, `aws:TagKeys`). Nothing is written when it refuses.
+        let held = store.roles.get(&key);
+        let resource = held.map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::TAG_ROLE,
+            &resource,
+            &format!("role {}", input.role_name),
+            crate::state::authorization::WrittenTags::Pairs(&input.tags),
+        )?;
+
         let Some(role) = store.roles.get_mut(&key) else {
             return Err(TagRoleErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
