@@ -20,6 +20,11 @@
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `a…` span (where the other apigateway suites land) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/apigateway_private_vpce_invoke.rs"]
+mod apigateway_private_vpce_invoke;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `b…` span (where the other bedrock suites land) are both regions concurrently
 // landing suites add their line to.
 #[path = "all/bedrock_model_customization_pass_role.rs"]

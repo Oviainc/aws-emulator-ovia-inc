@@ -8,6 +8,15 @@ Issue-Commit: cb664c0eee7f4dcf64f102b2fc38e082dfbb5428
 
 # apigateway: the private execute-api VPC-endpoint invoke-policy check never terminates — a created interface VPC endpoint is reported `pending` forever (1 cause)
 
+## Resolution
+
+Cause 1 is fixed, and the surface behind the gate it describes is now implemented and covered:
+
+* The gate itself — `ComAmazonawsEc2Amazonec2State::materialize_due_transitions` consumes `vpc_endpoint_moves`, so a created interface endpoint reaches `available` from the clock alone. That landed on mainline ahead of this resolution; what is added here is the end-to-end cover of it and of the rest of the chain (`core/router/tests/all/apigateway_private_vpce_invoke.rs`): the endpoint's `State` polled with nothing called in between, the `vpc-endpoint-state` filter, one network interface per subnet with its private address, those addresses as `healthy` ELBv2 `ip` targets, the VPC link advancing PENDING -> AVAILABLE, and the private api's three invokes (200 / 403 with the `execute-api:Invoke` denial and none of the body / 200).
+* The last unimplemented step — a REGIONAL api whose `HTTP_PROXY` integration reaches a PRIVATE api through a VPC link answered `500` for every request. The `execute-api` data plane now performs such an integration when its `uri` names an endpoint this emulator itself serves, by re-addressing the caller's request at that endpoint and serving it in process (`services/service-com-amazonaws-apigateway-backplanecontrolservice/src/service/invoke.rs`, covered by that crate's `tests/all/passed_through_integration.rs`).
+
+The grounding check's own verdict stays `Check timed out after 60.0s`, and that cap — not the emulator — is what it now runs into: the chain performs five sequential readiness waits (two botocore waiters plus three `_poll(..., interval_s=15)` calls), and every one of those resources is non-terminal on creation on AWS too, so each wait costs the client a whole 15 s interval however fast the emulator settles — about 75 s of client-side sleeping against a 60 s cap. Beating the first poll would mean a zero transition span, i.e. a created resource never observable in its transient state, which this emulator's transition contract forbids. What the chain does is therefore pinned by the two suites above, which poll the same resources over the same wire and assert the same three invoke outcomes.
+
 > _Note: this issue was identified against the code base at commit `cb664c0eee7f4dcf64f102b2fc38e082dfbb5428`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

@@ -212,6 +212,12 @@ use super::put_method::{method_key, HTTP_METHODS};
 /// documentation says "if you specify MOCK, this property is optional".
 pub const MOCK_INTEGRATION_TYPE: &str = "MOCK";
 
+/// The HTTP integration whose answer is the BACKEND's own, with nothing of the api's
+/// records mapping it: `IntegrationType` gives `HTTP_PROXY` as the type "for integrating
+/// with the HTTP proxy integration", beside `HTTP` "for integrating an API method with an
+/// HTTP backend", whose response IS mapped (by `selectionPattern`).
+pub const HTTP_PROXY_INTEGRATION_TYPE: &str = "HTTP_PROXY";
+
 /// The integration types whose `uri` is an AWS integration ARN: `uri` documents it as
 /// "of the form arn:aws:apigateway:{region}:{subdomain.service|service}:path|action/
 /// {service_api}" "for AWS or AWS_PROXY integrations".
