@@ -658,6 +658,41 @@ impl ComAmazonawsKmsTrentserviceState {
         }
     }
 
+    /// Configure the automatic rotation schedule of EVERY key of the multi-Region key
+    /// set `key_id`, from the rotation period the request named.
+    ///
+    /// The automatic rotation setting is a property the keys of a set share: "to enable
+    /// or disable automatic rotation of a set of related multi-Region keys, set the
+    /// property on the primary key" and "KMS automatically synchronizes these shared
+    /// properties among related multi-Region keys"
+    /// (`smithy_query(query="doc",shape="EnableKeyRotation")`,
+    /// `smithy_query(query="doc",shape="ReplicateKey")`) — so the one call that
+    /// configures it writes the SAME schedule through every member, and the status each
+    /// member's own Region reports is that one schedule rather than whatever the member
+    /// carried before.
+    ///
+    /// A key that belongs to no set is the only key of its key id, so this writes it
+    /// and nothing else.
+    pub fn schedule_rotation_across_set(&mut self, key_id: &str, period_in_days: Option<i32>) {
+        let schedule = RotationSchedule::starting_now(period_in_days);
+        for arn in self.set_member_arns(key_id) {
+            if let Some(key) = self.keys.get_mut(&arn) {
+                key.rotation_schedule = Some(schedule.clone());
+            }
+        }
+    }
+
+    /// Stop automatic rotation on EVERY key of the multi-Region key set `key_id` — the
+    /// other end of [`Self::schedule_rotation_across_set`], for the same reason: the
+    /// setting is one the set's keys share.
+    pub fn unschedule_rotation_across_set(&mut self, key_id: &str) {
+        for arn in self.set_member_arns(key_id) {
+            if let Some(key) = self.keys.get_mut(&arn) {
+                key.unschedule_rotation();
+            }
+        }
+    }
+
     /// Make the key in `region` the primary key of the multi-Region key set `key_id`
     /// ([`MultiRegionTopology::promote`]) on every key of that set, answering whether
     /// `region` held a replica of it to promote at all.
@@ -1131,6 +1166,79 @@ pub fn caller_identity_arn() -> String {
 /// own variant and is built here once, for every operation's error type.
 pub fn unauthorized_account<E>(operation: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::access_denied(unauthorized_account_message(operation))
+}
+
+/// How KMS words its refusal of an encryption context that is not a legal encryption
+/// context at all: fixed text that names neither the entry nor the value, because what
+/// the request got wrong is the context as a whole.
+pub const INVALID_ENCRYPTION_CONTEXT_MESSAGE: &str = "Invalid EncryptionContext";
+
+/// Whether `context` is an encryption context KMS accepts, and the refusal that reports
+/// it when it is not.
+///
+/// An encryption context is "a collection of non-secret key-value pairs"
+/// (`smithy_query(query="doc",shape="EncryptRequest",member="EncryptionContext")`), so
+/// an entry whose name or whose value is the empty string binds nothing: the REQUEST is
+/// malformed, and it is refused at input validation — a `ValidationException` carrying
+/// [`INVALID_ENCRYPTION_CONTEXT_MESSAGE`] — before any ciphertext is authenticated
+/// against it.
+///
+/// That ordering is the whole point of judging it here. A context that is well formed
+/// but not the one a ciphertext was sealed under is an AUTHENTICATION failure, which
+/// `InvalidCiphertextException` reports and which only an operation that opens a
+/// ciphertext models at all; a context that is not a context is wrong on every
+/// operation that takes one, including the ones that merely seal, where there is no
+/// ciphertext to authenticate against and no such fault is modelled.
+///
+/// Generic over the error channel, so every operation taking an encryption context
+/// refuses one identically.
+pub fn check_encryption_context<E>(
+    context: Option<&HashMap<String, String>>,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    let well_formed = context.is_none_or(|context| {
+        context
+            .iter()
+            .all(|(name, value)| !name.is_empty() && !value.is_empty())
+    });
+    if well_formed {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::validation(
+        INVALID_ENCRYPTION_CONTEXT_MESSAGE,
+    ))
+}
+
+/// How KMS refuses a request to open a ciphertext whose key material is not material
+/// this endpoint can authorize: it does not say whether that key exists, because the
+/// answer would disclose a key of another Region to a caller this endpoint cannot
+/// authorize for it.
+///
+/// Single-Region key material does not travel: a ciphertext minted in one Region, or a
+/// key ARN of one, presented to ANOTHER Region's endpoint names material this endpoint
+/// holds no key for — which is an authorization decision rather than a lookup, so the
+/// sentence covers all three of the reasons it can be refused at once.
+pub const FOREIGN_KEY_MATERIAL_MESSAGE: &str = "The ciphertext refers to a customer \
+     master key that does not exist, does not exist in this region, or you are not \
+     allowed to access.";
+
+/// The refusal every operation that OPENS a ciphertext answers for key material this
+/// endpoint cannot authorize ([`FOREIGN_KEY_MATERIAL_MESSAGE`]).
+///
+/// `AccessDeniedException` is not in this service's model at all — KMS answers an
+/// authorization failure with it regardless — so it travels on the error channel's own
+/// variant and is built here once, for every operation's error type.
+pub fn foreign_key_material<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::access_denied(FOREIGN_KEY_MATERIAL_MESSAGE)
+}
+
+/// Whether `identifier` is an ARN whose Region segment is not `region`, the Region the
+/// request was signed for.
+///
+/// Such an identifier addresses a resource of another Region's endpoint, which this one
+/// can never serve — the same reading [`key_not_found_message`] gives it, here as a
+/// question an operation can ask before it decides which refusal that is.
+pub fn names_another_region(region: &str, identifier: &str) -> bool {
+    arn_region(identifier).is_some_and(|arn_region| arn_region != region)
 }
 
 /// The Region segment of `identifier`, when it is a KMS key or alias ARN.
@@ -2553,10 +2661,7 @@ impl Cmk {
     /// measured from the call that configured it, and configuring it again measures
     /// the new period from that later call.
     pub fn schedule_rotation(&mut self, period_in_days: Option<i32>) {
-        self.rotation_schedule = Some(RotationSchedule {
-            period_in_days: period_in_days.unwrap_or(DEFAULT_ROTATION_PERIOD_IN_DAYS),
-            scheduled_from: SystemTime::now(),
-        });
+        self.rotation_schedule = Some(RotationSchedule::starting_now(period_in_days));
     }
 
     /// Stop automatic rotation of this key's key material, leaving the material and
@@ -2727,6 +2832,19 @@ impl Cmk {
         self.multi_region_topology.is_some()
     }
 
+    /// Whether this key is a REPLICA key of a multi-Region key set: a member of a set
+    /// whose primary key lives in another Region.
+    ///
+    /// Every key of a set shares the set's one primary-key designation, so which member
+    /// this is follows from the Region it lives in rather than from a flag of its own.
+    /// One function for every operation that treats a replica differently from the
+    /// primary, so they cannot disagree about which key is which.
+    pub fn is_multi_region_replica(&self) -> bool {
+        self.multi_region_topology
+            .as_ref()
+            .is_some_and(|topology| topology.primary_region != self.region)
+    }
+
     /// Whether this key's imported key material has reached the instant the caller set
     /// it to expire at.
     ///
@@ -2851,6 +2969,19 @@ pub struct RotationSchedule {
 }
 
 impl RotationSchedule {
+    /// The schedule a call made at this instant configures: the period the request
+    /// named, or [`DEFAULT_ROTATION_PERIOD_IN_DAYS`] when it named none, measured from
+    /// now.
+    ///
+    /// One constructor, so a schedule written onto one key and a schedule written onto
+    /// every key of a multi-Region set are the same schedule.
+    fn starting_now(period_in_days: Option<i32>) -> Self {
+        Self {
+            period_in_days: period_in_days.unwrap_or(DEFAULT_ROTATION_PERIOD_IN_DAYS),
+            scheduled_from: SystemTime::now(),
+        }
+    }
+
     /// When KMS next rotates the key material under this schedule: one rotation
     /// period after the call that configured it, since KMS "rotates the key material
     /// of the KMS key one year (approximately 365 days) from the enable date and
@@ -2877,11 +3008,14 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 pub enum RotationConfigRefusal {
     /// The key is not one whose automatic rotation is configurable at all —
     /// `UnsupportedOperationException`, "a specified resource is not valid for this
-    /// operation". KMS reports a key the rotation operations cannot rotate with the
-    /// error code ALONE: the refusal is recorded on the wire with an empty message,
-    /// so this variant carries none and [`unsupported_rotation_message`] is what
-    /// every rotation operation builds its wire message from.
-    Unsupported,
+    /// operation", carrying the `message` KMS words that refusal with.
+    ///
+    /// A key whose KIND cannot rotate is refused with the error code ALONE
+    /// ([`unsupported_rotation_message`]); a key that is a member of a multi-Region
+    /// set and is not the member the property belongs on is refused with the sentence
+    /// [`multi_region_replica_message`] builds, which names the key and the operation
+    /// so the caller knows which key to call instead.
+    Unsupported(Option<String>),
     /// The key is disabled — the modelled `DisabledException`, whose message names
     /// the key and its state ([`invalid_state_message`]).
     Disabled(String),
@@ -2901,6 +3035,19 @@ pub fn unsupported_rotation_message() -> Option<String> {
     None
 }
 
+/// How KMS words its refusal of a request aimed at a multi-Region REPLICA key for a
+/// property only the set's PRIMARY key carries: the key's own ARN, that it is a
+/// multi-region replica key, and the operation it is not a valid resource for.
+///
+/// The variable parts are the replica key's ARN, read from state, and the name of the
+/// operation that refused — so every operation that a replica key is not valid for
+/// words its refusal the same way and names itself. One function for the whole
+/// service, so no two of them word it differently.
+#[must_use]
+pub fn multi_region_replica_message(key_arn: &str, operation: &str) -> String {
+    format!("{key_arn} is a multi-region replica key which is not valid for {operation}.")
+}
+
 /// Whether `key` is one whose automatic key rotation schedule a caller may set or
 /// clear, and which refusal reports it when it is not.
 ///
@@ -2914,13 +3061,21 @@ pub fn unsupported_rotation_message() -> Option<String> {
 /// disable automatic rotation of Amazon Web Services managed KMS keys"
 /// (`smithy_query(query="doc",shape="EnableKeyRotation")`).
 ///
+/// `operation` is the operation asking, which is what its refusal of a replica key of
+/// a multi-Region set names.
+///
 /// One function for both operations, so they cannot judge the same key differently.
-pub fn check_rotation_configurable(key: &Cmk) -> Result<(), RotationConfigRefusal> {
+pub fn check_rotation_configurable(
+    key: &Cmk,
+    operation: &str,
+) -> Result<(), RotationConfigRefusal> {
     // "You cannot enable or disable automatic rotation of Amazon Web Services
     // managed KMS keys. KMS always rotates the key material of Amazon Web Services
     // managed keys every year."
     if key.key_manager != KEY_MANAGER_CUSTOMER {
-        return Err(RotationConfigRefusal::Unsupported);
+        return Err(RotationConfigRefusal::Unsupported(
+            unsupported_rotation_message(),
+        ));
     }
 
     // Which keys cannot rotate automatically follows from the key's own kind and the
@@ -2928,7 +3083,9 @@ pub fn check_rotation_configurable(key: &Cmk) -> Result<(), RotationConfigRefusa
     // HMAC key are not symmetric encryption keys, and a key whose material did not
     // come from KMS is a key with imported key material.
     if !key.is_symmetric_encryption() || key.origin != ORIGIN_AWS_KMS {
-        return Err(RotationConfigRefusal::Unsupported);
+        return Err(RotationConfigRefusal::Unsupported(
+            unsupported_rotation_message(),
+        ));
     }
 
     // "The KMS key that you use for this operation must be in a compatible key
@@ -2945,13 +3102,13 @@ pub fn check_rotation_configurable(key: &Cmk) -> Result<(), RotationConfigRefusa
 
     // "To enable or disable automatic rotation of a set of related multi-Region
     // keys, set the property on the primary key" — so a replica key of a set does
-    // not carry the schedule; the primary key of its set does.
-    if key
-        .multi_region_topology
-        .as_ref()
-        .is_some_and(|topology| topology.primary_region != key.region)
-    {
-        return Err(RotationConfigRefusal::Unsupported);
+    // not carry the schedule; the primary key of its set does. The refusal names the
+    // replica and the operation, because WHICH key the caller must call instead is
+    // the whole of what it got wrong.
+    if key.is_multi_region_replica() {
+        return Err(RotationConfigRefusal::Unsupported(Some(
+            multi_region_replica_message(&key.arn, operation),
+        )));
     }
 
     Ok(())

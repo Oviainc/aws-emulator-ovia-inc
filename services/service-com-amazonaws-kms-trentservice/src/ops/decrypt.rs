@@ -8,7 +8,16 @@
 //! is given it must name that same key. The AES-GCM tag is what distinguishes a
 //! ciphertext this service produced from a foreign or altered one, and a matching
 //! encryption context from a different one — both failures are
-//! `InvalidCiphertextException`.
+//! `InvalidCiphertextException`. An encryption context that is not a legal context at
+//! all never reaches that tag: it is a malformed request, refused by the validation
+//! every operation taking one shares ([`crate::state::check_encryption_context`]).
+//!
+//! Key material does not cross Regions. A ciphertext whose key this endpoint's Region
+//! holds no record of — and a `KeyId` that is an ARN of another Region — names material
+//! this endpoint cannot authorize, which is an authorization refusal
+//! ([`crate::state::foreign_key_material`]) and not a report that the key is missing.
+//! The material the keys of a multi-Region set share is held by every member, so a
+//! replica opens its primary's ciphertext.
 //!
 //! `Recipient` (returning the plaintext encrypted to a Nitro enclave's attested
 //! public key) is answered with the scaffold's 501: the capability is not
@@ -395,6 +404,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The encryption context is INPUT, judged before anything is looked up: a
+        // context that is not a legal encryption context is a malformed request
+        // (`crate::state::check_encryption_context`), not a ciphertext that failed to
+        // authenticate — the distinction a caller needs, because one is fixed in the
+        // caller and the other is a ciphertext that is not its own.
+        crate::state::check_encryption_context(input.encryption_context.as_ref())?;
+
         // The model does not mark `CiphertextBlob` required, so an absent one reaches
         // the handler; it is a malformed request rather than an invalid ciphertext.
         let Some(blob) = input.ciphertext_blob.as_deref() else {
@@ -417,16 +433,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // known and its key state has been judged.
         let tokens = input.grant_tokens.clone().unwrap_or_default();
 
-        // The envelope names the key whose material sealed it. A key that no longer
-        // exists in this Region cannot decrypt anything.
+        // The envelope names the key whose material sealed it, and this endpoint can
+        // open the ciphertext only with a key of its OWN Region: single-Region key
+        // material does not travel, so a ciphertext whose key is not held here names
+        // material this endpoint cannot authorize. That is an authorization decision
+        // and not a lookup — KMS does not disclose whether that key exists — so it is
+        // refused with `AccessDeniedException` rather than reported as a missing
+        // resource. Material the keys of a multi-Region set SHARE is held by every
+        // member, so a replica opens its primary's ciphertext here as usual.
         let Some(key) = state.key_in(&region, &envelope.key_id) else {
-            return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::key_not_found_message(
-                    &region,
-                    &envelope.key_id,
-                )),
-            })
-            .into());
+            return Err(crate::state::foreign_key_material());
         };
 
         // "Specify the key ID ... of the KMS key" only when the caller wants KMS to
@@ -444,6 +460,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 crate::state::KeyRef::UnauthorizedAccount => {
                     return Err(crate::state::unauthorized_account(Self::NAME));
+                }
+                // A `KeyId` that is an ARN of another Region names a key this endpoint
+                // cannot authorize for the ciphertext either, so it is refused the same
+                // way the ciphertext's own foreign key is: on authorization, not as a
+                // lookup miss.
+                crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn
+                    if crate::state::names_another_region(&region, requested) =>
+                {
+                    return Err(crate::state::foreign_key_material());
                 }
                 crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                     return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
