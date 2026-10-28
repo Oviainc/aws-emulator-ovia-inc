@@ -217,6 +217,26 @@ pub async fn create_campaign(
     name: &str,
     schedule: Option<Value>,
 ) -> String {
+    let extra = match schedule {
+        Some(schedule) => serde_json::json!({"schedule": schedule}),
+        None => serde_json::json!({}),
+    };
+    create_campaign_with(router, region, instance, name, extra).await
+}
+
+/// [`create_campaign`], with every member of `extra` merged into the create request.
+///
+/// The one place this crate's suites build a campaign fixture, so a suite that needs a
+/// member the fixture takes no argument for (a `source`, a flow ARN, an entry-limits
+/// config) adds that member rather than another copy of the fixture. A member `extra`
+/// carries replaces the fixture's own.
+pub async fn create_campaign_with(
+    router: &Harness,
+    region: &str,
+    instance: &str,
+    name: &str,
+    extra: Value,
+) -> String {
     onboard_instance(router, region, instance).await;
     let mut body = serde_json::json!({
         "name": name,
@@ -229,10 +249,13 @@ pub async fn create_campaign(
             }
         },
     });
-    if let Some(schedule) = schedule {
+    for (member, value) in extra
+        .as_object()
+        .expect("the extra create members are an object")
+    {
         body.as_object_mut()
             .expect("an object request")
-            .insert("schedule".to_string(), schedule);
+            .insert(member.clone(), value.clone());
     }
     let (status, created) = call(router, region, "PUT", "/v2/campaigns", &body).await;
     assert_eq!(
@@ -265,6 +288,58 @@ pub async fn campaign_state(
         "case {case:?}: GetCampaignState expected 200, got {status} {body}"
     );
     body["state"].as_str().unwrap_or("<no state>").to_string()
+}
+
+/// The `campaign` object `DescribeCampaign` projects for `id`, asserting the read
+/// succeeded — the one place a suite reads a whole campaign back, beside
+/// [`campaign_state`], which reads only the state it is at.
+pub async fn describe_campaign(
+    router: &MultiServiceRouter,
+    region: &str,
+    id: &str,
+    case: &str,
+) -> Value {
+    let (status, body) = call(
+        router,
+        region,
+        "GET",
+        &format!("/v2/campaigns/{id}"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeCampaign expected 200, got {status} {body}"
+    );
+    body["campaign"].clone()
+}
+
+/// `now + offset_secs` as the RFC 3339 instant a timestamp member carries on the wire:
+/// this service's `TimeStamp` is `@timestampFormat("date-time")`, so a negative offset
+/// is how a case puts a run window in the past.
+pub fn instant(offset_secs: f64) -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("a test clock after the Unix epoch")
+        .as_secs_f64();
+    ::aws_smithy_types::DateTime::from_secs_f64(now + offset_secs)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .expect("a formattable instant")
+}
+
+/// An ARN of exactly `len` characters: `head` — which must already be a well-formed
+/// `arn:<partition>:<service>:<region>:<account>:<resource-prefix>` — padded out with
+/// `a`s. How a case reaches a published bound of `Arn`'s `@length` 20..500.
+pub fn padded_arn(head: &str, len: usize) -> String {
+    let mut arn = head.to_string();
+    assert!(
+        len > arn.len(),
+        "padded_arn({head:?}, {len}): too short for the ARN head"
+    );
+    while arn.len() < len {
+        arn.push('a');
+    }
+    arn
 }
 
 /// Drive the lifecycle actions in `actions` (each asserted to succeed), leaving the
