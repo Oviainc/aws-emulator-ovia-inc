@@ -229,6 +229,8 @@ mod load_balancer_tls_certificate_delete;
 mod load_balancer_tls_certificate_read;
 #[path = "all/load_balancer_tls_certificate_tags.rs"]
 mod load_balancer_tls_certificate_tags;
+#[path = "all/load_balancer_tls_certificate_validation.rs"]
+mod load_balancer_tls_certificate_validation;
 #[path = "all/load_balancer_tls_policies.rs"]
 mod load_balancer_tls_policies;
 #[path = "all/operations_for_resource.rs"]

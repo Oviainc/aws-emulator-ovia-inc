@@ -8,7 +8,9 @@
 //! A load balancer terminates HTTPS with ONE certificate, so attaching a certificate
 //! replaces whichever of that load balancer's certificates was attached before — and the
 //! attached certificate is what gives the load balancer its HTTPS listener alongside the
-//! plain `HTTP` one it always has.
+//! plain `HTTP` one it always has. Only a certificate the certificate authority has
+//! already issued can be attached: "Once you create and validate your certificate, you
+//! can attach it to your load balancer."
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -183,8 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // centralized walk refused anything outside them before this body ran.
         // What is left is what the model cannot express: the load balancer has
         // to be one this account holds in this Region, and the certificate has
-        // to be one THAT load balancer holds. Both are checked BEFORE the write,
-        // so a refused request attaches nothing.
+        // to be one THAT load balancer holds and one the certificate authority
+        // has already issued. All of them are checked BEFORE the write, so a
+        // refused request attaches nothing.
         let load_balancer_name = input.load_balancer_name;
         let certificate_name = input.certificate_name;
         let now = crate::state::now_ms();
@@ -218,19 +221,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // HTTPS listener the modelled `protocol` and `publicPorts` are
             // computed from.
             //
-            // A certificate is addressed by its own name among the ones THIS
-            // load balancer holds, so a name none of them carries names nothing
-            // to attach — on a load balancer holding no certificate at all, and
-            // on one whose certificate a `DeleteLoadBalancerTlsCertificate` call
-            // already removed. That is the same owner's answer, which writes
-            // nothing for such a name, so a refused request leaves every
-            // certificate of this load balancer exactly as it was.
-            if !balancer.attach_certificate(&certificate_name) {
-                return Err(not_found(
-                    crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
-                    &certificate_name,
-                ));
-            }
+            // The same owner decides whether there is anything to attach at
+            // all, and it refuses two cases without writing a single
+            // certificate, so a refused request leaves every certificate of
+            // this load balancer exactly as it was:
+            //
+            // * a certificate is addressed by its own name among the ones THIS
+            //   load balancer holds, so a name none of them carries names
+            //   nothing to attach — on a load balancer holding no certificate
+            //   at all, and on one whose certificate a
+            //   `DeleteLoadBalancerTlsCertificate` call already removed;
+            // * a certificate the certificate authority has not issued yet
+            //   secures nothing, so there is no HTTPS traffic the load balancer
+            //   could terminate with it — "Once you create and validate your
+            //   certificate, you can attach it to your load balancer".
+            balancer
+                .attach_certificate(&certificate_name)
+                .map_err(|refusal| certificate_refusal(&certificate_name, refusal))?;
 
             // `operations` is a list because a Lightsail call can act on several
             // resources at once; this one attaches exactly one certificate, so
@@ -262,6 +269,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// requested name.
 fn not_found(resource_type: &str, name: &str) -> AttachLoadBalancerTlsCertificateError {
     crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// This operation's rendering of a certificate the store says this load balancer
+/// may not terminate HTTPS with: a name it holds no certificate under is the
+/// `DoesNotExist` envelope, and a certificate the certificate authority has not
+/// issued yet is the modelled `OperationFailureException` carrying the rule's
+/// own message — the same two renderings
+/// `AttachCertificateToDistribution` gives the same two refusals.
+fn certificate_refusal(
+    certificate_name: &str,
+    refusal: crate::state::CertificateNotUsable,
+) -> AttachLoadBalancerTlsCertificateError {
+    match refusal {
+        crate::state::CertificateNotUsable::DoesNotExist => not_found(
+            crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
+            certificate_name,
+        ),
+        crate::state::CertificateNotUsable::NotIssued { status } => operation_failure(
+            crate::state::certificate_not_issued_for_load_balancer(certificate_name, status),
+        ),
+    }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and the state it is in.
+fn operation_failure(message: String) -> AttachLoadBalancerTlsCertificateError {
+    AttachLoadBalancerTlsCertificateErrorModeled::OperationFailureException(
+        OperationFailureException {
+            message: Some(message),
+            ..Default::default()
+        },
+    )
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

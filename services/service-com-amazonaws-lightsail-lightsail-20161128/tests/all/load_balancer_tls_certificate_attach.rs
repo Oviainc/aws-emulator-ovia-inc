@@ -20,12 +20,18 @@
 //! balancer, or a certificate of that load balancer, the account does not hold
 //! attaches nothing and is answered with Lightsail's `DoesNotExist` rejection.
 //!
+//! Every attach here names a certificate the certificate authority has already
+//! issued, which is what the operation takes ("Once you create and validate your
+//! certificate, you can attach it to your load balancer"); the refusal of one it
+//! has not issued yet is the subject of
+//! `load_balancer_tls_certificate_validation`.
+//!
 //! The rows differ along everything the rule generalises over: the Region the
 //! load balancer lives in, how many certificates it holds, which of them the
 //! request attaches, whether that certificate came from `CreateLoadBalancer` or
 //! from a later `CreateLoadBalancerTlsCertificate`, the certificate's name and
 //! domains, the instance port the load balancer forwards to, and whether the
-//! load balancer has settled into `active` before the attach.
+//! load balancer's own `active` state is waited for before the attach.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,8 +39,13 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-// The UUID shape check this crate's suites share, rather than an Nth copy of it.
+// The UUID shape check this crate's suites share, the trait the shared issuance
+// wait needs of a harness, and that wait itself — owned by the suite for the
+// operation that reports a load balancer's certificates — rather than an Nth
+// copy of any of them.
+use crate::distribution_certificate_attachment::SignedCall;
 use crate::instance_lifecycle::is_uuid_shaped;
+use crate::load_balancer_tls_certificate_read::wait_for_issued;
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire
 /// protocol").
@@ -83,19 +94,34 @@ impl Emulator {
     /// Call `operation` in `region` with `body`, answering its HTTP status and
     /// parsed body.
     async fn call(&self, region: &str, operation: &str, body: Value) -> (u16, Value) {
-        let request = ::http::Request::builder()
+        self.call_in(Some(region), operation, body).await
+    }
+
+    /// Call `operation` with `body`, in `region` when one is given — and with no
+    /// credential scope at all when none is, which this service serves in its
+    /// default Region.
+    async fn call_in(
+        &self,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let mut builder = ::http::Request::builder()
             .method("POST")
             .uri("/")
             .header("host", "127.0.0.1:9297")
             .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-            .header("content-type", "application/x-amz-json-1.1")
-            .header(
+            .header("content-type", "application/x-amz-json-1.1");
+        if let Some(region) = region {
+            builder = builder.header(
                 "authorization",
                 format!(
                     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261022/{region}/lightsail/\
                      aws4_request, SignedHeaders=host, Signature=not-verified"
                 ),
-            )
+            );
+        }
+        let request = builder
             .body(bytes::Bytes::from(body.to_string()))
             .expect("the request is well formed");
         let response = self.router.dispatch(request).await;
@@ -124,6 +150,19 @@ impl Emulator {
         self.ok(region, "GetLoadBalancer", json!({"loadBalancerName": name}))
             .await["loadBalancer"]
             .clone()
+    }
+}
+
+/// What the ONE issuance wait of this test target needs of a harness, so this
+/// suite reaches it rather than carrying its own copy of the poll.
+impl SignedCall for Emulator {
+    async fn call_signed(
+        &self,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        self.call_in(region, operation, body).await
     }
 }
 
@@ -262,14 +301,14 @@ struct Row {
     /// the create asked for, `1` the added one.
     attach_first: usize,
     instance_port: i64,
-    /// Whether to let the clock settle the load balancer into `active` before
-    /// attaching.
+    /// Whether to wait for the clock to settle the load balancer itself into
+    /// `active` before attaching — the attach takes its certificate either way.
     settle_first: bool,
 }
 
 const ROWS: &[Row] = &[
     Row {
-        case: "the only certificate, no alternative domains, attached while provisioning",
+        case: "the only certificate, no alternative domains, attached without waiting for active",
         region: "us-east-1",
         load_balancer: "shop-lb",
         created_with: ("shop-cert", "example.com", &[]),
@@ -431,6 +470,11 @@ async fn attach_load_balancer_tls_certificate_attaches_the_named_certificate() {
         if row.settle_first {
             wait_for_state(&emulator, row.region, row.load_balancer, "active").await;
         }
+        // Only a certificate the certificate authority has issued can be
+        // attached, so every certificate this row attaches is waited for.
+        for certificate in row.certificates() {
+            wait_for_issued(&emulator, row.region, row.load_balancer, certificate).await;
+        }
 
         // Nothing is attached until this operation attaches it: the load
         // balancer serves the plain HTTP listener alone.
@@ -573,6 +617,7 @@ async fn an_attached_certificate_is_in_use_by_the_load_balancer() {
             }),
         )
         .await;
+    wait_for_issued(&emulator, region, load_balancer, certificate).await;
     emulator
         .ok(
             region,
@@ -805,6 +850,7 @@ async fn a_certificate_is_attached_to_one_load_balancer_only() {
             .await;
     }
 
+    wait_for_issued(&emulator, "us-east-1", "first-lb", "shared-name-cert").await;
     emulator
         .ok(
             "us-east-1",

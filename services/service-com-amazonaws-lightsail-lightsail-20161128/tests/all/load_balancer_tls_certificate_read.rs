@@ -40,6 +40,7 @@ use serde_json::{json, Value};
 // service through the same front door, and checks a minted serial the same way,
 // rather than standing up a second one.
 use crate::certificate_request::serial_number_of;
+use crate::distribution_certificate_attachment::SignedCall;
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, Emulator};
 
 /// The operation under test.
@@ -118,15 +119,23 @@ fn now_epoch_seconds() -> f64 {
 
 /// The certificates the load balancer `name` in `region` holds, as this
 /// operation reports them.
-async fn certificates(emulator: &Emulator, region: &str, name: &str) -> Vec<Value> {
-    let body = emulator
-        .ok_at(
-            None,
-            Some(region),
-            OPERATION,
-            json!({"loadBalancerName": name}),
-        )
+///
+/// `pub(crate)` with the issuance wait below: a load balancer's certificate is
+/// read and waited for here, once, for every suite of this test target whose
+/// cases need one — whatever its own harness looks like.
+pub(crate) async fn certificates<E: SignedCall>(
+    emulator: &E,
+    region: &str,
+    name: &str,
+) -> Vec<Value> {
+    let (status, body) = emulator
+        .call_signed(Some(region), OPERATION, json!({"loadBalancerName": name}))
         .await;
+    assert_eq!(
+        status, 200,
+        "case reading the certificates of {name} in {region}: expected HTTP 200, \
+         got {status} {body:?}"
+    );
     body["tlsCertificates"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a tlsCertificates array for {name}, got {body:?}"))
@@ -134,8 +143,13 @@ async fn certificates(emulator: &Emulator, region: &str, name: &str) -> Vec<Valu
 }
 
 /// The one certificate named `certificate` the load balancer `name` in `region`
-/// holds.
-async fn certificate(emulator: &Emulator, region: &str, name: &str, certificate: &str) -> Value {
+/// holds. `pub(crate)` for the same reason as [`certificates`].
+pub(crate) async fn certificate<E: SignedCall>(
+    emulator: &E,
+    region: &str,
+    name: &str,
+    certificate: &str,
+) -> Value {
     certificates(emulator, region, name)
         .await
         .into_iter()
@@ -147,9 +161,11 @@ async fn certificate(emulator: &Emulator, region: &str, name: &str, certificate:
 /// reported `ISSUED`, answering it.
 ///
 /// The issuance is owed by the clock, not by the poll: it arrives without anyone
-/// asking more than once.
-async fn wait_for_issued(
-    emulator: &Emulator,
+/// asking more than once. `pub(crate)` for the same reason as [`certificates`] —
+/// `AttachLoadBalancerTlsCertificate` takes only an issued certificate, so every
+/// suite that attaches one waits here.
+pub(crate) async fn wait_for_issued<E: SignedCall>(
+    emulator: &E,
     region: &str,
     name: &str,
     certificate_name: &str,
@@ -819,7 +835,12 @@ async fn the_read_reports_which_certificate_is_attached() {
     }
 
     // Each attachment in turn: the certificate named is the one reported
-    // attached, and every other certificate of the load balancer is not.
+    // attached, and every other certificate of the load balancer is not. The
+    // attach only takes a certificate the certificate authority has issued, so
+    // each one is waited for first.
+    for attached in ["attach-primary", "attach-backup"] {
+        wait_for_issued(&emulator, region, load_balancer, attached).await;
+    }
     for attached in ["attach-primary", "attach-backup", "attach-primary"] {
         let case = format!("attaching {attached}");
         emulator

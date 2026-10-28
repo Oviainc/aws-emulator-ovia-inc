@@ -11340,7 +11340,9 @@ impl StoredLoadBalancer {
     }
 
     /// Make the certificate `name` the one this load balancer terminates HTTPS
-    /// with, answering whether it holds a certificate of that name at all.
+    /// with — the ONE owner of that rule, as
+    /// [`ComAmazonawsLightsailLightsail20161128State::issued_certificate`] is for
+    /// the certificates of the account.
     ///
     /// A load balancer terminates HTTPS with ONE certificate, so attaching one
     /// detaches whichever was attached: "Use the AttachLoadBalancerTlsCertificate
@@ -11349,20 +11351,30 @@ impl StoredLoadBalancer {
     /// `AttachLoadBalancerTlsCertificate` documentation). Attaching the one
     /// already attached leaves the record in the state the request asks for.
     ///
-    /// A `name` this load balancer holds no certificate under changes NOTHING
-    /// and answers `false`, which is what the caller refuses the request by:
-    /// the name is resolved through [`Self::certificate_index`] before a single
-    /// certificate is written, so a request for a certificate this load
-    /// balancer does not hold cannot leave its attachment cleared. Both walks
-    /// are bounded by [`MAX_CERTIFICATES_PER_LOAD_BALANCER`].
-    pub fn attach_certificate(&mut self, name: &str) -> bool {
-        if self.certificate_index(name).is_none() {
-            return false;
+    /// The certificate has to be one this load balancer holds AND one the
+    /// certificate authority has already issued — "Once you create and validate
+    /// your certificate, you can attach it to your load balancer": a
+    /// certificate still being validated secures nothing, so there is no HTTPS
+    /// traffic the load balancer could terminate with it. Both are decided
+    /// BEFORE a single certificate is written — the name through
+    /// [`Self::certificate_index`] and the issuance through
+    /// [`StoredLoadBalancerCertificate::is_issued`] — so a refused request
+    /// cannot leave an attachment cleared or move one. Both walks are bounded by
+    /// [`MAX_CERTIFICATES_PER_LOAD_BALANCER`].
+    pub fn attach_certificate(&mut self, name: &str) -> Result<(), CertificateNotUsable> {
+        let index = self
+            .certificate_index(name)
+            .ok_or(CertificateNotUsable::DoesNotExist)?;
+        let requested = &self.certificates[index];
+        if !requested.is_issued() {
+            return Err(CertificateNotUsable::NotIssued {
+                status: requested.status,
+            });
         }
         for certificate in &mut self.certificates {
             certificate.is_attached = certificate.name == name;
         }
-        true
+        Ok(())
     }
 
     /// Every SSL/TLS certificate this load balancer holds, as the modelled
@@ -11912,10 +11924,13 @@ pub fn certificate_serial_number(id: &str) -> String {
 ///
 /// The rule is the same whichever operation records the reference — the create
 /// that names a certificate on a new distribution, the attach that sets one
-/// later, or the container service that keys its public domain names by one — so
-/// it is owned here, and each handler only renders the refusal in its own error
-/// channel. See
-/// [`ComAmazonawsLightsailLightsail20161128State::issued_certificate`].
+/// later, the container service that keys its public domain names by one, or the
+/// attach that puts one of a load balancer's certificates in front of its HTTPS
+/// traffic — so it is owned here, and each handler only renders the refusal in
+/// its own error channel. See
+/// [`ComAmazonawsLightsailLightsail20161128State::issued_certificate`] for the
+/// certificates of the account and [`StoredLoadBalancer::attach_certificate`]
+/// for the ones a load balancer holds.
 #[derive(Debug, Clone)]
 pub enum CertificateNotUsable {
     /// This account holds no certificate of that name: Lightsail's
@@ -11924,9 +11939,12 @@ pub enum CertificateNotUsable {
     /// [`RESOURCE_TYPE_CERTIFICATE`].
     DoesNotExist,
     /// The certificate exists but the certificate authority has not issued it,
-    /// so it secures nothing. The variant carries the `CertificateStatus` the
-    /// record is in, which is what the refusing operation's message names — see
-    /// [`certificate_not_issued_for_distribution`] and
+    /// so it secures nothing. The variant carries the status the record is in —
+    /// a `CertificateStatus`, or the `LoadBalancerTlsCertificateStatus` of a
+    /// certificate a load balancer holds — which is what the refusing
+    /// operation's message names: see
+    /// [`certificate_not_issued_for_distribution`],
+    /// [`certificate_not_issued_for_load_balancer`] and
     /// [`certificate_not_issued_for_public_domain_names`].
     NotIssued { status: &'static str },
 }
@@ -11940,6 +11958,18 @@ pub fn certificate_not_issued_for_distribution(name: &str, status: &str) -> Stri
     format!(
         "The certificate {name} is {status}: only certificates with a status of \
          {CERTIFICATE_STATUS_ISSUED} can be attached to a distribution."
+    )
+}
+
+/// Lightsail's message for a request that would make a certificate the
+/// certificate authority has not issued the one a load balancer terminates
+/// HTTPS with: "Once you create and validate your certificate, you can attach
+/// it to your load balancer" (the modelled
+/// `AttachLoadBalancerTlsCertificate` documentation).
+pub fn certificate_not_issued_for_load_balancer(name: &str, status: &str) -> String {
+    format!(
+        "The certificate {name} is {status}: once you create and validate your certificate, \
+         you can attach it to your load balancer."
     )
 }
 
