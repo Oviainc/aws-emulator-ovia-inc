@@ -16,10 +16,13 @@
 //!    `numResults` and the maximum it has to satisfy ("The default is 5. The maximum
 //!    is 100.") are facts about the REQUEST, so that bound is settled before the
 //!    campaign is resolved.
-//! 2. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
+//! 2. `userId` is the personalization input the RESOLVED campaign needs, not a fact
+//!    about the request: the model marks it optional, so its absence is answered only
+//!    once the campaign is in hand, and the refusal names that campaign.
+//! 3. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
 //!    `filterValues`, decides which stored Actions-catalog entries come back — not
 //!    what any of them scores.
-//! 3. Each action's score is [`crate::state::scoring::relevance`] of its STORED
+//! 4. Each action's score is [`crate::state::scoring::relevance`] of its STORED
 //!    `base_score` and the request's `userId`, so an identical request returns an
 //!    identical ordering (the operation is `@idempotent`), and the list is reported
 //!    descending by score. The scores are normalized across the whole stored Actions
@@ -86,7 +89,7 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{self as registry, scoring, Action, Denied, Entity, RecipeType};
+use crate::state::{self as registry, scoring, Action, Denied, Entity, RecipeType, RequiredInput};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -172,15 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(campaign_arn) = registry::present(input.campaign_arn.as_deref()) else {
             return Err(invalid_campaign_arn(input.campaign_arn.as_deref()));
         };
-        //    `userId` is a fact about the request too: this operation serves
-        //    `PERSONALIZED_ACTIONS` campaigns only ("the user to provide action
-        //    recommendations for"), so the input it needs never depends on what the
-        //    ARN resolves to.
-        let Some(user_id) = registry::present(input.user_id.as_deref()) else {
-            return Err(invalid(
-                "userId is required: it is the user to provide action recommendations for.",
-            ));
-        };
         //    How many results to compute is the value the caller sent against the
         //    documented maximum ("The default is 5. The maximum is 100."), both facts
         //    about the request — so it is answered BEFORE the campaign is resolved,
@@ -206,7 +200,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // 3. The request's filter, over the Actions dataset.
+        // 3. The personalization input the RESOLVED campaign needs. `userId` carries no
+        //    `@required` and its modelled length starts at 0, so nothing about the
+        //    request alone makes its absence a fault: it is the input the resolved
+        //    campaign's recipe type asks for
+        //    ([`crate::state::Campaign::required_input`]), so it is evaluated once that
+        //    campaign is in hand and the refusal names it — exactly as the sibling
+        //    `GetRecommendations` reports the input ITS resolved resource needs.
+        let user_id = registry::present(input.user_id.as_deref()).unwrap_or_default();
+        if campaign.required_input() == RequiredInput::User && user_id.is_empty() {
+            return Err(invalid(format!(
+                "userId is required to get action recommendations from campaign {} ({}).",
+                campaign.arn,
+                campaign.recipe_type.as_str()
+            )));
+        }
+
+        // 4. The request's filter, over the Actions dataset.
         let request_filter = guard
             .bind_filter(
                 registry::present(input.filter_arn.as_deref()),
@@ -215,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(deny)?;
 
-        // 4. Score every stored action, settle each one's share of the certainty over
+        // 5. Score every stored action, settle each one's share of the certainty over
         //    the whole stored Actions catalog, then let the request's filter and
         //    `numResults` decide which of them come back.
         let mut ranked: Vec<(&Action, f64)> = campaign

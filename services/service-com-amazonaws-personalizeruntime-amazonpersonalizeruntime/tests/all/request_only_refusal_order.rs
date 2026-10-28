@@ -4,17 +4,23 @@
 //! a resource that would be refused.
 //!
 //! The rule, over every inference operation: a refusal whose every input comes from the
-//! REQUEST — the value the caller sent, measured against a documented bound or a member
-//! the operation always needs — is settled BEFORE the request's campaign or recommender
-//! is resolved, so one malformed request earns one refusal whatever the registry holds.
+//! REQUEST — the value the caller sent, measured against a documented bound or against
+//! a member the model marks `@required` — is settled BEFORE the request's campaign or
+//! recommender is resolved, so one malformed request earns one refusal whatever the
+//! registry holds.
 //! A refusal that needs the resolved resource (an ARN the registry does not hold, a
 //! campaign of the wrong recipe type, the personalization input THAT resource needs)
 //! only wins when the request is well formed on its own terms.
 //!
 //! The rows span the operations, the request-only members (`numResults`, `inputList`,
-//! `userId`), the bound each one is measured against — including the lower maximum a
-//! request that asks for metadata gets — and the resource state the request names:
-//! unregistered, registered-but-wrong-recipe, and registered-but-missing-the-input.
+//! and the `@required` `userId` of `GetPersonalizedRanking`), the bound each one is
+//! measured against — including the lower maximum a request that asks for metadata gets
+//! — and the resource state the request names: unregistered,
+//! registered-but-wrong-recipe, and registered-but-missing-the-input.
+//!
+//! A member the model leaves OPTIONAL is not such a refusal: it is an input of the
+//! resolved resource, so it is answered after resolution — see
+//! `optional_input_refusal_order.rs`.
 
 use serde_json::{json, Value};
 
@@ -226,13 +232,6 @@ fn table(route: &str) -> (Value, Vec<Resource>, Vec<RequestOnly>) {
                         MAX_NUM_ACTION_RESULTS * 5,
                         MAX_NUM_ACTION_RESULTS,
                     ),
-                },
-                RequestOnly {
-                    case: "no userId at all",
-                    members: json!({ "userId": "" }),
-                    refusal: "userId is required: it is the user to provide action \
-                              recommendations for."
-                        .to_string(),
                 },
             ],
         ),
