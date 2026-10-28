@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(DeleteDBSecurityGroupError::validation)?;
+        // `DBSecurityGroupName` "is stored as a lowercase string" on the create, so this
+        // lookup folds the name the same way and one spelling cannot hide the group
+        // another spelling created.
+        let name = input.db_security_group_name.to_ascii_lowercase();
+        // "You can't delete the default DB security group" / "Must not be `Default`": that
+        // name belongs to the service, so a request naming it is refused for the VALUE it
+        // carries — the `InvalidParameterValue` the Query API answers a broken member
+        // constraint with, which is the same refusal `CreateDBSecurityGroup` answers for
+        // that name. It is NOT the not-found fault: that group is the account's own.
+        if name == crate::state::DEFAULT_DB_SECURITY_GROUP {
+            return Err(DeleteDBSecurityGroupError::invalid_parameter_value(format!(
+                "DBSecurityGroupName must not be {}: the account's own default DB security \
+                 group can't be deleted",
+                crate::state::DEFAULT_DB_SECURITY_GROUP
+            )));
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated deletion.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // The group this call ADDRESSES is resolved first: "DBSecurityGroupName doesn't
+        // refer to an existing DB security group" is the modelled 404, and it is also the
+        // answer a second delete of the same group gets — which is what lets a caller tell
+        // "deleted" from "never existed" at the first call.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBSecurityGroup"))
+        // RDS is regional: only the region the request was signed for is in scope, so one
+        // name can be a different group in each region. The lookup goes through the ONE
+        // resolver every operation that names a DB security group uses, so a group one
+        // operation reports as existing is never reported absent by another.
+        //
+        // The WORDING is the one this front door answers where the group is the SUBJECT of
+        // the call and the call changes it, which is not the wording it answers where a call
+        // only looks a group up — so the message comes from the mutating-path helper rather
+        // than from the lookup one the report and the ingress paths share.
+        let key = (region.clone(), name.clone());
+        if store.resolve_db_security_group(&region, &name).is_none() {
+            return Err(
+                DeleteDBSecurityGroupErrorModeled::DBSecurityGroupNotFoundFault(
+                    DBSecurityGroupNotFoundFault {
+                        message: Some(crate::state::db_security_group_not_found_colon_message(
+                            &name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "The specified DB security group must not be associated with any DB instances" —
+        // the modelled `InvalidDBSecurityGroupStateFault` ("The state of the DB security
+        // group doesn't allow deletion"). The membership is recorded on the INSTANCE
+        // record's own `DBSecurityGroups`, which is the only place this service holds it,
+        // so the guard reads the store rather than trusting the caller; a membership is
+        // matched case-insensitively because a group's name is stored folded while the
+        // membership keeps the spelling the instance request carried. The refusal names the
+        // instance that still holds the group, which is the variable part of the wording.
+        if let Some(holder) = store
+            .instances_in(&region)
+            .into_iter()
+            .find(|instance| {
+                instance
+                    .db_security_group_names
+                    .iter()
+                    .any(|member| member.eq_ignore_ascii_case(&name))
+            })
+            .map(|instance| instance.identifier.clone())
+        {
+            return Err(
+                DeleteDBSecurityGroupErrorModeled::InvalidDBSecurityGroupStateFault(
+                    InvalidDBSecurityGroupStateFault {
+                        message: Some(crate::state::db_security_group_in_use_message(
+                            &name, &holder,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record carries the group's ingress rules and its tags, so removing it is what
+        // makes every later read — the describe, the tag read on its ARN — report the group
+        // and everything hanging off it as gone.
+        store.db_security_groups.remove(&key);
+
+        Ok(DeleteDBSecurityGroupOutput)
     }
 }
+

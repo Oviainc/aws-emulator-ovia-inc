@@ -24,7 +24,9 @@
 //! may not modify), in the region the request was signed for and no other, and a group
 //! reads back holding no ingress rule after every refusal above.
 
-use service_com_amazonaws_rds_amazonrdsv19::state::VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE;
+use service_com_amazonaws_rds_amazonrdsv19::state::{
+    db_security_group_not_found_message, VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, call_in, emulator, expect_error, expect_ok, subtrees, text, REGION};
@@ -204,7 +206,7 @@ async fn a_group_no_create_stored_is_the_modelled_not_found() {
             );
             assert_eq!(
                 text(&body, "Message"),
-                format!("DBSecurityGroup not found: {}", named.to_ascii_lowercase()),
+                db_security_group_not_found_message(&named.to_ascii_lowercase()),
                 "case {case:?}: expected the not-found wording this service shares, got {body}"
             );
         }
