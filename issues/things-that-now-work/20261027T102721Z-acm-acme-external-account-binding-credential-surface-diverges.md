@@ -1,14 +1,59 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: acm.get-acme-external-account-binding-credentials-cross-account-denied acm.get-eab-credentials-cross-account-denied acm.update-acme-endpoint-on-revoked-account-succeeds
+Issue-Trace-Ids: acm.get-acme-external-account-binding-credentials-cross-account-denied acm.get-eab-credentials-cross-account-denied
 Issue-Shape-Id: com.amazonaws.acm#CertificateManager
 Issue-Key: acm.get-acme-external-account-binding-credentials-cross-account-denied|run#16|AssertionError|assert code == "ValidationException", f"expected ValidationException, got {code} message={message!r}"
 Issue-Key: acm.get-eab-credentials-cross-account-denied|_error#16|AssertionError|raise AssertionError(f"expected a rejection, but the call succeeded and returned {result!r}")
-Issue-Key: acm.update-acme-endpoint-on-revoked-account-succeeds|_acme_register_account#12|AssertionError|assert nonce, f"no Replay-Nonce returned from newNonce (status={status})"
 Issue-Commit: c048498fa9bf8a008294e81bd378b5619adc830b
 
-# ACM ACME external-account-binding credential surface diverges in three places: cross-account ARN answered ResourceNotFoundException, credentials served to an unauthorized principal, and newNonce emits a lower-cased Replay-Nonce field name (3 causes, 3 checks)
+# ACM ACME external-account-binding credential surface diverges in three places: cross-account ARN answered ResourceNotFoundException, credentials served to an unauthorized principal, and newNonce emits a lower-cased Replay-Nonce field name (3 causes, 3 checks; the newNonce cause is split out and still open)
+
+## Resolution
+
+Causes 1 and 2 are FIXED, and their two checks pass. Cause 3 is NOT fixed: the field
+name it is about is decided below every service crate, in the read-only `vendor/` tree,
+so it has been SPLIT OUT into its own open report rather than counted as resolved here —
+and the Issue-Key and trace id it owns moved with it, out of this record's header.
+
+* Cause 1 — an ARN input member that names the resource an operation acts on is held to
+  the caller's own account: an ARN whose account segment is another account's is refused
+  as invalid input (`ValidationException`, HTTP 400, the wholly fixed sentence `Invalid
+  ARN in request: Same account ARN expected but got cross-account ARN`) before any store
+  lookup, so the answer never depends on whether a record with that id exists, and only
+  an ARN of the caller's own account can be reported as missing. The crate already
+  implemented that rule for eight operations
+  (`state::arn_is_in_caller_account` + `service::cross_account_arn_refusal`); the gate
+  was added to the seven that lacked it (`GetAcmeExternalAccountBindingCredentials`,
+  `DescribeAcmeExternalAccountBinding`, `RevokeAcmeExternalAccountBinding`,
+  `DescribeAcmeEndpoint`, `UpdateAcmeEndpoint`, `DescribeAcmeDomainValidation`,
+  `UpdateAcmeDomainValidation`) and the one wording now carries the recorded sentence for
+  all of them.
+* Cause 2 — every implemented operation whose model declares `AccessDeniedException`
+  now evaluates the IAM identity-based policies in force on the principal the request's
+  credentials name, against `acm:<OperationName>` on the ARN the request addressed,
+  BEFORE it reads or writes anything, and refuses with the modelled
+  `AccessDeniedException` (HTTP 403) naming the principal, the action and that resource
+  (`services/service-com-amazonaws-acm-certificatemanager/src/service/authorization.rs`,
+  deciding through `service_common::iam_authorization`). The account's own published
+  credential, and a principal carrying a grant this emulator cannot read, are served.
+  This also satisfies the check carried by
+  `20261023T004835Z-acm-serves-calls-from-a-principal-with-no.md`, which stays filed for
+  its own keys.
+* Cause 3 — NOT FIXED, and SPLIT OUT so it stays filed: its Issue-Key
+  (`acm.update-acme-endpoint-on-revoked-account-succeeds`) now has its own open report,
+  `issues/things-that-do-not-work/20261027T102721Z-acm-acme-newnonce-emits-a-lower-cased-replay-nonce-field-name.md`.
+  The `newNonce` responder already states the field under its canonical `Replay-Nonce`
+  spelling, but every field name is normalised to lower case after that by code no fixer
+  may change — `aws_smithy_runtime_api::http::Headers` (an `http::HeaderName`, lower-cased
+  on construction), `vendor/smithy-server-runtime/src/multi_service_router.rs:411-430`
+  (which rebuilds the outgoing response name by name through `http::HeaderName` again) and
+  the HTTP/1 writer reached at `vendor/server/src/lib.rs:1205`. Nothing inside `services/`
+  reaches those bytes, and no test in the service crate can even observe the casing, so
+  the answer is left exactly as it was (200 to `HEAD`, 204 to `GET`, a fresh nonce,
+  `Cache-Control: no-store` and the `Link` index) rather than substituting some other
+  status or error, and that one check still fails — against the split-out report, not
+  this one.
 
 > _Note: this issue was identified against the code base at commit `c048498fa9bf8a008294e81bd378b5619adc830b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
