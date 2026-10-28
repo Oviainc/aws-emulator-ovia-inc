@@ -1244,17 +1244,12 @@ impl AlarmStatistic<'_> {
         }
     }
 
-    /// The name the alarm gave this statistic.
+    /// The name the alarm gave this statistic: one of the basic five, or the percentile name
+    /// the alarm spelled.
     fn name(&self) -> &str {
         match self {
             Self::Basic(name) | Self::Percentile(name, _) => name,
         }
-    }
-
-    /// Whether this is the percentile form, which a reason document records under its own
-    /// member.
-    fn is_percentile(&self) -> bool {
-        matches!(self, Self::Percentile(_, _))
     }
 }
 
@@ -1524,8 +1519,10 @@ fn decimal_text(value: f64) -> String {
 /// windows than the bound holds. Every instant inside it is written in the form a document of
 /// this service stamps an instant with ([`super::document_instant`]).
 ///
-/// The statistic is the one the graded series was FOLDED by, so a series a query array
-/// computed — which no single statistic describes — contributes no statistic member.
+/// The statistic is the one the graded series was FOLDED by, reported under the single
+/// `statistic` member whichever of the two members the alarm configured it on, so a series a
+/// query array computed — which no single statistic describes — contributes no statistic
+/// member at all.
 fn state_reason_data(
     statistic: Option<&AlarmStatistic<'_>>,
     period: f64,
@@ -1551,13 +1548,12 @@ fn state_reason_data(
     {
         document.insert("startDate".to_string(), Value::from(at));
     }
+    // ONE member carries the statistic however the alarm spelled it: the name the windows were
+    // folded by, whether that is one of the basic five (`MetricAlarm$Statistic`) or the
+    // percentile `MetricAlarm$ExtendedStatistic` names, so a reader recovers the statistic from
+    // the same place for either form.
     if let Some(statistic) = statistic {
-        let member = if statistic.is_percentile() {
-            "extendedStatistic"
-        } else {
-            "statistic"
-        };
-        document.insert(member.to_string(), Value::from(statistic.name()));
+        document.insert("statistic".to_string(), Value::from(statistic.name()));
     }
     document.insert("period".to_string(), Value::from(period));
     document.insert("threshold".to_string(), Value::from(threshold));

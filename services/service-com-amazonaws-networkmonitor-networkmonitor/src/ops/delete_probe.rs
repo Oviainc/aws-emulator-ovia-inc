@@ -200,16 +200,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // leaves `modifiedAt` where that delete put it.
         let already_tearing_down = probe.is_being_torn_down();
         probe.start_teardown(now);
-        if !already_tearing_down {
-            monitor.modified_at = now;
-        }
         // The monitor-level consequence of the write, from the one rule that
-        // decides a monitor's own state: the probes it holds. A teardown gains
-        // the monitor nothing to aggregate, so it never makes an activation due,
-        // and the probe is still held and reported, so the monitor keeps the
-        // state it had reached until that record is gone — decided here rather
-        // than left to whichever caller settles the monitor next.
-        monitor.follow_probe_states(now);
+        // decides a monitor's own state: the probes it holds. An accepted
+        // teardown changed a probe the monitor reports, so the monitor's
+        // `modifiedAt` moves with the probe's, while a repeat that stored
+        // nothing moves neither ([`crate::state::Monitor::follow_probe_write`]).
+        // A teardown gains the monitor nothing to aggregate, so it never makes
+        // an activation due, and the probe is still held and reported, so the
+        // monitor keeps the state it had reached until that record is gone —
+        // decided here rather than left to whichever caller settles the monitor
+        // next.
+        monitor.follow_probe_write(!already_tearing_down, now);
         Ok(DeleteProbeOutput {})
     }
 }

@@ -140,23 +140,26 @@
 //!
 //! Every paginated listing of this service pages the same way, so the rule lives here
 //! rather than once per handler: [`list_page_size`] is the width one `MaxResults` asks
-//! for, and [`page_after_position`] is the whole position-token rule the listings that
-//! page over a position share (`ListApprovalTeams`, `ListIdentitySources`,
-//! `ListSessions` over a record's stored position [`SeqOrdered`], `ListResourcePolicies`
-//! over an attachment's place in the resource's attachment list) — the page is the
-//! records ordered after the position the request's token names, at most one page of
-//! them, and the next token names the last of them while records remain
-//! ([`PositionPage`]).
+//! for, `cut_page` is the one place a page is CUT — at most one page of entries, and
+//! the next token naming the last entry reported exactly while entries remain
+//! ([`ListingPage`]) — and the two resume rules are stated over it once each:
+//!
+//! * [`page_after_position`], for the listings that page over a POSITION
+//!   (`ListApprovalTeams`, `ListIdentitySources`, `ListSessions` over a record's stored
+//!   position [`SeqOrdered`], `ListResourcePolicies` over an attachment's place in the
+//!   resource's attachment list): the page is the records ordered after the position the
+//!   request's token names.
+//! * [`page_after_key`], for the listings that page over a KEY the store itself orders
+//!   by (`ListPolicies` over the catalog's policy ARNs, `ListPolicyVersions` over one
+//!   policy's version ids): the page is the map's entries ordered after the key the
+//!   request's token names.
 //!
 //! A token is ONE listing's, so it carries the listing that issued it — the operation,
 //! and the resource it pages over where it pages over one ([`Listing`],
 //! [`listing_token`]) — and is only resumable there: a token this listing cannot read, a
 //! token another listing issued, and a token naming a record this listing does not hold
-//! are all refused ([`token_key`], [`page_after_position`], and for a catalog listing
-//! the catalog lookup of the key it read) rather than answered with a page. The catalog
-//! listings page over a key the catalog itself orders (a policy ARN, a version id) and
-//! so read their token's key with [`token_key`] rather than [`token_position`], but take
-//! their page width from [`list_page_size`] too.
+//! are all refused ([`token_key`], [`page_after_position`], [`page_after_key`]) rather
+//! than answered with a page.
 //!
 //! # Authorization
 //!
@@ -200,6 +203,7 @@
 //! value is held to that bound by [`bounded_message`].
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{AccessDeniedException, ResourceNotFoundException, ValidationException};
@@ -415,15 +419,15 @@ impl SeqOrdered for Session {
     }
 }
 
-/// One page of a position-token listing: the records it reports, and the token the NEXT
-/// page resumes after — absent once nothing is left, which is how a client knows the
-/// listing is over.
+/// One page of a paginated listing of this service: the records it reports, and the
+/// token the NEXT page resumes after — absent once nothing is left, which is how a
+/// client knows the listing is over.
 #[derive(Debug)]
-pub struct PositionPage<'a, T> {
-    /// The records this page reports, in the order `ordered` held them.
+pub struct ListingPage<'a, T> {
+    /// The records this page reports, in the order the listing held them.
     pub records: Vec<&'a T>,
-    /// `NextToken`: the token for the position of the last record on this page, when
-    /// records remain.
+    /// `NextToken`: this listing's token for the last record on this page, when records
+    /// remain.
     pub next_token: Option<String>,
 }
 
@@ -494,8 +498,8 @@ const TOKEN_SEPARATOR: char = ':';
 /// a query string or a JSON string, which is where the listings bind `NextToken`.
 ///
 /// The form proves nothing by itself: what makes a token resumable is that the listing
-/// reading it HOLDS the record its key names, which [`page_after_position`] and the
-/// catalog listings' own lookup decide.
+/// reading it HOLDS the record its key names, which [`page_after_position`] and
+/// [`page_after_key`] decide.
 #[must_use]
 pub fn listing_token(listing: Listing<'_>, key: &str) -> String {
     format!("{}{TOKEN_SEPARATOR}{key}", listing.scope())
@@ -510,8 +514,8 @@ pub fn listing_token(listing: Listing<'_>, key: &str) -> String {
 /// listing of another resource) handed out — is refused with [`foreign_next_token`] and
 /// the caller lifts that into its own operation's `ValidationException` (400). That the
 /// key was also HANDED OUT by this listing is decided against the records themselves:
-/// [`page_after_position`] for a position, and the catalog lookup of the listing that
-/// pages over a catalog key.
+/// [`page_after_position`] for a position, [`page_after_key`] for a key the store orders
+/// by.
 pub fn token_key(
     listing: Listing<'_>,
     next_token: Option<&str>,
@@ -546,14 +550,36 @@ pub fn token_position(
     }
 }
 
+/// One page cut out of `ordered`, and the token for the page after it.
+///
+/// This is the ONE place a page of this service is CUT, so the slice width and the
+/// next-token condition cannot drift between the listings — whatever a listing pages
+/// over and however it renders its token: the page is at most [`list_page_size`] entries
+/// of `ordered`, and the token (`token_of` over the LAST entry reported) is handed out
+/// exactly while entries remain, which is how a client knows the listing is over.
+///
+/// One entry past the page is read and no more: enough to know whether entries remain,
+/// without materialising the whole tail of a listing that has no fixed size.
+fn cut_page<I, U, F>(ordered: I, max_results: i32, token_of: F) -> (Vec<U>, Option<String>)
+where
+    I: IntoIterator<Item = U>,
+    F: FnOnce(&U) -> String,
+{
+    let page_size = list_page_size(max_results);
+    let mut reported: Vec<U> = ordered.into_iter().take(page_size + 1).collect();
+    let more_remain = reported.len() > page_size;
+    reported.truncate(page_size);
+    let next_token = reported.last().filter(|_| more_remain).map(token_of);
+    (reported, next_token)
+}
+
 /// One page of `ordered`, resuming after the position `after` names.
 ///
-/// This is the ONE place the page of a position listing is cut, so the slice width, the
-/// resume rule and the next-token condition cannot drift between the listings: `ordered`
-/// is the records in the order the listing reports them, each with its position; the
-/// page is the records ordered after `after`, at most [`list_page_size`] of them; and
-/// the token for the page after names the last record reported — absent once the page
-/// reached the end of `ordered`, which is how a client knows the listing is over.
+/// This is the ONE place the resume rule of a position listing lives, and the page is
+/// cut by `cut_page` like every other: `ordered` is the records in the order the
+/// listing reports them, each with its position; the page is the records ordered after
+/// `after`, at most [`list_page_size`] of them; and the token for the page after names
+/// the last record reported — absent once the page reached the end of `ordered`.
 ///
 /// A position is RESUMABLE only where this listing handed it out, and this listing hands
 /// out the position of a record it reported, so `after` has to be the position of a
@@ -568,12 +594,11 @@ pub fn page_after_position<'a, T, I>(
     ordered: I,
     after: Option<u64>,
     max_results: i32,
-) -> Result<PositionPage<'a, T>, ValidationException>
+) -> Result<ListingPage<'a, T>, ValidationException>
 where
     T: 'a,
     I: IntoIterator<Item = (u64, &'a T)>,
 {
-    let page_size = list_page_size(max_results);
     let mut handed_out = after.is_none();
     let mut records: Vec<(u64, &'a T)> = Vec::new();
     for (position, record) in ordered {
@@ -585,13 +610,52 @@ where
     if !handed_out {
         return Err(foreign_next_token());
     }
-    let more_remain = records.len() > page_size;
-    records.truncate(page_size);
-    let next_token = records
-        .last()
-        .filter(|_| more_remain)
-        .map(|(position, _)| position_token(listing, *position));
-    Ok(PositionPage {
+    let (records, next_token) = cut_page(records, max_results, |(position, _)| {
+        position_token(listing, *position)
+    });
+    Ok(ListingPage {
+        records: records.into_iter().map(|(_, record)| record).collect(),
+        next_token,
+    })
+}
+
+/// One page of `ordered`, resuming after the key `after` names.
+///
+/// This is the ONE place the resume rule of a listing that pages over a key the STORE
+/// orders by lives, and the page is cut by `cut_page` like every other: `ordered` is
+/// the records keyed by that ordering key (a policy ARN for `ListPolicies`, a version id
+/// for `ListPolicyVersions`); the page is the entries ordered after `after`, at most
+/// [`list_page_size`] of them; and the token for the page after names the key of the
+/// last entry reported — absent once the page reached the end of the map.
+///
+/// A key is RESUMABLE only where this listing handed it out, and this listing hands out
+/// the key of an entry it reported, so `after` has to be a key `ordered` still holds:
+/// any other key is refused with [`foreign_next_token`] rather than answered with a page
+/// the client would read as the end of the listing. The key of the LAST entry — which no
+/// page hands out, since a token is issued only while entries remain — is accepted and
+/// answers an empty final page, exactly as a position is in [`page_after_position`].
+pub fn page_after_key<'a, K, T>(
+    listing: Listing<'_>,
+    ordered: &'a BTreeMap<K, T>,
+    after: Option<&K>,
+    max_results: i32,
+) -> Result<ListingPage<'a, T>, ValidationException>
+where
+    K: Ord + ::std::fmt::Display,
+{
+    if after.is_some_and(|key| !ordered.contains_key(key)) {
+        return Err(foreign_next_token());
+    }
+    let start = match after {
+        None => Bound::Unbounded,
+        Some(key) => Bound::Excluded(key),
+    };
+    let (records, next_token) = cut_page(
+        ordered.range((start, Bound::Unbounded)),
+        max_results,
+        |(key, _)| listing_token(listing, &key.to_string()),
+    );
+    Ok(ListingPage {
         records: records.into_iter().map(|(_, record)| record).collect(),
         next_token,
     })
@@ -605,7 +669,7 @@ pub fn page_after_seq<'a, T, I>(
     ordered: I,
     after: Option<u64>,
     max_results: i32,
-) -> Result<PositionPage<'a, T>, ValidationException>
+) -> Result<ListingPage<'a, T>, ValidationException>
 where
     T: SeqOrdered + 'a,
     I: IntoIterator<Item = &'a T>,
@@ -627,13 +691,38 @@ pub fn page_by_seq_token<'a, T, I>(
     ordered: I,
     next_token: Option<&str>,
     max_results: i32,
-) -> Result<PositionPage<'a, T>, ValidationException>
+) -> Result<ListingPage<'a, T>, ValidationException>
 where
     T: SeqOrdered + 'a,
     I: IntoIterator<Item = &'a T>,
 {
     let after = token_position(listing, next_token)?;
     page_after_seq(listing, ordered, after, max_results)
+}
+
+/// One page of `ordered`, the page width and the resume key read off the request's
+/// `MaxResults` and `NextToken`: [`token_key`] then [`page_after_key`], the whole
+/// key-token paging rule in one call for a listing that pages over a key the store
+/// orders by.
+///
+/// The key is read back in the type the map is keyed by, so a token whose key is not a
+/// key of this map at all — one that does not parse, or one the map does not hold — is
+/// refused with [`foreign_next_token`], and a key handed out always reads back as the
+/// key it was rendered from.
+pub fn page_by_key_token<'a, K, T>(
+    listing: Listing<'_>,
+    ordered: &'a BTreeMap<K, T>,
+    next_token: Option<&str>,
+    max_results: i32,
+) -> Result<ListingPage<'a, T>, ValidationException>
+where
+    K: Ord + ::std::fmt::Display + ::std::str::FromStr,
+{
+    let after = match token_key(listing, next_token)? {
+        None => None,
+        Some(key) => Some(key.parse::<K>().map_err(|_| foreign_next_token())?),
+    };
+    page_after_key(listing, ordered, after.as_ref(), max_results)
 }
 
 /// Largest number of tags one resource holds.
