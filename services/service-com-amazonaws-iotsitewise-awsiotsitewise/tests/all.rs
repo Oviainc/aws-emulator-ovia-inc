@@ -27,6 +27,13 @@ mod query_results;
 #[path = "all/client_token_replay.rs"]
 mod client_token_replay;
 
+// `computation_model_resolve_to_resources` is declared HERE, beside the suite it
+// belongs with, rather than in the sorted list or at the END of the file: those
+// are the two stretches every concurrent iotsitewise change puts a declaration of
+// its own in. Fold it into the list once the churn settles.
+#[path = "all/computation_model_resolve_to_resources.rs"]
+mod computation_model_resolve_to_resources;
+
 // `computation_model_execution_summary` is declared HERE, beside the note above,
 // rather than in the sorted list or at the END of the file: those are the two
 // stretches every concurrent iotsitewise change puts a declaration of its own in.
