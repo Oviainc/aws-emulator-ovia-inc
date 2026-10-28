@@ -109,6 +109,8 @@ mod iam_identity_resources;
 mod include_transform;
 #[path = "all/in_flight_resource_status.rs"]
 mod in_flight_resource_status;
+#[path = "all/initiating_resource_events.rs"]
+mod initiating_resource_events;
 #[path = "all/in_place_resource_updates.rs"]
 mod in_place_resource_updates;
 #[path = "all/list_change_sets.rs"]

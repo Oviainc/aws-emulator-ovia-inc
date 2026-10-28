@@ -41,6 +41,13 @@
 //! that satisfies it rather than by the clock, so the steps behind it are scheduled from
 //! that signal's arrival.
 //!
+//! Inside one step, the instant a record carries is the instant the thing it reports
+//! HAPPENED: the step's last event is the resource finishing, and every record before it
+//! reports something the owning service was already asked for — the create CloudFormation
+//! records as initiated once the request for it has gone to that service — so those fall at
+//! the START of the step ([`StepTimes::event_at`]) and are in the log for the whole of the
+//! span the resource then takes, however that span ends.
+//!
 //! ## Bounds
 //!
 //! One step per resource transition the walk recorded, which a stack operation records at
@@ -61,6 +68,18 @@ const IN_PROGRESS: &str = super::IN_PROGRESS_SUFFIX;
 /// The prefix of every `ResourceStatus` of a resource being DELETED, which is the half of
 /// the walk that runs against the dependency relation rather than along it.
 const DELETE: &str = "DELETE_";
+
+/// How far apart the records a step makes at its START are stamped.
+///
+/// Every event of a step but the last reports work the service that owns the resource has
+/// already been ASKED for, so they all happened as the walk reached the resource rather than
+/// across the span it then spends on it ([`StepTimes::event_at`]). They are stamped this far
+/// apart so each still carries an instant of its own and a read that orders the log by
+/// `StackEvent$Timestamp` reports them in the order the walk made them. This short, because
+/// what it separates is two records of one answer and not a span anything waits for: the
+/// record that a resource's work has STARTED is in the log by the time any client can read
+/// the log at all, however long the resource then takes.
+const RECORD_TICK: Duration = Duration::from_micros(1);
 
 /// One `StackEvent` a step of the walk owes about one resource.
 #[derive(Debug, Clone)]
@@ -108,8 +127,9 @@ pub struct Step {
     /// The events this step owes: the first OPENS the transition (`*_IN_PROGRESS`) and the
     /// last ENDS it (`*_COMPLETE`/`*_FAILED`), with whatever the walk recorded in between —
     /// the second `CREATE_IN_PROGRESS` that says the create was initiated in the owning
-    /// service. They are spread across the span the walk spent on this resource, so each
-    /// carries the instant it happened at.
+    /// service. The one that ends it carries the instant the resource finished; the records
+    /// before it carry the instant the walk ASKED, at the start of the span it spends on
+    /// this resource ([`StepTimes::event_at`]).
     pub events: Vec<PlannedEvent>,
     /// The logical ids of the OTHER resources of this walk this one waits for.
     pub after: BTreeSet<String>,
@@ -550,25 +570,36 @@ impl Timeline {
 impl StepTimes {
     /// The instant the `index`th of a step's `count` events happened at.
     ///
-    /// The first is when the walk SCHEDULED the resource and the last when it FINISHED;
-    /// whatever the walk recorded in between falls between them, evenly across the span it
-    /// spent on that resource, so every event of one resource carries its own instant.
-    /// `None` while the walk has not reached that event.
+    /// The first is when the walk SCHEDULED the resource and the last when it FINISHED.
+    /// Whatever the walk recorded in BETWEEN them reports something the owning service has
+    /// already been asked for — the create CloudFormation records as initiated once the
+    /// request for it has gone to that service — so it happened at the START of the span the
+    /// walk spends on the resource and not at some point measured back from the end of it:
+    /// what takes the span is the resource coming up, which the LAST event reports. Those
+    /// records are therefore stamped one [`RECORD_TICK`] apart from the instant the step
+    /// opened, which is what keeps each one's own instant distinct and in the order the walk
+    /// made them, and never at or past the instant the step ended.
+    ///
+    /// `None` while the walk has not reached that event: for the record that ENDS a step
+    /// that is what the step not having finished means, and an earlier record of a step the
+    /// walk has not scheduled at all has no instant either.
     pub fn event_at(&self, index: usize, count: usize) -> Option<SystemTime> {
         let scheduled_at = self.scheduled_at?;
         if index == 0 {
             return Some(scheduled_at);
         }
-        let finished_at = self.finished_at?;
         if index + 1 >= count {
-            return Some(finished_at);
+            return self.finished_at;
         }
-        let span = finished_at
-            .duration_since(scheduled_at)
-            .unwrap_or_default();
-        let parts = u32::try_from(count - 1).unwrap_or(u32::MAX).max(1);
-        let offset = u32::try_from(index).unwrap_or(u32::MAX);
-        Some(scheduled_at + (span / parts) * offset)
+        let at = scheduled_at + RECORD_TICK * u32::try_from(index).unwrap_or(u32::MAX);
+        Some(match self.finished_at {
+            // A step the walk spent less than that on — one an owning service refused
+            // microseconds after the call, whose walk is reported in the span it really
+            // took — keeps the order of its records rather than stamping one past its own
+            // end.
+            Some(finished_at) => at.min(finished_at),
+            None => at,
+        })
     }
 }
 
