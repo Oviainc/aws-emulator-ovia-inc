@@ -221,15 +221,16 @@ pub const MAX_ENCRYPTION_CHANGES_PER_WINDOW: usize = 25;
 /// over: the "rolling 24-hour period" both encryption operations document.
 pub const ENCRYPTION_CHANGE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The most shards one stream of this emulator holds. `ShardCount` is modelled `range
-/// 1..` with no maximum, so a create past this one is refused rather than allocated — and
-/// the request's count is checked against it BEFORE a shard map is sized from it.
-pub const MAX_SHARDS_PER_STREAM: u32 = 500;
-
-/// The most shards one region of this emulator holds across every stream. The
-/// `CreateStream` doc answers `LimitExceededException` when a request would "create more
-/// shards than are authorized for your account", and this is the count this emulator
-/// authorizes, at the order of AWS's own default per-region shard quota.
+/// The shard quota this emulator authorizes one account and region, which is the ONE
+/// ceiling every operation that opens a shard is refused past and the ceiling
+/// `DescribeLimits` publishes as `ShardLimit`
+/// ([`ComAmazonawsKinesisKinesis20131202State::shard_quota_in`]).
+///
+/// The `CreateStream` doc answers `LimitExceededException` when a request would "create
+/// more shards than are authorized for your account", and the number authorized is the one
+/// `DescribeLimits` reports, so there is no second, per-stream ceiling: a stream may hold
+/// every shard the account's quota admits. Set at the order of AWS's own default per-region
+/// shard quota.
 pub const MAX_SHARDS_PER_REGION: u32 = 1_000;
 
 /// The most streams of the on-demand capacity mode one region of this emulator holds
@@ -243,22 +244,17 @@ pub const MAX_SHARDS_PER_REGION: u32 = 1_000;
 /// refused past by every operation that gives a stream that capacity mode.
 pub const MAX_ON_DEMAND_STREAMS_PER_REGION: usize = 50;
 
-/// The most streams one region of this emulator holds. `CreateStream` is the only thing
-/// that adds one and the store lives for the life of the process, so the store needs a
-/// maximum entry count; the emulator's OWN ceiling, not a modelled limit.
-pub const MAX_STREAMS_PER_REGION: usize = 500;
-
-/// The most streams this emulator holds across EVERY region, whatever region each was
-/// created in.
+/// The most shards this emulator holds across EVERY region, whatever region each was
+/// created in — the largest thing a create allocates, so this is the ceiling that bounds
+/// the store's memory.
 ///
-/// The per-region quotas above are partitioned by the region the CALLER's credential scope
-/// names, which the caller chooses, so they bound no total on their own: these two
-/// ceilings, which no request can partition, are what keep the store from growing without
-/// end. The emulator's OWN ceilings, not modelled limits.
-pub const MAX_STREAMS_TOTAL: usize = 1_000;
-
-/// The most shards this emulator holds across every stream of every region — the largest
-/// thing a create allocates, so this is the ceiling that bounds the store's memory.
+/// The shard quota above is partitioned by the region the CALLER's credential scope names,
+/// which the caller chooses, so it bounds no total on its own: this ceiling, which no
+/// request can partition, is what keeps the store from growing without end, and a stream
+/// always holds at least one shard, so it bounds the entry count too. The emulator's OWN
+/// ceiling, not a modelled limit — and it is folded INTO the quota `DescribeLimits`
+/// publishes ([`ComAmazonawsKinesisKinesis20131202State::shard_quota_in`]), so the ceiling
+/// reported and the ceiling enforced stay one number.
 pub const MAX_SHARDS_TOTAL: u32 = 4_000;
 
 /// The most tags one stream carries: "A set of up to 50 key-value pairs to use to create
@@ -2081,17 +2077,9 @@ impl ComAmazonawsKinesisKinesis20131202State {
         self.streams.retain(|_, stream| stream.is_held(now));
     }
 
-    /// How many streams `region`'s endpoint holds at `now`, which is what
-    /// [`MAX_STREAMS_PER_REGION`] bounds.
-    pub fn streams_held_in(&self, now: SystemTime, region: &str) -> usize {
-        self.streams
-            .iter()
-            .filter(|(key, stream)| key.region == region && stream.is_held(now))
-            .count()
-    }
-
-    /// How many shards `region`'s endpoint holds at `now` across every stream, which is
-    /// what [`MAX_SHARDS_PER_REGION`] bounds.
+    /// How many shards `region`'s endpoint holds at `now` across every stream, open and
+    /// closed alike — the shards the store is actually carrying, which is what the memory
+    /// ceiling [`MAX_SHARDS_TOTAL`] is counted against.
     pub fn shards_held_in(&self, now: SystemTime, region: &str) -> u32 {
         self.streams
             .values()
@@ -2131,15 +2119,6 @@ impl ComAmazonawsKinesisKinesis20131202State {
             .count()
     }
 
-    /// How many streams this emulator holds at `now` across every region, which is what
-    /// [`MAX_STREAMS_TOTAL`] bounds: the ceiling no request can partition.
-    pub fn streams_held(&self, now: SystemTime) -> usize {
-        self.streams
-            .values()
-            .filter(|stream| stream.is_held(now))
-            .count()
-    }
-
     /// How many shards this emulator holds at `now` across every region, which is what
     /// [`MAX_SHARDS_TOTAL`] bounds: the ceiling no request can partition.
     pub fn shards_held(&self, now: SystemTime) -> u32 {
@@ -2149,6 +2128,34 @@ impl ComAmazonawsKinesisKinesis20131202State {
             .fold(0u32, |held, stream| {
                 held.saturating_add(u32::try_from(stream.shards.len()).unwrap_or(u32::MAX))
             })
+    }
+
+    /// This account and region's shard quota at `now`, and the usage held against it:
+    /// `(ShardLimit, OpenShardCount)`, exactly as `DescribeLimits` answers with them.
+    ///
+    /// ONE number, read here by the operation that reports it and by every operation that
+    /// opens a shard, so the quota a caller is told about is the quota it is refused past:
+    /// a request that would open at most `ShardLimit - OpenShardCount` more shards is
+    /// served, and one for more than that is refused
+    /// ([`shard_limit_exceeded_message`]).
+    ///
+    /// The quota is per account and region, so the usage is the region's open shard count
+    /// ([`Self::open_shards_held_in`]). The emulator's own memory ceiling across every
+    /// region ([`MAX_SHARDS_TOTAL`]) is folded in rather than kept as a second, hidden
+    /// ceiling: it narrows the quota REPORTED once the store runs short, so the two
+    /// surfaces never contradict each other.
+    pub fn shard_quota_in(&self, now: SystemTime, region: &str) -> (i32, i32) {
+        let open = self.open_shards_held_in(now, region);
+        let region_ceiling = i32::try_from(MAX_SHARDS_PER_REGION).unwrap_or(i32::MAX);
+        let store_ceiling = i32::try_from(MAX_SHARDS_TOTAL).unwrap_or(i32::MAX);
+        let held = i32::try_from(self.shards_held(now)).unwrap_or(i32::MAX);
+        // What the account may still open here: the room under its own quota, and never
+        // more room than the store has left anywhere.
+        let room = region_ceiling
+            .saturating_sub(open)
+            .min(store_ceiling.saturating_sub(held))
+            .max(0);
+        (open.saturating_add(room), open)
     }
 
     /// The channel `region`'s endpoint holds under `name`, if any — the lookup a create
@@ -2435,6 +2442,37 @@ fn record_encryption_change(instants: &mut Vec<SystemTime>, at: SystemTime) {
 pub fn stream_on_demand_message(stream_name: &str) -> String {
     format!(
         "Request is invalid. Stream {stream_name} under account {} is in On-Demand mode.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How a request that would take an account and region past its shard quota is refused —
+/// the message AWS answers `LimitExceededException` with for a request that would "create
+/// more shards than are authorized for your account" (`CreateStream`) or "scale up to more
+/// than the shard limit for your account" (`UpdateShardCount`).
+///
+/// Built FROM the request and the store: the account this emulator serves, the region the
+/// request was signed for, the usage and the quota `DescribeLimits` reports at that instant
+/// ([`ComAmazonawsKinesisKinesis20131202State::shard_quota_in`]), and the shards the
+/// refused request would have laid
+/// down — so a caller can compute a size that fits from the refusal alone.
+///
+/// ONE sentence for the one rule: `CreateStream`, `UpdateShardCount`, `SplitShard` and
+/// `MergeShards` all open shards against that one quota, so they refuse it identically
+/// rather than each wording it.
+pub fn shard_limit_exceeded_message(
+    region: &str,
+    open_shard_count: i32,
+    shard_limit: i32,
+    additional_shards: i32,
+) -> String {
+    format!(
+        "This request would exceed the shard limit for the account {} in {region}. Current \
+         shard count for the account: {open_shard_count}. Limit: {shard_limit}. Number of \
+         additional shards that would have resulted from this request: {additional_shards}. \
+         Refer to the AWS Service Limits page \
+         (http://docs.aws.amazon.com/general/latest/gr/aws_service_limits.html) for current \
+         limits and how to request higher limits.",
         ::engine::emulator_account_id()
     )
 }
@@ -3163,17 +3201,20 @@ pub fn shard_id(index: u32) -> String {
 ///
 /// The map is one entry per shard, so the count is bounded HERE, at the allocation, and not
 /// only by the callers: every operation that lays down or re-tiles a shard map refuses a
-/// count past [`MAX_SHARDS_PER_STREAM`] with a modelled error before it reaches this
-/// function, and the clamp below keeps the allocation bounded whatever asks for it.
+/// count past the account and region's shard quota
+/// ([`ComAmazonawsKinesisKinesis20131202State::shard_quota_in`], which
+/// never reports more than [`MAX_SHARDS_PER_REGION`]) with a modelled error before it
+/// reaches this function, and the clamp below keeps the allocation bounded whatever asks
+/// for it.
 pub fn hash_key_ranges(shard_count: u32) -> Vec<(String, String)> {
     // Every caller refuses a larger count with a modelled error, so reaching here with one
     // is a caller bug rather than a request this function may answer: it is caught in a
     // debug build, and the clamp keeps the allocation bounded in a release build.
     debug_assert!(
-        shard_count <= MAX_SHARDS_PER_STREAM,
-        "a shard map is laid down for at most {MAX_SHARDS_PER_STREAM} shards"
+        shard_count <= MAX_SHARDS_PER_REGION,
+        "a shard map is laid down for at most {MAX_SHARDS_PER_REGION} shards"
     );
-    let shards = u128::from(shard_count.clamp(1, MAX_SHARDS_PER_STREAM));
+    let shards = u128::from(shard_count.clamp(1, MAX_SHARDS_PER_REGION));
     // 2^128 is one past `u128::MAX`, so the quotient and remainder of the division by the
     // shard count are taken against `u128::MAX` and the remainder carried back by one.
     let quotient = u128::MAX / shards;

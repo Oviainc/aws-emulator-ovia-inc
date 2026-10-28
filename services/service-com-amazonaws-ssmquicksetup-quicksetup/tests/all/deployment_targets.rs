@@ -9,8 +9,8 @@
 //! The rule under test: a configuration definition names where it is deployed through
 //! its `Parameters`, and the service deploys ONE configuration per targeted account and
 //! Region pair — the cross product of the accounts `TargetAccounts` names (the account
-//! this emulator serves when it names none) and the Regions `TargetRegions` names (the
-//! manager's own Region when it names none) — and each deployed configuration reports
+//! this emulator serves when it names none) and the Regions `TargetRegions` names — and
+//! each deployed configuration reports
 //! that pair as its `Account` and `Region` and is individually readable by the id the
 //! service generated for it. An update that changes those parameters changes the
 //! deployed set the same way.
@@ -25,7 +25,7 @@ use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for: the Region a created manager owns, and so
-/// the Region a definition naming no `TargetRegions` deploys in.
+/// the only Region whose endpoint serves it.
 const REGION: &str = "us-west-2";
 
 /// A configuration type the service publishes (`ListQuickSetupTypes`), so every create
@@ -315,7 +315,7 @@ type TargetCase = (&'static str, Value, Vec<(String, String)>);
 /// A create deploys one configuration per targeted account and Region pair.
 ///
 /// Each row differs along what the rule generalises over: how many Regions are
-/// targeted, how many accounts, whether the Regions are named at all, how the
+/// targeted, how many accounts, how the
 /// comma-separated list is written (padding, empty entries, repeats), and whether the
 /// accounts are named through `TargetAccounts` or left to the organizational units a
 /// definition may target instead.
@@ -329,8 +329,8 @@ async fn a_definition_deploys_one_configuration_per_targeted_account_and_region(
     // (case, the definition's Parameters, the (account, Region) pairs it must deploy to)
     let cases: Vec<TargetCase> = vec![
         (
-            "no target Region at all",
-            json!({ "TargetOrganizationalUnits": "ou-1" }),
+            "one targeted region named by the Region the request was signed for",
+            json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": REGION }),
             vec![(local.clone(), REGION.to_string())],
         ),
         (
@@ -373,8 +373,8 @@ async fn a_definition_deploys_one_configuration_per_targeted_account_and_region(
             ],
         ),
         (
-            "one targeted account, no targeted region",
-            json!({ "TargetAccounts": &other }),
+            "one targeted account in one region",
+            json!({ "TargetAccounts": &other, "TargetRegions": REGION }),
             vec![(other.clone(), REGION.to_string())],
         ),
         (
@@ -485,8 +485,8 @@ async fn an_update_redeploys_the_definition_to_exactly_the_targets_it_now_names(
             ],
         ),
         (
-            "no target Region at all, back to the manager's own region",
-            json!({ "TargetOrganizationalUnits": "ou-1" }),
+            "back to one region, in the Region the manager lives in",
+            json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": REGION }),
             vec![(local.clone(), REGION.to_string())],
         ),
     ];
@@ -609,34 +609,54 @@ async fn a_target_the_update_still_names_keeps_its_configuration_id() {
 async fn a_target_account_that_is_not_an_account_id_is_refused() {
     let router = emulator();
     // Rows span the ways the value can miss the 12-digit account-id form, plus the two
-    // accepted shapes: one id, and a comma-separated list of them.
+    // accepted shapes: one id, and a comma-separated list of them. Every row names the
+    // Region to deploy into, which every accepted definition must, so a row is refused
+    // only for the reason under test.
     let cases: Vec<(&str, Value, u16)> = vec![
-        ("one account id", json!({ "TargetAccounts": "111122223333" }), 200),
+        (
+            "one account id",
+            json!({ "TargetAccounts": "111122223333", "TargetRegions": "us-east-1" }),
+            200,
+        ),
         (
             "two account ids",
-            json!({ "TargetAccounts": "111122223333,444455556666" }),
+            json!({
+                "TargetAccounts": "111122223333,444455556666",
+                "TargetRegions": "us-east-1",
+            }),
             200,
         ),
         (
             "an account id with padding",
-            json!({ "TargetAccounts": " 111122223333 " }),
+            json!({ "TargetAccounts": " 111122223333 ", "TargetRegions": "us-east-1" }),
             200,
         ),
-        ("too few digits", json!({ "TargetAccounts": "11112222333" }), 400),
         (
-            "too many digits",
-            json!({ "TargetAccounts": "1111222233334" }),
+            "too few digits",
+            json!({ "TargetAccounts": "11112222333", "TargetRegions": "us-east-1" }),
             400,
         ),
-        ("not digits at all", json!({ "TargetAccounts": "my-account" }), 400),
+        (
+            "too many digits",
+            json!({ "TargetAccounts": "1111222233334", "TargetRegions": "us-east-1" }),
+            400,
+        ),
+        (
+            "not digits at all",
+            json!({ "TargetAccounts": "my-account", "TargetRegions": "us-east-1" }),
+            400,
+        ),
         (
             "an account alias beside a valid id",
-            json!({ "TargetAccounts": "111122223333,my-account" }),
+            json!({
+                "TargetAccounts": "111122223333,my-account",
+                "TargetRegions": "us-east-1",
+            }),
             400,
         ),
         (
             "an organizational unit named as an account",
-            json!({ "TargetAccounts": "ou-1234-56789012" }),
+            json!({ "TargetAccounts": "ou-1234-56789012", "TargetRegions": "us-east-1" }),
             400,
         ),
     ];
@@ -981,7 +1001,10 @@ async fn an_update_whose_targets_outgrow_the_store_is_refused() {
         .map(|index| {
             json!({
                 "Type": TYPE,
-                "Parameters": { "TargetOrganizationalUnits": format!("ou-{}", index + 2) },
+                "Parameters": {
+                    "TargetOrganizationalUnits": format!("ou-{}", index + 2),
+                    "TargetRegions": "us-east-1",
+                },
             })
         })
         .collect();
@@ -1001,7 +1024,7 @@ async fn an_update_whose_targets_outgrow_the_store_is_refused() {
         &router,
         case,
         "subject",
-        &json!({ "TargetOrganizationalUnits": "ou-subject" }),
+        &json!({ "TargetOrganizationalUnits": "ou-subject", "TargetRegions": "us-east-1" }),
     )
     .await;
     let id = definition_id(&router, case, &subject).await;

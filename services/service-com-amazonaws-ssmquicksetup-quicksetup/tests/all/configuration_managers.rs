@@ -212,17 +212,22 @@ async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Str
 
 /// The minimum a create needs: one definition whose `Type` satisfies the modelled
 /// `^[a-zA-Z0-9_\-.:/]{3,200}$` pattern and whose `Parameters` name somewhere to deploy
-/// to.
+/// to and the Regions to deploy into.
 ///
 /// A definition that names neither the accounts nor the organizational units to deploy
-/// to is refused, and no case here is about that rule, so the organizational unit is
-/// added wherever the row's own `parameters` leave it out — which leaves the accounts
-/// the definition fans out to exactly what those parameters name.
+/// to is refused, and so is one that names no Regions to deploy into; no case here is
+/// about either rule, so the organizational unit and [`REGION`] — the Region every
+/// request below signs for — are added wherever the row's own `parameters` leave them
+/// out, which leaves the accounts and the Regions the definition fans out to exactly
+/// what those parameters name.
 fn definition(type_: &str, parameters: Value) -> Value {
     let mut parameters = parameters.as_object().cloned().unwrap_or_default();
     parameters
         .entry("TargetOrganizationalUnits".to_string())
         .or_insert_with(|| json!("ou-1"));
+    parameters
+        .entry("TargetRegions".to_string())
+        .or_insert_with(|| json!(REGION));
     json!({ "Type": type_, "Parameters": Value::Object(parameters) })
 }
 
@@ -440,6 +445,7 @@ async fn a_created_manager_is_read_back_exactly_as_it_was_stored() {
                     "Parameters": {
                         "SelectedAggregatorRegion": "us-west-2",
                         "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": "us-west-2",
                     },
                     "TypeVersion": "1.1",
                     "LocalDeploymentExecutionRoleName": "QuickSetupExecRole",
@@ -943,6 +949,7 @@ async fn the_configuration_listing_reports_one_record_per_deployed_target() {
                     "Type": "AWSQuickSetupType-Scheduler",
                     "Parameters": {
                         "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": REGION,
                         "TargetTagKey": "Env",
                     },
                     "TypeVersion": "2.0",
@@ -975,8 +982,8 @@ async fn the_configuration_listing_reports_one_record_per_deployed_target() {
     assert_eq!(first_ids.len(), 2, "got {first_ids:?}");
 
     // (case, request, the (ManagerArn, ConfigurationDefinitionId, Region) rows it must
-    // report) — the first definition targets us-east-1, the other two name no Region,
-    // so they deploy in the manager's own.
+    // report) — the first definition targets us-east-1, the other two target the Region
+    // the requests are signed for.
     type ListingCase = (&'static str, Value, Vec<(String, String, String)>);
     let targeted = "us-east-1".to_string();
     let local = REGION.to_string();
@@ -1614,6 +1621,7 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
                     "Parameters": {
                         "SelectedAggregatorRegion": "us-west-2",
                         "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": "us-west-2",
                     },
                     "TypeVersion": "1.1",
                     "LocalDeploymentExecutionRoleName": "QuickSetupExecRole",

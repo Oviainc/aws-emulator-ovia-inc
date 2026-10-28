@@ -197,9 +197,14 @@ fn invalid_argument(message: String) -> SplitShardError {
     .into()
 }
 
+/// How many shards a split lays down: "Splits a shard into two new shards in the Kinesis
+/// data stream" (`SplitShard`), so an accepted call adds two shard records to the store and
+/// is counted against the account's shard quota by that number.
+const SPLIT_CHILDREN: i32 = 2;
+
 /// Refuse the request because serving it would take the stream past one of this operation's
-/// documented limits, or this emulator past a ceiling it keeps on itself: "the requested
-/// resource exceeds the maximum number allowed" (`LimitExceededException`).
+/// documented limits, or the account past its shard quota: "the requested resource exceeds
+/// the maximum number allowed" (`LimitExceededException`).
 fn limit_exceeded(message: String) -> SplitShardError {
     SplitShardErrorModeled::LimitExceededException(LimitExceededException {
         message: Some(message),
@@ -247,12 +252,11 @@ fn split_shard(
     now: ::std::time::SystemTime,
     input: &SplitShardInput,
 ) -> Result<(), SplitShardError> {
-    // The emulator's own ceilings are counted across the whole store, so they are read
+    // The account and region's shard quota is counted across the whole store, so it is read
     // BEFORE the stream is borrowed for writing: the two children this call lays down are
     // two more shard records beside the ones the store already holds, since the shard it
     // closes keeps the records written to it.
-    let shards_in_region = store.shards_held_in(now, region);
-    let shards_held = store.shards_held(now);
+    let (shard_limit, open_shard_count) = store.shard_quota_in(now, region);
 
     let identifier = stream_identifier(input).to_string();
     let stream = store
@@ -346,27 +350,16 @@ fn split_shard(
         ));
     }
 
-    // The store is bounded, so a split past a ceiling is refused rather than grown into.
-    let open_after = stream.open_shard_count().saturating_add(1);
-    if u32::try_from(open_after).unwrap_or(u32::MAX) > crate::state::MAX_SHARDS_PER_STREAM {
-        return Err(limit_exceeded(format!(
-            "a stream of {open_after} open shards exceeds the {} shards one stream of this \
-             emulator may hold",
-            crate::state::MAX_SHARDS_PER_STREAM
-        )));
-    }
-    if shards_in_region.saturating_add(2) > crate::state::MAX_SHARDS_PER_REGION {
-        return Err(limit_exceeded(format!(
-            "this region holds {shards_in_region} shards, and two more would exceed the {} \
-             shards authorized for this account and region",
-            crate::state::MAX_SHARDS_PER_REGION
-        )));
-    }
-    if shards_held.saturating_add(2) > crate::state::MAX_SHARDS_TOTAL {
-        return Err(limit_exceeded(format!(
-            "this emulator already holds {shards_held} of the maximum of {} shards across \
-             every region; delete a stream before resharding another",
-            crate::state::MAX_SHARDS_TOTAL
+    // "If you try to create more shards than are authorized for your account, you receive a
+    // LimitExceededException" (`SplitShard`): the two children this split lays down are
+    // counted against the room left under the quota `DescribeLimits` publishes for this
+    // account and region, and a split past it is refused rather than grown into.
+    if open_shard_count.saturating_add(SPLIT_CHILDREN) > shard_limit {
+        return Err(limit_exceeded(crate::state::shard_limit_exceeded_message(
+            region,
+            open_shard_count,
+            shard_limit,
+            SPLIT_CHILDREN,
         )));
     }
 

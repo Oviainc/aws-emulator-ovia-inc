@@ -2956,7 +2956,16 @@ pub struct Satellite {
     /// The ground stations this satellite is on-boarded to, each a `GroundStationName`.
     pub ground_stations: Vec<String>,
     /// The ephemeris currently used to compute this satellite's trajectory, once one is
-    /// known for it. An onboarding carries none until an ephemeris is stored.
+    /// known for it — what `GetSatellite` and `ListSatellites` report as
+    /// `currentEphemeris`.
+    ///
+    /// Materialised by
+    /// [`ComAmazonawsGroundstationGroundstationState::refresh_current_ephemerides`] from
+    /// the ephemerides this account holds for the satellite: the one in force supersedes
+    /// whatever default ephemeris the onboarding carried, and the default comes back when
+    /// the account holds none in force. An onboarding carries none, because a default
+    /// comes from outside this API (AWS computes one from Space Track) and this emulator
+    /// has no such source, so a satellite knows no ephemeris until one is stored for it.
     pub current_ephemeris: Option<EphemerisMetaData>,
 }
 
@@ -3102,6 +3111,51 @@ pub const MIN_EPHEMERIS_PRIORITY: i32 = 1;
 /// neither has not asked to enable it, and the ephemeris validates to
 /// [`EPHEMERIS_DISABLED`]. `UpdateEphemeris` then enables it, where `enabled` is required.
 pub const EPHEMERIS_ENABLED_BY_DEFAULT: bool = false;
+
+/// The `EphemerisSource` of an ephemeris this account supplied itself: a value of the
+/// model's own `EphemerisSource` enum, whose members are `CUSTOMER_PROVIDED` and
+/// `SPACE_TRACK` (`smithy_query(query="shape", shape="EphemerisSource")`). The other
+/// value belongs to the default ephemeris AWS generates from Space Track, which no
+/// request of this API creates.
+pub const EPHEMERIS_SOURCE_CUSTOMER_PROVIDED: &str = "CUSTOMER_PROVIDED";
+
+/// How a satellite reports `ephemeris`, one this account supplied, as the ephemeris its
+/// trajectory is computed from.
+///
+/// Each member follows what the model documents for it (`smithy_query(query="shape",
+/// shape="EphemerisMetaData")`): `ephemerisId` is the "UUID of a customer-provided
+/// ephemeris", `name` is the human-readable identifier the create named, and `epoch` is
+/// "the epoch of a default, ephemeris from Space Track" which "is not populated for
+/// customer-provided ephemerides".
+pub fn customer_ephemeris_metadata(ephemeris: &Ephemeris) -> EphemerisMetaData {
+    EphemerisMetaData {
+        source: EPHEMERIS_SOURCE_CUSTOMER_PROVIDED.to_string(),
+        ephemeris_id: Some(ephemeris.ephemeris_id.clone()),
+        epoch: None,
+        name: Some(ephemeris.name.clone()),
+    }
+}
+
+/// The ephemeris of two held for the same satellite that its trajectory is computed from:
+/// [`::std::cmp::Ordering::Greater`] when `left` takes precedence over `right`.
+///
+/// The highest `priority` wins: "A priority score that determines which ephemeris to use
+/// when multiple ephemerides overlap. Higher numbers take precedence."
+/// (`smithy_query(query="doc", shape="CreateEphemerisRequest", member="priority")`).
+///
+/// The tie-breaks are CHOSEN, so the answer is total and stable whatever order the store
+/// iterates in: of equal priority the most recently created wins (the later upload is the
+/// newer trajectory), and of equal creation instant the larger `ephemerisId`.
+fn ephemeris_precedence(left: &Ephemeris, right: &Ephemeris) -> ::std::cmp::Ordering {
+    left.priority
+        .cmp(&right.priority)
+        .then_with(|| {
+            left.creation_time
+                .as_secs_f64()
+                .total_cmp(&right.creation_time.as_secs_f64())
+        })
+        .then_with(|| left.ephemeris_id.cmp(&right.ephemeris_id))
+}
 
 /// Which `EphemerisType` an `EphemerisData` union member selects.
 ///
@@ -4570,18 +4624,66 @@ impl ComAmazonawsGroundstationGroundstationState {
         let removed = self.ephemerides.remove(ephemeris_id)?;
         self.arn_index.remove(&removed.ephemeris_arn);
         // A satellite reports the ephemeris its trajectory is computed from; a deleted one
-        // is no longer that, so the reference goes with it rather than being left dangling.
-        for satellite in self.satellites.values_mut() {
-            if satellite
-                .current_ephemeris
-                .as_ref()
-                .and_then(|metadata| metadata.ephemeris_id.as_deref())
-                == Some(ephemeris_id)
-            {
-                satellite.current_ephemeris = None;
+        // is no longer that, so the reference goes with it rather than being left dangling
+        // — and whichever ephemeris the account still holds for that satellite takes over.
+        self.refresh_current_ephemerides();
+        Some(removed)
+    }
+
+    /// Materialise, on every satellite this account is on-boarded to, the ephemeris its
+    /// trajectory is computed from — what a satellite read reports as its
+    /// `currentEphemeris`.
+    ///
+    /// A reporting operation calls this before reading a satellite: the value is derived
+    /// from the ephemerides this store already holds, so recomputing it changes nothing a
+    /// later caller could otherwise have seen. Callers that depend on an ephemeris status
+    /// the clock has already made due call [`Self::settle_due_ephemerides`] first.
+    ///
+    /// An ephemeris is in force for the satellite it was stored against once it is
+    /// [`EPHEMERIS_ENABLED`] — the status of one whose data validated and which the
+    /// account asked to be used, where every other status an ephemeris can hold is one no
+    /// trajectory is computed from (still validating, kept disabled, failed validation, or
+    /// expired) — and the one of highest precedence takes the satellite
+    /// ([`ephemeris_precedence`]).
+    ///
+    /// An ephemeris in force supersedes whatever default ephemeris the onboarding knows
+    /// (AWS generates one from Space Track outside this API), so a default is left alone
+    /// here and only a customer-provided reference is dropped — which is how a satellite
+    /// falls back to its default once the account holds nothing in force for it.
+    pub fn refresh_current_ephemerides(&mut self) {
+        // ONE pass over the ephemerides, keyed by the satellite each is held for, so the
+        // work is linear in the store rather than a scan of it per satellite.
+        let mut in_force: HashMap<&str, &Ephemeris> = HashMap::new();
+        for ephemeris in self.ephemerides.values() {
+            let Some(satellite_id) = ephemeris.satellite_id.as_deref() else {
+                continue;
+            };
+            if ephemeris.status != EPHEMERIS_ENABLED {
+                continue;
+            }
+            let takes_over = in_force.get(satellite_id).is_none_or(|held| {
+                ephemeris_precedence(ephemeris, held) == ::std::cmp::Ordering::Greater
+            });
+            if takes_over {
+                in_force.insert(satellite_id, ephemeris);
             }
         }
-        Some(removed)
+
+        for satellite in self.satellites.values_mut() {
+            match in_force.get(satellite.satellite_id.as_str()) {
+                Some(ephemeris) => {
+                    satellite.current_ephemeris = Some(customer_ephemeris_metadata(ephemeris));
+                }
+                None => {
+                    let customer_provided = satellite.current_ephemeris.as_ref().is_some_and(
+                        |metadata| metadata.source == EPHEMERIS_SOURCE_CUSTOMER_PROVIDED,
+                    );
+                    if customer_provided {
+                        satellite.current_ephemeris = None;
+                    }
+                }
+            }
+        }
     }
 
     /// Materialise every `creating` -> `created` endpoint move the clock has already made

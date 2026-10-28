@@ -195,12 +195,16 @@ async fn create(
 ) -> (u16, Value) {
     // `Type` must name a configuration type this service publishes; the catalog's first
     // entry is the one every case here deploys, since no case is about the type. Its
-    // parameters name somewhere to deploy to, which every accepted definition must.
+    // parameters name somewhere to deploy to and the Region to deploy into, which every
+    // accepted definition must.
     let body = json!({
         "Name": name,
         "ConfigurationDefinitions": [{
             "Type": QUICK_SETUP_TYPE_CATALOG[0].type_,
-            "Parameters": { "TargetOrganizationalUnits": "ou-1" },
+            "Parameters": {
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": "us-east-1",
+            },
         }],
         "Tags": tag_object(tags),
     });

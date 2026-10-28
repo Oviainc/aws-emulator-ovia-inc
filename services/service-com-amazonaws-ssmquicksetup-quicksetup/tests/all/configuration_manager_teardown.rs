@@ -129,17 +129,21 @@ fn label(value: &str) -> String {
 }
 
 /// The minimum a create needs: one definition whose `Type` the service publishes and
-/// whose `Parameters` name somewhere to deploy to.
+/// whose `Parameters` name somewhere to deploy to and the Regions to deploy into.
 ///
 /// A definition that names neither the accounts nor the organizational units to deploy
-/// to is refused, and no case here is about that rule, so the organizational unit is
-/// added wherever the row's own `parameters` leave it out — which leaves the accounts
+/// to is refused, and so is one that names no Regions to deploy into; no case here is
+/// about either rule, so the organizational unit and the Region are added wherever the
+/// row's own `parameters` leave them out — which leaves the accounts and the Regions
 /// the definition fans out to exactly what those parameters name.
 fn definition(type_: &str, parameters: Value) -> Value {
     let mut parameters = parameters.as_object().cloned().unwrap_or_default();
     parameters
         .entry("TargetOrganizationalUnits".to_string())
         .or_insert_with(|| json!("ou-1"));
+    parameters
+        .entry("TargetRegions".to_string())
+        .or_insert_with(|| json!("us-east-1"));
     json!({ "Type": type_, "Parameters": Value::Object(parameters) })
 }
 

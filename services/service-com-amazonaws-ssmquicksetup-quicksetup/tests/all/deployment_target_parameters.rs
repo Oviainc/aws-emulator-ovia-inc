@@ -21,7 +21,7 @@ use service_com_amazonaws_ssmquicksetup_quicksetup::state::MAX_DEPLOYMENT_TARGET
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for: the Region a created manager owns, and so
-/// the Region a definition naming no `TargetRegions` deploys in.
+/// the only Region whose endpoint serves it.
 const REGION: &str = "us-west-2";
 
 /// A configuration type the service publishes (`ListQuickSetupTypes`), so every create
@@ -292,7 +292,8 @@ type ParameterCase = (&'static str, Value, Expected);
 /// The table: parameter maps spanning what the rule generalises over — whether each
 /// target key is present at all, how many entries it names, how the comma-separated
 /// value is written (padding, empty entries, repeats), a parameter map that names no
-/// deployment target at all, a target set outside what may be deployed, the deployment
+/// deployment target at all, one that names no Region to deploy into, a target set
+/// outside what may be deployed, the deployment
 /// bound itself (at it and one past it), and a target list far longer than that bound.
 fn cases(local: &str) -> Vec<ParameterCase> {
     let other = "111122223333".to_string();
@@ -313,7 +314,7 @@ fn cases(local: &str) -> Vec<ParameterCase> {
         (
             "only the organizational units, no Region",
             json!({ "TargetOrganizationalUnits": "ou-1" }),
-            Expected::Targets(vec![(local.to_string(), REGION.to_string())]),
+            Expected::Refused,
         ),
         (
             "one targeted Region, the accounts left to the organizational units",
@@ -323,6 +324,11 @@ fn cases(local: &str) -> Vec<ParameterCase> {
         (
             "one targeted account, no Region",
             json!({ "TargetAccounts": &other }),
+            Expected::Refused,
+        ),
+        (
+            "one targeted account in one Region",
+            json!({ "TargetAccounts": &other, "TargetRegions": REGION }),
             Expected::Targets(vec![(other.clone(), REGION.to_string())]),
         ),
         (
@@ -361,7 +367,7 @@ fn cases(local: &str) -> Vec<ParameterCase> {
         ),
         (
             "an account that is not an account id",
-            json!({ "TargetAccounts": "my-account" }),
+            json!({ "TargetAccounts": "my-account", "TargetRegions": "eu-west-1" }),
             Expected::Refused,
         ),
         (
@@ -392,6 +398,7 @@ fn cases(local: &str) -> Vec<ParameterCase> {
                     accounts(MAX_DEPLOYMENT_TARGETS * 2),
                     accounts(1)
                 ),
+                "TargetRegions": "eu-west-1",
             }),
             Expected::Refused,
         ),
