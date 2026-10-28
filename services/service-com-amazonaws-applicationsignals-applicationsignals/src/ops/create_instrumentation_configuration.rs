@@ -217,7 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The model cannot express "this member is only supported for one value of that
         // one", nor a window measured from the time of the request, so both parts of the
         // documented `ExpiresAt` rule are enforced here and refused with 400 rather than
-        // silently coerced.
+        // silently coerced — worded, like the location rule below, by the service's one
+        // constraint-violation builder, so each refusal names the member the request must fix.
         let expires_at = crate::state::requested_expiry(
             &input.instrumentation_type,
             input.expires_at.as_ref(),

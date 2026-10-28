@@ -196,7 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
 
         // The model cannot express "both of these members or neither", so the documented
-        // pairing is enforced here and refused with 400 rather than read as half a window.
+        // pairing is enforced here and refused with 400 rather than read as half a window —
+        // worded, like the location rule below, by the service's one constraint-violation
+        // builder, so it names the member the request must fix.
         let requested_window = crate::state::status_event_window(
             input.start_time.as_ref(),
             input.end_time.as_ref(),

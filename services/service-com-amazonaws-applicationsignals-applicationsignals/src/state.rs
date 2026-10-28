@@ -3645,12 +3645,39 @@ pub fn instrumentation_status_token_tag(
     format!("{INSTRUMENTATION_STATUS_EVENTS_TOKEN_TAG}{fingerprint}/")
 }
 
+/// The member path a refusal of the status window's start names, spelled the way the boundary
+/// validator spells a member path for this service — lower camel case, as the refusal of a
+/// modelled constraint on a member of the same operation spells it.
+const START_TIME_MEMBER_PATH: &str = "startTime";
+
+/// [`START_TIME_MEMBER_PATH`] for the member that closes the window.
+const END_TIME_MEMBER_PATH: &str = "endTime";
+
+/// The refusal a request earns for naming ONE member of a pair whose documented rule is both
+/// or neither: the clause names the member that is MISSING — the one the request must add —
+/// and the sibling whose presence is what requires it.
+///
+/// Worded through the service's one constraint-violation builder, in the form an absent member
+/// is stated in ([`absent_member_clause`]) plus the condition the model cannot express, so a
+/// conditionally required member reads like an unconditionally required one.
+fn paired_member_refusal(absent_member_path: &str, present_member_path: &str) -> String {
+    validation_envelope(&[constraint_clause(
+        absent_member_path,
+        &format!("Member must not be null when {present_member_path} is provided"),
+    )])
+}
+
 /// The window a status read covers: the one the request names, or the documented default.
 ///
 /// `StartTime` and `EndTime` "must both be provided together or both be omitted", and "when
 /// both are omitted, the time range defaults to the last hour" — so a request naming exactly
 /// one of them names no window, and neither does one whose window ends before it begins.
 /// `Err` carries the refusal such a request earns.
+///
+/// Both refusals are worded through the service's one constraint-violation builder
+/// ([`constraint_clause`], under [`validation_envelope`]), so a constraint the model cannot
+/// express and is therefore enforced here names its member path and its requirement exactly
+/// as a modelled constraint refused at the boundary does.
 pub fn status_event_window(
     start: Option<&DateTime>,
     end: Option<&DateTime>,
@@ -3673,10 +3700,23 @@ pub fn status_event_window(
         {
             Ok((*start, *end))
         }
-        (Some(_), Some(_)) => Err("EndTime must not be earlier than StartTime".to_string()),
-        _ => Err(
-            "StartTime and EndTime must both be provided together or both be omitted".to_string(),
-        ),
+        // A window runs forwards, so the member at fault is the one that closes it, and the
+        // bound it violated is the member that opens it.
+        (Some(_), Some(_)) => Err(validation_envelope(&[constraint_clause(
+            END_TIME_MEMBER_PATH,
+            &format!(
+                "Member must have value greater than or equal to the value of \
+                 {START_TIME_MEMBER_PATH}"
+            ),
+        )])),
+        (Some(_), None) => Err(paired_member_refusal(
+            END_TIME_MEMBER_PATH,
+            START_TIME_MEMBER_PATH,
+        )),
+        (None, Some(_)) => Err(paired_member_refusal(
+            START_TIME_MEMBER_PATH,
+            END_TIME_MEMBER_PATH,
+        )),
     }
 }
 
@@ -4207,6 +4247,10 @@ pub fn without_service_env(
     }
 }
 
+/// The member path a refusal of the `ExpiresAt` rule names, spelled the way the boundary
+/// validator spells a member path for this service ([`START_TIME_MEMBER_PATH`]).
+const EXPIRES_AT_MEMBER_PATH: &str = "expiresAt";
+
 /// The `ExpiresAt` a create stores for an `InstrumentationType`, or `Err` with the refusal
 /// the request earns.
 ///
@@ -4218,6 +4262,12 @@ pub fn without_service_env(
 ///
 /// The window is measured from the instant the create is served, which is what makes the
 /// stored expiry a lifetime rather than a wall-clock instant the caller may pick freely.
+///
+/// Every refusal is worded through the service's one constraint-violation builder
+/// ([`constraint_clause`], under [`validation_envelope`]), like the conditional requirement on
+/// the location this same create enforces beside it: a constraint the model cannot express
+/// names its member path and its requirement exactly as a modelled one refused at the
+/// boundary does.
 pub fn requested_expiry(
     instrumentation_type: &str,
     requested: Option<&DateTime>,
@@ -4225,10 +4275,15 @@ pub fn requested_expiry(
 ) -> Result<Option<DateTime>, String> {
     if instrumentation_type != INSTRUMENTATION_TYPE_BREAKPOINT {
         return match requested {
-            Some(_) => Err(format!(
-                "ExpiresAt is not supported for {instrumentation_type} instrumentation \
-                 configurations, which persist until they are explicitly deleted"
-            )),
+            // The type is taken from the REQUEST rather than from the constant, so the clause
+            // states the type the rule fired on whichever type it fires for.
+            Some(_) => Err(validation_envelope(&[constraint_clause(
+                EXPIRES_AT_MEMBER_PATH,
+                &format!(
+                    "Member must be null for a {instrumentation_type} instrumentation \
+                     configuration"
+                ),
+            )])),
             None => Ok(None),
         };
     }
@@ -4238,17 +4293,34 @@ pub fn requested_expiry(
     };
 
     let lifetime = instant_nanos(requested).saturating_sub(instant_nanos(now));
-    if lifetime < duration_nanos(BREAKPOINT_MIN_EXPIRY)
-        || lifetime > duration_nanos(BREAKPOINT_MAX_EXPIRY)
-    {
-        return Err(format!(
-            "ExpiresAt must be between {} and {} seconds after the time of the request for \
-             {INSTRUMENTATION_TYPE_BREAKPOINT} instrumentation configurations",
+    // The two ends of the window are stated separately, each as the bound it violated, the
+    // way the boundary validator states a minimum and a maximum.
+    if lifetime < duration_nanos(BREAKPOINT_MIN_EXPIRY) {
+        return Err(expiry_window_refusal(
+            "greater than or equal to",
             BREAKPOINT_MIN_EXPIRY.as_secs(),
+        ));
+    }
+    if lifetime > duration_nanos(BREAKPOINT_MAX_EXPIRY) {
+        return Err(expiry_window_refusal(
+            "less than or equal to",
             BREAKPOINT_MAX_EXPIRY.as_secs(),
         ));
     }
     Ok(Some(*requested))
+}
+
+/// The refusal an `ExpiresAt` outside the documented lifetime window earns: the bound it
+/// violated, in seconds from the time of the request, worded through the service's one
+/// constraint-violation builder.
+fn expiry_window_refusal(comparison: &str, bound_secs: u64) -> String {
+    validation_envelope(&[constraint_clause(
+        EXPIRES_AT_MEMBER_PATH,
+        &format!(
+            "Member must have value {comparison} {bound_secs} seconds after the time of the \
+             request"
+        ),
+    )])
 }
 
 /// The modelled `ConflictException` for a create that names a configuration already stored.
