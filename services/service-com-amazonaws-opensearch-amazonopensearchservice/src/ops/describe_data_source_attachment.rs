@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attachment to report.
         let application = store.applications.get(&input.id).ok_or_else(|| {
             DescribeDataSourceAttachmentErrorModeled::ResourceNotFoundException(
-                application_not_found(&input.id),
+                application_not_found(),
             )
         })?;
 

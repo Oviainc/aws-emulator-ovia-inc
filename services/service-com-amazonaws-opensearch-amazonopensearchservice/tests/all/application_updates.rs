@@ -30,7 +30,7 @@
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    APPLICATION_STATUS_ACTIVE, APPLICATION_STATUS_CREATING,
+    APPLICATION_DOES_NOT_EXIST, APPLICATION_STATUS_ACTIVE, APPLICATION_STATUS_CREATING,
 };
 
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -635,8 +635,8 @@ async fn an_update_of_an_id_that_names_no_application_is_refused() {
         );
         assert_eq!(
             refused.body["message"],
-            json!(format!("Application not found: {id}")),
-            "case {id}: the refusal names the id it could not resolve, got {:?}",
+            json!(APPLICATION_DOES_NOT_EXIST),
+            "case {id}: the refusal states that the account holds no such application, got {:?}",
             refused.body
         );
 

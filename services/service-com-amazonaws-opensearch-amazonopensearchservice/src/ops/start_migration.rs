@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // naming no application of this account names nothing to migrate into.
         if !store.applications.contains_key(&input.application_id) {
             return Err(StartMigrationErrorModeled::ResourceNotFoundException(
-                application_not_found(&input.application_id),
+                application_not_found(),
             )
             .into());
         }

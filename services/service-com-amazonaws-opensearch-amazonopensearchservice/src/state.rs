@@ -1210,14 +1210,18 @@ pub const APPLICATION_STATUS_CREATING: &str = "CREATING";
 /// `ApplicationStatus`'s `ACTIVE` value: the application is up and can be used.
 pub const APPLICATION_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// `ApplicationStatus`'s `DELETING` value: the application's removal has been asked
+/// for and is being carried out.
+pub const APPLICATION_STATUS_DELETING: &str = "DELETING";
+
 /// How many OpenSearch UI applications this account holds before
 /// `CreateApplication` refuses to mint another.
 ///
 /// Like [`DOMAIN_QUOTA`] this is the emulator's OWN bound on the store — it models
 /// neither Service Quotas nor an account's adjustments — and it is what stops a caller
 /// looping with fresh names from growing the state without end: every record it counts
-/// is released when the application is deleted, which is `DeleteApplication`'s to do
-/// once that operation is written.
+/// is released when the delete that asked for its removal completes
+/// ([`Application::begin_deletion`]).
 pub const APPLICATION_QUOTA: usize = 100;
 
 /// One OpenSearch UI application of this account, as this emulator persists it.
@@ -1275,6 +1279,14 @@ pub struct Application {
     /// When the application was last changed — the creation instant for one no call
     /// has changed since.
     pub last_updated_at: SystemTime,
+    /// The instant this application's record is gone, set by the delete that asked for
+    /// its removal and absent on one nothing has asked to remove.
+    ///
+    /// A delete does not take the record away where it stands: the application rests
+    /// in its deleting status, and what the clock owes it is its removal — the same
+    /// shape as the status moves [`OwedStatus`] carries, for a move whose outcome is
+    /// that the account holds no such application at all.
+    pub removal_due: Option<SystemTime>,
     /// The request's `ClientToken`, absent where it carried none: "unique,
     /// case-sensitive identifier to ensure idempotency of the request", so a repeat
     /// of the same create is answered with THIS record rather than minting a second
@@ -1293,6 +1305,34 @@ impl Application {
             return;
         };
         self.status = owed.status;
+    }
+
+    /// Start this application's deletion, as the call that asked for it leaves the
+    /// record — the application mirror of [`Package::begin_deletion`].
+    ///
+    /// The application is not gone the instant that call returns: it is being deleted,
+    /// so it rests in [`APPLICATION_STATUS_DELETING`] and the clock owes the record's
+    /// removal one [`PROVISIONING`] span later, which
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::settle_applications`]
+    /// performs when it falls due. Whatever status move was outstanding is dropped: an
+    /// application on its way out is on its way to no other status.
+    ///
+    /// Idempotent — an application whose removal the clock already owes keeps the
+    /// instant it was owed at, so repeating the call cannot push the removal back.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.removal_due.is_some() {
+            return;
+        }
+        self.owed = None;
+        self.status = APPLICATION_STATUS_DELETING.to_string();
+        self.last_updated_at = now;
+        self.removal_due = Some(now + PROVISIONING);
+    }
+
+    /// Whether the removal the clock owed this application has fallen due by `now`, so
+    /// the account no longer holds it.
+    pub fn removal_landed(&self, now: SystemTime) -> bool {
+        self.removal_due.is_some_and(|due| now >= due)
     }
 
     /// Apply the settings an update asked to change to this application and record
@@ -1448,11 +1488,17 @@ pub fn application_name_taken(name: &str) -> ConflictException {
     }
 }
 
+/// What this service states about an id that names no application of this account.
+///
+/// The statement names no id: the request carries the one it could not resolve, so the
+/// answer states only that the account holds no such application.
+pub const APPLICATION_DOES_NOT_EXIST: &str = "Application does not exist";
+
 /// The `ResourceNotFoundException` payload for an id that names no application of
 /// this account — the application mirror of [`domain_not_found`].
-pub fn application_not_found(id: &str) -> ResourceNotFoundException {
+pub fn application_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Application not found: {id}")),
+        message: Some(APPLICATION_DOES_NOT_EXIST.to_string()),
     }
 }
 
@@ -2004,9 +2050,9 @@ pub fn unsupported_migration_status(value: &str) -> ValidationException {
 ///
 /// One wording for "this account holds no such application", whichever error channel
 /// the asking operation has for it.
-pub fn unknown_application_id(id: &str) -> ValidationException {
+pub fn unknown_application_id() -> ValidationException {
     ValidationException {
-        message: application_not_found(id).message,
+        message: application_not_found().message,
     }
 }
 
@@ -7624,10 +7670,33 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     }
 
     /// Materialise the status move the clock owes every stored application, for a
-    /// caller about to report on any of them.
+    /// caller about to report on any of them — and take away the record of every
+    /// application whose removal has fallen due.
     pub fn settle_applications(&mut self, now: SystemTime) {
         for application in self.applications.values_mut() {
             application.settle(now);
+        }
+        self.remove_deleted_applications(now);
+    }
+
+    /// Take the record of every application whose removal the clock has made due away,
+    /// together with the records held FOR such an application: a saved-object
+    /// migration job belongs to the application it migrates into, so a job of an
+    /// application the account no longer holds is no longer a job either.
+    ///
+    /// An application's data source attachments live ON its record, so they go with it
+    /// here rather than being hunted down.
+    fn remove_deleted_applications(&mut self, now: SystemTime) {
+        let removed: Vec<String> = self
+            .applications
+            .values()
+            .filter(|application| application.removal_landed(now))
+            .map(|application| application.id.clone())
+            .collect();
+        for id in &removed {
+            self.applications.remove(id);
+            self.migrations
+                .retain(|_, migration| &migration.application_id != id);
         }
     }
 
@@ -7782,6 +7851,10 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
 
     /// The application `id` names, with any status move the clock owes it already
     /// materialised — the one lookup a read of a single application goes through.
+    ///
+    /// An application whose removal has fallen due names nothing: its record is taken
+    /// away here, so a read of it finds no such application rather than one resting in
+    /// its deleting status for ever.
     pub fn settled_application_mut(
         &mut self,
         id: &str,
@@ -7789,7 +7862,11 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     ) -> Option<&mut Application> {
         let application = self.applications.get_mut(id)?;
         application.settle(now);
-        Some(application)
+        if application.removal_landed(now) {
+            self.remove_deleted_applications(now);
+            return None;
+        }
+        self.applications.get_mut(id)
     }
 
     /// Mint the identifier a data source attachment is addressed by, so two

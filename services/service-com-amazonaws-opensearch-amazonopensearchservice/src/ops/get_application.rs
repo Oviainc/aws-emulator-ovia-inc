@@ -185,9 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let application = store
             .settled_application_mut(&input.id, now)
             .ok_or_else(|| {
-                GetApplicationErrorModeled::ResourceNotFoundException(application_not_found(
-                    &input.id,
-                ))
+                GetApplicationErrorModeled::ResourceNotFoundException(application_not_found())
             })?;
 
         // Answered from the STORED record, through the same members the create

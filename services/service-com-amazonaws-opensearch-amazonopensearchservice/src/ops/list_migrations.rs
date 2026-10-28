@@ -200,13 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `status` filter below selects on.
         store.settle_migrations(now);
 
+        // The applications are settled too, so the resolution below judges the set of
+        // applications this account holds at `now`: one whose deletion has fallen due
+        // is no longer held, and neither are the jobs that belonged to it.
+        store.settle_applications(now);
+
         // The jobs belong to the application they migrate into, so an id the store holds
         // no application for has no listing to report. `ListMigrations` models no
         // `ResourceNotFoundException`, so the missing resource is reported through the
         // client-input error it does model.
         if !store.applications.contains_key(&input.application_id) {
             return Err(ListMigrationsErrorModeled::ValidationException(
-                unknown_application_id(&input.application_id),
+                unknown_application_id(),
             )
             .into());
         }

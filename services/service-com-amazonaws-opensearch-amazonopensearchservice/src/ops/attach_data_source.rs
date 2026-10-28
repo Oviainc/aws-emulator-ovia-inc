@@ -234,9 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The attachment belongs to the application, so an id naming none has nothing
         // to attach a data source to.
         let application = store.applications.get(&input.id).ok_or_else(|| {
-            AttachDataSourceErrorModeled::ResourceNotFoundException(application_not_found(
-                &input.id,
-            ))
+            AttachDataSourceErrorModeled::ResourceNotFoundException(application_not_found())
         })?;
 
         // "A unique, case-sensitive identifier to ensure idempotency of the request. If

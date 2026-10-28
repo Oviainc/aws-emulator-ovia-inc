@@ -191,9 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let application = store
             .settled_application_mut(&input.id, now)
             .ok_or_else(|| {
-                UpdateApplicationErrorModeled::ResourceNotFoundException(application_not_found(
-                    &input.id,
-                ))
+                UpdateApplicationErrorModeled::ResourceNotFoundException(application_not_found())
             })?;
 
         application.apply_update(

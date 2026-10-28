@@ -299,6 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has changed the application since the call that minted it, so the
             // instant it was last changed IS the instant it was created.
             last_updated_at: now,
+            // Nothing has asked for this application's removal, so the clock owes it
+            // none.
+            removal_due: None,
             client_token: input.client_token,
         };
 

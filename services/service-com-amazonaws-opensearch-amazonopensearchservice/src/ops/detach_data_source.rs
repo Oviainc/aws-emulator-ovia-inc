@@ -192,9 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The attachment belongs to the application, so an id naming none holds no
         // data source to detach.
         let application = store.applications.get_mut(&input.id).ok_or_else(|| {
-            DetachDataSourceErrorModeled::ResourceNotFoundException(application_not_found(
-                &input.id,
-            ))
+            DetachDataSourceErrorModeled::ResourceNotFoundException(application_not_found())
         })?;
 
         // "The application must be in the ACTIVE state": one that is still being

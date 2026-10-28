@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // empty page.
         let application = store.applications.get(&input.id).ok_or_else(|| {
             ListDataSourceAttachmentsErrorModeled::ResourceNotFoundException(
-                application_not_found(&input.id),
+                application_not_found(),
             )
         })?;
 
