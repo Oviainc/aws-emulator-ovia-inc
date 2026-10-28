@@ -245,7 +245,10 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
     }
 
     if let Some(state) = owner_sqs::state::service_state(engine) {
-        for queue in state.lock().queues.values() {
+        // A queue is a REGIONAL resource of that service — it belongs to the Region its
+        // create addressed, which is the Region its ARN carries — so the queues this
+        // projection reports are the ones of the serving Region.
+        for queue in state.lock().queues_in(region) {
             record(queue.arn.clone(), queue.tags.clone());
         }
     }
@@ -404,7 +407,9 @@ fn sqs<Eng: Send + Sync + 'static>(
         return Resolution::Unowned;
     };
     let mut state = state.lock();
-    let Some(queue) = state.queues.values_mut().find(|queue| queue.arn == arn.arn) else {
+    // A queue ARN carries the Region the queue lives in, so it is resolved through the
+    // SQS crate's own ARN reader rather than by scanning the store here.
+    let Some(queue) = state.queue_by_arn_mut(&arn.arn) else {
         // `QueueDoesNotExist`, whose wire code is its `awsQueryError`:
         // `smithy_query(query="shape", shape="QueueDoesNotExist")` on the SQS
         // model reports code `AWS.SimpleQueueService.NonExistentQueue`, 400.

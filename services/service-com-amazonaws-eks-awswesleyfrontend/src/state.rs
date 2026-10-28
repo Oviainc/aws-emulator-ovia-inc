@@ -3836,6 +3836,27 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         oldest_build: (1, 5, 0),
     },
     AddonCatalogSeed {
+        // Amazon SageMaker HyperPod's task governance, which schedules the
+        // training and inference workloads of a HyperPod cluster whose
+        // orchestration runs on this cluster.
+        addon_name: "amazon-sagemaker-hyperpod-taskgovernance",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "machine-learning",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        // Its chart exposes the queue the governance controller schedules
+        // through and how many replicas of that controller run, beside the
+        // placement values every add-on's schema carries.
+        configuration_properties: &[
+            ("kueue", "object"),
+            ("replicaCount", "integer"),
+        ],
+        oldest_build: (1, 0, 0),
+    },
+    AddonCatalogSeed {
         addon_name: "amazon-sagemaker-hyperpod-training-operator",
         owner: ADDON_OWNER_AWS,
         publisher: ADDON_PUBLISHER_EKS,
@@ -3875,6 +3896,23 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("storageClasses", "array"),
         ],
         oldest_build: (1, 31, 0),
+    },
+    AddonCatalogSeed {
+        // The Elastic Fabric Adapter device plugin, which advertises the EFA
+        // network interfaces of a node to the scheduler.
+        addon_name: "aws-efa-k8s-device-plugin",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "networking",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        // The plugin is a DaemonSet that advertises a node's devices and takes
+        // no settings of its own beyond the placement values every add-on's
+        // schema carries.
+        configuration_properties: &[],
+        oldest_build: (0, 5, 3),
     },
     AddonCatalogSeed {
         addon_name: "aws-efs-csi-driver",
@@ -3932,6 +3970,27 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             ("tolerations", "array"),
         ],
         oldest_build: (1, 7, 0),
+    },
+    AddonCatalogSeed {
+        // The agent that reports the cluster's network flows to Amazon
+        // CloudWatch Network Flow Monitor, which it publishes to with
+        // permissions of its own.
+        addon_name: "aws-network-flow-monitoring-agent",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "observability",
+        default_namespace: "aws-network-flow-monitor",
+        requires_iam_permissions: true,
+        required_configuration: &[],
+        pod_identity: &[(
+            "aws-network-flow-monitor-agent",
+            &["arn:aws:iam::aws:policy/CloudWatchNetworkFlowMonitorAgentPublishPolicy"],
+        )],
+        // Its chart exposes the agent itself; the rest of what a cluster
+        // operator sets on it are the placement values every add-on's schema
+        // carries.
+        configuration_properties: &[("agent", "object")],
+        oldest_build: (1, 0, 1),
     },
     AddonCatalogSeed {
         addon_name: "cert-manager",

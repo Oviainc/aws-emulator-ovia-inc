@@ -42,24 +42,75 @@ use crate::addon_versions::{
 use crate::cluster_lifecycle::REGION;
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
-/// The add-ons the catalog has to publish whatever else its seed carries, with
-/// the kind of add-on each one is — the axis the publication generalises over.
+/// The add-ons the catalog has to publish whatever else its seed carries, as
+/// `(addonName, defaultNamespace, the kind of add-on it is)` — the name a caller
+/// installs it by, the Kubernetes namespace its workloads run in
+/// (`AddonInfo$defaultNamespace`), and the axis the publication generalises over.
 ///
-/// Source: the "Amazon EKS add-ons" and "Community add-ons" tables of the Amazon
-/// EKS User Guide, which is what Amazon EKS publishes; a name missing from the
-/// catalog can be neither discovered nor installed.
-const PUBLISHED_ADDONS: &[(&str, &str)] = &[
-    ("vpc-cni", "an add-on Amazon EKS builds itself"),
-    ("aws-efs-csi-driver", "a CSI driver with its own options"),
-    ("cert-manager", "a community add-on Amazon EKS curates"),
-    ("external-dns", "a community add-on that needs IAM permissions"),
-    ("kube-state-metrics", "a community observability add-on"),
-    ("prometheus-node-exporter", "a community metrics exporter"),
+/// Source: the "Amazon EKS add-ons", "Community add-ons" and AWS Marketplace
+/// add-on tables of the Amazon EKS User Guide, which is what Amazon EKS
+/// publishes; a name missing from the catalog can be neither discovered nor
+/// installed, so this table is the REACH the publication must have. `pub(crate)`
+/// because `addon_catalog_coverage.rs` asserts the rest of the rule — the default
+/// build per cluster version, and the namespace an install resolves — over the
+/// same table, so the two suites cannot drift apart over which add-ons exist.
+pub(crate) const PUBLISHED_ADDONS: &[(&str, &str, &str)] = &[
+    ("adot", "opentelemetry-operator-system", "an operator Amazon EKS builds itself"),
+    (
+        "amazon-cloudwatch-observability",
+        "amazon-cloudwatch",
+        "an observability agent with pod identity",
+    ),
+    (
+        "amazon-sagemaker-hyperpod-taskgovernance",
+        "kube-system",
+        "a machine-learning scheduler",
+    ),
     (
         "amazon-sagemaker-hyperpod-training-operator",
+        "aws-hyperpod",
         "a machine-learning operator",
     ),
-    ("kubecost_kubecost", "an AWS Marketplace add-on"),
+    ("aws-ebs-csi-driver", "kube-system", "a CSI driver with its own options"),
+    ("aws-efa-k8s-device-plugin", "kube-system", "a device plugin"),
+    ("aws-efs-csi-driver", "kube-system", "a CSI driver with its own options"),
+    ("aws-guardduty-agent", "amazon-guardduty", "a security agent"),
+    ("aws-mountpoint-s3-csi-driver", "kube-system", "a CSI driver"),
+    (
+        "aws-network-flow-monitoring-agent",
+        "aws-network-flow-monitor",
+        "a network observability agent",
+    ),
+    ("cert-manager", "cert-manager", "a community add-on Amazon EKS curates"),
+    ("coredns", "kube-system", "an add-on Amazon EKS builds itself"),
+    (
+        "datadog_operator",
+        "datadog-agent",
+        "an AWS Marketplace add-on that cannot run unconfigured",
+    ),
+    (
+        "dynatrace_dynatrace-operator",
+        "dynatrace",
+        "an AWS Marketplace add-on that cannot run unconfigured",
+    ),
+    ("eks-node-monitoring-agent", "kube-system", "an observability agent"),
+    ("eks-pod-identity-agent", "kube-system", "a security agent"),
+    (
+        "external-dns",
+        "external-dns",
+        "a community add-on that needs IAM permissions",
+    ),
+    ("kube-proxy", "kube-system", "an add-on whose version tracks Kubernetes"),
+    ("kube-state-metrics", "kube-system", "a community observability add-on"),
+    ("kubecost_kubecost", "kubecost", "an AWS Marketplace add-on"),
+    ("metrics-server", "kube-system", "a community metrics server"),
+    (
+        "prometheus-node-exporter",
+        "prometheus-node-exporter",
+        "a community metrics exporter",
+    ),
+    ("snapshot-controller", "kube-system", "a storage controller"),
+    ("vpc-cni", "kube-system", "an add-on Amazon EKS builds itself"),
 ];
 
 /// The default Kubernetes version `DescribeClusterVersions` publishes — the
@@ -156,7 +207,7 @@ async fn every_published_addon_is_discoverable_by_name() {
     let published = addon_names(&whole_catalog(&router).await);
 
     // The add-ons the publication has to carry, spanning the kinds it holds.
-    for (addon_name, kind) in PUBLISHED_ADDONS {
+    for (addon_name, _, kind) in PUBLISHED_ADDONS {
         assert!(
             published.iter().any(|name| name == addon_name),
             "case {addon_name} ({kind}): the catalog must publish it, got {published:?}"

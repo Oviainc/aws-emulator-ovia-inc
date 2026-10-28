@@ -185,8 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = store.lock();
 
+        // A queue url resolves in the region the request addressed: this region's queue of
+        // that name, and nothing another region holds.
+        let region = sqs::request_region(ctx.parts());
         let name = sqs::queue_name_from_url(&input.queue_url)
-            .filter(|name| store.queues.contains_key(*name))
+            .filter(|name| store.holds_queue(&region, name))
             .map(str::to_string)
             .ok_or_else(|| {
                 RemovePermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist())
@@ -195,7 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // may is decided against the queue's own policy and the caller's identity-based
         // policies, before the policy is changed.
         let (queue_arn, in_force) = {
-            let queue = &store.queues[&name];
+            let queue = store
+                .queue(&region, &name)
+                .expect("the queue was resolved out of this same store");
             (queue.arn.clone(), queue.policy().map(str::to_string))
         };
         if let Some(denied) = sqs::authorization::denied(
@@ -208,8 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
         let queue = store
-            .queues
-            .get_mut(&name)
+            .queue_mut(&region, &name)
             .expect("the queue was resolved out of this same store");
 
         // A label is refused for its own form before it is looked for, so a value that

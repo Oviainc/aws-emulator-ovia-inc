@@ -445,6 +445,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same rule the create path applies: a Lambda@Edge association invokes ONE
+        // published version of a function, so an update cannot leave a distribution
+        // carrying an association that names no version either.
+        if let Some(message) =
+            crate::state::lambda_association_without_version(&input.distribution_config)
+        {
+            return Err(
+                UpdateDistributionErrorModeled::InvalidLambdaFunctionAssociation(
+                    InvalidLambdaFunctionAssociation {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The same rule the create path applies: an origin reaches its bucket with the
         // credentials of the origin access control it names, so an update cannot leave a
         // distribution naming a control this account does not hold either.

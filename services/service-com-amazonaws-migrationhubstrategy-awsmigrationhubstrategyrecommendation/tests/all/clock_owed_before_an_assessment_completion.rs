@@ -42,8 +42,9 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::assessment_analysis::{assert_recommendation, expected_application, Expected};
 use crate::import_and_assess::{
-    at, bring_every_completion_forward, call, get_assessment, get_import, minimal_assessment,
-    register_collector_in, start_assessment, start_import, stop_assessment, Answer, TEST_REGION,
+    at, bring_every_completion_forward, call, get_assessment, get_import, hold_buckets,
+    minimal_assessment, register_collector_in, start_assessment, start_import, stop_assessment,
+    Answer, TEST_BUCKETS, TEST_REGION,
 };
 use crate::import_ingestion::{create_bucket, put_import_file, IMPORT_BUCKET};
 
@@ -78,6 +79,8 @@ const COMPONENT_APP_TYPE: &str = "Tomcat";
 fn emulator() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     register_collector_in(&engine, &[TEST_REGION]);
+    // And the buckets a start call names, in the object storage it resolves them against.
+    hold_buckets(&engine, TEST_BUCKETS);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));

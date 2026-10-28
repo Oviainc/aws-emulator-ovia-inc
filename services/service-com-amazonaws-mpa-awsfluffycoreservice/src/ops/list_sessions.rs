@@ -13,10 +13,13 @@
 //! refused 403 BEFORE the lookup, and one the store does not hold earns
 //! `ResourceNotFoundException` (404) with the one not-found sentence this service states.
 //!
-//! `NextToken` is the initiation-order sequence number of the last session the previous
-//! page returned, so the next page is every matching session ordered after it: a client
-//! paging with any `MaxResults` sees each session exactly once. A token that is not one
-//! this service issued earns `ValidationException` (400).
+//! `NextToken` is this listing's own: it names this listing — this operation, for THIS
+//! team — and the initiation-order position of the last session the previous page
+//! returned, so the next page is every matching session ordered after it; a client
+//! paging with any `MaxResults` sees each session exactly once. A token this listing did
+//! not hand out — one it cannot read, one another listing (or another team's sessions)
+//! issued, or one naming a position this listing reports no session at — earns
+//! `ValidationException` (400) rather than an empty page.
 //!
 //! ## Filters
 //!
@@ -221,13 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token); then, below, whether the team exists.
         let predicates = compile_filters(input.filters.as_deref().unwrap_or_default())?;
 
-        // The token is this service's own: the initiation-order position the next page
-        // starts after, read by the one token reader this service's listings share
-        // ([`crate::state::seq_token_position`]). It is read HERE, with the request's
-        // other shape, so a token this service did not issue is refused before the team
-        // is resolved.
-        let after = crate::state::seq_token_position(input.next_token.as_deref())
-            .map_err(ListSessionsErrorModeled::ValidationException)?;
+        // The token is this service's own: it names THIS listing and the initiation-order
+        // position the next page starts after, read by the one token reader this
+        // service's listings share ([`crate::state::token_position`]). Its grammar is
+        // read HERE, with the request's other shape, so a value that is no token of this
+        // listing's is refused before the team is resolved; that the position was handed
+        // out is decided below, against the sessions themselves.
+        let after = crate::state::token_position(
+            crate::state::Listing::Sessions {
+                approval_team_arn: &input.approval_team_arn,
+            },
+            input.next_token.as_deref(),
+        )
+        .map_err(ListSessionsErrorModeled::ValidationException)?;
 
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
@@ -243,7 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The sessions this request asks for, in initiation order, cut into a page by
-        // the one paging rule this service's record listings share.
+        // the one paging rule this service's record listings share — which refuses a
+        // position no page of this listing handed out rather than answering a page.
         let matching = state
             .team_sessions_in_initiation_order(&input.approval_team_arn)
             .into_iter()
@@ -252,7 +262,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .iter()
                     .all(|predicate| predicate.matches(session))
             });
-        let page = crate::state::page_after_seq(matching, after, input.max_results);
+        let page = crate::state::page_after_seq(
+            crate::state::Listing::Sessions {
+                approval_team_arn: &input.approval_team_arn,
+            },
+            matching,
+            after,
+            input.max_results,
+        )
+        .map_err(ListSessionsErrorModeled::ValidationException)?;
 
         Ok(ListSessionsOutput {
             sessions: Some(page.records.iter().copied().map(entry).collect()),

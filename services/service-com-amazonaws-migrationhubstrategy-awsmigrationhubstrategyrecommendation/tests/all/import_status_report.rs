@@ -6,9 +6,9 @@
 //! its status report object into that bucket and the completed task reports WHERE it is —
 //! `statusReportS3Bucket` AND `statusReportS3Key` — so a caller can follow the pair and
 //! read the per-record outcomes (the companion of `numberOfRecordsFailed`); a task that
-//! named no report bucket, or whose report could not be written, reports no key, so no
-//! reported key ever names an object a caller cannot fetch. `GetImportFileTask` and
-//! `ListImportFileTask` report the same pair, because both read the one stored task.
+//! named no report bucket reports no key, so no reported key ever names an object a caller
+//! cannot fetch. `GetImportFileTask` and `ListImportFileTask` report the same pair, because
+//! both read the one stored task.
 //!
 //! The emulator mounted here therefore holds the S3 service beside Strategy
 //! Recommendations on ONE engine, exactly as the assembled emulator does: the import
@@ -180,6 +180,11 @@ struct Case {
     /// The bucket to create before starting the import; `None` leaves the named report
     /// bucket (if any) absent from the account.
     create: Option<&'static str>,
+    /// Whether the start call is refused outright. A report bucket the account holds no
+    /// bucket for is one the import could not write its report into, so the service refuses
+    /// the start instead of running an import whose results go nowhere
+    /// (`start_call_bucket_existence.rs` owns that rule).
+    refused: bool,
     /// Whether the import can write its report, and so whether a key is reported.
     expect_key: bool,
 }
@@ -201,6 +206,7 @@ fn cases() -> Vec<Case> {
                 "s3key": "servers.csv",
             }),
             create: None,
+            refused: false,
             expect_key: false,
         },
         Case {
@@ -212,6 +218,7 @@ fn cases() -> Vec<Case> {
                 "s3bucketForReportData": "migrationhub-strategy-reports",
             }),
             create: Some("migrationhub-strategy-reports"),
+            refused: false,
             expect_key: true,
         },
         Case {
@@ -225,6 +232,7 @@ fn cases() -> Vec<Case> {
                 "groupId": [{"name": "ExternalId", "value": "wave-1"}],
             }),
             create: Some("migrationhub-strategy-rep.dotted.name"),
+            refused: false,
             expect_key: true,
         },
         Case {
@@ -241,11 +249,12 @@ fn cases() -> Vec<Case> {
                 ],
             }),
             create: Some("migrationhub-strategy-r"),
+            refused: false,
             expect_key: true,
         },
         Case {
-            // Nothing could be written, so nothing is named: the bucket the request
-            // carried is still reported, the key is not.
+            // There is nowhere to write the report, so no import runs at all: the start is
+            // refused and no task is minted to report a location from.
             name: "a report bucket the account does not hold",
             request: json!({
                 "name": "import-5",
@@ -254,6 +263,7 @@ fn cases() -> Vec<Case> {
                 "s3bucketForReportData": "migrationhub-strategy-no-such-bucket",
             }),
             create: None,
+            refused: true,
             expect_key: false,
         },
     ]
@@ -271,6 +281,7 @@ async fn a_completed_import_reports_the_status_report_it_wrote() {
             name: case,
             request,
             create,
+            refused,
             expect_key,
         } = case;
         if let Some(bucket) = create {
@@ -279,6 +290,32 @@ async fn a_completed_import_reports_the_status_report_it_wrote() {
         put_input_file(case, &router, &request).await;
 
         let started = start_import(&router, request.clone()).await;
+        if refused {
+            let named = request["s3bucketForReportData"].as_str().unwrap_or_default();
+            assert_eq!(
+                started.status, 400,
+                "case {case:?}: a report bucket the account does not hold must be refused, \
+                 got {} with {:?}",
+                started.status, started.body
+            );
+            assert_eq!(
+                started.error_code(),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {:?}",
+                started.body
+            );
+            assert!(
+                started.string("/message").contains(named),
+                "case {case:?}: the refusal must name the report bucket {named:?}, got {:?}",
+                started.body
+            );
+            assert!(
+                started.string("/id").is_empty(),
+                "case {case:?}: a refused start mints no task, got {:?}",
+                started.body
+            );
+            continue;
+        }
         assert_eq!(
             started.status, 200,
             "case {case:?}: expected HTTP 200 from StartImportFileTask, got {} with {:?}",

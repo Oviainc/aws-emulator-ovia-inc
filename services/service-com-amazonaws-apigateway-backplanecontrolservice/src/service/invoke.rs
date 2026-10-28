@@ -16,8 +16,11 @@
 //! So this module is the second half of [`crate::service::EmulatedService`]: the claim
 //! ([`claims_parts`], read by `Service::can_handle`) and the serving
 //! ([`serve`], reached from the two seams the router offers before and after
-//! authentication). It is a READ of the control plane's own records — a request to a
-//! stage changes nothing — and every status it answers is computed from them.
+//! authentication). Every status it answers is computed from the control plane's own
+//! records, and the one thing it WRITES is the metering a usage plan's throttle consists
+//! of ([`metered_refusal`]): the rate a key's requests are admitted at cannot be computed
+//! without recording the ones already admitted. Nothing else about a stage, an api or a
+//! key changes because it was invoked.
 //!
 //! A client on the machine this emulator runs on cannot reach that host at all: nothing
 //! resolves `{rest-api-id}.execute-api.{region}.amazonaws.com` there, so it points at the
@@ -44,7 +47,13 @@
 //!    key-required method admits only an enabled API key the records associate with THIS
 //!    stage, through a usage plan over that api stage or the key's own deprecated
 //!    `stageKeys`, and refuses every other request before the integration is reached;
-//! 6. the method's integration decides the response.
+//! 6. the method's REQUEST VALIDATOR is applied — the `RequestValidator` the live method's
+//!    `requestValidatorId` names decides whether the request's parameters
+//!    ([`parameters_refusal`]) and its payload ([`PendingBodyCheck::refusal`]) are checked
+//!    before the integration is reached;
+//! 7. the usage plan metering the presented API key admits the request at the plan's
+//!    throttle, or the request is shed ([`metered_refusal`]);
+//! 8. the method's integration decides the response.
 //!
 //! A step that resolves nothing is answered the way API Gateway answers it: through the
 //! API's GATEWAY RESPONSE for the matching response type ([`GatewayRefusal`]), so a
@@ -99,6 +108,7 @@
 //! status and body a call no integration can serve is answered with. That operation REPORTS
 //! what this module SENDS, so neither can answer one stored configuration differently.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
@@ -166,16 +176,30 @@ const API_KEY_HEADER: &str = "x-api-key";
 /// The `apiKeySource` that reads the key from the request header; see [`API_KEY_HEADER`].
 const API_KEY_SOURCE_HEADER: &str = "HEADER";
 
-/// The identity-source prefix of a request header, from `Authorizer$identitySource`: "For
-/// a `TOKEN` or `COGNITO_USER_POOLS` authorizer, this is required and specifies the request
-/// header mapping expression for the custom header holding the authorization token …
-/// `method.request.header.Auth`".
-const IDENTITY_SOURCE_HEADER_PREFIX: &str = "method.request.header.";
+/// The mapping-expression prefix of a request HEADER, which is how both an authorizer's
+/// identity source and a method's request parameter name one.
+///
+/// From `Method$requestParameters`: "a key is a method request parameter name matching the
+/// pattern of `method.request.{location}.{name}`, where `location` is `querystring`,
+/// `path`, or `header`"; `Authorizer$identitySource` names a header the same way ("the
+/// request header mapping expression for the custom header holding the authorization token
+/// … `method.request.header.Auth`").
+const METHOD_REQUEST_HEADER_PREFIX: &str = "method.request.header.";
 
-/// The identity-source prefix of a query-string parameter, the other request-bound form
-/// `Authorizer$identitySource` names for a `REQUEST` authorizer ("for example,
-/// `$request.querystring.auth`" in the comma-separated list it documents).
-const IDENTITY_SOURCE_QUERY_PREFIX: &str = "method.request.querystring.";
+/// The mapping-expression prefix of a query-string parameter; see
+/// [`METHOD_REQUEST_HEADER_PREFIX`] for the pattern both members share.
+const METHOD_REQUEST_QUERY_PREFIX: &str = "method.request.querystring.";
+
+/// The mapping-expression prefix of a PATH parameter, the third `location`
+/// [`METHOD_REQUEST_HEADER_PREFIX`] quotes.
+const METHOD_REQUEST_PATH_PREFIX: &str = "method.request.path.";
+
+/// The mapping-expression prefix of a query-string parameter taken with every one of its
+/// values, the multi-value spelling of [`METHOD_REQUEST_QUERY_PREFIX`].
+const METHOD_REQUEST_MULTI_QUERY_PREFIX: &str = "method.request.multivaluequerystring.";
+
+/// The multi-value spelling of [`METHOD_REQUEST_HEADER_PREFIX`].
+const METHOD_REQUEST_MULTI_HEADER_PREFIX: &str = "method.request.multivalueheader.";
 
 /// The media type a gateway response and an untemplated integration response are rendered
 /// with. API Gateway's own default gateway-response templates are
@@ -220,12 +244,22 @@ const DEFAULT_5XX: &str = "DEFAULT_5XX";
 /// The type is the unit of customization (`PutGatewayResponse` takes a `responseType`), so
 /// naming it here is what lets a developer's customization reach the caller without this
 /// module knowing anything about it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GatewayRefusal {
     /// A value of the model's `GatewayResponseType` enum.
     response_type: &'static str,
-    /// The sentence the uncustomized response body carries.
-    message: &'static str,
+    /// The sentence the uncustomized response body carries. Owned-or-borrowed because a
+    /// few refusals state what the request was missing, which is read off the request
+    /// rather than fixed in the binary.
+    message: Cow<'static, str>,
+    /// The error shape this refusal is the wire form of, reported in
+    /// [`ERROR_TYPE_HEADER`], or `None` for a response type whose exception name this
+    /// service's model does not declare.
+    error_type: Option<&'static str>,
+    /// What a VALIDATION of the request found, as the gateway response's
+    /// `$context.error.validationErrorString` reports it; empty for every refusal that is
+    /// not the outcome of validating the request against what the method declares.
+    validation_detail: Cow<'static, str>,
 }
 
 impl GatewayRefusal {
@@ -243,7 +277,9 @@ impl GatewayRefusal {
 /// that has no deployment, and an endpoint a developer has turned off.
 const FORBIDDEN: GatewayRefusal = GatewayRefusal {
     response_type: "ACCESS_DENIED",
-    message: "Forbidden",
+    message: Cow::Borrowed("Forbidden"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
 };
 
 /// Nothing in the DEPLOYMENT matches the path and verb, or the method's authorization
@@ -252,21 +288,27 @@ const FORBIDDEN: GatewayRefusal = GatewayRefusal {
 /// answers for a route it cannot place and for an `AWS_IAM` method reached unsigned.
 const MISSING_AUTHENTICATION_TOKEN: GatewayRefusal = GatewayRefusal {
     response_type: "MISSING_AUTHENTICATION_TOKEN",
-    message: "Missing Authentication Token",
+    message: Cow::Borrowed("Missing Authentication Token"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
 };
 
 /// The method requires an API key and the request presented none this API's records
 /// associate with this stage: `403` `{"message":"Forbidden"}` through `INVALID_API_KEY`.
 const INVALID_API_KEY: GatewayRefusal = GatewayRefusal {
     response_type: "INVALID_API_KEY",
-    message: "Forbidden",
+    message: Cow::Borrowed("Forbidden"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
 };
 
 /// An authorizer's identity source is absent from the request, so the authorizer is not
 /// even called: `401` `{"message":"Unauthorized"}`.
 const UNAUTHORIZED: GatewayRefusal = GatewayRefusal {
     response_type: "UNAUTHORIZED",
-    message: "Unauthorized",
+    message: Cow::Borrowed("Unauthorized"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
 };
 
 /// The method's configuration cannot serve the call: no integration on the deployed
@@ -274,7 +316,9 @@ const UNAUTHORIZED: GatewayRefusal = GatewayRefusal {
 /// mapping template it cannot evaluate. `500` `{"message":"Internal server error"}`.
 const API_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
     response_type: "API_CONFIGURATION_ERROR",
-    message: "Internal server error",
+    message: Cow::Borrowed("Internal server error"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
 };
 
 /// The method is authorized by an `Authorizer` whose decision this emulator cannot
@@ -283,7 +327,9 @@ const API_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
 /// cannot invoke the authorizer.
 const AUTHORIZER_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
     response_type: "AUTHORIZER_CONFIGURATION_ERROR",
-    message: "Internal server error",
+    message: Cow::Borrowed("Internal server error"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
 };
 
 /// The request's content type maps to no integration request template and the
@@ -291,8 +337,59 @@ const AUTHORIZER_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
 /// `{"message":"Unsupported Media Type"}`.
 const UNSUPPORTED_MEDIA_TYPE: GatewayRefusal = GatewayRefusal {
     response_type: "UNSUPPORTED_MEDIA_TYPE",
-    message: "Unsupported Media Type",
+    message: Cow::Borrowed("Unsupported Media Type"),
+    error_type: None,
+    validation_detail: Cow::Borrowed(""),
 };
+
+/// The method's request validator declares `validateRequestBody` and the request's payload
+/// does not satisfy the JSON Schema of the `Model` the method maps its content type to:
+/// `400` `{"message":"Invalid request body"}` through `BAD_REQUEST_BODY`.
+///
+/// The sentence is FIXED — it names neither the model nor what about the payload failed.
+/// WHAT failed is the validation's own report, which a gateway response template reads
+/// through `$context.error.validationErrorString`: `detail` is that report, and it is the
+/// validator's own finding about THIS payload rather than a sentence written here.
+fn bad_request_body(detail: String) -> GatewayRefusal {
+    GatewayRefusal {
+        response_type: "BAD_REQUEST_BODY",
+        message: Cow::Borrowed("Invalid request body"),
+        error_type: Some("BadRequestException"),
+        validation_detail: Cow::Owned(detail),
+    }
+}
+
+/// The usage plan metering this request's API key admits no further request at this
+/// instant: `429` `{"message":"Too Many Requests"}` through `THROTTLED`. The plan's
+/// numeric limits are what decide the refusal, not what it says.
+const THROTTLED: GatewayRefusal = GatewayRefusal {
+    response_type: "THROTTLED",
+    message: Cow::Borrowed("Too Many Requests"),
+    error_type: Some("TooManyRequestsException"),
+    validation_detail: Cow::Borrowed(""),
+};
+
+/// The method's request validator declares `validateRequestParameters` and the request
+/// does not carry every request parameter the method declares REQUIRED: `400` through
+/// `BAD_REQUEST_PARAMETERS`.
+///
+/// The sentence's fixed part states the condition and its variable part is the list of
+/// parameter NAMES the request was missing, read off the method's own
+/// `requestParameters` declarations — which is what tells the caller what to add, and
+/// which is also the validation's whole finding, so it is reported as the detail too.
+fn bad_request_parameters(missing: &[String]) -> GatewayRefusal {
+    let named = missing.join(", ");
+    GatewayRefusal {
+        response_type: "BAD_REQUEST_PARAMETERS",
+        message: Cow::Owned(format!("Missing required request parameters: [{named}]")),
+        error_type: Some("BadRequestException"),
+        validation_detail: Cow::Owned(format!("[{named}]")),
+    }
+}
+
+/// The header API Gateway names the error shape of a refused request in, which is what an
+/// SDK reads a restJson1 error code out of.
+const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
 /// What an invoke addresses, as the wire carries it: the request's host — absent on a
 /// request that carries neither a `Host` header nor an absolute URI — and its path.
@@ -591,75 +688,160 @@ fn serve_resolved<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> 
     let Some(state) = crate::state::service_state(engine) else {
         return refusal_response(None, API_CONFIGURATION_ERROR);
     };
-    let store = state.lock();
-    let Some(resolved) = resolve(&store, &addressed) else {
-        // The api was deleted between the claim and now, or another process minted the
-        // host: an endpoint that serves no api of this account is `403 Forbidden`.
-        return refusal_response(None, FORBIDDEN);
-    };
-    let api = resolved.api;
-    if api.disable_execute_api_endpoint {
-        // `disableExecuteApiEndpoint`: "Specifies whether clients can invoke your API by
-        // using the default execute-api endpoint." Turned off, the endpoint serves nothing.
-        return refusal_response(Some(api), FORBIDDEN);
-    }
+    // What the records answer this request, what VALIDATING its payload needs, and what
+    // METERING that answer is subject to. All three are computed under a shared read of
+    // the store, which is RELEASED before either of the last two runs: validating a
+    // payload against a caller-stored JSON Schema is the one piece of work here whose cost
+    // a caller's own records decide, so it must not hold the lock every other request to
+    // this service waits on, and recording a metered request needs an exclusive lock of
+    // its own. The answer is computed from records alone, so computing it before the two
+    // changes nothing a caller can see.
+    let (answer, pending_body, metering) = {
+        let store = state.lock();
+        let Some(resolved) = resolve(&store, &addressed) else {
+            // The api was deleted between the claim and now, or another process minted the
+            // host: an endpoint that serves no api of this account is `403 Forbidden`.
+            return refusal_response(None, FORBIDDEN);
+        };
+        let api = resolved.api;
+        if api.disable_execute_api_endpoint {
+            // `disableExecuteApiEndpoint`: "Specifies whether clients can invoke your API by
+            // using the default execute-api endpoint." Turned off, the endpoint serves nothing.
+            return refusal_response(Some(api), FORBIDDEN);
+        }
 
-    let Some((stage_name, resource_path)) = split_stage(resolved.invoke_path) else {
-        return refusal_response(Some(api), FORBIDDEN);
-    };
-    let Some(stage) = api.stages.get(stage_name) else {
-        return refusal_response(Some(api), FORBIDDEN);
-    };
-    let Some(deployment) = api.deployments.get(&stage.deployment_id) else {
-        return refusal_response(Some(api), FORBIDDEN);
+        let Some((stage_name, resource_path)) = split_stage(resolved.invoke_path) else {
+            return refusal_response(Some(api), FORBIDDEN);
+        };
+        let Some(stage) = api.stages.get(stage_name) else {
+            return refusal_response(Some(api), FORBIDDEN);
+        };
+        let Some(deployment) = api.deployments.get(&stage.deployment_id) else {
+            return refusal_response(Some(api), FORBIDDEN);
+        };
+
+        // The DEPLOYMENT decides what is served: a method put on the API after the stage's
+        // deployment was created is not in it, and one deleted afterwards still is.
+        let Some(matched_path) = match_resource_path(deployment, &resource_path) else {
+            return refusal_response(Some(api), MISSING_AUTHENTICATION_TOKEN);
+        };
+        let Some((verb, snapshot)) = match_method(deployment, matched_path, req.method()) else {
+            return refusal_response(Some(api), MISSING_AUTHENTICATION_TOKEN);
+        };
+
+        let authorization_type = snapshot
+            .authorization_type
+            .as_deref()
+            .unwrap_or(AUTHORIZATION_NONE);
+        // The live method carries the integration, the authorizer and the request
+        // validator the deployed method names; `Deployment$apiSummary`'s `MethodSnapshot`
+        // models only `authorizationType` and `apiKeyRequired`, so the rest of the method
+        // is read from the API itself.
+        let live_method = api
+            .resources
+            .values()
+            .find(|resource| resource.path == matched_path)
+            .and_then(|resource| resource.methods.get(verb));
+
+        if let Some(refusal) = authorization_refusal(api, live_method, authorization_type, req) {
+            return refusal_response(Some(api), refusal);
+        }
+        // A key-required method is admitted by the key the records associate with this
+        // stage, and the association is also what says which usage plans METER the call.
+        let admission = if snapshot.api_key_required {
+            match api_key_admission(&store, api, &stage.stage_name, req) {
+                Some(admission) => Some(admission),
+                None => return refusal_response(Some(api), INVALID_API_KEY),
+            }
+        } else {
+            // A method that requires no key presents the records no key to meter: a usage
+            // plan is what "specify[ies] who can access associated API stages", so it
+            // meters the calls it admits.
+            None
+        };
+
+        let call = MethodRequest::of_request(req);
+        // The method's own request validator, before the integration is reached: a
+        // request the method declares invalid never gets to the backend. The PARAMETERS
+        // half is decided here, from the request's own query string and headers; the BODY
+        // half is prepared here and decided below, off the lock.
+        if let Some(refusal) = parameters_refusal(api, live_method, req) {
+            return refusal_response(Some(api), refusal);
+        }
+        let pending_body = pending_body_check(api, live_method, &call);
+
+        // The integration is what answers, and performing it is the half this module shares
+        // with `TestInvokeMethod`: the SAME records decide a simulated invocation and a real
+        // one, so the two cannot answer one configuration differently.
+        let answer = match perform_integration(live_method, &call) {
+            Ok(served) => served_response(served),
+            Err(unserved) => {
+                tracing::warn!(
+                    api_id = %api.id,
+                    stage = %stage.stage_name,
+                    path = %matched_path,
+                    verb = %verb,
+                    reason = %unserved.reason,
+                    "the stage cannot serve this call through the method's integration"
+                );
+                refusal_response(Some(api), unserved.refusal)
+            }
+        };
+        // The 429 this call earns if the plans metering it have no request left for it,
+        // rendered now because it is rendered from the api's own gateway responses.
+        let metering = admission
+            .filter(|admission| !admission.throttled_plans.is_empty())
+            .map(|admission| (admission, refusal_response(Some(api), THROTTLED)));
+        (answer, pending_body, metering)
     };
 
-    // The DEPLOYMENT decides what is served: a method put on the API after the stage's
-    // deployment was created is not in it, and one deleted afterwards still is.
-    let Some(matched_path) = match_resource_path(deployment, &resource_path) else {
-        return refusal_response(Some(api), MISSING_AUTHENTICATION_TOKEN);
-    };
-    let Some((verb, snapshot)) = match_method(deployment, matched_path, req.method()) else {
-        return refusal_response(Some(api), MISSING_AUTHENTICATION_TOKEN);
-    };
-
-    let authorization_type = snapshot
-        .authorization_type
-        .as_deref()
-        .unwrap_or(AUTHORIZATION_NONE);
-    // The live method carries the integration and the authorizer the deployed method
-    // names; `Deployment$apiSummary`'s `MethodSnapshot` models only `authorizationType`
-    // and `apiKeyRequired`, so the rest of the method is read from the API itself.
-    let live_method = api
-        .resources
-        .values()
-        .find(|resource| resource.path == matched_path)
-        .and_then(|resource| resource.methods.get(verb));
-
-    if let Some(refusal) = authorization_refusal(api, live_method, authorization_type, req) {
-        return refusal_response(Some(api), refusal);
-    }
-    if snapshot.api_key_required && !api_key_admits(&store, api, &stage.stage_name, req) {
-        return refusal_response(Some(api), INVALID_API_KEY);
-    }
-
-    // The integration is what answers, and performing it is the half this module shares
-    // with `TestInvokeMethod`: the SAME records decide a simulated invocation and a real
-    // one, so the two cannot answer one configuration differently.
-    match perform_integration(live_method, &MethodRequest::of_request(req)) {
-        Ok(served) => served_response(served),
-        Err(unserved) => {
-            tracing::warn!(
-                api_id = %api.id,
-                stage = %stage.stage_name,
-                path = %matched_path,
-                verb = %verb,
-                reason = %unserved.reason,
-                "the stage cannot serve this call through the method's integration"
-            );
-            refusal_response(Some(api), unserved.refusal)
+    // The usage plan METERS the call before its payload is checked, as API Gateway's
+    // method-request flow does: a request the plan sheds is answered 429 whatever its
+    // payload says. This is the exclusive-lock half, so it is taken on its own.
+    if let Some((admission, throttled)) = metering {
+        let mut store = state.lock();
+        if metered_refusal(&mut store, &admission).is_some() {
+            return throttled;
         }
     }
+
+    // OFF the lock: the payload against the model's JSON Schema. A refused payload is
+    // answered through the api's own gateway response for `BAD_REQUEST_BODY`, so the
+    // records are read again — briefly, and only to render that refusal.
+    if let Some(pending) = pending_body {
+        if let Some(refusal) = pending.refusal(req.body().bytes()) {
+            let store = state.lock();
+            let api = resolve(&store, &addressed).map(|resolved| resolved.api);
+            return refusal_response(api, refusal);
+        }
+    }
+
+    answer
+}
+
+/// Record this request against every usage plan that meters the presented API key, and
+/// report whether one of them sheds it.
+///
+/// A usage plan's `throttle` is "the request rate limits" the plan admits FOR EACH of its
+/// keys, so the accounting is per `(plan, key)` pair
+/// ([`crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState::throttle_admits`]):
+/// a key metered by two plans has to satisfy both, and `Some(())` means at least one plan
+/// had no request left for it at this instant, which is the `THROTTLED` gateway response.
+///
+/// Every plan is accounted even when an earlier one sheds the request: a shed request is
+/// one the key SENT, and the plans that still had capacity are the ones that admitted it.
+fn metered_refusal(
+    store: &mut crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
+    admission: &Metered,
+) -> Option<()> {
+    let now = ::std::time::Instant::now();
+    let mut shed = false;
+    for (plan_id, limits) in &admission.throttled_plans {
+        if !store.throttle_admits(plan_id, &admission.key_id, *limits, now) {
+            shed = true;
+        }
+    }
+    shed.then_some(())
 }
 
 /// The refusal the method's `authorizationType` earns this request, or `None` when the
@@ -716,7 +898,7 @@ fn authorization_refusal(
         // is not called at all. The two request-bound forms are read here; a source bound
         // to something else (a stage variable, say) is not one this emulator can resolve,
         // and is left to the refusal below rather than treated as satisfied.
-        if let Some(header) = source.strip_prefix(IDENTITY_SOURCE_HEADER_PREFIX) {
+        if let Some(header) = source.strip_prefix(METHOD_REQUEST_HEADER_PREFIX) {
             if req
                 .headers()
                 .get(header.to_ascii_lowercase())
@@ -726,7 +908,7 @@ fn authorization_refusal(
             }
             continue;
         }
-        if let Some(parameter) = source.strip_prefix(IDENTITY_SOURCE_QUERY_PREFIX) {
+        if let Some(parameter) = source.strip_prefix(METHOD_REQUEST_QUERY_PREFIX) {
             let present = query_of(req.uri()).split('&').any(|pair| {
                 pair.split_once('=')
                     .is_some_and(|(key, value)| key == parameter && !value.is_empty())
@@ -744,66 +926,416 @@ fn authorization_refusal(
     Some(AUTHORIZER_CONFIGURATION_ERROR)
 }
 
-/// Whether the request presents an API key this API's records associate with `stage`.
+/// What the records say about the API key a request presented: which stored key admitted
+/// the call, and the usage plans that METER it for this stage.
+///
+/// The key id rather than the key's value, because the value is the client's credential
+/// and the accounting is per stored key; the plans are the ones whose throttle declares a
+/// limit at all, so a plan that limits nothing adds no accounting.
+#[derive(Debug)]
+struct Metered {
+    /// The stored `ApiKey`'s id.
+    key_id: String,
+    /// The `(usage plan id, limits)` pairs this call is metered against.
+    throttled_plans: Vec<(String, crate::state::ThrottleLimits)>,
+}
+
+/// The admission the API key a request presents earns at `stage`, or `None` when the
+/// records associate no such key with it.
 ///
 /// The key travels in [`API_KEY_HEADER`] when the API's `apiKeySource` is `HEADER`; the
 /// other documented source reads it from a custom authorizer's returned context, which is
 /// a decision this emulator cannot obtain, so no key is presented for it.
 ///
 /// A key admits the call when it is ENABLED and this api's `stage` is among the stages the
-/// records associate it with — see [`associates_stage`] for the two associations that say
-/// so. A value no stored key carries, a disabled key and a key associated with some other
-/// stage are each a key that does not admit the call.
-fn api_key_admits(
+/// records associate it with — see [`plans_metering`] and `ApiKey$stageKeys` for the two
+/// associations that say so. A value no stored key carries, a disabled key and a key
+/// associated with some other stage are each a key that does not admit the call.
+fn api_key_admission(
     store: &crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
     api: &RestApiEntry,
     stage: &str,
     req: &RtRequest,
-) -> bool {
+) -> Option<Metered> {
     let source = api
         .api_key_source
         .as_deref()
         .unwrap_or(crate::state::DEFAULT_API_KEY_SOURCE);
     if source != API_KEY_SOURCE_HEADER {
-        return false;
+        return None;
     }
-    let Some(presented) = req.headers().get(API_KEY_HEADER).filter(|key| !key.is_empty()) else {
-        return false;
-    };
+    let presented = req.headers().get(API_KEY_HEADER).filter(|key| !key.is_empty())?;
     store
         .api_keys
         .values()
         .filter(|key| key.value == presented && key.enabled)
-        .any(|key| associates_stage(store, key, api, stage))
+        .find_map(|key| {
+            let associating = plans_associating(store, key, api, stage);
+            // The key's own `stageKeys` is the OLDER association, which
+            // `CreateApiKey$stageKeys` documents as "DEPRECATED FOR USAGE PLANS -
+            // Specifies stages associated with the API key". It is honoured beside the
+            // plan because the operations that write it still accept it, and a deprecated
+            // association is still an association — but it names no plan, so it carries no
+            // limits to meter against.
+            let by_stage_key = key.stage_keys.contains(&format!("{}/{stage}", api.id));
+            (!associating.is_empty() || by_stage_key).then(|| Metered {
+                key_id: key.id.clone(),
+                // Only a plan whose throttle declares a limit meters anything: a plan
+                // without one admits every request it associates.
+                throttled_plans: associating
+                    .into_iter()
+                    .filter_map(|(plan_id, limits)| limits.map(|limits| (plan_id, limits)))
+                    .collect(),
+            })
+        })
 }
 
-/// Whether the records associate `key` with `stage` of `api`, in EITHER of the two
-/// associations this service's model carries.
+/// The usage plans that associate `key` with `stage` of `api`, each with the limits its
+/// `throttle` declares — `None` for a plan that declares none.
 ///
-/// A USAGE PLAN is the current one: a `UsagePlan` is "used to specify who can access
-/// associated API stages", its `apiStages` name the api and stage its limits apply to, and
-/// a `UsagePlanKey` is the association of one stored API key with one plan. So a client
-/// creates the key, a plan over the api stage, and a plan key — and that key is what the
-/// stage admits.
-///
-/// The key's own `stageKeys` is the OLDER one, which `CreateApiKey$stageKeys` documents as
-/// "DEPRECATED FOR USAGE PLANS - Specifies stages associated with the API key". It is
-/// honoured beside the plan because the operations that write it still accept it, and a
-/// deprecated association is still an association.
-fn associates_stage(
+/// A `UsagePlan` is "used to specify who can access associated API stages", its
+/// `apiStages` name the api and stage its limits apply to, and a `UsagePlanKey` is the
+/// association of one stored API key with one plan. So a client creates the key, a plan
+/// over the api stage, and a plan key — and that key is what the stage admits, metered by
+/// that plan.
+fn plans_associating(
     store: &crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
     key: &ApiKeyEntry,
     api: &RestApiEntry,
     stage: &str,
-) -> bool {
-    let metered_for_stage = store.usage_plans.values().any(|plan| {
-        plan.keys.contains_key(&key.id)
-            && plan.api_stages.iter().any(|api_stage| {
-                api_stage.api_id.as_deref() == Some(api.id.as_str())
-                    && api_stage.stage.as_deref() == Some(stage)
+) -> Vec<(String, Option<crate::state::ThrottleLimits>)> {
+    store
+        .usage_plans
+        .values()
+        .filter(|plan| {
+            plan.keys.contains_key(&key.id)
+                && plan.api_stages.iter().any(|api_stage| {
+                    api_stage.api_id.as_deref() == Some(api.id.as_str())
+                        && api_stage.stage.as_deref() == Some(stage)
+                })
+        })
+        .map(|plan| {
+            (
+                plan.id.clone(),
+                crate::state::ThrottleLimits::declared(plan.throttle.as_ref()),
+            )
+        })
+        .collect()
+}
+
+/// Where a request parameter a method declares travels on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterIn {
+    /// The query string, in either its single- or multi-value spelling.
+    Query,
+    /// A request header, in either spelling.
+    Header,
+    /// A path segment of the resource the method sits on.
+    Path,
+}
+
+/// Where `expression` says a request parameter travels and under what NAME, or `None` for
+/// a key that is no `method.request.{location}.{name}` mapping expression at all.
+fn parameter_source(expression: &str) -> Option<(ParameterIn, &str)> {
+    // The multi-value spellings are tried first: each is a longer prefix than the
+    // single-value one it extends, and both name the same parameter.
+    [
+        (METHOD_REQUEST_MULTI_QUERY_PREFIX, ParameterIn::Query),
+        (METHOD_REQUEST_QUERY_PREFIX, ParameterIn::Query),
+        (METHOD_REQUEST_MULTI_HEADER_PREFIX, ParameterIn::Header),
+        (METHOD_REQUEST_HEADER_PREFIX, ParameterIn::Header),
+        (METHOD_REQUEST_PATH_PREFIX, ParameterIn::Path),
+    ]
+    .into_iter()
+    .find_map(|(prefix, source)| {
+        expression
+            .strip_prefix(prefix)
+            .filter(|name| !name.is_empty())
+            .map(|name| (source, name))
+    })
+}
+
+/// The `RequestValidator` the method names, or `None` when it names none the API holds.
+///
+/// A `Method` names its validator in `requestValidatorId`, and the `RequestValidator` that
+/// id resolves to declares which halves of the request are checked
+/// (`validateRequestParameters`, `validateRequestBody`, each `@default false`): a method
+/// that names none, or names one of the two flags only, is checked exactly as far as it
+/// declares — which is why the four modes differ in what they refuse. A
+/// `requestValidatorId` naming no validator of the API validates nothing: that is a
+/// configuration this emulator cannot apply, and inventing a refusal for it would refuse
+/// requests AWS serves.
+fn declared_validator<'a>(
+    api: &'a RestApiEntry,
+    method: Option<&MethodEntry>,
+) -> Option<&'a crate::state::RequestValidatorEntry> {
+    api.request_validators
+        .get(method?.request_validator_id.as_deref()?)
+}
+
+/// The refusal the PARAMETERS half of the method's request validator earns this request,
+/// or `None` when it declares no parameter check or the request carries everything the
+/// method declares required.
+///
+/// The parameters are checked FIRST, before the payload: a request that does not even
+/// carry what the method declares required is refused for that rather than for whatever
+/// its payload says.
+fn parameters_refusal(
+    api: &RestApiEntry,
+    method: Option<&MethodEntry>,
+    req: &RtRequest,
+) -> Option<GatewayRefusal> {
+    let validator = declared_validator(api, method)?;
+    if !validator.validate_request_parameters {
+        return None;
+    }
+    let missing = missing_parameters(method?, req);
+    (!missing.is_empty()).then(|| bad_request_parameters(&missing))
+}
+
+/// The names of the request parameters the method declares REQUIRED that this request does
+/// not carry, in the order the method declares them.
+///
+/// `Method$requestParameters` is "a key-value map defining required or optional method
+/// request parameters … the value is a Boolean flag indicating whether the parameter is
+/// required", so only the `true` ones can be missing. A parameter is carried when it is
+/// present and NOT BLANK, which is what request validation verifies of a query-string
+/// parameter or a header.
+///
+/// A PATH parameter is never missing: the request path matched the resource template that
+/// declares it, which cannot match with that segment absent.
+fn missing_parameters(method: &MethodEntry, req: &RtRequest) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for (expression, required) in &method.request_parameters {
+        if !required {
+            continue;
+        }
+        let Some((source, name)) = parameter_source(expression) else {
+            continue;
+        };
+        let carried = match source {
+            ParameterIn::Query => query_of(req.uri()).split('&').any(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                key == name && !value.is_empty()
+            }),
+            ParameterIn::Header => req
+                .headers()
+                .get(name.to_ascii_lowercase())
+                .is_some_and(|value| !value.is_empty()),
+            ParameterIn::Path => true,
+        };
+        if !carried && !missing.iter().any(|already| already == name) {
+            missing.push(name.to_string());
+        }
+    }
+    missing
+}
+
+/// The URL the model `model_name` of the API `api_id` is a JSON Schema resource under —
+/// the identifier API Gateway gives a model's schema, which is what a `$ref` from another
+/// model of the same API names.
+fn model_schema_url(api_id: &str, model_name: &str) -> String {
+    format!("https://apigateway.amazonaws.com/restapis/{api_id}/models/{model_name}")
+}
+
+/// The schema resources this validator resolves a `$ref` against: NOTHING but what this
+/// module registered itself.
+///
+/// A `Model`'s schema is a document any caller stores, and `$ref` is a dynamic resolution
+/// mechanism, so a schema could name a resource by any URL — including a `file:` one.
+/// Registering this as the compiler's loader REPLACES the one it comes with, so a
+/// reference the API's own models do not satisfy resolves to an error instead of reaching
+/// the host's filesystem or network: the only resources are the ones
+/// [`PendingBodyCheck::refusal`] adds, which are models of the api being invoked.
+#[derive(Debug)]
+struct NoSchemasBeyondTheApi;
+
+impl ::boon::UrlLoader for NoSchemasBeyondTheApi {
+    fn load(&self, url: &str) -> Result<::serde_json::Value, Box<dyn ::std::error::Error>> {
+        tracing::warn!(
+            reference = %url,
+            "the model's schema references a resource outside the api's own models, which \
+             this emulator resolves nothing for"
+        );
+        Err("this emulator resolves no schema outside the api's own models".into())
+    }
+}
+
+/// What validating one request's PAYLOAD needs, owned: the schema to validate it against
+/// and the sibling schemas that schema references.
+///
+/// Owned rather than borrowed on purpose. Compiling and evaluating a JSON Schema is the
+/// one piece of work in this data plane whose cost a caller's own RECORDS decide, so it is
+/// done with the shared store's lock RELEASED (see [`serve_resolved`]) — one request's
+/// payload check cannot hold up every other request to this service. The copy is of the
+/// stored schema text, which `CreateModel` bounds at
+/// [`crate::ops::create_model::MAX_MODEL_SCHEMA_CHARS`], and of the siblings that schema
+/// names, so the work and the copy are bounded by records a control-plane call had to
+/// store rather than by anything the invoke carries.
+#[derive(Debug)]
+struct PendingBodyCheck {
+    /// The api whose model this is, for the log and the schema's resource URL.
+    api_id: String,
+    /// The model the method declared for this request's content type.
+    model_name: String,
+    /// That model's schema, as stored.
+    schema: String,
+    /// The sibling models the schema REFERENCES by their model-schema URL, as
+    /// `(url, stored schema)`.
+    referenced: Vec<(String, String)>,
+}
+
+/// The payload check the method's request validator declares for this call, or `None` when
+/// it declares none that can be applied.
+///
+/// `Method$requestModels` is "a key-value map specifying data schemas … a key is a content
+/// type and the value is a `Model` name", so a content type the method maps no model to
+/// declares nothing to validate against. `None` is also the answer when the model names no
+/// record of the API or carries no schema: each is a configuration this emulator cannot
+/// validate against, and inventing a refusal for it would refuse requests AWS serves.
+fn pending_body_check(
+    api: &RestApiEntry,
+    method: Option<&MethodEntry>,
+    call: &MethodRequest,
+) -> Option<PendingBodyCheck> {
+    let validator = declared_validator(api, method)?;
+    if !validator.validate_request_body {
+        return None;
+    }
+    let model_name = method?.request_models.get(call.media_type())?;
+    let schema = api.models.get(model_name)?.schema.as_deref()?.to_string();
+    // A schema composed of references to OTHER models of the API resolves them: API
+    // Gateway identifies a model's schema by [`model_schema_url`], so a sibling the schema
+    // REFERENCES BY THAT URL is carried over with it. Only a referenced sibling is, so the
+    // work one request causes is bounded by the references the schema carries rather than
+    // by how many models the API holds.
+    let referenced = if schema.contains("$ref") {
+        api.models
+            .iter()
+            .filter(|(name, _)| *name != model_name)
+            .filter_map(|(name, sibling)| {
+                let url = model_schema_url(&api.id, name);
+                let text = sibling.schema.clone()?;
+                schema.contains(&url).then_some((url, text))
             })
-    });
-    metered_for_stage || key.stage_keys.contains(&format!("{}/{stage}", api.id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(PendingBodyCheck {
+        api_id: api.id.clone(),
+        model_name: model_name.clone(),
+        schema,
+        referenced,
+    })
+}
+
+impl PendingBodyCheck {
+    /// The refusal this request's payload earns against the model, or `None` when it
+    /// satisfies it.
+    ///
+    /// `CreateModel$schema` is "the schema for the model. For application/json models,
+    /// this should be JSON schema draft 4 model", so the payload is validated against that
+    /// document by a JSON Schema validator with draft 4 as the default dialect for a schema
+    /// that names none. A payload that is not a JSON document at all does not satisfy a
+    /// JSON Schema, so an unparseable (including an empty) body is refused exactly as a
+    /// structurally wrong one is; a body the transport did not buffer in memory
+    /// (`None`) is one this emulator cannot read, so it is validated against nothing.
+    ///
+    /// A stored schema this validator cannot READ as a JSON Schema — a document that is a
+    /// JSON object, which is all `CreateModel` requires of it, but no schema, or one whose
+    /// references resolve to nothing — is a method the stage cannot serve as configured:
+    /// the validator the method declares cannot be applied to anything, so the call is
+    /// answered through `API_CONFIGURATION_ERROR` exactly as an integration this module
+    /// cannot perform is, rather than served as if the check had passed.
+    ///
+    /// The work is bounded by its two inputs: the schema is at most
+    /// [`crate::ops::create_model::MAX_MODEL_SCHEMA_CHARS`] and the payload is what the
+    /// front door admitted, and a JSON Schema evaluation applies each keyword of the one
+    /// to the members of the other. Nothing here compiles a pattern into a backtracking
+    /// engine either — the validator's regexes are the `regex` crate's, which has no
+    /// backtracking — so a stored `pattern` cannot make the evaluation super-linear in the
+    /// payload.
+    fn refusal(&self, payload: Option<&[u8]>) -> Option<GatewayRefusal> {
+        let Ok(schema) = ::serde_json::from_str::<::serde_json::Value>(&self.schema) else {
+            return Some(self.unapplicable_schema("it is not a JSON document"));
+        };
+        let Ok(instance) = ::serde_json::from_slice::<::serde_json::Value>(payload?) else {
+            return Some(bad_request_body(unreadable_payload_detail()));
+        };
+
+        let mut compiler = ::boon::Compiler::new();
+        // The only schema resources are the ones registered below: see
+        // [`NoSchemasBeyondTheApi`] for why the compiler's own loader is replaced.
+        compiler.use_loader(Box::new(NoSchemasBeyondTheApi));
+        // "For application/json models, this should be JSON schema draft 4 model"
+        // (`CreateModel$schema`), so draft 4 is the dialect a schema that declares no
+        // `$schema` of its own is read under; one that declares a dialect keeps it.
+        compiler.set_default_draft(::boon::Draft::V4);
+        for (url, text) in &self.referenced {
+            if let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(text) {
+                let _ = compiler.add_resource(url, document);
+            }
+        }
+        let url = model_schema_url(&self.api_id, &self.model_name);
+        if compiler.add_resource(&url, schema).is_err() {
+            return Some(self.unapplicable_schema("it is not a schema resource"));
+        }
+        let mut schemas = ::boon::Schemas::new();
+        let Ok(compiled) = compiler.compile(&url, &mut schemas) else {
+            return Some(self.unapplicable_schema(
+                "it is not a JSON Schema this emulator can compile, or it references a \
+                 resource that resolves to nothing",
+            ));
+        };
+        schemas
+            .validate(&instance, compiled)
+            .err()
+            .map(|failed| bad_request_body(validation_detail(&failed)))
+    }
+
+    /// The refusal a stored schema the validator cannot be built from earns, said once:
+    /// the method declares a check its own records make impossible, which is a
+    /// configuration the stage cannot serve the call through.
+    fn unapplicable_schema(&self, reason: &str) -> GatewayRefusal {
+        tracing::warn!(
+            api_id = %self.api_id,
+            model = %self.model_name,
+            reason = %reason,
+            "the method's request validator cannot be applied: the model's schema is not \
+             one this emulator can validate against"
+        );
+        API_CONFIGURATION_ERROR
+    }
+}
+
+/// The validation detail a payload that is not a JSON document at all earns: there is no
+/// schema finding to report, because the document the schema would be applied to could not
+/// be read.
+fn unreadable_payload_detail() -> String {
+    "[the request body could not be read as a JSON document]".to_string()
+}
+
+/// The validation's own finding about the payload, as one line, for
+/// `$context.error.validationErrorString`.
+///
+/// It is the VALIDATOR's report — which member of the payload failed which keyword of the
+/// model's schema — flattened to one line and bracketed the way API Gateway brackets that
+/// member in a gateway response, so a developer reading the refusal can see which part of
+/// the payload the model rejected. Nothing of it is written here: the schema's own URL line
+/// is dropped (it names the model this emulator compiled, not the payload) and the rest is
+/// the validator's text.
+fn validation_detail(failed: &::boon::ValidationError) -> String {
+    let reported = failed.to_string();
+    let findings = reported
+        .split_once('\n')
+        .map(|(_schema, findings)| findings)
+        .unwrap_or(reported.as_str());
+    let flattened: Vec<&str> = findings
+        .split_whitespace()
+        .filter(|word| *word != "-")
+        .collect();
+    format!("[{}]", flattened.join(" "))
 }
 
 /// What an integration reads off the METHOD REQUEST it serves: the media type the request
@@ -1256,25 +1788,100 @@ fn is_velocity_template(template: &str) -> bool {
             }
             continue;
         }
-        if rest.starts_with('#') || rest.starts_with('*') {
-            return true;
-        }
-        let directive = rest.strip_prefix('{').unwrap_or(rest);
-        if VELOCITY_DIRECTIVES.iter().any(|name| {
-            // The NAME, not a word that starts with it: `#sets` and `#ifconfig` are literal
-            // text, so the name must be followed by something that cannot continue an
-            // identifier (`(`, `}`, a space, the end of the template).
-            directive.strip_prefix(name).is_some_and(|after| {
-                after
-                    .chars()
-                    .next()
-                    .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
-            })
-        }) {
+        if carries_directive_at(rest) {
             return true;
         }
     }
     false
+}
+
+/// Whether `template` carries a Velocity DIRECTIVE — the half of the language that is
+/// statements rather than references, and the half no substitution can stand in for.
+///
+/// Split out from [`is_velocity_template`] so the one place that DOES resolve references —
+/// a gateway response's body template, whose variables are a documented, closed set
+/// ([`gateway_context`]) — can tell "a template naming a variable" from "a template that
+/// has to be executed". TOTAL over every `&str` for the reason [`is_velocity_template`]
+/// gives.
+fn carries_velocity_directive(template: &str) -> bool {
+    for (index, byte) in template.as_bytes().iter().enumerate() {
+        if *byte != b'#' {
+            continue;
+        }
+        let Some(rest) = template.get(index + 1..) else {
+            continue;
+        };
+        if carries_directive_at(rest) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the text right after a `#` begins a directive or a comment marker; see
+/// [`is_velocity_template`] for why the NAME has to end where an identifier cannot
+/// continue.
+fn carries_directive_at(rest: &str) -> bool {
+    if rest.starts_with('#') || rest.starts_with('*') {
+        return true;
+    }
+    let directive = rest.strip_prefix('{').unwrap_or(rest);
+    VELOCITY_DIRECTIVES.iter().any(|name| {
+        directive.strip_prefix(name).is_some_and(|after| {
+            after
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
+        })
+    })
+}
+
+/// The `$context` variables a GATEWAY RESPONSE's template names, and what each one stands
+/// for in the refusal being answered.
+///
+/// A gateway response is answered for a request that reached no integration, so the
+/// variables it can resolve are the ones describing the REFUSAL. API Gateway's own default
+/// template for every type is `{"message":$context.error.messageString}` — the
+/// `messageString` form is "the quoted value of `$context.error.message`", quotes
+/// included, which is why that template produces a JSON object — beside the message
+/// itself, the gateway response type the refusal is answered through, and the validation
+/// detail, which is a PLAIN string and which only a refusal that VALIDATED the request
+/// has ([`GatewayRefusal::validation_detail`]).
+fn gateway_context(refusal: &GatewayRefusal) -> Vec<(&'static str, String)> {
+    // Longest path first: `context.error.message` is a PREFIX of
+    // `context.error.messageString`, so substituting it first would leave `String` behind.
+    vec![
+        ("context.error.validationErrorString", refusal.validation_detail.to_string()),
+        (
+            "context.error.messageString",
+            ::serde_json::Value::String(refusal.message.to_string()).to_string(),
+        ),
+        ("context.error.responseType", refusal.response_type.to_string()),
+        ("context.error.message", refusal.message.to_string()),
+    ]
+}
+
+/// The body a gateway response's `application/json` template renders to for `refusal`, or
+/// `None` when this emulator cannot render it.
+///
+/// The template's `$context` references are resolved from [`gateway_context`], in both
+/// spellings the language writes a reference in (`$context.error.message` and
+/// `${context.error.message}`); a reference to anything else is left in the body exactly as
+/// the template wrote it, which is what the language itself does with a reference it cannot
+/// resolve. A template carrying a DIRECTIVE is a template that has to be EXECUTED, which
+/// this emulator does not do: it renders nothing rather than a body it guessed at, and the
+/// caller gets API Gateway's own default body for the response type.
+fn rendered_gateway_template(template: &str, refusal: &GatewayRefusal) -> Option<String> {
+    if carries_velocity_directive(template) {
+        return None;
+    }
+    let mut rendered = template.to_string();
+    for (path, value) in gateway_context(refusal) {
+        rendered = rendered
+            .replace(&format!("${{{path}}}"), &value)
+            .replace(&format!("${path}"), &value);
+    }
+    Some(rendered)
 }
 
 /// The resource path of the DEPLOYMENT that matches `request_path`, most specific first.
@@ -1395,9 +2002,20 @@ pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
 }
 
 /// One gateway-response refusal, rendered as the API serves it on the wire.
+///
+/// The response NAMES the error shape it is the wire form of, in the header an SDK reads a
+/// restJson1 error code out of, for every refusal whose exception this service's model
+/// declares ([`GatewayRefusal::error_type`]).
 fn refusal_response(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> RtResponse {
+    let error_type = refusal.error_type;
     let (status, body) = refusal_rendering(api, refusal);
-    response_with(status, JSON_CONTENT_TYPE, body)
+    let mut response = response_with(status, JSON_CONTENT_TYPE, body);
+    if let Some(error_type) = error_type {
+        let _ = response
+            .headers_mut()
+            .try_insert(ERROR_TYPE_HEADER, error_type);
+    }
+    response
 }
 
 /// The status and body one gateway-response refusal renders to, as the API answers it.
@@ -1405,9 +2023,9 @@ fn refusal_response(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> RtRe
 /// The status code is the API's customization of this response type when it has one, then
 /// its customization of the whole class (`DEFAULT_4XX` / `DEFAULT_5XX`), then the status
 /// code the response type itself documents. The body is the customized
-/// `application/json` template when that template is a literal, and otherwise the default
-/// `{"message": …}` body — a template carrying Velocity is not evaluated here, for the
-/// reason the module docs give.
+/// `application/json` template with its `$context` references resolved
+/// ([`rendered_gateway_template`]), and otherwise the default `{"message": …}` body — which
+/// is what a template this emulator cannot render falls back to.
 ///
 /// Separate from [`refusal_response`] because the data plane SENDS this rendering while
 /// `TestInvokeMethod` REPORTS it as the simulated response, and a developer's
@@ -1429,10 +2047,10 @@ pub fn refusal_rendering(api: Option<&RestApiEntry>, refusal: GatewayRefusal) ->
     let templated = customized
         .and_then(|response| response.response_templates.as_ref())
         .and_then(|templates| templates.get(JSON_CONTENT_TYPE))
-        .filter(|template| !is_velocity_template(template));
+        .and_then(|template| rendered_gateway_template(template, &refusal));
     let body = match templated {
-        Some(template) => template.clone().into_bytes(),
-        None => ::serde_json::json!({ MESSAGE_MEMBER: refusal.message })
+        Some(template) => template.into_bytes(),
+        None => ::serde_json::json!({ MESSAGE_MEMBER: refusal.message.as_ref() })
             .to_string()
             .into_bytes(),
     };

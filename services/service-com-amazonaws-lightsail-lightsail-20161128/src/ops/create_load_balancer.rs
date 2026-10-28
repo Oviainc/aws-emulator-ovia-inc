@@ -359,6 +359,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     arn: crate::state::load_balancer_tls_certificate_arn(&region, &certificate_id),
                     support_code: crate::state::support_code(&certificate_id),
                     created_at_ms: now,
+                    // Where the certificate is: the load balancer this call
+                    // creates is what holds and locates it.
+                    location: location.clone(),
                     domain_name,
                     alternative_names,
                     is_attached: false,

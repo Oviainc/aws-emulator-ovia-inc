@@ -170,11 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DeleteQueueErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
         let mut state = store.lock();
+        // A queue url resolves in the region the request addressed, so a delete reaches
+        // only this region's queue of that name.
+        let region = sqs::request_region(ctx.parts());
 
         // Whether this caller may delete this queue is decided against the queue's own
         // policy and the caller's identity-based policies, before it is removed: a delete
         // no statement allows is refused and the queue survives.
-        if let Some(queue) = state.queue_by_url(&input.queue_url) {
+        if let Some(queue) = state.queue_by_url(&region, &input.queue_url) {
             let (queue_arn, policy) = (queue.arn.clone(), queue.policy().map(str::to_string));
             if let Some(denied) = sqs::authorization::denied(
                 &*self.engine,
@@ -192,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // now: "If you delete a queue, you must wait at least 60 seconds before creating
         // a queue with the same name."
         if state
-            .remove_queue_by_url(&input.queue_url, ::std::time::SystemTime::now())
+            .remove_queue_by_url(&region, &input.queue_url, ::std::time::SystemTime::now())
             .is_none()
         {
             return Err(DeleteQueueErrorModeled::QueueDoesNotExist(

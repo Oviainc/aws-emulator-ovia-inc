@@ -46,7 +46,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
     at, bring_every_completion_forward, call, get_assessment, minimal_assessment,
-    register_collector_in, start_assessment, stop_assessment, Answer, TEST_REGION,
+    mount_object_storage, register_collector_in, start_assessment, stop_assessment, Answer,
+    TEST_BUCKETS, TEST_REGION,
 };
 
 /// `StrategyRecommendation`'s value for a strategy the service itself recommends, from
@@ -380,6 +381,8 @@ fn portfolio() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine.clone()));
+    // And the buckets a start call names, in the object storage it resolves them against.
+    mount_object_storage(&mut router, &engine, TEST_BUCKETS);
     (engine, router)
 }
 

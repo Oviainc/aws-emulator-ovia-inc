@@ -188,15 +188,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clearing the reference is the caller's own `UpdateMethod` or `DeleteMethod`.
         // The authorizer is resolved FIRST, so an id that names no authorizer is the
         // not-found it always was whether or not a method carries that identifier.
-        if !api.authorizers.contains_key(&input.authorizer_id) {
+        let Some(authorizer) = api.authorizers.get(&input.authorizer_id) else {
             return Err(DeleteAuthorizerErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::NO_SUCH_AUTHORIZER.to_string()),
             })
             .into());
-        }
-        if api.authorizer_is_referenced(&input.authorizer_id) {
+        };
+        // The refusal NAMES the blocked authorizer and the method that still points at
+        // it: those are the two records the caller has to act on, and the name comes from
+        // the record resolved above rather than from the request, which carries only its
+        // id.
+        let authorizer_name = authorizer.name.clone();
+        if let Some(referencing) = api.method_referencing_authorizer(&input.authorizer_id) {
             return Err(DeleteAuthorizerErrorModeled::ConflictException(ConflictException {
-                message: Some(crate::state::AUTHORIZER_IN_USE.to_string()),
+                message: Some(crate::state::authorizer_in_use(
+                    &authorizer_name,
+                    &referencing,
+                )),
             })
             .into());
         }

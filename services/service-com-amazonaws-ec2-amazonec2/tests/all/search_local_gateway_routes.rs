@@ -131,6 +131,9 @@ impl RouteRow {
             coip_pool_id: None,
             route_type: self.route_type.to_string(),
             state: self.state.to_string(),
+            // Each seeded route is written in the state its row names and stays in it:
+            // nothing in this table is a route a call of this emulator just introduced.
+            becomes: None,
         };
         match self.target {
             Target::VirtualInterfaceGroup(id) => {
@@ -527,6 +530,7 @@ async fn a_route_search_filter_relates_address_ranges_not_destination_text() {
                 coip_pool_id: None,
                 route_type: LOCAL_GATEWAY_ROUTE_TYPE_STATIC.to_string(),
                 state: ROUTE_STATE_ACTIVE.to_string(),
+                becomes: None,
             };
             let stored = guard
                 .insert_local_gateway_route(spec)

@@ -184,35 +184,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
 
-        let registry = state
-            .registries
-            .get_mut(&input.registry_name)
-            .ok_or_else(|| {
-                PutCodeBindingError::from(PutCodeBindingErrorModeled::NotFoundException(
-                    crate::state::registry_not_found(&input.registry_name),
-                ))
-            })?;
-        let schema = registry.schemas.get_mut(&input.schema_name).ok_or_else(|| {
-            PutCodeBindingError::from(PutCodeBindingErrorModeled::NotFoundException(
-                crate::state::schema_not_found(&input.schema_name),
-            ))
-        })?;
+        // The one resolution every call that names a schema version makes: the
+        // registry, the schema in it and the version the request selects, each step
+        // answering its own refusal. See `crate::state::schema_at_version_mut`, which
+        // resolves it and hands the schema back for the binding this put attaches.
+        //
         // `SchemaVersion` "limits the results to only this schema version"; absent, the
         // latest stored version is the one generation runs against. The number is
         // resolved HERE and stored on the binding, so a later version of the schema
         // does not silently re-point a binding that was generated from this one.
-        let version = schema
-            .version_for(input.schema_version.as_deref())
-            .ok_or_else(|| {
+        let (schema, version) = state
+            .schema_at_version_mut(
+                &input.registry_name,
+                &input.schema_name,
+                input.schema_version.as_deref(),
+            )
+            .map_err(|refusal| {
                 PutCodeBindingError::from(PutCodeBindingErrorModeled::NotFoundException(
-                    crate::state::schema_version_not_found(
-                        &input.registry_name,
-                        &input.schema_name,
-                        input.schema_version.as_deref(),
-                    ),
+                    refusal.not_found(),
                 ))
-            })?
-            .version;
+            })?;
 
         // ONE clock reading for the whole call: the instant this request is served.
         // The binding is created at it and its generation is due a fixed span later,

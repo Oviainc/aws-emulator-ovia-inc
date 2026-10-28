@@ -187,31 +187,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // describes in a row cannot differ for having been called.
         let state = store.lock();
 
-        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
-            DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&input.registry_name),
-            ))
-        })?;
-        let schema = registry.schemas.get(&input.schema_name).ok_or_else(|| {
-            DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
-                crate::state::schema_not_found(&input.schema_name),
-            ))
-        })?;
+        // The one resolution every read that names a schema version makes: the
+        // registry, the schema in it and the version the request selects, each step
+        // answering its own refusal. See `crate::state::readable_schema_version`.
+        //
         // `SchemaVersion` "limits the results to only this schema version"; absent, the
         // latest stored version answers, which is the version a put with no
         // `SchemaVersion` generated against.
-        let version = schema
-            .version_for(input.schema_version.as_deref())
-            .ok_or_else(|| {
-                DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
-                    crate::state::schema_version_not_found(
-                        &input.registry_name,
-                        &input.schema_name,
-                        input.schema_version.as_deref(),
-                    ),
-                ))
-            })?
-            .version;
+        let crate::state::ResolvedSchemaVersion { schema, version, .. } = state
+            .readable_schema_version(
+                &input.registry_name,
+                &input.schema_name,
+                input.schema_version.as_deref(),
+            )
+            .map_err(|refusal| {
+                DescribeCodeBindingError::from(
+                    DescribeCodeBindingErrorModeled::NotFoundException(refusal.not_found()),
+                )
+            })?;
+        // The binding is keyed by the version NUMBER, as `PutCodeBinding` stored it: a
+        // code binding is a resource of the version it was generated from.
+        let version = version.version;
 
         // A binding exists only once a put started its generation: describing one
         // nobody asked for is a 404, exactly as for a schema that was never created.

@@ -165,7 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Reporting which queues redrive here reads the store and writes nothing: the
         // answer is a function of the queues' current `RedrivePolicy` values.
-        let _ = ctx;
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             ListDeadLetterSourceQueuesErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
@@ -190,11 +189,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The URL of a dead-letter queue": the queue whose sources are wanted has to be
-        // one this account has, which is the absence `QueueDoesNotExist` reports, and it
-        // is resolved exactly as every url-addressed operation of this service resolves
-        // one.
+        // one this account has IN THE REGION this call addressed, which is the absence
+        // `QueueDoesNotExist` reports, and it is resolved exactly as every url-addressed
+        // operation of this service resolves one.
+        let region = sqs::request_region(ctx.parts());
         let dead_letter_name = sqs::queue_name_from_url(&input.queue_url)
-            .filter(|name| state.queues.contains_key(*name))
+            .filter(|name| state.holds_queue(&region, name))
             .ok_or_else(|| {
                 ListDeadLetterSourceQueuesErrorModeled::QueueDoesNotExist(
                     sqs::queue_does_not_exist(),
@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Name-ordered, so a page boundary means the same thing on the next call.
-        let sources = state.dead_letter_source_queue_names(dead_letter_name);
+        let sources = state.dead_letter_source_queue_names(&region, dead_letter_name);
 
         // Where this request's `NextToken` continues the listing, under the one cursor
         // rule every paged listing of this service shares.
@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page: Vec<&String> = sources.iter().skip(start).take(page_size).collect();
         let queue_urls: Vec<String> = page
             .iter()
-            .filter_map(|name| state.queues.get(*name).map(|queue| queue.url.clone()))
+            .filter_map(|name| state.queue(&region, name).map(|queue| queue.url.clone()))
             .collect();
 
         Ok(ListDeadLetterSourceQueuesOutput {

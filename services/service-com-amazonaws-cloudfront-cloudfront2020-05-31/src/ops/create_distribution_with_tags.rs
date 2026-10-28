@@ -359,6 +359,13 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionWit
                 },
             )
         }
+        crate::state::CreateRefusal::InvalidLambdaFunctionAssociation(message) => {
+            CreateDistributionWithTagsErrorModeled::InvalidLambdaFunctionAssociation(
+                InvalidLambdaFunctionAssociation {
+                    message: Some(message),
+                },
+            )
+        }
     }
     .into()
 }

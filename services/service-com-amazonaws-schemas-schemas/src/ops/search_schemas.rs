@@ -217,11 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = store.lock();
 
-        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
-            SearchSchemasError::from(SearchSchemasErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&input.registry_name),
-            ))
-        })?;
+        // The registry step of the one read resolution — the whole of it for a search
+        // that names no schema. See `crate::state::readable_registry`.
+        let registry = state
+            .readable_registry(&input.registry_name)
+            .map_err(|refusal| {
+                SearchSchemasError::from(SearchSchemasErrorModeled::NotFoundException(
+                    refusal.not_found(),
+                ))
+            })?;
 
         // The members that decide WHICH schemas this search contains. Bound into the
         // `NextToken`, so a token cannot resume a differently-selected search.
