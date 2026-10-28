@@ -105,6 +105,8 @@ mod open_id_connect_provider_tag_removal;
 mod open_id_connect_provider_tag_updates;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
+#[path = "all/organizations_access_report_generation.rs"]
+mod organizations_access_report_generation;
 #[path = "all/permissions_boundary_ceiling.rs"]
 mod permissions_boundary_ceiling;
 #[path = "all/policies_granting_service_access.rs"]

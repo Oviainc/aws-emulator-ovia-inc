@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's MINIMUM THROUGHPUT BILLING COMMITMENT: the status the stored
+//! commitment carries at this instant, the instant an enable started it, the earliest instant
+//! it may end at and the instant it ended at. A reporting operation, so the only change it
+//! materialises is the end the clock already owes a commitment a disable was accepted for.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -80,10 +77,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `DescribeAccountSettingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DescribeAccountSettings")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DescribeAccountSettings",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as
+    // `DescribeLimits` widens it: this SERVICE models it ("The processing of the request
+    // failed because of an unknown error, exception, or failure"), the operation shape does
+    // not list it, and it is the only honest answer for a service mounted on an engine that
+    // holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DescribeAccountSettingsErrorModeled {
     LimitExceededException(LimitExceededException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -134,21 +140,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _input: Self::Input,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountSettings"))
+        // "Describes the account-level settings for Amazon Kinesis Data Streams": what is
+        // reported is "the minimum throughput billing commitment for your Amazon Web Services
+        // account" (`DescribeAccountSettingsOutput$MinimumThroughputBillingCommitment`), so
+        // every endpoint of this account reads the one stored commitment and the request
+        // carries nothing to resolve.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAccountSettingsError::from(
+                DescribeAccountSettingsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // A read reports what the store holds AT this instant and leaves it exactly as it
+        // was: a commitment whose scheduled end has fallen due reads as ended without this
+        // call writing anything, because the status is derived from the stored end instant.
+        let now = ::std::time::SystemTime::now();
+        let commitment = state.lock().commitment_at(now);
+
+        Ok(DescribeAccountSettingsOutput {
+            minimum_throughput_billing_commitment: Some(commitment),
+        })
     }
 }

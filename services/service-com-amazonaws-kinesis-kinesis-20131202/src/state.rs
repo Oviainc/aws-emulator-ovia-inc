@@ -13,6 +13,12 @@
 //! encryption configuration `CreateChannel` resolves every documented default into, the ARN
 //! and id a channel is addressed by, and the `CREATING` -> `ACTIVE` and `UPDATING` ->
 //! `ACTIVE` transitions the clock owes it ([`Channel::status`]).
+//!
+//! It owns this account's minimum throughput billing commitment the same way
+//! ([`Commitment`]): the instant an enable started it, the earliest instant it may end at,
+//! and the end a disable scheduled for it, with the `ENABLED` ->
+//! `ENABLED_UNTIL_EARLIEST_ALLOWED_END` -> `DISABLED` transitions decided in one place
+//! ([`Commitment::status`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,7 +26,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     ChannelDescription, ChannelEncryptionConfiguration, ChannelLoggingConfiguration,
     ChannelStreamDescription, ChannelStreamIdentifier, ChannelSummary, ChildShard, CloudWatchLogs,
-    Consumer, ConsumerDescription, EnhancedMetrics, HashKeyRange, Record, S3DestinationDescription,
+    Consumer, ConsumerDescription, EnhancedMetrics, HashKeyRange,
+    MinimumThroughputBillingCommitmentOutput, Record, S3DestinationDescription,
     S3TablesDestinationDescription, SequenceNumberRange, Shard, StreamDescription,
     StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag, WarmThroughputObject,
     METRICS_NAME_VALUES,
@@ -89,6 +96,28 @@ pub const RESHARD_DELAY: Duration = Duration::from_millis(500);
 /// and a second change that overlaps the first is refused rather than served. The instant
 /// it falls due is stored on the record and never slept on.
 pub const MODE_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// An account that holds a standing minimum throughput billing commitment, spelled as
+/// `MinimumThroughputBillingCommitmentOutputStatus` models it
+/// (`smithy_query(query="shape",shape="MinimumThroughputBillingCommitmentOutputStatus")`).
+pub const COMMITMENT_ENABLED: &str = "ENABLED";
+
+/// An account that holds no standing minimum throughput billing commitment, which is what
+/// an account that has never asked for one carries.
+pub const COMMITMENT_DISABLED: &str = "DISABLED";
+
+/// A standing commitment a disable has already been accepted for, which stands until its
+/// earliest allowed end: "If you attempt to disable a commitment before the minimum
+/// commitment period ends, the commitment will be scheduled for automatic disable at the
+/// earliest allowed end time" (`MinimumThroughputBillingCommitmentInput`).
+pub const COMMITMENT_ENABLED_UNTIL_EARLIEST_ALLOWED_END: &str =
+    "ENABLED_UNTIL_EARLIEST_ALLOWED_END";
+
+/// How long a minimum throughput billing commitment stands before it may end: "Commitments
+/// have a minimum duration of 24 hours that must be honored before they can be disabled"
+/// (`MinimumThroughputBillingCommitmentInput`). A DOCUMENTED duration, so it keeps the value
+/// the doc states rather than a span this emulator chooses.
+pub const MINIMUM_COMMITMENT_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// A consumer that is still being registered, spelled as `ConsumerStatus` models it
 /// (`smithy_query(query="shape",shape="ConsumerStatus")`). "A consumer can't read data
@@ -1717,6 +1746,99 @@ impl Channel {
     }
 }
 
+/// The minimum throughput billing commitment this account holds: the instant it started, the
+/// earliest instant it may end at, and the instant it ends at once an end has been reached or
+/// scheduled.
+///
+/// `UpdateAccountSettings` writes it and `DescribeAccountSettings` reports it, both through
+/// [`Self::to_shape`]. [`Self::status`] is the single place where the `ENABLED` ->
+/// `ENABLED_UNTIL_EARLIEST_ALLOWED_END` -> `DISABLED` transitions are decided, so the end the
+/// clock owes a scheduled disable is materialised by whoever reads it rather than slept on.
+#[derive(Debug, Clone)]
+pub struct Commitment {
+    /// "The timestamp when the commitment was started"
+    /// (`MinimumThroughputBillingCommitmentOutput$StartedAt`).
+    pub started_at: SystemTime,
+    /// "The earliest timestamp when the commitment can be ended" (same shape,
+    /// `EarliestAllowedEndAt`): one [`MINIMUM_COMMITMENT_DURATION`] past the start.
+    pub earliest_allowed_end_at: SystemTime,
+    /// The instant this commitment ends at, once an end has been reached or scheduled;
+    /// `None` on a commitment no disable has been accepted for.
+    pub ends_at: Option<SystemTime>,
+}
+
+impl Commitment {
+    /// The commitment an enable starts at `at`, which stands until it is both disabled and
+    /// past the minimum duration it has to honour.
+    pub fn started_at(at: SystemTime) -> Self {
+        Self {
+            started_at: at,
+            earliest_allowed_end_at: at + MINIMUM_COMMITMENT_DURATION,
+            ends_at: None,
+        }
+    }
+
+    /// The status this commitment carries at `now`: one no disable has been accepted for is
+    /// `ENABLED`, one whose end is still ahead stands until it
+    /// (`ENABLED_UNTIL_EARLIEST_ALLOWED_END`), and one whose end has fallen due is
+    /// `DISABLED`.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        match self.ends_at {
+            None => COMMITMENT_ENABLED,
+            Some(ends_at) if ends_at <= now => COMMITMENT_DISABLED,
+            Some(_) => COMMITMENT_ENABLED_UNTIL_EARLIEST_ALLOWED_END,
+        }
+    }
+
+    /// The instant this commitment HAS ended at, which is what "The timestamp when the
+    /// commitment was ended" (`MinimumThroughputBillingCommitmentOutput$EndedAt`) names: a
+    /// commitment whose scheduled end is still ahead has not ended, so it carries none.
+    pub fn ended_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.ends_at.filter(|ends_at| *ends_at <= now)
+    }
+
+    /// Cancel the end a disable scheduled for this commitment: "You can cancel a pending
+    /// disable by enabling the commitment again before the earliest allowed end time"
+    /// (`MinimumThroughputBillingCommitmentInput`). A commitment no disable has been accepted
+    /// for is left exactly as it stands, so enabling twice starts no second window.
+    pub fn cancel_end(&mut self) {
+        self.ends_at = None;
+    }
+
+    /// Schedule this commitment's end at the earliest instant it may end at, which is `now`
+    /// once the minimum duration it has to honour has passed and the earliest allowed end
+    /// otherwise. A commitment whose end is already scheduled or reached keeps that end, so
+    /// disabling twice brings it no closer.
+    pub fn schedule_end(&mut self, now: SystemTime) {
+        if self.ends_at.is_none() {
+            self.ends_at = Some(self.earliest_allowed_end_at.max(now));
+        }
+    }
+
+    /// This record as the modelled `MinimumThroughputBillingCommitmentOutput`, which is what
+    /// both account-settings operations answer with.
+    pub fn to_shape(&self, now: SystemTime) -> MinimumThroughputBillingCommitmentOutput {
+        MinimumThroughputBillingCommitmentOutput {
+            status: self.status(now).to_string(),
+            started_at: Some(timestamp(self.started_at)),
+            ended_at: self.ended_at(now).map(timestamp),
+            earliest_allowed_end_at: Some(timestamp(self.earliest_allowed_end_at)),
+        }
+    }
+}
+
+/// What the account-settings operations report for an account that has never asked for a
+/// minimum throughput billing commitment: a commitment is something an account opts into, so
+/// none stands and there is no instant to report for one.
+pub fn no_commitment() -> MinimumThroughputBillingCommitmentOutput {
+    MinimumThroughputBillingCommitmentOutput {
+        status: COMMITMENT_DISABLED.to_string(),
+        started_at: None,
+        ended_at: None,
+        earliest_allowed_end_at: None,
+    }
+}
+
 /// Per-service state for com-amazonaws-kinesis-kinesis-20131202. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKinesisKinesis20131202State {
@@ -1726,6 +1848,12 @@ pub struct ComAmazonawsKinesisKinesis20131202State {
     /// within your Amazon Web Services account and Amazon Web Services Region"
     /// (`CreateChannelInput$ChannelName`).
     pub channels: HashMap<RegionalName, Channel>,
+    /// The minimum throughput billing commitment this account holds, `None` while it has
+    /// never asked for one. ONE record, not one per region: what `UpdateAccountSettings`
+    /// writes is "your account's updated settings" and what `DescribeAccountSettings` reports
+    /// is "the minimum throughput billing commitment for your Amazon Web Services account",
+    /// so every endpoint of the one account this emulator holds reads the same commitment.
+    pub commitment: Option<Commitment>,
 }
 
 impl ComAmazonawsKinesisKinesis20131202State {
@@ -1993,6 +2121,45 @@ impl ComAmazonawsKinesisKinesis20131202State {
     /// [`MAX_CHANNELS_TOTAL`] bounds: the ceiling no request can partition.
     pub fn channels_held(&self) -> usize {
         self.channels.len()
+    }
+
+    /// The minimum throughput billing commitment this account holds at `now`, as the shape
+    /// both account-settings operations report it with. An account that has never asked for
+    /// one reports [`no_commitment`].
+    pub fn commitment_at(&self, now: SystemTime) -> MinimumThroughputBillingCommitmentOutput {
+        self.commitment
+            .as_ref()
+            .map(|commitment| commitment.to_shape(now))
+            .unwrap_or_else(no_commitment)
+    }
+
+    /// Take this account's minimum throughput billing commitment to the status the request
+    /// asks for at `now`, and answer what it carries once the change is stored.
+    ///
+    /// Enabling holds a commitment: it starts one when none stands, and cancels the end a
+    /// disable scheduled for one that does. Disabling ends one: at `now` when the minimum
+    /// duration it has to honour has passed, and at its earliest allowed end otherwise.
+    /// Either way, asking for the status the account already carries changes nothing.
+    pub fn set_commitment(
+        &mut self,
+        now: SystemTime,
+        enabled: bool,
+    ) -> MinimumThroughputBillingCommitmentOutput {
+        match (&mut self.commitment, enabled) {
+            // A commitment that has already ended is spent: enabling starts a NEW one, whose
+            // own minimum duration runs from this instant. One that still stands keeps the
+            // start and the earliest allowed end it was created with, and only loses the end a
+            // disable had scheduled for it.
+            (Some(commitment), true) if commitment.status(now) != COMMITMENT_DISABLED => {
+                commitment.cancel_end();
+            }
+            (_, true) => self.commitment = Some(Commitment::started_at(now)),
+            (Some(commitment), false) => commitment.schedule_end(now),
+            // Nothing to end, and nothing to record either: an account that has never asked
+            // for a commitment holds none whether it asks for that or not.
+            (None, false) => {}
+        }
+        self.commitment_at(now)
     }
 
     /// Every channel `region`'s endpoint holds, ordered by name.

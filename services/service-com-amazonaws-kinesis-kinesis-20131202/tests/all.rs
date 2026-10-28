@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_limits.rs"]
 mod account_limits;
+#[path = "all/account_settings.rs"]
+mod account_settings;
 #[path = "all/batch_write_failure_count.rs"]
 mod batch_write_failure_count;
 #[path = "all/capacity_mode.rs"]

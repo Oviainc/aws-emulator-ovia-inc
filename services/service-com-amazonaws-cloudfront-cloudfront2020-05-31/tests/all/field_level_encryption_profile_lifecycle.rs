@@ -68,7 +68,7 @@ pub(crate) async fn create_profile(router: &MultiServiceRouter, body: &str) -> A
 }
 
 /// `GET /2020-05-31/field-level-encryption-profile/{Id}`.
-async fn get_profile(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_profile(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -80,7 +80,7 @@ async fn get_profile(router: &MultiServiceRouter, id: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/field-level-encryption-profile/{Id}/config`.
-async fn get_profile_config(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_profile_config(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -96,7 +96,7 @@ async fn get_profile_config(router: &MultiServiceRouter, id: &str) -> Answer {
 /// A profile's encryption entities name a public key that must already be stored, so every
 /// case below starts from keys uploaded through the public key surface itself rather than
 /// from an id made up here.
-async fn upload_key(router: &MultiServiceRouter, index: usize) -> String {
+pub(crate) async fn upload_key(router: &MultiServiceRouter, index: usize) -> String {
     let body = format!(
         "<PublicKeyConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>fle-profile-key-{index}</CallerReference>\
@@ -275,7 +275,7 @@ impl Profile {
 
     /// Assert that `config` — a `FieldLevelEncryptionProfileConfig` element the emulator
     /// serialised — reports exactly this configuration.
-    fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
+    pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
         for (member, expected) in [
             ("Name", Some(self.name.clone())),
             ("CallerReference", Some(self.caller_reference.clone())),
