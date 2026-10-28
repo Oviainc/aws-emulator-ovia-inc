@@ -368,18 +368,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Does an association in this `SubnetCidrBlockStateCode` / `VpcCidrBlockStateCode` state
 /// still HOLD the block it names?
 ///
-/// `associating` and `associated` do — the block is on its way in or in — while
-/// `disassociating`, `disassociated`, `failing` and `failed` do not: the block is on its
-/// way out, gone, or was never taken. An association carrying no state at all is read as
-/// holding its block, since every writer of this crate sets one. The two enums share these
-/// words (`smithy_query(query="shape",shape="SubnetCidrBlockStateCode,VpcCidrBlockStateCode")`),
-/// so one reader answers for a subnet's association and for its VPC's.
+/// The rule itself lives beside the store the other readers of it ask
+/// ([`crate::state::cidr_association_holds_its_block`]), so this operation and every
+/// operation that assigns an address out of a subnet's IPv6 block agree about which
+/// association holds one.
 fn holds_its_block(state: Option<&str>) -> bool {
-    match state {
-        None => true,
-        Some(state) => {
-            state == crate::state::CIDR_BLOCK_STATE_ASSOCIATING
-                || state == crate::state::CIDR_BLOCK_STATE_ASSOCIATED
-        }
-    }
+    crate::state::cidr_association_holds_its_block(state)
 }

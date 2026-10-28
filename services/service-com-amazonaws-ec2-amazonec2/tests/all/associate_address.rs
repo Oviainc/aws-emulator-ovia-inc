@@ -658,7 +658,7 @@ async fn a_request_it_cannot_serve_is_refused_and_stores_nothing() {
                 p("NetworkInterfaceId", "eni-0a1b2c3"),
             ],
             400,
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             "an id of another resource kind in networkInterfaceId",
@@ -667,7 +667,7 @@ async fn a_request_it_cannot_serve_is_refused_and_stores_nothing() {
                 p("NetworkInterfaceId", "subnet-0123456789abcdef0"),
             ],
             400,
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             "a private address the instance does not have",

@@ -9,7 +9,7 @@
 //!
 //! A `NetworkInterfaceId` is resolved against the account's network interfaces — the same
 //! store `CreateNetworkInterface` writes and `DescribeNetworkInterfaces` reports: a value
-//! that is not an interface id is refused `InvalidNetworkInterfaceID.Malformed` and a
+//! that is not an interface id is refused `InvalidNetworkInterfaceId.Malformed` and a
 //! well-formed id the account holds no interface for `InvalidNetworkInterfaceID.NotFound`.
 //! Associating an address with an INTERFACE rather than with an instance is work this slice
 //! has not done, so an id the store DOES hold is refused rather than answered with an

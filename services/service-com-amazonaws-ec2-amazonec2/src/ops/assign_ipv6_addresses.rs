@@ -1,15 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssignIpv6Addresses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssignIpv6Addresses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes IPv6 addresses — and IPv6 Prefix Delegation prefixes — out of the
+//! IPv6 CIDR block of the subnet the named network interface sits in, and records them on
+//! that interface, so a later `DescribeNetworkInterfaces` reports them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssignIpv6Addresses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! The addresses an interface holds live on the interface record itself
+//! (`NetworkInterface$Ipv6Addresses` / `$Ipv6Prefixes`), which is therefore the in-use pool
+//! as well: what a caller may name and what the service may choose are judged against the
+//! same records ([`crate::state::ipv6_address_is_taken`] /
+//! [`crate::state::ipv6_prefix_is_free`]), so no two interfaces of an account can be handed
+//! the same IPv6 address or overlapping ranges.
+//!
+//! What it refuses, and why:
+//!
+//! * `InvalidNetworkInterfaceId.Malformed` (400) — the value is not a network interface id
+//!   at all, so there is nothing to look up
+//!   ([`crate::state::network_interface_id_is_well_formed`]).
+//! * `InvalidNetworkInterfaceID.NotFound` (400) — a well-formed id the account holds no
+//!   interface for.
+//! * `InvalidParameterCombination` (400) — the addresses AND their count, or the prefixes
+//!   AND their count: "You can't use this option if specifying specific IPv6 addresses"
+//!   (below).
+//! * `MissingParameter` (400) — neither the addresses nor a count of them, and no prefixes
+//!   either: "You must specify either the IPv6 addresses or the IPv6 address count in the
+//!   request" (below), so the request asks for nothing.
+//! * `InvalidParameterValue` (400) — a negative count, a value that is not an IPv6 address
+//!   or prefix, one outside the subnet's assignable range, or a subnet with no IPv6 CIDR
+//!   block to assign out of.
+//! * `InvalidIPAddress.InUse` (400) — an address or a range something in the account
+//!   already holds.
+//! * `InsufficientFreeAddressesInSubnet` (400) — the subnet's block has fewer free
+//!   addresses, or fewer free prefixes, than the request asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +179,271 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssignIpv6Addresses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssignIpv6AddressesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssignIpv6Addresses"))
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // interface is named by the request, and every address and prefix comes out of that
+        // interface's own subnet. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        let network_interface_id = input.network_interface_id.as_str();
+
+        // A value that is not a network interface id at all is refused BEFORE the store is
+        // asked about it, the way the service orders the two: there is nothing to look up.
+        if !state::network_interface_id_is_well_formed(network_interface_id) {
+            return Err(state::invalid_network_interface_id_malformed(
+                network_interface_id,
+            ));
+        }
+
+        // "You must specify either the IPv6 addresses or the IPv6 address count in the
+        // request" and "You must specify either the IPV6 Prefix Delegation prefixes, or the
+        // IPv6 Prefix Delegation count" (above): the four members pair into two asks, each
+        // of which is either NAMED or COUNTED — "You can't use this option if specifying
+        // specific IPv6 addresses" (`Ipv6AddressCount`).
+        let named_addresses: Vec<&str> = input
+            .ipv6_addresses
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let address_count = input.ipv6_address_count.unwrap_or_default();
+        let named_prefixes: Vec<&str> = input
+            .ipv6_prefixes
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let prefix_count = input.ipv6_prefix_count.unwrap_or_default();
+
+        if !named_addresses.is_empty() && address_count > 0 {
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify both ipv6Addresses and ipv6AddressCount",
+            ));
+        }
+        if !named_prefixes.is_empty() && prefix_count > 0 {
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify both ipv6Prefixes and ipv6PrefixCount",
+            ));
+        }
+        // The model declares no `@range` on either count, so a negative one reaches here;
+        // a number of addresses to assign cannot be below zero.
+        if address_count < 0 {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{address_count}' for ipv6AddressCount. It cannot be negative"
+            )));
+        }
+        if prefix_count < 0 {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{prefix_count}' for ipv6PrefixCount. It cannot be negative"
+            )));
+        }
+        // A request that names nothing and counts nothing asks for no assignment at all.
+        if named_addresses.is_empty()
+            && address_count == 0
+            && named_prefixes.is_empty()
+            && prefix_count == 0
+        {
+            return Err(state::missing_parameter(
+                "Either 'ipv6Addresses' or 'ipv6AddressCount' must be specified",
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed transitions every path that reads a subnet applies: an IPv6 CIDR
+        // block association answered as `associating` is `associated` once its due instant
+        // has passed, whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "The ID of the network interface" (`NetworkInterfaceId`): an id the account holds
+        // no interface for is a refusal — there is nothing to assign to.
+        let Some(interface) = store.network_interfaces.get(network_interface_id) else {
+            return Err(state::invalid_network_interface_id_not_found(
+                network_interface_id,
+            ));
+        };
+        let subnet_id = interface.subnet_id.clone().unwrap_or_default();
+        let addresses_held_here = interface.ipv6_addresses.iter().flatten().count();
+        let prefixes_held_here = interface.ipv6_prefixes.iter().flatten().count();
+
+        // "Amazon EC2 automatically selects the IPv6 addresses from the subnet range"
+        // (`Ipv6AddressCount`): the subnet's own IPv6 CIDR block is the range every address
+        // and prefix this call assigns comes out of, so a subnet with no IPv6 block has
+        // nothing to assign.
+        let Some(block) = store.subnet_ipv6_cidr_block(&subnet_id) else {
+            return Err(state::invalid_parameter_value(format!(
+                "The subnet '{subnet_id}' does not have an associated IPv6 CIDR block"
+            )));
+        };
+        // What the account already holds, read off the interface records that ARE the pool.
+        // Both lists are read ONCE and grown with what this call assigns, so no refusal and
+        // no choice below re-reads the store, and the work one call does is bounded by what
+        // it hands out plus what the account holds.
+        let mut taken_addresses = store.assigned_ipv6_addresses();
+        let mut taken_prefixes = store.assigned_ipv6_prefixes();
+
+        // "You can assign as many IPv6 addresses to a network interface as you can assign
+        // private IPv4 addresses, and the limit varies by instance type" (above), so the
+        // IPv6 set is held to the same per-interface ceiling as the IPv4 one. One of each
+        // pair is zero by the combination rule above, so the larger IS what was asked for.
+        let wanted_addresses = named_addresses
+            .len()
+            .max(usize::try_from(address_count).unwrap_or_default());
+        let wanted_prefixes = named_prefixes
+            .len()
+            .max(usize::try_from(prefix_count).unwrap_or_default());
+        let addresses_after = addresses_held_here.saturating_add(wanted_addresses);
+        if addresses_after > state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE {
+            return Err(state::invalid_parameter_value(format!(
+                "The request would leave the network interface with {addresses_after} IPv6 \
+                 addresses, above the maximum of {max} per network interface",
+                max = state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE,
+            )));
+        }
+        let prefixes_after = prefixes_held_here.saturating_add(wanted_prefixes);
+        if prefixes_after > state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE {
+            return Err(state::invalid_parameter_value(format!(
+                "The request would leave the network interface with {prefixes_after} IPv6 \
+                 prefixes, above the maximum of {max} per network interface",
+                max = state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE,
+            )));
+        }
+
+        // The addresses this call assigns. A caller-named one is judged by the same window a
+        // service-chosen one is drawn from ([`crate::state::is_assignable_subnet_ipv6_address`]),
+        // and against the same in-use reading, so the two cannot disagree; an address named
+        // twice in one request is in use the second time, like one another interface holds.
+        // Grown as each address is resolved rather than sized from the request's own count:
+        // a capacity a caller names is memory a caller sizes.
+        let mut assigned_addresses: Vec<String> = Vec::new();
+        for address in &named_addresses {
+            let Some(canonical) = state::canonical_ipv6_address(address) else {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({address}) for parameter ipv6Addresses is invalid. \
+                     This is not a valid IPv6 address."
+                )));
+            };
+            if !state::is_assignable_subnet_ipv6_address(&block, &canonical) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({address}) for parameter ipv6Addresses is invalid. \
+                     Address does not fall within the subnet's assignable address range \
+                     {block}"
+                )));
+            }
+            if state::ipv6_address_is_taken(&canonical, &taken_addresses, &taken_prefixes) {
+                return Err(Scaffolded::invalid_ip_address_in_use(&canonical));
+            }
+            // Held from here on, so a request naming one address twice is refused the second
+            // time the way one another interface holds is.
+            taken_addresses.push(canonical.clone());
+            assigned_addresses.push(canonical);
+        }
+        // "The specified number of IPv6 addresses are assigned in addition to the existing
+        // IPv6 addresses that are already assigned to the network interface. Amazon EC2
+        // automatically selects the IPv6 addresses from the subnet range"
+        // (`Ipv6AddressCount`).
+        let to_choose = wanted_addresses.saturating_sub(assigned_addresses.len());
+        if to_choose > 0 {
+            let Some(chosen) = state::free_subnet_ipv6_addresses(
+                &block,
+                &taken_addresses,
+                &taken_prefixes,
+                to_choose,
+            ) else {
+                return Err(state::insufficient_free_ipv6_addresses());
+            };
+            taken_addresses.extend(chosen.iter().cloned());
+            assigned_addresses.extend(chosen);
+        }
+
+        // The prefixes this call delegates, on the same terms: "One or more IPv6 prefixes
+        // assigned to the network interface" (`Ipv6Prefixes`) is a range OF the subnet's
+        // block, so it has to sit inside the assignable part of it and overlap nothing the
+        // account already holds.
+        // Grown as each prefix is resolved, for the same reason as the addresses above.
+        let mut assigned_prefixes: Vec<String> = Vec::new();
+        for prefix in &named_prefixes {
+            let Ok(canonical) = state::canonical_ipv6_cidr(prefix) else {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({prefix}) for parameter ipv6Prefixes is invalid. \
+                     This is not a valid IPv6 CIDR block."
+                )));
+            };
+            // The block is canonical, so the text before the `/` is its LOWEST address: a
+            // prefix inside the subnet's block whose lowest address is assignable holds no
+            // reserved address at all.
+            let lowest = canonical.split('/').next().unwrap_or_default().to_string();
+            if !state::ipv6_cidr_block_contains(&block, &canonical)
+                || !state::is_assignable_subnet_ipv6_address(&block, &lowest)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({prefix}) for parameter ipv6Prefixes is invalid. \
+                     Prefix does not fall within the subnet's assignable address range \
+                     {block}"
+                )));
+            }
+            if !state::ipv6_prefix_is_free(&canonical, &taken_addresses, &taken_prefixes) {
+                return Err(Scaffolded::invalid_ip_address_in_use(&canonical));
+            }
+            // Held from here on, like an assigned address above.
+            taken_prefixes.push(canonical.clone());
+            assigned_prefixes.push(canonical);
+        }
+        // "The number of IPv6 prefixes that Amazon Web Services automatically assigns to the
+        // network interface" (`Ipv6PrefixCount`): the service picks them out of the same
+        // block, at the one size Prefix Delegation hands out
+        // ([`crate::state::IPV6_PREFIX_DELEGATION_PREFIX_LENGTH`]).
+        let to_delegate = wanted_prefixes.saturating_sub(assigned_prefixes.len());
+        if to_delegate > 0 {
+            let Some(chosen) = state::free_subnet_ipv6_prefixes(
+                &block,
+                &taken_addresses,
+                &taken_prefixes,
+                to_delegate,
+            ) else {
+                return Err(state::insufficient_free_ipv6_addresses());
+            };
+            assigned_prefixes.extend(chosen);
+        }
+
+        // Nothing has been written until here, so every refusal above leaves the interface
+        // exactly as it was. The interface was read under this same lock a moment ago, so a
+        // miss here is the store losing a record between two reads of one lock.
+        let Some(interface) = store.network_interfaces.get_mut(network_interface_id) else {
+            return Err(state::internal_error(
+                "the network interface checked a moment ago could not be read back",
+            ));
+        };
+        let addresses = interface.ipv6_addresses.get_or_insert_with(Vec::new);
+        for address in &assigned_addresses {
+            addresses.push(NetworkInterfaceIpv6Address {
+                ipv6_address: Some(address.clone()),
+                // "An IPv6-enabled public hostname for a network interface"
+                // (`PublicIpv6DnsName`): reported for an interface with public DNS names,
+                // which no operation of this crate turns on.
+                public_ipv6_dns_name: None,
+                // "Determines if an IPv6 address associated with a network interface is the
+                // primary IPv6 address" (`IsPrimaryIpv6`): reported for an interface whose
+                // primary IPv6 has been enabled, which nothing here enables.
+                is_primary_ipv6: None,
+            });
+        }
+        let prefixes = interface.ipv6_prefixes.get_or_insert_with(Vec::new);
+        for prefix in &assigned_prefixes {
+            prefixes.push(Ipv6PrefixSpecification {
+                ipv6_prefix: Some(prefix.clone()),
+            });
+        }
+
+        // "The new IPv6 addresses assigned to the network interface. Existing IPv6 addresses
+        // that were assigned to the network interface before the request are not included"
+        // (`AssignedIpv6Addresses`), so the answer is what THIS call assigned — and nothing
+        // at all for the half of the request that asked for nothing.
+        Ok(AssignIpv6AddressesOutput {
+            assigned_ipv6_addresses: (!assigned_addresses.is_empty()).then_some(assigned_addresses),
+            assigned_ipv6_prefixes: (!assigned_prefixes.is_empty()).then_some(assigned_prefixes),
+            network_interface_id: Some(network_interface_id.to_string()),
+        })
     }
 }

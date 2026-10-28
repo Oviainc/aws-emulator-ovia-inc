@@ -796,15 +796,15 @@ async fn a_request_that_does_not_name_exactly_one_known_target_is_refused() {
         ),
         (
             vec![param("NetworkInterfaceId", "eni-")],
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             vec![param("NetworkInterfaceId", "eni-0123456789abcdefg")],
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             vec![param("NetworkInterfaceId", &known_group)],
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
     ];
     for (target_fields, expected_code) in cases {

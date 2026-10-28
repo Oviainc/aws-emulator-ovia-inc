@@ -13,7 +13,7 @@
 //!
 //! What it refuses, and why:
 //!
-//! * `InvalidNetworkInterfaceID.Malformed` (400) — the value is not a network interface id
+//! * `InvalidNetworkInterfaceId.Malformed` (400) — the value is not a network interface id
 //!   at all, so there is nothing to look up
 //!   ([`crate::state::network_interface_id_is_well_formed`]).
 //! * `InvalidNetworkInterfaceID.NotFound` (400) — a well-formed id the account holds no

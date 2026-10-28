@@ -220,6 +220,11 @@ mod application_status_checks;
 // published bounds it refuses past, and the check it answers read back through the describe.
 #[path = "all/create_application_status_check.rs"]
 mod create_application_status_check;
+// What `AssignIpv6Addresses` takes out of the IPv6 block of the subnet a network interface
+// sits in, and records on that interface — named addresses and prefixes against a count of
+// each, read back through `DescribeNetworkInterfaces`.
+#[path = "all/assign_ipv6_addresses.rs"]
+mod assign_ipv6_addresses;
 #[path = "all/associate_address.rs"]
 mod associate_address;
 #[path = "all/associate_client_vpn_target_network.rs"]

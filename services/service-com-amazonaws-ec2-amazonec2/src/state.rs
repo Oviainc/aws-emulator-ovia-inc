@@ -17552,6 +17552,361 @@ pub fn is_assignable_subnet_address(cidr_block: &str, address: &str) -> bool {
     window.contains(&u32::from(candidate))
 }
 
+// ---------------------------------------------------------------------------
+// The IPv6 side of a subnet's addresses: the block a subnet holds, which of its
+// addresses a network interface may be given, which prefixes may be delegated
+// out of it, and what is taken already
+// ---------------------------------------------------------------------------
+
+/// Does an association in this `SubnetCidrBlockStateCode` / `VpcCidrBlockStateCode` state
+/// still HOLD the block it names?
+///
+/// `associating` and `associated` do — the block is on its way in or in — while
+/// `disassociating`, `disassociated`, `failing` and `failed` do not: the block is on its
+/// way out, gone, or was never taken. An association carrying no state at all is read as
+/// holding its block, since every writer of this crate sets one. The two enums share these
+/// words (`smithy_query(query="shape",shape="SubnetCidrBlockStateCode,VpcCidrBlockStateCode")`),
+/// so ONE reader answers for a subnet's association and for its VPC's: every operation that
+/// asks whether a block is held reads this rather than keeping a copy of the rule.
+pub fn cidr_association_holds_its_block(state: Option<&str>) -> bool {
+    match state {
+        None => true,
+        Some(state) => {
+            state == CIDR_BLOCK_STATE_ASSOCIATING || state == CIDR_BLOCK_STATE_ASSOCIATED
+        }
+    }
+}
+
+/// How many IPv6 addresses at the BOTTOM of a subnet's CIDR block are not available to a
+/// network interface.
+///
+/// AWS reserves the first four addresses of a subnet's IPv6 CIDR block — the network
+/// address and three it keeps for itself (Amazon VPC User Guide, "Subnet CIDR blocks") —
+/// and, unlike the IPv4 side ([`SUBNET_RESERVED_ADDRESSES`]), nothing at the TOP of the
+/// block: IPv6 has no broadcast address.
+pub const SUBNET_RESERVED_IPV6_ADDRESSES: u128 = 4;
+
+/// The prefix length of an IPv6 prefix this service delegates to a network interface when
+/// the request asks for a NUMBER of prefixes instead of naming them: Prefix Delegation
+/// hands out a /80 of the subnet's block (Amazon EC2 User Guide, "Assigning prefixes to
+/// network interfaces", which `AssignIpv6Addresses` points at for its `Ipv6PrefixCount`).
+pub const IPV6_PREFIX_DELEGATION_PREFIX_LENGTH: u8 = 80;
+
+/// `address` in the one text [`Ipv6Addr`] renders an IPv6 address in, or `None` when it is
+/// not an IPv6 address at all.
+///
+/// One address has many spellings — `2600:1F16:0:0:0:0:0:5` and `2600:1f16::5` are the same
+/// address — so an address is canonicalised on the way into the store and compared in that
+/// form, the way [`canonical_ipv6_cidr`] canonicalises a block.
+pub fn canonical_ipv6_address(address: &str) -> Option<String> {
+    address
+        .parse::<Ipv6Addr>()
+        .ok()
+        .map(|address| address.to_string())
+}
+
+/// The IPv6 addresses of `block` a network interface may be given, as a range of numbers.
+///
+/// The block's addresses less the [`SUBNET_RESERVED_IPV6_ADDRESSES`] AWS reserves at its
+/// bottom. The ONE computation of that window: the point question
+/// ([`is_assignable_subnet_ipv6_address`]) and the search
+/// ([`free_subnet_ipv6_addresses`]) both read it, so a service-chosen address is always one
+/// a caller could have named. A block this emulator cannot read has no window at all, and
+/// one too small to hold an assignable address has none either, rather than a guess.
+fn assignable_subnet_ipv6_window(block: &str) -> Option<::std::ops::RangeInclusive<u128>> {
+    let (base, prefix_length) = split_ipv6_cidr(block)?;
+    let size = 1u128
+        .checked_shl(u32::from(128 - prefix_length))
+        .unwrap_or_default();
+    // The block's own base, masked here rather than trusted from the parser, so the window
+    // is the block's even if a stored CIDR ever carries host bits. A `/0` spans the whole
+    // space, whose size does not fit a `u128`.
+    let (base, last) = match size {
+        0 => (0, u128::MAX),
+        size => (base & !(size - 1), (base & !(size - 1)).checked_add(size - 1)?),
+    };
+    let lowest = base.checked_add(SUBNET_RESERVED_IPV6_ADDRESSES)?;
+    (lowest <= last).then_some(lowest..=last)
+}
+
+/// Is `address` an address of `block` that a network interface may be given?
+///
+/// The IPv6 counterpart of [`is_assignable_subnet_address`], on the same terms: an address
+/// of the block is assignable exactly when it is outside the reserved window
+/// ([`assignable_subnet_ipv6_window`]), and an unreadable block has no assignable address.
+pub fn is_assignable_subnet_ipv6_address(block: &str, address: &str) -> bool {
+    let Some(window) = assignable_subnet_ipv6_window(block) else {
+        return false;
+    };
+    let Ok(candidate) = address.parse::<Ipv6Addr>() else {
+        return false;
+    };
+    window.contains(&u128::from(candidate))
+}
+
+/// Every IPv6 address something already holds, as the merged, sorted ranges of the address
+/// space they cover.
+///
+/// One range per address listed on an interface, one per prefix delegated to one, merged so
+/// adjoining and overlapping holdings become one span. That is what lets the two searches
+/// below SKIP a whole holding in one step instead of walking its addresses: a `/80` covers
+/// 2^48 of them, so an address-at-a-time scan past one is not work this emulator will do for
+/// a single request.
+fn taken_ipv6_ranges(taken_addresses: &[String], taken_prefixes: &[String]) -> Vec<(u128, u128)> {
+    let mut ranges: Vec<(u128, u128)> = Vec::with_capacity(
+        taken_addresses.len().saturating_add(taken_prefixes.len()),
+    );
+    for address in taken_addresses {
+        if let Ok(parsed) = address.parse::<Ipv6Addr>() {
+            let value = u128::from(parsed);
+            ranges.push((value, value));
+        }
+    }
+    for prefix in taken_prefixes {
+        if let Some(bounds) = ipv6_cidr_bounds(prefix) {
+            ranges.push(bounds);
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        match merged.last_mut() {
+            Some((_, held_last)) if first <= held_last.saturating_add(1) => {
+                *held_last = (*held_last).max(last);
+            }
+            _ => merged.push((first, last)),
+        }
+    }
+    merged
+}
+
+/// The merged range of `taken` that covers `candidate`, or `None` when nothing holds it.
+///
+/// `taken` is sorted and non-overlapping ([`taken_ipv6_ranges`]), so the covering range is
+/// found by bisection rather than by a scan: the question is asked once per candidate and
+/// once per holding skipped.
+fn taken_ipv6_range_at(taken: &[(u128, u128)], candidate: u128) -> Option<(u128, u128)> {
+    let after = taken.partition_point(|(first, _)| *first <= candidate);
+    taken
+        .get(after.checked_sub(1)?)
+        .copied()
+        .filter(|(_, last)| candidate <= *last)
+}
+
+/// Is the IPv6 address `address` already held — listed on a network interface, or inside a
+/// prefix delegated to one?
+///
+/// A delegated prefix is the interface's whole range ("One or more IPv6 prefixes assigned
+/// to the network interface"), so its addresses are as held as the ones listed one by one.
+/// The ONE definition of "held" for an IPv6 address, so what a caller may name and what the
+/// service may choose cannot disagree about who holds what.
+pub fn ipv6_address_is_taken(
+    address: &str,
+    taken_addresses: &[String],
+    taken_prefixes: &[String],
+) -> bool {
+    let Some(canonical) = canonical_ipv6_address(address) else {
+        return false;
+    };
+    let Ok(parsed) = canonical.parse::<Ipv6Addr>() else {
+        return false;
+    };
+    taken_ipv6_range_at(
+        &taken_ipv6_ranges(taken_addresses, taken_prefixes),
+        u128::from(parsed),
+    )
+    .is_some()
+}
+
+/// `how_many` assignable IPv6 addresses of `block` that nothing holds, lowest first — or
+/// `None` when the block has that many nowhere.
+///
+/// The counterpart of [`ComAmazonawsEc2Amazonec2State::free_subnet_address`] for the IPv6
+/// family: the candidates are the window [`assignable_subnet_ipv6_window`] admits, judged
+/// against the one definition of held ([`ipv6_address_is_taken`] reads the same ranges). The
+/// walk takes one step per address it chooses and one per holding it skips
+/// ([`taken_ipv6_ranges`] makes a holding one step however wide it is), so the width of a
+/// `/64` cannot turn one call into unbounded work.
+pub fn free_subnet_ipv6_addresses(
+    block: &str,
+    taken_addresses: &[String],
+    taken_prefixes: &[String],
+    how_many: usize,
+) -> Option<Vec<String>> {
+    let window = assignable_subnet_ipv6_window(block)?;
+    let taken = taken_ipv6_ranges(taken_addresses, taken_prefixes);
+    let last = *window.end();
+    let mut candidate = *window.start();
+    // Grown as each one is chosen: `how_many` comes from a request, and a capacity a caller
+    // names is memory a caller sizes.
+    let mut chosen: Vec<String> = Vec::new();
+    while chosen.len() < how_many && candidate <= last {
+        let next = match taken_ipv6_range_at(&taken, candidate) {
+            // Something holds this address, and everything up to the end of its range:
+            // the next candidate is the address after that range.
+            Some((_, held_last)) => held_last.checked_add(1),
+            None => {
+                chosen.push(Ipv6Addr::from(candidate).to_string());
+                candidate.checked_add(1)
+            }
+        };
+        match next {
+            Some(next) => candidate = next,
+            // The top of the address space: there is nothing above this candidate.
+            None => break,
+        }
+    }
+    (chosen.len() == how_many).then_some(chosen)
+}
+
+/// Is the IPv6 prefix `prefix` free — overlapping no prefix already delegated and covering
+/// no address an interface already holds?
+///
+/// Two interfaces cannot be delegated overlapping ranges, and a range cannot swallow an
+/// address something else holds, so this is the prefix counterpart of
+/// [`ipv6_address_is_taken`] and reads the same ranges.
+pub fn ipv6_prefix_is_free(
+    prefix: &str,
+    taken_addresses: &[String],
+    taken_prefixes: &[String],
+) -> bool {
+    let Some((first, last)) = ipv6_cidr_bounds(prefix) else {
+        return false;
+    };
+    let taken = taken_ipv6_ranges(taken_addresses, taken_prefixes);
+    // A range is free when nothing holds its first address and no holding STARTS inside it.
+    taken_ipv6_range_at(&taken, first).is_none()
+        && taken
+            .get(taken.partition_point(|(held_first, _)| *held_first <= first))
+            .is_none_or(|(held_first, _)| *held_first > last)
+}
+
+/// `how_many` free IPv6 prefixes of `block`, lowest first — or `None` when it has that many
+/// nowhere.
+///
+/// Each one is a [`IPV6_PREFIX_DELEGATION_PREFIX_LENGTH`] block aligned inside `block`, and
+/// the first such sub-block is skipped: it holds the addresses AWS reserves at the bottom of
+/// the subnet ([`SUBNET_RESERVED_IPV6_ADDRESSES`]), which a delegated prefix cannot take. The
+/// choice is judged by [`ipv6_prefix_is_free`], and the walk steps over a holding in one step
+/// the way the address search does, so one call's work is bounded by what it hands out plus
+/// what the account already holds.
+pub fn free_subnet_ipv6_prefixes(
+    block: &str,
+    taken_addresses: &[String],
+    taken_prefixes: &[String],
+    how_many: usize,
+) -> Option<Vec<String>> {
+    let (base, prefix_length) = split_ipv6_cidr(block)?;
+    if prefix_length >= IPV6_PREFIX_DELEGATION_PREFIX_LENGTH {
+        // A block no larger than one delegated prefix has no aligned sub-block to hand out
+        // above its reserved addresses.
+        return None;
+    }
+    let size = 1u128.checked_shl(u32::from(128 - prefix_length))?;
+    let base = base & !(size - 1);
+    let step = 1u128.checked_shl(u32::from(128 - IPV6_PREFIX_DELEGATION_PREFIX_LENGTH))?;
+    let last = base.checked_add(size - 1)?;
+    let taken = taken_ipv6_ranges(taken_addresses, taken_prefixes);
+    // The second aligned sub-block: the first holds the subnet's reserved addresses.
+    let mut start = base.checked_add(step)?;
+    // Grown as each one is chosen: `how_many` comes from a request, and a capacity a caller
+    // names is memory a caller sizes.
+    let mut chosen: Vec<String> = Vec::new();
+    while chosen.len() < how_many && start < last {
+        let end = start.checked_add(step - 1)?;
+        let held = taken_ipv6_range_at(&taken, start).map(|(_, held_last)| held_last).or_else(|| {
+            taken
+                .get(taken.partition_point(|(held_first, _)| *held_first <= start))
+                .filter(|(held_first, _)| *held_first <= end)
+                .map(|(_, held_last)| *held_last)
+        });
+        let next = match held {
+            // Something holds part of this candidate, and everything up to the end of its
+            // range: the next candidate is the first aligned block above that range.
+            Some(held_last) => held_last
+                .checked_add(1)?
+                .checked_add(step - 1)
+                .map(|above| above - (above % step)),
+            None => {
+                chosen.push(format!(
+                    "{}/{IPV6_PREFIX_DELEGATION_PREFIX_LENGTH}",
+                    Ipv6Addr::from(start)
+                ));
+                start.checked_add(step)
+            }
+        };
+        match next {
+            Some(next) if next > start => start = next,
+            // The top of the address space, or a jump that did not advance.
+            _ => break,
+        }
+    }
+    (chosen.len() == how_many).then_some(chosen)
+}
+
+/// Refuse a request that asked for more IPv6 addresses than the subnet's block has free:
+/// HTTP 400 `InsufficientFreeAddressesInSubnet`.
+///
+/// The IPv6 counterpart of [`crate::scaffolded::Scaffolded::insufficient_free_addresses`],
+/// which says the same about the subnet's private IPv4 addresses.
+pub fn insufficient_free_ipv6_addresses<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        "InsufficientFreeAddressesInSubnet",
+        400,
+        "The subnet does not have enough free IPv6 addresses to satisfy the request",
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The IPv6 CIDR block the subnet `subnet_id` holds, or `None` when it holds none (or
+    /// the store holds no such subnet).
+    ///
+    /// "You can only associate a single IPv6 CIDR block with your subnet"
+    /// (`AssociateSubnetCidrBlock`), so the one association that still HOLDS its block
+    /// ([`cidr_association_holds_its_block`]) is the subnet's IPv6 range — what every
+    /// operation that assigns an IPv6 address out of a subnet reads.
+    pub fn subnet_ipv6_cidr_block(&self, subnet_id: &str) -> Option<String> {
+        self.subnets
+            .get(subnet_id)?
+            .ipv6_cidr_block_association_set
+            .iter()
+            .flatten()
+            .filter(|association| {
+                cidr_association_holds_its_block(
+                    association
+                        .ipv6_cidr_block_state
+                        .as_ref()
+                        .and_then(|state| state.state.as_deref()),
+                )
+            })
+            .find_map(|association| association.ipv6_cidr_block.clone())
+    }
+
+    /// Every IPv6 address the account's network interfaces hold, in store order.
+    ///
+    /// An assigned IPv6 address lives on the interface record itself
+    /// (`NetworkInterface$Ipv6Addresses`), so the records ARE the in-use pool — there is no
+    /// second copy of them to drift from.
+    pub fn assigned_ipv6_addresses(&self) -> Vec<String> {
+        self.network_interfaces
+            .values()
+            .flat_map(|interface| interface.ipv6_addresses.iter().flatten())
+            .filter_map(|address| address.ipv6_address.clone())
+            .collect()
+    }
+
+    /// Every IPv6 prefix delegated to one of the account's network interfaces, in store
+    /// order — read off `NetworkInterface$Ipv6Prefixes` for the same reason as
+    /// [`Self::assigned_ipv6_addresses`].
+    pub fn assigned_ipv6_prefixes(&self) -> Vec<String> {
+        self.network_interfaces
+            .values()
+            .flat_map(|interface| interface.ipv6_prefixes.iter().flatten())
+            .filter_map(|prefix| prefix.ipv6_prefix.clone())
+            .collect()
+    }
+}
+
 /// The tags a create assigns to the ONE resource it creates, from the request's
 /// `TagSpecifications`.
 ///
@@ -23401,9 +23756,13 @@ pub const RESOURCE_ALREADY_ASSOCIATED: &str = "Resource.AlreadyAssociated";
 /// id this account holds no network interface for.
 pub const INVALID_NETWORK_INTERFACE_ID_NOT_FOUND: &str = "InvalidNetworkInterfaceID.NotFound";
 
-/// `InvalidNetworkInterfaceID.Malformed` (HTTP 400): the request named something that is
+/// `InvalidNetworkInterfaceId.Malformed` (HTTP 400): the request named something that is
 /// not a network interface id at all, so there is nothing to look up.
-pub const INVALID_NETWORK_INTERFACE_ID_MALFORMED: &str = "InvalidNetworkInterfaceID.Malformed";
+///
+/// The casing is EC2's own and differs from [`INVALID_NETWORK_INTERFACE_ID_NOT_FOUND`]'s:
+/// the syntax refusal spells the id `Id` while the lookup refusal spells it `ID`, which is
+/// how EC2's own error-code list spells the two.
+pub const INVALID_NETWORK_INTERFACE_ID_MALFORMED: &str = "InvalidNetworkInterfaceId.Malformed";
 
 /// The id prefix of the association between an Elastic IP address and a resource, which
 /// is what `ElasticIpAssociationId` names and `AssociateAddress` mints.
@@ -23967,12 +24326,18 @@ pub fn network_interface_id_is_well_formed(id: &str) -> bool {
 }
 
 /// Refuse a request that named something that is not a network interface id: HTTP 400
-/// `InvalidNetworkInterfaceID.Malformed`.
+/// `InvalidNetworkInterfaceId.Malformed`.
+///
+/// The message is the one EC2 answers a value it cannot read as a resource id with: the
+/// literal `Invalid id: ` and the offending value from the REQUEST, in DOUBLE quotes — the
+/// template this corpus records for the network interface family's own ids (a malformed
+/// network interface ATTACHMENT id is refused `Invalid id: "<value>"`), and the quoting the
+/// same template carries wherever a recording shows it.
 pub fn invalid_network_interface_id_malformed<E>(network_interface_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INTERFACE_ID_MALFORMED,
         400,
-        format!("Invalid id: '{network_interface_id}'"),
+        format!("Invalid id: \"{network_interface_id}\""),
     )
 }
 

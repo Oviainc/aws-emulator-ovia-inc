@@ -11,7 +11,7 @@
 //! ACCOUNT'S STORE, whatever shape that interface has, and leaves every other interface
 //! alone — so the id then names nothing and a second delete refuses it rather than
 //! answering as a no-op — while a value that is not an interface id at all is refused
-//! `InvalidNetworkInterfaceID.Malformed`, a well-formed id the account holds no interface
+//! `InvalidNetworkInterfaceId.Malformed`, a well-formed id the account holds no interface
 //! for `InvalidNetworkInterfaceID.NotFound`, and an interface an attachment still holds
 //! `InvalidNetworkInterface.InUse` ("You must detach the network interface before you can
 //! delete it" — `DeleteNetworkInterface`). A `DryRun` of a call that would have succeeded
@@ -297,7 +297,7 @@ async fn the_delete_removes_the_named_interface_whatever_shape_it_has() {
 // ---------------------------------------------------------------------------
 
 /// The rule: a `NetworkInterfaceId` that is not an interface id at all is refused
-/// `InvalidNetworkInterfaceID.Malformed`, a well-formed one the account holds no interface
+/// `InvalidNetworkInterfaceId.Malformed`, a well-formed one the account holds no interface
 /// for `InvalidNetworkInterfaceID.NotFound`, and either way nothing is deleted.
 ///
 /// The rows differ in the form of the value: both published id lengths (8 and 17 lowercase
@@ -333,32 +333,32 @@ async fn an_id_that_names_no_interface_of_the_account_deletes_nothing() {
         (
             "one digit short of the short form",
             "eni-0a1b2c3",
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             "one digit short of the long form",
             "eni-0123456789abcdef",
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             "an uppercase hex digit",
             "eni-0123456789ABCDEF0",
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             "another resource kind's id",
             "subnet-0123456789abcdef0",
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             "not an id at all",
             "not-an-id",
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
         (
             "an empty networkInterfaceId",
             "",
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
     ];
 
@@ -584,7 +584,7 @@ async fn a_dry_run_reports_the_permission_check_and_removes_nothing() {
 
 /// The rule reaches every operation that resolves a `NetworkInterfaceId`, not only the
 /// delete: `AssociateAddress` reads THE SAME store, so a malformed value is refused
-/// `InvalidNetworkInterfaceID.Malformed`, a well-formed id the account holds no interface
+/// `InvalidNetworkInterfaceId.Malformed`, a well-formed id the account holds no interface
 /// for `InvalidNetworkInterfaceID.NotFound`, and an id the store DOES hold is no longer
 /// mis-reported as not found — it is answered with the scaffold's 501, because persisting
 /// the association on the interface is work the `AssociateAddress` slice has not done and a
@@ -618,7 +618,7 @@ async fn associate_address_resolves_a_network_interface_id_against_the_same_stor
             "a value that is no interface id at all",
             "not-an-id",
             400,
-            "InvalidNetworkInterfaceID.Malformed",
+            "InvalidNetworkInterfaceId.Malformed",
         ),
     ];
 
