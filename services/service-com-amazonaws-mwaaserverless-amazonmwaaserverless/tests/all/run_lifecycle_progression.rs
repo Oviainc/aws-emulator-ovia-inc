@@ -7,17 +7,17 @@
 //! over an `awsJson1_0` request).
 //!
 //! 1. A run walks the modelled `WorkflowRunStatus` lifecycle on the CLOCK, one state at a
-//!    time, and never reports a status for work nothing ran. `StartWorkflowRun` accepts the
-//!    run into `STARTING` — "This is typically STARTING when you first create the run"
-//!    (`smithy_query(query="operation", operation="StartWorkflowRun")`, `Status`) — the
-//!    control plane's admission of the run makes `STARTING` -> `QUEUED` due
-//!    `RUN_ADMITTED_AFTER` later, and because this emulator has no Apache Airflow engine to
-//!    execute a workflow definition with, nothing dequeues the run: `RUN_SETTLE_AFTER`
-//!    after that it reaches the modelled failure state `FAILED` carrying the reason
-//!    (`NO_AIRFLOW_ENGINE`), with `CompletedOn` and `Duration` set and no task instance.
-//!    `RUNNING` and `SUCCESS` are never reported, because nothing ran. Every transition is
-//!    owed by the clock and dated from the instant it fell DUE, so a read never changes
-//!    what a later caller sees and a terminal status is never left.
+//!    time. `StartWorkflowRun` accepts the run into `STARTING` — "This is typically
+//!    STARTING when you first create the run" (`smithy_query(query="operation",
+//!    operation="StartWorkflowRun")`, `Status`) — the control plane's admission of the run
+//!    makes `STARTING` -> `QUEUED` due `RUN_ADMITTED_AFTER` later, an executor picking it
+//!    up makes `QUEUED` -> `RUNNING` due `RUN_DEQUEUED_AFTER` after that, and the
+//!    execution of the tasks its definition declares carries it to `SUCCESS`, with
+//!    `CompletedOn` and `Duration` set and no `ErrorMessage` — "This value is null if the
+//!    run completed successfully". Every transition is owed by the clock and dated from the
+//!    instant it fell DUE, so a read never changes what a later caller sees and a terminal
+//!    status is never left. WHICH terminal status a run reaches is decided by the task
+//!    graph of the definition it runs, which `run_execution_outcome.rs` covers.
 //!
 //! 2. An optional member is reported only when the stored run HOLDS a value for it: a run
 //!    started with no (or an empty) `OverrideParameters` map, and a run holding no task
@@ -33,19 +33,24 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    WorkflowRun, NO_AIRFLOW_ENGINE, RUN_ADMITTED_AFTER, RUN_SETTLE_AFTER, RUN_STATUS_FAILED,
-    RUN_STATUS_QUEUED, RUN_STATUS_STARTING,
+    WorkflowRun, RUN_ADMITTED_AFTER, RUN_DEQUEUED_AFTER, RUN_STATUS_FAILED, RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING, RUN_STATUS_STARTING, RUN_STATUS_SUCCESS, TASK_LEVEL_RUNS_FOR,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::ComAmazonawsMwaaserverlessAmazonmwaaserverlessState;
 
 use crate::task_instance_reads::{epoch_seconds, instance, seed};
 use crate::workflow_lifecycle::{role_arn, Harness};
 
-/// The `WorkflowRunStatus` values a run of this emulator passes through, in the order the
-/// clock owes them (`smithy_query(query="shape", shape="WorkflowRunStatus")` declares
-/// `STARTING | QUEUED | RUNNING | SUCCESS | FAILED | TIMEOUT | STOPPING | STOPPED`; these
-/// three are the ones a run nothing executed reaches).
-const LIFECYCLE: &[&str] = &[RUN_STATUS_STARTING, RUN_STATUS_QUEUED, RUN_STATUS_FAILED];
+/// The `WorkflowRunStatus` values a run of a definition that declares no failing task
+/// passes through, in the order the clock owes them
+/// (`smithy_query(query="shape", shape="WorkflowRunStatus")` declares
+/// `STARTING | QUEUED | RUNNING | SUCCESS | FAILED | TIMEOUT | STOPPING | STOPPED`).
+const LIFECYCLE: &[&str] = &[
+    RUN_STATUS_STARTING,
+    RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING,
+    RUN_STATUS_SUCCESS,
+];
 
 /// Create a workflow and start a run under it: `(WorkflowArn, RunId)`.
 async fn started_run(harness: &Harness, name: &str) -> (String, String) {
@@ -162,11 +167,16 @@ struct Row {
 }
 
 /// The rows. They differ along the state the run is in, whether the next change is due,
-/// how far overdue it is (so that one change or BOTH are owed at once), and the length of
-/// the span `Duration` is computed over (zero, sub-second, seconds, an hour) — not merely
-/// along the run's identity.
+/// how far overdue it is (so that one change or EVERY remaining one is owed at once), and
+/// the length of the span `Duration` is computed over (zero, sub-second, seconds, an
+/// hour) — not merely along the run's identity.
+///
+/// The workflow these rows are seeded on snapshotted no definition, so its runs declare
+/// no task: such a run has nothing to execute and so nothing that can fail, and the
+/// execution it walks takes one `TASK_LEVEL_RUNS_FOR` span.
 fn rows() -> Vec<Row> {
-    let settle = i64::try_from(RUN_SETTLE_AFTER.as_millis()).expect("a span of a few hundred ms");
+    let dequeued = i64::try_from(RUN_DEQUEUED_AFTER.as_millis()).expect("a span of a few hundred ms");
+    let level = i64::try_from(TASK_LEVEL_RUNS_FOR.as_millis()).expect("a span of a few hundred ms");
     vec![
         Row {
             case: "starting/no change due yet",
@@ -181,7 +191,7 @@ fn rows() -> Vec<Row> {
         Row {
             // ONE change is owed: admission is done, so the run is waiting for an
             // executor. The intermediate state IS observable.
-            case: "starting/admission due, terminal change not",
+            case: "starting/admission due, nothing further",
             status: RUN_STATUS_STARTING,
             started_millis_ago: 1_000,
             due_in_millis: 0,
@@ -191,19 +201,20 @@ fn rows() -> Vec<Row> {
             expected_error: None,
         },
         Row {
-            // BOTH changes are owed, so one read applies both and lands on the terminal
-            // state, dated from when each fell due: 5s + RUN_SETTLE_AFTER after the start.
+            // EVERY change is owed, so one read applies them all and lands on the
+            // terminal state, dated from when each fell due: the admission deadline,
+            // then RUN_DEQUEUED_AFTER, then one task level.
             case: "starting/whole schedule overdue",
             status: RUN_STATUS_STARTING,
             started_millis_ago: 10_000,
             due_in_millis: -5_000,
-            expected_state: RUN_STATUS_FAILED,
+            expected_state: RUN_STATUS_SUCCESS,
             expected_duration: Some(6),
-            completed_in_millis: Some(-5_000 + settle),
-            expected_error: Some(NO_AIRFLOW_ENGINE),
+            completed_in_millis: Some(-5_000 + dequeued + level),
+            expected_error: None,
         },
         Row {
-            case: "queued/terminal change not due yet",
+            case: "queued/the executor is not due to pick it up yet",
             status: RUN_STATUS_QUEUED,
             started_millis_ago: 0,
             due_in_millis: 10_000,
@@ -213,35 +224,47 @@ fn rows() -> Vec<Row> {
             expected_error: None,
         },
         Row {
-            // A sub-second run still reports the second it occupied.
-            case: "queued/terminal change due, sub-second span",
+            // The executor has picked the run up: it is executing, and an execution that
+            // has not finished reports neither a completion nor a duration.
+            case: "queued/execution due to start",
             status: RUN_STATUS_QUEUED,
             started_millis_ago: 1,
             due_in_millis: 0,
-            expected_state: RUN_STATUS_FAILED,
+            expected_state: RUN_STATUS_RUNNING,
+            expected_duration: None,
+            completed_in_millis: None,
+            expected_error: None,
+        },
+        Row {
+            // A sub-second run still reports the second it occupied.
+            case: "running/completion due, sub-second span",
+            status: RUN_STATUS_RUNNING,
+            started_millis_ago: 1,
+            due_in_millis: 0,
+            expected_state: RUN_STATUS_SUCCESS,
             expected_duration: Some(1),
             completed_in_millis: Some(0),
-            expected_error: Some(NO_AIRFLOW_ENGINE),
+            expected_error: None,
         },
         Row {
-            case: "queued/terminal change due at the instant it started",
-            status: RUN_STATUS_QUEUED,
+            case: "running/completion due at the instant it started",
+            status: RUN_STATUS_RUNNING,
             started_millis_ago: 0,
             due_in_millis: 0,
-            expected_state: RUN_STATUS_FAILED,
+            expected_state: RUN_STATUS_SUCCESS,
             expected_duration: Some(0),
             completed_in_millis: Some(0),
-            expected_error: Some(NO_AIRFLOW_ENGINE),
+            expected_error: None,
         },
         Row {
-            case: "queued/terminal change due, hour-long span",
-            status: RUN_STATUS_QUEUED,
+            case: "running/completion due, hour-long span",
+            status: RUN_STATUS_RUNNING,
             started_millis_ago: 3_600_000,
             due_in_millis: 0,
-            expected_state: RUN_STATUS_FAILED,
+            expected_state: RUN_STATUS_SUCCESS,
             expected_duration: Some(3_600),
             completed_in_millis: Some(0),
-            expected_error: Some(NO_AIRFLOW_ENGINE),
+            expected_error: None,
         },
         Row {
             // A terminal state is never left, and never rewritten: the deadline is long
@@ -254,6 +277,18 @@ fn rows() -> Vec<Row> {
             expected_duration: Some(7),
             completed_in_millis: Some(-1_000),
             expected_error: Some("a failure this run already recorded"),
+        },
+        Row {
+            // The other terminal state this lifecycle reaches, equally never left and
+            // equally never given a reason it did not fail for.
+            case: "success/terminal state is never left",
+            status: RUN_STATUS_SUCCESS,
+            started_millis_ago: 9_000,
+            due_in_millis: -10_000,
+            expected_state: RUN_STATUS_SUCCESS,
+            expected_duration: Some(7),
+            completed_in_millis: Some(-1_000),
+            expected_error: None,
         },
     ]
 }
@@ -286,7 +321,7 @@ async fn a_run_reports_the_state_the_clock_owes_it_and_nothing_further() {
             run.next_status_at = shifted(reference, row.due_in_millis);
             // A terminal row keeps the completion it already recorded; every other row
             // starts from a run that has not completed.
-            if row.status == RUN_STATUS_FAILED {
+            if row.status == RUN_STATUS_FAILED || row.status == RUN_STATUS_SUCCESS {
                 run.completed_on = row.completed_in_millis.map(|at| shifted(reference, at));
                 run.duration = row.expected_duration;
                 run.error_message = row.expected_error.map(str::to_string);
@@ -337,8 +372,8 @@ async fn a_run_reports_the_state_the_clock_owes_it_and_nothing_further() {
         );
         assert!(
             detail["TaskInstances"].is_null(),
-            "case {:?}: a run nothing executed holds no task instance, so the member is \
-             absent, got {:?}",
+            "case {:?}: a run whose definition declared no task holds no task instance, so \
+             the member is absent, got {:?}",
             row.case,
             detail["TaskInstances"]
         );
@@ -386,7 +421,7 @@ async fn a_real_run_is_observed_walking_the_lifecycle_in_order() {
             observed.push(state.clone());
         }
         last = answered;
-        if state == RUN_STATUS_FAILED {
+        if state == RUN_STATUS_SUCCESS {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -400,10 +435,10 @@ async fn a_real_run_is_observed_walking_the_lifecycle_in_order() {
     );
     assert_eq!(
         observed.last().map(String::as_str),
-        Some(RUN_STATUS_FAILED),
-        "case poll: a run nothing executed must reach the modelled failure state within \
-         {:?}, got {observed:?}",
-        RUN_ADMITTED_AFTER + RUN_SETTLE_AFTER
+        Some(RUN_STATUS_SUCCESS),
+        "case poll: a run of a definition with no failing task must complete successfully \
+         within {:?}, got {observed:?}",
+        RUN_ADMITTED_AFTER + RUN_DEQUEUED_AFTER + TASK_LEVEL_RUNS_FOR
     );
     let positions: Vec<Option<usize>> = observed
         .iter()
@@ -411,8 +446,8 @@ async fn a_real_run_is_observed_walking_the_lifecycle_in_order() {
         .collect();
     assert!(
         positions.iter().all(Option::is_some),
-        "case poll: every observed state belongs to the lifecycle {LIFECYCLE:?} — nothing \
-         reports RUNNING or SUCCESS for work nothing ran, got {observed:?}"
+        "case poll: every observed state belongs to the lifecycle {LIFECYCLE:?}, got \
+         {observed:?}"
     );
     let positions: Vec<usize> = positions.into_iter().flatten().collect();
     assert!(
@@ -422,10 +457,9 @@ async fn a_real_run_is_observed_walking_the_lifecycle_in_order() {
     );
 
     let detail = &last["RunDetail"];
-    assert_eq!(
-        detail["ErrorMessage"].as_str(),
-        Some(NO_AIRFLOW_ENGINE),
-        "case poll: a failed run says why it failed, got {:?}",
+    assert!(
+        detail["ErrorMessage"].is_null(),
+        "case poll: a run that completed successfully reports no ErrorMessage, got {:?}",
         detail["ErrorMessage"]
     );
     assert!(
@@ -440,8 +474,8 @@ async fn a_real_run_is_observed_walking_the_lifecycle_in_order() {
     );
     assert!(
         detail["TaskInstances"].is_null(),
-        "case poll: nothing executed the definition, so the run holds no task instance, \
-         got {:?}",
+        "case poll: this workflow's version snapshotted no definition, so its run declares \
+         no task and holds no task instance, got {:?}",
         detail["TaskInstances"]
     );
 
@@ -502,9 +536,10 @@ async fn an_optional_run_member_is_reported_only_when_the_run_holds_it() {
         .expect("setup: a created workflow has an ARN")
         .to_string();
 
-    // The task-instance ids each row seeds. A run of this emulator produces none (no
-    // Apache Airflow engine executes a definition here), so the non-empty rows seed the
-    // store the reader reads — the same records `GetTaskInstance` serves.
+    // The task-instance ids each row seeds. This workflow's version snapshotted no
+    // definition, so its runs declare no task and produce no instance of their own: the
+    // non-empty rows seed the store the reader reads — the same records
+    // `GetTaskInstance` serves.
     let seeded_tasks: &[&[&str]] = &[
         &[],
         &["extract.task-01"],

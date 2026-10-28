@@ -29,10 +29,11 @@
 //! refused and stores nothing); and the
 //! idempotency ledger is capped and evicted on its own terms (see [`IdempotencyLedger`]).
 //! A listing's response is bounded too, by the modelled `MaxResults` range.
-//! A run's `task_instances` ([`TaskInstance`]) is NOT caller-driven growth: no modelled
-//! operation creates a task instance — only executing a workflow definition does, and
-//! this emulator has no Apache Airflow engine ([`NO_AIRFLOW_ENGINE`]) — so the map is
-//! bounded by the number of runs that hold it.
+//! A run's `task_instances` ([`TaskInstance`]) is NOT caller-driven growth: a task
+//! instance exists because the run's definition DECLARED that task, so the map holds at
+//! most one entry per declared task, which
+//! [`workflow_definition::MAX_DECLARED_TASKS`] caps, and a run's plan
+//! ([`workflow_execution::ExecutionPlan`]) holds one entry per task for the same reason.
 //! The definition content a version freezes ([`WorkflowSnapshot::workflow_definition`])
 //! is caller-driven data held per version, and is capped at
 //! [`workflow_definition::MAX_DEFINITION_BYTES`] before a byte of the object is
@@ -56,8 +57,11 @@ use crate::ops::types::{
 };
 
 /// Reading the workflow definition file a version snapshots out of Amazon S3, and the
-/// schedule that definition declares.
+/// schedule and tasks that definition declares.
 pub mod workflow_definition;
+
+/// The task graph a run executes, built from the definition its version froze.
+pub mod workflow_execution;
 
 /// The region used in minted ARNs when the request carries no usable SigV4
 /// credential scope. Every generated emulator defaults to `us-east-1`.
@@ -73,18 +77,21 @@ pub const ARN_NAMESPACE: &str = "airflow-serverless";
 /// `STARTING` its start reported.
 pub const RUN_ADMITTED_AFTER: Duration = Duration::from_millis(400);
 
-/// How long after a run is `QUEUED` it reaches its terminal status. The span is
-/// deliberately non-zero so a caller that polls immediately still observes
-/// `QUEUED`.
-pub const RUN_SETTLE_AFTER: Duration = Duration::from_millis(300);
+/// How long a run waits in `QUEUED` before an executor picks it up and it starts
+/// `RUNNING`. The span is deliberately non-zero so a caller that polls immediately
+/// still observes `QUEUED`.
+pub const RUN_DEQUEUED_AFTER: Duration = Duration::from_millis(300);
 
-/// Why a run that was accepted never executes here. This emulator serves the
-/// workflow control plane faithfully but has no Apache Airflow engine to run a
-/// DAG definition with, so the run ends in the modelled failure state rather
-/// than reporting a success nothing computed.
-pub const NO_AIRFLOW_ENGINE: &str =
-    "The emulator accepted this run but has no Apache Airflow execution engine, \
-     so the workflow definition was never executed.";
+/// How long ONE dependency level of a run's task graph occupies: the span the task
+/// instances at that level are `RUNNING` for.
+///
+/// The tasks at one level run together — nothing between them waits — so a run occupies
+/// about this long per level of its graph
+/// ([`workflow_execution::ExecutionPlan::levels`]), and a run whose definition declares
+/// no task still occupies one. The length is the emulator's own choice, not a fidelity
+/// claim about how long any task takes, and it is deliberately non-zero so a caller that
+/// polls still observes `RUNNING` and the task instances that are running in it.
+pub const TASK_LEVEL_RUNS_FOR: Duration = Duration::from_millis(300);
 
 /// `WorkflowStatus` as the model spells it
 /// (`smithy_query(query="shape", shape="WorkflowStatus")` declares `READY | DELETING`).
@@ -119,6 +126,10 @@ pub const WORKFLOW_DELETED_AFTER: Duration = Duration::from_millis(500);
 pub const RUN_STATUS_STARTING: &str = "STARTING";
 /// The status an admitted run waits in for an executor.
 pub const RUN_STATUS_QUEUED: &str = "QUEUED";
+/// The status a run carries while the tasks its definition declares are being
+/// executed, between the executor picking it up and the last of those tasks
+/// finishing.
+pub const RUN_STATUS_RUNNING: &str = "RUNNING";
 /// The modelled failure state a run that could not execute ends in.
 pub const RUN_STATUS_FAILED: &str = "FAILED";
 /// The status a run carries while the shutdown a stop started is still running:
@@ -128,11 +139,12 @@ pub const RUN_STATUS_FAILED: &str = "FAILED";
 pub const RUN_STATUS_STOPPING: &str = "STOPPING";
 /// The status a run that was stopped reports once that shutdown is complete.
 pub const RUN_STATUS_STOPPED: &str = "STOPPED";
-/// The modelled success state. No run of this emulator reaches it — nothing executes
-/// a workflow definition here ([`NO_AIRFLOW_ENGINE`]) — but it is one of the statuses
-/// a run never leaves, so it belongs to [`RUN_TERMINAL_STATUSES`].
+/// The modelled success state: the status a run reaches once every task its
+/// definition declared has finished successfully.
 pub const RUN_STATUS_SUCCESS: &str = "SUCCESS";
-/// The modelled timeout state, likewise terminal and likewise never assigned here.
+/// The modelled timeout state. Terminal like the others, and not assigned here:
+/// nothing in this emulator imposes a deadline on a run's execution, so no run of it
+/// runs out of one.
 pub const RUN_STATUS_TIMEOUT: &str = "TIMEOUT";
 
 /// The `WorkflowRunStatus` values a run has FINISHED in and never leaves, out of the
@@ -295,12 +307,19 @@ pub struct WorkflowRun {
     pub duration: Option<i32>,
     pub error_message: Option<String>,
     /// The task instances this run produced, keyed by `TaskInstanceId` — a
-    /// `BTreeMap` so a reader walks them in one total order. Empty for every run
-    /// this emulator starts: a task instance exists only once something executed
-    /// the workflow definition, and nothing here does (see [`NO_AIRFLOW_ENGINE`]),
-    /// so `GetTaskInstance` answers the modelled `ResourceNotFoundException`
-    /// rather than reporting a task nothing ran.
+    /// `BTreeMap` so a reader walks them in one total order. One per task the
+    /// run's definition declared, recorded when the run starts executing them
+    /// ([`WorkflowRun::settle`]); a run whose definition declared none, and one
+    /// whose graph could not be built at all, hold none, so `GetTaskInstance`
+    /// answers the modelled `ResourceNotFoundException` rather than reporting a
+    /// task the definition never declared.
     pub task_instances: BTreeMap<String, TaskInstance>,
+    /// What this run executes: the task graph built from the definition its
+    /// version froze, once, when the run was recorded
+    /// ([`workflow_execution::ExecutionPlan`]). A version is immutable, so what it
+    /// holds IS what this run executes, and a plan built once is what makes two
+    /// reads of the same run answer identically.
+    pub execution: workflow_execution::ExecutionPlan,
     /// The instant the clock owes this run's NEXT status change. Stored, never
     /// slept on, and advanced by [`WorkflowRun::settle`] as each change lands.
     pub next_status_at: SystemTime,
@@ -348,23 +367,29 @@ impl WorkflowRun {
     /// timestamp it writes comes from the DUE instant, never from `now`, so two
     /// reads after the same deadline answer identically.
     ///
-    /// The schedule is the lifecycle the control plane itself drives:
+    /// The schedule is the lifecycle the control plane itself drives, and the
+    /// execution the run's plan lays out ([`workflow_execution::ExecutionPlan`]):
     ///
     /// * `STARTING` -> `QUEUED` after [`RUN_ADMITTED_AFTER`]: the run has been
-    ///   admitted and is waiting for an executor. Both are modelled
-    ///   `WorkflowRunStatus` values and both are the control plane's own work,
-    ///   which this emulator really does.
-    /// * `QUEUED` -> `FAILED` after [`RUN_SETTLE_AFTER`], with
-    ///   [`NO_AIRFLOW_ENGINE`] as `ErrorMessage`: nothing dequeues the run,
-    ///   because executing an Apache Airflow workflow definition needs an
-    ///   Airflow engine this emulator does not have. A run that nothing executed
-    ///   never reaches `RUNNING` or `SUCCESS` here — those would be a status for
-    ///   work nothing ran — so it ends in the service's modelled failure state
-    ///   with a reason that says exactly that, and holds no task instance.
+    ///   admitted and is waiting for an executor.
+    /// * `QUEUED` -> `RUNNING` after [`RUN_DEQUEUED_AFTER`]: an executor has picked
+    ///   the run up, so the tasks its definition declared start — one task instance
+    ///   per declared task, the ones that wait for nothing first.
+    /// * `QUEUED` -> `FAILED` instead, for a definition whose task graph could not
+    ///   be built: that is a definition no run of it can execute, so the run fails
+    ///   with the reason the plan recorded and holds no task instance.
+    /// * `RUNNING` -> `RUNNING`, one dependency level per [`TASK_LEVEL_RUNS_FOR`]:
+    ///   the level that was running finishes and the level that waited for it
+    ///   starts.
+    /// * `RUNNING` -> `SUCCESS` once no level is left: every task the definition
+    ///   declared has finished, so the run is complete and carries the completion
+    ///   instant and duration every finished run does, and no `ErrorMessage` —
+    ///   "This value is null if the run completed successfully".
     /// * `STOPPING` -> `STOPPED` after [`RUN_STOPPED_AFTER`]: the shutdown a stop
     ///   started is complete, so the run is finished and carries the completion
     ///   instant and duration every finished run does. It records no `ErrorMessage`:
-    ///   a run the caller stopped did not fail.
+    ///   a run the caller stopped did not fail. The stop "terminates all running
+    ///   tasks", so the instances it was still running end `CANCELLED`.
     ///
     /// A terminal status is never left: the loop stops at any status no
     /// transition is owed from, which is what makes a settled run stable across
@@ -377,22 +402,37 @@ impl WorkflowRun {
                 RUN_STATUS_STARTING => {
                     self.status = RUN_STATUS_QUEUED.to_string();
                     self.modified_at = due;
-                    self.next_status_at = due + RUN_SETTLE_AFTER;
+                    self.next_status_at = due + RUN_DEQUEUED_AFTER;
                 }
                 RUN_STATUS_QUEUED => {
-                    let elapsed = due.duration_since(self.started_on).unwrap_or_default();
-                    self.status = RUN_STATUS_FAILED.to_string();
-                    self.completed_on = Some(due);
                     self.modified_at = due;
-                    self.duration = Some(duration_in_seconds(elapsed));
-                    self.error_message = Some(NO_AIRFLOW_ENGINE.to_string());
+                    match self.execution.build_error.clone() {
+                        Some(reason) => {
+                            self.status = RUN_STATUS_FAILED.to_string();
+                            self.complete_at(due);
+                            self.error_message = Some(reason);
+                        }
+                        None => {
+                            self.status = RUN_STATUS_RUNNING.to_string();
+                            self.start_declared_tasks(due);
+                            self.next_status_at = due + TASK_LEVEL_RUNS_FOR;
+                        }
+                    }
+                }
+                RUN_STATUS_RUNNING => {
+                    self.modified_at = due;
+                    if self.advance_declared_tasks(due) {
+                        self.status = RUN_STATUS_SUCCESS.to_string();
+                        self.complete_at(due);
+                    } else {
+                        self.next_status_at = due + TASK_LEVEL_RUNS_FOR;
+                    }
                 }
                 RUN_STATUS_STOPPING => {
-                    let elapsed = due.duration_since(self.started_on).unwrap_or_default();
                     self.status = RUN_STATUS_STOPPED.to_string();
-                    self.completed_on = Some(due);
                     self.modified_at = due;
-                    self.duration = Some(duration_in_seconds(elapsed));
+                    self.complete_at(due);
+                    self.cancel_unfinished_tasks(due);
                 }
                 // Terminal, or a status whose exit no clock owes.
                 _ => break,
@@ -400,6 +440,122 @@ impl WorkflowRun {
             changed = true;
         }
         changed
+    }
+
+    /// Record this run as COMPLETE at `at`: the completion instant and the duration
+    /// every finished run carries, computed over the span the run occupied.
+    fn complete_at(&mut self, at: SystemTime) {
+        let elapsed = at.duration_since(self.started_on).unwrap_or_default();
+        self.completed_on = Some(at);
+        self.duration = Some(duration_in_seconds(elapsed));
+    }
+
+    /// Record one task instance per task the run's plan holds and start the first
+    /// dependency level: the tasks that wait for nothing are `RUNNING` from `at`, and
+    /// every other task is `SCHEDULED` until the level it waits for is done.
+    ///
+    /// An instance already stored under a planned identifier is left alone, so this
+    /// writes each instance once however often the clock is advanced.
+    fn start_declared_tasks(&mut self, at: SystemTime) {
+        for task in &self.execution.tasks {
+            let running = task.level == 0;
+            self.task_instances
+                .entry(task.task_instance_id.clone())
+                .or_insert_with(|| TaskInstance {
+                    task_instance_id: task.task_instance_id.clone(),
+                    task_id: Some(task.task_id.clone()),
+                    status: if running {
+                        TASK_INSTANCE_STATUS_RUNNING.to_string()
+                    } else {
+                        TASK_INSTANCE_STATUS_SCHEDULED.to_string()
+                    },
+                    operator_name: task.operator_name.clone(),
+                    // The run executes a declared task once, so its instance is the
+                    // first attempt at it.
+                    attempt_number: Some(1),
+                    started_at: running.then_some(at),
+                    ended_at: None,
+                    modified_at: at,
+                    error_message: None,
+                    // Nothing in this process writes a task's log events, so the
+                    // instance names no log stream, and nothing ran an operator that
+                    // could push a value to another task.
+                    log_stream: None,
+                    xcom: BTreeMap::new(),
+                });
+        }
+    }
+
+    /// Advance the run's execution by ONE dependency level at `at`: the level that was
+    /// running finishes successfully and the level that waited for it starts.
+    ///
+    /// Reports whether the execution is now COMPLETE — no level was left to start, which
+    /// is also the answer for a run whose definition declared no task at all.
+    fn advance_declared_tasks(&mut self, at: SystemTime) -> bool {
+        let Some(level) = self.running_level() else {
+            return true;
+        };
+        for id in self.task_instance_ids_at(level) {
+            if let Some(instance) = self.task_instances.get_mut(&id) {
+                instance.status = TASK_INSTANCE_STATUS_SUCCESS.to_string();
+                instance.ended_at = Some(at);
+                instance.modified_at = at;
+            }
+        }
+        let next = self.task_instance_ids_at(level + 1);
+        if next.is_empty() {
+            return true;
+        }
+        for id in next {
+            if let Some(instance) = self.task_instances.get_mut(&id) {
+                instance.status = TASK_INSTANCE_STATUS_RUNNING.to_string();
+                instance.started_at = Some(at);
+                instance.modified_at = at;
+            }
+        }
+        false
+    }
+
+    /// The dependency level the run is executing: the shallowest level whose task
+    /// instances are still `RUNNING`, and `None` when none of them is.
+    fn running_level(&self) -> Option<usize> {
+        self.execution
+            .tasks
+            .iter()
+            .filter(|task| {
+                self.task_instances
+                    .get(&task.task_instance_id)
+                    .is_some_and(|instance| instance.status == TASK_INSTANCE_STATUS_RUNNING)
+            })
+            .map(|task| task.level)
+            .min()
+    }
+
+    /// The identifiers of the instances of the planned tasks at `level`.
+    fn task_instance_ids_at(&self, level: usize) -> Vec<String> {
+        self.execution
+            .tasks_at(level)
+            .map(|task| task.task_instance_id.clone())
+            .collect()
+    }
+
+    /// End every task instance this run had not finished at `at`: `StopWorkflowRun`
+    /// "terminates all running tasks", and a task that was running or waiting when the
+    /// shutdown reached it ran to neither success nor failure.
+    ///
+    /// Only the two statuses this emulator's own execution assigns are ended, so an
+    /// instance that had already finished keeps the outcome it finished with.
+    fn cancel_unfinished_tasks(&mut self, at: SystemTime) {
+        for instance in self.task_instances.values_mut() {
+            if instance.status != TASK_INSTANCE_STATUS_RUNNING
+                && instance.status != TASK_INSTANCE_STATUS_SCHEDULED
+            {
+                continue;
+            }
+            instance.status = TASK_INSTANCE_STATUS_CANCELLED.to_string();
+            instance.ended_at = instance.started_at.map(|_| at);
+            instance.modified_at = at;
+        }
     }
 
     /// Whether this run has finished: its status is one a run never leaves
@@ -438,8 +594,8 @@ impl WorkflowRun {
 /// `WorkflowVersion`) and the `DurationInSeconds` a reader DERIVES from
 /// `started_at`/`ended_at` ([`TaskInstance::duration_in_seconds`]).
 ///
-/// Written only by whatever executes a workflow definition; this emulator has no
-/// Apache Airflow engine, so nothing writes one and no stored run holds one.
+/// Written by the run's own execution of the task graph its definition declared
+/// ([`WorkflowRun::settle`]), so a run holds one of these per declared task.
 #[derive(Debug, Clone)]
 pub struct TaskInstance {
     /// `TaskInstanceId`: this instance's own identifier, the key it is stored under.
@@ -481,13 +637,28 @@ impl TaskInstance {
     }
 }
 
-/// The `TaskInstanceStatus` value for an instance that has no status yet, as the
-/// model spells it (`smithy_query(query="shape", shape="TaskInstanceStatus")`).
+/// The `TaskInstanceStatus` values this service's execution assigns, as the model
+/// spells them (`smithy_query(query="shape", shape="TaskInstanceStatus")`).
 ///
-/// Nothing in `src/ops/` writes a task instance (no Apache Airflow engine executes a
-/// definition here), so this is the value a seeded record starts from in
-/// `tests/all/task_instance_reads.rs` rather than one a handler assigns.
+/// The value for an instance that has no status yet. Nothing in this emulator's own
+/// execution assigns it — an instance is recorded when its run starts executing — so
+/// it is the value a seeded record starts from in
+/// `tests/all/task_instance_reads.rs`.
 pub const TASK_INSTANCE_STATUS_NONE: &str = "NONE";
+
+/// The status an instance of a task waiting for the tasks it depends on carries.
+pub const TASK_INSTANCE_STATUS_SCHEDULED: &str = "SCHEDULED";
+
+/// The status an instance carries while its task is being executed.
+pub const TASK_INSTANCE_STATUS_RUNNING: &str = "RUNNING";
+
+/// The status an instance of a task that finished successfully carries.
+pub const TASK_INSTANCE_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// The status an instance that was still running or waiting when its run was stopped
+/// carries: the stop "terminates all running tasks", so the task ran to neither
+/// success nor failure.
+pub const TASK_INSTANCE_STATUS_CANCELLED: &str = "CANCELLED";
 
 /// A run duration in whole seconds, rounded up so a sub-second run still reports
 /// the second it occupied, and clamped into the modelled `Integer`.
@@ -872,7 +1043,9 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
         for arn in due {
             // Every firing the clock owes, oldest first, so a trigger left behind
             // reports one run per firing rather than one run for the whole gap.
-            while let Some((due_at, version, at_capacity)) = self.next_owed_firing(&arn, now) {
+            while let Some((due_at, version, definition, at_capacity)) =
+                self.next_owed_firing(&arn, now)
+            {
                 if at_capacity {
                     let skipped = firing_after(due_at, now, SCHEDULED_RUN_EVERY);
                     if let Some(workflow) = self.workflows.get_mut(&arn) {
@@ -902,10 +1075,10 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
                     modified_at: due_at,
                     duration: None,
                     error_message: None,
-                    // Nothing executes a workflow definition here
-                    // ([`NO_AIRFLOW_ENGINE`]), so this run holds no task instance
-                    // either.
+                    // The instances of the tasks this run's definition declares are
+                    // recorded when it starts executing them ([`WorkflowRun::settle`]).
                     task_instances: BTreeMap::new(),
+                    execution: workflow_execution::ExecutionPlan::of(definition.as_deref()),
                     next_status_at: due_at + RUN_ADMITTED_AFTER,
                     sequence,
                 };
@@ -923,17 +1096,23 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
 
     /// The next firing of `arn`'s trigger that `now` has already made due: the instant
     /// it fell due, the version in force at that instant — the one its run executes —
-    /// and whether the workflow already holds every run this store keeps for it.
+    /// with the definition content that version froze, and whether the workflow already
+    /// holds every run this store keeps for it.
     ///
     /// `None` when the trigger owes nothing: the workflow is gone, it has no trigger,
     /// its next firing is still ahead, or it holds no version to run.
-    fn next_owed_firing(&self, arn: &str, now: SystemTime) -> Option<(SystemTime, String, bool)> {
+    fn next_owed_firing(
+        &self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<(SystemTime, String, Option<String>, bool)> {
         let workflow = self.workflows.get(arn)?;
         let due_at = workflow.next_scheduled_run_at.filter(|at| now >= *at)?;
-        let version = workflow.version(None)?.version.clone();
+        let version = workflow.version(None)?;
         Some((
             due_at,
-            version,
+            version.version.clone(),
+            version.snapshot.workflow_definition.clone(),
             workflow.runs.len() >= MAX_RUNS_PER_WORKFLOW,
         ))
     }
