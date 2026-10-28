@@ -2441,6 +2441,45 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     pub billing_family_account_ids: Option<BTreeSet<String>>,
 }
 
+/// The kind -> store-map dispatch both tag accessors share, written ONCE.
+///
+/// [`ComAmazonawsBillingconductorAwsbillingconductorState::resource_tags`] and
+/// [`ComAmazonawsBillingconductorAwsbillingconductorState::resource_tags_mut`] differ
+/// only in the map lookup (`get` or `get_mut`) and in how they borrow the record's
+/// `tags`, so the list of kinds lives here: a kind added to [`TaggableResourceKind`] is
+/// resolved once and both accessors gain it together, which is what keeps the tags a
+/// create stored readable by the read half and writable by the write half of the same
+/// tagging surface.
+///
+/// `$arn` is the tagging `ResourceArn` as the caller spelled it; it is read into the one
+/// spelling the maps are keyed by ([`parse_taggable_arn`]) before any map is touched, so
+/// both halves resolve one resource from all of its spellings. An ARN that names no
+/// resource of this service early-returns `None` from the enclosing function, which is
+/// why this expands only inside one returning `Option`.
+macro_rules! resource_tags_of {
+    ($state:expr, $arn:expr, $get:ident $(, $mutability:tt)?) => {{
+        let resource = parse_taggable_arn($arn)?;
+        match resource.kind {
+            TaggableResourceKind::BillingGroup => $state
+                .billing_groups
+                .$get(&resource.arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggableResourceKind::PricingPlan => $state
+                .pricing_plans
+                .$get(&resource.arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggableResourceKind::PricingRule => $state
+                .pricing_rules
+                .$get(&resource.arn)
+                .map(|record| & $($mutability)? record.tags),
+            TaggableResourceKind::CustomLineItem => $state
+                .custom_line_items
+                .$get(&resource.arn)
+                .map(|record| & $($mutability)? record.tags),
+        }
+    }};
+}
+
 impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Mint the next `width`-character `[a-zA-Z0-9]` resource id. Monotonic, so no
     /// two resources of this service ever share an id.
@@ -3323,28 +3362,11 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Tags live ON the resource record (the same map `CreateBillingGroup` /
     /// `CreatePricingPlan` / `CreatePricingRule` / `CreateCustomLineItem` persisted their
     /// `Tags` into), so there is one copy of a resource's tags and a delete reclaims them
-    /// with the resource. EVERY taggable kind this service persists is resolved here: a
-    /// kind left unresolved would make the tags its create stored unreadable.
+    /// with the resource. EVERY taggable kind this service persists is resolved by the one
+    /// dispatch both halves of the tagging surface share (`resource_tags_of!`): a kind
+    /// left unresolved would make the tags its create stored unreadable.
     pub fn resource_tags(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
-        let resource = parse_taggable_arn(resource_arn)?;
-        match resource.kind {
-            TaggableResourceKind::BillingGroup => self
-                .billing_groups
-                .get(&resource.arn)
-                .map(|record| &record.tags),
-            TaggableResourceKind::PricingPlan => self
-                .pricing_plans
-                .get(&resource.arn)
-                .map(|record| &record.tags),
-            TaggableResourceKind::PricingRule => self
-                .pricing_rules
-                .get(&resource.arn)
-                .map(|record| &record.tags),
-            TaggableResourceKind::CustomLineItem => self
-                .custom_line_items
-                .get(&resource.arn)
-                .map(|record| &record.tags),
-        }
+        resource_tags_of!(self, resource_arn, get)
     }
 
     /// [`resource_tags`](Self::resource_tags), for a tagging operation that WRITES.
@@ -3352,25 +3374,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         &mut self,
         resource_arn: &str,
     ) -> Option<&mut BTreeMap<String, String>> {
-        let resource = parse_taggable_arn(resource_arn)?;
-        match resource.kind {
-            TaggableResourceKind::BillingGroup => self
-                .billing_groups
-                .get_mut(&resource.arn)
-                .map(|record| &mut record.tags),
-            TaggableResourceKind::PricingPlan => self
-                .pricing_plans
-                .get_mut(&resource.arn)
-                .map(|record| &mut record.tags),
-            TaggableResourceKind::PricingRule => self
-                .pricing_rules
-                .get_mut(&resource.arn)
-                .map(|record| &mut record.tags),
-            TaggableResourceKind::CustomLineItem => self
-                .custom_line_items
-                .get_mut(&resource.arn)
-                .map(|record| &mut record.tags),
-        }
+        resource_tags_of!(self, resource_arn, get_mut, mut)
     }
 
     /// What the custom line items of one billing group put on its PRO FORMA bill in
