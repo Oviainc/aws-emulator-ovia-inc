@@ -3,7 +3,10 @@
 //! @op UntagResource
 //! Implemented: removes the named tag keys from the resource named by `ResourceArn` in
 //! [`crate::state`] — the one tag set `ListTagsForResource` and that resource's own
-//! Get/Describe report. A key in the reserved namespace
+//! Get/Describe report. A tag set belongs to a resource an ACCOUNT holds, so an ARN naming
+//! a record no request created and no account owns (one of AWS's standing public networks,
+//! [`crate::state::StoredNetwork::is_account_resource`]) names no tag set this operation
+//! removes from. A key in the reserved namespace
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a key a
 //! caller may remove, so such a request is refused whole and removes nothing. Nor is a
 //! resource the service is still creating, or has already begun removing, in a status that
@@ -199,8 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UntagResourceErrorModeled::ResourceNotReadyException(refusal).into());
         }
 
-        // An ARN of another Region names no resource this Region holds — see the same
-        // Region check in `tag_resource.rs`.
+        // An ARN of another Region names no resource this Region holds, and a record that
+        // is no account's — one of AWS's standing public networks — holds no account's tag
+        // set to remove from, in every Region alike: see the same two tests in
+        // `tag_resource.rs`.
         let Some(tags) = crate::state::arn_in_region(&input.resource_arn, &region)
             .then(|| guard.tags_for_resource_mut(&input.resource_arn))
             .flatten()

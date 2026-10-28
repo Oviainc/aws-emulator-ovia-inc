@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/accessor_lifecycle.rs"]
 mod accessor_lifecycle;
+#[path = "all/aws_owned_record_tagging.rs"]
+mod aws_owned_record_tagging;
 #[path = "all/create_node_member_scope.rs"]
 mod create_node_member_scope;
 #[path = "all/delete_member.rs"]

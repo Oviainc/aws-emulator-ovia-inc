@@ -3,7 +3,10 @@
 //! @op ListTagsForResource
 //! Implemented: reports the tag set the resource named by `ResourceArn` holds in
 //! [`crate::state`] — the one set `TagResource`, `UntagResource` and every create's
-//! `Tags` write to. A resource the service is still creating, or has already begun
+//! `Tags` write to. A tag set belongs to a resource an ACCOUNT holds, so an ARN naming a
+//! record no request created and no account owns (one of AWS's standing public networks,
+//! [`crate::state::StoredNetwork::is_account_resource`]) names no tag set to report. A
+//! resource the service is still creating, or has already begun
 //! removing, isn't in a status that can complete the operation
 //! ([`crate::state::is_transient_status`]), so such a request is refused.
 //!
@@ -189,8 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // An ARN of another Region names no resource this Region holds — see the same
-        // Region check in `tag_resource.rs`.
+        // An ARN of another Region names no resource this Region holds, and a record that
+        // is no account's — one of AWS's standing public networks — holds no account's tag
+        // set to report, in every Region alike: see the same two tests in
+        // `tag_resource.rs`.
         let Some(tags) = crate::state::arn_in_region(&input.resource_arn, &region)
             .then(|| guard.tags_for_resource(&input.resource_arn))
             .flatten()

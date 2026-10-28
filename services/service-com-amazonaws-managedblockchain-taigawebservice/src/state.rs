@@ -843,6 +843,19 @@ impl StoredNetwork {
         self.aws_owned || arn_in_region(&self.arn, region)
     }
 
+    /// Whether this network is a resource an ACCOUNT holds — one a request created, which
+    /// belongs to the account that created it and to that account's Region.
+    ///
+    /// AWS's standing public networks ([`PUBLIC_NETWORKS`]) are not: no request created
+    /// them and they belong to no account, which is why every Region's endpoint reads the
+    /// same ones ([`Self::in_region`]). A record that is not an account resource is not one
+    /// an account's call changes or holds account state on, so it is kept out of the write
+    /// paths and out of the per-resource tag plane; what an account creates ON one — a
+    /// member, a node, a proposal — is an account resource again.
+    pub fn is_account_resource(&self) -> bool {
+        !self.aws_owned
+    }
+
     /// The member `member_id` names, as a request addressed to `region` sees it.
     pub fn member(&self, region: &str, member_id: &str) -> Option<&StoredMember> {
         self.members
@@ -976,7 +989,7 @@ impl StoredNetwork {
     /// removal has started does not count: it "can no longer participate on the network"
     /// (`Member$Status` / `Node$Status`).
     pub fn account_participates(&self, region: &str) -> bool {
-        !self.aws_owned
+        self.is_account_resource()
             || self.participating_members(region).next().is_some()
             || self
                 .nodes_in(region)
@@ -1706,6 +1719,12 @@ impl StoredInvitation {
 /// therefore exist ONCE: a kind added here is added to both resolutions, so the status a
 /// refusal keys on and the tag set a write lands in can never come from different records.
 ///
+/// A tag set belongs to a resource an ACCOUNT holds, so only a record that is one resolves
+/// here: a network no request created and no account owns ([`StoredNetwork::is_account_resource`])
+/// carries no tag set a caller can read, write or remove, while the members, nodes and
+/// proposals an account creates ON such a network are its own resources and resolve as any
+/// other do.
+///
 /// Expands to the whole body of a resolver returning `Option<$record<'_>>`: it `return`s the
 /// first record whose stored ARN is `$arn` and evaluates to `None` when no record carries it.
 macro_rules! resolve_tagged_record {
@@ -1715,7 +1734,7 @@ macro_rules! resolve_tagged_record {
             return Some($record::Accessor(accessor));
         }
         for network in $state.networks.$records() {
-            if network.arn == arn {
+            if network.arn == arn && network.is_account_resource() {
                 return Some($record::Network(network));
             }
             if let Some(member) = network.members.$records().find(|member| member.arn == arn) {
@@ -2027,9 +2046,11 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     /// rebuilding one from the request: an ARN naming another account's or another
     /// Region's resource therefore names nothing this store holds, which is the same
     /// answer as naming a resource that was never created. Every taggable resource is
-    /// reachable here — the account's accessors, and each network with the members, nodes
-    /// and proposals that belong to it — so one tag set is read and written through this
-    /// one lookup rather than a copy per operation.
+    /// reachable here — the account's accessors, and each network it holds with the
+    /// members, nodes and proposals that belong to it — so one tag set is read and written
+    /// through this one lookup rather than a copy per operation. A network that is not an
+    /// account resource ([`StoredNetwork::is_account_resource`]) holds no tag set of an
+    /// account's, so an ARN of one resolves to nothing here either.
     pub fn tags_for_resource(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
         self.tagged_record(arn).map(TaggedRecord::tags)
     }
@@ -2453,7 +2474,7 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         // member. One of AWS's standing public networks is not an account resource and no
         // call deletes it, so losing the members an account held on it leaves it standing
         // for every other caller.
-        if !network.aws_owned
+        if network.is_account_resource()
             && network
                 .members
                 .values()

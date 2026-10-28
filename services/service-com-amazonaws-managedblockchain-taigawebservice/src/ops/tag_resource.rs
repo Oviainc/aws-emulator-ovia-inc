@@ -3,7 +3,11 @@
 //! @op TagResource
 //! Implemented: adds or overwrites tags on the resource named by `ResourceArn` in
 //! [`crate::state`] — the one tag set `ListTagsForResource` and that resource's own
-//! Get/Describe report. A key in the reserved namespace
+//! Get/Describe report. A tag set belongs to a resource an ACCOUNT holds, so an ARN naming
+//! a record no request created and no account owns (one of AWS's standing public networks,
+//! [`crate::state::StoredNetwork::is_account_resource`]) names no tag set this operation
+//! writes, and the request is answered the way an ARN naming nothing stored is. A key in
+//! the reserved namespace
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a key a
 //! caller may write, so such a request is refused whole and stores nothing. A resource the
 //! service is still creating, or has already begun removing, isn't in a status that can
@@ -212,6 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below already gives for every record minted in another Region, stated here so it
         // holds for the standing public networks too (they are read in every Region, so
         // their stored ARN alone does not settle which Region a request addresses).
+        //
+        // Those standing networks are not account resources at all: no request created
+        // them and they belong to no account, so they hold no account's tag set and the
+        // resolution answers nothing for an ARN of one, in every Region alike.
         let Some(tags) = crate::state::arn_in_region(&resource_arn, &region)
             .then(|| guard.tags_for_resource_mut(&resource_arn))
             .flatten()
