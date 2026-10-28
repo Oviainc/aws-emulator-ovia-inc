@@ -8,13 +8,26 @@
 //! one the call that applied it persisted, and an enablement the clock has torn down is
 //! gone from it.
 //!
-//! One filter member selects by something this service holds no value for. An
-//! `EnabledBaseline` here is applied directly to its target and this service records no
-//! organizational hierarchy, so no enablement is the child of another one
-//! (`parentIdentifier` absent) and `includeChildren` — which asks for the enablements the
-//! target's member accounts inherited — widens the listing by nothing. An absent value is
-//! selected only by an absent filter, so filtering on `parentIdentifiers` selects nothing
-//! rather than inventing a parent to match it.
+//! `includeChildren` decides WHICH enablements are listed: it is "a value that can be set
+//! to include the child enabled baselines in responses. The default value is false", and a
+//! child is an enablement that INHERITED its configuration from another one
+//! (`EnabledBaselineDetails$parentIdentifier`), so the listing holds the enablements
+//! carrying a parent only when the request sets it. The parent an entry reports is read off
+//! its stored record — the same member `GetEnabledBaseline` reports — and `parentIdentifiers`
+//! selects on that value, so a filter on it keeps the enablements inherited from the
+//! enablements it names; an absent value is selected only by an absent filter, so no parent
+//! is invented to match one.
+//!
+//! No enablement this service holds carries a parent, so the flag widens this listing by
+//! nothing today: a child of an enablement on an organizational unit is a deployment into a
+//! member ACCOUNT of that unit (`EnabledBaselineInheritanceDrift` has inheritance drift
+//! occurring "when any accounts in the target OU do not match the baseline configuration
+//! defined on that OU"), which takes the organization's membership — and no call this
+//! service serves states that an account is a member of a unit, nor does any rule derive
+//! one from a unit's opaque identifier. The accounts a landing zone designates
+//! (`centralizedLogging.accountId`, `securityRoles.accountId`) are not recorded as members
+//! of any particular unit, so attaching them to whichever unit a request names would report
+//! resources this service does not hold.
 //!
 //! `inheritanceDriftStatuses` DOES select, on the drift status the enablement carries —
 //! the same one `GetEnabledBaseline` reports — so an enablement of a baseline AWS assesses
@@ -99,8 +112,8 @@ use super::types::*;
 // it (normalising a compared identifier, say) narrows every listing the same way; see
 // `crate::state` for how a sent filter member becomes the set it matches against.
 // `selected_optional` is the rule for a member an enablement may have no value for: an
-// absent actual value is selected only by an absent filter, so a filter on a member no
-// enablement here carries selects nothing (see the module header on `parentIdentifiers`
+// absent actual value is selected only by an absent filter, so a filter on it selects
+// just the enablements that do carry one (see the module header on `parentIdentifiers`
 // and `inheritanceDriftStatuses`).
 use crate::state::{filter_set, resolve_baseline, selected, selected_optional, selected_resolved};
 
@@ -202,14 +215,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@readonly` and writes nothing else.
         store.settle(::std::time::SystemTime::now());
 
-        // A stable total order over the page boundary, so a `nextToken` resumes where the
-        // previous page stopped whatever order the map iterates in. The records are
-        // BORROWED, not cloned: only the page this call returns is materialised.
+        // WHAT this call lists: the stored enablements, less the ones that INHERITED their
+        // configuration from another enablement unless the request asked for those
+        // (`includeChildren`). The records are BORROWED, not cloned: only the page this
+        // call returns is materialised.
         let mut enabled: Vec<&crate::state::EnabledBaseline> = store
             .enabled_baselines
             .values()
             .filter(|enabled_baseline| {
-                selected(&target_identifiers, &enabled_baseline.target_identifier)
+                (input.include_children || enabled_baseline.parent_identifier.is_none())
+                    && selected(&target_identifiers, &enabled_baseline.target_identifier)
                     // A baseline is selected by the catalog entry a filter value
                     // resolves to, so an enablement is found by any of the identifiers
                     // that name its baseline, not only by the one the enabling call sent.
@@ -219,20 +234,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         resolve_baseline,
                     )
                     && selected(&statuses, enabled_baseline.status.as_wire())
-                    // An enablement whose inheritance drift is not assessed has no status
-                    // for this filter to match, so only an absent filter selects it; see
-                    // the module header, and `parentIdentifiers`, which no enablement here
-                    // has a value for at all — nor does `includeChildren` widen this set,
-                    // because there is no hierarchy to widen it with.
+                    // Each of these two members only some enablements carry a value for:
+                    // one whose inheritance drift is not assessed has no drift status, and
+                    // one applied directly to its target has no parent, so a filter on
+                    // either selects just the enablements that do carry one — and, for a
+                    // member no enablement here carries, nothing (see the module header).
                     && selected_optional(
                         &inheritance_drift_statuses,
                         enabled_baseline
                             .inheritance_drift_status
                             .map(|status| status.as_wire()),
                     )
-                    && selected_optional(&parent_identifiers, None)
+                    && selected_optional(
+                        &parent_identifiers,
+                        enabled_baseline.parent_identifier.as_deref(),
+                    )
             })
             .collect();
+        // A stable total order over the page boundary, so a `nextToken` resumes where the
+        // previous page stopped whatever order the map iterates in.
         enabled.sort_by(|left, right| left.arn.cmp(&right.arn));
 
         // The page the call asks for, cut out by this crate's one pagination rule: the
@@ -273,8 +293,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }),
                 target_identifier: enabled_baseline.target_identifier.clone(),
-                // Every enablement here is an OU-level one, so none inherits from a parent.
-                parent_identifier: None,
+                // The enablement this one inherited its configuration from, read off the
+                // same stored member `GetEnabledBaseline` reports: absent for an enablement
+                // applied directly to its target.
+                parent_identifier: enabled_baseline.parent_identifier.clone(),
                 status_summary: EnablementStatusSummary {
                     status: Some(enabled_baseline.status.as_wire().to_string()),
                     last_operation_identifier: Some(

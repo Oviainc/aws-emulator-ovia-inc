@@ -938,6 +938,24 @@ pub struct EnabledBaseline {
     pub baseline_version: String,
     pub target_identifier: String,
     pub parameters: Vec<(String, ::aws_smithy_types::Document)>,
+    /// `EnabledBaselineSummary$parentIdentifier` /
+    /// `EnabledBaselineDetails$parentIdentifier`: the `EnabledBaseline` this one INHERITED
+    /// its configuration from, or `None` when it inherits from none.
+    ///
+    /// A parent is "an ARN that represents the parent EnabledBaseline at the
+    /// Organizational Unit (OU) level, from which the child EnabledBaseline inherits its
+    /// configuration" (model docs), and a child of one is a deployment into a MEMBER
+    /// ACCOUNT of that unit — `EnabledBaselineInheritanceDrift` has inheritance drift
+    /// occurring "when any accounts in the target OU do not match the baseline
+    /// configuration defined on that OU". Which accounts a unit holds is the organization's
+    /// membership, and this service records none: no call it serves states that an account
+    /// is a member of a unit, and no rule derives one from a unit's ARN (an organizational
+    /// unit identifier is opaque). So every enablement here is one `EnableBaseline` applied
+    /// DIRECTLY to its target, which inherits from nothing and carries no parent — the
+    /// member is absent rather than filled with a parent nothing establishes. Reported and
+    /// filtered on from HERE by both reporting operations, so the day membership is
+    /// recorded, the enablements derived from it report their parent through the same path.
+    pub parent_identifier: Option<String>,
     /// `EnablementStatusSummary$status`, derived from `due_at` and the transitions parked
     /// on this enablement by [`settle`].
     ///
@@ -1944,6 +1962,14 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
                 baseline_version: baseline_version.to_string(),
                 target_identifier: target_identifier.to_string(),
                 parameters,
+                // `EnableBaseline` applies a baseline DIRECTLY to the target the request
+                // names, so what it persists inherits its configuration from no other
+                // enablement and reports no parent. A child enablement is one Control
+                // Tower derives from the organization's membership — a deployment into a
+                // member ACCOUNT of a target organizational unit — and this service
+                // records no membership for one to be derived from, so the member stays
+                // absent rather than naming a parent nothing establishes.
+                parent_identifier: None,
                 // The enablement is changing until its ENABLE_BASELINE operation is due;
                 // the status is derived from the log by `settle`, and seeded to match.
                 status: EnablementStatus::UnderChange,

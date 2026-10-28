@@ -20,11 +20,18 @@
 //! the status is stored on the enablement and materialised by `settle`, never computed
 //! here.
 //!
-//! `parentIdentifier` is ABSENT: it "represents the parent EnabledBaseline at the
-//! Organizational Unit (OU) level, from which the CHILD EnabledBaseline inherits its
-//! configuration", and every enablement this service holds is itself an OU-level one —
-//! `EnableBaseline` refuses any target that is not an organizational unit — so none is a
-//! child of another and there is no parent to name.
+//! `parentIdentifier` is the enablement a reported one INHERITED its configuration from:
+//! it "represents the parent EnabledBaseline at the Organizational Unit (OU) level, from
+//! which the child EnabledBaseline inherits its configuration" and "the value is returned
+//! by GetEnabledBaseline". It is read off the stored record rather than decided here, and
+//! an enablement `EnableBaseline` applied directly to its target inherits from nothing, so
+//! the member is absent for every enablement this service holds: a child of one is a
+//! deployment into a member ACCOUNT of the target organizational unit
+//! (`EnabledBaselineInheritanceDrift` has inheritance drift occurring "when any accounts in
+//! the target OU do not match the baseline configuration defined on that OU"), which takes
+//! the organization's membership — and no call this service serves states that an account
+//! is a member of a unit, nor does any rule derive one from a unit's opaque identifier. So
+//! no parent is named rather than one being invented.
 //!
 //! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
 //! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
@@ -218,8 +225,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }),
                 target_identifier: enabled_baseline.target_identifier.clone(),
-                // Every enablement here is an OU-level one, so none inherits from a parent.
-                parent_identifier: None,
+                // The enablement this one inherited its configuration from, read off the
+                // record: absent for an enablement applied directly to its target, which
+                // inherits from nothing (see the module header).
+                parent_identifier: enabled_baseline.parent_identifier.clone(),
                 status_summary: EnablementStatusSummary {
                     status: Some(enabled_baseline.status.as_wire().to_string()),
                     last_operation_identifier: Some(

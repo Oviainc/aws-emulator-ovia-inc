@@ -57,6 +57,8 @@ mod front_door_validation;
 mod get_enabled_control;
 #[path = "all/in_flight_configuration_change_drift.rs"]
 mod in_flight_configuration_change_drift;
+#[path = "all/inherited_enabled_baselines.rs"]
+mod inherited_enabled_baselines;
 #[path = "all/landing_zone_decommission.rs"]
 mod landing_zone_decommission;
 #[path = "all/landing_zone_identifier.rs"]
