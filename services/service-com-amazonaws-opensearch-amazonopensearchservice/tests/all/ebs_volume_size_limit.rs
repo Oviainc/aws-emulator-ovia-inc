@@ -22,12 +22,15 @@
 //! So the assertions span SETS of inputs: a table of instance sizes, volume sub-types
 //! and engine releases of both engine lines, each probed below the published floor and
 //! above the published maximum, with each row's bounds read from the service's own
-//! catalog; the bounds themselves, which are accepted and read back; and the update path,
-//! where the merged record is what the bounds are read for.
+//! catalog; the bounds themselves, which are accepted and read back; the update path,
+//! where the merged record is what the bounds are read for; and, over a second table of
+//! pairings, that a refused create materialises NO domain — neither reader answers from
+//! a record and the enumeration does not hold the name, while the same name sized at the
+//! published floor is created.
 
 use serde_json::{json, Value};
 
-use super::domain_lifecycle::{error_code, Answer, Emulator};
+use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
 use super::instance_type_limits::published_volume_size_range;
 
 /// The pairings the table spans: one row per instance SIZE the published maximum
@@ -371,4 +374,114 @@ async fn a_request_naming_no_instance_type_is_held_to_the_published_floor() {
         "case EBS not enabled: expected no volume to be sized, got {} {:?}",
         answer.status, answer.body
     );
+}
+
+/// The pairings the "nothing was created" invariant is held over: a row per instance
+/// FAMILY, volume sub-type and engine line, so the invariant rests on no single
+/// instance type, sub-type or release.
+const ABSENCE_ROWS: [(&str, &str, &str); 3] = [
+    ("OpenSearch_2.19", "r6g.large.search", "gp2"),
+    ("Elasticsearch_7.10", "m5.4xlarge.search", "io1"),
+    ("OpenSearch_2.11", "t3.small.search", "gp3"),
+];
+
+/// The domain names `ListDomainNames` enumerates for the account.
+async fn listed_names(emulator: &Emulator, case: &str) -> Vec<String> {
+    let answer = emulator.call("GET", &format!("{PREFIX}/domain"), None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected ListDomainNames to answer 200, got {} {:?}",
+        answer.status, answer.body
+    );
+    answer.body["DomainNames"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected DomainNames, got {:?}", answer.body))
+        .iter()
+        .filter_map(|entry| entry["DomainName"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_create_refused_by_the_published_bounds_materialises_no_domain() {
+    let emulator = Emulator::new();
+
+    for (row, (engine_version, instance_type, sub_type)) in ABSENCE_ROWS.into_iter().enumerate() {
+        let (minimum, maximum) =
+            published_volume_size_range(&emulator, engine_version, instance_type, sub_type).await;
+        let expected = expected_message(minimum, maximum, instance_type, engine_version);
+
+        // One probe past each published bound: whichever bound the size is outside, the
+        // request is refused and the account is left exactly as it was.
+        for (index, size) in [minimum - 1, maximum + 1].into_iter().enumerate() {
+            let name = format!("ebs-absent-{row}-{index}");
+            let case = format!("{engine_version} {instance_type} {sub_type} {size} GiB");
+            let answer = emulator
+                .create(create_body(
+                    &name,
+                    engine_version,
+                    instance_type,
+                    sub_type,
+                    size,
+                ))
+                .await;
+            assert_refused(&answer, &expected, &case);
+
+            // Nothing was materialised, which is observable through every reader of a
+            // domain: neither read answers from a record, and the enumeration does not
+            // hold the name.
+            for (reader, answer) in [
+                ("DescribeDomain", emulator.describe(&name).await),
+                ("DescribeDomainConfig", emulator.describe_config(&name).await),
+            ] {
+                assert_eq!(
+                    answer.status, 409,
+                    "case {case} {reader}: expected no domain to have been created, got {} {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    error_code(&answer),
+                    "ResourceNotFoundException",
+                    "case {case} {reader}: expected the not-found refusal, got {:?}",
+                    answer.body
+                );
+                let actual = message(&answer, &case);
+                assert_eq!(
+                    actual,
+                    format!("Domain not found: {name}"),
+                    "case {case} {reader}: expected the missing name to be reported, got \
+                     {actual:?}"
+                );
+            }
+            let listed = listed_names(&emulator, &case).await;
+            assert!(
+                !listed.contains(&name),
+                "case {case}: expected {name} not to be enumerated, got {listed:?}"
+            );
+        }
+
+        // The refusal took nothing, not even the name: the SAME name, sized at the
+        // published floor, is created and then enumerated — so the invariant above is
+        // the refusal's own, not a service that creates no domain at all.
+        let name = format!("ebs-absent-{row}-0");
+        let case = format!("{engine_version} {instance_type} {sub_type} {minimum} GiB accepted");
+        let answer = emulator
+            .create(create_body(
+                &name,
+                engine_version,
+                instance_type,
+                sub_type,
+                minimum,
+            ))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected the published floor to be accepted, got {} {:?}",
+            answer.status, answer.body
+        );
+        let listed = listed_names(&emulator, &case).await;
+        assert!(
+            listed.contains(&name),
+            "case {case}: expected {name} to be enumerated, got {listed:?}"
+        );
+    }
 }
