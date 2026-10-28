@@ -35,8 +35,33 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediaconnect_mediaconnect::ops::types::FailoverConfig;
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_flow_arn, minted_gateway_arn};
+use crate::bridge_lifecycle::{cloud_flow, create_bridge, describe_bridge, gateway_with_networks};
 use crate::flow_lifecycle::Emulator;
+
+/// The network the placement gateway of every bridge below declares — the one name a
+/// network source of such a bridge may ingest on (`GatewayNetwork$Name`: "this name is used
+/// to reference the network and must be unique among networks in this gateway").
+const DECLARED_NETWORK: &str = "net-1";
+
+/// The resources this suite's sources reference: the gateway every bridge is placed on,
+/// declaring [`DECLARED_NETWORK`], and one cloud flow the account holds.
+///
+/// A source written onto a bridge the store holds must name resources the store holds —
+/// that rule is `crate::bridge_add_references`' own subject — so the fixtures here are
+/// created over the wire and the rows below then vary only the direction and count rules
+/// this suite is about.
+struct Placed {
+    placement_arn: String,
+    flow_arn: String,
+}
+
+async fn placed(emulator: &Emulator, name: &str) -> Placed {
+    Placed {
+        placement_arn: gateway_with_networks(emulator, &format!("gw-{name}"), &[DECLARED_NETWORK])
+            .await,
+        flow_arn: cloud_flow(emulator, &format!("flow-{name}")).await,
+    }
+}
 
 /// `POST /v1/bridges/{BridgeArn}/sources`.
 async fn add_sources(emulator: &Emulator, arn: &str, sources: Vec<Value>) -> (u16, Option<String>, Value) {
@@ -56,10 +81,10 @@ async fn update_bridge(emulator: &Emulator, arn: &str, body: Value) -> (u16, Opt
         .await
 }
 
-/// One flow source: the kind a cloud-to-ground bridge ingests.
-fn flow_source(name: &str, suffix: u64) -> Value {
+/// One flow source on the cloud flow `flow_arn`: the kind a cloud-to-ground bridge ingests.
+fn flow_source(name: &str, flow_arn: &str) -> Value {
     json!({ "flowSource": {
-        "flowArn": minted_flow_arn(suffix, &format!("flow-{suffix}")),
+        "flowArn": flow_arn,
         "name": name,
     }})
 }
@@ -69,7 +94,7 @@ fn network_source(name: &str, port: i64) -> Value {
     json!({ "networkSource": {
         "multicastIp": "224.0.1.1",
         "name": name,
-        "networkName": "net-1",
+        "networkName": DECLARED_NETWORK,
         "port": port,
         "protocol": "rtp",
     }})
@@ -83,19 +108,20 @@ struct Kind {
     label: &'static str,
     /// The bridge-type member a bridge that ingests this kind carries.
     admitted_by: &'static str,
-    /// One source entry of this kind, named `name`.
-    source: fn(&str, u64) -> Value,
+    /// One source entry of this kind, named `name` and distinguished from the others of its
+    /// request by `index`, naming the resources [`Placed`] holds.
+    source: fn(&str, u64, &Placed) -> Value,
 }
 
 const FLOW: Kind = Kind {
     label: "flow source",
     admitted_by: "egressGatewayBridge",
-    source: flow_source,
+    source: |name, _index, placed| flow_source(name, &placed.flow_arn),
 };
 const NETWORK: Kind = Kind {
     label: "network source",
     admitted_by: "ingressGatewayBridge",
-    source: |name, index| network_source(name, 5_000 + index as i64),
+    source: |name, index, _placed| network_source(name, 5_000 + index as i64),
 };
 
 /// The bridge-type member `member` carries, with its settings. `IngressGatewayBridge`
@@ -111,10 +137,16 @@ fn bridge_type_settings(member: &str) -> Value {
 
 /// A CreateBridge body for a bridge of `member` type carrying `sources`, with `failover`
 /// when the row names one.
-fn create_body(name: &str, member: &str, sources: Vec<Value>, failover: Option<&Value>) -> Value {
+fn create_body(
+    name: &str,
+    member: &str,
+    sources: Vec<Value>,
+    failover: Option<&Value>,
+    placed: &Placed,
+) -> Value {
     let mut body = json!({
         "name": name,
-        "placementArn": minted_gateway_arn(1, "gw-source-admission"),
+        "placementArn": placed.placement_arn,
         "sources": sources,
     });
     body[member] = bridge_type_settings(member);
@@ -256,6 +288,7 @@ fn stored_failover_config(body: &Value) -> FailoverConfig {
 #[tokio::test]
 async fn create_bridge_admits_the_sources_the_bridge_s_direction_and_failover_state_allow() {
     let emulator = Emulator::new();
+    let placed = placed(&emulator, "source-admission-create").await;
 
     for (kind_index, kind) in [FLOW, NETWORK].into_iter().enumerate() {
         for member in ["egressGatewayBridge", "ingressGatewayBridge"] {
@@ -271,12 +304,12 @@ async fn create_bridge_admits_the_sources_the_bridge_s_direction_and_failover_st
                         format!("bridge-create-{kind_index}-{member}-{form_index}-{count}");
                     let sources: Vec<Value> = (0..count)
                         .map(|index| {
-                            (kind.source)(&format!("src-{index}"), (index + 1) as u64)
+                            (kind.source)(&format!("src-{index}"), (index + 1) as u64, &placed)
                         })
                         .collect();
                     let (status, code, answered) = create_bridge(
                         &emulator,
-                        create_body(&name, member, sources.clone(), failover.as_ref()),
+                        create_body(&name, member, sources.clone(), failover.as_ref(), &placed),
                     )
                     .await;
 
@@ -333,6 +366,7 @@ async fn create_bridge_admits_the_sources_the_bridge_s_direction_and_failover_st
 #[tokio::test]
 async fn add_bridge_sources_admits_the_sources_the_stored_bridge_s_direction_and_bound_allow() {
     let emulator = Emulator::new();
+    let placed = placed(&emulator, "source-admission-add").await;
 
     for (kind_index, kind) in [FLOW, NETWORK].into_iter().enumerate() {
         for member in ["egressGatewayBridge", "ingressGatewayBridge"] {
@@ -353,8 +387,9 @@ async fn add_bridge_sources_admits_the_sources_the_stored_bridge_s_direction_and
                         create_body(
                             &name,
                             member,
-                            vec![(held_kind.source)("held", 50)],
+                            vec![(held_kind.source)("held", 50, &placed)],
                             failover.as_ref(),
+                            &placed,
                         ),
                     )
                     .await;
@@ -375,7 +410,7 @@ async fn add_bridge_sources_admits_the_sources_the_stored_bridge_s_direction_and
 
                     let added: Vec<Value> = (0..adding)
                         .map(|index| {
-                            (kind.source)(&format!("added-{index}"), (index + 10) as u64)
+                            (kind.source)(&format!("added-{index}"), (index + 10) as u64, &placed)
                         })
                         .collect();
                     let (status, code, answered) =
@@ -424,12 +459,25 @@ async fn add_bridge_sources_admits_the_sources_the_stored_bridge_s_direction_and
 #[tokio::test]
 async fn a_batch_mixing_the_two_kinds_of_source_is_refused_by_either_bridge() {
     let emulator = Emulator::new();
+    let placed = placed(&emulator, "source-admission-mixed").await;
 
     for member in ["egressGatewayBridge", "ingressGatewayBridge"] {
         let held_kind = if member == FLOW.admitted_by { FLOW } else { NETWORK };
         for (position, batch) in [
-            ("the flow source first", vec![flow_source("a", 1), network_source("b", 5_001)]),
-            ("the network source first", vec![network_source("a", 5_002), flow_source("b", 2)]),
+            (
+                "the flow source first",
+                vec![
+                    flow_source("a", &placed.flow_arn),
+                    network_source("b", 5_001),
+                ],
+            ),
+            (
+                "the network source first",
+                vec![
+                    network_source("a", 5_002),
+                    flow_source("b", &placed.flow_arn),
+                ],
+            ),
         ] {
             let case = format!("a mixed batch on a bridge whose type is {member}, {position}");
             let name = format!("bridge-mixed-{member}-{}", batch.len() + position.len());
@@ -438,10 +486,11 @@ async fn a_batch_mixing_the_two_kinds_of_source_is_refused_by_either_bridge() {
                 create_body(
                     &name,
                     member,
-                    vec![(held_kind.source)("held", 60)],
+                    vec![(held_kind.source)("held", 60, &placed)],
                     // Failover ACTIVE, so the batch is never refused for the COUNT: what
                     // this row asserts is the kind rule alone.
                     Some(&json!({ "state": mc::STATE_ENABLED })),
+                    &placed,
                 ),
             )
             .await;
@@ -475,6 +524,7 @@ async fn a_batch_mixing_the_two_kinds_of_source_is_refused_by_either_bridge() {
 #[tokio::test]
 async fn update_bridge_moves_the_bound_a_bridge_holds_its_sources_under() {
     let emulator = Emulator::new();
+    let placed = placed(&emulator, "source-admission-bound").await;
 
     // A pair of flow sources under ACTIVE failover: switching the state off would leave the
     // bridge over the inactive bound.
@@ -484,8 +534,12 @@ async fn update_bridge_moves_the_bound_a_bridge_holds_its_sources_under() {
         create_body(
             "bridge-bound-pair",
             "egressGatewayBridge",
-            vec![flow_source("primary", 1), flow_source("backup", 2)],
+            vec![
+                flow_source("primary", &placed.flow_arn),
+                flow_source("backup", &placed.flow_arn),
+            ],
             Some(&json!({ "state": mc::STATE_ENABLED })),
+            &placed,
         ),
     )
     .await;
@@ -529,6 +583,7 @@ async fn update_bridge_moves_the_bound_a_bridge_holds_its_sources_under() {
             "ingressGatewayBridge",
             vec![network_source("held", 5_000)],
             None,
+            &placed,
         ),
     )
     .await;

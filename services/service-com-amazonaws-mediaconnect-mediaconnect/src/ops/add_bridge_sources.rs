@@ -218,6 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let bridge_type = bridge.bridge_type();
         let held = bridge.sources.len();
         let failover = bridge.source_failover_config.clone();
+        // The gateway this bridge is placed on (`Bridge$PlacementArn`): the one gateway
+        // whose declared networks a network source of this bridge may ingest on.
+        let placement_arn = bridge.placement_arn.clone();
 
         // Each entry configures ONE kind of source, and a source is addressed by its name:
         // `AddBridgeNetworkSourceRequest$Name` / `AddBridgeFlowSourceRequest$Name` "is used
@@ -247,6 +250,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             if let Some(detail) = crate::state::bridge_source_kind_rejection(bridge_type, &source) {
+                return Err(bad_request(detail));
+            }
+            // A bridge source names other resources: the cloud flow a flow source takes its
+            // content from (`BridgeFlowSource$FlowArn`) and the gateway network a network
+            // source ingests on (`BridgeNetworkSource$NetworkName`). Both are RESOLVED
+            // against the store before the source is stored, through the one function every
+            // path that writes a source onto a stored bridge resolves them with — so this
+            // operation stores no source UpdateBridgeSource would refuse (see
+            // `crate::state::bridge_source_reference_rejection`).
+            if let Some(detail) = store.bridge_source_reference_rejection(&placement_arn, &source) {
                 return Err(bad_request(detail));
             }
             added.push(source);

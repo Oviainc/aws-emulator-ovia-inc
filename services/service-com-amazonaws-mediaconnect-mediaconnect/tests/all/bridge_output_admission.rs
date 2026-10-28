@@ -27,7 +27,9 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
-use crate::bridge_lifecycle::{create_bridge, describe_bridge, minted_flow_arn, minted_gateway_arn};
+use crate::bridge_lifecycle::{
+    create_bridge, describe_bridge, gateway_with_networks, minted_flow_arn,
+};
 use crate::bridge_members_and_deletion::{add_outputs, network_output, network_source};
 use crate::flow_lifecycle::Emulator;
 
@@ -177,7 +179,11 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn only_a_cloud_to_ground_bridge_takes_the_outputs_a_request_configures() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(1, "gw-output-admission");
+    // The gateway every bridge below is placed on, declaring the network its outputs are
+    // delivered on: a network output names a network of the placement gateway
+    // (`BridgeNetworkOutput$NetworkName`), which `crate::bridge_add_references` is the suite
+    // for, so this one's rows vary only the direction and count rules it is about.
+    let placement = gateway_with_networks(&emulator, "gw-output-admission", &["net-1"]).await;
 
     for (index, row) in rows().into_iter().enumerate() {
         let Row {

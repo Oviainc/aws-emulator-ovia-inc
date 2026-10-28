@@ -237,6 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names the bridge ALREADY holds as well as the ones of earlier entries of this
         // same request.
         let mut taken = bridge.output_names();
+        // The gateway this bridge is placed on (`Bridge$PlacementArn`): the one gateway
+        // whose declared networks a network output of this bridge may be delivered on.
+        let placement_arn = bridge.placement_arn.clone();
         let mut added: Vec<BridgeOutput> = Vec::with_capacity(input.outputs.len());
         for request in &input.outputs {
             let Some(output) = crate::state::materialise_bridge_output(request) else {
@@ -254,6 +257,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "An output name must be unique among the outputs of one bridge; \
                      {name:?} is already in use."
                 )));
+            }
+            // A network output is delivered on one of the networks the gateway this bridge
+            // is placed on declares (`BridgeNetworkOutput$NetworkName`), so the name is
+            // RESOLVED against that gateway's own networks before the output is stored,
+            // through the one function every path that writes an output onto a stored bridge
+            // resolves it with — so this operation stores no output UpdateBridgeOutput would
+            // refuse (see `crate::state::bridge_output_reference_rejection`).
+            if let Some(detail) = store.bridge_output_reference_rejection(&placement_arn, &output) {
+                return Err(bad_request(detail));
             }
             added.push(output);
         }

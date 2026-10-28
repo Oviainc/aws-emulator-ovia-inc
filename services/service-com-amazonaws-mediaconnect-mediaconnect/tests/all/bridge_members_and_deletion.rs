@@ -34,7 +34,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::bridge_lifecycle::{
-    create_bridge, describe_bridge, minted_flow_arn, minted_gateway_arn,
+    cloud_flow, create_bridge, describe_bridge, gateway_with_networks, minted_flow_arn,
+    minted_gateway_arn,
 };
 use crate::flow_lifecycle::{Emulator, REGION};
 
@@ -110,6 +111,18 @@ pub(crate) fn network_source(name: &str, port: i64, protocol: &str) -> Value {
 pub(crate) fn flow_source(name: &str, suffix: u64) -> Value {
     json!({ "flowSource": {
         "flowArn": minted_flow_arn(suffix, &format!("flow-{suffix}")),
+        "name": name,
+    }})
+}
+
+/// One flow source on the cloud flow `flow_arn` the account HOLDS.
+///
+/// A source written onto a bridge the store already holds names a flow the account holds,
+/// which is `crate::bridge_add_references`' own subject, so the rows that drive
+/// AddBridgeSources below name the fixture flow rather than an ARN of the minted form.
+fn held_flow_source(name: &str, flow_arn: &str) -> Value {
+    json!({ "flowSource": {
+        "flowArn": flow_arn,
         "name": name,
     }})
 }
@@ -190,16 +203,16 @@ struct AddCase {
 /// holding one source, so each row adds the second source of the failover pair such a
 /// bridge can ingest; which bridge ingests which KIND of source is
 /// `crate::bridge_source_admission`'s own table.
-fn add_cases() -> Vec<AddCase> {
+fn add_cases(flow_arn: &str) -> Vec<AddCase> {
     vec![
         AddCase {
             case: "one flow source, one network output",
-            sources: vec![flow_source("added-flow", 101)],
+            sources: vec![held_flow_source("added-flow", flow_arn)],
             outputs: vec![network_output("added-out", 6100, "udp", 32)],
         },
         AddCase {
             case: "a flow source and two outputs on different protocols",
-            sources: vec![flow_source("added-flow-2", 102)],
+            sources: vec![held_flow_source("added-flow-2", flow_arn)],
             outputs: vec![
                 network_output("added-out-udp", 6200, "udp", 16),
                 network_output("added-out-srt", 6201, "srt-listener", 255),
@@ -208,7 +221,7 @@ fn add_cases() -> Vec<AddCase> {
         AddCase {
             case: "a flow source with a VPC interface attachment, and three outputs",
             sources: vec![json!({ "flowSource": {
-                "flowArn": minted_flow_arn(103, "flow-b"),
+                "flowArn": flow_arn,
                 "name": "added-flow-vpc",
                 "flowVpcInterfaceAttachment": { "vpcInterfaceName": "vpc-1" },
             }})],
@@ -227,9 +240,12 @@ fn add_cases() -> Vec<AddCase> {
 #[tokio::test]
 async fn adding_sources_and_outputs_appends_them_to_the_stored_bridge() {
     let emulator = Emulator::new();
-    let placement = minted_gateway_arn(1, "gw-members");
+    // The adds below write members that NAME other resources — a cloud flow, and a network
+    // of the gateway the bridge is placed on — so the fixture creates both over the wire.
+    let placement = gateway_with_networks(&emulator, "gw-members", &["net-1"]).await;
+    let flow_arn = cloud_flow(&emulator, "flow-members").await;
 
-    for (index, case) in add_cases().into_iter().enumerate() {
+    for (index, case) in add_cases(&flow_arn).into_iter().enumerate() {
         let AddCase {
             case: name_of_case,
             sources,

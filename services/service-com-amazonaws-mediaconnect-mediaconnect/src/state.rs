@@ -5757,6 +5757,64 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         ))
     }
 
+    /// Why the bridge source `source` cannot be written onto a bridge placed on
+    /// `placement_arn` because a resource it names does not exist, or `None` when every
+    /// reference it carries resolves.
+    ///
+    /// A stored `BridgeSource` carries the two references a bridge source can hold, and each
+    /// one names a resource this store holds: `BridgeFlowSource$FlowArn` ("the ARN of the
+    /// cloud flow used as a source of this bridge" — a flow source "originates in
+    /// MediaConnect as an existing cloud flow", so the ARN is resolved against the account's
+    /// flows through [`Self::unknown_flow_rejection`]) and
+    /// `BridgeNetworkSource$NetworkName` ("the network source's gateway network name",
+    /// resolved against the placement gateway's own networks through
+    /// [`Self::unknown_gateway_network_rejection`]). Resolving them HERE is what keeps every
+    /// operation that writes a source onto a bridge the store holds answering one reference
+    /// the same way. The detail is the sentence the refusal's envelope carries
+    /// ([`validation_failed_message`]).
+    pub fn bridge_source_reference_rejection(
+        &self,
+        placement_arn: &str,
+        source: &BridgeSource,
+    ) -> Option<String> {
+        if let Some(flow_source) = source.flow_source.as_ref() {
+            if let Some(rejection) =
+                self.unknown_flow_rejection("FlowSource FlowArn", &flow_source.flow_arn)
+            {
+                return Some(rejection);
+            }
+        }
+        let network_source = source.network_source.as_ref()?;
+        self.unknown_gateway_network_rejection(
+            "NetworkSource NetworkName",
+            placement_arn,
+            &network_source.network_name,
+        )
+    }
+
+    /// The output-side counterpart of [`Self::bridge_source_reference_rejection`]: why the
+    /// bridge output `output` cannot be written onto a bridge placed on `placement_arn`, or
+    /// `None` when the reference it carries resolves.
+    ///
+    /// A network output is "delivered to your premises" over one of the networks the
+    /// placement gateway declares, so `BridgeNetworkOutput$NetworkName` ("the network
+    /// output's gateway network name") is resolved against that gateway's own networks. The
+    /// other kind of bridge output, a `BridgeFlowOutput`, names the flow and the flow source
+    /// THIS service minted when a cloud flow took the bridge as its source, so no reference
+    /// a request carries reaches it.
+    pub fn bridge_output_reference_rejection(
+        &self,
+        placement_arn: &str,
+        output: &BridgeOutput,
+    ) -> Option<String> {
+        let network_output = output.network_output.as_ref()?;
+        self.unknown_gateway_network_rejection(
+            "NetworkOutput NetworkName",
+            placement_arn,
+            &network_output.network_name,
+        )
+    }
+
     /// Why the router input configuration `configuration` cannot be stored because a
     /// resource of THIS service it names does not exist, or `None` when every such
     /// reference resolves.
