@@ -187,19 +187,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is the offset the next page resumes at; one this service
         // never issued names no page, and neither does one outside the modelled
         // `NextToken` syntax (`skip_validation` on `ListAssessmentsInput`), so
-        // both are the one page-token fault.
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                match crate::state::decode_page_token(crate::state::ASSESSMENT_PAGE_PREFIX, token) {
-                    Some(offset) => offset,
-                    None => {
-                        return Err(ListAssessmentsErrorModeled::ValidationException(
-                            crate::state::invalid_page_token(),
-                        )
-                        .into())
-                    }
-                }
+        // both are the one page-token fault — the decision
+        // `crate::state::page_offset` makes for every paginated operation.
+        let offset = match crate::state::page_offset(
+            crate::state::ASSESSMENT_PAGE_PREFIX,
+            input.next_token.as_deref(),
+        ) {
+            Ok(offset) => offset,
+            Err(fault) => {
+                return Err(ListAssessmentsErrorModeled::ValidationException(fault).into())
             }
         };
 

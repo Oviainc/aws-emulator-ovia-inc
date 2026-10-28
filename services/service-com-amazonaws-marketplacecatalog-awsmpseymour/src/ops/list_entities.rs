@@ -337,20 +337,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A token this service never issued names no page, and neither does one
         // outside the modelled `NextToken` syntax (`skip_validation` on
-        // `ListEntitiesInput`), so both are the one page-token fault.
-        let offset = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                match crate::state::decode_page_token(crate::state::ENTITY_PAGE_PREFIX, token) {
-                    Some(offset) => offset,
-                    None => {
-                        return Err(ListEntitiesErrorModeled::ValidationException(
-                            crate::state::invalid_page_token(),
-                        )
-                        .into())
-                    }
-                }
-            }
+        // `ListEntitiesInput`), so both are the one page-token fault — the
+        // decision `crate::state::page_offset` makes for every paginated
+        // operation.
+        let offset = match crate::state::page_offset(
+            crate::state::ENTITY_PAGE_PREFIX,
+            input.next_token.as_deref(),
+        ) {
+            Ok(offset) => offset,
+            Err(fault) => return Err(ListEntitiesErrorModeled::ValidationException(fault).into()),
         };
 
         // `MaxResults` is modelled `@range(min: 1, max: 50)`, judged by the one

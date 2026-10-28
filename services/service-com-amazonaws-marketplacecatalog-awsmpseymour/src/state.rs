@@ -1356,6 +1356,23 @@ pub fn page_size(
     Ok(usize::try_from(serving).expect("a page size inside the modelled range fits in usize"))
 }
 
+/// The offset a `NextToken` asks the list paging with `prefix` to resume at, or
+/// the modelled `ValidationException` that refuses it.
+///
+/// The page-TOKEN decision, the sibling of [`page_size`]'s page-size decision
+/// and made in this one place for the same reason: a request naming no
+/// `NextToken` asks for the first page (offset zero), one carrying a token this
+/// service issued for the list being called resumes where that token points, and
+/// anything else — a token outside the modelled `NextToken` syntax, a well-formed
+/// token naming no page, or a token another list of this service issued — names
+/// no page of this list and is the one [`invalid_page_token`] fault.
+pub fn page_offset(prefix: &str, token: Option<&str>) -> Result<usize, ValidationException> {
+    match token {
+        None => Ok(0),
+        Some(token) => decode_page_token(prefix, token).ok_or_else(invalid_page_token),
+    }
+}
+
 /// Per-service state for com-amazonaws-marketplacecatalog-awsmpseymour. A handler reaches it through [`service_state`].
 ///
 /// There is one store rather than one per catalog because every operation's

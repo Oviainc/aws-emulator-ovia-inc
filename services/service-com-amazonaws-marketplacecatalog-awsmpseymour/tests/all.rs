@@ -37,6 +37,8 @@ mod entity_type_projections;
 mod filter_validation;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
+#[path = "all/page_token_rule.rs"]
+mod page_token_rule;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/reserved_tag_keys.rs"]
