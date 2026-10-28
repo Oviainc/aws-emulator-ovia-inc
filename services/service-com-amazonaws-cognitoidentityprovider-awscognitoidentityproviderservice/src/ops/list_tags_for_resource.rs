@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags stored on the user pool the request's `ResourceArn` names, as an
+//! EMPTY map when that pool carries none: `Tags` is "The tags that are assigned to the
+//! user pool", and a pool nothing has tagged is assigned no tags rather than unknown
+//! ones.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read: it renders the stored tag set and changes nothing about the pool. The
+//! resource read is the pool the ARN names — the `UserPoolId` inside it, in the Region
+//! it names, so a secondary replica reports its own tag set.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +155,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // `ArnType` constrains the ARN's length and general shape, so WHICH resource
+        // an ARN of that shape names is this service's own rule — the same rule the two
+        // operations that write tags read a `ResourceArn` by: an ARN that is not a
+        // user-pool ARN of this service names no resource at all, which is a bad input
+        // parameter rather than a missing resource.
+        let Some((region, user_pool_id)) = crate::state::user_pool_arn_parts(&input.resource_arn)
+        else {
+            return Err(not_a_user_pool_arn(&input.resource_arn));
+        };
+
+        // A pure read: the stored tag set is rendered, and nothing about the pool moves.
+        let now = ::std::time::SystemTime::now();
+        let guard = state.lock();
+        let Some(stored) = guard.pool_tags(region, user_pool_id, now) else {
+            return Err(user_pool_not_found(user_pool_id));
+        };
+        Ok(ListTagsForResourceOutput {
+            tags: Some(stored.clone()),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an ARN naming a user pool this
+/// service does not hold in the Region the ARN names.
+fn user_pool_not_found(user_pool_id: &str) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The refusal for a `ResourceArn` that is not the ARN of a user pool of this service,
+/// so it names no resource whose tags could be listed.
+fn not_a_user_pool_arn(resource_arn: &str) -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(format!(
+            "ResourceArn '{resource_arn}' is not the ARN of an Amazon Cognito user pool."
+        )),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListTagsForResourceError {
+    ListTagsForResourceErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

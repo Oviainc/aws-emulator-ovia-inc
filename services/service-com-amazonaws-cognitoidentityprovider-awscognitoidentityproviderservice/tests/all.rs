@@ -127,6 +127,8 @@ mod public_user_not_found_message;
 mod resend_confirmation_code;
 #[path = "all/resource_server_lifecycle.rs"]
 mod resource_server_lifecycle;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/risk_configuration.rs"]
 mod risk_configuration;
 #[path = "all/self_service_sign_up.rs"]
