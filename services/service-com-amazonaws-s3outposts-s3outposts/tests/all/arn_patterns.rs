@@ -203,7 +203,7 @@ pub(crate) fn optional_member(value: &Value, name: &str) -> Option<String> {
 }
 
 /// The single Outpost a one-Outpost inventory reports in `region`.
-async fn the_outpost(router: &MultiServiceRouter, region: &str) -> Value {
+pub(crate) async fn the_outpost(router: &MultiServiceRouter, region: &str) -> Value {
     let answer = call_in(
         router,
         region,

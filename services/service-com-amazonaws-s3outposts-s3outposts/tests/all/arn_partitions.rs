@@ -2,13 +2,17 @@
 
 //! The partition field of every ARN this service reports, end to end over HTTP.
 //!
-//! The rule under test: an ARN names its resource in FULL, so the partition field and the
-//! Region field of one ARN describe the same place — the partition is a function of the
-//! Region the request was signed for, never a constant. `EndpointArn`, `OutpostArn` and
-//! `S3OutpostArn` each spell the alternation out
-//! (`^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):…`) beside a Region field their
-//! pattern leaves open, so a request signed for a GovCloud Region owes `aws-us-gov` ARNs,
-//! one signed for a China Region owes `aws-cn` ARNs, and so on.
+//! The rule under test has two halves. An ARN names its resource in FULL, so the partition
+//! field and the Region field of one ARN describe the same place — the partition is a
+//! function of the Region the request was signed for, never a constant. And an ARN member
+//! can only carry a value its own pattern admits: `EndpointArn`, `OutpostArn` and
+//! `S3OutpostArn` each spell their partition field out as a CLOSED alternation
+//! (`^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):…`) beside a Region field their pattern
+//! leaves open, so a request signed for a GovCloud Region owes `aws-us-gov` ARNs, one
+//! signed for a China Region owes `aws-cn` ARNs — and one signed for a Region whose
+//! partition that alternation does not list owes NO value for the member at all, which,
+//! every ARN member here being optional, means the member is absent while the resource
+//! itself is reported as usual.
 //!
 //! Every case drives the four operations that report an ARN — `CreateEndpoint`,
 //! `ListEndpoints`, `ListSharedEndpoints` and `ListOutpostsWithS3` — through the router in
@@ -16,11 +20,15 @@
 
 use serde_json::Value;
 
+use crate::arn_patterns::optional_member;
 use crate::endpoint_lifecycle::{
-    call_in, emulator_holding, emulator_in_region, endpoint_id_of, minimal_create,
-    owned_outposts_in, string_at, Answer,
+    create_in, emulator_holding, emulator_in_region, endpoint_id_of, list_endpoints_in,
+    list_outposts_in, list_shared_in, minimal_create, owned_outposts_in, string_at, Answer,
 };
-use smithy_server_runtime::MultiServiceRouter;
+
+/// The query every listing below is driven with: one page big enough for the whole answer,
+/// `MaxResults`'s own published maximum.
+const WHOLE_PAGE: &str = "?maxResults=100";
 
 /// A Region and the partition its ARNs belong to.
 ///
@@ -28,13 +36,15 @@ use smithy_server_runtime::MultiServiceRouter;
 /// (`emulator_telemetry::policy::KNOWN_REGIONS`, "every AWS region the wire may carry") and
 /// the partition names from this service's ARN patterns
 /// (smithy_query(query="shape", shape="EndpointArn,OutpostArn,S3OutpostArn")), whose
-/// alternation lists `aws`, `aws-cn`, `aws-us-gov`, `aws-iso` and `aws-iso-b`; the isolated
-/// Regions AWS added after those patterns were published carry their own partition, since
-/// the Region is what decides.
+/// alternation lists `aws`, `aws-cn`, `aws-us-gov`, `aws-iso` and `aws-iso-b` and nothing
+/// else.
 struct Row {
     case: &'static str,
     region: &'static str,
-    partition: &'static str,
+    /// The partition this Region's ARNs name, when the members' own alternation lists it —
+    /// and `None` for a Region in a partition that alternation does NOT list, where no ARN
+    /// member of this service has a legal value at all and so carries none.
+    partition: Option<&'static str>,
 }
 
 /// One row per partition the catalog reaches, plus a second Region in the partitions that
@@ -43,107 +53,68 @@ const ROWS: &[Row] = &[
     Row {
         case: "the commercial partition",
         region: "us-east-1",
-        partition: "aws",
+        partition: Some("aws"),
     },
     Row {
         case: "another commercial Region",
         region: "ap-southeast-2",
-        partition: "aws",
+        partition: Some("aws"),
     },
     Row {
         case: "a commercial Region whose code is longest",
         region: "ap-northeast-3",
-        partition: "aws",
+        partition: Some("aws"),
     },
     Row {
         case: "the China partition",
         region: "cn-north-1",
-        partition: "aws-cn",
+        partition: Some("aws-cn"),
     },
     Row {
         case: "the other China Region",
         region: "cn-northwest-1",
-        partition: "aws-cn",
+        partition: Some("aws-cn"),
     },
     Row {
         case: "GovCloud (US-West)",
         region: "us-gov-west-1",
-        partition: "aws-us-gov",
+        partition: Some("aws-us-gov"),
     },
     Row {
         case: "GovCloud (US-East)",
         region: "us-gov-east-1",
-        partition: "aws-us-gov",
+        partition: Some("aws-us-gov"),
     },
     Row {
         case: "the isolated partition",
         region: "us-iso-east-1",
-        partition: "aws-iso",
+        partition: Some("aws-iso"),
     },
     Row {
         case: "the other isolated Region",
         region: "us-iso-west-1",
-        partition: "aws-iso",
+        partition: Some("aws-iso"),
     },
     Row {
         case: "the second isolated partition, whose prefix extends the first",
         region: "us-isob-east-1",
-        partition: "aws-iso-b",
+        partition: Some("aws-iso-b"),
     },
     Row {
-        case: "an isolated partition added after the ARN patterns were published",
+        case: "an isolated partition the ARN patterns' alternation does not list",
         region: "us-isof-east-1",
-        partition: "aws-iso-f",
+        partition: None,
     },
     Row {
-        case: "the European isolated partition",
+        case: "the European isolated partition, also outside the alternation",
         region: "eu-isoe-west-1",
-        partition: "aws-iso-e",
+        partition: None,
     },
 ];
 
-async fn create_in(router: &MultiServiceRouter, region: &str, request: Value) -> Answer {
-    call_in(
-        router,
-        region,
-        "POST",
-        "/S3Outposts/CreateEndpoint",
-        Some(request),
-    )
-    .await
-}
-
-async fn list_endpoints_in(router: &MultiServiceRouter, region: &str) -> Answer {
-    call_in(
-        router,
-        region,
-        "GET",
-        "/S3Outposts/ListEndpoints?maxResults=100",
-        None,
-    )
-    .await
-}
-
-async fn list_shared_in(router: &MultiServiceRouter, region: &str, outpost_id: &str) -> Answer {
-    call_in(
-        router,
-        region,
-        "GET",
-        &format!("/S3Outposts/ListSharedEndpoints?outpostId={outpost_id}&maxResults=100"),
-        None,
-    )
-    .await
-}
-
-async fn list_outposts_in(router: &MultiServiceRouter, region: &str) -> Answer {
-    call_in(
-        router,
-        region,
-        "GET",
-        "/S3Outposts/ListOutpostsWithS3?maxResults=100",
-        None,
-    )
-    .await
+/// The `ListSharedEndpoints` query for one Outpost's whole listing.
+fn shared_query(outpost_id: &str) -> String {
+    format!("?outpostId={outpost_id}&maxResults=100")
 }
 
 /// The partition field of an ARN: its second colon-separated field.
@@ -159,14 +130,25 @@ fn partition_of(arn: &str) -> &str {
         .unwrap_or_else(|| panic!("{arn:?} carries no partition field"))
 }
 
-/// The endpoint in `answer` whose `EndpointArn` is `arn`.
-fn endpoint_with_arn(answer: &Answer, arn: &str) -> Value {
-    answer
-        .endpoints()
-        .iter()
-        .find(|endpoint| endpoint["EndpointArn"].as_str() == Some(arn))
-        .unwrap_or_else(|| panic!("no endpoint with ARN {arn} in {:?}", answer.body))
-        .clone()
+/// The one endpoint a listing reports, and the `EndpointArn` member it carries for it —
+/// `None` where the answer carries no such member.
+fn the_only_endpoint(answer: &Answer, case: &str, listing: &str) -> (Value, Option<String>) {
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: {listing} must answer 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let endpoints = answer.endpoints();
+    assert_eq!(
+        endpoints.len(),
+        1,
+        "case {case:?}: {listing} must report exactly the endpoint created in this Region, \
+         got {:?}",
+        answer.body
+    );
+    let endpoint = endpoints[0].clone();
+    let arn = optional_member(&endpoint, "EndpointArn");
+    (endpoint, arn)
 }
 
 /// The Outpost `outpost_id` in `answer`.
@@ -179,12 +161,32 @@ fn outpost_with_id(answer: &Answer, outpost_id: &str) -> Value {
         .clone()
 }
 
+/// The `EndpointArn` a create in `region` owes for `outpost_id`, read off the member's own
+/// pattern: the whole ARN in the Region's partition where the alternation lists it, and
+/// nothing where it does not.
+fn expected_endpoint_arn(
+    partition: Option<&str>,
+    region: &str,
+    account: &str,
+    outpost_id: &str,
+    reported: Option<&str>,
+) -> Option<String> {
+    let partition = partition?;
+    let endpoint_id = endpoint_id_of(reported?);
+    Some(format!(
+        "arn:{partition}:s3-outposts:{region}:{account}:outpost/{outpost_id}/endpoint/{endpoint_id}"
+    ))
+}
+
 /// Every ARN an answer reports names the partition of the Region the request was signed
-/// for: the endpoint ARN `CreateEndpoint` mints and the listings report, and the Outpost's
-/// own two ARNs.
+/// for — the endpoint ARN `CreateEndpoint` mints and the listings report, and the Outpost's
+/// own two ARNs — and where that partition is one the member's own alternation does not
+/// list, the member is absent while the endpoint and the Outpost are still reported.
 #[tokio::test]
 async fn every_arn_names_the_partition_of_the_region_the_request_was_signed_for() {
     let account = engine::emulator_account_id();
+    let mut absent_rows = 0;
+
     for Row {
         case,
         region,
@@ -206,58 +208,89 @@ async fn every_arn_names_the_partition_of_the_region_the_request_was_signed_for(
             "case {case:?} ({region}): CreateEndpoint must answer 200, got {} with {:?}",
             created.status, created.body
         );
-        let arn = string_at(&created.body, "EndpointArn");
-        let endpoint_id = endpoint_id_of(&arn);
+        let reported = optional_member(&created.body, "EndpointArn");
         assert_eq!(
-            arn,
-            format!(
-                "arn:{partition}:s3-outposts:{region}:{account}:outpost/{outpost_id}/endpoint/{endpoint_id}"
+            reported.is_some(),
+            partition.is_some(),
+            "case {case:?} ({region}): the EndpointArn member must be carried exactly where \
+             the member's own alternation lists this Region's partition, got {:?}",
+            created.body
+        );
+        let expected = expected_endpoint_arn(
+            *partition,
+            region,
+            account,
+            &outpost_id,
+            reported.as_deref(),
+        );
+        assert_eq!(
+            reported, expected,
+            "case {case:?} ({region}): expected EndpointArn {expected:?} — the ARN in this \
+             Region's own partition where the member admits it, nothing where it does not — \
+             got {reported:?}"
+        );
+        if reported.is_none() {
+            absent_rows += 1;
+        }
+
+        // Stored either way: both listings report the endpoint, carrying the very same
+        // EndpointArn member the create answered with.
+        for (listing, answer) in [
+            (
+                "ListEndpoints",
+                list_endpoints_in(&router, region, WHOLE_PAGE).await,
             ),
-            "case {case:?} ({region}): the EndpointArn must name the Region's own partition, got {arn:?}"
-        );
+            (
+                "ListSharedEndpoints",
+                list_shared_in(&router, region, &shared_query(&outpost_id)).await,
+            ),
+        ] {
+            let (endpoint, listed_arn) = the_only_endpoint(&answer, case, listing);
+            assert_eq!(
+                string_at(&endpoint, "OutpostsId"),
+                outpost_id,
+                "case {case:?} ({region}): {listing} must report the endpoint on its own \
+                 Outpost, got {endpoint:?}"
+            );
+            assert_eq!(
+                listed_arn, reported,
+                "case {case:?} ({region}): {listing} must report the same EndpointArn member \
+                 the create answered with ({reported:?}), got {listed_arn:?}"
+            );
+        }
 
-        let listed = list_endpoints_in(&router, region).await;
-        assert_eq!(
-            listed.status, 200,
-            "case {case:?} ({region}): ListEndpoints must answer 200, got {} with {:?}",
-            listed.status, listed.body
-        );
-        assert_eq!(
-            string_at(&endpoint_with_arn(&listed, &arn), "EndpointArn"),
-            arn,
-            "case {case:?} ({region}): the listed EndpointArn must be the created one"
-        );
-
-        let shared = list_shared_in(&router, region, &outpost_id).await;
-        assert_eq!(
-            shared.status, 200,
-            "case {case:?} ({region}): ListSharedEndpoints must answer 200, got {} with {:?}",
-            shared.status, shared.body
-        );
-        assert_eq!(
-            string_at(&endpoint_with_arn(&shared, &arn), "EndpointArn"),
-            arn,
-            "case {case:?} ({region}): the Outpost-scoped listing must report the same ARN"
-        );
-
-        let outposts = list_outposts_in(&router, region).await;
+        let outposts = list_outposts_in(&router, region, WHOLE_PAGE).await;
         assert_eq!(
             outposts.status, 200,
             "case {case:?} ({region}): ListOutpostsWithS3 must answer 200, got {} with {:?}",
             outposts.status, outposts.body
         );
         let outpost = outpost_with_id(&outposts, &outpost_id);
+        let expected_outpost_arn = partition
+            .map(|p| format!("arn:{p}:outposts:{region}:{account}:outpost/{outpost_id}"));
         assert_eq!(
-            string_at(&outpost, "OutpostArn"),
-            format!("arn:{partition}:outposts:{region}:{account}:outpost/{outpost_id}"),
-            "case {case:?} ({region}): the OutpostArn must name the Region's own partition"
+            optional_member(&outpost, "OutpostArn"),
+            expected_outpost_arn,
+            "case {case:?} ({region}): expected OutpostArn {expected_outpost_arn:?}, got \
+             {outpost:?}"
         );
+        let expected_s3_arn = partition
+            .map(|p| format!("arn:{p}:s3-outposts:{region}:{account}:outpost/{outpost_id}/s3"));
         assert_eq!(
-            string_at(&outpost, "S3OutpostArn"),
-            format!("arn:{partition}:s3-outposts:{region}:{account}:outpost/{outpost_id}/s3"),
-            "case {case:?} ({region}): the S3OutpostArn must name the Region's own partition"
+            optional_member(&outpost, "S3OutpostArn"),
+            expected_s3_arn,
+            "case {case:?} ({region}): expected S3OutpostArn {expected_s3_arn:?}, got \
+             {outpost:?}"
         );
     }
+
+    // The table covers both halves of the rule, so a service that always filled the member
+    // in — with a partition its own pattern rejects — would fail above.
+    assert!(
+        absent_rows > 0,
+        "the table must cover Regions in a partition the ARN members' alternation does not \
+         list, got {absent_rows} such rows"
+    );
 }
 
 /// The partition is a function of the Region ALONE: one store holding an Outpost in every
@@ -301,29 +334,23 @@ async fn one_store_reports_each_region_s_own_partition_consistently() {
             partition,
         } = row;
 
-        let listed = list_endpoints_in(&router, region).await;
-        let endpoint_arns: Vec<String> = listed
-            .endpoints()
-            .iter()
-            .map(|endpoint| string_at(endpoint, "EndpointArn"))
-            .collect();
-        assert_eq!(
-            endpoint_arns.len(),
-            1,
-            "case {case:?} ({region}): the Region must report exactly the endpoint installed \
-             in it, got {endpoint_arns:?}"
+        let listed = list_endpoints_in(&router, region, WHOLE_PAGE).await;
+        let (_, endpoint_arn) = the_only_endpoint(&listed, case, "ListEndpoints");
+        let expected = expected_endpoint_arn(
+            *partition,
+            region,
+            &caller,
+            outpost_id,
+            endpoint_arn.as_deref(),
         );
-        let endpoint_arn = endpoint_arns[0].clone();
-        let endpoint_id = endpoint_id_of(&endpoint_arn);
         assert_eq!(
-            endpoint_arn,
-            format!(
-                "arn:{partition}:s3-outposts:{region}:{caller}:outpost/{outpost_id}/endpoint/{endpoint_id}"
-            ),
-            "case {case:?} ({region}): the EndpointArn must name this Region and its partition"
+            endpoint_arn, expected,
+            "case {case:?} ({region}): expected EndpointArn {expected:?} — this Region and \
+             its own partition, or nothing where the member's alternation does not list that \
+             partition — got {endpoint_arn:?}"
         );
 
-        let outposts = list_outposts_in(&router, region).await;
+        let outposts = list_outposts_in(&router, region, WHOLE_PAGE).await;
         let reported: Vec<String> = outposts
             .outposts()
             .iter()
@@ -336,19 +363,35 @@ async fn one_store_reports_each_region_s_own_partition_consistently() {
              in this Region, got {reported:?}"
         );
         let outpost = outpost_with_id(&outposts, outpost_id);
-        let outpost_arn = string_at(&outpost, "OutpostArn");
-        let s3_outpost_arn = string_at(&outpost, "S3OutpostArn");
-
-        for reported in [&endpoint_arn, &outpost_arn, &s3_outpost_arn] {
+        let outpost_arn = optional_member(&outpost, "OutpostArn");
+        let s3_outpost_arn = optional_member(&outpost, "S3OutpostArn");
+        for (member, reported) in [
+            ("OutpostArn", &outpost_arn),
+            ("S3OutpostArn", &s3_outpost_arn),
+        ] {
             assert_eq!(
-                partition_of(reported),
+                reported.is_some(),
+                partition.is_some(),
+                "case {case:?} ({region}): {member} must be carried exactly where its own \
+                 alternation lists this Region's partition, got {reported:?}"
+            );
+        }
+
+        // Where the members do carry an ARN, every one of them names this Region and the
+        // one partition it belongs to: no answer contradicts itself.
+        for reported in [&endpoint_arn, &outpost_arn, &s3_outpost_arn]
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(
+                Some(partition_of(reported)),
                 *partition,
                 "case {case:?} ({region}): every ARN of the answer must name that Region's \
                  partition, got {reported:?}"
             );
             assert!(
                 reported.contains(&format!(":{region}:")),
-                "case {case:?}: an ARN naming partition {partition} must name the Region it \
+                "case {case:?}: an ARN naming partition {partition:?} must name the Region it \
                  belongs to, got {reported:?}"
             );
         }

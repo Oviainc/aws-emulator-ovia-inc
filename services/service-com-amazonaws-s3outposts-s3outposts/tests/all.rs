@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_type_coip_pool_pairing.rs"]
 mod access_type_coip_pool_pairing;
+#[path = "all/arn_partition_admission.rs"]
+mod arn_partition_admission;
 #[path = "all/arn_partitions.rs"]
 mod arn_partitions;
 #[path = "all/arn_patterns.rs"]

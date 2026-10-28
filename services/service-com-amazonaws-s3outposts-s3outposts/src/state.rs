@@ -72,14 +72,23 @@
 //!
 //! ## Why an ARN member can be ABSENT
 //!
-//! An id has to be one an ARN member's own pattern admits before that member
-//! can name it. `OutpostId` admits three branches
-//! (`op-[a-f0-9]{17}`, `\d{12}` and `ec2`) and the ARN shapes admit DIFFERENT
-//! subsets of them — [`OUTPOST_ARN_BRANCHES`], [`S3_OUTPOST_ARN_BRANCHES`] and
-//! [`ENDPOINT_ARN_BRANCHES`] — so for some Outposts there is no legal value for
-//! one of the ARNs at all. Each ARN member is optional, so the projection leaves
-//! out the member it cannot form instead of reporting a string the member's own
-//! pattern rejects; everything else about the resource is reported as usual.
+//! A value has to be one an ARN member's own pattern admits before that member
+//! can name it, and that holds for EVERY segment the pattern closes, not just
+//! one of them. Two of these segments are closed alternations:
+//!
+//! * the Outpost segment. `OutpostId` admits three branches
+//!   (`op-[a-f0-9]{17}`, `\d{12}` and `ec2`) and the ARN shapes admit DIFFERENT
+//!   subsets of them — [`OUTPOST_ARN_BRANCHES`], [`S3_OUTPOST_ARN_BRANCHES`] and
+//!   [`ENDPOINT_ARN_BRANCHES`];
+//! * the partition segment. Every one of these patterns spells its partition
+//!   field out as a fixed alternation ([`ARN_PARTITIONS`]), which does not list
+//!   every partition a Region can belong to.
+//!
+//! So for some Outposts, and for a Region in a partition outside that
+//! alternation, there is no legal value for one of the ARNs at all. Each ARN
+//! member is optional, so the projection leaves out the member it cannot form
+//! instead of reporting a string the member's own pattern rejects; everything
+//! else about the resource is reported as usual.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -277,32 +286,32 @@ impl OutpostRecord {
 
     /// `arn:<partition>:outposts:<region>:<owner>:outpost/<id>`, as
     /// `OutpostArn`'s pattern spells it, naming the Outpost's own home Region and
-    /// the partition that Region belongs to ([`arn_partition`]) — or `None` for an
-    /// Outpost whose id that pattern does not admit ([`OUTPOST_ARN_BRANCHES`]).
+    /// the partition that Region belongs to — or `None` when that pattern admits
+    /// no such value: for an Outpost whose id branch it does not list
+    /// ([`OUTPOST_ARN_BRANCHES`]), or for a Region whose partition it does not
+    /// list ([`admitted_arn_partition`]).
     pub fn outpost_arn(&self) -> Option<String> {
+        let partition = admitted_arn_partition(&self.region)?;
         arn_admits_outpost(OUTPOST_ARN_BRANCHES, &self.outpost_id).then(|| {
             format!(
-                "arn:{}:outposts:{}:{}:outpost/{}",
-                arn_partition(&self.region),
-                self.region,
-                self.owner_id,
-                self.outpost_id
+                "arn:{partition}:outposts:{}:{}:outpost/{}",
+                self.region, self.owner_id, self.outpost_id
             )
         })
     }
 
     /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<id>/s3`, as
     /// `S3OutpostArn`'s pattern spells it: the name RAM shares, naming the
-    /// Outpost's own home Region — or `None` for an Outpost whose id that pattern
-    /// does not admit ([`S3_OUTPOST_ARN_BRANCHES`]).
+    /// Outpost's own home Region — or `None` when that pattern admits no such
+    /// value: for an Outpost whose id branch it does not list
+    /// ([`S3_OUTPOST_ARN_BRANCHES`]), or for a Region whose partition it does not
+    /// list ([`admitted_arn_partition`]).
     pub fn s3_outpost_arn(&self) -> Option<String> {
+        let partition = admitted_arn_partition(&self.region)?;
         arn_admits_outpost(S3_OUTPOST_ARN_BRANCHES, &self.outpost_id).then(|| {
             format!(
-                "arn:{}:s3-outposts:{}:{}:outpost/{}/s3",
-                arn_partition(&self.region),
-                self.region,
-                self.owner_id,
-                self.outpost_id
+                "arn:{partition}:s3-outposts:{}:{}:outpost/{}/s3",
+                self.region, self.owner_id, self.outpost_id
             )
         })
     }
@@ -350,21 +359,21 @@ pub struct EndpointRecord {
 impl EndpointRecord {
     /// `arn:<partition>:s3-outposts:<region>:<owner>:outpost/<outpost>/endpoint/<id>`,
     /// as `EndpointArn`'s pattern spells it, in the partition `home_region`
-    /// belongs to ([`arn_partition`]) — or `None` for an endpoint whose Outpost's
-    /// id that pattern does not admit ([`ENDPOINT_ARN_BRANCHES`]).
+    /// belongs to — or `None` when that pattern admits no such value: for an
+    /// endpoint whose Outpost's id branch it does not list
+    /// ([`ENDPOINT_ARN_BRANCHES`]), or for a Region whose partition it does not
+    /// list ([`admitted_arn_partition`]).
     ///
     /// `home_region` is the Region of the Outpost this endpoint is on
     /// ([`outpost_region`]), which is the
     /// endpoint's own Region: an endpoint has no Region apart from its parent
     /// Outpost's, so the two ARNs always agree on it.
     pub fn endpoint_arn(&self, home_region: &str) -> Option<String> {
+        let partition = admitted_arn_partition(home_region)?;
         arn_admits_outpost(ENDPOINT_ARN_BRANCHES, &self.outpost_id).then(|| {
             format!(
-                "arn:{}:s3-outposts:{home_region}:{}:outpost/{}/endpoint/{}",
-                arn_partition(home_region),
-                self.owner_account,
-                self.outpost_id,
-                self.endpoint_id
+                "arn:{partition}:s3-outposts:{home_region}:{}:outpost/{}/endpoint/{}",
+                self.owner_account, self.outpost_id, self.endpoint_id
             )
         })
     }
@@ -860,6 +869,10 @@ pub fn is_region(value: &str) -> bool {
 /// outside it is the very disagreement this function exists to prevent. The
 /// longer `us-isob-` / `us-isof-` prefixes are matched before `us-iso-` so each
 /// lands in its own partition.
+///
+/// This is the partition the Region belongs to, which is not the same question
+/// as whether an ARN member can name it: [`admitted_arn_partition`] answers
+/// that one, off [`ARN_PARTITIONS`].
 #[must_use]
 pub fn arn_partition(region: &str) -> &'static str {
     const PARTITION_PREFIXES: &[(&str, &str)] = &[
@@ -874,6 +887,32 @@ pub fn arn_partition(region: &str) -> &'static str {
         .iter()
         .find(|(prefix, _)| region.starts_with(prefix))
         .map_or("aws", |(_, partition)| *partition)
+}
+
+/// The partitions the ARN members of this service admit, spelled out by the
+/// alternation every one of their patterns opens with
+/// (`^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):…`, identical in
+/// `Outpost$OutpostArn`, `Outpost$S3OutpostArn`, `Endpoint$EndpointArn` and
+/// `CreateEndpointResult$EndpointArn`).
+///
+/// It is a CLOSED list: a Region whose partition is not on it has no ARN any of
+/// these members can carry, the same way an Outpost id outside
+/// [`OUTPOST_ARN_BRANCHES`] has none.
+pub const ARN_PARTITIONS: &[&str] = &["aws", "aws-cn", "aws-us-gov", "aws-iso", "aws-iso-b"];
+
+/// True when an ARN member of this service can name a resource in `partition`
+/// at all — that is, when its own alternation lists it ([`ARN_PARTITIONS`]).
+fn arn_admits_partition(partition: &str) -> bool {
+    ARN_PARTITIONS.contains(&partition)
+}
+
+/// The partition field an ARN of `region` carries, or `None` when the ARN
+/// members' own alternation does not admit that Region's partition and so no
+/// legal ARN exists for a resource there.
+#[must_use]
+pub fn admitted_arn_partition(region: &str) -> Option<&'static str> {
+    let partition = arn_partition(region);
+    arn_admits_partition(partition).then_some(partition)
 }
 
 /// The page a list operation serves for `max_results`.

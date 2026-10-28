@@ -271,12 +271,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `EndpointArn` is the one member of this answer, and it is optional:
-        // its pattern admits only some of the `OutpostId` branches, so an
-        // endpoint on an Outpost outside them has no legal ARN and the member is
-        // left out rather than filled with a value the pattern rejects. The
-        // endpoint itself is stored either way and the listings report it. The
-        // Region the ARN names is the parent Outpost's home Region, which is the
-        // endpoint's own, so every later read reports this same ARN.
+        // its pattern closes both the Outpost segment and the partition
+        // segment, so an endpoint on an Outpost outside the id branches it
+        // lists, or in a Region whose partition it does not list, has no legal
+        // ARN and the member is left out rather than filled with a value the
+        // pattern rejects. The endpoint itself is stored either way and the
+        // listings report it. The Region the ARN names is the parent Outpost's
+        // home Region, which is the endpoint's own, so every later read reports
+        // this same ARN.
         let endpoint_arn = endpoint.endpoint_arn(&home_region);
         store
             .endpoints
