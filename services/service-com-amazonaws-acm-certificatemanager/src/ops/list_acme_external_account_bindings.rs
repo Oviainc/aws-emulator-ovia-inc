@@ -161,10 +161,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // No request metadata is needed: the `AcmeEndpointArn` the request names carries
-        // the Region its endpoint was minted in, and every one of that endpoint's binding
-        // ARNs is a path under it, so the records are found by that ARN alone.
-        let _ = ctx;
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at anything, so a caller whose identity-based policies do not
+        // allow the action is refused without being told what this account holds. `ctx`
+        // carries the credential the request presented, which is who is judged
+        // ([`crate::service::authorization`]); the rest of the request's addressing is the
+        // `AcmeEndpointArn` it names, which carries the Region its endpoint was minted in,
+        // and every one of that endpoint's binding ARNs is a path under it, so the records
+        // are found by that ARN alone.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.acme_endpoint_arn,
+        )
+        .map_err(ListAcmeExternalAccountBindingsErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator (the engine IS the shared store);
             // this operation models a server fault, so that is the honest answer.
@@ -188,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is consulted at all — never reported as a resource this account happens not to
         // hold.
         if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
-            return Err(cross_account_arn(crate::state::ACME_ENDPOINT_RESOURCE_TYPE));
+            return Err(cross_account_arn());
         }
 
         // A token is only ever read against the endpoint it was issued for, so it is
@@ -311,12 +322,12 @@ fn invalid_next_token() -> ListAcmeExternalAccountBindingsError {
     .into()
 }
 
-/// The refusal for an ARN input member addressing `resource_type` that names another
-/// account's resource: the same `ValidationException` class, worded once for the whole
-/// service ([`crate::service::cross_account_arn_refusal`]).
-fn cross_account_arn(resource_type: &str) -> ListAcmeExternalAccountBindingsError {
+/// The refusal for an ARN input member that names another account's resource: the same
+/// `ValidationException` class, worded once for the whole service
+/// ([`crate::service::cross_account_arn_refusal`]).
+fn cross_account_arn() -> ListAcmeExternalAccountBindingsError {
     ListAcmeExternalAccountBindingsErrorModeled::ValidationException(ValidationException {
-        message: Some(crate::service::cross_account_arn_refusal(resource_type)),
+        message: Some(crate::service::cross_account_arn_refusal()),
     })
     .into()
 }

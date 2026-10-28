@@ -39,20 +39,24 @@ const INTERNAL_SERVER_ERROR: &str = "Internal server error";
 const API_CONFIGURATION_ERROR: &str = "API_CONFIGURATION_ERROR";
 
 /// One simulated invocation, as the operation reports it.
-struct Simulated {
+///
+/// `pub(crate)` with [`test_invoke`], so the sibling
+/// `test_invoke_method_data_plane_parity` suite reads a simulated response through this
+/// one reader rather than a second one of its own.
+pub(crate) struct Simulated {
     /// The HTTP status of the `TestInvokeMethod` call itself — 200 for a performed
     /// simulation, whatever the SIMULATED status is.
-    http_status: u16,
+    pub(crate) http_status: u16,
     /// The `x-amzn-errortype` of a refused call.
     error: Option<String>,
     /// The whole response body, so a case can assert on a member this struct does not
     /// name.
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Simulated {
     /// The simulated response's status — the `status` member.
-    fn status(&self) -> i64 {
+    pub(crate) fn status(&self) -> i64 {
         self.body
             .get("status")
             .and_then(Value::as_i64)
@@ -60,7 +64,7 @@ impl Simulated {
     }
 
     /// The simulated response's body — the `body` member.
-    fn simulated_body(&self) -> String {
+    pub(crate) fn simulated_body(&self) -> String {
         self.body
             .get("body")
             .and_then(Value::as_str)
@@ -69,7 +73,7 @@ impl Simulated {
     }
 
     /// The simulated response's headers — the `headers` member.
-    fn headers(&self) -> Value {
+    pub(crate) fn headers(&self) -> Value {
         self.body.get("headers").cloned().unwrap_or(Value::Null)
     }
 
@@ -109,7 +113,10 @@ impl Simulated {
 }
 
 /// `TestInvokeMethod` for `verb` on `resource`, with `request` as the simulated request.
-async fn test_invoke(
+///
+/// `pub(crate)` for the sibling `test_invoke_method_data_plane_parity` suite; see
+/// [`Simulated`].
+pub(crate) async fn test_invoke(
     gateway: &Gateway,
     api: &str,
     resource: &str,
