@@ -8,6 +8,11 @@
 //! eligibility predicate `RedriveExecution` itself reads, so this report cannot
 //! disagree with what that call does.
 //!
+//! The report carries the execution's `input` and `output`, which a state machine on a
+//! customer managed KMS key sealed under that key, so the caller's `kms:Decrypt` grant
+//! on it is decided first — `crate::state::encryption`, which answers the modelled
+//! `KmsAccessDeniedException` for a caller the key's policy does not allow.
+//!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
 //!
@@ -250,6 +255,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now();
+        // A state machine encrypted with a CUSTOMER MANAGED KMS key hands its
+        // execution's data out only to a caller that key permits: this report carries
+        // the execution's `input` and `output`, which were sealed under that key, so
+        // the caller's `kms:Decrypt` grant on it is decided before any of it is read.
+        // The decision is made with no store of this service locked.
+        if let Some(why) = crate::state::encryption::execution_read_denied(
+            &*self.engine,
+            ctx,
+            &endpoint_region,
+            &input.execution_arn,
+        ) {
+            return Err(DescribeExecutionErrorModeled::KmsAccessDeniedException(
+                KmsAccessDeniedException { message: Some(why) },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // The one write a report may make: the terminal status was owed at the instant
         // the clock made it due, whether or not anybody described the execution.

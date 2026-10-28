@@ -8,6 +8,12 @@
 //! never from a canned value. The only write it makes is materialising what the
 //! clock has already made due.
 //!
+//! The `definition` it reports is encrypted under the state machine's own customer
+//! managed KMS key when it has one, so a read that reports it decides the caller's
+//! `kms:Decrypt` grant on that key first (`crate::state::encryption`, the modelled
+//! `KmsAccessDeniedException`); a metadata-only read reports no definition and so
+//! needs no grant.
+//!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
 //!
@@ -221,6 +227,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now();
+        // The definition of a state machine encrypted with a CUSTOMER MANAGED KMS key
+        // is handed out only to a caller that key permits ("callers must have
+        // kms:Decrypt permission to decrypt the definition"), so the caller's
+        // `kms:Decrypt` grant on it is decided before the definition is read. A
+        // metadata-only read reports no definition, so it decrypts nothing and needs
+        // no grant ("you can call the API with includedData = METADATA_ONLY to get a
+        // successful response without the encrypted definition"). The decision is made
+        // with no store of this service locked.
+        if !included_data.is_metadata_only() {
+            if let Some(why) = crate::state::encryption::execution_read_denied(
+                &*self.engine,
+                ctx,
+                &endpoint_region,
+                &input.execution_arn,
+            ) {
+                return Err(
+                    DescribeStateMachineForExecutionErrorModeled::KmsAccessDeniedException(
+                        KmsAccessDeniedException { message: Some(why) },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         let mut store = state.lock();
         // Materialising what the clock already owes — a terminal execution status, a
         // started deletion — is the one write a report may make: it was due at the
