@@ -29,17 +29,15 @@ use service_com_amazonaws_mediaconnect_mediaconnect::state as mc;
 
 use crate::flow_lifecycle::Emulator;
 use crate::router_output_lifecycle::delete_router_output;
+// TakeRouterInput is the operation that records the ACTIVE ROUTE this file's
+// `FabricConfiguration` precondition is stated against, and the one that clears it when the
+// request names no input; its suite owns the request helper.
+use crate::router_output_take_input::take_router_input;
 use crate::router_outputs::{
     batch_get_router_outputs, create_router_output, minted_configuration_targets,
     minted_flow_source, now_epoch_seconds, reported_timestamp, standard, standard_with_protocol,
     PERSISTED_MEMBERS, UNKNOWN_ARN,
 };
-
-/// A `RouterInputArn` matching the modelled pattern
-/// (`smithy_query(query="shape",shape="RouterInputArn")`:
-/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerInput:[a-z0-9]{12}$`) — the
-/// input an output is ROUTED from in the cases about an active route.
-const ROUTED_INPUT_ARN: &str = "arn:aws:mediaconnect:us-east-1:000000000000:routerInput:a1b2c3d4e5f6";
 
 /// Long enough for a transition the clock owes to be due: twice [`mc::TRANSITION_SPAN`], so
 /// a settled state is never read early.
@@ -822,23 +820,30 @@ async fn an_update_is_refused_while_the_output_is_being_deleted() {
     );
 }
 
-/// Route `input_arn` to the router output `arn` in the store, or unroute it with `None`.
+/// Give the router output `arn` an active route, over the wire, and answer the ARN of the
+/// router input it now carries.
 ///
-/// TakeRouterInput — the operation that routes a router input to an output — is still a
-/// scaffold, so the ACTIVE ROUTE that `UpdateRouterOutput$FabricConfiguration`'s documented
-/// precondition is stated against cannot be reached over the wire yet. The record is put in
-/// the state the service holds a routed output in instead: `RouterOutput$RoutedInputArn` is
-/// the one place that relation lives.
-fn set_routed_input(emulator: &Emulator, arn: &str, input_arn: Option<&str>) {
-    let state = emulator
-        .engine
-        .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
-    let mut store = state.lock();
-    let output = store
-        .router_outputs
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the created output {arn} is in the store"));
-    output.routed_input_arn = input_arn.map(ToString::to_string);
+/// A take resolves the input it names against the store, so the input is one the account
+/// HOLDS — seeded through the helper `router_input_deletion` owns. The take is accepted only
+/// for a settled output and the association it records settles one transition span later, so
+/// both transitions are waited out: what the cases below need is an output that HAS an
+/// active route.
+async fn route_an_input_to(emulator: &Emulator, arn: &str) -> String {
+    let input_arn = crate::router_input_deletion::seed_router_input(
+        emulator,
+        "ro-update-routed-input",
+        mc::ROUTER_INPUT_STATE_ACTIVE,
+    );
+    tokio::time::sleep(past_transition_span()).await;
+    let (status, code, taken) = take_router_input(emulator, arn, Some(&input_arn)).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (202, None),
+        "TakeRouterInput routes the input to the output under test, got {status} {code:?}: \
+         {taken}"
+    );
+    tokio::time::sleep(past_transition_span()).await;
+    input_arn
 }
 
 #[tokio::test]
@@ -846,7 +851,7 @@ async fn the_fabric_configuration_cannot_be_updated_while_the_output_is_routed()
     let emulator = Emulator::new();
     let targets = Targets::mint(&emulator).await;
     let (arn, created) = create_output(&emulator, standard_create(&targets, "ro-routed")).await;
-    set_routed_input(&emulator, &arn, Some(ROUTED_INPUT_ARN));
+    route_an_input_to(&emulator, &arn).await;
 
     // "You cannot update the fabric configuration while the output has an active route."
     let (status, code, refusal) = update_router_output(
@@ -889,8 +894,16 @@ async fn the_fabric_configuration_cannot_be_updated_while_the_output_is_routed()
     );
 
     // "You must unroute the output before updating the fabric configuration" — and once it
-    // is unrouted, the same request is accepted.
-    set_routed_input(&emulator, &arn, None);
+    // is unrouted, the same request is accepted. The rename above is a state change of its
+    // own, so the take that unroutes the output waits for it to settle first.
+    tokio::time::sleep(past_transition_span()).await;
+    let (status, code, unrouted) = take_router_input(&emulator, &arn, None).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (202, None),
+        "TakeRouterInput clears the route when it names no input, got {status} {code:?}: \
+         {unrouted}"
+    );
     let (status, code, answered) = update_router_output(
         &emulator,
         &arn,

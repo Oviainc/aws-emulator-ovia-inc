@@ -1289,6 +1289,9 @@ pub(crate) fn seed_router_outputs(emulator: &Emulator, count: usize) {
                 state: mc::ROUTER_OUTPUT_STATE_STANDBY.to_string(),
                 pending: None,
                 routed_input_arn: None,
+                // and no association is in flight for a seeded output either: only
+                // TakeRouterInput records one.
+                routing_due_at: None,
                 messages: Vec::new(),
                 // A seeded output has not been started, so nothing has scheduled a
                 // maintenance window for it, exactly as a created one has none.
