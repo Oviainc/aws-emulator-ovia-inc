@@ -3549,6 +3549,94 @@ pub fn resolve_composite_component_path(
     })
 }
 
+/// The component of an entity a `ComponentPath` addresses, as
+/// [`component_at_path`] read it: either one of the entity's top-level
+/// components or a composite component held inside one of them.
+///
+/// The two are kept apart rather than reduced on the spot, because a caller
+/// reports them differently — a composite component is named by its own
+/// `ComponentPath` — while every caller needs the same two things out of the
+/// resolution, which [`component_type_id`](Self::component_type_id) and
+/// [`properties`](Self::properties) answer.
+#[derive(Debug, Clone, Copy)]
+pub enum ComponentAtPath<'a> {
+    /// The path named one of the entity's top-level components: it had a single
+    /// segment.
+    TopLevel(&'a ComponentRecord),
+    /// The path named a composite component inside one of the entity's
+    /// components.
+    Composite {
+        /// The top-level component the composite component hangs under: the
+        /// path's first segment.
+        component: &'a ComponentRecord,
+        /// The path BELOW that component — the key
+        /// [`ComponentRecord::composite_components`] holds the composite
+        /// component under.
+        composite_path: &'a str,
+        /// The addressed composite component itself.
+        composite: &'a CompositeComponentRecord,
+    },
+}
+
+impl<'a> ComponentAtPath<'a> {
+    /// The component type the addressed component instantiates. Absent only for
+    /// a top-level component created without a `componentTypeId`; a composite
+    /// component always instantiates the type its declaration names.
+    pub fn component_type_id(&self) -> Option<&'a str> {
+        match self {
+            Self::TopLevel(component) => component.component_type_id.as_deref(),
+            Self::Composite { composite, .. } => Some(&composite.component_type_id),
+        }
+    }
+
+    /// The addressed component's stored properties, keyed by property name.
+    pub fn properties(&self) -> &'a BTreeMap<String, PropertyRecord> {
+        match self {
+            Self::TopLevel(component) => &component.properties,
+            Self::Composite { composite, .. } => &composite.properties,
+        }
+    }
+}
+
+/// The component of `entity` a `ComponentPath` addresses, or `None` when the
+/// entity holds none there.
+///
+/// A path is "the path to the composite component, STARTING FROM the top-level
+/// component", so a path of ONE segment names that top-level component, and a
+/// longer one names the composite component stored under the REST of the path
+/// inside it — the key [`ComponentRecord::composite_components`] holds it
+/// under, whatever depth the composite component sits at.
+///
+/// This is the READ side of the rule
+/// [`resolve_composite_component_path`] writes with: every property reader that
+/// accepts a `componentPath` resolves it here, so one change to how a path is
+/// read reaches all of them at once and they cannot disagree about which
+/// component one path names. A reader needs no component types to resolve a
+/// path, unlike a writer: the composite components a path may reach are the
+/// ones the entity already holds.
+pub fn component_at_path<'a>(
+    entity: &'a Entity,
+    component_path: &str,
+) -> Option<ComponentAtPath<'a>> {
+    match component_path.split_once(COMPONENT_PATH_SEPARATOR) {
+        None => Some(ComponentAtPath::TopLevel(
+            entity.components.get(component_path)?,
+        )),
+        Some((component_name, composite_path)) => {
+            let component = entity.components.get(component_name)?;
+            // By key, so the path below the component is borrowed from the
+            // STORE and outlives the request's own string.
+            let (composite_path, composite) =
+                component.composite_components.get_key_value(composite_path)?;
+            Some(ComponentAtPath::Composite {
+                component,
+                composite_path,
+                composite,
+            })
+        }
+    }
+}
+
 /// One property of a component: the definition and value the request gave it.
 ///
 /// Whether the property is the component's external id is NOT answerable from

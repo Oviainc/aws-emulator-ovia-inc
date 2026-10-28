@@ -743,24 +743,16 @@ fn scope<'a>(
     Ok(components)
 }
 
-/// The component of `entity` a `componentPath` addresses: "the path to the
-/// composite component, STARTING FROM the top-level component", so a path of
-/// one segment names that top-level component and a longer one the composite
-/// component stored under the rest of the path inside it.
+/// The component of `entity` a `componentPath` addresses, resolved by the one
+/// read-side rule every property reader shares
+/// ([`crate::state::component_at_path`]).
 fn at_path<'a>(entity: &'a crate::state::Entity, component_path: &str) -> Option<Scoped<'a>> {
-    match component_path.split_once(crate::state::COMPONENT_PATH_SEPARATOR) {
-        None => Some(scoped(
-            &entity.entity_id,
-            entity.components.get(component_path)?,
-        )),
-        Some((component_name, composite_path)) => {
-            let component = entity.components.get(component_name)?;
-            Some(scoped_composite(
-                &entity.entity_id,
-                component.composite_components.get(composite_path)?,
-            ))
+    Some(match crate::state::component_at_path(entity, component_path)? {
+        crate::state::ComponentAtPath::TopLevel(component) => scoped(&entity.entity_id, component),
+        crate::state::ComponentAtPath::Composite { composite, .. } => {
+            scoped_composite(&entity.entity_id, composite)
         }
-    }
+    })
 }
 
 /// The properties the request selected, de-duplicated and in name order, each

@@ -23,6 +23,9 @@ mod component_inherited_schema;
 #[path = "all/component_listing.rs"]
 mod component_listing;
 
+#[path = "all/component_path_resolution.rs"]
+mod component_path_resolution;
+
 #[path = "all/component_type_create_references.rs"]
 mod component_type_create_references;
 

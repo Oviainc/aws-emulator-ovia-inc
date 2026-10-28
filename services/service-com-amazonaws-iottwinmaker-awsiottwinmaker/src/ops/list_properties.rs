@@ -324,12 +324,9 @@ struct AddressedComponent<'a> {
 /// the top-level component `componentName` names.
 ///
 /// A path is the more specific address, so it takes precedence — the same
-/// precedence `GetPropertyValue` gives it. A path of one segment names a
-/// top-level component ("the path to the composite component, STARTING FROM the
-/// top-level component", so the top-level component is the path's first
-/// segment); a longer one names the composite component stored under the rest of
-/// the path inside it, which is the key
-/// [`crate::state::ComponentRecord::composite_components`] holds it under.
+/// precedence `GetPropertyValue` gives it. What a path leads to is read by the
+/// one read-side rule every property reader shares
+/// ([`crate::state::component_at_path`]).
 fn addressed_component<'a>(
     entity: &'a crate::state::Entity,
     input: &ListPropertiesInput,
@@ -369,31 +366,17 @@ fn addressed_component<'a>(
 }
 
 /// The component `component_path` leads to, or `None` when the entity holds none
-/// there. See [`addressed_component`] for how a path is read.
+/// there, resolved by the one read-side rule every property reader shares
+/// ([`crate::state::component_at_path`]).
 fn component_at_path<'a>(
     entity: &'a crate::state::Entity,
     component_path: &str,
 ) -> Option<AddressedComponent<'a>> {
-    match component_path.split_once(crate::state::COMPONENT_PATH_SEPARATOR) {
-        None => {
-            let component = entity.components.get(component_path)?;
-            Some(AddressedComponent {
-                component_type_id: component.component_type_id.as_deref(),
-                properties: &component.properties,
-            })
-        }
-        Some((component_name, composite_path)) => {
-            let composite = entity
-                .components
-                .get(component_name)?
-                .composite_components
-                .get(composite_path)?;
-            Some(AddressedComponent {
-                component_type_id: Some(&composite.component_type_id),
-                properties: &composite.properties,
-            })
-        }
-    }
+    let addressed = crate::state::component_at_path(entity, component_path)?;
+    Some(AddressedComponent {
+        component_type_id: addressed.component_type_id(),
+        properties: addressed.properties(),
+    })
 }
 
 /// One property of the addressed component as the modelled `PropertySummary`.

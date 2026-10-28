@@ -507,25 +507,21 @@ fn of_composite<'a>(
     }
 }
 
-/// The component of `entity` a `componentPath` addresses: "the path to the
-/// composite component, STARTING FROM the top-level component", so a path of
-/// one segment names that top-level component and a longer one the composite
-/// component stored under the rest of the path inside it.
+/// The component of `entity` a `componentPath` addresses, resolved by the one
+/// read-side rule every property reader shares
+/// ([`crate::state::component_at_path`]).
 fn at_path<'a>(
     entity: &'a crate::state::Entity,
     component_path: &str,
 ) -> Option<Addressed<'a>> {
-    match component_path.split_once(crate::state::COMPONENT_PATH_SEPARATOR) {
-        None => Some(of_component(
-            entity,
-            entity.components.get(component_path)?,
-        )),
-        Some((component_name, composite_path)) => {
-            let component = entity.components.get(component_name)?;
-            let composite = component.composite_components.get(composite_path)?;
-            Some(of_composite(entity, component, composite, composite_path))
-        }
-    }
+    Some(match crate::state::component_at_path(entity, component_path)? {
+        crate::state::ComponentAtPath::TopLevel(component) => of_component(entity, component),
+        crate::state::ComponentAtPath::Composite {
+            component,
+            composite_path,
+            composite,
+        } => of_composite(entity, component, composite, composite_path),
+    })
 }
 
 /// Every component of the workspace whose external-id properties carry EVERY
