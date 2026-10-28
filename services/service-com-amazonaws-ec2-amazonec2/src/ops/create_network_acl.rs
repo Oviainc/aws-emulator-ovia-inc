@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkAcl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkAcl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkAcl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one network ACL in the VPC the request names and stores it in [`crate::state`],
+//! where `DescribeNetworkAcls` reports it from. The ACL is answered with the entries AWS
+//! gives a caller-created one — the catch-all deny in each direction
+//! ([`crate::state::created_network_acl_entries`]) — and with no subnet association, an
+//! association being what `ReplaceNetworkAclAssociation` moves onto it later. It is never
+//! the VPC's DEFAULT ACL: that one is the ACL the VPC itself came with
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::insert_default_network_acl`]).
+//!
+//! A `ClientToken` is idempotent only for the request it was first given with: replayed
+//! with the same parameters it reports the ACL it already minted, and replayed with any
+//! different parameter it is refused with `IdempotentParameterMismatch` ([`same_request`]).
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +144,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkAcl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkAclErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkAcl"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and nothing about a network ACL is a fact of
+        // the Region (the modelled `NetworkAcl` carries no Region or ARN member), so this
+        // operation reads none of it. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The tags to assign to the network ACL"
+        // (`CreateNetworkAclRequest$TagSpecifications`) — the shared reader refuses a
+        // specification naming any other resource type and holds the payload to the
+        // documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::NETWORK_ACL_TAGGABLE_RESOURCE,
+            Self::NAME,
+        )?;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateNetworkAclRequest$ClientToken`). The model puts no `@length`
+        // on it and the store keeps it for the process's lifetime, so the bound this crate
+        // holds every client token to is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // The entries the ACL will be created with, built before the store is locked: the
+        // catch-all deny in each direction, which is what a caller-created ACL carries until
+        // `CreateNetworkAclEntry` adds a rule.
+        let entries = state::created_network_acl_entries();
+
+        // The caller-chosen bytes this create would retain, counted by the ONE definition of
+        // that charge, so the gate below asks exactly what the insert will take.
+        let payload_bytes = state::network_acl_payload_bytes(&entries, &tags);
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // Idempotency: one token names the one ACL it minted, so a replay of the SAME
+        // request reports that ACL and creates nothing. Read here and answered below the
+        // DryRun check, because a replay stores nothing and so passes the ceilings a fresh
+        // create has to clear.
+        let replayed_id = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.network_acl_minted_by_client_token(token));
+
+        // "The ID of the VPC" (`CreateNetworkAclRequest$VpcId`): a network ACL belongs to a
+        // VPC (`NetworkAcl$VpcId`), so an id this account holds no VPC for is a refusal
+        // rather than an ACL in no VPC — the one refusal this crate words for an
+        // unresolvable VPC id.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        let replayed = match replayed_id {
+            None => None,
+            Some(network_acl_id) => {
+                let network_acl = store
+                    .network_acls
+                    .get(&network_acl_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        state::internal_error(format!(
+                            "a client token names network ACL '{network_acl_id}', which is \
+                             not stored"
+                        ))
+                    })?;
+                // A token is only idempotent for the REQUEST it was first given with:
+                // replayed with a different parameter it names an ACL the caller did not ask
+                // for, which EC2 refuses rather than answers, the way every other create in
+                // this crate that reads a client token does.
+                if !same_request(&network_acl, &input.vpc_id, &tags) {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(network_acl)
+            }
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. Both
+        // are the bounds `insert_network_acl` itself enforces, asked HERE so the refusal
+        // names what is full and so a dry run of a create the store has no room for is
+        // refused with that reason. A replay stores nothing, so it is charged nothing and
+        // clears both gates.
+        if replayed.is_none() && !store.has_network_acl_capacity() {
+            return Err(state::network_acl_limit_exceeded(format!(
+                "This emulator holds {max} network ACLs, which is as many as it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::network_acl_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`CreateNetworkAclRequest$DryRun`). Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The ACL that token already minted, exactly as it is stored now.
+        if let Some(network_acl) = replayed {
+            return Ok(CreateNetworkAclOutput {
+                network_acl: Some(network_acl),
+                client_token: input.client_token,
+            });
+        }
+
+        let Some(network_acl_id) = store.insert_network_acl(state::NetworkAclSpec {
+            vpc_id: input.vpc_id.clone(),
+            // "Indicates whether this is the default network ACL for the VPC"
+            // (`NetworkAcl$IsDefault`): the default ACL is the one a VPC comes with, so an
+            // ACL this operation creates is not it.
+            is_default: false,
+            entries,
+            tags,
+        }) else {
+            // Unreachable: both bounds the insert enforces were asked above, and the store is
+            // locked throughout. Answered rather than unwrapped, so a store at a ceiling can
+            // only ever refuse.
+            return Err(state::network_acl_limit_exceeded(
+                "This emulator has no room for another network ACL",
+            ));
+        };
+        // The token is recorded with the ACL it minted, so a replay of this request reports
+        // that ACL instead of creating a second one.
+        if let Some(token) = input.client_token.clone() {
+            store.record_network_acl_client_token(token, &network_acl_id);
+        }
+
+        // The answer is the record as it was stored, so `CreateNetworkAcl` and
+        // `DescribeNetworkAcls` cannot drift apart.
+        let Some(network_acl) = store.network_acls.get(&network_acl_id).cloned() else {
+            return Err(state::internal_error(
+                "the network ACL just created could not be read back",
+            ));
+        };
+        Ok(CreateNetworkAclOutput {
+            network_acl: Some(network_acl),
+            // "Unique, case-sensitive identifier to ensure the idempotency of the request.
+            // Only returned if a client token was provided in the request"
+            // (`CreateNetworkAclResult$ClientToken`): the token the REQUEST carried, echoed,
+            // and nothing at all when it carried none.
+            client_token: input.client_token,
+        })
     }
+}
+
+/// Does `network_acl` — the ACL a replayed `ClientToken` names — hold what THIS request asks
+/// for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with an ACL
+/// the caller did not ask for; the same contract `create_carrier_gateway`'s `same_request`
+/// has for a carrier gateway. The members this service derives (the id, the owning account,
+/// the entries a create mints and the empty association set) are not compared: they follow
+/// from the ones that are. Tags are a SET, so the order a request names them in is not a
+/// difference.
+fn same_request(network_acl: &NetworkAcl, vpc_id: &str, tags: &[Tag]) -> bool {
+    network_acl.vpc_id.as_deref() == Some(vpc_id)
+        && crate::state::tag_pairs(network_acl.tags.as_deref().unwrap_or_default())
+            == crate::state::tag_pairs(tags)
 }

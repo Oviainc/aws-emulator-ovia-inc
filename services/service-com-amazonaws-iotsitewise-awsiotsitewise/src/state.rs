@@ -4745,6 +4745,73 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         }
     }
 
+    /// The dataset that holds a data segment whose data came FROM `dataset_id`,
+    /// paired with that segment, or `None` when nothing references its data.
+    ///
+    /// A segment names the dataset its data came from
+    /// ([`DataSegmentRecord::source_dataset_id`]), so a segment ANOTHER dataset
+    /// holds under this one references this dataset's data — the reference
+    /// `DeleteDataset` refuses to break: "You can't delete a session dataset
+    /// while a curated dataset references its data segments." A segment whose
+    /// data came from the dataset that HOLDS it is that dataset's own data and
+    /// references nothing, read exactly as
+    /// [`Self::overlapping_data_segment_association`] reads it.
+    ///
+    /// Answered in dataset-then-span order, so one store answers one way
+    /// whatever order its map iterates in.
+    pub fn dataset_data_reference(&self, dataset_id: &str) -> Option<(&str, &DataSegmentRecord)> {
+        self.dataset_data_segments
+            .iter()
+            .flat_map(|(holder, held)| {
+                held.iter().map(move |segment| (holder.as_str(), segment))
+            })
+            .filter(|(holder, segment)| {
+                segment.source_dataset_id == dataset_id && *holder != dataset_id
+            })
+            .min_by(|(left_id, left), (right_id, right)| {
+                (*left_id, data_segment_key(left)).cmp(&(*right_id, data_segment_key(right)))
+            })
+    }
+
+    /// Forget a dataset and the data segments it held, answering the record it
+    /// removed.
+    ///
+    /// A segment whose data came from the dataset that HELD it is that dataset's
+    /// OWN data, so the samples its span covers go with it — "Deleting a session
+    /// dataset also deletes the underlying time series data in the session" —
+    /// through [`Self::forget_series_window`], the one window remover a single
+    /// segment's deletion already goes through. A segment whose source is
+    /// ANOTHER dataset only REFERENCES that dataset's data, so just the
+    /// reference goes: "Deleting a curated dataset doesn't delete the underlying
+    /// data in the source session datasets", the same split
+    /// [`Self::disassociate_dataset_data_segment`] makes for one segment.
+    ///
+    /// The dataset's tags go with its record, which owns them. A dataset whose
+    /// data another dataset still references is NOT refused here:
+    /// [`Self::dataset_data_reference`] is what the caller refuses it with.
+    pub fn forget_dataset(&mut self, dataset_id: &str) -> Option<DatasetRecord> {
+        let record = self.datasets.remove(dataset_id)?;
+        let held = self
+            .dataset_data_segments
+            .remove(dataset_id)
+            .unwrap_or_default();
+        for segment in held {
+            if segment.source_dataset_id != dataset_id {
+                continue;
+            }
+            // A segment whose time series the store no longer holds has no data
+            // left to delete, which is no reason to keep the dataset.
+            if let Some(stream) = self.series_by_time_series_id(&segment.time_series_id) {
+                self.forget_series_window(
+                    &stream,
+                    &segment.start_timestamp,
+                    &segment.end_timestamp,
+                );
+            }
+        }
+        Some(record)
+    }
+
     /// The stored data stream whose own `TimeSeriesId` is `time_series_id`, or
     /// `None` when no stream of this store carries it.
     ///

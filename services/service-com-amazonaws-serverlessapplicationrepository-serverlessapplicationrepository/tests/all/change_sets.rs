@@ -961,7 +961,7 @@ async fn a_change_set_is_refused_when_no_published_version_is_named() {
             400,
             "BadRequestException",
             "InvalidRequestException",
-            "does not have any versions",
+            "application with no version",
         ),
         (
             "a version the application does not carry",
@@ -970,7 +970,7 @@ async fn a_change_set_is_refused_when_no_published_version_is_named() {
             404,
             "NotFoundException",
             "VersionNotFoundException",
-            "Version 9.9.9 could not be found",
+            "does not have a version 9.9.9",
         ),
         (
             "an application the catalogue does not hold",
