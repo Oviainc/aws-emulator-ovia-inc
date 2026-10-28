@@ -17,6 +17,9 @@ mod cancel_profile_status_transitions;
 #[path = "all/error_responses.rs"]
 mod error_responses;
 
+#[path = "all/job_listing.rs"]
+mod job_listing;
+
 #[path = "all/platform_listing.rs"]
 mod platform_listing;
 

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSigningJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSigningJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSigningJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the signing jobs the region whose endpoint answered holds,
+//! narrowed to the filters the call carried and cut into pages this listing's own
+//! opaque `nextToken` resumes.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +127,20 @@ impl From<ListSigningJobsErrorModeled> for ListSigningJobsError {
     }
 }
 
+/// The modelled 400 for a `nextToken` that is not one this listing handed out.
+///
+/// `code` names the condition a paginating client resets on, as the service's
+/// other paginated reads word it. The refused value is not echoed: a client that
+/// held a token from another listing learns that the token is not valid here, and
+/// nothing of what the token decodes to is reported back.
+fn invalid_next_token() -> ListSigningJobsError {
+    ListSigningJobsErrorModeled::ValidationException(ValidationException {
+        message: Some("Invalid next token provided".to_string()),
+        code: Some(crate::state::ERROR_CODE_INVALID_NEXT_TOKEN.to_string()),
+    })
+    .into()
+}
+
 /// The `ListSigningJobs` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,18 +177,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSigningJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSigningJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSigningJobs"))
+        // Signer is regional: a list reports the jobs of the region whose
+        // endpoint was addressed, and none of any other region's.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSigningJobsErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the signer job store is unavailable".to_string()),
+                    code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` is modelled `@range(min: 1, max: 25)` and the boundary
+        // validator refused anything outside it before this handler ran, so the
+        // only case left is an absent value: serve the largest page the model
+        // allows. The `clamp` states that invariant rather than correcting a
+        // caller — a value reaching here outside the range is a validator bug,
+        // which the debug assertion surfaces instead of silently repairing.
+        let requested = input.max_results.unwrap_or(crate::state::JOB_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::JOB_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::JOB_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=25 fits in usize");
+
+        // Which jobs this call enumerates — the listing a page of it hands a
+        // token out for, and the only listing that token resumes.
+        let listing = crate::state::JobListing {
+            region,
+            status: input.status,
+            platform_id: input.platform_id,
+            requested_by: input.requested_by,
+            job_invoker: input.job_invoker,
+            revoked_only: input.is_revoked,
+            signature_expires_before: input.signature_expires_before,
+            signature_expires_after: input.signature_expires_after,
+        };
+
+        // `nextToken` is this service's own opaque cursor into THIS listing, so
+        // the job the next page starts at is read back out of the token rather
+        // than taken from it. A value the service never handed out — one it
+        // cannot decode, or one issued for another region or another filter set —
+        // is refused with the modelled 400, whose `code` names the condition a
+        // paginating client resets on, instead of serving a page out of some other
+        // ordering.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => match listing.resume_at(token) {
+                Some(resume_at) => Some(resume_at),
+                None => return Err(invalid_next_token()),
+            },
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A listed job reports its `status`, so the completions the clock has
+        // already made due are materialised first: they were owed at their due
+        // instant whether or not anybody listed.
+        store.settle_jobs_in(&listing.region, now);
+        let mut jobs = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for job in store.jobs_in(&listing.region) {
+            // Resume at the first job at or after the one the token carries, so a
+            // page is still served when the job it named has since stopped
+            // passing the filters this listing carries.
+            if resume_at
+                .as_deref()
+                .is_some_and(|resume_at| job.job_id.as_str() < resume_at)
+            {
+                continue;
+            }
+            if !listing.includes(job) {
+                continue;
+            }
+            if jobs.len() == page_size {
+                next_token = Some(listing.page_token(&job.job_id));
+                break;
+            }
+            jobs.push(job.to_summary());
+        }
+
+        Ok(ListSigningJobsOutput {
+            jobs: Some(jobs),
+            next_token,
+        })
     }
 }

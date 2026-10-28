@@ -72,9 +72,8 @@ fn signed_for_region() -> String {
 }
 
 /// One emulator: a router carrying only this service, over one shared engine —
-/// handed back beside the router so a case can read the stored jobs directly
-/// (`ListSigningJobs` is still scaffolded, so the store is what says whether a
-/// refused start wrote anything).
+/// handed back beside the router so a case can read the stored jobs directly,
+/// which is what says whether a refused start wrote anything at all.
 fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();

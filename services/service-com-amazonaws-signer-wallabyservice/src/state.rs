@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Destination, EncryptionAlgorithmOptions, HashAlgorithmOptions, S3SignedObject,
-    SignatureValidityPeriod, SignedObject, SigningConfiguration, SigningImageFormat,
+    SignatureValidityPeriod, SignedObject, SigningConfiguration, SigningImageFormat, SigningJob,
     SigningJobRevocationRecord, SigningMaterial, SigningPlatform, SigningPlatformOverrides,
     SigningProfile, SigningProfileRevocationRecord, Source,
 };
@@ -103,6 +103,14 @@ pub const PROFILE_PAGE_LIMIT: i32 = 25;
 /// modelled with, so one operation's model changing does not silently move the
 /// other's page size.
 pub const PLATFORM_PAGE_LIMIT: i32 = 25;
+
+/// The largest page `ListSigningJobs` serves, and the page size it uses when the
+/// request names no `maxResults`: `ListSigningJobsRequest$maxResults` is modelled
+/// `@range(min: 1, max: 25)`.
+///
+/// Stated per operation rather than shared with the other two page limits, for
+/// the reason [`PLATFORM_PAGE_LIMIT`] gives.
+pub const JOB_PAGE_LIMIT: i32 = 25;
 
 /// The most tags one signing profile can hold.
 ///
@@ -484,6 +492,46 @@ impl SigningJobRecord {
     pub fn signing_parameter_map(&self) -> Option<HashMap<String, String>> {
         non_empty_map(&self.signing_parameters)
     }
+
+    /// The instant the signature this job produced expires — the
+    /// `signatureExpiresAt` a read of the job reports.
+    ///
+    /// The ONE place that instant is taken from, so the member a read of a single
+    /// job reports and the window a listing's expiry bounds judge can never
+    /// disagree. Nothing in this service records it on a job yet: a signature
+    /// expires with the certificate it was issued under, and no certificate is
+    /// issued here, so a read reports the member absent rather than an instant
+    /// nothing fixed — and a listing bounded by an expiry judges that same
+    /// absence instead of guessing one.
+    pub fn signature_expires_at(&self) -> Option<::aws_smithy_types::DateTime> {
+        None
+    }
+
+    /// The `SigningJob` summary `ListSigningJobs` returns.
+    ///
+    /// Every member is read off this record, so a listed job carries the same
+    /// values `DescribeSigningJob` reports for it, narrowed to the members the
+    /// summary shape holds.
+    pub fn to_summary(&self) -> SigningJob {
+        SigningJob {
+            job_id: Some(self.job_id.clone()),
+            source: Some(self.source.clone()),
+            signed_object: self.signed_object.clone(),
+            signing_material: self.signing_material.clone(),
+            created_at: Some(to_timestamp(self.created_at)),
+            status: Some(self.status.clone()),
+            // `SigningStatus` cannot say "revoked", so the summary reports the
+            // fact of the revocation record this job carries.
+            is_revoked: self.is_revoked(),
+            profile_name: Some(self.profile_name.clone()),
+            profile_version: Some(self.profile_version.clone()),
+            platform_id: Some(self.platform_id.clone()),
+            platform_display_name: self.platform_display_name.clone(),
+            signature_expires_at: self.signature_expires_at(),
+            job_owner: Some(self.job_owner.clone()),
+            job_invoker: self.job_invoker.clone(),
+        }
+    }
 }
 
 /// The cross-account permission policy of a signing profile: the statements
@@ -675,6 +723,32 @@ impl ComAmazonawsSignerWallabyserviceState {
             .filter(|job| job.region == region)?;
         job.settle(now);
         Some(job)
+    }
+
+    /// Materialise every completion the clock has already made due for a job of
+    /// `region`.
+    ///
+    /// For a read that REPORTS job statuses: each completion was owed at its due
+    /// instant whether or not anybody asked, so a listing reports the status each
+    /// job holds at `now` rather than the one it held when it was last written —
+    /// and two readers of one job still see the same completion time (see
+    /// [`SigningJobRecord::settle`]).
+    pub fn settle_jobs_in(&mut self, region: &str, now: SystemTime) {
+        for job in self.jobs.values_mut() {
+            if job.region == region {
+                job.settle(now);
+            }
+        }
+    }
+
+    /// Every job `region` holds, in the order their ids were minted — which is
+    /// the order they were started, and the one stable total order a page of a
+    /// job listing is cut out of — and nothing from any other region.
+    pub fn jobs_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a SigningJobRecord> + 'a {
+        self.jobs.values().filter(move |job| job.region == region)
     }
 
     /// The job `region`'s endpoint already started for `client_request_token`, so
@@ -1517,6 +1591,23 @@ pub fn is_profile_version(value: &str) -> bool {
     value.len() == 10 && value.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// True when `value` has the form
+/// [`ComAmazonawsSignerWallabyserviceState::mint_job_id`] mints — the 8-4-4-4-12
+/// hex digits of a UUID.
+///
+/// `JobId` is an unconstrained string, so this is for a job id read out of a
+/// value nothing else constrains: the one a decoded pagination token resumes at.
+pub fn is_job_id(value: &str) -> bool {
+    /// How many hex digits each dash-separated group of a UUID carries.
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut groups = value.split('-');
+    GROUPS.iter().all(|digits| {
+        groups.next().is_some_and(|group| {
+            group.len() == *digits && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
+}
+
 /// Whether `signature_timestamp` falls at or after `effective_from`.
 ///
 /// A modelled `Timestamp` is whole epoch seconds (signed) plus a non-negative
@@ -1566,6 +1657,9 @@ const LISTING_KIND_PROFILES: &str = "signing-profiles";
 
 /// The platform listing's kind marker (see [`LISTING_KIND_PROFILES`]).
 const LISTING_KIND_PLATFORMS: &str = "signing-platforms";
+
+/// The signing-job listing's kind marker (see [`LISTING_KIND_PROFILES`]).
+const LISTING_KIND_JOBS: &str = "signing-jobs";
 
 /// One field of a rendered listing: its byte length, then the value.
 ///
@@ -1617,6 +1711,149 @@ impl ProfileListing {
         let resume_at = decoded_resume_at(&self.canonical(), token)?;
         is_profile_name(&resume_at).then_some(resume_at)
     }
+}
+
+/// Which signing jobs one job listing enumerates: the region whose endpoint is
+/// answering, and every filter the call narrowed its jobs with.
+///
+/// A pagination token is issued FOR one listing and resumes only a call that
+/// enumerates that same listing, so a token carried over to another region or
+/// another filter set is refused rather than serving a page out of a different
+/// enumeration.
+#[derive(Debug, Default)]
+pub struct JobListing {
+    /// The region whose jobs are enumerated, and no other region's.
+    pub region: String,
+    /// The `SigningStatus` filter, or `None` when the call filters on no status.
+    pub status: Option<String>,
+    /// The `platformId` filter, or `None` when the call filters on no platform.
+    pub platform_id: Option<String>,
+    /// The `requestedBy` filter — the IAM principal that requested the job — or
+    /// `None` when the call filters on no principal.
+    pub requested_by: Option<String>,
+    /// The `jobInvoker` filter — the account that initiated the job on another
+    /// account's profile — or `None` when the call filters on no invoker.
+    pub job_invoker: Option<String>,
+    /// Whether the listing is narrowed to the jobs whose signature has been
+    /// revoked, from `isRevoked`.
+    pub revoked_only: bool,
+    /// The `signatureExpiresBefore` bound of the expiry window, or `None` when
+    /// the call named no upper bound.
+    pub signature_expires_before: Option<::aws_smithy_types::DateTime>,
+    /// The `signatureExpiresAfter` bound of the expiry window, or `None` when the
+    /// call named no lower bound.
+    pub signature_expires_after: Option<::aws_smithy_types::DateTime>,
+}
+
+impl JobListing {
+    /// Whether `job` is one of the jobs this listing enumerates: every filter the
+    /// caller named has to equal the value the job RECORDS for that member, and a
+    /// member it named no filter for narrows nothing.
+    pub fn includes(&self, job: &SigningJobRecord) -> bool {
+        fn kept(filter: Option<&str>, recorded: Option<&str>) -> bool {
+            filter.is_none_or(|filter| recorded == Some(filter))
+        }
+        if !kept(self.status.as_deref(), Some(job.status.as_str())) {
+            return false;
+        }
+        if !kept(self.platform_id.as_deref(), Some(job.platform_id.as_str())) {
+            return false;
+        }
+        if !kept(self.requested_by.as_deref(), job.requested_by.as_deref()) {
+            return false;
+        }
+        if !kept(self.job_invoker.as_deref(), job.job_invoker.as_deref()) {
+            return false;
+        }
+        // `isRevoked` narrows the listing to the jobs whose signature has been
+        // revoked; it is modelled with a default of `false`, which a request
+        // omitting it also carries, so the unfiltered listing reports a job
+        // whether or not its signature is still trusted — each one saying which
+        // it is in its own `isRevoked`.
+        if self.revoked_only && !job.is_revoked() {
+            return false;
+        }
+        // The expiry window narrows the listing to the jobs whose signature
+        // expires inside it, judged on the instant the job records for that
+        // (`SigningJobRecord::signature_expires_at`). The two bounds partition at
+        // the instant they name: a signature expiring exactly then is not before
+        // it, so it is after it.
+        match job.signature_expires_at() {
+            Some(expires_at) => {
+                self.signature_expires_before
+                    .as_ref()
+                    .is_none_or(|before| !at_or_after(&expires_at, before))
+                    && self
+                        .signature_expires_after
+                        .as_ref()
+                        .is_none_or(|after| at_or_after(&expires_at, after))
+            }
+            // A signature that is not known to expire at all falls inside no
+            // window a caller can name, so only a call that bounded the expiry
+            // nowhere enumerates the job.
+            None => {
+                self.signature_expires_before.is_none() && self.signature_expires_after.is_none()
+            }
+        }
+    }
+
+    /// What this listing enumerates, rendered canonically (see
+    /// [`ProfileListing::canonical`]).
+    fn canonical(&self) -> String {
+        let mut canonical = String::from(PAGE_TOKEN_VERSION);
+        canonical.push_str(&rendered_field(LISTING_KIND_JOBS));
+        canonical.push_str(&rendered_field(&self.region));
+        for filter in [
+            &self.status,
+            &self.platform_id,
+            &self.requested_by,
+            &self.job_invoker,
+        ] {
+            canonical.push_str(&rendered_field(filter.as_deref().unwrap_or_default()));
+        }
+        canonical.push_str(&rendered_field(if self.revoked_only {
+            REVOKED_ONLY_MARKER
+        } else {
+            ""
+        }));
+        for bound in [
+            &self.signature_expires_before,
+            &self.signature_expires_after,
+        ] {
+            canonical.push_str(&rendered_field(&rendered_instant(bound.as_ref())));
+        }
+        canonical
+    }
+
+    /// The `nextToken` a page of this listing that stops BEFORE the job
+    /// `resume_at` hands back.
+    pub fn page_token(&self, resume_at: &str) -> String {
+        rendered_page_token(&self.canonical(), resume_at)
+    }
+
+    /// The job id `token` resumes THIS listing at, or `None` when `token` is not
+    /// one this listing handed out: a value whose digest does not match the
+    /// cursor it carries, a cursor issued for another region, another filter set
+    /// or another paginated read, or one resuming at a value that is not a job id
+    /// at all.
+    pub fn resume_at(&self, token: &str) -> Option<String> {
+        let resume_at = decoded_resume_at(&self.canonical(), token)?;
+        is_job_id(&resume_at).then_some(resume_at)
+    }
+}
+
+/// How a listing narrowed to revoked signatures renders that filter, so it never
+/// renders as the empty field an unnarrowed one does.
+const REVOKED_ONLY_MARKER: &str = "revoked";
+
+/// An instant a listing is bounded by, rendered canonically: the whole epoch
+/// seconds and the sub-second part a modelled `Timestamp` carries, so two calls
+/// that named the same instant render identically however the request spelled it,
+/// and the empty string for a call that named no bound.
+fn rendered_instant(instant: Option<&::aws_smithy_types::DateTime>) -> String {
+    instant
+        .map(|instant| format!("{}.{:09}", instant.secs(), instant.subsec_nanos()))
+        .unwrap_or_default()
 }
 
 /// Which signing platforms one platform listing enumerates: the catalog this
