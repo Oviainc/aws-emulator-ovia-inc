@@ -50,6 +50,9 @@ mod component_type_update;
 #[path = "all/component_type_update_references.rs"]
 mod component_type_update_references;
 
+#[path = "all/composite_component_inherited_declaration.rs"]
+mod composite_component_inherited_declaration;
+
 #[path = "all/entity_composite_components.rs"]
 mod entity_composite_components;
 

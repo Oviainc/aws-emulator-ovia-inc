@@ -1323,23 +1323,7 @@ impl Workspace {
         &self,
         seeds: impl IntoIterator<Item = String>,
     ) -> (Vec<&ComponentType>, BTreeSet<String>, bool) {
-        let mut reached: BTreeSet<String> = BTreeSet::new();
-        let mut queue: VecDeque<String> = seeds.into_iter().collect();
-        let mut chain = Vec::new();
-        let mut holds_unstored = false;
-        while let Some(ancestor) = queue.pop_front() {
-            if !reached.insert(ancestor.clone()) {
-                continue;
-            }
-            match self.component_types.get(&ancestor) {
-                Some(stored) => {
-                    chain.push(stored);
-                    queue.extend(stored.extends_from.iter().cloned());
-                }
-                None => holds_unstored = true,
-            }
-        }
-        (chain, reached, holds_unstored)
+        component_type_closure_in(&self.component_types, seeds)
     }
 
     /// Every component type `extends_from` reaches — the ids it names plus,
@@ -3467,6 +3451,49 @@ pub struct ResolvedComponentPath {
     pub component_type_id: String,
 }
 
+/// The transitive `extendsFrom` closure of `seeds` over a stored component-type
+/// map, as [`Workspace::component_type_closure`] describes it.
+///
+/// The walk itself lives here, over the MAP rather than the whole workspace, so
+/// a resolution that holds only the component types — a writer of an entity's
+/// composite components, which also holds the entity being patched — walks an
+/// inheritance chain the same single way every reader of inherited structure
+/// does.
+fn component_type_closure_in(
+    component_types: &BTreeMap<String, ComponentType>,
+    seeds: impl IntoIterator<Item = String>,
+) -> (Vec<&ComponentType>, BTreeSet<String>, bool) {
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<String> = seeds.into_iter().collect();
+    let mut chain = Vec::new();
+    let mut holds_unstored = false;
+    while let Some(ancestor) = queue.pop_front() {
+        if !reached.insert(ancestor.clone()) {
+            continue;
+        }
+        match component_types.get(&ancestor) {
+            Some(stored) => {
+                chain.push(stored);
+                queue.extend(stored.extends_from.iter().cloned());
+            }
+            None => holds_unstored = true,
+        }
+    }
+    (chain, reached, holds_unstored)
+}
+
+/// The component type `component_type_id` and every component type it extends,
+/// nearest first — [`Workspace::component_type_chain`] over a component-type
+/// map. Empty when the map holds no component type under the id.
+pub fn component_type_chain_in<'a>(
+    component_types: &'a BTreeMap<String, ComponentType>,
+    component_type_id: &str,
+) -> Vec<&'a ComponentType> {
+    let (chain, _, _) =
+        component_type_closure_in(component_types, [component_type_id.to_string()]);
+    chain
+}
+
 /// Resolve a `ComponentPath` that addresses a COMPOSITE component of an entity.
 ///
 /// A composite component path is valid when its first segment names one of the
@@ -3486,11 +3513,12 @@ pub struct ResolvedComponentPath {
 ///
 /// Two limits are deliberate, both inherited from how this service stores
 /// component types. A path of a single segment names a top-level component and
-/// no composite component, so it does not resolve; and resolution walks only
-/// the component type's OWN `compositeComponentTypes`, because this service
-/// does not model every built-in component type a real workspace carries — so a
-/// path through a component type this workspace does not hold cannot be
-/// resolved, and is refused rather than guessed at.
+/// no composite component, so it does not resolve; and a segment is resolved
+/// against the EFFECTIVE `compositeComponentTypes` of the component type
+/// reached so far — its own declarations plus the ones its `extendsFrom` chain
+/// contributes, nearest first, which is the schema the component type reader
+/// reports — so a path through a component type this workspace does not hold at
+/// all cannot be resolved, and is refused rather than guessed at.
 pub fn resolve_composite_component_path(
     components: &BTreeMap<String, ComponentRecord>,
     component_types: &BTreeMap<String, ComponentType>,
@@ -3520,19 +3548,32 @@ pub fn resolve_composite_component_path(
         ));
     };
     for segment in &segments[1..] {
-        let Some(parent) = component_types.get(&component_type_id) else {
+        // Every declaration that reaches the entry, nearest first: the
+        // component type's own, then its `extendsFrom` chain's. The chain is
+        // empty exactly when this workspace holds no component type under the
+        // id.
+        let chain = component_type_chain_in(component_types, &component_type_id);
+        if chain.is_empty() {
             return Err(format!(
                 "{member}.{component_path}: componentType {component_type_id} does \
                  not exist in this workspace, so {segment} cannot be resolved against it"
             ));
-        };
-        let Some(declaration) = parent.composite_component_types.get(*segment) else {
+        }
+        let mut declarations = chain
+            .iter()
+            .filter_map(|parent| parent.composite_component_types.get(*segment))
+            .peekable();
+        if declarations.peek().is_none() {
             return Err(format!(
                 "{member}.{component_path}: componentType {component_type_id} \
                  declares no compositeComponentTypes.{segment}"
             ));
-        };
-        let Some(declared) = declaration.component_type_id.clone() else {
+        }
+        // The id instantiated is the one the NEAREST declaration that names any
+        // refers to, the fold every other part of an inherited schema gets.
+        let Some(declared) =
+            declarations.find_map(|declaration| declaration.component_type_id.clone())
+        else {
             return Err(format!(
                 "{member}.{component_path}: componentType {component_type_id} \
                  declares compositeComponentTypes.{segment} with no componentTypeId, so it names \
