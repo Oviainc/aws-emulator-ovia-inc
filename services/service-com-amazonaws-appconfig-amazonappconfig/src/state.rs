@@ -510,21 +510,50 @@ pub const MAX_ENTITY_ID_LENGTH: usize = 2048;
 /// `TreatmentKey`, `^[a-zA-Z0-9]{1,8}$` — the pattern [`treatment_key`] mints within.
 pub const TREATMENT_KEY_PATTERN: &str = "^[a-zA-Z0-9]{1,8}$";
 
-/// The most bytes of a caller-supplied value a refusal echoes, the same bound the
-/// framework's validating walk applies to every value IT echoes: a clause interpolates the
-/// value as-is, so an unelided echo would let one request size the response.
-const MAX_ECHOED_VALUE_BYTES: usize = 256;
+/// The most bytes of a caller-supplied value ONE clause echoes in full, the same per-clause
+/// ceiling `service_common::validation` restores a pre-handler refusal's echo up to: an AWS
+/// validation clause quotes the value the caller submitted, so a clause states it whole, and
+/// the ceiling is what bounds the clause.
+const MAX_ECHOED_VALUE_BYTES: usize = 16 * 1024;
 
-/// `value` as a clause states it: itself when short, a character-boundary-safe prefix with
-/// an elision when not — the rendering the framework's own clauses use.
+/// The echoed bytes all clauses of ONE refusal carry together, the same per-message total
+/// that module holds a refusal to. Both bounds are needed: the per-clause ceiling alone
+/// would let a request that breaks many constraints at once size the refusal by the number
+/// of clauses it broke.
+const MAX_ECHOED_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// The leading bytes an elided echo keeps, the framework's own figure for how much of a
+/// value it shows when it will not show all of it.
+const ELIDED_ECHO_PREFIX_BYTES: usize = 256;
+
+/// `value` as a single-clause refusal states it: itself — the bytes the caller sent, which
+/// is what an AWS validation clause quotes — up to [`MAX_ECHOED_VALUE_BYTES`], and
+/// [`elided`] past it.
 ///
 /// Rendering only: every check runs against the original value, because eliding first
 /// would compare text the caller never sent.
 fn echoed(value: &str) -> String {
-    if value.len() <= MAX_ECHOED_VALUE_BYTES {
-        return value.to_string();
-    }
-    let mut end = MAX_ECHOED_VALUE_BYTES;
+    let mut whole_message = MAX_ECHOED_MESSAGE_BYTES;
+    echoed_within(value, &mut whole_message)
+}
+
+/// `value` as one clause of a refusal states it, within what that refusal has left to
+/// spend: itself when it fits both the per-clause ceiling and `remaining`, and [`elided`]
+/// otherwise. `remaining` is decremented by what the clause took.
+fn echoed_within(value: &str, remaining: &mut usize) -> String {
+    let shown = if value.len() <= MAX_ECHOED_VALUE_BYTES && value.len() <= *remaining {
+        value.to_string()
+    } else {
+        elided(value)
+    };
+    *remaining = remaining.saturating_sub(shown.len());
+    shown
+}
+
+/// A character-boundary-safe prefix of `value` with the framework's own elision, for a
+/// value a refusal will not state in full.
+fn elided(value: &str) -> String {
+    let mut end = ELIDED_ECHO_PREFIX_BYTES.min(value.len());
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -541,19 +570,25 @@ fn inline_overrides_path() -> String {
 }
 
 /// The clause path of one entry of that map, which names the entity the entry assigns.
-/// Elided like an echoed value: it embeds caller-supplied text, so it is the same
-/// amplification vector.
-fn inline_override_entry_path(entity: &str) -> String {
-    echoed(&format!(
-        "{}.{}",
-        inline_overrides_path(),
-        path::entry(entity)
-    ))
+/// Bounded like an echoed value, out of the same refusal's budget: it embeds
+/// caller-supplied text, so it is the same amplification vector.
+fn inline_override_entry_path(entity: &str, remaining: &mut usize) -> String {
+    echoed_within(
+        &format!("{}.{}", inline_overrides_path(), path::entry(entity)),
+        remaining,
+    )
 }
 
 /// Which constraint the assignment of `entity` to `treatment` breaks, or `None` when it
 /// breaks none: the entity id's own `length` bound and the treatment key's `@pattern`.
-fn inline_override_violation(entity: &str, treatment: &str) -> Option<Violation> {
+///
+/// `remaining` is the echoed budget the refusal being built has left, spent by the clause
+/// path and the echoed value together.
+fn inline_override_violation(
+    entity: &str,
+    treatment: &str,
+    remaining: &mut usize,
+) -> Option<Violation> {
     let length = entity.chars().count();
     let kind = if length < MIN_ENTITY_ID_LENGTH {
         ViolationKind::MinLength(MIN_ENTITY_ID_LENGTH as i64)
@@ -561,17 +596,17 @@ fn inline_override_violation(entity: &str, treatment: &str) -> Option<Violation>
         ViolationKind::MaxLength(MAX_ENTITY_ID_LENGTH as i64)
     } else if !matches_treatment_key_pattern(treatment) {
         return Some(Violation {
-            path: inline_override_entry_path(entity),
+            path: inline_override_entry_path(entity, remaining),
             kind: ViolationKind::Pattern(TREATMENT_KEY_PATTERN.to_string()),
-            value: Some(echoed(treatment)),
+            value: Some(echoed_within(treatment, remaining)),
         });
     } else {
         return None;
     };
     Some(Violation {
-        path: inline_override_entry_path(entity),
+        path: inline_override_entry_path(entity, remaining),
         kind,
-        value: Some(echoed(entity)),
+        value: Some(echoed_within(entity, remaining)),
     })
 }
 
@@ -609,13 +644,17 @@ pub fn treatment_overrides_rejection(overrides: &TreatmentOverrides) -> Option<S
                 }]
             } else {
                 // Then the entries, by entity id, so one request is refused with one
-                // sentence however the map happened to iterate.
+                // sentence however the map happened to iterate. The echoed budget is the
+                // whole refusal's, spent across the entries in that order, so a request
+                // breaking the rule in many entries at once cannot size the sentence by
+                // how many it broke.
                 let mut entries: Vec<(&String, &String)> = assignments.iter().collect();
                 entries.sort_by(|left, right| left.0.cmp(right.0));
+                let mut remaining = MAX_ECHOED_MESSAGE_BYTES;
                 entries
                     .into_iter()
                     .filter_map(|(entity, treatment)| {
-                        inline_override_violation(entity, treatment)
+                        inline_override_violation(entity, treatment, &mut remaining)
                     })
                     .collect()
             }
@@ -2758,10 +2797,15 @@ pub fn extension_not_found() -> String {
 
 /// `Message` for a `ResourceArn` that addresses no resource this service holds — the
 /// identifier the tagging operations scope their lookup with.
+///
+/// The label this kind's template spells its identifier with is the initialism `ARN`, in
+/// upper case, as the recorded refusals of the tagging operations carry it — a label is
+/// the token that kind's own message uses and is not derived from the member name
+/// (`ResourceArn`) by re-casing it.
 pub fn resource_arn_not_found(resource_arn: &str) -> String {
     not_found_message(
         "Resource",
-        &[("Arn", resource_arn)],
+        &[("ARN", resource_arn)],
         AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
     )
@@ -2842,11 +2886,22 @@ pub fn configuration_profile_still_has_hosted_versions(configuration_profile_id:
 
 /// `Message` for a `NextToken` the listing being called did not mint.
 ///
+/// AppConfig's template for a cursor it will not resume is built from the request: the
+/// fixed sentence `Invalid nextToken parameter ` — the member spelled as the paginated
+/// trait names it, in lowerCamel — followed by the token the call submitted, echoed as
+/// sent, and a full stop. The same sentence for every listing: one rule, so one wording.
+///
 /// [`paginate`] owns the cursor rule for every listing this service serves, so the
 /// sentence that reports a token it will not resume lives here beside it rather than once
-/// per `List*` handler.
-pub fn next_token_not_issued() -> String {
-    "NextToken is not a pagination token this operation issued.".to_string()
+/// per `List*` handler, and only [`paginate`] renders it — a caller is handed the message
+/// with the token already in it.
+///
+/// The token is echoed through [`echoed`], so the sentence stays bounded whatever a
+/// listing's own `NextToken` member declares: every one of them is `length 1..2048` today,
+/// which the schema walk enforces before any handler runs, but the bound on the sentence
+/// does not depend on that staying true.
+fn next_token_not_issued(submitted: &str) -> String {
+    format!("Invalid nextToken parameter {}.", echoed(submitted))
 }
 
 // =============================================================================
@@ -2867,6 +2922,32 @@ pub fn environment_not_ready_for_deployment(environment_id: &str, state: &str) -
     format!(
         "Environment {environment_id} currently has a state of {state}. The current deployment \
          must finish before a new deployment can be started."
+    )
+}
+
+/// `Message` for a `CreateHostedConfigurationVersion` refused by its optimistic lock: the
+/// `LatestVersionNumber` the request named is not the version the profile currently holds.
+///
+/// The sentence is built from the two version numbers alone — the one the request EXPECTED
+/// and the one that is ACTUALLY latest — and names neither the application nor the profile:
+/// `Expected latest version <expected> does not match actual latest version <actual>`, with
+/// no trailing full stop. A caller comparing the two decides between re-reading and
+/// retrying; nothing of any one request is stored here.
+pub fn hosted_configuration_version_stale_lock(expected: i32, actual: i32) -> String {
+    format!("Expected latest version {expected} does not match actual latest version {actual}")
+}
+
+/// `Message` for a create refused because the `Name` it asks for already addresses another
+/// experiment definition under the same application.
+///
+/// Built from the request alone: the submitted `Name`, SINGLE-QUOTED, and the id of the
+/// application the create was scoped to, with no trailing full stop. The colliding
+/// definition is NOT disclosed — neither its id nor its status is part of this refusal — so
+/// a caller learns that the name is taken and nothing about the resource holding it.
+pub fn experiment_definition_name_taken(name: &str, application_id: &str) -> String {
+    format!(
+        "Experiment definition with name '{name}' already exists for application \
+         {application_id}"
     )
 }
 
@@ -4026,18 +4107,20 @@ fn decode_cursor(kind: &str, token: &str) -> Option<String> {
 /// ascending key order — into the page that resumes at `next_token` and carries at most
 /// `max_results` items.
 ///
-/// `None` means `next_token` is not a token this service minted for `kind`, which the
-/// calling operation refuses with the error it models for a bad request. Keying the
-/// cursor on an item's own key rather than on an offset is what makes a walk stable:
-/// an item created or deleted between two calls shifts no later page.
+/// `Err` is the `Message` the calling operation refuses the request with — the one
+/// sentence AppConfig words a cursor it will not resume in ([`next_token_not_issued`]),
+/// rendered here from the token the caller submitted, so every listing of this service
+/// states it identically and no handler writes a sentence of its own. Keying the cursor on
+/// an item's own key rather than on an offset is what makes a walk stable: an item created
+/// or deleted between two calls shifts no later page.
 pub fn paginate<T>(
     ordered: Vec<(String, T)>,
     kind: &str,
     next_token: Option<&str>,
     max_results: Option<i32>,
-) -> Option<Page<T>> {
+) -> Result<Page<T>, String> {
     let resume_at = match next_token {
-        Some(token) => Some(decode_cursor(kind, token)?),
+        Some(token) => Some(decode_cursor(kind, token).ok_or_else(|| next_token_not_issued(token))?),
         None => None,
     };
     // `MaxResults` is a maximum, not a demand. The modelled range (1..50) is enforced
@@ -4060,7 +4143,7 @@ pub fn paginate<T>(
         .take(page_size)
         .map(|(_, item)| item)
         .collect();
-    Some(Page {
+    Ok(Page {
         next_token: remaining.next().map(|(key, _)| encode_cursor(kind, &key)),
         items,
     })
