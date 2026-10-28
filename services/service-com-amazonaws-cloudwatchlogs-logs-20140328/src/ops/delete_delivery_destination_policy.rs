@@ -160,9 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Deleting a policy names the destination it was assigned to and nothing else; `ctx`
-        // carries only request metadata, which takes no part in identifying it.
-        let _ = ctx;
+        // Deleting a policy names the destination it was assigned to and nothing else; that
+        // destination is a regional resource, so it is the one the Region this request was
+        // signed for holds under that name.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteDeliveryDestinationPolicyError::from(
@@ -175,12 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The policy is assigned TO a delivery destination, so a name this account holds no
+        // The policy is assigned TO a delivery destination, so a name this Region holds no
         // destination under names no resource to delete a policy from — the refusal the
         // assignment and the report of this same policy answer such a name with.
-        let Some(destination) = store
-            .delivery_destinations
-            .get_mut(&input.delivery_destination_name)
+        let Some(destination) =
+            store.delivery_destination_mut(&region, &input.delivery_destination_name)
         else {
             return Err(
                 DeleteDeliveryDestinationPolicyErrorModeled::ResourceNotFoundException(

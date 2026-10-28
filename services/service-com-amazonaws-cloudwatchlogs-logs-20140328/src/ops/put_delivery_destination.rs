@@ -265,9 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // A put under a name already stored UPDATES that destination, so only a put that
-        // would ADD one can exceed the number this emulator holds.
-        if !store.delivery_destinations.contains_key(&input.name)
+        // A put under a name the Region already holds UPDATES that destination, so only a put
+        // that would ADD one can exceed the number this emulator holds.
+        if store.delivery_destination(&region, &input.name).is_none()
             && store.delivery_destinations.len() >= crate::state::MAX_DELIVERY_DESTINATIONS
         {
             return Err(
@@ -313,8 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             None => store
-                .delivery_destinations
-                .get(&input.name)
+                .delivery_destination(&region, &input.name)
                 .map(|stored| stored.tags.clone())
                 .unwrap_or_default(),
         };
@@ -323,18 +322,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed by `DeleteDeliveryDestinationPolicy`, so a put that updates this
         // destination's parameters leaves the policy it was assigned in place.
         record.policy = store
-            .delivery_destinations
-            .get(&input.name)
+            .delivery_destination(&region, &input.name)
             .and_then(|stored| stored.policy.clone());
-        store.delivery_destinations.insert(input.name.clone(), record);
+        // A delivery destination belongs to the Region its put was signed for: the same name in
+        // another Region is another destination, which this one neither reads nor overwrites.
+        store.delivery_destinations.insert(
+            crate::state::RegionalKey::new(&region, &input.name),
+            record,
+        );
 
         Ok(PutDeliveryDestinationOutput {
             // "A structure containing information about the delivery destination that you
             // just created or updated" — read back out of the store, so what this call
             // reports is what `GetDeliveryDestination` reports afterwards.
             delivery_destination: store
-                .delivery_destinations
-                .get(&input.name)
+                .delivery_destination(&region, &input.name)
                 .map(crate::state::DeliveryDestinationRecord::reported),
         })
     }

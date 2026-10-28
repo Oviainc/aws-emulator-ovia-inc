@@ -3170,6 +3170,9 @@ pub enum TaggedResource {
     ConfigurationTemplate(String, String),
     /// An environment, by `EnvironmentId`.
     Environment(String),
+    /// A custom platform version, by its `PlatformArn` — the key
+    /// [`ServiceState::platform_versions`] holds it under.
+    PlatformVersion(String),
 }
 
 /// Why a `ResourceArn` resolves to no taggable resource in this store. Each
@@ -6911,13 +6914,16 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     ///
     /// The ARN forms are this service's own ([`application_arn`],
     /// [`application_version_arn`], [`configuration_template_arn`],
-    /// [`environment_arn`]), so the same ARN a
+    /// [`environment_arn`], [`platform_version_arn`]), so the same ARN a
     /// create answered with resolves back to the record it minted. The resource
     /// path after the type is matched against the names the store HOLDS rather
     /// than split on `/`, because an application name, a version label and an
     /// environment name may each contain that character, which would otherwise
     /// make the ARN of a stored resource unresolvable. A terminated environment
     /// is not resolved: its resources are gone, so there is nothing left to tag.
+    /// A platform version is the one record this store keys by its WHOLE ARN, so
+    /// that is what resolves it, which is also how `DescribePlatformVersion`
+    /// reads one.
     pub fn resolve_tagged_resource(
         &self,
         arn: &str,
@@ -6970,6 +6976,15 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
                     TaggedResource::Environment(environment.environment_id.clone())
                 })
                 .ok_or(ResourceArnRefusal::NotFound),
+            // A custom platform version is named by its whole `PlatformArn`,
+            // which is the key this store holds it under — the same lookup
+            // `DescribePlatformVersion` does — so the ARN the create answered
+            // with resolves back to the record it minted, carrying the tags that
+            // create applied to it, and the same name and version under another
+            // Region's ARN names another resource.
+            "platform" if self.platform_versions.contains_key(arn) => {
+                Ok(TaggedResource::PlatformVersion(arn.to_string()))
+            }
             // A taggable type whose record this store does not hold: the ARN is
             // this service's and its type is one Elastic Beanstalk tags, so what
             // is missing is the resource.
@@ -6997,6 +7012,9 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             TaggedResource::Environment(environment_id) => {
                 self.environments.get(environment_id).map(|record| &record.tags)
             }
+            TaggedResource::PlatformVersion(platform_arn) => {
+                self.platform_versions.get(platform_arn).map(|record| &record.tags)
+            }
         }
     }
 
@@ -7017,6 +7035,10 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             TaggedResource::Environment(environment_id) => self
                 .environments
                 .get_mut(environment_id)
+                .map(|record| &mut record.tags),
+            TaggedResource::PlatformVersion(platform_arn) => self
+                .platform_versions
+                .get_mut(platform_arn)
                 .map(|record| &mut record.tags),
         }
     }

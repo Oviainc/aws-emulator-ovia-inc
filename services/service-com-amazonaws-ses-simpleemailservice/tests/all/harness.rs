@@ -173,3 +173,15 @@ pub fn xml_text(data: &str) -> String {
         .replace("&gt;", ">")
         .replace("&amp;", "&")
 }
+
+/// The `<Code>` and `<Message>` of an awsQuery `<ErrorResponse>` envelope, with
+/// the message's escaped entities read back ([`xml_text`]).
+///
+/// Here rather than in one suite because every suite that asserts a refusal
+/// reads the same two elements out of the same envelope.
+pub fn error_envelope(body: &str) -> (Option<String>, Option<String>) {
+    (
+        element(body, "Code"),
+        element(body, "Message").map(|text| xml_text(&text)),
+    )
+}

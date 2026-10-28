@@ -220,14 +220,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A delivery pairs "a logical delivery source and a logical delivery destination that
         // you have already created", so BOTH have to be in the account before this call can
-        // connect them. The source is checked first, in the order the request names them.
-        if !store.delivery_sources.contains_key(&input.delivery_source_name) {
+        // connect them. Both are regional resources, so both are looked for in the Region this
+        // create was signed for. The source is checked first, in the order the request names
+        // them.
+        if store
+            .delivery_source(&region, &input.delivery_source_name)
+            .is_none()
+        {
             return Err(not_found(
                 crate::state::DELIVERY_SOURCE_NOT_FOUND_MESSAGE,
             ));
         }
         if store
-            .delivery_destination_by_arn(&input.delivery_destination_arn)
+            .delivery_destination_by_arn(&region, &input.delivery_destination_arn)
             .is_none()
         {
             return Err(not_found(
@@ -239,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // DESTINATION, which carries it, rather than about the logical destination's own ARN
         // — so it is read off the stored destination.
         let delivery_destination_type = store
-            .delivery_destination_by_arn(&input.delivery_destination_arn)
+            .delivery_destination_by_arn(&region, &input.delivery_destination_arn)
             .and_then(|destination| destination.delivery_destination_type.clone());
 
         // "Use CreateDelivery to create a delivery by pairing exactly one delivery source and
@@ -251,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changed by `UpdateDeliveryConfiguration`, which is why this call leaves the stored
         // record alone. `ConflictException` stays for the creates whose identity is a
         // caller-chosen name already held by a DIFFERENT resource.
-        if let Some(existing) = store.deliveries.values().find(|delivery| {
+        if let Some(existing) = store.deliveries_in(&region).find(|delivery| {
             delivery.delivery_source_name == input.delivery_source_name
                 && delivery.delivery_destination_arn == input.delivery_destination_arn
         }) {
@@ -297,15 +302,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             })
             .unwrap_or_default();
-        store.deliveries.insert(id.clone(), record);
+        store
+            .deliveries
+            .insert(crate::state::RegionalKey::new(&region, &id), record);
 
         Ok(CreateDeliveryOutput {
             // "A structure that contains information about the delivery that you just
             // created" — read back out of the store, so what this call reports is what
             // `GetDelivery` and `DescribeDeliveries` report afterwards.
             delivery: store
-                .deliveries
-                .get(&id)
+                .delivery(&region, &id)
                 .map(crate::state::DeliveryRecord::reported),
         })
     }

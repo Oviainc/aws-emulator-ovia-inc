@@ -91,7 +91,9 @@
 //! to date. `ListMessageMoveTasks` reports those records through
 //! [`ComAmazonawsSqsAmazonsqsState::reported_message_move_tasks`], which projects the
 //! wire entry from the record and the clock exactly as
-//! [`Queue::reported_attributes`] projects a queue's attributes.
+//! [`Queue::reported_attributes`] projects a queue's attributes — including which of that
+//! entry's members are populated at all, each one only in the condition the member is
+//! documented for.
 //!
 //! `CancelMessageMoveTask` stops such a task through
 //! [`ComAmazonawsSqsAmazonsqsState::cancel_message_move_task`]: the messages whose
@@ -2493,9 +2495,17 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// and the moved count are functions of the record and the clock, the to-move count
     /// is the size the task was started over, and each ARN is the one the queue record
     /// itself reports, so two readers cannot disagree about a task and nothing stores a
-    /// progress value it would have to keep up to date. `FailureReason` is left unset
-    /// because no task this store records can fail: it takes its messages when it starts,
-    /// and a status it never reaches owes no reason.
+    /// progress value it would have to keep up to date.
+    ///
+    /// A member the entry populates only in a stated condition is populated in THAT
+    /// condition and absent otherwise, so a reader can tell the condition from the reply:
+    /// `TaskHandle` "is only populated for tasks that are in RUNNING status",
+    /// `DestinationArn` is "the ARN of the destination queue IF IT HAS BEEN SPECIFIED in
+    /// the StartMessageMoveTask request" and is NULL when the request specified none,
+    /// `MaxNumberOfMessagesPerSecond` likewise carries only a rate the request fixed, and
+    /// `FailureReason` is "only included if the task status is FAILED" — which no task this
+    /// store records reaches, because it takes its messages when it starts, so a status it
+    /// never reaches owes no reason.
     pub fn reported_message_move_tasks(
         &self,
         region: &str,
@@ -2510,20 +2520,24 @@ impl ComAmazonawsSqsAmazonsqsState {
             .rev()
             .filter(|task| task.region == region && task.source_queue_name == source_queue_name)
             .take(max_results)
-            .map(|task| ListMessageMoveTasksResultEntry {
-                task_handle: Some(task.task_handle.clone()),
-                status: Some(task.status(now).to_string()),
-                source_arn: Some(self.reported_queue_arn(region, &task.source_queue_name)),
-                destination_arn: Some(
-                    self.reported_queue_arn(region, &task.destination_queue_name),
-                ),
-                max_number_of_messages_per_second: task.max_number_of_messages_per_second,
-                approximate_number_of_messages_moved: count_as_i64(task.messages_moved(now)),
-                approximate_number_of_messages_to_move: Some(count_as_i64(
-                    task.messages_to_move(),
-                )),
-                failure_reason: None,
-                started_timestamp: epoch_millis_number(task.started_at),
+            .map(|task| {
+                let status = task.status(now);
+                ListMessageMoveTasksResultEntry {
+                    task_handle: (status == MESSAGE_MOVE_RUNNING)
+                        .then(|| task.task_handle.clone()),
+                    status: Some(status.to_string()),
+                    source_arn: Some(self.reported_queue_arn(region, &task.source_queue_name)),
+                    destination_arn: task.destination_specified.then(|| {
+                        self.reported_queue_arn(region, &task.destination_queue_name)
+                    }),
+                    max_number_of_messages_per_second: task.max_number_of_messages_per_second,
+                    approximate_number_of_messages_moved: count_as_i64(task.messages_moved(now)),
+                    approximate_number_of_messages_to_move: Some(count_as_i64(
+                        task.messages_to_move(),
+                    )),
+                    failure_reason: None,
+                    started_timestamp: epoch_millis_number(task.started_at),
+                }
             })
             .collect()
     }
@@ -2649,6 +2663,10 @@ pub struct MessageMoveTask {
     pub source_queue_name: String,
     /// The name of the queue they are being delivered to.
     pub destination_queue_name: String,
+    /// Whether the start call SPECIFIED that destination, rather than leaving the field
+    /// blank for the messages to be "redriven back to their respective original source
+    /// queues": a reader reports `DestinationArn` only for a task whose request named one.
+    pub destination_specified: bool,
     /// The message movement rate the caller fixed, or `None` when it left the rate to
     /// the service ("the system will optimize the rate based on the queue message
     /// backlog size").

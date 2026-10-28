@@ -99,6 +99,8 @@ mod list_identity_providers;
 mod list_resource_servers;
 #[path = "all/list_terms.rs"]
 mod list_terms;
+#[path = "all/list_user_pool_client_secrets.rs"]
+mod list_user_pool_client_secrets;
 #[path = "all/list_user_pool_clients.rs"]
 mod list_user_pool_clients;
 #[path = "all/list_user_pools.rs"]

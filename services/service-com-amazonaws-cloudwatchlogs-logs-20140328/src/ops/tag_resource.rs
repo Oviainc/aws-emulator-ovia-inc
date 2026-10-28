@@ -171,9 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Tagging names its target by ARN alone, so nothing here is read off the request
-        // metadata `ctx` carries.
-        let _ = ctx;
+        // The ARN names the resource, and the Region the request was signed for is which
+        // Region's resources this endpoint serves: the vended-delivery resources belong to the
+        // Region they were created in, so a tag write reaches that Region's own records.
+        let region = crate::state::request_region(ctx.parts());
 
         // "A parameter is specified incorrectly" — this operation's refusal for a
         // `resourceArn` the service cannot make a tagging target of.
@@ -216,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        let Some(stored) = store.resource_tags_mut(&resource) else {
+        let Some(stored) = store.resource_tags_mut(&region, &resource) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(resource.kind())),

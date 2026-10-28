@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSecurityGroupsForVpc
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSecurityGroupsForVpc`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSecurityGroupsForVpc::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the security groups that can be used by a network interface in ONE VPC out of
+//! [`crate::state`]: the groups created IN that VPC, plus the groups of another VPC that
+//! `AssociateSecurityGroupVpc` has made usable in it, one `MaxResults`-sized page at a
+//! time and narrowed by whatever `Filters` the request carries. A reporting operation —
+//! the only thing it writes is what was already owed at the instant it was called: the
+//! ambient default network the account holds in the Region the request is signed for
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::ensure_default_network`], which is
+//! idempotent per Region).
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +80,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MAX_PAGE_SIZE, MatchBudget,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -147,18 +154,276 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSecurityGroupsForVpc` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSecurityGroupsForVpcErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region this request was signed for: the VPC the request names is a resource
+        // of the Region the caller is asking in, and that Region is what says which ambient
+        // default network the account already holds (see below).
+        let region = crate::state::request_region(ctx.parts());
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`GetSecurityGroupsForVpcRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request"
+        // (`GetSecurityGroupsForVpcRequest$NextToken`) — anything else is refused rather
+        // than read as an id, and it is refused before any other member is looked at, so
+        // whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x candidate groups, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to
+        // it is done and before the store is locked — the same ceilings
+        // `DescribeSecurityGroups` enforces, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // group would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate group.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                crate::state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        let mut store = state.lock();
+
+        // The ambient default network of the Region this request is signed for: the account
+        // already has a default VPC "in each AWS Region" and it "automatically comes with a
+        // default security group" (Amazon VPC User Guide, "Default VPCs"), so both are
+        // already the account's whatever it has created. The call is idempotent per Region
+        // and materialises what has been owed since the account existed rather than
+        // anything this read created, so it changes nothing a later caller would not have
+        // seen anyway.
+        store.ensure_default_network(&region);
+
+        // "The VPC ID where the security group can be used"
+        // (`GetSecurityGroupsForVpcRequest$VpcId`, required): a VPC the account does not
+        // have is an error, not an empty report — which would read as "this VPC has no
+        // usable group".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSecurityGroupsForVpc"))
+        // ONE refusal for every value this operation cannot resolve, whatever the value's
+        // SHAPE ([`crate::state::invalid_vpc_id_malformed`]): the recorded refusal of THIS
+        // operation carries `InvalidVpcId.Malformed` and that function's sentence for a
+        // WELL-FORMED VPC id the account holds no VPC for, so the `.NotFound` the surfaces
+        // that read a `VpcId` as one parameter among several answer
+        // ([`crate::state::invalid_vpc_id_not_found`], which `DescribeStaleSecurityGroups`
+        // keeps) is not this operation's answer. WHICH refusal an unresolvable `VpcId` gets
+        // is a fact of the operation rather than of the value — the same split
+        // `CreateCarrierGateway` records for its own `VpcId`.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(crate::state::invalid_vpc_id_malformed(&input.vpc_id));
+        }
+
+        // "Gets security groups that can be associated by the Amazon Web Services account
+        // making the request with network interfaces in the specified VPC"
+        // (`GetSecurityGroupsForVpc`): a group can be used by an interface in a VPC when it
+        // was created in that VPC, or when `AssociateSecurityGroupVpc` has associated it
+        // with that VPC and the association has reached `associated` — which is why the
+        // report names each group's `PrimaryVpcId`, "the VPC ID in which the security group
+        // was created" (`SecurityGroupForVpc$PrimaryVpcId`), rather than the VPC asked
+        // about. An association the clock has not established yet carries nothing, so the
+        // group it names is not usable in the VPC yet either.
+        //
+        // Every comparison is charged to ONE budget, so the product of candidate groups,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the store's lock.
+        let now = ::std::time::Instant::now();
+        let usable: std::collections::BTreeSet<String> = store
+            .security_group_vpc_associations
+            .iter()
+            .filter(|((_, vpc_id), record)| {
+                vpc_id.as_str() == input.vpc_id
+                    && record.state_at(now)
+                        == crate::state::SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED
+            })
+            .map(|((group_id, _), _)| group_id.clone())
+            .collect();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<SecurityGroupForVpc> = Vec::new();
+        for group in store.security_groups.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let created_here = group.vpc_id.as_deref() == Some(input.vpc_id.as_str());
+            let associated = group
+                .group_id
+                .as_deref()
+                .is_some_and(|group_id| usable.contains(group_id));
+            if !created_here && !associated {
+                continue;
+            }
+            let reported = security_group_for_vpc(group);
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(&reported, name)
+            }) {
+                selected.push(reported);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so. Paging is NOT the remedy — the filters are evaluated in full before
+        // `MaxResults` cuts the page — so the refusal names the one thing that does reduce
+        // the comparisons: fewer filters and fewer values.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them by naming fewer filters or fewer \
+                     values"
+                ),
+            ));
+        }
+
+        // Page in `GroupId` order, which the cursor below names a position in. The store is
+        // an ordered map keyed by that id, so a group created in the VPC is already in this
+        // order; a group reached through an association is not, so the sort is what makes
+        // the one order the cursor depends on hold for both.
+        selected.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+
+        // "The maximum number of items to return for this request. To get the next page of
+        // items, make another request with the token returned in the output"
+        // (`GetSecurityGroupsForVpcRequest$MaxResults`). A request that names no page size
+        // gets the documented maximum rather than the whole store — the same default every
+        // other paginated read of this crate applies ([`MAX_PAGE_SIZE`]); the rest follow
+        // through `NextToken`, so nothing is withheld. The model's `range 5..1000` has
+        // already refused anything outside it, so the only value that cannot convert is one
+        // the boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE);
+
+        // The page and the token that follows it, through the one definition of EC2 paging
+        // ([`crate::state::page_from_cursor`]). "This value is null when there are no more
+        // items to return" (`GetSecurityGroupsForVpcResult$NextToken`): a token only when a
+        // group follows this page, which is what that sentence reads as on its own.
+        let (page, next_token) = crate::state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            Some(limit),
+            crate::state::PageTokenRule::WhenAnotherItemFollows,
+            |group| group.group_id.as_deref().unwrap_or_default(),
+        );
+
+        Ok(GetSecurityGroupsForVpcOutput {
+            security_group_for_vpcs: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// One stored security group as THIS operation reports it: "a security group that can be
+/// used by interfaces in the VPC" (`SecurityGroupForVpc`).
+///
+/// Every member is copied from the stored group rather than rebuilt, so this operation and
+/// `DescribeSecurityGroups` cannot report one group differently — including
+/// `PrimaryVpcId`, "the VPC ID in which the security group was created"
+/// (`SecurityGroupForVpc$PrimaryVpcId`), which is the group's own `VpcId` and so names the
+/// VPC the request asked about only for a group created in it.
+fn security_group_for_vpc(group: &SecurityGroup) -> SecurityGroupForVpc {
+    SecurityGroupForVpc {
+        description: group.description.clone(),
+        group_name: group.group_name.clone(),
+        owner_id: group.owner_id.clone(),
+        group_id: group.group_id.clone(),
+        tags: group.tags.clone(),
+        primary_vpc_id: group.vpc_id.clone(),
+    }
+}
+
+/// The filter names this operation documents, from
+/// `GetSecurityGroupsForVpcRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="GetSecurityGroupsForVpcRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// That doc publishes no `tag:` filter for this operation, so the catalog is closed and
+/// every entry must be answered by [`filter_values`].
+const SECURITY_GROUP_FOR_VPC_FILTERS: [&str; 5] = [
+    "description",
+    "group-id",
+    "group-name",
+    "owner-id",
+    "primary-vpc-id",
+];
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact. This
+/// operation's `Filters` doc publishes no alternative spellings.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    SECURITY_GROUP_FOR_VPC_FILTERS.contains(&name).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against one reported group.
+///
+/// A filter naming an attribute the group does not carry compares against NO values, so it
+/// selects nothing. `name` is a name [`canonical_filter_name`] resolved, and the values are
+/// read off the REPORTED shape, so a filter can never select on something the response does
+/// not carry.
+fn filter_values<'a>(group: &'a SecurityGroupForVpc, name: &str) -> Vec<Cow<'a, str>> {
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "description" => text(group.description.as_deref()),
+        "group-id" => text(group.group_id.as_deref()),
+        "group-name" => text(group.group_name.as_deref()),
+        "owner-id" => text(group.owner_id.as_deref()),
+        "primary-vpc-id" => text(group.primary_vpc_id.as_deref()),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+// The AND/OR evaluation of this operation's filters, and the budget that bounds it, live
+// in `crate::state::matches_every_filter`, which every filtered read of this crate shares;
+// only `filter_values` — what THIS report holds for a filter name — is this operation's own.

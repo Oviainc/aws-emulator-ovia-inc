@@ -42,9 +42,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use crate::ops::types::{
     AsyncInvokeOutputDataConfig, CacheDetail, CachePointBlock, CitationGeneratedContent,
     CitationSourceContent, ContentBlock, DocumentBlock, DocumentContentBlock, DocumentSource,
-    GuardrailConverseContentBlock, Message, ReasoningContentBlock, SearchResultBlock,
-    SystemContentBlock, Tag, TokenUsage, Tool, ToolChoice, ToolConfiguration, ToolInputSchema,
-    ToolReference, ToolResultContentBlock, ToolUseBlock,
+    GuardrailConverseContentBlock, InferenceConfiguration, Message, ReasoningContentBlock,
+    SearchResultBlock, SystemContentBlock, Tag, TokenUsage, Tool, ToolChoice, ToolConfiguration,
+    ToolInputSchema, ToolReference, ToolResultContentBlock, ToolUseBlock,
 };
 
 /// The `AWS/Bedrock` metric data a served inference publishes, beside the
@@ -2304,7 +2304,9 @@ pub struct ConverseTurn {
     /// cacheable prefix at all.
     pub cache: Option<PromptCacheOutcome>,
     /// Whether the generation cap cut the text short, which is what makes the
-    /// turn stop on `max_tokens` instead of `end_turn`.
+    /// turn stop on `max_tokens` instead of `end_turn`. A turn whose text halted
+    /// at a configured stop sequence ended on that sequence rather than at the
+    /// cap, so this is `false` for it.
     pub truncated: bool,
 }
 
@@ -2367,6 +2369,39 @@ impl ConverseTurn {
     }
 }
 
+/// The base inference parameters one Converse-API request configures, as
+/// [`converse_turn`] reads them off `InferenceConfiguration`: the generation
+/// ceiling and the stop sequences that halt generation.
+///
+/// `Converse` and `ConverseStream` bind the SAME `InferenceConfiguration`, so
+/// both read their parameters through [`Self::of`] and neither can honour one
+/// member the other drops. `temperature` and `topP` steer which tokens a model
+/// would pick, which no model picks here, so they bound nothing about the text
+/// that is served.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnInference<'a> {
+    /// `inferenceConfig.maxTokens`: the maximum number of tokens to allow in the
+    /// generated response.
+    pub max_tokens: Option<i32>,
+    /// `inferenceConfig.stopSequences`: the sequences whose first completed
+    /// occurrence halts generation.
+    pub stop_sequences: &'a [String],
+}
+
+impl<'a> TurnInference<'a> {
+    /// The parameters a request's own `inferenceConfig` configures; a request
+    /// that carries none configures none of them.
+    pub fn of(config: Option<&'a InferenceConfiguration>) -> Self {
+        Self {
+            max_tokens: config.and_then(|config| config.max_tokens),
+            stop_sequences: config
+                .and_then(|config| config.stop_sequences.as_ref())
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// Serve one Converse-API turn from the request that was actually supplied.
 ///
 /// `Converse` and `ConverseStream` both call this, so the content, the stop
@@ -2380,10 +2415,12 @@ impl ConverseTurn {
 /// answers is that one content block and the tokens it reports for its output
 /// are that block's.
 ///
-/// `requested_max_tokens` is `inferenceConfig.maxTokens`; the model's own ceiling
-/// caps it, and the completion is composed to FIT that budget
-/// ([`emulated_completion`]) — only a budget it cannot fit in at all cuts the
-/// turn short.
+/// `inference` is the request's own `inferenceConfig`, read through
+/// [`TurnInference`]: the model's ceiling caps `maxTokens` and the completion is
+/// composed to FIT that budget ([`emulated_completion`]) — only a budget it
+/// cannot fit in at all cuts the turn short — and the text halts where the first
+/// of `stopSequences` completes, so a configured stop sequence is the last thing
+/// the turn serves however much budget is left.
 ///
 /// `cache` is the prompt-cache stage's outcome
 /// ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::apply_prompt_cache`]):
@@ -2395,7 +2432,7 @@ pub fn converse_turn(
     system: Option<&Vec<SystemContentBlock>>,
     messages: Option<&Vec<Message>>,
     tool_config: Option<&ToolConfiguration>,
-    requested_max_tokens: Option<i32>,
+    inference: TurnInference<'_>,
     tool_use: Option<ToolUseBlock>,
     cache: Option<PromptCacheOutcome>,
 ) -> ConverseTurn {
@@ -2414,7 +2451,8 @@ pub fn converse_turn(
             truncated: false,
         };
     }
-    let max_output_tokens = requested_max_tokens
+    let max_output_tokens = inference
+        .max_tokens
         .and_then(|max| u32::try_from(max).ok())
         .unwrap_or(model.max_output_tokens)
         .min(model.max_output_tokens);
@@ -2424,6 +2462,7 @@ pub fn converse_turn(
         u32::try_from(turns).unwrap_or(u32::MAX),
         input_tokens,
         max_output_tokens,
+        inference.stop_sequences,
     );
     let output_tokens = count_text_tokens(&completion.text);
     ConverseTurn {
@@ -2532,6 +2571,44 @@ pub fn body_max_tokens(family: ModelFamily, body: &serde_json::Value) -> Option<
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value > 0)
+}
+
+/// The stop sequences a request body of each family configures, in the order the
+/// body lists them.
+///
+/// Source: the per-family request formats in "Inference request parameters and
+/// response fields for foundation models" (Amazon Bedrock User Guide) —
+/// Anthropic's `stop_sequences`, Titan's `textGenerationConfig.stopSequences`,
+/// Nova's `inferenceConfig.stopSequences`, Mistral's `stop` and Cohere's
+/// `stop_sequences`. Llama's request format documents no stop-sequence
+/// parameter, so a Llama body configures none. A sequence has to be a non-empty
+/// string to stop anything, which is also what the Converse API's own
+/// `NonEmptyStringList` requires of one.
+///
+/// The member is a list of sequences, and one sequence on its own is that list
+/// with a single entry: a body that binds a bare string configures that one
+/// sequence rather than none, since the halt a caller asked for cannot depend on
+/// which of the two spellings the body used.
+pub fn body_stop_sequences(family: ModelFamily, body: &serde_json::Value) -> Vec<String> {
+    let pointer = match family {
+        ModelFamily::AnthropicMessages => "/stop_sequences",
+        ModelFamily::TitanText => "/textGenerationConfig/stopSequences",
+        ModelFamily::Nova => "/inferenceConfig/stopSequences",
+        ModelFamily::Llama => return Vec::new(),
+        ModelFamily::Mistral => "/stop",
+        ModelFamily::CohereCommand => "/stop_sequences",
+    };
+    let configured = match body.pointer(pointer) {
+        Some(serde_json::Value::Array(sequences)) => sequences.as_slice(),
+        Some(sequence @ serde_json::Value::String(_)) => std::slice::from_ref(sequence),
+        _ => &[],
+    };
+    configured
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|sequence| !sequence.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The only body MIME type the invoke APIs accept: "The MIME type of the input
@@ -2672,7 +2749,20 @@ pub fn invoke_turn(model: &ModelEntry, family: ModelFamily, body: &[u8]) -> Invo
         .min(model.max_output_tokens);
 
     let input_tokens = body_input_tokens(body);
-    let completion = emulated_completion(&model.model_id, 1, input_tokens, max_output_tokens);
+    // The stop sequences the body carries for this family. Generation halts
+    // where the first of them completes, so the text the envelope and the
+    // streaming events carry ends with that sequence and nothing follows it.
+    let stop_sequences = parsed_body
+        .as_ref()
+        .map(|value| body_stop_sequences(family, value))
+        .unwrap_or_default();
+    let completion = emulated_completion(
+        &model.model_id,
+        1,
+        input_tokens,
+        max_output_tokens,
+        &stop_sequences,
+    );
     let text = completion.text;
     let truncated = completion.truncated;
     let output_tokens = count_text_tokens(&text);
@@ -3349,7 +3439,7 @@ pub struct EmulatedCompletion {
 }
 
 /// The completion a synchronous inference call answers with, composed to fit
-/// `max_output_tokens`.
+/// `max_output_tokens` and halted at the first stop sequence it carries.
 ///
 /// No language model runs in this emulator, so the text says so, and carries
 /// only facts about the request that was actually served: how many messages it
@@ -3362,17 +3452,31 @@ pub struct EmulatedCompletion {
 /// clauses are appended in order only while the next one still fits. Only a
 /// budget smaller than [`EMULATED_COMPLETION_FLOOR`] genuinely reaches the
 /// ceiling, and that completion is reported as cut off.
+///
+/// `stop_sequences` are the sequences the request configured, applied by
+/// [`halt_at_stop_sequence`]: generation ends where the first of them completes,
+/// so a halted completion is NOT one the ceiling cut off however little of the
+/// budget it used.
 pub fn emulated_completion(
     model_id: &str,
     messages: u32,
     input_tokens: u32,
     max_output_tokens: u32,
+    stop_sequences: &[String],
 ) -> EmulatedCompletion {
+    let halted = |text: String, truncated: bool| match halt_at_stop_sequence(&text, stop_sequences)
+    {
+        Some(text) => EmulatedCompletion {
+            text,
+            truncated: false,
+        },
+        None => EmulatedCompletion { text, truncated },
+    };
     if count_text_tokens(EMULATED_COMPLETION_FLOOR) > max_output_tokens {
-        return EmulatedCompletion {
-            text: truncate_to_tokens(EMULATED_COMPLETION_FLOOR, max_output_tokens),
-            truncated: true,
-        };
+        return halted(
+            truncate_to_tokens(EMULATED_COMPLETION_FLOOR, max_output_tokens),
+            true,
+        );
     }
     let mut text = EMULATED_COMPLETION_FLOOR.to_string();
     for clause in [
@@ -3387,16 +3491,41 @@ pub fn emulated_completion(
         }
         text = extended;
     }
-    EmulatedCompletion {
-        text,
-        truncated: false,
-    }
+    halted(text, false)
+}
+
+/// The completion `text` as a configured stop sequence halts it, or `None` when
+/// it carries none of them.
+///
+/// A stop sequence is "a sequence of characters that causes the model to stop
+/// generating the response" (`InferenceConfiguration.stopSequences`), so
+/// generation ends the moment one of them has been generated in full: the served
+/// text ends WITH that sequence and carries nothing after it, whatever
+/// generation budget is left over. Several configured sequences are one rule —
+/// generation stops at whichever of them completes first, which is the earliest
+/// offset any occurrence ends at.
+///
+/// Every inference surface that lets a request configure stop sequences reads
+/// this one function, so the text a halted turn serves is the same whether the
+/// sequences arrived in `inferenceConfig` or in a model family's own request
+/// body, and the streaming surfaces frame exactly the text their unary siblings
+/// return.
+pub fn halt_at_stop_sequence(text: &str, stop_sequences: &[String]) -> Option<String> {
+    stop_sequences
+        .iter()
+        .filter(|sequence| !sequence.is_empty())
+        .filter_map(|sequence| {
+            text.find(sequence.as_str())
+                .map(|at| at.saturating_add(sequence.len()))
+        })
+        .min()
+        .map(|end| text[..end].to_string())
 }
 
 /// The whole completion [`emulated_completion`] composes when no generation cap
-/// constrains it.
+/// and no stop sequence constrains it.
 pub fn emulated_completion_text(model_id: &str, messages: u32, input_tokens: u32) -> String {
-    emulated_completion(model_id, messages, input_tokens, u32::MAX).text
+    emulated_completion(model_id, messages, input_tokens, u32::MAX, &[]).text
 }
 
 /// The refusal message for an `InvokeModel` body that is not even a JSON object:

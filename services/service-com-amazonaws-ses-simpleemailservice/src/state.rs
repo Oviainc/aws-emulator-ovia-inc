@@ -1280,14 +1280,22 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// ([`Self::settle_identities`]), so what this reads is the verification the
     /// clock has carried through.
     pub fn is_verified_sender(&self, address: &str) -> bool {
-        let addr = addr_spec(address);
-        if self.is_verified(addr) {
-            return true;
-        }
-        let Some((_, domain)) = addr.split_once('@') else {
-            return false;
-        };
-        self.covers_verified_domain(domain)
+        sender_identity_names(address).any(|name| self.is_verified(name))
+    }
+
+    /// Whether this account HOLDS an identity for `address` — the addr-spec
+    /// itself, or any domain suffix of it — whatever verification state the
+    /// list holds for that identity.
+    ///
+    /// The weaker reading of a sender, and the one a request that only RECORDS
+    /// an address is read against: the account has asked SES about the address,
+    /// which a verification that has not completed is still evidence of, while
+    /// whether that verification succeeded is read where a message is actually
+    /// sent ([`Self::is_verified_sender`]). Both readings walk the same names
+    /// ([`sender_identity_names`]), so an identity for a domain covers the
+    /// mailboxes in it and in its subdomains here too.
+    pub fn holds_sending_identity(&self, address: &str) -> bool {
+        sender_identity_names(address).any(|name| self.identities.contains_key(name))
     }
 
     /// Whether `domain` is itself a verified domain identity, or sits under one.
@@ -1842,6 +1850,22 @@ fn domain_suffixes(domain: &str) -> impl Iterator<Item = &str> {
         .chain(labels)
         .filter(move |start| domain[*start..].contains('.'))
         .map(move |start| &domain[start..])
+}
+
+/// Every name an identity of this account could carry that would cover
+/// `address` as a sender: the addr-spec itself, then each domain suffix of its
+/// domain, longest first ([`domain_suffixes`]).
+///
+/// The ONE walk both readings of a sender use —
+/// [`ComAmazonawsSesSimpleemailserviceState::is_verified_sender`], which asks
+/// whether each name is a verified identity, and
+/// [`ComAmazonawsSesSimpleemailserviceState::holds_sending_identity`], which
+/// asks only whether the list holds it — so the two cannot drift apart over
+/// which names cover an address.
+fn sender_identity_names(address: &str) -> impl Iterator<Item = &str> {
+    let addr = addr_spec(address);
+    let domain = addr.split_once('@').map(|(_, domain)| domain);
+    std::iter::once(addr).chain(domain.into_iter().flat_map(domain_suffixes))
 }
 
 /// Whether `value` is an email address in the form SES requires.

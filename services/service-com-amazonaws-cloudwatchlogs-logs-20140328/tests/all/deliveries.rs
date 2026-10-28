@@ -35,7 +35,7 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::{
     S3DeliveryConfiguration, DELIVERY_DESTINATION_TYPE_VALUES,
 };
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
-    delivery_arn, ComAmazonawsCloudwatchlogsLogs20140328State, DeliveryRecord,
+    delivery_arn, ComAmazonawsCloudwatchlogsLogs20140328State, DeliveryRecord, RegionalKey,
 };
 
 use crate::harness::{Logs, REGION};
@@ -182,7 +182,9 @@ fn seed_store(logs: &Logs) {
             .into_iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
-        store.deliveries.insert(record.id.clone(), record);
+        store
+            .deliveries
+            .insert(RegionalKey::new(REGION, &record.id), record);
     }
 }
 
@@ -703,7 +705,11 @@ async fn reporting_changes_nothing_a_later_caller_sees() {
     let state = logs
         .engine()
         .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
-    let stored: Vec<String> = state.lock().deliveries.keys().cloned().collect();
+    let stored: Vec<String> = state
+        .lock()
+        .deliveries_in(REGION)
+        .map(|delivery| delivery.id.clone())
+        .collect();
     assert_eq!(
         stored,
         all_ids(),

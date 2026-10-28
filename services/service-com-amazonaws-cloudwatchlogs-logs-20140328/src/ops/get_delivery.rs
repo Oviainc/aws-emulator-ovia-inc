@@ -149,9 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; a delivery is identified by its own id and
-        // by nothing about the request.
-        let _ = ctx;
+        // A delivery is a regional resource, so the delivery this reports is the one the
+        // Region the request was signed for holds under that id.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetDeliveryError::from(GetDeliveryErrorModeled::ServiceUnavailableException(
@@ -162,9 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // "You need to specify the delivery id in this operation": an id this account holds
+        // "You need to specify the delivery id in this operation": an id this Region holds
         // no delivery under names no delivery, which is the modelled not-found refusal.
-        let Some(delivery) = store.deliveries.get(&input.id) else {
+        let Some(delivery) = store.delivery(&region, &input.id) else {
             return Err(GetDeliveryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::DELIVERY_NOT_FOUND_MESSAGE.to_string()),

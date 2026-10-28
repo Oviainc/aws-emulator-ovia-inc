@@ -221,17 +221,6 @@ impl From<CreateOriginEndpointErrorModeled> for CreateOriginEndpointError {
     }
 }
 
-/// How many manifests the request carries per family, in
-/// [`crate::state::ManifestFamily::ALL`] order.
-fn manifest_counts(input: &CreateOriginEndpointInput) -> [usize; 4] {
-    [
-        input.hls_manifests.as_ref().map_or(0, Vec::len),
-        input.low_latency_hls_manifests.as_ref().map_or(0, Vec::len),
-        input.dash_manifests.as_ref().map_or(0, Vec::len),
-        input.mss_manifests.as_ref().map_or(0, Vec::len),
-    ]
-}
-
 /// The response for a stored origin endpoint. Both the create and its idempotent replay
 /// answer from the SAME stored record through here.
 fn endpoint_output(
@@ -317,7 +306,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // as an unplayable URL.
         if let Some(violation) = crate::state::manifest_set_violation(
             &input.container_type,
-            manifest_counts(&input),
+            // The per-family counts are built by the ONE builder that owns the array's
+            // family order, beside the enum that declares it.
+            crate::state::manifest_counts(
+                input.hls_manifests.as_deref(),
+                input.low_latency_hls_manifests.as_deref(),
+                input.dash_manifests.as_deref(),
+                input.mss_manifests.as_deref(),
+            ),
             crate::state::ManifestSetOn::Create,
         ) {
             return Err(CreateOriginEndpointErrorModeled::ValidationException(
