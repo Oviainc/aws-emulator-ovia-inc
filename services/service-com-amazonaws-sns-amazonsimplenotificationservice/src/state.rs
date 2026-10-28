@@ -3238,6 +3238,68 @@ pub const ENDPOINT_ENABLED_ATTRIBUTE: &str = "Enabled";
 /// value [`PlatformEndpointRecord::token`] holds.
 pub const ENDPOINT_TOKEN_ATTRIBUTE: &str = "Token";
 
+/// The push service whose endpoints carry a channel and a user of their own: "When
+/// using CreatePlatformEndpoint with Baidu, two attributes must be provided: ChannelId
+/// and UserId" (`CreatePlatformEndpoint` doc), where every other platform's endpoint
+/// takes only the names on [`ENDPOINT_ATTRIBUTE_NAMES`].
+pub const PLATFORM_WITH_CHANNEL_ENDPOINTS: &str = "Baidu";
+
+/// The two extra attribute names an endpoint of [`PLATFORM_WITH_CHANNEL_ENDPOINTS`]
+/// carries, from the same doc sentence.
+pub const CHANNEL_ENDPOINT_ATTRIBUTE_NAMES: &[&str] = &["ChannelId", "UserId"];
+
+/// Whether `name` is an attribute SNS defines for a device endpoint of a platform
+/// application targeting `platform`: the names every endpoint takes
+/// ([`ENDPOINT_ATTRIBUTE_NAMES`]), and for [`PLATFORM_WITH_CHANNEL_ENDPOINTS`] the two
+/// its own endpoints carry beside them.
+///
+/// SNS refuses any other name, and so does this emulator: the closed set is also what
+/// stops a caller inventing fresh attribute names to grow one endpoint record for ever.
+pub fn is_endpoint_attribute(platform: &str, name: &str) -> bool {
+    ENDPOINT_ATTRIBUTE_NAMES.contains(&name)
+        || (platform.eq_ignore_ascii_case(PLATFORM_WITH_CHANNEL_ENDPOINTS)
+            && CHANNEL_ENDPOINT_ATTRIBUTE_NAMES.contains(&name))
+}
+
+/// The name a refusal gives a device endpoint record, for the shared attribute-map
+/// ceiling ([`attribute_bytes_refusal`]).
+pub const ENDPOINT_RECORD: &str = "an endpoint";
+
+/// The most bytes of `CustomUserData` an endpoint may carry: "The data must be in UTF-8
+/// format and less than 2KB" (`CreatePlatformEndpointInput$CustomUserData` doc) — LESS
+/// than 2 KiB, so the most it holds is one byte under that.
+pub const MAX_ENDPOINT_CUSTOM_USER_DATA_BYTES: usize = 2 * 1024 - 1;
+
+/// The refusal for user data that crosses [`MAX_ENDPOINT_CUSTOM_USER_DATA_BYTES`], or
+/// `None` when an endpoint may carry it. Worded like this service's other
+/// size refusals: the member, the ceiling, and the size the request offered — never the
+/// data itself.
+pub fn custom_user_data_refusal(data: &str) -> Option<String> {
+    let held = data.len();
+    (held > MAX_ENDPOINT_CUSTOM_USER_DATA_BYTES).then(|| {
+        format!(
+            "Invalid parameter: CustomUserData - at most \
+             {MAX_ENDPOINT_CUSTOM_USER_DATA_BYTES} bytes: {held}"
+        )
+    })
+}
+
+/// The sentence SNS refuses a registration that re-uses a device token under DIFFERENT
+/// attributes with: the endpoint that already holds the token, and the reason the second
+/// registration is not the idempotent one.
+///
+/// "The CreatePlatformEndpoint action is idempotent, so if the requester already owns an
+/// endpoint with the same device token and attributes, that endpoint's ARN is returned
+/// without creating a new endpoint" (`CreatePlatformEndpoint` doc) — the same token
+/// under other attributes is therefore a conflict rather than a second endpoint, and the
+/// sentence names the held endpoint so the caller can read or update it.
+pub fn endpoint_token_conflict_refusal(endpoint_arn: &str) -> String {
+    format!(
+        "Invalid parameter: Token Reason: Endpoint {endpoint_arn} already exists with \
+         the same Token, but different attributes."
+    )
+}
+
 /// One device endpoint of a platform application: the device a mobile push
 /// notification is addressed to, as a registration call recorded it.
 #[derive(Debug, Clone)]
@@ -3284,7 +3346,8 @@ impl PlatformEndpointRecord {
 /// Per-service state for com-amazonaws-sns-amazonsimplenotificationservice. A handler reaches it through [`service_state`].
 ///
 /// Every CALLER-DRIVEN store here is therefore BOUNDED: `topics`,
-/// `subscriptions`, `sandbox_phone_numbers` and `platform_applications` at
+/// `subscriptions`, `sandbox_phone_numbers`, `platform_applications` and
+/// `platform_endpoints` at
 /// [`MAX_RECORDS_PER_STORE`] records
 /// each (a request that would cross it is refused with a modelled error), and
 /// `delivered` at

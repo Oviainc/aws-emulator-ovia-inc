@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePlatformEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePlatformEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePlatformEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +80,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{self, PlatformEndpointRecord};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,23 +148,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_PLATFORM_ENDPOINT_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Register the device `Token` as an endpoint of the platform application
+    /// `PlatformApplicationArn` names, and answer that endpoint's ARN.
+    ///
+    /// A MUTATION the spec names: "Creates an endpoint for a device and mobile app on
+    /// one of the supported push notification services … You can use the returned
+    /// EndpointArn to send a message to a mobile app" — and an IDEMPOTENT one: "if the
+    /// requester already owns an endpoint with the same device token and attributes,
+    /// that endpoint's ARN is returned without creating a new endpoint" (this
+    /// operation's doc). So the device token is what identifies a device inside one
+    /// application: the same token under the same attributes addresses the endpoint that
+    /// token already has, and the same token under OTHER attributes is a conflict the
+    /// caller is told about rather than a second endpoint for one device.
+    ///
+    /// The application has to RESOLVE: an ARN this account holds no application record
+    /// of in the request's own region names nothing to register a device against, which
+    /// is the modelled `NotFoundException` (HTTP 404, code `NotFound`). A value that is
+    /// not an ARN of this region at all is a fault in the argument instead, judged
+    /// before the store is consulted, as is user data past its documented size and an
+    /// attribute name SNS does not define for an endpoint of that platform — each the
+    /// operation's `InvalidParameterException` (HTTP 400). Existence of the application
+    /// and acceptability of the request's own values are therefore distinct refusal
+    /// classes, and neither is ever answered as the other.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePlatformEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePlatformEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePlatformEndpoint"))
+        let refuse = |message: String| -> Self::Error {
+            CreatePlatformEndpointErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let region = state::request_region(ctx.parts());
+        if let Some(message) = state::regional_arn_refusal(
+            "PlatformApplicationArn",
+            &input.platform_application_arn,
+            &region,
+        ) {
+            return Err(refuse(message));
+        }
+        if let Some(message) = input
+            .custom_user_data
+            .as_deref()
+            .and_then(state::custom_user_data_refusal)
+        {
+            return Err(refuse(message));
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(CreatePlatformEndpointErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        // The application this device registers against: a miss here is the lookup
+        // failure, never a bad argument. The platform and name come off the RECORD, so
+        // the endpoint's ARN sits under the application that minted it.
+        let Some(application) = store
+            .platform_applications
+            .get(&input.platform_application_arn)
+        else {
+            return Err(CreatePlatformEndpointErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(state::PLATFORM_APPLICATION_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+        let platform = application.platform.clone();
+        let application_name = application.name.clone();
+
+        // The attributes this registration would leave the endpoint holding: the map the
+        // request carried, plus the user data its own member carries, which SNS reports
+        // as that same attribute.
+        let mut attributes = input.attributes.unwrap_or_default();
+        if let Some(unknown) = state::unknown_attribute_name(&attributes, |name| {
+            state::is_endpoint_attribute(&platform, name)
+        }) {
+            let message = state::unknown_attribute_refusal(state::ATTRIBUTES_MEMBER, unknown);
+            return Err(refuse(message));
+        }
+        if let Some(data) = input.custom_user_data {
+            attributes.insert(
+                state::ENDPOINT_CUSTOM_USER_DATA_ATTRIBUTE.to_string(),
+                data,
+            );
+        }
+        // Every report of an endpoint takes the device token off the record's own field,
+        // so a copy of it inside the attribute map would be a second source for one
+        // value: it is absorbed here rather than stored beside the field.
+        attributes.remove(state::ENDPOINT_TOKEN_ATTRIBUTE);
+        if let Some(message) = state::attribute_bytes_refusal(state::ENDPOINT_RECORD, &attributes) {
+            return Err(refuse(message));
+        }
+
+        // The idempotency clause: one device token is one endpoint of one application.
+        if let Some(held) = store
+            .endpoints_of_application(&input.platform_application_arn)
+            .into_iter()
+            .find(|endpoint| endpoint.token == input.token)
+        {
+            if held.attributes == attributes {
+                return Ok(CreatePlatformEndpointOutput {
+                    endpoint_arn: Some(held.arn.clone()),
+                });
+            }
+            let message = state::endpoint_token_conflict_refusal(&held.arn);
+            return Err(refuse(message));
+        }
+
+        if store.platform_endpoints.len() >= state::MAX_RECORDS_PER_STORE {
+            return Err(refuse(state::limit_exceeded_message("platform endpoints")));
+        }
+
+        // The endpoint id is minted by the store, not derived from the device token: two
+        // devices of one application get two ids, and nothing about a token is readable
+        // off the ARN that carries it.
+        let endpoint_id = store.next_unique_id();
+        let arn = state::platform_endpoint_arn(&region, &platform, &application_name, &endpoint_id);
+        store.platform_endpoints.insert(
+            arn.clone(),
+            PlatformEndpointRecord {
+                arn: arn.clone(),
+                platform_application_arn: input.platform_application_arn,
+                token: input.token,
+                attributes,
+                created_at: ::std::time::SystemTime::now(),
+            },
+        );
+
+        Ok(CreatePlatformEndpointOutput {
+            endpoint_arn: Some(arn),
+        })
     }
 }

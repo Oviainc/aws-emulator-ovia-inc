@@ -20,6 +20,9 @@ mod confirm_subscription;
 #[path = "all/create_platform_application.rs"]
 mod create_platform_application;
 
+#[path = "all/create_platform_endpoint.rs"]
+mod create_platform_endpoint;
+
 #[path = "all/data_protection_policy.rs"]
 mod data_protection_policy;
 

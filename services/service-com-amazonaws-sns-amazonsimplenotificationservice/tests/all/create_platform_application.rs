@@ -67,7 +67,11 @@ const KEY_FILE: &str = r#"{"type":"service_account","project_id":"push-emulator"
 /// type names: a PEM-encoded key for the Apple services and MPNS, an API key for GCM
 /// (which documents no principal), and an opaque secret for the services whose clause
 /// names one (ADM's client secret, Baidu's and WNS's secret key).
-fn credentials(platform: &str) -> Vec<(String, String)> {
+///
+/// `pub(crate)` so a sibling suite that needs a REGISTERED application to act on builds
+/// one through the same credential material rather than re-deriving each platform's
+/// documented pair.
+pub(crate) fn credentials(platform: &str) -> Vec<(String, String)> {
     let mut pair = Vec::new();
     match platform {
         "APNS" | "APNS_SANDBOX" | "MPNS" => {
@@ -100,7 +104,10 @@ fn credentials(platform: &str) -> Vec<(String, String)> {
 }
 
 /// The awsQuery form parameters carrying `attributes` as the input's attribute map.
-fn attribute_params(attributes: &[(String, String)]) -> Vec<(String, String)> {
+///
+/// `pub(crate)` so every suite that sends an attribute MAP over this service's awsQuery
+/// form encodes it the same way rather than writing a second encoder.
+pub(crate) fn attribute_params(attributes: &[(String, String)]) -> Vec<(String, String)> {
     let mut params = Vec::new();
     for (index, (name, value)) in attributes.iter().enumerate() {
         params.push((format!("Attributes.entry.{}.key", index + 1), name.clone()));
@@ -146,6 +153,30 @@ async fn create(
 /// A create carrying only the credential pair `platform` documents.
 async fn create_with_credentials(sns: &Sns, name: &str, platform: &str) -> Answer {
     create(sns, name, platform, &credentials(platform)).await
+}
+
+/// A platform application of `platform` registered in `region`, with its ARN.
+///
+/// `pub(crate)` so a sibling suite acts on an application this service really holds —
+/// registered through the wire call that mints one — rather than seeding a record.
+pub(crate) async fn registered_application(
+    sns: &Sns,
+    region: &str,
+    name: &str,
+    platform: &str,
+) -> String {
+    let answer = create_in_region(sns, region, name, platform, &credentials(platform)).await;
+    assert_eq!(
+        answer.status, 200,
+        "CreatePlatformApplication {name:?} on {platform:?}: expected 200, got {} / {}",
+        answer.status, answer.body
+    );
+    answer.element("PlatformApplicationArn").unwrap_or_else(|| {
+        panic!(
+            "CreatePlatformApplication {name:?} on {platform:?}: no ARN in {}",
+            answer.body
+        )
+    })
 }
 
 /// The attributes `GetPlatformApplicationAttributes` reports for `arn`.
