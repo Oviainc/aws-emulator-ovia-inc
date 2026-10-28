@@ -13,7 +13,9 @@
 //! display name, a quoted display name, surrounding whitespace), and each row's
 //! message therefore names the one mailbox rather than the text submitted.
 
-use crate::harness::{call, element, emulator, field, xml_text, Field};
+use crate::harness::{
+    call, element, emulator, emulator_and_engine, field, settle_verifications, xml_text, Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::state::DEFAULT_REGION;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -102,7 +104,7 @@ async fn the_same_forms_of_a_verified_identity_are_accepted() {
         ("a display name and an angle-addr", "Sender <allowed@example.com>"),
         ("whitespace around the whole value", " allowed@example.com "),
     ] {
-        let router = emulator();
+        let (router, engine) = emulator_and_engine();
         let (status, body) = call(
             &router,
             "VerifyEmailIdentity",
@@ -113,6 +115,10 @@ async fn the_same_forms_of_a_verified_identity_are_accepted() {
             status, 200,
             "case {case:?}: VerifyEmailIdentity expected 200, got {status} with {body}"
         );
+        // The request only ASKS for the verification; these rows are about the form
+        // the Source arrives in, so the store is settled past the span the clock owes
+        // the record rather than slept through.
+        settle_verifications(&engine);
 
         let (status, body) = send_from(&router, source).await;
         assert_eq!(

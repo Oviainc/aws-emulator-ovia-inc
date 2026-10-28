@@ -16,7 +16,7 @@
 //! * a delete touches only the set it names: every other stored set, and its
 //!   tracking options, is left as it was.
 
-use crate::harness::{call, element, emulator, field, xml_text, Field};
+use crate::harness::{call, element, emulator, emulator_and_engine, field, settle_verifications, xml_text, Field};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// `CreateConfigurationSet`.
@@ -232,7 +232,7 @@ async fn a_delete_naming_a_set_the_account_does_not_hold_is_refused() {
 
 #[tokio::test]
 async fn a_delete_takes_the_sets_sub_resources_and_nothing_else() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     let (status, body) = call(
         &router,
         "VerifyDomainIdentity",
@@ -243,6 +243,11 @@ async fn a_delete_takes_the_sets_sub_resources_and_nothing_else() {
         status, 200,
         "case verify example.com: expected 200, got {status} with {body}"
     );
+    // Asking for a domain's verification only starts it, and a tracking domain
+    // has to be under one this account HAS verified: the store is settled past
+    // the span the clock owes that record, because this suite is about the
+    // sub-resources a delete takes with it.
+    settle_verifications(&engine);
 
     // Two sets, each carrying its own tracking-options association.
     let sets = [("tracked-a", "a.example.com"), ("tracked-b", "b.example.com")];

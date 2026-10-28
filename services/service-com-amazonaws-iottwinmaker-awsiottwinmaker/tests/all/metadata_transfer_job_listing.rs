@@ -15,9 +15,10 @@
 //! * a page carries at most the page size asked for, in `metadataTransferJobId`
 //!   order, and walking its `nextToken`s yields every matching job exactly once,
 //!   whatever the page size;
-//! * a value outside a modelled enumeration, a `maxResults` below one and a
-//!   `nextToken` this listing did not mint are each refused with HTTP 400
-//!   `ValidationException`;
+//! * a value outside a modelled enumeration, a `maxResults` outside the range
+//!   its member publishes and a `nextToken` this listing did not mint are each
+//!   refused with HTTP 400 `ValidationException`, while the zero that range
+//!   admits is served as the page of no rows it asks for;
 //! * and a listing — served or refused — mints no job and removes none.
 //!
 //! Every case drives the real request path (`MultiServiceRouter::dispatch`), so
@@ -552,9 +553,13 @@ async fn pages_are_bounded_and_resume_where_they_left_off() {
 
 /// RULE: a request outside the model's own values — an end type outside the
 /// modelled `SourceType`/`DestinationType`, a filter naming a state outside the
-/// modelled `MetadataTransferJobState`, a `maxResults` below one, or a
-/// `nextToken` this listing did not mint — is refused with HTTP 400
-/// `ValidationException` and reports nothing.
+/// modelled `MetadataTransferJobState`, a `maxResults` past the top of the range
+/// its member publishes, or a `nextToken` this listing did not mint — is refused
+/// with HTTP 400 `ValidationException` and reports nothing.
+///
+/// The bottom of that published range is NOT such a value: this member's
+/// documentation names no minimum, so a zero is a page of no rows (pinned in
+/// `max_results_zero_page`), not a refusal.
 #[tokio::test]
 async fn a_listing_refuses_what_the_model_does_not_admit() {
     let emulator = Emulator::new();
@@ -631,10 +636,6 @@ async fn a_listing_refuses_what_the_model_does_not_admit() {
                     {"state": METADATA_TRANSFER_JOB_STATE_VALIDATING},
                 ]}),
             ),
-        ),
-        (
-            "maxResults of zero",
-            list_request("s3", "iottwinmaker", json!({"maxResults": 0})),
         ),
         (
             "maxResults past the modelled range",

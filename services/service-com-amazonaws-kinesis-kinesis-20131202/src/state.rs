@@ -2315,12 +2315,22 @@ pub fn stream_not_found_message(identifier: &str) -> String {
 
 /// How an operation that needs a ready stream refuses one that is not ready yet: the rule
 /// `ResourceInUseException` publishes ("The resource is not available for this operation.
-/// For successful operation, the resource must be in the ACTIVE state"). Built FROM the
-/// request and the stored record, so the identifier and the status at fault name it.
-pub fn stream_not_active_message(identifier: &str, status: &str) -> String {
+/// For successful operation, the resource must be in the ACTIVE state"), worded the way the
+/// service words that refusal — the stream named by the `StreamName` it is stored under, the
+/// account that holds it, and the state it is in INSTEAD of `ACTIVE`.
+///
+/// Built from the STORED record rather than the request, the same way
+/// [`stream_on_demand_message`] is: a stream addressed by its ARN is refused with the same
+/// sentence as one addressed by its name, since the stream a refusal names is the stored one
+/// either way.
+///
+/// ONE sentence for the one rule, whichever modelled error carries it: an operation that has
+/// no shard map to serve states the same thing through its not-found error as one that
+/// refuses the change through its in-use error.
+pub fn stream_not_active_message(stream_name: &str, status: &str) -> String {
     format!(
-        "stream {identifier} is in state {status}, not {STREAM_ACTIVE}; the stream must be \
-         {STREAM_ACTIVE} for this operation"
+        "Stream {stream_name} under account {} not {STREAM_ACTIVE}, instead in state {status}",
+        ::engine::emulator_account_id()
     )
 }
 

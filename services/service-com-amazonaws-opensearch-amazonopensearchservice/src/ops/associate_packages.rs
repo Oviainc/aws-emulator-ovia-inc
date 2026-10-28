@@ -217,8 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             if !store.packages.contains_key(&entry.package_id) {
-                return Err(AssociatePackagesErrorModeled::ResourceNotFoundException(
-                    package_not_found(&entry.package_id),
+                return Err(AssociatePackagesErrorModeled::ValidationException(
+                    package_not_found(),
                 )
                 .into());
             }

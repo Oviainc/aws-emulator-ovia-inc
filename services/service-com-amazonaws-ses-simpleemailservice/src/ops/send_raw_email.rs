@@ -220,7 +220,7 @@ const MULTIPART_MEDIA_TYPE: &[u8] = b"multipart/";
 
 /// The header field a part's media type is declared in, which is the only place
 /// a media type DECLARES anything: the same bytes in a body are prose.
-const CONTENT_TYPE_FIELD: &[u8] = b"content-type:";
+const CONTENT_TYPE_FIELD_NAME: &[u8] = b"content-type";
 
 /// The header line naming the mailbox a message is from, which is where the
 /// sender comes from when the request names no `Source`: "If you do not provide a
@@ -277,13 +277,6 @@ fn header_addresses(value: &str) -> Option<Vec<String>> {
     Some(addresses)
 }
 
-/// Whether `line` opens with `prefix`, however either is cased: a header field
-/// name "is case-insensitive" (RFC 5322), as is a media type (RFC 2045).
-fn opens_with_ignore_ascii_case(line: &[u8], prefix: &[u8]) -> bool {
-    line.get(..prefix.len())
-        .is_some_and(|opening| opening.eq_ignore_ascii_case(prefix))
-}
-
 /// How many times `needle` occurs in `line`, however either is cased.
 fn occurrences_ignore_ascii_case(line: &[u8], needle: &[u8]) -> usize {
     let mut found = 0;
@@ -299,22 +292,70 @@ fn occurrences_ignore_ascii_case(line: &[u8], needle: &[u8]) -> usize {
     found
 }
 
+/// Whether `line` opens the header field named `Content-Type`.
+///
+/// A field name is the text before the first colon, and it "is case-insensitive"
+/// (RFC 5322); white space around it is not part of the name, which is how a
+/// reader of the message takes it, so `Content-Type :` names the same field as
+/// `content-type:`. A field NAME carries no RFC 2047 encoded word — encoded words
+/// occur in field VALUES — so the name is decided on the raw bytes.
+fn opens_content_type_field(line: &[u8]) -> bool {
+    line.iter()
+        .position(|byte| *byte == b':')
+        .and_then(|colon| line.get(..colon))
+        .is_some_and(|name| {
+            let name = name
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .map_or(&[][..], |first| &name[first..]);
+            let name = name
+                .iter()
+                .rposition(|byte| !byte.is_ascii_whitespace())
+                .map_or(&[][..], |last| &name[..=last]);
+            name.eq_ignore_ascii_case(CONTENT_TYPE_FIELD_NAME)
+        })
+}
+
+/// How many `multipart` media types ONE `Content-Type` field declares.
+///
+/// Read through the same decoding the MIME reader applies, rather than off the
+/// raw bytes: `mailparse::parse_header` unfolds the field and decodes the RFC
+/// 2047 encoded words in its value, so a media type a caller wrote as an encoded
+/// word is counted here exactly as the parser will read it. A field this emulator
+/// cannot read at all is counted on its raw bytes instead, because this count
+/// must never report FEWER containers than the parser may descend into.
+fn multipart_declarations(field: &[u8]) -> usize {
+    match ::mailparse::parse_header(field) {
+        Ok((header, _)) => {
+            occurrences_ignore_ascii_case(header.get_value().as_bytes(), MULTIPART_MEDIA_TYPE)
+        }
+        Err(_) => occurrences_ignore_ascii_case(field, MULTIPART_MEDIA_TYPE),
+    }
+}
+
 /// How many `multipart` containers the raw message DECLARES.
 ///
 /// Counted on the BYTES, before the message is parsed: parsing a MIME tree
 /// descends once per nesting level, and each level is one part declaring a
 /// `multipart` media type in its own `Content-Type` field, so this count is what
-/// stands between a caller's chosen nesting and the depth of that descent.
+/// stands between a caller's chosen nesting and the depth of that descent. It is
+/// an UPPER bound on that depth — every container it misses would be a level the
+/// descent could take unbidden — which is why an unreadable field is counted
+/// rather than skipped ([`multipart_declarations`]) and why the depth of the tree
+/// the parser actually built is checked again once it is in hand
+/// ([`nesting_depth`]).
 ///
-/// Only a `Content-Type` field DECLARES a media type, so only those lines are
+/// Only a `Content-Type` field DECLARES a media type, so only those fields are
 /// counted — the same bytes in a body are prose, and a message that merely
 /// discusses MIME is not a deeply nested one. A field value may be folded over
 /// several lines (RFC 5322), so a continuation line, which opens with white
-/// space, stays inside the field it continues. The scan is linear in the bytes,
-/// which [`MAX_MESSAGE_BYTES`] has already bounded.
+/// space, stays inside the field it continues and is read as part of it. The scan
+/// is linear in the bytes, which [`MAX_MESSAGE_BYTES`] has already bounded.
 fn multipart_containers(data: &[u8]) -> usize {
     let mut found = 0;
-    let mut in_content_type = false;
+    // The `Content-Type` field currently being collected, folded lines included,
+    // and `None` while the scan is not inside one.
+    let mut field: Option<Vec<u8>> = None;
     for line in data.split(|byte| *byte == b'\n') {
         // A line of a `CRLF`-delimited message keeps its carriage return when
         // split on the line feed alone; it is part of the ending, not the field.
@@ -325,14 +366,48 @@ fn multipart_containers(data: &[u8]) -> usize {
         let continuation = line
             .first()
             .is_some_and(|byte| matches!(byte, b' ' | b'\t'));
-        if !continuation {
-            in_content_type = opens_with_ignore_ascii_case(line, CONTENT_TYPE_FIELD);
+        if continuation {
+            if let Some(collected) = field.as_mut() {
+                collected.push(b'\n');
+                collected.extend_from_slice(line);
+            }
+            continue;
         }
-        if in_content_type {
-            found += occurrences_ignore_ascii_case(line, MULTIPART_MEDIA_TYPE);
+        // Any line that is not a continuation ends the field before it.
+        if let Some(collected) = field.take() {
+            found += multipart_declarations(&collected);
+        }
+        if opens_content_type_field(line) {
+            field = Some(line.to_vec());
         }
     }
+    if let Some(collected) = field {
+        found += multipart_declarations(&collected);
+    }
     found
+}
+
+/// How deeply the parsed message NESTS: 0 for a single part, and one more for
+/// each `multipart` container on the longest path through its tree.
+///
+/// Walked through an explicit worklist rather than by recursion, for the reason
+/// [`text_part`] is: the depth is the caller's to choose, so a recursive walk
+/// would turn that choice into stack depth. Read once the tree is in hand, as the
+/// check on what the parser ACTUALLY built — [`multipart_containers`] bounds the
+/// descent that builds it, and this is what makes a message past the ceiling
+/// refused even if the two readings of a container were ever to disagree.
+fn nesting_depth(message: &::mailparse::ParsedMail<'_>) -> usize {
+    let mut deepest = 0;
+    let mut pending: Vec<(&::mailparse::ParsedMail<'_>, usize)> = vec![(message, 0)];
+    while let Some((part, depth)) = pending.pop() {
+        deepest = deepest.max(depth);
+        pending.extend(
+            part.subparts
+                .iter()
+                .map(|subpart| (subpart, depth.saturating_add(1))),
+        );
+    }
+    deepest
 }
 
 /// The text of the first `text/*` part of the message, which is the part of the
@@ -424,10 +499,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // Each level of a MIME tree is one part declaring a `multipart` media
-        // type, which is one header line, so the size ceiling above bounds how
-        // BIG a message is and not how deeply it nests. The nesting is bounded
-        // here, on the raw bytes, because parsing the tree descends once per
-        // level.
+        // type in its own `Content-Type` field, so the size ceiling above bounds
+        // how BIG a message is and not how deeply it nests. The nesting is
+        // bounded here, BEFORE the tree is parsed, because parsing it descends
+        // once per level: the count is an upper bound on that descent, read
+        // through the same decoding the parser applies to a `Content-Type` field.
         let containers = multipart_containers(raw);
         if containers > MAX_MULTIPART_CONTAINERS {
             return Err(rejected(format!(
@@ -450,6 +526,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Message is not a MIME message: its headers could not be read".to_string(),
             ));
         };
+        // And the ceiling again, on the tree that was actually built rather than
+        // on the declarations that were counted: the two readings of a container
+        // agree today, and a message past the ceiling is refused rather than
+        // walked even if they ever stopped agreeing.
+        let depth = nesting_depth(&message);
+        if depth > MAX_MULTIPART_CONTAINERS {
+            return Err(rejected(format!(
+                "Message may declare at most {MAX_MULTIPART_CONTAINERS} multipart containers, \
+                 got {depth}"
+            )));
+        }
         let headers = message.headers.as_slice();
 
         // The sender: "If you do not provide a value for this parameter, you must
@@ -538,6 +625,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // One instant for the whole send, with the verification move the clock
+        // already owes each of this account's identities materialised against
+        // it: the sender gate below reads the status a caller reading the same
+        // identity at this instant is reported.
+        let now = std::time::SystemTime::now();
+        state.settle_identities(now);
+
         // Account-wide pause, then the configuration set's own: each has its own
         // modeled error, and the set must exist before its sending state is read.
         if !state.account.sending_enabled {
@@ -597,7 +691,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // counts against: a send past it is refused rather than accepted, which is
         // also what keeps the send log bounded. A negative `Max24HourSend`
         // "signifies an unlimited quota" (the member's own documentation).
-        let now = std::time::SystemTime::now();
         let quota = state.account.max_24_hour_send;
         let already_sent = state.sent_last_24_hours(now);
         if quota >= 0.0 && already_sent + destinations.len() as f64 > quota {

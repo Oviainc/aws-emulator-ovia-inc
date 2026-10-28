@@ -1086,89 +1086,72 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     ///
     /// This is the ONLY writer of the applied overlay.
     pub fn settle_due_requests(&mut self, now: SystemTime) {
-        // Nothing is owed on the overwhelmingly common path, so the region keys are
-        // only copied out (to settle while holding them mutably) once a step is
-        // actually due somewhere.
-        let owed = self.regions.values().any(|state| {
-            state
-                .quota_requests
-                .values()
-                .any(|request| is_open_request_status(&request.status) && request.due_at <= now)
-        });
-        if !owed {
-            return;
-        }
-        let regions: Vec<String> = self.regions.keys().cloned().collect();
-        for region in regions {
-            self.settle_region_due_requests(&region, now);
-        }
-    }
-
-    /// [`Self::settle_due_requests`] for ONE region's request store: that region's
-    /// requests take the steps they owe, and the overlay each `APPROVED` one puts in
-    /// force goes where the quota's own scope keeps it — account-wide for a
-    /// `GlobalQuota`, this region for a regional one.
-    fn settle_region_due_requests(&mut self, region: &str, now: SystemTime) {
         loop {
-            let Some(state) = self.regions.get(region) else {
-                return;
-            };
-            let due: Vec<String> = state
-                .request_order
+            // Every request whose next step the clock already owes, wherever it is
+            // recorded, EARLIEST DUE FIRST: a step is taken in the order the clock made
+            // it due, so what a quota plane is left holding is what was decided LAST,
+            // never whichever region's code happens to sort last.
+            let mut due: Vec<(SystemTime, String, String)> = self
+                .regions
                 .iter()
-                .filter(|id| {
-                    state.quota_requests.get(*id).is_some_and(|request| {
-                        is_open_request_status(&request.status) && request.due_at <= now
+                .flat_map(|(region, state)| {
+                    state.request_order.iter().filter_map(move |id| {
+                        let request = state.quota_requests.get(id)?;
+                        (is_open_request_status(&request.status) && request.due_at <= now)
+                            .then(|| (request.due_at, region.clone(), id.clone()))
                     })
                 })
-                .cloned()
                 .collect();
             if due.is_empty() {
                 return;
             }
+            due.sort();
 
-            // Take each due request's next step, and note the overlay each APPROVED
-            // one puts in force. A request no support case ever reviewed settles to
-            // NOT_APPROVED and contributes no overlay.
-            let mut decided: Vec<(AppliedKey, AppliedQuota)> = Vec::new();
-            if let Some(state) = self.regions.get_mut(region) {
-                for id in due {
-                    let Some(request) = state.quota_requests.get_mut(&id) else {
-                        continue;
-                    };
-                    // The step happened when it came due, not when somebody looked.
-                    let due_at = request.due_at;
-                    if request.status == STATUS_PENDING && request.case_id.is_none() {
-                        if request.support_case_allowed {
-                            open_case_on(request, due_at);
-                        } else {
-                            request.status = STATUS_NOT_APPROVED.to_string();
-                            request.last_updated = due_at;
-                        }
-                        continue;
+            // Take each due request's next step, and note the overlay each APPROVED one
+            // puts in force, in that same order. A request no support case ever
+            // reviewed settles to NOT_APPROVED and contributes no overlay.
+            let mut decided: Vec<(String, AppliedKey, AppliedQuota)> = Vec::new();
+            for (_, region, id) in due {
+                let Some(request) = self
+                    .regions
+                    .get_mut(&region)
+                    .and_then(|state| state.quota_requests.get_mut(&id))
+                else {
+                    continue;
+                };
+                // The step happened when it came due, not when somebody looked.
+                let due_at = request.due_at;
+                if request.status == STATUS_PENDING && request.case_id.is_none() {
+                    if request.support_case_allowed {
+                        open_case_on(request, due_at);
+                    } else {
+                        request.status = STATUS_NOT_APPROVED.to_string();
+                        request.last_updated = due_at;
                     }
-                    request.status = STATUS_APPROVED.to_string();
-                    request.last_updated = due_at;
-                    decided.push((
-                        (
-                            request.service_code.clone(),
-                            request.quota_code.clone(),
-                            request.context_id.clone(),
-                        ),
-                        AppliedQuota {
-                            value: request.desired_value,
-                        },
-                    ));
+                    continue;
                 }
+                request.status = STATUS_APPROVED.to_string();
+                request.last_updated = due_at;
+                let key = (
+                    request.service_code.clone(),
+                    request.quota_code.clone(),
+                    request.context_id.clone(),
+                );
+                let applied = AppliedQuota {
+                    value: request.desired_value,
+                };
+                decided.push((region, key, applied));
             }
 
-            for (key, applied) in decided {
+            // The overlay goes where the quota's own scope keeps it: account-wide for a
+            // `GlobalQuota`, the region the request was recorded at for a regional one.
+            for (region, key, applied) in decided {
                 if self
                     .default_quota(&key.0, &key.1)
                     .is_some_and(|quota| quota.global_quota)
                 {
                     self.global_applied_quotas.insert(key, applied);
-                } else if let Some(state) = self.regions.get_mut(region) {
+                } else if let Some(state) = self.regions.get_mut(&region) {
                     state.applied_quotas.insert(key, applied);
                 }
             }
@@ -1217,6 +1200,53 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
         open_case_on(request, now);
         Ok(request.clone())
+    }
+
+    /// The request still awaiting a decision on one quota PLANE — the one minted most
+    /// recently, when the plane somehow holds several — or `None` when nothing on it is
+    /// open.
+    ///
+    /// A plane is the scope an approved increase is put in force on, which is the scope
+    /// the one-open-request rule has to hold over: the whole ACCOUNT for a quota the
+    /// catalog publishes as counted account-wide ([`DefaultQuota::global_quota`]), whose
+    /// applied value is kept regionless and read back at every regional endpoint, and
+    /// the caller's region for any other quota, whose applied value is kept per region.
+    /// Within either, a resource context is a plane of its own, so an open increase for
+    /// one resource does not block another resource's.
+    ///
+    /// Scoping this the same way [`Self::applied_entry`] scopes the overlay is what
+    /// keeps two open requests from ever landing on one applied value.
+    pub fn open_request_on_plane(
+        &self,
+        region: &str,
+        service_code: &str,
+        quota_code: &str,
+        context_id: Option<&str>,
+    ) -> Option<QuotaRequest> {
+        let account_wide = self
+            .default_quota(service_code, quota_code)
+            .is_some_and(|quota| quota.global_quota);
+        let stores: Vec<&RegionState> = if account_wide {
+            self.regions.values().collect()
+        } else {
+            self.regions.get(region).into_iter().collect()
+        };
+        stores
+            .into_iter()
+            .flat_map(|state| {
+                state
+                    .request_order
+                    .iter()
+                    .filter_map(|id| state.quota_requests.get(id))
+            })
+            .filter(|request| {
+                request.service_code == service_code
+                    && request.quota_code == quota_code
+                    && request.context_id.as_deref() == context_id
+                    && is_open_request_status(&request.status)
+            })
+            .max_by_key(|request| request.created)
+            .cloned()
     }
 
     /// Every stored request for one quota, NEWEST FIRST.

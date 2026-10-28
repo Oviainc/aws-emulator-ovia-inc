@@ -1922,11 +1922,15 @@ fn page_of_where<T: Clone>(
 /// Merge a request's `Tags` into the tags a resource already carries, refusing what the
 /// model's own traits cannot express.
 ///
-/// Two rules, both from the model's docs rather than its traits — so the boundary
+/// Three rules, all from the model's docs rather than its traits — so the boundary
 /// validator cannot have refused them already:
 ///
 /// * `Tag$Key` "can't start with `aws:`" (that prefix is reserved for AWS-generated
 ///   tags), which the member's `@pattern` allows;
+/// * "Spaces are not allowed in tag values" (the `Tag` shape's own doc), which
+///   `TagValue`'s `@pattern` of `^[^\x00]*$` admits — a space in any of its forms, the
+///   family the `TagKey` pattern spells out as `\p{Z}` where it deliberately DOES admit
+///   it, so a key may carry spaces and a value may not;
 /// * a resource carries at most [`MAX_TAGS_PER_RESOURCE`] tags.
 ///
 /// `Err` carries the sentence the refusal states. Merging is by key, so a key already
@@ -1942,6 +1946,13 @@ pub fn merged_tags(
                 "Value '{}' at 'Tags' failed to satisfy constraint: a tag key must not \
                  start with the reserved prefix 'aws:'",
                 tag.key
+            ));
+        }
+        if tag.value.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "Value '{}' at 'Tags' failed to satisfy constraint: a tag value must not \
+                 contain spaces",
+                tag.value
             ));
         }
         merged.insert(tag.key.clone(), tag.value.clone());

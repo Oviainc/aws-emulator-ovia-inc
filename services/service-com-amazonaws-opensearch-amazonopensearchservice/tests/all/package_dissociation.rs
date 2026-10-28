@@ -579,11 +579,13 @@ async fn a_request_that_cannot_be_served_dissociates_nothing() {
 
     // One row per way a request cannot be served, each with the status and error code
     // the model declares for it: `ResourceNotFoundException` at HTTP 409 and
-    // `ValidationException` at 400. A `DomainName` that resolves to no domain is read
-    // from the request like any other value, so it is the validation refusal — the
-    // same one the associate path answers. A list longer than the packages the account
-    // can hold is refused by its first entry that names no link, which is what keeps a
-    // call's work bounded by the store rather than by the request.
+    // `ValidationException` at 400. A `DomainName` that resolves to no domain and a
+    // `PackageID` that resolves to no package are read from the request like any other
+    // value, so each is the validation refusal — the same one the associate path
+    // answers; a link the domain does not hold is the missing resource itself. A list
+    // longer than the packages the account can hold is refused by its first entry that
+    // resolves to nothing, which is what keeps a call's work bounded by the store rather
+    // than by the request.
     let more_than_the_account_holds: Vec<String> = (0..=PACKAGE_QUOTA)
         .map(|index| format!("pkg-{index:032x}"))
         .collect();
@@ -603,8 +605,8 @@ async fn a_request_that_cannot_be_served_dissociates_nothing() {
         (
             "a package nothing created",
             json!({ "DomainName": domain, "PackageList": [UNKNOWN_PACKAGE_ID] }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a stored package the domain never had",
@@ -633,8 +635,8 @@ async fn a_request_that_cannot_be_served_dissociates_nothing() {
         (
             "more packages than the account holds",
             json!({ "DomainName": domain, "PackageList": more_than_the_account_holds }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ];
 
@@ -683,8 +685,8 @@ async fn a_request_that_cannot_be_served_dissociates_nothing() {
             "a package nothing created",
             domain,
             &unknown,
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a stored package the domain never had",

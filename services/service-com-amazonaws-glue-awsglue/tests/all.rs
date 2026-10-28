@@ -161,6 +161,8 @@ mod table_version_deletion;
 mod table_version_listing;
 #[path = "all/table_versions.rs"]
 mod table_versions;
+#[path = "all/trigger_action_runs.rs"]
+mod trigger_action_runs;
 #[path = "all/trigger_starts.rs"]
 mod trigger_starts;
 #[path = "all/trigger_stops.rs"]

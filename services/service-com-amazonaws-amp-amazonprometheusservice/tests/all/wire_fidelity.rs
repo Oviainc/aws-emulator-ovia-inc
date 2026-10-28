@@ -75,7 +75,7 @@ fn encode_label(value: &str) -> String {
 
 /// The media type is a property of the SERVICE, not of one operation: every JSON body it
 /// produces announces [`RESPONSE_CONTENT_TYPE`], across a 200, a 202, a 204 with no body
-/// at all, a 400, a 404, a 409 and the 501 a scaffolded operation answers.
+/// at all, a 400, a 404 and a 409.
 #[tokio::test]
 async fn every_response_announces_one_media_type() {
     let region = "us-west-2";
@@ -159,12 +159,11 @@ async fn every_response_announces_one_media_type() {
             200,
         ),
         (
-            // Still a scaffold, so the 501 media type stays covered by a row the census
-            // can confirm: `src/ops/update_scraper_logging_configuration.rs` carries
-            // the `//! SCAFFOLDED, NOT IMPLEMENTED:` marker. The body satisfies every
-            // modelled constraint, since a request that does not is refused at the
-            // boundary with a 400 before the scaffold is reached.
-            "UpdateScraperLoggingConfiguration, a scaffolded operation",
+            // The one PUT the model binds, and the only operation here addressed by a
+            // scraper id: a scraper no store holds is the modelled 404, whose media type
+            // this row is what covers. The body satisfies every modelled constraint,
+            // since a request that does not is refused at the boundary with a 400.
+            "UpdateScraperLoggingConfiguration, a scraper no store holds",
             "PUT",
             "/scrapers/s-00000000-0000-0000-0000-000000000000/logging-configuration"
                 .to_string(),
@@ -179,7 +178,7 @@ async fn every_response_announces_one_media_type() {
                 }
             })
             .to_string(),
-            501,
+            404,
         ),
     ];
 

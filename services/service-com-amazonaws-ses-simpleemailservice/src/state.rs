@@ -252,6 +252,20 @@ pub const MAX_LOGGED_TEXT: usize = 1024;
 /// state whose behaviour `BehaviorOnMXFailure` describes.
 pub const MAIL_FROM_SETUP_SPAN: Duration = Duration::from_secs(3);
 
+/// How long an identity stays [`VerificationStatus::Pending`] before the clock
+/// owes it its move to [`VerificationStatus::Success`].
+///
+/// Requesting verification only STARTS it: SES completes it when it observes
+/// something this emulator cannot observe — the recipient following the link in
+/// the verification message, or the domain's TXT record appearing in DNS — so
+/// the span is this emulator's CHOICE rather than a documented duration, the
+/// same convention the custom MAIL FROM setup follows
+/// ([`MAIL_FROM_SETUP_SPAN`]). It is not zero, so a caller that reads or sends
+/// straight after asking for verification still sees `Pending` and the refusals
+/// that go with it. The due instant is stored on the record
+/// ([`Identity::verification_due`]); nothing ever sleeps for it.
+pub const IDENTITY_VERIFICATION_SPAN: Duration = Duration::from_secs(3);
+
 /// The class of an identity, as SES's `IdentityType` enum names it.
 ///
 /// The wire spellings are the model's own enum values, published as
@@ -621,6 +635,29 @@ pub struct Identity {
     pub policies: BTreeMap<String, String>,
     /// When the identity was added to the list.
     pub verified_at: SystemTime,
+    /// The INSTANT the move out of [`VerificationStatus::Pending`] is due, and
+    /// `None` once there is no move left to make. An instant rather than a
+    /// timer: nothing sleeps for it, and a reader materialises the move only
+    /// once the clock has already made it due ([`Self::settle_verification`]).
+    pub verification_due: Option<SystemTime>,
+}
+
+impl Identity {
+    /// Materialise the verification move the clock already owes this identity at
+    /// `now`, and answer the status to report.
+    ///
+    /// This is the ONLY write a reporting operation makes about an identity's
+    /// verification: the move was owed at `now` whether or not anyone called, so
+    /// applying it changes nothing a later caller would otherwise have seen.
+    pub fn settle_verification(&mut self, now: SystemTime) -> VerificationStatus {
+        if self.verification_status == VerificationStatus::Pending
+            && self.verification_due.is_some_and(|due| now >= due)
+        {
+            self.verification_status = VerificationStatus::Success;
+            self.verification_due = None;
+        }
+        self.verification_status
+    }
 }
 
 /// One entry of the append-only send log.
@@ -917,16 +954,17 @@ impl ComAmazonawsSesSimpleemailserviceState {
     ///
     /// Idempotent: re-verifying an identity leaves the existing record — and the
     /// verification token a domain identity carries — in place, so the list never
-    /// holds a duplicate and a token stays stable across reads.
+    /// holds a duplicate, a token stays stable across reads, and asking again
+    /// does not restart the span an identity already part-way through it has
+    /// left to run.
     ///
-    /// The record is stored [`VerificationStatus::Success`]: a real verification
-    /// completes only when someone follows the link in the message SES sends to
-    /// the address (or publishes the domain's TXT record), and this emulator
-    /// delivers no mail and reads no DNS, so a record left `Pending` could never
-    /// advance and every later send from it would be refused. Recording it
-    /// verified is the one choice that is consistent and observable: the next
-    /// `GetIdentityVerificationAttributes` reports `Success`, and `SendEmail`
-    /// accepts the identity as a `Source`.
+    /// The record is stored [`VerificationStatus::Pending`]: requesting
+    /// verification only STARTS it — the identity's owner has yet to follow the
+    /// link in the message SES sends, or to publish the domain's TXT record — so
+    /// a send from the identity is refused until the move to
+    /// [`VerificationStatus::Success`] the clock owes it falls due,
+    /// [`IDENTITY_VERIFICATION_SPAN`] after this call
+    /// ([`Identity::settle_verification`]).
     ///
     /// `None` when the list already holds [`MAX_IDENTITIES`] identities and this
     /// is a new one: the caller refuses the request rather than growing the store
@@ -948,21 +986,37 @@ impl ComAmazonawsSesSimpleemailserviceState {
             (true, IdentityType::Domain) => Some(self.new_verification_token()),
             _ => None,
         };
+        let requested_at = SystemTime::now();
         Some(
             self.identities
                 .entry(name.to_string())
                 .or_insert_with(|| Identity {
                     name: name.to_string(),
                     identity_type,
-                    verification_status: VerificationStatus::Success,
+                    verification_status: VerificationStatus::Pending,
                     verification_token,
                     dkim_tokens: Vec::new(),
                     notifications: NotificationSettings::default(),
                     mail_from: None,
                     policies: BTreeMap::new(),
-                    verified_at: SystemTime::now(),
+                    verified_at: requested_at,
+                    verification_due: requested_at.checked_add(IDENTITY_VERIFICATION_SPAN),
                 }),
         )
+    }
+
+    /// Materialise the verification move the clock owes every identity of this
+    /// account at `now` ([`Identity::settle_verification`]).
+    ///
+    /// Called by each operation that READS an identity's verification — the
+    /// status report, the sender gate on a send, the verified-address listing,
+    /// the tracking-domain check — so every one of them reads the same store the
+    /// clock has already carried forward, rather than one reader seeing a move
+    /// another reader does not.
+    pub fn settle_identities(&mut self, now: SystemTime) {
+        for identity in self.identities.values_mut() {
+            identity.settle_verification(now);
+        }
     }
 
     /// Record `template` under its own name, replacing any template already
@@ -1043,7 +1097,10 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// `SendEmail`: "The message must be sent from a verified email address or
     /// domain." So the addr-spec itself may be a verified identity, or any
     /// domain suffix of it may be — a verified domain covers the mailboxes in it
-    /// and in its subdomains.
+    /// and in its subdomains. An identity whose verification was only REQUESTED
+    /// is not one of them: the caller settles the store first
+    /// ([`Self::settle_identities`]), so what this reads is the verification the
+    /// clock has carried through.
     pub fn is_verified_sender(&self, address: &str) -> bool {
         let addr = addr_spec(address);
         if self.is_verified(addr) {
@@ -1088,6 +1145,9 @@ impl ComAmazonawsSesSimpleemailserviceState {
     }
 
     /// Whether `name` is in the identity list with a successful verification.
+    ///
+    /// The STORED status, which the caller has already settled against the clock
+    /// ([`Self::settle_identities`]).
     pub fn is_verified(&self, name: &str) -> bool {
         self.identities
             .get(name)

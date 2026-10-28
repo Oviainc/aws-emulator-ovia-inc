@@ -354,6 +354,15 @@ pub const DB_SHARD_GROUP_STATUS_CREATING: &str = "creating";
 /// carries it.
 pub const DB_SHARD_GROUP_STATUS_AVAILABLE: &str = "available";
 
+/// The status a DB shard group reports once a reboot has been accepted for it, the same
+/// `rebooting` status the other reboot path of this service reports: "Rebooting a DB
+/// instance results in a momentary outage, during which the DB instance status is set to
+/// rebooting", and a DB shard group is restarted the same way.
+///
+/// It is a TRANSIENT status: the clock owes the shard group
+/// [`DB_SHARD_GROUP_STATUS_AVAILABLE`] again once the outage is over.
+pub const DB_SHARD_GROUP_STATUS_REBOOTING: &str = "rebooting";
+
 /// The status a DB shard group reports once a delete has been accepted for it — the same
 /// `deleting` status the other delete paths of this service report
 /// ([`DB_INSTANCE_STATUS_DELETING`], [`DB_CLUSTER_STATUS_DELETING`]).
@@ -3808,6 +3817,17 @@ impl DbShardGroupRecord {
         self.pending_status = Some(PendingStatus::removal_in_a_moment());
     }
 
+    /// Accept a reboot: the shard group reports [`DB_SHARD_GROUP_STATUS_REBOOTING`] from
+    /// now on, and the clock owes it [`DB_SHARD_GROUP_STATUS_AVAILABLE`] again
+    /// [`STATUS_TRANSITION_DELAY`] from now, once the momentary outage a restart causes is
+    /// over. Nothing sleeps: the due instant is stored and materialised by
+    /// [`ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`], exactly as
+    /// [`Self::begin_deletion`] does for an accepted delete.
+    pub fn begin_reboot(&mut self) {
+        self.status = DB_SHARD_GROUP_STATUS_REBOOTING.to_string();
+        self.pending_status = Some(PendingStatus::in_a_moment(DB_SHARD_GROUP_STATUS_AVAILABLE));
+    }
+
     /// Project the stored record onto the modelled `DBShardGroup` wire shape — the output
     /// of every DB shard group operation, and one entry of the `DescribeDBShardGroups`
     /// report, so the two cannot disagree about a shard group.
@@ -3843,6 +3863,17 @@ pub fn check_free_form(member: &str, value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The message a `DBShardGroupNotFoundFault` carries: "the specified DB shard group name
+/// wasn't found", in the `<resource type> <name> not found.` wording this front door
+/// answers a named resource it cannot resolve with.
+///
+/// `named` is the value the REQUEST carried, not the key the store folded it to, so a
+/// caller matching the message against what it sent finds it there — the same reason
+/// [`db_cluster_not_found_message`] names the request's spelling.
+pub fn db_shard_group_not_found_message(named: &str) -> String {
+    format!("DBShardGroup {named} not found.")
 }
 
 /// The message a `DBClusterNotFoundFault` carries where the call LOOKS a DB cluster UP —

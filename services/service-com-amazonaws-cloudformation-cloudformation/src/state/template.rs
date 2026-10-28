@@ -2403,6 +2403,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon EC2 `CreateSecurityGroup.GroupName`: "Up to 255 characters in length"
         // (Amazon EC2 API reference) — EC2's model carries no `@length` for it.
         EC2_SECURITY_GROUP => rules(255, Characters::AsGenerated),
+        // AWS Glue `CreateJob.Name`: `NameString`, `@length(min: 1, max: 255)` with pattern
+        // `^[\u0020-\uD7FF\uE000-\uFFFD\uD800\uDC00-\uDBFF\uDFFF\t]*$` (AWS Glue's own
+        // Smithy model), which a generated name is already inside — every character one is
+        // built from is printable — but may be longer than.
+        "AWS::Glue::Job" => rules(255, Characters::AsGenerated),
         // Amazon EventBridge `PutRule.Name`: `RuleName`, `@length(min: 1, max: 64)` with
         // pattern `^[\.\-_A-Za-z0-9]+$` (EventBridge's own Smithy model), which a
         // generated name is already inside but may be longer than.

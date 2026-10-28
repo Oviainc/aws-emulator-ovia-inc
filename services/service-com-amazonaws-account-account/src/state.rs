@@ -1329,25 +1329,39 @@ pub fn alternate_contact_not_found() -> ResourceNotFoundException {
     }
 }
 
-/// The `ValidationException` payload for a primary-email call on an account that
-/// has never had an update started: there is no update to report or to accept.
+/// The `ResourceNotFoundException` payload for a primary-email call on an
+/// account that has never had an update started: there is no update to report or
+/// to accept.
 ///
 /// `GetPrimaryEmailUpdateStatus` reports "the status of the MOST RECENT primary
 /// email update" and models `Status` as REQUIRED, so an account with no update
 /// has no status to report and the call is refused rather than answered with an
 /// invented status; `AcceptPrimaryEmailUpdate` accepts "the request that
 /// originated from StartPrimaryEmailUpdate", so with no such request there is
-/// nothing it can accept. The modelled refusal is the 400 `ValidationException`; the
-/// `reason` member is left absent because neither
-/// `ValidationExceptionReason` value (`fieldValidationFailed |
-/// invalidRegionOptTarget`) describes it — no input member was invalid.
-pub fn no_primary_email_update() -> ValidationException {
-    ValidationException {
-        message: "No email update found for account".to_string(),
-        reason: None,
-        field_list: None,
+/// nothing it can accept. Either way the account resolved and is readable and
+/// every input member was valid: what is missing is the update the call names,
+/// so the refusal is the modelled 404 `ResourceNotFoundException` — "the
+/// operation failed because it specified a resource that can't be found" — the
+/// same answer [`alternate_contact_not_found`] and
+/// [`gov_cloud_account_not_linked`] give for a sub-resource an otherwise
+/// readable account does not hold. A 400 `ValidationException` would state an
+/// invalid input parameter, which is a different fact and leaves its modelled
+/// `reason` unpopulated.
+///
+/// INVARIANT OF THE REQUEST: the message names no account id, so it is the same
+/// sentence whichever account the call resolved to, as it is on the status read
+/// (where the account id can be absent from the request entirely) and on the
+/// acceptance.
+pub fn no_primary_email_update() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: NO_PRIMARY_EMAIL_UPDATE_MESSAGE.to_string(),
+        error_type: None,
     }
 }
+
+/// The one sentence Account Management states for a primary email update that is
+/// not there to be reported or accepted.
+pub const NO_PRIMARY_EMAIL_UPDATE_MESSAGE: &str = "No email update found for account";
 
 /// The `ConflictException` payload for an `AcceptPrimaryEmailUpdate` whose
 /// update is not waiting for its one-time passcode: only a `PENDING` update can

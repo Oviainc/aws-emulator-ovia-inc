@@ -449,8 +449,9 @@ async fn a_prerequisite_is_satisfied_only_by_an_association_the_domain_has_or_th
 
     // One row per way a prerequisite can be named: already on the domain, made by
     // the same call, a stored package the domain does not have, a package nothing
-    // created, and the associating package itself. `ResourceNotFoundException` is
-    // modelled at HTTP 409 for this operation, `ValidationException` at 400.
+    // created, and the associating package itself. `ValidationException` is modelled at
+    // HTTP 400 for this operation, and a prerequisite id that resolves to no package is
+    // a bad input value like the rest.
     let table: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a prerequisite the domain already has",
@@ -485,8 +486,8 @@ async fn a_prerequisite_is_satisfied_only_by_an_association_the_domain_has_or_th
         (
             "a package nothing created",
             json!([{ "PackageID": ids[1], "PrerequisitePackageIDList": [UNKNOWN_PACKAGE_ID] }]),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "the associating package itself",
@@ -670,10 +671,10 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
     create_baseline(&emulator, domain).await;
 
     // One row per way a request cannot be served, each with the status and error
-    // code the model declares for it: `ResourceNotFoundException` at HTTP 409 and
-    // `ValidationException` at 400. A `DomainName` that names no domain is the
-    // CLIENT-INPUT refusal, exactly as it is for a call that links one package:
-    // linking resolves the domain as part of reading the request.
+    // code the model declares for it: `ValidationException` at HTTP 400. A `DomainName`
+    // that names no domain and a `PackageID` that resolves to no package are both
+    // CLIENT-INPUT refusals, exactly as they are for a call that links one package:
+    // linking resolves both as part of reading the request.
     let table: Vec<(&str, Value, u16, &str)> = vec![
         (
             "a domain nothing created",
@@ -690,8 +691,8 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
                 "DomainName": domain,
                 "PackageList": [{ "PackageID": UNKNOWN_PACKAGE_ID }],
             }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "a batch whose last package nothing created",
@@ -703,8 +704,8 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
                     { "PackageID": UNKNOWN_PACKAGE_ID },
                 ],
             }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
         (
             "the same package named twice",
@@ -729,8 +730,8 @@ async fn a_request_that_cannot_be_served_associates_nothing() {
                     .map(|index| json!({ "PackageID": format!("pkg-{index:032x}") }))
                     .collect::<Vec<Value>>(),
             }),
-            409,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ];
 

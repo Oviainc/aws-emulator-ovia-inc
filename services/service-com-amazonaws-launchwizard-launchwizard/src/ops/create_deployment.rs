@@ -143,6 +143,18 @@ impl<Eng> CreateDeployment<Eng> {
     }
 }
 
+/// The refusal a create that does not fit in the store is answered with: the modelled
+/// `ResourceLimitException` over [`crate::state::deployment_limit_message`].
+///
+/// Built in one place so the read-only fit check and the eviction that takes the slot
+/// answer the same request with the same error, whichever of them refuses it.
+fn resource_limit_refusal() -> CreateDeploymentError {
+    CreateDeploymentErrorModeled::ResourceLimitException(ResourceLimitException {
+        message: Some(crate::state::deployment_limit_message()),
+    })
+    .into()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateDeployment<Eng>
 {
@@ -287,6 +299,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The store lives as long as the process, so it has a ceiling; see
+        // `state::MAX_DEPLOYMENTS` for why this is the error the service answers when
+        // there is no room. Whether this create FITS is a property of the store, not of
+        // whether the caller asked for the action or only for a check, so it is decided
+        // here — READ-ONLY (`has_room_for_a_deployment` changes nothing) and above the
+        // short-circuit below, so a checked request is answered the refusal the
+        // performed request would have had. The eviction that makes the room stays on
+        // the performing path below, because dropping a terminal record is a write.
+        if !store.has_room_for_a_deployment() {
+            return Err(resource_limit_refusal());
+        }
+
         // `dryRun` checks the request without making it, and is documented to answer
         // with an ERROR RESPONSE rather than success: `DryRunOperation` for a caller
         // who holds the permissions the action needs. A 200 would be
@@ -300,20 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::dry_run_operation());
         }
 
-        // The store lives as long as the process, so it has a ceiling; see
-        // `state::MAX_DEPLOYMENTS` for how room is made and why this is the error the
-        // service answers when there is none.
+        // The room the check above found is TAKEN here, on the performing path only:
+        // already-deleted records are dropped oldest-first to fit this one. The two
+        // agree by construction (`state::has_room_for_a_deployment`), so this reports
+        // the same refusal rather than letting the store grow past its ceiling.
         if !store.make_room_for_a_deployment() {
-            return Err(CreateDeploymentErrorModeled::ResourceLimitException(
-                ResourceLimitException {
-                    message: Some(format!(
-                        "The maximum of {} deployments has been reached; delete a deployment \
-                         before creating another.",
-                        crate::state::MAX_DEPLOYMENTS
-                    )),
-                },
-            )
-            .into());
+            return Err(resource_limit_refusal());
         }
 
         let Some(id) = store.mint_deployment_id() else {

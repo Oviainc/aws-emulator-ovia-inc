@@ -35,6 +35,8 @@ mod configuration_set_event_destinations;
 mod configuration_set_event_publication_surface;
 #[path = "all/configuration_set_message_security.rs"]
 mod configuration_set_message_security;
+#[path = "all/configuration_set_not_found_message.rs"]
+mod configuration_set_not_found_message;
 #[path = "all/configuration_set_sns_event_destinations.rs"]
 mod configuration_set_sns_event_destinations;
 #[path = "all/configuration_sets.rs"]

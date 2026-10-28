@@ -43,6 +43,7 @@ use crate::query_wire::{elements, form_encode, opt_element};
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     failed_action, resource_failure_summary,
 };
+use service_com_amazonaws_ses_simpleemailservice::state::IDENTITY_VERIFICATION_SPAN;
 
 /// The region every request here is signed for, and so the region the stack's configuration
 /// sets belong to. Deliberately NOT the emulator's default region: the call that creates the
@@ -61,6 +62,13 @@ const GENERATED_SUFFIX_LEN: usize = 12;
 /// it: `CreateConfigurationSetTrackingOptions` refuses a tracking domain that "is not
 /// verified in Amazon SES", and a verified domain covers its subdomains.
 const VERIFIED_DOMAIN: &str = "example.com";
+
+/// Long enough for the identity's own clock-owed transition to come due:
+/// `VerifyDomainIdentity` only ASKS for the verification, and the record stays pending
+/// for `IDENTITY_VERIFICATION_SPAN` after it, so a tracking domain under it is refused
+/// until the move the clock owes the record has been made.
+const PAST_THE_IDENTITY_SPAN: Duration =
+    IDENTITY_VERIFICATION_SPAN.saturating_add(Duration::from_millis(250));
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them.
@@ -194,7 +202,8 @@ fn outputs_of(xml: &str) -> BTreeMap<String, String> {
 }
 
 /// Verify `VERIFIED_DOMAIN` as a domain identity, so a tracking subdomain under it is one
-/// Amazon SES accepts.
+/// Amazon SES accepts — and wait past the span the request leaves the record pending for,
+/// since nothing but the clock completes it.
 async fn verify_domain(router: &MultiServiceRouter, case: &str) {
     ses_ok(
         router,
@@ -203,6 +212,7 @@ async fn verify_domain(router: &MultiServiceRouter, case: &str) {
         &[("Domain", VERIFIED_DOMAIN)],
     )
     .await;
+    tokio::time::sleep(PAST_THE_IDENTITY_SPAN).await;
 }
 
 /// Create a stack, wait past its transition, and answer the `DescribeStacks` body.

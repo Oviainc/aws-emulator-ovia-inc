@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootDBShardGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootDBShardGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootDBShardGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +87,20 @@
 //! * `DBShardGroupNotFoundFault` (HTTP 404) — The specified DB shard group name wasn't found.
 //! * `InvalidDBShardGroupStateFault` (HTTP 400) — The DB shard group must be in the available
 //!   state.
+//!
+//! ## What this handler does
+//!
+//! A reboot restarts the DB shard group: the stored shard group of the region the request is
+//! signed for goes to `rebooting` and the clock owes it `available` again once the momentary
+//! outage is over, and the answer is the record as it now stands — which is what the next
+//! `DescribeDBShardGroups` of that identifier reports until that transition comes due.
+//!
+//! Nothing else about the shard group changes: a restart carries no new settings, so its
+//! capacity range, standby count, endpoint, ARN, resource id and tags stand exactly as they
+//! did. The two modelled faults are the whole refusal surface — a name no shard group of the
+//! region has, and a shard group that is not in the available state (one this service is
+//! still provisioning, one whose delete has begun, and one already rebooting), since there
+//! has to be a running shard group for a restart to restart.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -169,18 +174,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootDBShardGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootDBShardGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootDBShardGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(RebootDBShardGroupError::validation)?;
+        // `DBShardGroupIdentifier` needs no check here: this operation's input member targets
+        // the constrained `DBShardGroupIdentifier` shape, so the boundary validator has
+        // already refused a name outside its published length and pattern.
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a reboot nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this reboot is judged against is the current one.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional, and the identifier names one DB shard group of the region
+        // case-insensitively, so it is folded the way the store keys it.
+        let key = (
+            region.clone(),
+            crate::state::db_shard_group_key(&input.db_shard_group_identifier),
+        );
+        // "The specified DB shard group name wasn't found": a name no create stored in this
+        // region — and one a delete has already taken out — is the modelled not-found fault.
+        let Some(record) = store.db_shard_groups.get_mut(&key) else {
+            return Err(RebootDBShardGroupErrorModeled::DBShardGroupNotFoundFault(
+                DBShardGroupNotFoundFault {
+                    message: Some(crate::state::db_shard_group_not_found_message(
+                        &input.db_shard_group_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        // `InvalidDBShardGroupStateFault`: "the DB shard group must be in the available
+        // state". A restart restarts something that is running, so a shard group this
+        // emulator's clock has yet to finish provisioning, one whose delete has begun — a
+        // delete "can't be canceled or reverted after it begins" — and one already inside the
+        // outage of an earlier reboot are all that same state fault rather than a second
+        // acknowledgement.
+        if !record.is_available() {
+            return Err(
+                RebootDBShardGroupErrorModeled::InvalidDBShardGroupStateFault(
+                    InvalidDBShardGroupStateFault {
+                        message: Some(format!(
+                            "DB shard group {} must be in the available state to be rebooted \
+                             (status {})",
+                            record.identifier, record.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The reboot is accepted: the shard group reports `rebooting` from now on and the
+        // clock owes it `available` once the momentary outage is over. The answer is the
+        // record as it now stands, which is what AWS reports for an accepted reboot.
+        record.begin_reboot();
+        let rebooting = record.to_wire();
+        // The generated types declare ONE struct per operation for the modelled
+        // `DBShardGroup` shape, so the projection every DB shard group operation shares
+        // (`DbShardGroupRecord::to_wire`) is mapped onto this operation's own output rather
+        // than written out a second time here.
+        Ok(RebootDBShardGroupOutput {
+            db_shard_group_resource_id: rebooting.db_shard_group_resource_id,
+            db_shard_group_identifier: rebooting.db_shard_group_identifier,
+            db_cluster_identifier: rebooting.db_cluster_identifier,
+            max_acu: rebooting.max_acu,
+            min_acu: rebooting.min_acu,
+            compute_redundancy: rebooting.compute_redundancy,
+            status: rebooting.status,
+            publicly_accessible: rebooting.publicly_accessible,
+            endpoint: rebooting.endpoint,
+            db_shard_group_arn: rebooting.db_shard_group_arn,
+            tag_list: rebooting.tag_list,
+        })
     }
 }

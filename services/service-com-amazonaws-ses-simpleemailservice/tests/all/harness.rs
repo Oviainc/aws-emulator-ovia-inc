@@ -47,6 +47,30 @@ pub fn emulator_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter 
     router
 }
 
+/// A router and the engine behind it, for a suite that needs both.
+pub fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    (emulator_over(Arc::clone(&engine)), engine)
+}
+
+/// The store as it stands once the clock has carried every requested
+/// verification through to `Success`.
+///
+/// Asking for an identity's verification only STARTS it: the move the clock owes
+/// the record falls due `IDENTITY_VERIFICATION_SPAN` later, so a suite that needs
+/// a SENDING identity settles the store against an instant past that span instead
+/// of sleeping for it. Nothing else about the store is touched, and a suite about
+/// the span itself (or about the pending state) drives the real clock instead.
+///
+/// [`IDENTITY_VERIFICATION_SPAN`]: service_com_amazonaws_ses_simpleemailservice::state::IDENTITY_VERIFICATION_SPAN
+pub fn settle_verifications(engine: &Arc<engine::InMemoryEngine>) {
+    let state = service_com_amazonaws_ses_simpleemailservice::state::service_state(&**engine)
+        .expect("this service has a store on the engine it is mounted on");
+    let past_the_span = std::time::SystemTime::now()
+        + service_com_amazonaws_ses_simpleemailservice::state::IDENTITY_VERIFICATION_SPAN;
+    state.lock().settle_identities(past_the_span);
+}
+
 /// One awsQuery call: `(status, body)`.
 pub async fn call(router: &MultiServiceRouter, action: &str, params: &[Field]) -> (u16, String) {
     let mut body = format!("Action={action}&Version={VERSION}");

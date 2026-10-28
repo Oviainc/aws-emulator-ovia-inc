@@ -113,7 +113,19 @@ impl Paged {
     /// `smithy_query(query="doc",shape="<operation>Request",member="maxResults")`.
     fn documented_minimum(self) -> u32 {
         match self {
-            Self::ListScenes | Self::ListSyncJobs | Self::ListComponents => 0,
+            // "Specifies the maximum number of results to display."
+            // (`ListScenes`), "The maximum number of results to return at one
+            // time. The default is 50.\nValid Range: Minimum value of 0."
+            // (`ListSyncJobs`), "The maximum number of results returned at one
+            // time. The default is 25." (`ListComponents`) and "The maximum
+            // number of results to return at one time."
+            // (`ListMetadataTransferJobs`) \u2014 none of them publishes a minimum
+            // of 1.
+            Self::ListScenes
+            | Self::ListSyncJobs
+            | Self::ListComponents
+            | Self::ListMetadataTransferJobs => 0,
+            // The rest publish "Valid Range: Minimum value of 1."
             _ => 1,
         }
     }

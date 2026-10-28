@@ -829,9 +829,12 @@ async fn a_refused_create_stores_nothing() {
                 }),
             ),
             "ResourceInUseException",
+            // The sentence this service states for a stream that is not `ACTIVE`, written
+            // out here rather than borrowed from the crate, so the wording is what this
+            // case pins.
             format!(
-                "stream {} is in state CREATING, not ACTIVE",
-                stream_arn(REGION, creating)
+                "Stream {creating} under account {} not ACTIVE, instead in state CREATING",
+                engine::EMULATOR_ACCOUNT_ID
             ),
         ),
         (

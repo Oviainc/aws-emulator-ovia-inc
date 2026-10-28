@@ -238,7 +238,6 @@ fn delete_stream(
 
     // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
     // carries one and a request naming only that member names no stream.
-    let identifier = stream_identifier(input).to_string();
     let stream = store
         .resolve_stream_mut(
             now,
@@ -255,15 +254,10 @@ fn delete_stream(
     // the ACTIVE state").
     let status = stream.status(now);
     if status != crate::state::STREAM_ACTIVE {
-        let identifier = if identifier.is_empty() {
-            stream.name.clone()
-        } else {
-            identifier
-        };
         return Err(DeleteStreamErrorModeled::ResourceInUseException(
             ResourceInUseException {
                 message: Some(crate::state::stream_not_active_message(
-                    &identifier,
+                    &stream.name,
                     status,
                 )),
             },

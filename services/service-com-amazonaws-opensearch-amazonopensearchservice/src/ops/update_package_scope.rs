@@ -210,14 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_packages(now);
 
         // Read before the record is borrowed, and judged after it is resolved: an id
-        // that names no package of this account is refused as not found whatever the
-        // account's standing.
+        // that names no package of this account is refused as the bad input value it is
+        // whatever the account's standing.
         let entitled = store.package_vending_entitled;
 
         let package = store.packages.get_mut(&input.package_id).ok_or_else(|| {
-            UpdatePackageScopeErrorModeled::ResourceNotFoundException(package_not_found(
-                &input.package_id,
-            ))
+            UpdatePackageScopeErrorModeled::ValidationException(package_not_found())
         })?;
 
         // A package is shared with another user only by an account that may vend

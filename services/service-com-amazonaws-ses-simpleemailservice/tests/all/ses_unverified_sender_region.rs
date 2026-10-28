@@ -30,7 +30,7 @@ use service_com_amazonaws_ses_simpleemailservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-use crate::harness::{element, field, form_encode, xml_text, Field, VERSION};
+use crate::harness::{element, field, form_encode, settle_verifications, xml_text, Field, VERSION};
 
 /// The message a send from an unverified identity is refused with, as this service words
 /// it for `region` and `identities`.
@@ -43,11 +43,17 @@ fn expected_message(region: &str, identities: &[&str]) -> String {
     )
 }
 
+/// A router holding only this service, over a fresh engine, and that engine.
+fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
 /// A router holding only this service, over a fresh engine.
 fn emulator() -> MultiServiceRouter {
-    let mut router = MultiServiceRouter::new();
-    router.register_service(EmulatedService::new(Arc::new(engine::InMemoryEngine::new())));
-    router
+    emulator_and_engine().0
 }
 
 /// One awsQuery call whose SigV4 credential scope names `region`, or that carries no
@@ -204,7 +210,7 @@ async fn an_identity_verified_in_the_requests_region_is_not_refused() {
     // identity this account verified is accepted whatever Region the send is scoped to —
     // the emulator serves one Region's identity list, the one every call reads.
     for region in [Some("us-west-2"), Some("eu-central-1"), None] {
-        let router = emulator();
+        let (router, engine) = emulator_and_engine();
         let (status, body) = call_in_region(
             &router,
             region,
@@ -216,6 +222,10 @@ async fn an_identity_verified_in_the_requests_region_is_not_refused() {
             status, 200,
             "case {region:?}: VerifyEmailIdentity expected 200, got {status} with {body}"
         );
+        // The request only ASKS for the verification; what these rows are about is
+        // which Region the refusal names, so the store is settled past the span the
+        // clock owes the record rather than slept through.
+        settle_verifications(&engine);
 
         let (status, body) = call_in_region(
             &router,

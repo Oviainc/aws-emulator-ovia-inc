@@ -182,12 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_packages(now);
 
         // `PackageID` is "the unique identifier for the package": an id that names no
-        // package of this account is the modelled not-found refusal rather than a
-        // package this call would create.
+        // package of this account is refused as the bad input value it is rather than as
+        // a package this call would create.
         let package = store.packages.get_mut(&input.package_id).ok_or_else(|| {
-            UpdatePackageErrorModeled::ResourceNotFoundException(package_not_found(
-                &input.package_id,
-            ))
+            UpdatePackageErrorModeled::ValidationException(package_not_found())
         })?;
 
         // An update replaces the package's content, which the service does by COPYING

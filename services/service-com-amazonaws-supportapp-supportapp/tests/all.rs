@@ -25,6 +25,8 @@ mod error_message_templates;
 mod listing_pagination;
 #[path = "all/notification_flag_default.rs"]
 mod notification_flag_default;
+#[path = "all/organization_membership.rs"]
+mod organization_membership;
 #[path = "all/resource_preconditions.rs"]
 mod resource_preconditions;
 #[path = "all/slack_channel_configurations.rs"]

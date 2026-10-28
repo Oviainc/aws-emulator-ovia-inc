@@ -2265,6 +2265,38 @@ pub fn decode_pagination_token(
     (key.len() == components && !key[0].is_empty()).then_some(key)
 }
 
+/// The page a `MaxResultsInteger`-paged operation of this service returns when the
+/// request names no `MaxResults`.
+///
+/// From the model: every one of those members documents "The maximum number of results to
+/// return in one operation. The default is 50. The maximum that you can specify is 100."
+const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// The largest page one of those operations returns: `MaxResultsInteger`'s modelled
+/// maximum (`@range(min: 1, max: 100)`).
+const MAX_PAGE_SIZE: usize = 100;
+
+/// How many entries a page of a `MaxResultsInteger`-paged operation holds, for a request
+/// that asked for `requested` of them (`None` when it named no `MaxResults`).
+///
+/// ONE page-size rule for every such operation of this service (`ListAppMonitors`,
+/// `ListRumMetricsDestinations`, `BatchGetRumMetricDefinitions`), beside the token codec
+/// those same operations share, so their page sizes cannot drift. `MaxResultsInteger` is
+/// modelled `@range(min: 1, max: 100)`, so the boundary validator has already refused
+/// anything outside it; an absent value pages at the documented default
+/// ([`DEFAULT_PAGE_SIZE`]), and the result is held inside the modelled range so no
+/// arithmetic here can hand a caller an empty or an unbounded page.
+///
+/// NOT every paginated operation of this service: `GetAppMonitorData` pages on
+/// `MaxQueryResults`, a different member with a different range and its own `@default`,
+/// and keeps its own rule.
+pub fn page_size(requested: Option<i32>) -> usize {
+    requested
+        .and_then(|requested| usize::try_from(requested).ok())
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

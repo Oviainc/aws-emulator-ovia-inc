@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Whether this account belongs to an organization, and which account manages that
+# organization, is state the Organizations control plane owns:
+# `RegisterSlackWorkspaceForOrganization` is an Organizations-scoped call, so it reads
+# that store through the one shared engine instead of assuming an answer.
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

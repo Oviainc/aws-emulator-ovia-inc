@@ -456,9 +456,9 @@ async fn a_listing_of_something_that_does_not_exist_is_refused_and_an_empty_set_
     let answer = list_for_package(&emulator, UNKNOWN_PACKAGE_ID, None, None).await;
     assert_eq!(
         (answer.status, error_code(&answer).as_str()),
-        (409, "ResourceNotFoundException"),
-        "case ListDomainsForPackage(an id nothing minted): expected the modelled \
-         missing-resource refusal, got {} with {:?}",
+        (400, "ValidationException"),
+        "case ListDomainsForPackage(an id nothing minted): expected the id to be refused as \
+         a bad input value, got {} with {:?}",
         answer.status,
         answer.body
     );

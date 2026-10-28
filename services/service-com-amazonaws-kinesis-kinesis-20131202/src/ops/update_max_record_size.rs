@@ -198,7 +198,7 @@ fn apply_update(
     if status != crate::state::STREAM_ACTIVE {
         return Err(UpdateMaxRecordSizeErrorModeled::ResourceInUseException(
             ResourceInUseException {
-                message: Some(crate::state::stream_not_active_message(&identifier, status)),
+                message: Some(crate::state::stream_not_active_message(&stream.name, status)),
             },
         )
         .into());
