@@ -105,6 +105,35 @@ pub(crate) fn complete_aggregation_in(engine: &Arc<engine::InMemoryEngine>, name
     }
 }
 
+/// One day in seconds, for the window arithmetic below.
+const DAY_SECONDS: i64 = 24 * 60 * 60;
+
+/// `at` (epoch seconds) in the ISO 8601 `date-time` form the modelled query members of
+/// this service carry.
+fn iso_second(at: i64) -> String {
+    aws_smithy_types::DateTime::from_secs(at)
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| panic!("unformattable instant {at}: {error}"))
+}
+
+/// A `GetProfile` query naming a window that HOLDS the receipt of a profile posted through
+/// this harness and that the operation's documented maximum range still allows: one day
+/// either side of the clock's current instant.
+///
+/// `GetProfile` selects on the stored receipt time, which is the clock's for a profile
+/// posted over HTTP (`complete_aggregation` moves it back by one aggregation window, well
+/// inside this), and the operation's doc bounds the range it answers over — "The maximum
+/// time range allowed is 7 days" — so a suite that needs a window AROUND a just-posted
+/// profile and WITHIN that limit names it here once. `pub(crate)` for exactly that reason.
+pub(crate) fn servable_window() -> String {
+    let now = aws_smithy_types::DateTime::from(std::time::SystemTime::now()).secs();
+    format!(
+        "?startTime={}&endTime={}",
+        iso_second(now - DAY_SECONDS),
+        iso_second(now + DAY_SECONDS)
+    )
+}
+
 /// One HTTP answer, reduced to what these tests assert on. `pub(crate)` so the other
 /// suites in this test target drive the same harness instead of forking it.
 pub(crate) struct Answer {
@@ -1295,62 +1324,75 @@ async fn get_profile_selects_by_the_requested_time_range() {
 
     // Rows: each way the operation's doc allows a window to be named. A window that
     // contains the receipt time serves the profile; one that does not is a 404.
-    let cases: Vec<(&str, &str, u16)> = vec![
-        ("no parameters", "", 200),
-        ("period alone (the latest profile)", "?period=PT1H", 200),
+    let cases: Vec<(&str, String, u16)> = vec![
+        ("no parameters", String::new(), 200),
+        (
+            "period alone (the latest profile)",
+            "?period=PT1H".to_string(),
+            200,
+        ),
         (
             "a start before the profile",
-            "?startTime=2000-01-01T00:00:00Z",
+            "?startTime=2000-01-01T00:00:00Z".to_string(),
             200,
         ),
         (
             "a start after the profile",
-            "?startTime=2999-01-01T00:00:00Z",
+            "?startTime=2999-01-01T00:00:00Z".to_string(),
             404,
         ),
         (
             "an end after the profile",
-            "?endTime=2999-01-01T00:00:00Z",
+            "?endTime=2999-01-01T00:00:00Z".to_string(),
             200,
         ),
         (
             "an end before the profile",
-            "?endTime=2000-01-01T00:00:00Z",
+            "?endTime=2000-01-01T00:00:00Z".to_string(),
             404,
         ),
+        // A PAIR of bounds around the profile, within the maximum range the operation's
+        // doc allows ("The maximum time range allowed is 7 days"), which is what
+        // `servable_window` names; a pair wider than that is refused, and the rule over
+        // the width of the range is `crate::get_profile_window_length`'s table.
         (
             "a start and an end around the profile",
-            "?startTime=2000-01-01T00:00:00Z&endTime=2999-01-01T00:00:00Z",
+            servable_window(),
             200,
         ),
         (
             "a day-long window starting long before the profile",
-            "?startTime=2000-01-01T00:00:00Z&period=P1D",
+            "?startTime=2000-01-01T00:00:00Z&period=P1D".to_string(),
             404,
         ),
         (
             "a day-long window ending far after the profile",
-            "?endTime=2999-01-01T00:00:00Z&period=P1D",
+            "?endTime=2999-01-01T00:00:00Z&period=P1D".to_string(),
             404,
         ),
         // The operation's doc: "If you specify all 3 parameters, an exception is thrown."
         (
             "all three parameters",
-            "?startTime=2000-01-01T00:00:00Z&endTime=2999-01-01T00:00:00Z&period=P1D",
+            "?startTime=2000-01-01T00:00:00Z&endTime=2000-01-02T00:00:00Z&period=P1D"
+                .to_string(),
             400,
         ),
         // `period` here is the free-form `Period` string, not the `AggregationPeriod`
         // enum: any ISO 8601 duration names a window length, and on its own selects the
         // latest profile. The spans each duration names are
         // `crate::profile_representations`' table.
-        ("a period that is not an aggregation period", "?period=PT7M", 200),
+        (
+            "a period that is not an aggregation period",
+            "?period=PT7M".to_string(),
+            200,
+        ),
         // The depth the served profile's call stacks are bounded to; what it leaves out
         // is `crate::profile_representations`' table.
-        ("maxDepth", "?maxDepth=2", 200),
+        ("maxDepth", "?maxDepth=2".to_string(), 200),
     ];
 
     for (label, query, expected_status) in cases {
-        let answer = harness.get_profile(&case.name, query).await;
+        let answer = harness.get_profile(&case.name, &query).await;
         assert_eq!(
             answer.status, expected_status,
             "case {label:?} ({query}): expected HTTP {expected_status}, got {} {}",

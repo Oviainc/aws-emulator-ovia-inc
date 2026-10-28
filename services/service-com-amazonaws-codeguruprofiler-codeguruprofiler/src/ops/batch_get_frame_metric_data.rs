@@ -145,17 +145,10 @@ const MAX_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// refusal that states the limit.
 const MAX_PERIOD_TEXT: &str = "PT24H";
 
-/// Why a request whose time period is longer than [`MAX_PERIOD`] is refused: the limit
-/// the member documents, and the period the request ended up naming — after an open side
-/// was completed — so the caller can fix the request from the message alone.
-fn period_too_long_message(start: DateTime, end: DateTime) -> String {
-    format!(
-        "the time period for the returned time series values must be at most \
-         {MAX_PERIOD_TEXT} long, got {} to {}",
-        crate::state::iso8601(start),
-        crate::state::iso8601(end)
-    )
-}
+/// What this operation's doc calls the range [`MAX_PERIOD`] bounds, for that same refusal
+/// (`crate::state::window_too_long_message`, the one sentence this service states a range
+/// longer than its operation's documented maximum with).
+const PERIOD_SUBJECT: &str = "the time period for the returned time series values";
 
 /// This operation's modelled 400, for a request it refuses on its input.
 fn validation(message: String) -> BatchGetFrameMetricDataError {
@@ -223,10 +216,11 @@ fn reported_period(
     // in `crate::state::validate_interval`, which the shared reading already applied to a
     // period whose two bounds the request itself named.
     crate::state::validate_interval(start, end).map_err(validation)?;
-    let longest = crate::state::shifted(start, crate::state::span_nanos(MAX_PERIOD));
-    if crate::state::instant_key(end) > crate::state::instant_key(longest) {
-        return Err(validation(period_too_long_message(start, end)));
-    }
+    // And no longer than the maximum this operation's own doc states — the service-wide
+    // window-length rule, stated once in `crate::state::validate_window_length`, applied
+    // here to the period after an open side was completed.
+    crate::state::validate_bounds_length(start, end, MAX_PERIOD, MAX_PERIOD_TEXT, PERIOD_SUBJECT)
+        .map_err(validation)?;
     Ok((start, end))
 }
 

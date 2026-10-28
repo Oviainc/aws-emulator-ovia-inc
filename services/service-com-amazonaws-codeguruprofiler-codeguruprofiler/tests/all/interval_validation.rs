@@ -359,11 +359,13 @@ async fn a_refused_interval_changes_nothing_a_later_caller_sees() {
     );
 
     // What every ranged operation answers over a window that IS an interval, before any
-    // refusal has been attempted.
+    // refusal has been attempted. A week long, so the window is one `GetProfile` serves
+    // over too: its doc bounds the range it answers over at 7 days
+    // ([`crate::get_profile_window_length`]).
     let window = Bounds {
-        label: "a wide window around the stored profile",
-        start: "2000-01-01T00:00:00Z",
-        end: "2099-01-01T00:00:00Z",
+        label: "a week-long window every ranged operation accepts",
+        start: "2020-06-01T00:00:00Z",
+        end: "2020-06-08T00:00:00Z",
         is_interval: true,
     };
     let mut before: Vec<(String, u16, Vec<u8>)> = Vec::new();

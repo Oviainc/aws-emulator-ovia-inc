@@ -23,6 +23,8 @@ mod findings_reports_listing;
 mod frame_metric_data;
 #[path = "all/get_profile_interval.rs"]
 mod get_profile_interval;
+#[path = "all/get_profile_window_length.rs"]
+mod get_profile_window_length;
 #[path = "all/instant_comparison_resolution.rs"]
 mod instant_comparison_resolution;
 #[path = "all/interval_resolution.rs"]
