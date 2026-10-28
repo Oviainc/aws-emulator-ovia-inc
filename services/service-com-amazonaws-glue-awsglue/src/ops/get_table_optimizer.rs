@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableOptimizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableOptimizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableOptimizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the optimizer of one `TableOptimizerType` that `CreateTableOptimizer`
+//! registered on the table the request addresses, together with the catalog, database and
+//! table it belongs to.
+//!
+//! An optimizer is addressed by its table and its type, so each step of that address is
+//! resolved in turn and a miss at any of them — the database, the table, or an optimizer of
+//! that type — is the operation's modelled `EntityNotFoundException`. The reported
+//! `configuration` is the one the create or the last update wrote, and no `lastRun` is
+//! reported: nothing here performs the work an optimizer run does, so there is no run to
+//! report ([`crate::state::TableOptimizerEntry`]).
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +164,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableOptimizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableOptimizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableOptimizer"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTableOptimizerErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(Some(&input.catalog_id));
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the caller may read this catalog at all is decided BEFORE the entity
+        // lookup (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
+            return Err(GetTableOptimizerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(GetTableOptimizerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let Some(table) = database
+            .tables
+            .get(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(GetTableOptimizerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let Some(optimizer) = table.optimizers.get(&input.r#type) else {
+            return Err(GetTableOptimizerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_optimizer_not_found(
+                        &input.table_name,
+                        &input.r#type,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // The answer attributes the optimizer to the resource it belongs to, each member
+        // taken from the STORED table rather than echoed from the request, so a request
+        // that spelled the table in another case is answered with the stored name.
+        Ok(GetTableOptimizerOutput {
+            catalog_id: Some(table.catalog_id.clone()),
+            database_name: Some(table.database_name.clone()),
+            table_name: Some(table.name.clone()),
+            table_optimizer: Some(optimizer.to_table_optimizer()),
+        })
     }
 }
