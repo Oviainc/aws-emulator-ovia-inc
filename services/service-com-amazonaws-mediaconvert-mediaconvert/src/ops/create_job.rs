@@ -285,12 +285,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If you reuse a client request token within one minute of a successful request,
         // the API returns the job details for the original request." Inside that window
         // the token names the job it first created, never a second one.
+        //
+        // The token is the KEY of that window, so it takes the one test every caller-sent
+        // key member in this crate takes (`crate::state::carries_no_characters`) and NO
+        // other normalisation: a token can be "any string that includes up to 64 ASCII
+        // characters", so two strings that differ only by the whitespace around them are
+        // two tokens and name two jobs, and the value stored on the job — the one
+        // `Job$ClientRequestToken` echoes — is the one the caller sent, byte for byte.
+        // A value carrying no characters at all names nothing, so it is the same as a
+        // token the request left out: no idempotency entry, and nothing echoed. (It is
+        // not refused, because unlike a resource name it addresses nothing the caller
+        // could have meant to reach.)
         let token = input
             .client_request_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .map(str::to_string);
+            .filter(|token| !crate::state::carries_no_characters(token));
 
         // The job template this request inherits from, and the queue the job is sent to,
         // both read under the store's guard — which is then RELEASED, because the input

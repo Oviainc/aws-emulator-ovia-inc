@@ -17,6 +17,8 @@ mod acceleration_status;
 mod account_endpoints;
 #[path = "all/blank_resource_name.rs"]
 mod blank_resource_name;
+#[path = "all/caller_sent_key_identity.rs"]
+mod caller_sent_key_identity;
 #[path = "all/cancel_job_idempotence.rs"]
 mod cancel_job_idempotence;
 #[path = "all/certificate_association.rs"]

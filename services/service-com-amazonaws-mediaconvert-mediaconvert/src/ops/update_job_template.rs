@@ -189,9 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            Some(reference) => {
-                Some(crate::state::queue_name_from_reference(reference.trim()).to_string())
-            }
+            // As on create, the reference is resolved byte for byte: a queue name carries
+            // whatever characters the caller gave it, so trimming a reference would
+            // resolve a queue the caller never named.
+            Some(reference) => Some(crate::state::queue_name_from_reference(reference).to_string()),
             None => None,
         };
 
