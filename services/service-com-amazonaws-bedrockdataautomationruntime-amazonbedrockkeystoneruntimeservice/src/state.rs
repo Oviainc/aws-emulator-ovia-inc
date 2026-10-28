@@ -26,7 +26,9 @@ use crate::ops::types::{
 };
 
 /// The region every ARN this service mints falls back to when the request carries no
-/// SigV4 credential scope to read one from (an unsigned, host-routed request).
+/// region an ARN can be minted in: an unsigned, host-routed request with no SigV4
+/// credential scope to read one from, or a scope whose region is outside the label
+/// grammar [`arn_region`] holds it to.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// This service's `arnNamespace` (`aws.api#service`): every resource ARN is under
@@ -666,7 +668,8 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
     /// different tokens therefore get different ids, and the count means an id is never
     /// reused even after the record it named was retired. Lower-case hex and one hyphen,
     /// so the id is inside the modelled `InvocationArn` pattern's `[a-zA-Z0-9-_]+`
-    /// resource segment and the whole ARN stays well inside its `@length(1..128)`.
+    /// resource segment; its fixed width is what [`arn_region`] bounds the ARN's region
+    /// segment against, so the whole ARN stays inside its `@length(1..128)`.
     pub fn mint_invocation_id(&mut self, now: SystemTime) -> String {
         self.minted_invocations = self.minted_invocations.wrapping_add(1);
         let since_epoch = now
@@ -781,6 +784,26 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
     }
 }
 
+/// The region segment an ARN this service MINTS may carry: `candidate` when it is a
+/// well-formed AWS region label, else [`DEFAULT_REGION`].
+///
+/// A minted ARN is returned in — and read back through — members the model constrains
+/// (`InvocationArn`, `@length(1..128)` and its pattern; `TaggableResourceArn`), so the
+/// region segment spliced into it has to leave the whole value inside those bounds: an
+/// ARN this service hands out but its own input members refuse would name a record no
+/// caller could ever address. The label is therefore read through the shared
+/// `service_common::arn::region_label` grammar — non-empty, at most 20 characters, and
+/// composed only of `[a-z0-9-]`, the form every model's `*Arn` pattern states for the
+/// field — which is what bounds the result: the fixed part of an invocation ARN
+/// (`arn:aws:bedrock:` + account + [`INVOCATION_RESOURCE_PREFIX`]) plus the 33-character
+/// id [`ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState::mint_invocation_id`]
+/// produces is 90 characters, so a region label within that grammar can never push the
+/// ARN past 128. Anything wider names no region an endpoint has, so it is not spliced
+/// into an ARN at all and the service's own region answers instead.
+pub fn arn_region(candidate: &str) -> &str {
+    ::service_common::arn::region_label(candidate).unwrap_or(DEFAULT_REGION)
+}
+
 /// The ARN of an invocation with resource id `invocation_id` in `region`.
 ///
 /// Built through `emulator_server::emulator_arn`, so the account segment is the one
@@ -788,13 +811,13 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
 /// caller mints it with
 /// [`ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState::mint_invocation_id`],
 /// whose hex-and-hyphen text is inside the modelled `InvocationArn` pattern's
-/// `[a-zA-Z0-9-_]+` resource segment — and `region` has already been reduced to that
-/// pattern's `[a-zA-Z0-9-]*` charset by [`request_region`], so the result satisfies the
-/// modelled pattern for every input this service produces.
+/// `[a-zA-Z0-9-_]+` resource segment — and `region` is reduced to a region label by
+/// [`arn_region`] HERE, at the one place an invocation ARN is built, so the result
+/// satisfies the modelled pattern and its `@length(1..128)` whatever a caller passes.
 pub fn invocation_arn(region: &str, invocation_id: &str) -> String {
     ::emulator_server::emulator_arn(
         ARN_NAMESPACE,
-        region,
+        arn_region(region),
         &format!("{INVOCATION_RESOURCE_PREFIX}{invocation_id}"),
     )
 }
@@ -802,22 +825,16 @@ pub fn invocation_arn(region: &str, invocation_id: &str) -> String {
 /// The region to mint an ARN in for this request: the SigV4 credential scope's region,
 /// else [`DEFAULT_REGION`].
 ///
-/// The scope region is accepted only when it is non-empty and entirely within the
-/// modelled `InvocationArn` pattern's `[a-zA-Z0-9-]*` region charset; anything else
-/// falls back to [`DEFAULT_REGION`] rather than being spliced into an ARN. This is a
-/// charset check, NOT a check that the label names a real AWS region: the emulator
-/// serves whatever region a caller signs for, and the only property an ARN needs is
-/// that it satisfies the modelled pattern.
+/// The scope region is accepted only when [`arn_region`] reports it as a region label an
+/// ARN can carry; anything else — absent, empty, or outside that grammar — falls back to
+/// [`DEFAULT_REGION`] rather than being spliced into an ARN. This is not a check that the
+/// label names a region AWS has deployed: the emulator serves whatever region a caller
+/// signs for, and the only property a minted ARN needs is that it stays inside the
+/// members the model constrains it by.
 pub fn request_region(parts: &::http::request::Parts) -> String {
-    ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map(|scope| scope.region)
-        .filter(|region| {
-            !region.is_empty()
-                && region
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        })
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+    let signed =
+        ::emulator_server::sigv4_credential_scope(&parts.headers).map(|scope| scope.region);
+    arn_region(signed.as_deref().unwrap_or_default()).to_string()
 }
 
 /// A stored instant as the modelled `Timestamp` the wire carries.
