@@ -1187,6 +1187,19 @@ fn newest_first<'a, T>(
         .filter_map(|identifier| records.get(identifier))
 }
 
+/// Which record of this store a tag operation's `ResourceArn` resolved to, and its
+/// identifier in that record's map — what
+/// [`ComAmazonawsBackupsearchCryobackupsearchserviceState::taggable_record`] answers.
+///
+/// The variants are the resources this service mints that carry a tag set, so adding a
+/// third taggable record type is a variant here and one more arm in the single resolution
+/// step, rather than a second copy of the resolution order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TaggableRecord {
+    SearchJob(String),
+    ExportJob(String),
+}
+
 impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// Materialise every status transition the clock has already made due. Call this
     /// FIRST in every handler that reports or moves a search job's STATUS, including a
@@ -1214,9 +1227,14 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         self.search_jobs.get_mut(identifier)
     }
 
-    /// The tag set stored on the resource whose minted ARN is `arn` — how the tagging
-    /// operations, which take an unconstrained `ResourceArn`, resolve the resource they
-    /// name.
+    /// The record whose minted ARN is `arn` — how the tagging operations, which take an
+    /// unconstrained `ResourceArn`, resolve the resource they name. THE one resolution
+    /// step: both [`tags_by_arn`](Self::tags_by_arn) (the read `ListTagsForResource`
+    /// performs) and [`tags_by_arn_mut`](Self::tags_by_arn_mut) (the write `TagResource`
+    /// and `UntagResource` perform) reach their tag set through this, so the ARNs the read
+    /// path resolves and the ARNs the write path resolves cannot drift apart, and a change
+    /// to the resolution — another taggable record type, or which record wins when two
+    /// carry one ARN — is made here once.
     ///
     /// The lookup spans EVERY resource this service mints and holds, not one type of
     /// them: a `ResourceArn` is documented only as "the resource that will have the
@@ -1226,44 +1244,46 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// a held search job or a held export job resolves, and `None` — the
     /// `ResourceNotFoundException` the tag APIs answer — is reserved for an ARN that
     /// matches no record this store holds.
+    ///
+    /// It answers WHICH record was matched rather than a borrow of it, so the one
+    /// resolution serves the mutable path too: a map cannot be borrowed for the search and
+    /// the write at once.
+    fn taggable_record(&self, arn: &str) -> Option<TaggableRecord> {
+        if let Some(job) = self.search_jobs.values().find(|job| job.arn == arn) {
+            return Some(TaggableRecord::SearchJob(job.identifier.clone()));
+        }
+        let job = self.export_jobs.values().find(|job| job.arn == arn)?;
+        Some(TaggableRecord::ExportJob(job.identifier.clone()))
+    }
+
+    /// The tag set stored on the resource whose minted ARN is `arn`, as
+    /// `ListTagsForResource` reads it — the resource
+    /// [`taggable_record`](Self::taggable_record) resolves the ARN to.
     pub fn tags_by_arn(&self, arn: &str) -> Option<&HashMap<String, String>> {
-        self.search_jobs
-            .values()
-            .find(|job| job.arn == arn)
-            .map(|job| &job.tags)
-            .or_else(|| {
-                self.export_jobs
-                    .values()
-                    .find(|job| job.arn == arn)
-                    .map(|job| &job.tags)
-            })
+        match self.taggable_record(arn)? {
+            TaggableRecord::SearchJob(identifier) => {
+                self.search_jobs.get(&identifier).map(|job| &job.tags)
+            }
+            TaggableRecord::ExportJob(identifier) => {
+                self.export_jobs.get(&identifier).map(|job| &job.tags)
+            }
+        }
     }
 
     /// The tag set stored on the resource whose minted ARN is `arn`, mutably — the same
     /// resolution [`tags_by_arn`](Self::tags_by_arn) performs, for `TagResource` and
     /// `UntagResource`.
     pub fn tags_by_arn_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
-        // Resolved to an identifier first, then borrowed mutably: the map a record lives
-        // in cannot be borrowed for the search and the write at once.
-        if let Some(identifier) = self
-            .search_jobs
-            .values()
-            .find(|job| job.arn == arn)
-            .map(|job| job.identifier.clone())
-        {
-            return self
+        match self.taggable_record(arn)? {
+            TaggableRecord::SearchJob(identifier) => self
                 .search_jobs
                 .get_mut(&identifier)
-                .map(|job| &mut job.tags);
+                .map(|job| &mut job.tags),
+            TaggableRecord::ExportJob(identifier) => self
+                .export_jobs
+                .get_mut(&identifier)
+                .map(|job| &mut job.tags),
         }
-        let identifier = self
-            .export_jobs
-            .values()
-            .find(|job| job.arn == arn)
-            .map(|job| job.identifier.clone())?;
-        self.export_jobs
-            .get_mut(&identifier)
-            .map(|job| &mut job.tags)
     }
 
     /// Every job NEWEST-CREATED FIRST, which is the sequence `ListSearchJobs` filters

@@ -59,6 +59,8 @@ mod stop_search_job_status_gate;
 mod success_status;
 #[path = "all/tag_admission_rule.rs"]
 mod tag_admission_rule;
+#[path = "all/tag_arn_resolution.rs"]
+mod tag_arn_resolution;
 #[path = "all/tag_character_set.rs"]
 mod tag_character_set;
 #[path = "all/tag_removal.rs"]
