@@ -29,6 +29,8 @@ mod pls_alphabet_support;
 mod pls_document_validity;
 #[path = "all/pls_replacement_measurement.rs"]
 mod pls_replacement_measurement;
+#[path = "all/pls_replacement_whitespace.rs"]
+mod pls_replacement_whitespace;
 // The shared PLS document fixture, driven through the path the suites that share it
 // drive.
 #[path = "all/shared_pls_fixture.rs"]

@@ -361,14 +361,21 @@ fn character_data_outside_the_document() -> PlsRejection {
 /// measured is the WHOLE character content of the element — every text node under it,
 /// whatever elements that text is nested in and whatever follows them, with a
 /// character written as an entity or character reference counting as the one character
-/// it stands for — so no nesting and no form of escaping can leave part of a
+/// it stands for and WHITESPACE counting wherever it sits in the element, including at
+/// its edges — so no nesting, no form of escaping and no padding can leave part of a
 /// replacement unmeasured.
 pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
     use quick_xml::events::Event;
     use quick_xml::name::ResolveResult;
 
+    // The reader is left UNTRIMMED. Trimming is applied per text EVENT, and the reader
+    // breaks character data at every entity or character reference and at every child
+    // element, so a replacement arrives as several fragments: trimming them would drop
+    // the replacement's own leading, trailing and reference-adjacent spaces before they
+    // are measured, and those spaces are characters of the content the quota is on.
+    // Whitespace around the document element, which XML does admit, is recognised where
+    // the events outside every element are handled instead.
     let mut reader = quick_xml::NsReader::from_str(content);
-    reader.config_mut().trim_text(true);
 
     let mut document_element: Option<DocumentElement> = None;
     let mut lexemes_count: i32 = 0;
