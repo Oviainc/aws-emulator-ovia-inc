@@ -23,7 +23,7 @@ use ::service_com_amazonaws_outposts_outpostsolafservice::state as outposts;
 use crate::ops::types::{
     AccessDeniedException, ConflictException, FirewallConfig, FirewallDomainList,
     FirewallDomainListMetadata,
-    FirewallRule, FirewallRuleGroup,
+    FirewallRule, FirewallRuleGroup, FirewallRuleGroupMetadata,
     InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
     LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
@@ -1578,6 +1578,27 @@ impl FirewallRuleGroupRecord {
             share_status: Some(self.share_status.clone()),
             creation_time: Some(self.creation_time.clone()),
             modification_time: Some(self.modification_time.clone()),
+        }
+    }
+
+    /// Project the record onto the modelled `FirewallRuleGroupMetadata`, the
+    /// "minimal high-level information for a firewall rule group"
+    /// `ListFirewallRuleGroups` reports.
+    ///
+    /// It is the same record [`Self::to_rule_group`] projects, narrowed to the
+    /// members `FirewallRuleGroupMetadata` declares
+    /// (`smithy_query(query="shape",shape="FirewallRuleGroupMetadata")`): the
+    /// metadata shape carries no `RuleCount`, `Status`, `StatusMessage` or
+    /// timestamps, which is why its doc says to "call GetFirewallRuleGroup and
+    /// ListFirewallRules" for the full information.
+    pub fn to_metadata(&self) -> FirewallRuleGroupMetadata {
+        FirewallRuleGroupMetadata {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            owner_id: Some(self.owner_id.clone()),
+            creator_request_id: Some(self.creator_request_id.clone()),
+            share_status: Some(self.share_status.clone()),
         }
     }
 }
@@ -3718,6 +3739,17 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         all
     }
 
+    /// Every stored firewall rule group in creation order — the order
+    /// `ListFirewallRuleGroups`' pages and its cursor are defined over, for the
+    /// same reason as [`Self::firewall_domain_lists_in_creation_order`]: a page
+    /// is cut at an offset into this sequence, so the sequence must not depend
+    /// on the hash order of the map that holds the records.
+    pub fn firewall_rule_groups_in_creation_order(&self) -> Vec<&FirewallRuleGroupRecord> {
+        let mut all: Vec<&FirewallRuleGroupRecord> = self.firewall_rule_groups.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
+    }
+
     /// The resource an ARN names, when this store holds one under it.
     ///
     /// Matched against the ARN each record was minted with, so an ARN resolves
@@ -4114,6 +4146,14 @@ pub const FIREWALL_DOMAIN_LIST_LIST_SCOPE: &str = "ListFirewallDomainLists/all/v
 /// [`FIREWALL_DOMAIN_LIST_LIST_SCOPE`] — the scope is a constant that names the
 /// operation.
 pub const FIREWALL_CONFIG_LIST_SCOPE: &str = "ListFirewallConfigs/all/v1";
+
+/// The cursor scope of one `ListFirewallRuleGroups` query.
+///
+/// `ListFirewallRuleGroups` models no filter either — only `MaxResults` and
+/// `NextToken` (`smithy_query(query="operation",operation="ListFirewallRuleGroups")`)
+/// — so, for the same reason as [`FIREWALL_DOMAIN_LIST_LIST_SCOPE`], the scope
+/// is a constant that names the operation.
+pub const FIREWALL_RULE_GROUP_LIST_SCOPE: &str = "ListFirewallRuleGroups/all/v1";
 
 /// The largest page `ListFirewallConfigs` may be asked for, from the range the
 /// model puts on its `MaxResults` (5..10,
