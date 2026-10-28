@@ -125,6 +125,8 @@ mod glossaries;
 mod glossary_deletion;
 #[path = "all/glossary_term_association.rs"]
 mod glossary_term_association;
+#[path = "all/glossary_term_deletion.rs"]
+mod glossary_term_deletion;
 #[path = "all/glossary_term_listing.rs"]
 mod glossary_term_listing;
 #[path = "all/glossary_terms.rs"]
