@@ -1093,6 +1093,31 @@ impl Monitor {
             self.state = MONITOR_STATE_ACTIVE.to_string();
         }
     }
+
+    /// Apply a call's write to one of THIS monitor's probes: when that write
+    /// stored something new (`stored_change`) the monitor's own `modifiedAt`
+    /// moves to the instant of the call, and the monitor's state then follows
+    /// the probes it now holds ([`Self::follow_probe_states`]).
+    ///
+    /// The probes are part of the monitor record every read reports
+    /// (`GetMonitor` lists them with their own members), so a call that adds a
+    /// probe, takes one away or rewrites one CHANGED the monitor — the same rule
+    /// a changed tag map follows
+    /// ([`ComAmazonawsNetworkmonitorNetworkmonitorState::mark_modified`]). A
+    /// call that stored nothing new changed nothing, so it moves no
+    /// `modifiedAt`: the probe-writing operations are `@idempotent`, and a
+    /// repeat of one leaves both records exactly as they were.
+    ///
+    /// Called by every operation that writes a probe of a stored monitor, so
+    /// one rule is applied however the probes changed. NOT part of the settle
+    /// walk a read performs: a transition the clock made due was already owed by
+    /// the call that scheduled it, and a read modifies nothing.
+    pub fn follow_probe_write(&mut self, stored_change: bool, now: SystemTime) {
+        if stored_change {
+            self.modified_at = now;
+        }
+        self.follow_probe_states(now);
+    }
 }
 
 /// Which stored resource the `resourceArn` of a tagging request names.

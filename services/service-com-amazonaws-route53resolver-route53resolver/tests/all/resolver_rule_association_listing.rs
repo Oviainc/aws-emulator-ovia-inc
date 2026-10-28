@@ -16,9 +16,7 @@
 //! [`super::resolver_rule_deletion`].
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
-
-use super::harness::{emulator, expect_error, ok, string_member, without_status};
+use super::harness::{emulator, expect_error, ok, string_member, without_status, Emulator};
 use super::resolver_rule_deletion::{associate, forward_rule, outbound_endpoint};
 
 /// The VPCs the table below associates rules with.
@@ -30,7 +28,7 @@ const SECOND_VPC: &str = "vpc-00000000000000062";
 ///
 /// The records span what a list query selects on: which rule the association is
 /// of, which VPC it is with, and a `Name` present or absent.
-async fn seed_associations(router: &MultiServiceRouter) -> (Vec<String>, Vec<String>) {
+async fn seed_associations(router: &Emulator) -> (Vec<String>, Vec<String>) {
     let endpoint = outbound_endpoint(router, "endpoint-association-listing").await;
     let first_rule = forward_rule(
         router,

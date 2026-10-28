@@ -42,6 +42,11 @@ mod cloudformation_provisions_backup_resources;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions
 // concurrently landing suites add their line to.
+#[path = "all/cloudformation_provisions_route53_health_checks.rs"]
+mod cloudformation_provisions_route53_health_checks;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_kms_aliases.rs"]
 mod cloudformation_provisions_kms_aliases;
 // Declared beside the entry above, at the head, for the same reason: the appended tail and

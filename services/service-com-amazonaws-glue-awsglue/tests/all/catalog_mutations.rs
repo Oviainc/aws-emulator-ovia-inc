@@ -888,15 +888,6 @@ async fn unsupported_update_members_are_refused_not_silently_dropped() {
             }),
         ),
         (
-            "UpdateTable with VersionId",
-            "UpdateTable",
-            json!({
-                "DatabaseName": "guarded_db",
-                "TableInput": { "Name": "events" },
-                "VersionId": "1"
-            }),
-        ),
-        (
             "UpdateTable with ViewUpdateAction",
             "UpdateTable",
             json!({

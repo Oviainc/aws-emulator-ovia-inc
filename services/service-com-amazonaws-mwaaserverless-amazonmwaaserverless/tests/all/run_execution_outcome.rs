@@ -302,7 +302,11 @@ fn poll_budget() -> Duration {
 
 /// Poll `GetWorkflowRun` the way a client waiting for completion does, and answer the
 /// last report once the run has finished.
-async fn run_to_completion(
+///
+/// `pub(crate)` with [`read_task_instance`] below, so another suite that has to let a run
+/// finish before reading its instances polls through the same harness rather than keeping
+/// a second copy of it.
+pub(crate) async fn run_to_completion(
     router: &smithy_server_runtime::MultiServiceRouter,
     workflow_arn: &str,
     run_id: &str,
@@ -331,7 +335,7 @@ async fn run_to_completion(
 }
 
 /// `GetTaskInstance` for one instance of a run.
-async fn read_task_instance(
+pub(crate) async fn read_task_instance(
     router: &smithy_server_runtime::MultiServiceRouter,
     workflow_arn: &str,
     run_id: &str,

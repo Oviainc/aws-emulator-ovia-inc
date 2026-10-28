@@ -41,6 +41,8 @@ mod identity_source_region;
 mod identity_sources;
 #[path = "all/inactive_team_version_deletion.rs"]
 mod inactive_team_version_deletion;
+#[path = "all/key_token_pagination.rs"]
+mod key_token_pagination;
 #[path = "all/management_account_gate_order.rs"]
 mod management_account_gate_order;
 #[path = "all/pagination_token_provenance.rs"]

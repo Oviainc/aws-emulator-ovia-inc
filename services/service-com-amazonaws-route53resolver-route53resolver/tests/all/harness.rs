@@ -11,6 +11,7 @@
 //! copy of the dispatch, the error reading and the timestamp parsing.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_route53resolver_route53resolver::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
@@ -22,18 +23,106 @@ pub const REGION: &str = "us-west-2";
 /// The canonical placeholder account id every emulator ARN carries.
 pub const ACCOUNT: &str = "000000000000";
 
+/// The IPv4 CIDR block of the VPC [`Emulator::hold_subnets`] registers its
+/// subnets in; each subnet gets one /24 block of it.
+const VPC_CIDR_BLOCK: &str = "10.0.0.0/16";
+
+/// The emulator a suite drives: the router every request goes through, and the
+/// shared engine it is mounted on.
+///
+/// It dereferences to the router, so a suite that only makes requests uses it
+/// exactly as it would the router itself. The engine is what gives a suite
+/// access to the account's resources in ANOTHER service's store — the Amazon
+/// EC2 subnets a Resolver endpoint's IP addresses are placed in
+/// ([`Emulator::hold_subnets`]).
+pub struct Emulator {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl std::ops::Deref for Emulator {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.router
+    }
+}
+
+impl Emulator {
+    /// Put one subnet per id into the account's own Amazon EC2 store, inside a
+    /// VPC of that store.
+    ///
+    /// `CreateResolverEndpoint` and `AssociateResolverEndpointIpAddress` place
+    /// an endpoint's IP addresses IN subnets of the caller's VPC and resolve
+    /// every `SubnetId` against that store, so a suite whose write must be
+    /// served registers the subnets it names here first — the way
+    /// [`rack_outpost`] racks the Outpost a Resolver on an Outpost needs.
+    ///
+    /// Each subnet is stored as the modelled shape Amazon EC2 reports, in the
+    /// one VPC this account's store holds for these suites, `available`, with a
+    /// /24 block of that VPC and a zone of [`REGION`].
+    pub fn hold_subnets<I>(&self, subnet_ids: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let ec2_state = ec2::state::service_state(&*self.engine)
+            .expect("the in-memory engine carries the account's Amazon EC2 store");
+        let mut store = ec2_state.lock();
+        let vpc_id = store.vpcs.keys().next().cloned().unwrap_or_else(|| {
+            let vpc_id = store.next_id("vpc");
+            store.vpcs.insert(
+                vpc_id.clone(),
+                ec2::ops::types::Vpc {
+                    vpc_id: Some(vpc_id.clone()),
+                    cidr_block: Some(VPC_CIDR_BLOCK.to_string()),
+                    state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+                    ..Default::default()
+                },
+            );
+            vpc_id
+        });
+        for subnet_id in subnet_ids {
+            let subnet_id = subnet_id.as_ref().to_string();
+            if store.subnets.contains_key(&subnet_id) {
+                continue;
+            }
+            let block = store.subnets.len() % 256;
+            store.subnets.insert(
+                subnet_id.clone(),
+                ec2::ops::types::Subnet {
+                    subnet_id: Some(subnet_id),
+                    vpc_id: Some(vpc_id.clone()),
+                    cidr_block: Some(format!("10.0.{block}.0/24")),
+                    availability_zone: Some(format!("{REGION}a")),
+                    state: Some(ec2::state::SUBNET_STATE_AVAILABLE.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Take the subnet `subnet_id` names out of the account's Amazon EC2 store,
+    /// so a Resolver write that names it afterwards resolves to nothing.
+    pub fn release_subnet(&self, subnet_id: &str) {
+        let ec2_state = ec2::state::service_state(&*self.engine)
+            .expect("the in-memory engine carries the account's Amazon EC2 store");
+        ec2_state.lock().subnets.remove(subnet_id);
+    }
+}
+
 /// A fresh emulator: one shared engine, this one service mounted on it.
-pub fn emulator() -> MultiServiceRouter {
+pub fn emulator() -> Emulator {
     emulator_on(Arc::new(engine::InMemoryEngine::new()))
 }
 
 /// The same emulator, mounted on an engine the caller keeps a handle to — for a
 /// suite that must observe the store itself and not only the wire (whether a
 /// call wrote a record at all, say).
-pub fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> Emulator {
     let mut router = MultiServiceRouter::new();
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    Emulator { router, engine }
 }
 
 /// A fresh emulator with this service AND the account's own AWS Outposts
@@ -43,14 +132,16 @@ pub fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 /// so a suite that creates one racks it first — through the Outposts API, over
 /// the wire, exactly as an account does ([`rack_outpost`]) — and the two
 /// services read the one inventory because they share the engine.
-pub fn emulator_with_outposts() -> MultiServiceRouter {
+pub fn emulator_with_outposts() -> Emulator {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(
-        service_com_amazonaws_outposts_outpostsolafservice::EmulatedService::new(engine),
+        service_com_amazonaws_outposts_outpostsolafservice::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    router
+    Emulator { router, engine }
 }
 
 /// Rack one Outpost in `region` and answer its `OutpostArn`.
