@@ -105,6 +105,8 @@ mod distributions_by_web_acl_id;
 mod domain_conflicts;
 #[path = "all/edge_data_plane.rs"]
 mod edge_data_plane;
+#[path = "all/enum_value_set_message.rs"]
+mod enum_value_set_message;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/field_level_encryption_config_delete.rs"]

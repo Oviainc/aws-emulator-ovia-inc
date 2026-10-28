@@ -54,7 +54,9 @@
 //!   set it broke. The BINDING the value travelled in does not change that — a query
 //!   parameter, a member of the request's document and a member nested inside its payload
 //!   are all the same schema — so the condition reads the constraint the refusal reports
-//!   and nothing else;
+//!   and nothing else. The value set that sentence lists is a property of the ENUM, so it
+//!   is listed in the order this service publishes that enum's values
+//!   ([`STATED_VALUE_ORDERS`]);
 //! * a body-bearing request that carries NO body cannot have a payload at all, so the
 //!   null member the boundary reports is one nested inside that payload and the member
 //!   that is really absent is the payload itself: the answer is `MalformedXML` (400)
@@ -313,41 +315,74 @@ fn refused_over_enum_value(refusal: &str) -> bool {
     element_text(refusal, "Message").is_some_and(|message| message.contains(ENUM_VALUE_SET_MARKER))
 }
 
-/// `refusal` with the enum's admitted values stated in ONE canonical order.
+/// The value sets this service publishes in an order of its own, each listed in that order.
 ///
-/// What the refusal reports is a SET of admitted values, so the order the model happens to
-/// declare them in says nothing about the request that broke the constraint: the set is
-/// stated sorted, so the same constraint is always refused with the same sentence.
-fn with_sorted_enum_values(refusal: &str) -> String {
+/// A refusal reports the SET a member admits rather than the shape that set came from, so a
+/// set is recognised by the values it holds: every member targeting that enum is stated
+/// alike, in every operation and in whatever binding carried the value. A value set with no
+/// row here is listed in the order it ARRIVED in — the order this API's schema declares the
+/// enum in, which is the only order there is evidence for.
+const STATED_VALUE_ORDERS: &[&[&str]] = &[
+    // `FunctionStage`, the stage every function and connection-function operation names a
+    // copy of a function by: the service lists the published stage first, which is not the
+    // order the schema declares (`smithy_query(query="shape",shape="FunctionStage")` ->
+    // DEVELOPMENT, LIVE).
+    &["LIVE", "DEVELOPMENT"],
+];
+
+/// `refusal` with the enum's admitted values listed in the order this service publishes that
+/// enum's values.
+///
+/// The value set a refusal reports is a property of the ENUM the member targets, not of the
+/// request that broke it, so the order it is listed in is the service's own for that enum
+/// ([`STATED_VALUE_ORDERS`]) and nothing the emulator chooses: a set whose published order is
+/// the order it arrived in is handed back untouched.
+fn with_stated_enum_values(refusal: &str) -> String {
     let Some(message) = element_text(refusal, "Message") else {
         return refusal.to_string();
     };
-    let Some(sorted) = sorted_enum_values(message) else {
+    let Some(stated) = stated_enum_values(message) else {
         return refusal.to_string();
     };
     refusal.replacen(
         &format!("<Message>{message}</Message>"),
-        &format!("<Message>{sorted}</Message>"),
+        &format!("<Message>{stated}</Message>"),
         1,
     )
 }
 
-/// `message` with the value set it lists after [`ENUM_VALUE_SET_MARKER`] sorted, or `None`
-/// when it lists none — the rewrite reads the MESSAGE rather than the document, so nothing
-/// else the envelope carries can be touched by it.
-fn sorted_enum_values(message: &str) -> Option<String> {
+/// `message` with the value set it lists after [`ENUM_VALUE_SET_MARKER`] listed in this
+/// service's order for that set, or `None` when it lists no set or lists one this service
+/// states in the order it already stands in — the rewrite reads the MESSAGE rather than the
+/// document, so nothing else the envelope carries can be touched by it.
+fn stated_enum_values(message: &str) -> Option<String> {
     let marker_at = message.find(ENUM_VALUE_SET_MARKER)?;
     let tail = &message[marker_at..];
     let open = tail.find('[')?;
     let close = open + tail[open..].find(']')?;
-    let mut values: Vec<&str> = tail[open + 1..close].split(',').map(str::trim).collect();
-    values.sort_unstable();
+    let values: Vec<&str> = tail[open + 1..close].split(',').map(str::trim).collect();
+    let stated = stated_value_order(&values)?;
     Some(format!(
         "{}{}{}",
         &message[..marker_at + open + 1],
-        values.join(", "),
+        stated.join(", "),
         &message[marker_at + close..]
     ))
+}
+
+/// The order this service lists `values` in, or `None` when that is the order they already
+/// stand in — every value set but the ones [`STATED_VALUE_ORDERS`] pins.
+fn stated_value_order(values: &[&str]) -> Option<Vec<&'static str>> {
+    STATED_VALUE_ORDERS
+        .iter()
+        .find(|stated| is_same_value_set(stated, values))
+        .map(|stated| stated.to_vec())
+}
+
+/// Whether two value sets hold the same values. An enum's values are unique by definition,
+/// so equal lengths plus containment is set equality.
+fn is_same_value_set(stated: &[&str], values: &[&str]) -> bool {
+    stated.len() == values.len() && stated.iter().all(|value| values.contains(value))
 }
 
 /// `refusal` answered under `code`, with everything else the boundary rendered — its
@@ -426,9 +461,11 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // value outside it is one CloudFront cannot read, which it answers with `MalformedXML`
     // (400) — the same code it answers any unreadable request document with, in whatever
     // binding the value travelled. The member and the values it admits are what the
-    // boundary's own sentence states, so only the code is restated.
+    // boundary's own sentence states, so the code is restated and the sentence is left as it
+    // stands — except for the ORDER the value set is listed in, which belongs to the enum and
+    // is this service's own for it.
     if refused_over_enum_value(refusal) {
-        return Some(recoded(&with_sorted_enum_values(refusal), MALFORMED_XML));
+        return Some(recoded(&with_stated_enum_values(refusal), MALFORMED_XML));
     }
 
     // A request with a body to give carried none, so the whole payload is null. The
@@ -581,35 +618,70 @@ mod tests {
         )
     }
 
-    /// The value set an enum refusal lists is a SET: the sentence states it in one order,
-    /// and nothing else the refusal says changes.
+    /// An enum refusal's value set is listed in the order this service publishes that enum's
+    /// values, and a set this service has no order of its own for keeps the order it arrived
+    /// in. Nothing else the sentence says changes either way.
     #[test]
-    fn an_enum_refusals_value_set_is_stated_sorted() {
-        let refusal = format!(
-            "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
-             <Code>{FRAMEWORK_REFUSAL_CODE}</Code><Message>1 validation error detected: \
-             Value &apos;bogus&apos; at &apos;type&apos; failed to satisfy constraint: \
-             {ENUM_VALUE_SET_MARKER} [managed, custom]</Message></Error></ErrorResponse>"
-        );
-        let sorted = with_sorted_enum_values(&refusal);
-        assert_eq!(
-            element_text(&sorted, "Message"),
-            Some(
-                "1 validation error detected: Value &apos;bogus&apos; at &apos;type&apos; \
-                 failed to satisfy constraint: Member must satisfy enum value set: \
-                 [custom, managed]"
+    fn an_enum_refusals_value_set_is_listed_in_the_services_order() {
+        // (case, the set as the boundary listed it, the set as this service lists it). The
+        // value sets come from `smithy_query(query="shape",shape="…")`: FunctionStage
+        // (DEVELOPMENT, LIVE), CachePolicyType (managed, custom) and IpAddressType (ipv4,
+        // ipv6, dualstack).
+        let rows: [(&str, &str, &str); 5] = [
+            (
+                "the stage set as the schema declares it",
+                "[DEVELOPMENT, LIVE]",
+                "[LIVE, DEVELOPMENT]",
             ),
-            "expected the value set stated sorted, got {sorted}"
-        );
+            (
+                "the stage set already in the order the service lists it",
+                "[LIVE, DEVELOPMENT]",
+                "[LIVE, DEVELOPMENT]",
+            ),
+            (
+                "a two-value set with no order of its own",
+                "[managed, custom]",
+                "[managed, custom]",
+            ),
+            (
+                "a three-value set with no order of its own",
+                "[ipv4, ipv6, dualstack]",
+                "[ipv4, ipv6, dualstack]",
+            ),
+            (
+                "a one-value set holding a stage",
+                "[DEVELOPMENT]",
+                "[DEVELOPMENT]",
+            ),
+        ];
+
+        for (case, listed, expected) in rows {
+            let refusal = format!(
+                "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
+                 <Code>{FRAMEWORK_REFUSAL_CODE}</Code><Message>1 validation error detected: \
+                 Value &apos;bogus&apos; at &apos;stage&apos; failed to satisfy constraint: \
+                 {ENUM_VALUE_SET_MARKER} {listed}</Message></Error></ErrorResponse>"
+            );
+            let stated = with_stated_enum_values(&refusal);
+            let actual = element_text(&stated, "Message").unwrap_or_default();
+            let wanted = format!(
+                "1 validation error detected: Value &apos;bogus&apos; at &apos;stage&apos; \
+                 failed to satisfy constraint: {ENUM_VALUE_SET_MARKER} {expected}"
+            );
+            assert_eq!(
+                actual, wanted,
+                "case {case:?}: expected the sentence {wanted:?}, got {actual:?}"
+            );
+        }
 
         // A refusal that lists no value set is handed back exactly as it stands.
         let other = "<ErrorResponse><Error><Code>ValidationException</Code>\
                      <Message>Value null at &apos;x.y&apos; failed to satisfy constraint: \
                      Member must not be null</Message></Error></ErrorResponse>";
+        let actual = with_stated_enum_values(other);
         assert_eq!(
-            with_sorted_enum_values(other),
-            other,
-            "a refusal about another constraint must be left alone"
+            actual, other,
+            "case \"another constraint\": expected the refusal left alone, got {actual:?}"
         );
     }
 

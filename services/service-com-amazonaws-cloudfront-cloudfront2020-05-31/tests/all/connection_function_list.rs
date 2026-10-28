@@ -561,7 +561,7 @@ async fn a_stage_outside_the_modelled_enum_is_refused_as_a_request_that_cannot_b
             "case {case} ({value:?}): expected the refusal to name the member, got {message:?}"
         );
         assert!(
-            message.contains(&format!("[{STAGE_DEVELOPMENT}, {STAGE_LIVE}]")),
+            message.contains(&format!("[{STAGE_LIVE}, {STAGE_DEVELOPMENT}]")),
             "case {case} ({value:?}): expected the refusal to state the value set, got \
              {message:?}"
         );

@@ -455,9 +455,9 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
     let (list_id, etag) = anycast_ip_list(&router, "refusal-contract-enum").await;
 
     // `IpAddressType` admits ipv4, ipv6 and dualstack
-    // (`smithy_query(query="shape",shape="IpAddressType")`); the refusal states that set
-    // sorted.
-    let ip_address_types = "[dualstack, ipv4, ipv6]";
+    // (`smithy_query(query="shape",shape="IpAddressType")`); the refusal lists that set in the
+    // order this API publishes the enum's values.
+    let ip_address_types = "[ipv4, ipv6, dualstack]";
     for (case, value) in inadmissible("ipv4") {
         // The update: the member travels in the request document of a PUT addressing one
         // list, under a version token that IS the list's current one, so nothing but the
@@ -517,7 +517,7 @@ async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
             &value,
             &answer,
             "originAccessControlOriginType",
-            "[lambda, mediapackagev2, mediastore, s3]",
+            "[s3, mediastore, mediapackagev2, lambda]",
         );
     }
 
