@@ -47,7 +47,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX, SETTLE_WAIT};
 
 /// `AttachDataSource`: `POST /2021-01-01/opensearch/application/{id}/attachDataSource`.
-async fn attach(emulator: &Emulator, id: &str, body: Value) -> Answer {
+pub(crate) async fn attach(emulator: &Emulator, id: &str, body: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -70,7 +70,11 @@ async fn detach(emulator: &Emulator, id: &str, data_source_arn: &str) -> Answer 
 
 /// `DescribeDataSourceAttachment`:
 /// `POST /2021-01-01/opensearch/application/{id}/describeDataSourceAttachment`.
-async fn describe_attachment(emulator: &Emulator, id: &str, data_source_arn: &str) -> Answer {
+pub(crate) async fn describe_attachment(
+    emulator: &Emulator,
+    id: &str,
+    data_source_arn: &str,
+) -> Answer {
     emulator
         .call(
             "POST",
@@ -82,7 +86,7 @@ async fn describe_attachment(emulator: &Emulator, id: &str, data_source_arn: &st
 
 /// `ListDataSourceAttachments`:
 /// `POST /2021-01-01/opensearch/application/{id}/listDataSourceAttachments`.
-async fn list_attachments(emulator: &Emulator, id: &str, body: Value) -> Answer {
+pub(crate) async fn list_attachments(emulator: &Emulator, id: &str, body: Value) -> Answer {
     emulator
         .call(
             "POST",

@@ -55,7 +55,7 @@ const PASS_THROUGH_DEFINITION: &str = r#"{
 
 /// Pipes, plus every service a pipe's stages and its own metrics live in, on ONE engine —
 /// the shape `core/router/src/lib.rs` mounts them in.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -112,7 +112,11 @@ fn form_encode(value: &str) -> String {
 
 /// One IAM call: IAM speaks `awsQuery`, so its parameters travel as a form body and its
 /// answer comes back as XML.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -141,7 +145,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// The text of the first `<tag>` of an XML body.
-fn xml_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
@@ -150,7 +154,7 @@ fn xml_text(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// A trust policy naming one service principal, written as a client sends it.
-fn trust_policy(principal: &str) -> String {
+pub(crate) fn trust_policy(principal: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -163,7 +167,7 @@ fn trust_policy(principal: &str) -> String {
 }
 
 /// An identity policy allowing `allowed` and denying `denied`, on every resource.
-fn identity_policy(allowed: &[&str], denied: Option<&str>) -> String {
+fn identity_policy(allowed: &[&str], denied: Option<&str>) -> Value {
     let mut statements = vec![json!({
         "Effect": "Allow",
         "Action": allowed,
@@ -176,17 +180,32 @@ fn identity_policy(allowed: &[&str], denied: Option<&str>) -> String {
             "Resource": "*",
         }));
     }
-    json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
+    Value::Array(statements)
 }
 
-/// A role called `name` trusting `principal` and carrying one inline policy; answered with
-/// the ARN IAM persisted.
+/// A role called `name` trusting `principal` and carrying one inline policy over every
+/// resource; answered with the ARN IAM persisted.
 async fn given_role(
     router: &MultiServiceRouter,
     name: &str,
     principal: &str,
     allowed: &[&str],
     denied: Option<&str>,
+) -> String {
+    given_role_stating(router, name, principal, identity_policy(allowed, denied)).await
+}
+
+/// A role called `name` trusting `principal` and carrying `statements` as its one inline
+/// policy; answered with the ARN IAM persisted.
+///
+/// `pub(crate)` because `tests/all/pipe_execution_role.rs` writes its statements against
+/// the queues of each row rather than over every resource, and reaches the SAME role
+/// through this one path.
+pub(crate) async fn given_role_stating(
+    router: &MultiServiceRouter,
+    name: &str,
+    principal: &str,
+    statements: Value,
 ) -> String {
     let document = trust_policy(principal);
     let (status, created) = iam(
@@ -201,7 +220,7 @@ async fn given_role(
     );
     let arn =
         xml_text(&created, "Arn").unwrap_or_else(|| panic!("case {name}: no Arn in {created}"));
-    let document = identity_policy(allowed, denied);
+    let document = json!({ "Version": "2012-10-17", "Statement": statements }).to_string();
     let (status, written) = iam(
         router,
         "PutRolePolicy",

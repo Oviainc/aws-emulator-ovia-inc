@@ -13210,40 +13210,68 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// can observe an instance holding an address the store does not have.
     ///
     /// The instance that held it keeps public addressing, drawn afresh from this
-    /// store's one address allocator: an attached static IP is the ONLY thing
-    /// that pins an instance's public IPv4 address ("To use the same IP address
-    /// after stopping and starting an instance, create a static IP address and
-    /// attach it to the instance" — the modelled `StartInstance`
-    /// documentation), so an instance with none holds an ordinary address the
-    /// platform assigned it, and `Instance$isStaticIp` — "a Boolean value
-    /// indicating whether this instance has a static IP assigned to it" — is
-    /// false again. The private address and the IPv6 addresses are left where
-    /// they are: a static IP reserves one public IPv4 address (the modelled
-    /// `StaticIp$ipAddress`), so it pinned neither.
+    /// store's one address allocator — see
+    /// [`Self::redraw_public_address_without_static_ip`], which is where that
+    /// fallback lives for every call that releases an attachment.
     pub fn remove_static_ip(&mut self, name: &str) -> Option<StoredStaticIp> {
         let static_ip = self.static_ips.remove(name)?;
         if let Some(instance_name) = static_ip.attached_to.clone() {
-            // Which addresses the instance has at all is its own
-            // `ipAddressType`, exactly as it is on a start; an instance the
-            // store no longer holds has none to redraw.
-            let ip_address_type = self
-                .instance(&instance_name)
-                .map(|instance| instance.ip_address_type.clone());
-            if let Some(ip_address_type) = ip_address_type {
-                // ONE draw from the one allocator every address in this store
-                // comes out of, so the address the instance falls back to is one
-                // no resource in this process has held. The private address and
-                // the IPv6 addresses it also yields are dropped — the instance
-                // keeps its own — which spends the offset rather than wasting
-                // it.
-                let (_private, public, _ipv6) = self.fresh_addresses(&ip_address_type);
-                if let Some(instance) = self.instance_mut(&instance_name) {
-                    instance.is_static_ip = false;
-                    instance.public_ip_address = public;
-                }
-            }
+            self.redraw_public_address_without_static_ip(&instance_name);
         }
         Some(static_ip)
+    }
+
+    /// Release the attachment the static IP `name` holds, answering the instance
+    /// it was attached to. `None` when the account holds no static IP of that
+    /// name, or that static IP is attached to nothing — in which case nothing
+    /// was changed.
+    ///
+    /// Only the ATTACHMENT is released: the address stays reserved for the
+    /// account, so the record keeps every other member it has and a later read
+    /// still reports the reservation — releasing the reservation is
+    /// [`Self::remove_static_ip`]'s business. The instance it came off falls
+    /// back to an ordinary public address, through the same
+    /// [`Self::redraw_public_address_without_static_ip`] a release puts it on,
+    /// so the two calls leave an instance in the same state.
+    pub fn detach_static_ip(&mut self, name: &str) -> Option<String> {
+        let instance_name = self.static_ips.get_mut(name)?.attached_to.take()?;
+        self.redraw_public_address_without_static_ip(&instance_name);
+        Some(instance_name)
+    }
+
+    /// Put the instance `instance_name` back on the public addressing it holds
+    /// while no static IP is attached to it, drawn afresh from this store's one
+    /// address allocator.
+    ///
+    /// An attached static IP is the ONLY thing that pins an instance's public
+    /// IPv4 address ("To use the same IP address after stopping and starting an
+    /// instance, create a static IP address and attach it to the instance" — the
+    /// modelled `StartInstance` documentation), so an instance with none holds an
+    /// ordinary address the platform assigned it, and `Instance$isStaticIp` — "a
+    /// Boolean value indicating whether this instance has a static IP assigned to
+    /// it" — is false again. The private address and the IPv6 addresses are left
+    /// where they are: a static IP reserves one public IPv4 address (the modelled
+    /// `StaticIp$ipAddress`), so it pinned neither.
+    fn redraw_public_address_without_static_ip(&mut self, instance_name: &str) {
+        // Which addresses the instance has at all is its own `ipAddressType`,
+        // exactly as it is on a start; an instance this store does not hold has
+        // none to redraw.
+        let Some(ip_address_type) = self
+            .instance(instance_name)
+            .map(|instance| instance.ip_address_type.clone())
+        else {
+            return;
+        };
+        // ONE draw from the one allocator every address in this store comes out
+        // of, so the address the instance falls back to is one no resource in
+        // this process has held. The private address and the IPv6 addresses it
+        // also yields are dropped — the instance keeps its own — which spends
+        // the offset rather than wasting it.
+        let (_private, public, _ipv6) = self.fresh_addresses(&ip_address_type);
+        if let Some(instance) = self.instance_mut(instance_name) {
+            instance.is_static_ip = false;
+            instance.public_ip_address = public;
+        }
     }
 
     /// Store a newly created disk snapshot.
@@ -13392,7 +13420,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
             }
             // The address stays ALLOCATED to the account — nothing released the
             // reservation, only the attachment — so the record keeps every
-            // other member it has.
+            // other member it has. The instance is not put back on platform
+            // addressing here (as `detach_static_ip` does through
+            // [`Self::redraw_public_address_without_static_ip`]): this walk runs
+            // while the instance itself is being removed, so there is no record
+            // left to hold an address.
             static_ip.attached_to = None;
             released.push(ReleasedAttachment {
                 operation_type: OPERATION_TYPE_DETACH_STATIC_IP,

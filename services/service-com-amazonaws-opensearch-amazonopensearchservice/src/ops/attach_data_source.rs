@@ -107,8 +107,8 @@ use super::types::*;
 use crate::state::{
     application_not_found, attachment_client_token_taken, attachment_outcome,
     attachment_quota_exceeded, internal_failure, is_arn, malformed_arn, service_state,
-    state_unavailable, workspace_selection_conflict, DataSourceAttachment, ATTACHMENT_QUOTA,
-    ATTACHMENT_STATUS_FAILED, PROVISIONING,
+    state_unavailable, workspace_selection_conflict, DataSourceActivation, DataSourceAttachment,
+    ATTACHMENT_QUOTA, ATTACHMENT_STATUS_FAILED, PROVISIONING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -184,7 +184,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
 
         // `workspaceId` is "mutually exclusive with workspaceConfiguration" and
@@ -208,6 +207,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
             .into());
         }
+
+        // IAM decides whether the caller may do this BEFORE the application, the
+        // attachment or the data source is looked up, so a caller no identity-based
+        // policy permits is told it is not authorized rather than told anything about
+        // the resources the request names — and nothing is mutated on that path.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::authorization::data_source_attachment_resource(ctx),
+        )
+        .map_err(AttachDataSourceErrorModeled::AccessDeniedException)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -266,15 +277,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its status becomes FAILED." So whether the ARN resolves to a data source is
         // carried by the attachment's status, not by refusing the call — the same way
         // this service accepts a cross-cluster connection whose far domain does not
-        // resolve and reports the outcome on the connection.
-        let data_source_up_at = match store.domain_of_arn(&input.data_source_arn) {
-            // The state of the domain the ARN names is what decides whether the
+        // resolve and reports the outcome on the connection. A data source that is
+        // already active therefore completes AT ONCE, which is the documented rule; a
+        // caller that observes PENDING first for such an attach observed the service
+        // catching up with itself rather than a state of its own.
+        let data_source_up_at = match store.data_source_activation(&input.data_source_arn) {
+            // The state of the data source the ARN names is what decides whether the
             // attachment completes now or is owed to the clock.
-            Some(domain) => domain.cluster_up_at(),
-            // An ARN naming no domain of this account has nothing that becomes active,
-            // so the attachment is owed its outcome a span from here, and settles as the
-            // non-retryable FAILED unless the account holds that data source by then.
-            None => Some(now + PROVISIONING),
+            DataSourceActivation::Active => None,
+            DataSourceActivation::ActiveAt(due) => Some(due),
+            // An ARN naming no data source of this account has nothing that becomes
+            // active, so the attachment is owed its outcome a span from here, and
+            // settles as the non-retryable FAILED unless the account holds that data
+            // source by then.
+            DataSourceActivation::Absent => Some(now + PROVISIONING),
         };
 
         // The set is bounded: past its quota an attach is refused rather than adding

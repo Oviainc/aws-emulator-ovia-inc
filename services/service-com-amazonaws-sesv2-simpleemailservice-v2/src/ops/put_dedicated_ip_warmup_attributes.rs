@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDedicatedIpWarmupAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDedicatedIpWarmupAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDedicatedIpWarmupAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the warm-up percentage of the dedicated IP address the request names onto the
+//! account's record of that address, so `GetDedicatedIp` then reports it, and the warm-up
+//! status derived from it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +130,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDedicatedIpWarmupAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDedicatedIpWarmupAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDedicatedIpWarmupAttributes"))
+        // Request metadata is not needed: a dedicated IP is keyed by the address
+        // itself, inside the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutDedicatedIpWarmupAttributes without the shared emulator state",
+            ));
+        };
+
+        let ip = input.ip;
+        let warmup_percentage = input.warmup_percentage;
+
+        // `Percentage100Wrapper` carries no modelled range, so the range a warm-up
+        // percentage can be set to is refused here, and BEFORE the address is looked
+        // up: a number outside it is invalid input whatever the account holds.
+        if !crate::state::warmup_percentage_can_be_set(warmup_percentage) {
+            return Err(bad_request(crate::state::invalid_warmup_percentage()));
+        }
+
+        // An `Ip` is "an IPv4 address", so a value that is not one names no address at
+        // all: that is invalid input, not an address the account happens not to hold.
+        if !crate::state::ip_is_well_formed(&ip) {
+            return Err(bad_request(crate::state::invalid_ip(&ip)));
+        }
+
+        let mut store = state.lock();
+        // The attributes written are those of "the dedicated IP address that you want
+        // to update the warm-up attributes for", so an address the account holds no
+        // dedicated IP for is a missing resource: this call updates one, it mints none.
+        let Some(record) = store.dedicated_ips.get_mut(&ip) else {
+            return Err(
+                PutDedicatedIpWarmupAttributesErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::dedicated_ip_not_found(&ip)),
+                })
+                .into(),
+            );
+        };
+
+        // "The warm-up percentage that you want to associate with the dedicated IP
+        // address": the request's number replaces the stored one, and the `WarmupStatus`
+        // every reader reports is derived from it, so the two cannot disagree after this
+        // write.
+        record.warmup_percentage = warmup_percentage;
+
+        // `PutDedicatedIpWarmupAttributesResponse` carries no members: the stored
+        // warm-up is read back with `GetDedicatedIp`.
+        Ok(PutDedicatedIpWarmupAttributesOutput {})
     }
 }
+
+/// `BadRequestException` ("the input you provided is invalid") in this operation's error
+/// channel, so every refusal of a bad request is stated the same way.
+fn bad_request(message: impl Into<String>) -> PutDedicatedIpWarmupAttributesError {
+    PutDedicatedIpWarmupAttributesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+

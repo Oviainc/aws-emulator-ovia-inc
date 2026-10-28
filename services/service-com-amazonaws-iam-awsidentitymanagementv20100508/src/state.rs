@@ -624,6 +624,21 @@ pub const MARKER_SCOPE_ACCOUNT_AUTHORIZATION_DETAILS: &str = "account-authorizat
 /// holds a request under.
 pub const MARKER_SCOPE_DELEGATION_REQUESTS: &str = "delegation-requests";
 
+/// The marker scope of the services ONE service-last-accessed report reports on, which
+/// `GetServiceLastAccessedDetails` pages over. The report's own `JobId` follows it, so a
+/// marker issued while paging one report's services names no position in another's: see
+/// [`service_last_accessed_marker_scope`]. The key it carries is a service namespace, the
+/// value that report's entries are ordered by.
+pub const MARKER_SCOPE_SERVICE_LAST_ACCESSED: &str = "service-last-accessed";
+
+/// The marker scope of the entities ONE service-last-accessed report reports for ONE
+/// service, which `GetServiceLastAccessedDetailsWithEntities` pages over. Both the report's
+/// `JobId` and that service's namespace follow it, so a marker issued while paging one
+/// service's entities names no position in another service's: see
+/// [`service_last_accessed_entities_marker_scope`]. The key it carries is an
+/// [`entity_page_key`].
+pub const MARKER_SCOPE_SERVICE_LAST_ACCESSED_ENTITIES: &str = "service-last-accessed-entities";
+
 /// The alphabet the suffix is drawn from: RFC 4648 base32, every character of
 /// which is an uppercase alphanumeric and so inside `idType`'s `^[\w]+$`.
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -1054,6 +1069,40 @@ pub struct OrganizationsAccessReportJob {
     pub completes: ::aws_smithy_types::DateTime,
 }
 
+/// One service-last-accessed report job the account has asked for, keyed in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::service_last_accessed_reports`]
+/// by the `JobId` the generate answered with.
+///
+/// `GenerateServiceLastAccessedDetails` "generates a report that includes details about
+/// when an IAM resource (user, group, role, or policy) was last used in an attempt to
+/// access Amazon Web Services services" and answers only a job id: the report itself is
+/// what `GetServiceLastAccessedDetails` and `GetServiceLastAccessedDetailsWithEntities`
+/// report, so the job records WHICH resource and WHICH level of detail were asked for
+/// rather than an answer computed on the spot.
+#[derive(Debug, Clone)]
+pub struct ServiceLastAccessedJob {
+    /// "The ARN of the IAM resource (user, group, role, or managed policy) used to
+    /// generate information about when the resource was last used in an attempt to
+    /// access an Amazon Web Services service"
+    /// (`GenerateServiceLastAccessedDetails$Arn`), as the request supplied it: the
+    /// resource whose permissions policies the report is about.
+    pub arn: String,
+    /// "The level of detail that you want to generate"
+    /// (`GenerateServiceLastAccessedDetails$Granularity`), reported back by the read as
+    /// its `JobType`. Held RESOLVED: a request that omits the parameter asks for
+    /// service data ("if you don't include this optional parameter, the operation
+    /// generates service data"), which is [`USAGE_GRANULARITY_SERVICE_LEVEL`].
+    pub granularity: String,
+    /// "The date and time, in ISO 8601 date-time format, when the report job was
+    /// created" (`GetServiceLastAccessedDetails$JobCreationDate`).
+    pub created: ::aws_smithy_types::DateTime,
+    /// The instant the generation is DUE, read through [`report_job_status`] exactly as
+    /// an Organizations report job's is ([`OrganizationsAccessReportJob::completes`]):
+    /// stored rather than slept for, so a caller polling straight after the generate
+    /// still sees the job in flight.
+    pub completes: ::aws_smithy_types::DateTime,
+}
+
 /// One persisted server certificate: the metadata every operation reports about it,
 /// beside the PEM material a read may hand back.
 ///
@@ -1330,9 +1379,26 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// `GenerateOrganizationsAccessReport` is what fills this map and
     /// `GetOrganizationsAccessReport` what reports one entry.
     pub organizations_access_reports: BTreeMap<String, OrganizationsAccessReportJob>,
-    /// Monotonic counter feeding
-    /// [`next_access_report_job_id`](Self::next_access_report_job_id).
-    pub organizations_access_report_seq: u64,
+    /// The service-last-accessed report jobs the account has asked for, keyed by the
+    /// `JobId` [`GenerateServiceLastAccessedDetails`] answered with — "the JobId that
+    /// you can use in the GetServiceLastAccessedDetails or
+    /// GetServiceLastAccessedDetailsWithEntities operations" — which is the handle both
+    /// reads take.
+    ///
+    /// `GenerateServiceLastAccessedDetails` is what fills this map;
+    /// `GetServiceLastAccessedDetails` and `GetServiceLastAccessedDetailsWithEntities`
+    /// are what report one entry. Held apart from
+    /// [`Self::organizations_access_reports`] because the two are different reports of
+    /// different resources, read back by different operations: a job id minted for one
+    /// names no job of the other.
+    pub service_last_accessed_reports: BTreeMap<String, ServiceLastAccessedJob>,
+    /// Monotonic counter feeding every report job's `JobId`
+    /// ([`next_access_report_job_id`](Self::next_access_report_job_id) and
+    /// [`next_service_last_accessed_job_id`](Self::next_service_last_accessed_job_id)).
+    ///
+    /// ONE counter for both kinds of job, so no two jobs the account ever records can
+    /// share an id whichever generate minted them.
+    pub report_job_seq: u64,
     /// Monotonic counter feeding
     /// [`next_saml_provider_uuid`](Self::next_saml_provider_uuid).
     pub saml_provider_uuid_seq: u64,
@@ -1421,7 +1487,8 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             delegation_requests: BTreeMap::new(),
             organization: None,
             organizations_access_reports: BTreeMap::new(),
-            organizations_access_report_seq: 0,
+            service_last_accessed_reports: BTreeMap::new(),
+            report_job_seq: 0,
             saml_provider_uuid_seq: 0,
             saml_private_key_id_seq: 0,
             user_id_seq: 0,
@@ -1507,24 +1574,24 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         unique_id(GROUP_ID_PREFIX, self.group_id_seq)
     }
 
-    /// Mint the next access-report job's `JobId`.
+    /// Mint the next Organizations access-report job's `JobId`.
     ///
-    /// `jobIDType` is exactly 36 characters, which is the 8-4-4-4-12 grouping of 128 bits
-    /// AWS reports a job id in, so the id is built as that grouping over two bijectively
-    /// mixed words of the counter — unique for the same reason
+    /// Spelled by [`report_job_id`] — unique for the same reason
     /// [`next_user_id`](Self::next_user_id) is, and minted once, then stored with the job.
     pub fn next_access_report_job_id(&mut self) -> String {
-        self.organizations_access_report_seq += 1;
-        let high = splitmix64(self.organizations_access_report_seq);
-        let low = splitmix64(self.organizations_access_report_seq ^ JOB_ID_LOW_WORD_KEY);
-        format!(
-            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-            high >> 32,
-            (high >> 16) & 0xFFFF,
-            high & 0xFFFF,
-            low >> 48,
-            low & 0xFFFF_FFFF_FFFF
-        )
+        self.report_job_seq += 1;
+        report_job_id(self.report_job_seq)
+    }
+
+    /// Mint the next service-last-accessed report job's `JobId`.
+    ///
+    /// Drawn from the same counter and the same spelling as
+    /// [`next_access_report_job_id`](Self::next_access_report_job_id), so an id is
+    /// unique across BOTH kinds of report job the account records, and minted once,
+    /// then stored with the job.
+    pub fn next_service_last_accessed_job_id(&mut self) -> String {
+        self.report_job_seq += 1;
+        report_job_id(self.report_job_seq)
     }
 
     /// Mint the next SAML provider's `SAMLProviderUUID`.
@@ -2070,6 +2137,45 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             }
         }
         Some(collected)
+    }
+
+    /// The permissions policies the resource a service-last-accessed report is about
+    /// carries, or `None` when `arn` names no such resource of this account.
+    ///
+    /// "The ARN of the IAM resource (user, group, role, or managed policy) used to
+    /// generate information about when the resource was last used in an attempt to access
+    /// an Amazon Web Services service" (`GenerateServiceLastAccessedDetails$Arn`): the
+    /// report is about what that resource's permissions policies ALLOW, so for an
+    /// IDENTITY the collection is the one every reader of an identity's grants takes
+    /// ([`Self::principal_sourced_policies`], which for a user also collects the policies
+    /// the groups it belongs to carry), and for a managed POLICY it is that policy's own
+    /// operative document ([`Self::default_version_document`]).
+    ///
+    /// Only permissions policies: "service last accessed data does not use other policy
+    /// types when determining whether a resource could access a service. These other
+    /// policy types include resource-based policies, access control lists, Organizations
+    /// policies, IAM permissions boundaries, and STS assume role policies. It only
+    /// applies permissions policy logic" (`GenerateServiceLastAccessedDetails`) — which
+    /// is exactly the collection those readers make, so a role's trust policy and the
+    /// ceiling an entity carries are not in it.
+    ///
+    /// A READ: it only consults the store.
+    pub fn report_resource_policies(&self, arn: &str) -> Option<Vec<SourcedPolicy>> {
+        if parse_entity_arn(arn).is_some() {
+            return self.principal_sourced_policies(arn);
+        }
+        // A managed policy answers only through the ARN grammar that names one, and only
+        // when this emulator holds that policy at all — the account's own or an entry of
+        // AWS's catalog ([`Self::resolve_policy`]).
+        parse_policy_arn(arn)?;
+        self.resolve_policy(arn)?;
+        Some(vec![SourcedPolicy {
+            source: PolicySource::Managed {
+                aws_owned: is_aws_managed_policy_arn(arn),
+                policy_arn: arn.to_string(),
+            },
+            document: self.default_version_document(arn),
+        }])
     }
 
     /// What the inline policies embedded in the user keyed by `user_key` take up,
@@ -2774,6 +2880,22 @@ pub fn entities_for_policy_marker_scope(policy_arn: &str) -> String {
 /// names. See [`MARKER_SCOPE_POLICY_VERSIONS`].
 pub fn policy_versions_marker_scope(policy_arn: &str) -> String {
     format!("{MARKER_SCOPE_POLICY_VERSIONS}:{policy_arn}")
+}
+
+/// The marker scope of the services the report job `job_id` names reports on. See
+/// [`MARKER_SCOPE_SERVICE_LAST_ACCESSED`].
+pub fn service_last_accessed_marker_scope(job_id: &str) -> String {
+    format!("{MARKER_SCOPE_SERVICE_LAST_ACCESSED}:{job_id}")
+}
+
+/// The marker scope of the entities the report job `job_id` names reports for the service
+/// whose namespace is `service_namespace`. See
+/// [`MARKER_SCOPE_SERVICE_LAST_ACCESSED_ENTITIES`].
+pub fn service_last_accessed_entities_marker_scope(
+    job_id: &str,
+    service_namespace: &str,
+) -> String {
+    format!("{MARKER_SCOPE_SERVICE_LAST_ACCESSED_ENTITIES}:{job_id}:{service_namespace}")
 }
 
 /// The page key of ONE policy version in the order a reader of a managed policy's
@@ -4008,10 +4130,30 @@ fn splitmix64(seq: u64) -> u64 {
 
 /// What the LOW word of a 128-bit job id is keyed with, so the two words of one id are
 /// drawn from independent mixes of the same counter rather than repeating it
-/// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::next_access_report_job_id`]).
-/// The HIGH word carries all 64 bits of the counter's bijective mix, which is what makes
-/// two distinct counter values yield two distinct ids.
+/// ([`report_job_id`]). The HIGH word carries all 64 bits of the counter's bijective mix,
+/// which is what makes two distinct counter values yield two distinct ids.
 const JOB_ID_LOW_WORD_KEY: u64 = 0xA076_1D64_78BD_642F;
+
+/// The `JobId` of the report job at counter position `seq`.
+///
+/// `jobIDType` is exactly 36 characters, which is the 8-4-4-4-12 grouping of 128 bits AWS
+/// reports a job id in, so the id is built as that grouping over two bijectively mixed
+/// words of the counter ([`splitmix64`], [`JOB_ID_LOW_WORD_KEY`]).
+///
+/// ONE spelling, shared by every report job the account mints an id for, so a client
+/// cannot tell which generate produced an id from its shape.
+fn report_job_id(seq: u64) -> String {
+    let high = splitmix64(seq);
+    let low = splitmix64(seq ^ JOB_ID_LOW_WORD_KEY);
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        high >> 32,
+        (high >> 16) & 0xFFFF,
+        high & 0xFFFF,
+        low >> 48,
+        low & 0xFFFF_FFFF_FFFF
+    )
+}
 
 /// How long after the request an Organizations access report's generation is due.
 ///
@@ -4031,27 +4173,171 @@ pub const ACCESS_REPORT_GENERATION_SECONDS: i64 = 3;
 /// the emulator's own.
 pub const MAX_CONCURRENT_ACCESS_REPORT_JOBS: usize = 5;
 
-/// How many FINISHED access-report jobs the account keeps.
+/// How many FINISHED report jobs of ONE kind the account keeps.
 ///
 /// A report job is a record a caller can ask for again, so a finished one is kept — but not
 /// forever: past this many the oldest are dropped, so the store cannot grow without end on
 /// repeated generates. The emulator's own bound; AWS publishes no retention for a report.
 pub const MAX_RETAINED_ACCESS_REPORT_JOBS: usize = 100;
 
-/// The `JobStatus` an access-report job is in at `now`: `IN_PROGRESS` until its generation
-/// is due, `COMPLETED` from then on.
+/// The `JobStatus` the job whose generation is due at `completes` is in at `now`:
+/// `IN_PROGRESS` until that instant, `COMPLETED` from it on.
 ///
-/// The ONE reading of that clock, so the status a read reports and the
-/// `JobCompletionDate` beside it cannot disagree.
-pub fn access_report_job_status(
-    job: &OrganizationsAccessReportJob,
+/// The ONE reading of that clock, shared by every report job the account records, so the
+/// status a read reports and the `JobCompletionDate` beside it cannot disagree.
+pub fn report_job_status(
+    completes: ::aws_smithy_types::DateTime,
     now: ::aws_smithy_types::DateTime,
 ) -> &'static str {
-    if now.as_secs_f64() < job.completes.as_secs_f64() {
+    if now.as_secs_f64() < completes.as_secs_f64() {
         JOB_STATUS_IN_PROGRESS
     } else {
         JOB_STATUS_COMPLETED
     }
+}
+
+/// The `JobStatus` an Organizations access-report job is in at `now`, read through the one
+/// clock rule [`report_job_status`] states.
+pub fn access_report_job_status(
+    job: &OrganizationsAccessReportJob,
+    now: ::aws_smithy_types::DateTime,
+) -> &'static str {
+    report_job_status(job.completes, now)
+}
+
+/// The message a read of a report job the account holds nothing under is refused with —
+/// the `NoSuchEntityException` message, whose fixed text is `The job ID ` and ` cannot be
+/// found.` around the id the request supplied.
+///
+/// ONE wording, shared by every reader of a report job, so two reads cannot describe the
+/// same missing job differently.
+pub fn report_job_not_found(job_id: &str) -> String {
+    format!("The job ID {job_id} cannot be found.")
+}
+
+/// The `AccessAdvisorUsageGranularityType` value that asks for SERVICE data only: "if you
+/// specify service-level granularity, this operation generates only service data"
+/// (`GenerateServiceLastAccessedDetails$Granularity`), and the level an omitted
+/// `Granularity` asks for. One of the two values the enum declares, which
+/// `ops::types::ACCESS_ADVISOR_USAGE_GRANULARITY_TYPE_VALUES` records.
+pub const USAGE_GRANULARITY_SERVICE_LEVEL: &str = "SERVICE_LEVEL";
+
+/// The `AccessAdvisorUsageGranularityType` value that asks for action data beside the
+/// service data: "if you specify action-level granularity, it generates service and action
+/// data". See [`USAGE_GRANULARITY_SERVICE_LEVEL`].
+pub const USAGE_GRANULARITY_ACTION_LEVEL: &str = "ACTION_LEVEL";
+
+/// One service a service-last-accessed report covers: the namespace a policy names that
+/// service's actions under, and the service's own name.
+#[derive(Debug, Clone, Copy)]
+pub struct ReportedService {
+    /// "The namespace of the service in which access was attempted"
+    /// (`ServiceLastAccessed$ServiceNamespace`): the service prefix an action element
+    /// spells before the separator.
+    pub service_namespace: &'static str,
+    /// "The name of the service in which access was attempted"
+    /// (`ServiceLastAccessed$ServiceName`): the service's published name.
+    pub service_name: &'static str,
+}
+
+/// The services a service-last-accessed report reports on, ascending by namespace.
+///
+/// SOURCE: the Service Authorization Reference ("Actions, resources, and condition keys for
+/// Amazon Web Services services"), which `ServiceLastAccessed$ServiceNamespace`'s own
+/// documentation points at to learn a service's namespace — "choose the name of the service
+/// to view details for that service. In the first paragraph, find the service prefix" — so
+/// each row is one service of that reference: its prefix, and the name it is published
+/// under.
+///
+/// A SUBSET of it, and that is what the report covers: IAM reports last accessed data only
+/// for the services that report activity to it ("for more information about services and
+/// actions for which action last accessed information is displayed, see IAM action last
+/// accessed information services and actions", `GenerateServiceLastAccessedDetails`), so a
+/// namespace outside this catalog is a service no entry is reported for rather than one
+/// reported without a name. The rows are every namespace this emulator's own catalog of
+/// AWS-managed policies ([`AWS_MANAGED_POLICIES`]) grants actions under, plus the services
+/// a client's own policies are most likely to name.
+///
+/// Ascending by namespace, because "by default, the list is sorted by service namespace"
+/// (`GetServiceLastAccessedDetails`), so the catalog's own order IS the reported order.
+pub const REPORTED_SERVICES: &[ReportedService] = &[
+    ReportedService { service_namespace: "account", service_name: "AWS Account Management" },
+    ReportedService { service_namespace: "acm", service_name: "AWS Certificate Manager" },
+    ReportedService { service_namespace: "apigateway", service_name: "Amazon API Gateway" },
+    ReportedService { service_namespace: "athena", service_name: "Amazon Athena" },
+    ReportedService { service_namespace: "autoscaling", service_name: "Amazon EC2 Auto Scaling" },
+    ReportedService { service_namespace: "backup", service_name: "AWS Backup" },
+    ReportedService { service_namespace: "batch", service_name: "AWS Batch" },
+    ReportedService { service_namespace: "bedrock", service_name: "Amazon Bedrock" },
+    ReportedService { service_namespace: "cassandra", service_name: "Amazon Keyspaces" },
+    ReportedService { service_namespace: "cloudformation", service_name: "AWS CloudFormation" },
+    ReportedService { service_namespace: "cloudfront", service_name: "Amazon CloudFront" },
+    ReportedService { service_namespace: "cloudtrail", service_name: "AWS CloudTrail" },
+    ReportedService { service_namespace: "cloudwatch", service_name: "Amazon CloudWatch" },
+    ReportedService { service_namespace: "codebuild", service_name: "AWS CodeBuild" },
+    ReportedService { service_namespace: "codecommit", service_name: "AWS CodeCommit" },
+    ReportedService { service_namespace: "codepipeline", service_name: "AWS CodePipeline" },
+    ReportedService { service_namespace: "config", service_name: "AWS Config" },
+    ReportedService { service_namespace: "dynamodb", service_name: "Amazon DynamoDB" },
+    ReportedService { service_namespace: "ec2", service_name: "Amazon Elastic Compute Cloud" },
+    ReportedService { service_namespace: "ecr", service_name: "Amazon Elastic Container Registry" },
+    ReportedService { service_namespace: "ecs", service_name: "Amazon Elastic Container Service" },
+    ReportedService { service_namespace: "eks", service_name: "Amazon Elastic Kubernetes Service" },
+    ReportedService { service_namespace: "elasticache", service_name: "Amazon ElastiCache" },
+    ReportedService {
+        service_namespace: "elasticbeanstalk",
+        service_name: "AWS Elastic Beanstalk",
+    },
+    ReportedService {
+        service_namespace: "elasticfilesystem",
+        service_name: "Amazon Elastic File System",
+    },
+    ReportedService {
+        service_namespace: "elasticloadbalancing",
+        service_name: "Elastic Load Balancing",
+    },
+    ReportedService { service_namespace: "events", service_name: "Amazon EventBridge" },
+    ReportedService { service_namespace: "firehose", service_name: "Amazon Data Firehose" },
+    ReportedService { service_namespace: "glue", service_name: "AWS Glue" },
+    ReportedService { service_namespace: "iam", service_name: "AWS Identity and Access Management" },
+    ReportedService { service_namespace: "kinesis", service_name: "Amazon Kinesis" },
+    ReportedService { service_namespace: "kms", service_name: "AWS Key Management Service" },
+    ReportedService { service_namespace: "lakeformation", service_name: "AWS Lake Formation" },
+    ReportedService { service_namespace: "lambda", service_name: "AWS Lambda" },
+    ReportedService { service_namespace: "logs", service_name: "Amazon CloudWatch Logs" },
+    ReportedService { service_namespace: "organizations", service_name: "AWS Organizations" },
+    ReportedService { service_namespace: "rds", service_name: "Amazon Relational Database Service" },
+    ReportedService { service_namespace: "redshift", service_name: "Amazon Redshift" },
+    ReportedService { service_namespace: "route53", service_name: "Amazon Route 53" },
+    ReportedService { service_namespace: "s3", service_name: "Amazon Simple Storage Service" },
+    ReportedService {
+        service_namespace: "s3-object-lambda",
+        service_name: "Amazon S3 Object Lambda",
+    },
+    ReportedService { service_namespace: "sagemaker", service_name: "Amazon SageMaker" },
+    ReportedService { service_namespace: "secretsmanager", service_name: "AWS Secrets Manager" },
+    ReportedService { service_namespace: "ses", service_name: "Amazon Simple Email Service" },
+    ReportedService { service_namespace: "sns", service_name: "Amazon Simple Notification Service" },
+    ReportedService { service_namespace: "sqs", service_name: "Amazon Simple Queue Service" },
+    ReportedService { service_namespace: "ssm", service_name: "AWS Systems Manager" },
+    ReportedService { service_namespace: "states", service_name: "AWS Step Functions" },
+    ReportedService { service_namespace: "sts", service_name: "AWS Security Token Service" },
+    ReportedService { service_namespace: "support", service_name: "AWS Support" },
+    ReportedService { service_namespace: "swf", service_name: "Amazon Simple Workflow Service" },
+    ReportedService { service_namespace: "trustedadvisor", service_name: "AWS Trusted Advisor" },
+    ReportedService { service_namespace: "xray", service_name: "AWS X-Ray" },
+];
+
+/// The catalog entry for `service_namespace`, or `None` when [`REPORTED_SERVICES`] carries
+/// no service under that namespace.
+///
+/// A service prefix is published in lower case and an action element may spell it in any
+/// (the comparison [`grants_service_access`] makes is case-insensitive too), so the lookup
+/// folds case: two spellings of one namespace name one service.
+pub fn reported_service(service_namespace: &str) -> Option<&'static ReportedService> {
+    REPORTED_SERVICES
+        .iter()
+        .find(|service| service.service_namespace.eq_ignore_ascii_case(service_namespace))
 }
 
 /// The `jobStatusType` value of a job whose generation is not due yet.

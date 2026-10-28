@@ -120,7 +120,7 @@ pub(crate) async fn create_override(emulator: &Emulator, request: Value, case: &
 }
 
 /// How many overrides the store holds right now, over every rotation.
-fn override_count(emulator: &Emulator) -> usize {
+pub(crate) fn override_count(emulator: &Emulator) -> usize {
     let store =
         state::service_state(&*emulator.engine).expect("the engine holds this service's state");
     let store = store.lock();
