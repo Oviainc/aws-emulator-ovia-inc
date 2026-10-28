@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set the resource a `resourceArn` names carries. A pure read: the
+//! tags come out of the one record the resource's own reader answers from
+//! ([`crate::state::resource_tags`]), and an ARN this store holds no resource for is
+//! answered as absent — the same class every other reader of this service answers for
+//! an identifier that names nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +145,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder resource store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A REPORTING call: the tag set is read out of the resource's own record and
+        // nothing is written, so a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(tags) = crate::state::resource_tags(&store, &input.resource_arn) else {
+            // An ARN that names no resource this store holds — including one that is not
+            // an ARN of this service at all, which names no resource either — is absent:
+            // the modelled `ResourceNotFoundException` (404), carrying the one not-found
+            // literal this service answers a read with.
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::item_not_found(),
+            )
+            .into());
+        };
+
+        // `tags` is `@required` on the output: a resource carrying no tag answers the
+        // empty map, which is not the same answer as a missing member.
+        Ok(ListTagsForResourceOutput { tags })
     }
 }

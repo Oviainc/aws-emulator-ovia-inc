@@ -763,21 +763,40 @@ pub fn integer_bound_message(member: &str, value: i32, min: i32, max: i32) -> Op
     }
 }
 
-/// `InvalidParameterException$message` for a `maxResults` outside the inclusive page-size
-/// range its own doc states ("This value can be between 1 and 100"). Amazon ECS states the
-/// RANGE the page size has to fall in — not the one bound the value crossed — and echoes
-/// neither the value the request carried nor the member's spelling on the wire.
+/// `InvalidParameterException$message` for a `maxResults` ABOVE the largest page its own
+/// doc states ("This value can be between 1 and 100"). Amazon ECS states the RANGE the
+/// page size has to fall in and echoes neither the value the request carried nor the
+/// member's spelling on the wire.
 pub fn page_size_range_message(min: i32, max: i32) -> String {
     format!("MaxResults must be a positive number between {min}-{max}.")
+}
+
+/// The sentence a value BELOW the smallest its own member documents is refused with: the
+/// `subject` the refusal names that member by and the bound the value crossed, echoing
+/// neither the value the request carried nor the other end of the range.
+///
+/// Spelled once for every member of this API bounded from below, so the refusal cannot
+/// drift between them — [`DESIRED_COUNT_NEGATIVE_MESSAGE`] carries it for a service's
+/// task count, and a page's `maxResults` carries it for a list.
+pub fn below_minimum_message(subject: &str, min: i32) -> String {
+    format!("{subject} can not be lesser than {min}")
 }
 
 /// The refusal a `maxResults` earns when it falls outside the inclusive page-size range
 /// `min..=max` its own doc states, or `None` when it is inside it.
 ///
 /// Spelled once for every operation in this crate that pages, so the refusal cannot drift
-/// between the lists — each with its own documented range.
+/// between the lists — each with its own documented range. A page BELOW the range is the
+/// below-the-minimum refusal every such member answers ([`below_minimum_message`]); one
+/// above it states the range the page size has to fall in.
 pub fn page_size_violation(max_results: i32, min: i32, max: i32) -> Option<String> {
-    (max_results < min || max_results > max).then(|| page_size_range_message(min, max))
+    if max_results < min {
+        Some(below_minimum_message(&member_subject("maxResults"), min))
+    } else if max_results > max {
+        Some(page_size_range_message(min, max))
+    } else {
+        None
+    }
 }
 
 /// The launch type a task takes when the request names neither a `launchType` nor a
@@ -7959,6 +7978,18 @@ pub fn invalid_setting_message(member: &str) -> String {
     format!("Invalid setting '{member}'")
 }
 
+/// `InvalidParameterException$message` for an account-setting request that leaves out a
+/// member ANOTHER member it carries requires — a `value` to filter by without the `name`
+/// whose values it filters ("You must also specify an account setting name to use this
+/// parameter").
+///
+/// The two members are named the way every other account-setting refusal names one
+/// ([`invalid_setting_message`]): quoted, after the noun this API states its setting
+/// refusals under.
+pub fn setting_member_required_message(required: &str, present: &str) -> String {
+    format!("Setting '{required}' must be provided when '{present}' is present")
+}
+
 /// The segment a validation path marks a step from a COLLECTION into one of its elements
 /// with: it stands after the element's position (a list) or the entry's key (a map), so a
 /// refused element reads `requiresCompatibilities.1.member`. It names no member of this
@@ -8016,7 +8047,7 @@ pub const CONTAINER_INSTANCE_ID_PATTERN: &str = "^[a-f0-9-]{1,36}$";
 /// The sentence a `containerInstance` whose id does not match
 /// [`CONTAINER_INSTANCE_ID_PATTERN`] is refused with.
 pub fn container_instance_id_pattern_message() -> String {
-    format!("ContainerInstanceId must match {CONTAINER_INSTANCE_ID_PATTERN}")
+    pattern_message("ContainerInstanceId", CONTAINER_INSTANCE_ID_PATTERN)
 }
 
 /// Whether `instance_id` is a container-instance id of the form
@@ -8580,13 +8611,87 @@ pub fn is_valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// The pattern a name [`is_valid_name`] accepts, spelled as a refusal quotes it.
+/// The pattern a name [`is_valid_name`] accepts, spelled as a refusal quotes it — the
+/// character set and the length bounds the name members document, in one regular
+/// expression.
 pub const RESOURCE_NAME_PATTERN: &str = r"^[a-zA-Z0-9\-_]{1,255}$";
 
-/// The refusal for a name outside [`RESOURCE_NAME_PATTERN`]: the member as AWS names it
-/// in the message, the pattern itself, and the value the request spelled.
+/// The sentence a value outside a documented `pattern` is refused with: the subject the
+/// refusal names the member by, and the pattern the value has to match. The whole of it
+/// is fixed text — a read states the RULE the value broke and echoes nothing the request
+/// carried.
+pub fn pattern_message(subject: &str, pattern: &str) -> String {
+    format!("{subject} must match {pattern}")
+}
+
+/// `InvalidParameterException$message` for a caller-supplied NAME outside
+/// [`RESOURCE_NAME_PATTERN`]: [`pattern_message`] for that pattern, plus the value the
+/// request spelled, appended bare after the fixed `but was ` prefix — what a call asked
+/// to TAKE the name adds, so the caller is told which of the names it sent it must change.
+///
+/// Spelled once for every name member in this crate, so the refusal cannot drift between
+/// the operations that take one — a cluster name, a service name, a daemon name and a
+/// task-definition family are all the same rule, stated the same way.
 pub fn name_pattern_message(subject: &str, name: &str) -> String {
-    format!("{subject} must match {RESOURCE_NAME_PATTERN}, but was {name}")
+    format!(
+        "{}, but was {name}",
+        pattern_message(subject, RESOURCE_NAME_PATTERN)
+    )
+}
+
+/// The refusal a caller-supplied `name` earns when it falls outside
+/// [`RESOURCE_NAME_PATTERN`], under the `subject` the refusal names its member by, or
+/// `None` when [`is_valid_name`] accepts it.
+pub fn name_pattern_violation(subject: &str, name: &str) -> Option<String> {
+    (!is_valid_name(name)).then(|| name_pattern_message(subject, name))
+}
+
+/// The same refusal for a member Amazon ECS names by the member itself: the subject is
+/// [`member_subject`] of the member's own name.
+pub fn member_name_pattern_violation(member: &str, name: &str) -> Option<String> {
+    name_pattern_violation(&member_subject(member), name)
+}
+
+/// The words a refusal that reads as a SENTENCE names a member by: [`member_words`] with
+/// the first letter upper-cased, so `clusterName` opens the sentence as `Cluster name`.
+pub fn member_subject(member_path: &str) -> String {
+    let words = member_words(member_path);
+    let mut letters = words.chars();
+    match letters.next() {
+        Some(first) => first.to_uppercase().chain(letters).collect(),
+        None => words,
+    }
+}
+
+/// The subject the refusal of a cluster reference a READ carries names it by: a describe's
+/// entries are "cluster names or full cluster Amazon Resource Name (ARN) entries", so the
+/// refusal names the cluster NAME the entry resolves to rather than the list member that
+/// carried it — one name, spelled as the member it stands for and not as a sentence's
+/// words.
+pub const READ_CLUSTER_NAME_SUBJECT: &str = "ClusterName";
+
+/// The name rule [`RESOURCE_NAME_PATTERN`] states, as the READ's refusal spells it: the
+/// same character set and the same bounds, with the escape before the literal hyphen
+/// doubled.
+///
+/// Recorded text of that ONE sentence, and the reason it is spelled here rather than
+/// shared with the pattern the other refusals carry: the recorded refusal of a cluster
+/// reference a read names carries the doubled escape, where the recorded refusal of a
+/// name a create was asked to take carries the single one. Two sentences of two different
+/// calls, each reproduced as that call states it.
+pub const READ_CLUSTER_NAME_PATTERN: &str = r"^[a-zA-Z0-9\\-_]{1,255}$";
+
+/// The refusal a cluster reference a READ carries earns when the name it resolves to
+/// falls outside [`RESOURCE_NAME_PATTERN`], or `None` when [`is_valid_name`] accepts it.
+///
+/// A name outside that set names no cluster this account could ever hold, so the read
+/// refuses the parameter instead of reporting a cluster that merely happens to be
+/// missing. Unlike a create's refusal the sentence echoes no value: a read states the
+/// rule, as every other pattern refusal a read answers does
+/// ([`container_instance_id_pattern_message`]).
+pub fn read_cluster_name_violation(name: &str) -> Option<String> {
+    (!is_valid_name(name))
+        .then(|| pattern_message(READ_CLUSTER_NAME_SUBJECT, READ_CLUSTER_NAME_PATTERN))
 }
 
 /// The ARN of a capacity provider: `arn:aws:ecs:<region>:<account>:capacity-provider/<name>`.

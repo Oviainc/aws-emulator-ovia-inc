@@ -39,7 +39,7 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 
 /// `GetCompatibleVersions`: `GET /2021-01-01/opensearch/compatibleVersions`, with
 /// `DomainName` as its one `@httpQuery` member.
-async fn compatible(emulator: &Emulator, domain_name: Option<&str>) -> Answer {
+pub(crate) async fn compatible(emulator: &Emulator, domain_name: Option<&str>) -> Answer {
     let uri = match domain_name {
         None => format!("{PREFIX}/opensearch/compatibleVersions"),
         Some(name) => format!("{PREFIX}/opensearch/compatibleVersions?domainName={name}"),
@@ -49,7 +49,7 @@ async fn compatible(emulator: &Emulator, domain_name: Option<&str>) -> Answer {
 
 /// The `CompatibleVersions` list of a successful answer, with the case named on
 /// failure.
-fn entries(answer: &Answer, case: &str) -> Vec<Value> {
+pub(crate) fn entries(answer: &Answer, case: &str) -> Vec<Value> {
     assert_eq!(
         answer.status, 200,
         "case {case}: expected HTTP 200, got {} {:?}",
@@ -68,7 +68,7 @@ fn entries(answer: &Answer, case: &str) -> Vec<Value> {
 
 /// One entry's `TargetVersions`, as strings. The member is always present: a version
 /// with nothing to upgrade to reports an empty list.
-fn target_versions(entry: &Value, case: &str) -> Vec<String> {
+pub(crate) fn target_versions(entry: &Value, case: &str) -> Vec<String> {
     entry["TargetVersions"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: expected a TargetVersions array, got {entry:?}"))
@@ -91,7 +91,7 @@ fn target_versions(entry: &Value, case: &str) -> Vec<String> {
 /// `^Elasticsearch_[0-9]{1}\.[0-9]{1,2}$|^OpenSearch_[0-9]{1,2}\.[0-9]{1,2}$` does
 /// not allow, which is what makes it an assertion about every version the service
 /// reports.
-fn rank(version: &str) -> (u8, u32, u32) {
+pub(crate) fn rank(version: &str) -> (u8, u32, u32) {
     let (generation, numbers) = if let Some(rest) = version.strip_prefix("OpenSearch_") {
         (1_u8, rest)
     } else if let Some(rest) = version.strip_prefix("Elasticsearch_") {

@@ -209,11 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.value.is_some() && input.name.is_none() {
             return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(
-                        "name is required when value is specified; a value filters the \
-                         settings of one account setting name"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::setting_member_required_message("name", "value")),
                 },
             )
             .into());

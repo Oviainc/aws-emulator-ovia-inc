@@ -34,6 +34,11 @@ const CLUSTER: &str = "demo";
 const FAMILY: &str = "probe-family";
 const SERVICE: &str = "probe-service";
 
+/// A second family whose ONLY revision is deregistered, so the family resolves to no
+/// ACTIVE revision — the same condition as a family nothing was ever registered under
+/// ("If a revision isn't specified, the latest ACTIVE revision is used").
+const RETIRED_FAMILY: &str = "retired-family";
+
 /// The fixed sentence for a `cluster` that names no cluster (recorded ECS behaviour:
 /// every `ClusterNotFoundException` in the corpus carries this text).
 const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
@@ -84,6 +89,25 @@ async fn fixture() -> MultiServiceRouter {
             "desiredCount": 1,
             "networkConfiguration": awsvpc_network_configuration(),
         }),
+        "fixture",
+    )
+    .await;
+    // The retired family: registered, then deregistered, so it is readable but holds no
+    // revision any call may put to work.
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": RETIRED_FAMILY,
+            "containerDefinitions": [container("web", "public.ecr.aws/nginx/nginx:latest")],
+        }),
+        "fixture",
+    )
+    .await;
+    ok(
+        &router,
+        "DeregisterTaskDefinition",
+        json!({ "taskDefinition": format!("{RETIRED_FAMILY}:1") }),
         "fixture",
     )
     .await;
@@ -293,13 +317,16 @@ async fn a_task_definition_that_does_not_exist_is_refused_with_one_fixed_sentenc
     let router = fixture().await;
 
     // A task-definition reference is a family, a `family:revision` or a full ARN, and a
-    // stored family with an absent revision names no revision either.
+    // stored family with an absent revision names no revision either — as does a family
+    // whose every revision has been deregistered, since a reference without a revision
+    // takes the latest ACTIVE one.
     let references = [
         ("absent family", "ghost-family".to_string()),
         (
             "absent revision of a stored family",
             format!("{FAMILY}:999"),
         ),
+        ("all-INACTIVE family", RETIRED_FAMILY.to_string()),
         (
             "full ARN",
             format!(

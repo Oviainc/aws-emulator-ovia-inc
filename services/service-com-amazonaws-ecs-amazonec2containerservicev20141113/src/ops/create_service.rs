@@ -343,14 +343,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let name = input.service_name.clone();
-        if !crate::state::is_valid_name(&name) {
+        if let Some(message) = crate::state::member_name_pattern_violation("serviceName", &name)
+        {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "serviceName must be 1 to {} letters, numbers, underscores or \
-                         hyphens; got {name:?}",
-                        crate::state::MAX_NAME_LENGTH
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

@@ -318,15 +318,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "This name must be unique within the specified cluster and can contain up to
         // 255 letters (uppercase and lowercase), numbers, underscores, and hyphens."
-        if let Some(name) = input
+        if let Some(message) = input
             .service_name
             .as_deref()
-            .filter(|name| !crate::state::is_valid_name(name))
+            .and_then(|name| crate::state::member_name_pattern_violation("serviceName", name))
         {
             return Err(
                 CreateExpressGatewayServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::name_pattern_message("Service name", name)),
+                        message: Some(message),
                     },
                 )
                 .into(),

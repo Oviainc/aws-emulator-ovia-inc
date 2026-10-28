@@ -217,15 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name of the daemon. Up to 255 letters (uppercase and lowercase), numbers,
         // underscores, and hyphens are allowed."
-        if !crate::state::is_valid_name(&input.daemon_name) {
+        if let Some(message) =
+            crate::state::member_name_pattern_violation("daemonName", &input.daemon_name)
+        {
             return Err(CreateDaemonErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "daemonName must be 1 to {} letters, numbers, underscores or \
-                         hyphens; got {:?}",
-                        crate::state::MAX_NAME_LENGTH,
-                        input.daemon_name
-                    )),
+                    message: Some(message),
                 },
             )
             .into());

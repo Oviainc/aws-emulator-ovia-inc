@@ -81,6 +81,8 @@ mod list_task_definitions;
 mod load_balancer_target_group_placement;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
+#[path = "all/name_pattern_refusals.rs"]
+mod name_pattern_refusals;
 #[path = "all/primary_task_set.rs"]
 mod primary_task_set;
 #[path = "all/reserved_tag_prefix.rs"]

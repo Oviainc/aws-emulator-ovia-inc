@@ -289,11 +289,24 @@ async fn a_page_is_at_most_max_results_and_its_token_resumes_the_walk() {
         "case {case:?}: the last page reports no token, got {token:?}"
     );
 
-    // A page size outside the published range is refused, stating the range.
-    for (case, max_results) in [
-        ("a page below the range", 0),
-        ("a page far below the range", -5),
-        ("a page one above the range", 101),
+    // A page size outside the published range is refused: a page below it states the
+    // smallest page the member takes, one above it states the range.
+    for (case, max_results, expected) in [
+        (
+            "a page below the range",
+            0,
+            "Max results can not be lesser than 1",
+        ),
+        (
+            "a page far below the range",
+            -5,
+            "Max results can not be lesser than 1",
+        ),
+        (
+            "a page one above the range",
+            101,
+            "MaxResults must be a positive number between 1-100.",
+        ),
     ] {
         let (code, message) = refusal(
             &router,
@@ -304,10 +317,7 @@ async fn a_page_is_at_most_max_results_and_its_token_resumes_the_walk() {
         .await;
         assert_eq!(
             (code.as_str(), message.as_str()),
-            (
-                "InvalidParameterException",
-                "MaxResults must be a positive number between 1-100."
-            ),
+            ("InvalidParameterException", expected),
             "case {case:?}: expected the page-size refusal, got {code} with {message:?}"
         );
     }
