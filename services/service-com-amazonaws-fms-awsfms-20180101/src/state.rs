@@ -2173,32 +2173,12 @@ pub fn duplicate_tag_key_message(tag_list: &[Tag]) -> Option<String> {
 /// programming error, distinct from an ARN that is well formed but names
 /// nothing.
 ///
-/// The form is the documented ARN layout
-/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`: the literal
-/// `arn` prefix, six colon-separated fields, and a non-empty partition, service
-/// and resource. Region and account id are deliberately allowed to be empty —
-/// ARNs of global and account-less resources leave them so.
+/// The form itself is NOT restated here: it is the one [`parse_arn_form`]
+/// applies, so a string these operations call an ARN and a string the
+/// resource-set classifier calls an ARN ([`parse_arn`]) are the same string, and
+/// this function only words the defect that single parse reports.
 pub fn arn_format_error(arn: &str) -> Option<String> {
-    if !arn.starts_with("arn:") {
-        return Some(format!(
-            "Incorrect arn format. error:ARNs must start with 'arn:': {arn}"
-        ));
-    }
-    let fields: Vec<&str> = arn.splitn(6, ':').collect();
-    if fields.len() < 6 {
-        return Some(format!(
-            "Incorrect arn format. error:ARNs must have six colon-separated fields, \
-             found {}: {arn}",
-            fields.len()
-        ));
-    }
-    let empty = match (fields[1], fields[2], fields[5]) {
-        ("", _, _) => Some("partition"),
-        (_, "", _) => Some("service"),
-        (_, _, "") => Some("resource"),
-        _ => None,
-    };
-    empty.map(|field| format!("Incorrect arn format. error:ARNs must name a {field}: {arn}"))
+    parse_arn_form(arn).err().map(|defect| defect.message(arn))
 }
 
 /// Whether `value` is an `AWSAccountId` as this service's model declares it
@@ -2859,26 +2839,86 @@ pub struct ParsedArn<'a> {
     pub resource: &'a str,
 }
 
-/// Parse an ARN, or `None` when `value` is not one at all: six colon-separated
-/// fields, the first literally `arn`, and a non-empty partition, service and
-/// resource. The region and account fields MAY be empty — a global service's ARN
-/// leaves them so.
-pub fn parse_arn(value: &str) -> Option<ParsedArn<'_>> {
-    let mut fields = value.splitn(6, ':');
-    if fields.next()? != "arn" {
-        return None;
+/// Which ONE condition of the ARN form ([`parse_arn_form`]) a value that is not
+/// an ARN is the first to break.
+///
+/// Reported as a value rather than as a message so the single parse serves both
+/// the callers that only ask whether a string is an ARN ([`parse_arn`]) and the
+/// one that must word why it is not ([`arn_format_error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArnFormDefect {
+    /// The value does not begin with the literal `arn:` prefix.
+    MissingPrefix,
+    /// The value has fewer than six colon-separated fields (how many it has).
+    TooFewFields(usize),
+    /// A field the form requires to carry a value — `"partition"`, `"service"`
+    /// or `"resource"` — is empty.
+    EmptyField(&'static str),
+}
+
+impl ArnFormDefect {
+    /// How this defect is worded for the caller that sent `arn`: one message per
+    /// condition, naming the field or the count that disagrees and echoing the
+    /// value, which is what the caller needs to correct the request.
+    fn message(self, arn: &str) -> String {
+        match self {
+            Self::MissingPrefix => {
+                format!("Incorrect arn format. error:ARNs must start with 'arn:': {arn}")
+            }
+            Self::TooFewFields(found) => format!(
+                "Incorrect arn format. error:ARNs must have six colon-separated fields, \
+                 found {found}: {arn}"
+            ),
+            Self::EmptyField(field) => {
+                format!("Incorrect arn format. error:ARNs must name a {field}: {arn}")
+            }
+        }
     }
-    let parsed = ParsedArn {
-        partition: fields.next()?,
-        service: fields.next()?,
-        region: fields.next()?,
-        account: fields.next()?,
-        resource: fields.next()?,
+}
+
+/// The ONE place this service states what makes a string an ARN: the parse of
+/// `value` as the documented ARN layout
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>` — the literal
+/// `arn` prefix, six colon-separated fields, and a non-empty partition, service
+/// and resource. Region and account id are deliberately allowed to be empty —
+/// ARNs of global and account-less resources leave them so.
+///
+/// It answers the parsed fields, or the first condition the value breaks, so the
+/// operations that only need to know whether a value is an ARN ([`parse_arn`])
+/// and the one that must answer WHY it is not ([`arn_format_error`]) read the
+/// same rule rather than each re-deriving it: nothing can loosen the form for
+/// the resource-set membership classifier while the tagging operations still
+/// refuse the same string, or the other way round.
+fn parse_arn_form(value: &str) -> Result<ParsedArn<'_>, ArnFormDefect> {
+    if !value.starts_with("arn:") {
+        return Err(ArnFormDefect::MissingPrefix);
+    }
+    // Six fields at most, so a resource id that itself contains colons stays
+    // whole in the last one.
+    let fields: Vec<&str> = value.splitn(6, ':').collect();
+    let [_, partition, service, region, account, resource] = fields[..] else {
+        return Err(ArnFormDefect::TooFewFields(fields.len()));
     };
-    let complete = !parsed.partition.is_empty()
-        && !parsed.service.is_empty()
-        && !parsed.resource.is_empty();
-    complete.then_some(parsed)
+    let parsed = ParsedArn {
+        partition,
+        service,
+        region,
+        account,
+        resource,
+    };
+    match (parsed.partition, parsed.service, parsed.resource) {
+        ("", _, _) => Err(ArnFormDefect::EmptyField("partition")),
+        (_, "", _) => Err(ArnFormDefect::EmptyField("service")),
+        (_, _, "") => Err(ArnFormDefect::EmptyField("resource")),
+        _ => Ok(parsed),
+    }
+}
+
+/// Parse an ARN, or `None` when `value` is not one at all — the form is the one
+/// [`parse_arn_form`] states, for the callers that only need the fields and not
+/// the reason a value has none.
+pub fn parse_arn(value: &str) -> Option<ParsedArn<'_>> {
+    parse_arn_form(value).ok()
 }
 
 /// The ARN partition this emulator's own resources live in, read off an ARN

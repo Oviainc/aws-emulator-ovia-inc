@@ -81,6 +81,8 @@ mod apps_list_lifecycle;
 mod apps_list_reporting;
 #[path = "all/apps_lists_enumeration.rs"]
 mod apps_lists_enumeration;
+#[path = "all/arn_form_single_rule.rs"]
+mod arn_form_single_rule;
 #[path = "all/associable_discovered_resources.rs"]
 mod associable_discovered_resources;
 #[path = "all/compliance_detail.rs"]
