@@ -137,8 +137,12 @@ async fn create_manager(router: &MultiServiceRouter, region: &str, type_: &str) 
             "Name": "catalog-probe",
             "ConfigurationDefinitions": [{
                 "Type": type_,
-                // Every accepted definition's parameters name somewhere to deploy to.
-                "Parameters": { "TargetOrganizationalUnits": "ou-1" },
+                // Every accepted definition's parameters name somewhere to deploy to
+                // and the Regions to deploy into.
+                "Parameters": {
+                    "TargetOrganizationalUnits": "ou-1",
+                    "TargetRegions": "us-east-1",
+                },
             }],
         })),
     )
@@ -332,8 +336,10 @@ async fn a_published_catalog_entry_is_accepted_as_a_configuration_definition_typ
                 "TypeVersion": entry.latest_version(),
                 "Parameters": {
                     "DelegatedAccountId": "000000000000",
-                    // Every accepted definition's parameters name somewhere to deploy to.
+                    // Every accepted definition's parameters name somewhere to deploy
+                    // to and the Regions to deploy into.
                     "TargetOrganizationalUnits": "ou-1",
+                    "TargetRegions": "us-east-1",
                 },
             }],
         })),

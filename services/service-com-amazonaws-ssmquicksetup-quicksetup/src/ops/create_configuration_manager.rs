@@ -126,8 +126,8 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 /// (`crate::state::resolve_type_version`). The deployment targets a definition's
 /// parameters name must be servable, because each targeted account and Region pair
 /// becomes a stored configuration (`crate::state::deployment_targets_rejection`, which
-/// counts those pairs the way the handler below deploys them, from `local_account` and
-/// `local_region` for a definition naming no account or no Region). The
+/// counts those pairs the way the handler below deploys them, from `local_account` for
+/// a definition naming no account). The
 /// remaining checks are
 /// the store's own bounds on collections the model gives no length (see
 /// `crate::state`'s `MAX_*` constants), the provider-reserved tag-key namespace a
@@ -138,7 +138,6 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
 fn definitions_rejection(
     input: &CreateConfigurationManagerInput,
     local_account: &str,
-    local_region: &str,
 ) -> Option<String> {
     if input.configuration_definitions.is_empty() {
         return Some(
@@ -195,7 +194,6 @@ fn definitions_rejection(
                     "ConfigurationDefinitions.Parameters",
                     &definition.parameters,
                     local_account,
-                    local_region,
                 )
             })
     })
@@ -294,14 +292,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Quick Setup is a regional control plane: the Region this request was signed
-        // for is the Region the manager it creates is served from, and so the Region a
-        // definition naming none is deployed in. Read before the request is checked,
-        // because the deployments a definition fans out to — what the check below bounds
-        // and what the handler then deploys — are counted from it.
+        // for is the Region the manager it creates is served from. It is NOT where a
+        // definition is deployed — a definition is deployed into the Regions its own
+        // parameters name, which the check below requires it to name.
         let region = crate::state::request_region(ctx.parts());
         let account = ::engine::emulator_account_id().to_string();
 
-        if let Some(why) = definitions_rejection(&input, &account, &region) {
+        if let Some(why) = definitions_rejection(&input, &account) {
             return Err(CreateConfigurationManagerErrorModeled::ValidationException(
                 ValidationException { message: Some(why) },
             )
@@ -362,7 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .configuration_definitions
             .iter()
             .map(|definition| {
-                crate::state::deployment_targets(&definition.parameters, &account, &region).len()
+                crate::state::deployment_targets(&definition.parameters, &account).len()
             })
             .sum();
         if let Some(why) = crate::state::configuration_capacity_rejection(
@@ -403,11 +400,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             // The definition's parameters name where it is deployed, so one
             // configuration is deployed per targeted account and Region — the account
-            // and Region each of them then reports. A definition naming no target
-            // deploys in this manager's own account and Region. Every configuration id
-            // is service-generated and distinct from the definition id it names.
-            let targets =
-                crate::state::deployment_targets(&*record.parameters, &account, &region);
+            // and Region each of them then reports. A definition naming no account
+            // deploys in this manager's own account. Every configuration id is
+            // service-generated and distinct from the definition id it names.
+            let targets = crate::state::deployment_targets(&*record.parameters, &account);
             store.deploy_definition(&manager_arn, &record, &targets, created_at);
             definitions.push(record);
         }

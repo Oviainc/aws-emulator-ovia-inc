@@ -469,6 +469,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::retire_policy_alarms(&*self.engine, key, "TargetTrackingScaling");
         }
 
+        // The capacity window this registration wrote is what every scaling policy of the
+        // target is clamped into, and the movement this call may have made is one the scaled
+        // resource is owed, so both are settled here — and the clock is left watching for the
+        // next breach of the target's policies.
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+        crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
+
         // The audit record for a state-changing call: who asked, what changed and that it
         // succeeded. Never the caller's secret — only the access key id it presented.
         ::tracing::info!(

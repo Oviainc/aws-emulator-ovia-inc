@@ -185,9 +185,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // AWS tells the two conditions this refusal covers apart BY ITS MESSAGE, so the
+        // user is looked up first: a name the account holds no user under is reported as
+        // that user not being found, and only a user the account DOES hold, carrying no
+        // password, is reported as having no login profile. That is the order
+        // `UpdateLoginProfile` and `DeleteLoginProfile` already read the two facts in, so
+        // a caller can tell "create the user" from "create only its password". IAM entity
+        // names "are not distinguished by case", so the lookup is on the case-folded key.
+        if !store.users.contains_key(&user_key) {
+            return Err(GetLoginProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "If the user does not exist or does not have a password, the operation
-        // returns a 404 (NoSuchEntity) error" — one refusal for both, since a login
-        // profile exists only as a password of a user the account holds.
+        // returns a 404 (NoSuchEntity) error" — the same error code for both, since a
+        // login profile exists only as a password of a user the account holds.
         match store.login_profile_report(&user_key) {
             Some(login_profile) => Ok(GetLoginProfileOutput { login_profile }),
             None => Err(GetLoginProfileErrorModeled::NoSuchEntityException(

@@ -7,9 +7,10 @@
 //! `Succeeded`. Removing an ARN the group does not hold is a no-op, so a repeated call
 //! reports the same outcome and changes nothing.
 //!
-//! Only a group whose stored service configuration declares one of the supported
-//! configuration types ([`crate::state::STATIC_MEMBERSHIP_CONFIGURATION_TYPES`]) holds
-//! static memberships at all; a group populated from a resource query, or one with no
+//! Only a group the store records as populated through a static grouping, or one whose
+//! service configuration still declares one of the supported configuration types
+//! ([`crate::state::STATIC_MEMBERSHIP_CONFIGURATION_TYPES`]), is served; a group
+//! populated from a resource query, or one that was never grouped and carries no such
 //! configuration, is refused with `BadRequestException`.
 //!
 //! ## Shape of an operation
@@ -228,10 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Documented: this operation "works only with static groups that you
         // populated using the GroupResources operation" and "doesn't work with any
         // resource groups that are automatically populated by tag-based or
-        // CloudFormation stack-based queries" — the same groups `GroupResources`
-        // serves, since a group outside that catalog holds no static membership to
-        // remove.
-        if group.static_membership_configuration_type().is_none() {
+        // CloudFormation stack-based queries" — so the groups it serves are the
+        // ones the store records as populated that way, plus the ones a static
+        // membership can still be recorded against. A configuration replaced
+        // after the memberships were recorded does not take them with it, so
+        // gating on the configuration alone would leave stored memberships no
+        // call could ever drop.
+        if !group.serves_static_membership_removal() {
             return Err(UngroupResourcesErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::unsupported_group_message(Self::NAME)),
             })

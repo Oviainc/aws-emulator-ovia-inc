@@ -93,11 +93,12 @@ use super::types::*;
 ///   stored — the same bound `CreateConfigurationManager` applies to the definitions it
 ///   stores, so an update can never put a definition past what a create may hold;
 /// * a definition is deployed where its parameters say, so the parameter set this
-///   request writes must name somewhere to deploy to and must name no more deployments
-///   than may be served; [`crate::state::deployment_targets_rejection`] is the one place
+///   request writes must name somewhere to deploy to, must name the Regions to deploy
+///   into and must name no more deployments than may be served;
+///   [`crate::state::deployment_targets_rejection`] is the one place
 ///   that rule lives, shared with the create that stores a definition, and it counts the
-///   very deployments the fan-out below performs — hence the `local_account` and
-///   `local_region` defaults, which it needs to count them;
+///   very deployments the fan-out below performs — hence the `local_account`
+///   default, which it needs to count them;
 /// * `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
 ///   `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to enforce
 ///   it; [`crate::state::iam_role_arn_rejection`] is the one place that rule lives,
@@ -111,7 +112,6 @@ use super::types::*;
 fn update_rejection(
     input: &UpdateConfigurationDefinitionInput,
     local_account: &str,
-    local_region: &str,
 ) -> Option<String> {
     let parameters = input
         .parameters
@@ -128,12 +128,7 @@ fn update_rejection(
     // deployed, so the targets it names are checked the way a create's are —
     // `crate::state` is the one place that rule lives.
     if let Some(why) = input.parameters.as_ref().and_then(|parameters| {
-        crate::state::deployment_targets_rejection(
-            "Parameters",
-            parameters,
-            local_account,
-            local_region,
-        )
+        crate::state::deployment_targets_rejection("Parameters", parameters, local_account)
     }) {
         return Some(why);
     }
@@ -254,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        if let Some(why) = update_rejection(&input, ::engine::emulator_account_id(), &region) {
+        if let Some(why) = update_rejection(&input, ::engine::emulator_account_id()) {
             return Err(
                 UpdateConfigurationDefinitionErrorModeled::ValidationException(
                     ValidationException { message: Some(why) },
@@ -335,12 +330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // update the store cannot take changes nothing. The Region is the manager's own:
         // only the endpoint that created a manager serves it.
         if let Some(parameters) = input.parameters.as_ref() {
-            let planned = crate::state::deployment_targets(
-                parameters,
-                ::engine::emulator_account_id(),
-                &region,
-            )
-            .len();
+            let planned =
+                crate::state::deployment_targets(parameters, ::engine::emulator_account_id())
+                    .len();
             if let Some(why) =
                 crate::state::configuration_capacity_rejection(held_configurations, planned)
             {
@@ -400,7 +392,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition.local_deployment_administration_role_arn = Some(role_arn);
         }
         let definition = definition.clone();
-        let manager_region = manager.region.clone();
 
         // Monotonic: the stamp never moves backwards, whatever the host clock does.
         manager.last_modified_at = now.max(manager.last_modified_at);
@@ -419,7 +410,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let targets = crate::state::deployment_targets(
             &*definition.parameters,
             ::engine::emulator_account_id(),
-            &manager_region,
         );
         store.deploy_definition(&input.manager_arn, &definition, &targets, now);
 

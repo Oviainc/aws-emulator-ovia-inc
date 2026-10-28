@@ -206,6 +206,11 @@ const BASELINE_TYPE: &str = "AWSQuickSetupType-SSMHostMgmt";
 /// no case here is about that rule, so every accepted parameter set names this one.
 const TARGET_OU: &str = "ou-1";
 
+/// The Region every definition below deploys into. A parameter set that names no
+/// Regions to deploy into is refused, and no case here is about that rule, so every
+/// accepted parameter set names this one.
+const TARGET_REGIONS: &str = "us-east-1";
+
 /// The newest configuration version the catalog publishes for `type_` — what the
 /// modelled `LATEST` alias resolves to.
 fn latest_version_of(type_: &str) -> &'static str {
@@ -218,7 +223,8 @@ fn latest_version_of(type_: &str) -> &'static str {
 
 /// The two definitions every case below starts from: both carry a `TypeVersion` the
 /// catalog publishes for their type and a parameter set naming somewhere to deploy to
-/// (which every accepted definition must), the first also both local-deployment role
+/// and the Region to deploy into (which every accepted definition must), the first also
+/// both local-deployment role
 /// members, so an update that omits a member is observably leaving a STORED value alone
 /// rather than leaving an absent one absent.
 fn baseline() -> Value {
@@ -229,6 +235,7 @@ fn baseline() -> Value {
                 "Type": BASELINE_TYPE,
                 "Parameters": {
                     "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetRegions": TARGET_REGIONS,
                     "TargetType": "*",
                     "UpdateSSMAgent": "true",
                 },
@@ -241,6 +248,7 @@ fn baseline() -> Value {
                 "Type": "AWSQuickSetupType-Scheduler",
                 "Parameters": {
                     "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetRegions": TARGET_REGIONS,
                     "TargetTagKey": "Env",
                 },
                 "TypeVersion": "2.0",
@@ -325,18 +333,20 @@ fn epoch_seconds(case: &str, value: &Value, member: &str) -> f64 {
     }
 }
 
-/// A parameter map of `count` entries, ONE of them the deployment target every accepted
-/// definition must name and the rest keys inside the modelled
+/// A parameter map of `count` entries, TWO of them the deployment target and the
+/// Regions every accepted definition must name, and the rest keys inside the modelled
 /// `ConfigurationParametersMap` key pattern `^[A-Za-z0-9+=@_\/\s-]+$`.
 fn parameters(count: usize) -> Value {
     assert!(
-        count >= 1,
-        "a parameter set names somewhere to deploy to, so it holds at least one entry"
+        count >= 2,
+        "a parameter set names somewhere to deploy to and the Regions to deploy into, so \
+         it holds at least two entries"
     );
-    let mut map: Map<String, Value> = (0..count - 1)
+    let mut map: Map<String, Value> = (0..count - 2)
         .map(|index| (format!("Key{index}"), json!(index.to_string())))
         .collect();
     map.insert("TargetOrganizationalUnits".to_string(), json!(TARGET_OU));
+    map.insert("TargetRegions".to_string(), json!(TARGET_REGIONS));
     Value::Object(map)
 }
 
@@ -379,17 +389,19 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
             "parameters are replaced, not merged into",
             json!({ "Parameters": {
                 "TargetOrganizationalUnits": TARGET_OU,
+                "TargetRegions": TARGET_REGIONS,
                 "TargetType": "instance",
             } }),
             json!({ "Parameters": {
                 "TargetOrganizationalUnits": TARGET_OU,
+                "TargetRegions": TARGET_REGIONS,
                 "TargetType": "instance",
             } }),
         ),
         (
-            "a parameter set holding nothing but the deployment target",
-            json!({ "Parameters": parameters(1) }),
-            json!({ "Parameters": parameters(1) }),
+            "a parameter set holding nothing but the deployment target and its Regions",
+            json!({ "Parameters": parameters(2) }),
+            json!({ "Parameters": parameters(2) }),
         ),
         (
             "a parameter set larger than the stored one",
@@ -430,6 +442,7 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
                 "TypeVersion": "LATEST",
                 "Parameters": {
                     "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetRegions": TARGET_REGIONS,
                     "TargetType": "tag-key",
                     "TargetTagKey": "Env",
                 },
@@ -441,6 +454,7 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
                 "TypeVersion": latest,
                 "Parameters": {
                     "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetRegions": TARGET_REGIONS,
                     "TargetType": "tag-key",
                     "TargetTagKey": "Env",
                 },
@@ -540,6 +554,7 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
             "TypeVersion": "1.1",
             "Parameters": {
                 "TargetOrganizationalUnits": TARGET_OU,
+                "TargetRegions": TARGET_REGIONS,
                 "TargetType": "instance",
             },
         }),
@@ -563,7 +578,10 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
     );
     assert_eq!(
         target_after.get("FirstClassParameters"),
-        Some(&json!({ "TargetOrganizationalUnits": TARGET_OU })),
+        Some(&json!({
+            "TargetOrganizationalUnits": TARGET_OU,
+            "TargetRegions": TARGET_REGIONS,
+        })),
         "case {case}: the deployed configuration must carry the common parameters the update \
          wrote, got {target_after:?}"
     );
@@ -588,6 +606,7 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
         deployed.get("Parameters"),
         Some(&json!({
             "TargetOrganizationalUnits": TARGET_OU,
+            "TargetRegions": TARGET_REGIONS,
             "TargetType": "instance",
         })),
         "case {case}: the deployed configuration must carry every updated parameter, got \
@@ -664,6 +683,7 @@ async fn a_pair_that_names_no_stored_definition_is_a_404() {
                     "Type": "AWSQuickSetupType-DHMC",
                     "Parameters": {
                         "TargetOrganizationalUnits": TARGET_OU,
+                        "TargetRegions": TARGET_REGIONS,
                         "TargetType": "*",
                     },
                 },
@@ -874,6 +894,7 @@ async fn an_update_redeploys_the_definition_and_the_deployment_settles() {
         &target,
         &json!({ "Parameters": {
             "TargetOrganizationalUnits": TARGET_OU,
+            "TargetRegions": TARGET_REGIONS,
             "TargetType": "instance",
         } }),
     )

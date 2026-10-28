@@ -336,6 +336,37 @@ pub(crate) async fn principal(
     element(&key, "AccessKeyId")
 }
 
+/// The policy name [`grant_get_user`] puts its grant under, so a suite that goes on to
+/// delete the user can take the grant off again first.
+pub(crate) const GET_USER_GRANT_NAME: &str = "allow-getuser";
+
+/// Put on `user_name` the grant AWS requires for a signed `iam:GetUser` read.
+///
+/// IAM authorizes its own API against the calling user's identity-based policies, so a
+/// user holding none cannot read even itself. Every suite that uses the nameless
+/// `GetUser` as its "which user does this key resolve to" probe needs that grant as a
+/// FIXTURE — it is not what those suites are about — so the grant is written once here,
+/// beside the other authorization fixtures.
+pub(crate) async fn grant_get_user(router: &MultiServiceRouter, case: &str, user_name: &str) {
+    let (status, put) = call(
+        router,
+        "PutUserPolicy",
+        &[
+            ("UserName", user_name),
+            ("PolicyName", GET_USER_GRANT_NAME),
+            (
+                "PolicyDocument",
+                &statement("Allow", "iam:GetUser", "*"),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the fixture PutUserPolicy must succeed, got {status}: {put}"
+    );
+}
+
 /// RULE: a call signed by an IAM user is decided against that user's identity-based
 /// policies — a `Deny` about the request refuses it whatever any `Allow` says, an `Allow`
 /// with no such `Deny` serves it, and a principal with neither is refused — and a

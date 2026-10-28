@@ -95,6 +95,8 @@ mod resource_tagging;
 mod s3_recording_buckets;
 #[path = "all/satellite_catalog.rs"]
 mod satellite_catalog;
+#[path = "all/satellite_current_ephemeris.rs"]
+mod satellite_current_ephemeris;
 #[path = "all/satellite_reads.rs"]
 mod satellite_reads;
 #[path = "all/scheduling_loop.rs"]

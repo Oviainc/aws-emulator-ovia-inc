@@ -131,7 +131,7 @@ fn in_flight(emulator: &Emulator, name: &str) -> bool {
 ///
 /// The due instant is what the handlers read, so moving it is how this suite reaches
 /// the state a caller reaches by waiting — without sleeping for the span.
-fn make_update_due(emulator: &Emulator, name: &str) {
+pub(crate) fn make_update_due(emulator: &Emulator, name: &str) {
     let state = emulator
         .engine()
         .state::<ComAmazonawsResourcegroupsArdiState>();

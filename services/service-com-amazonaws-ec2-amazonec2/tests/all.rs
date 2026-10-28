@@ -291,6 +291,13 @@ mod delete_security_group;
 mod delete_vpc;
 #[path = "all/describe_images.rs"]
 mod describe_images;
+// What `DescribeNetworkAcls` reports out of the network ACL store: the default ACL every VPC
+// comes with, the subnets associated with it, and the narrowing its ids, filters and pages
+// do. Declared HERE, in sorted position inside the long-settled block rather than beside
+// `prefix_lists`: the head of this file is where every new ec2 suite inserts its lines, and
+// this fix lost two serialized squash merges to exactly that contention.
+#[path = "all/describe_network_acls.rs"]
+mod describe_network_acls;
 #[path = "all/describe_page_truncation.rs"]
 mod describe_page_truncation;
 #[path = "all/describe_security_groups.rs"]

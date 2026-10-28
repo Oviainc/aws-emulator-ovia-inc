@@ -240,10 +240,9 @@ fn update_shard_count(
         )));
     }
 
-    // The emulator's own ceilings are counted across the whole store, so they are read
+    // The account and region's shard quota is counted across the whole store, so it is read
     // BEFORE the stream is borrowed for writing.
-    let shards_in_region = store.shards_held_in(now, region);
-    let shards_held = store.shards_held(now);
+    let (shard_limit, open_shard_count) = store.shard_quota_in(now, region);
 
     // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
     // carries one and a request naming only that member names no stream.
@@ -325,28 +324,20 @@ fn update_shard_count(
         )));
     }
 
-    // The store is bounded, so a scaling action past a ceiling is refused rather than
-    // grown into: the shards a re-tile lays down are counted beside the ones the store
-    // already holds, since the shards it closes keep the records written to them.
-    if target > crate::state::MAX_SHARDS_PER_STREAM {
-        return Err(limit_exceeded(format!(
-            "a stream of {target} shards exceeds the {} shards one stream of this emulator \
-             may hold",
-            crate::state::MAX_SHARDS_PER_STREAM
-        )));
-    }
-    if shards_in_region.saturating_add(target) > crate::state::MAX_SHARDS_PER_REGION {
-        return Err(limit_exceeded(format!(
-            "this region holds {shards_in_region} shards, and {target} more would exceed \
-             the {} shards authorized for this account and region",
-            crate::state::MAX_SHARDS_PER_REGION
-        )));
-    }
-    if shards_held.saturating_add(target) > crate::state::MAX_SHARDS_TOTAL {
-        return Err(limit_exceeded(format!(
-            "this emulator already holds {shards_held} of the maximum of {} shards across \
-             every region; delete a stream before scaling another up",
-            crate::state::MAX_SHARDS_TOTAL
+    // "You cannot ... scale up to more than the shard limit for your account", and "to
+    // update the shard count, Kinesis Data Streams performs splits or merges on individual
+    // shards. This can cause short-lived shards to be created, in addition to the final
+    // shards. These short-lived shards count towards your total shard limit for your account
+    // in the Region" — so the shards this re-tiling lays down are counted against the room
+    // left under the quota `DescribeLimits` publishes, and a target past it is refused
+    // rather than grown into.
+    let laid_down = i32::try_from(target).unwrap_or(i32::MAX);
+    if open_shard_count.saturating_add(laid_down) > shard_limit {
+        return Err(limit_exceeded(crate::state::shard_limit_exceeded_message(
+            region,
+            open_shard_count,
+            shard_limit,
+            laid_down,
         )));
     }
 

@@ -32,8 +32,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     scale_down_below_half_message, scale_up_over_double_message, stream_not_found_message,
-    stream_on_demand_message, MAX_RESHARDS_PER_WINDOW, MAX_SHARDS_PER_STREAM, RESHARD_DELAY,
-    STREAM_ACTIVE, STREAM_IDENTIFIER_MISMATCH_MESSAGE, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
+    stream_on_demand_message, MAX_RESHARDS_PER_WINDOW, RESHARD_DELAY, STREAM_ACTIVE,
+    STREAM_IDENTIFIER_MISMATCH_MESSAGE, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
     STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED, STREAM_UPDATING,
 };
 
@@ -414,11 +414,19 @@ async fn update_shard_count_refuses_what_the_limits_forbid() {
             says: |_| scale_down_below_half_message(4, 1),
         },
         Refusal {
-            case: "past-the-shard-ceiling",
-            subject: Subject::Active(MAX_SHARDS_PER_STREAM - 200),
-            body: |name| scale_to(name, MAX_SHARDS_PER_STREAM + 1),
+            // A target no bigger than double the stream's open count, and still more shards
+            // than the account's published quota leaves this region: the ONE shard ceiling
+            // a scaling action is refused past (`shard_quota.rs` covers it in full).
+            case: "past-the-shard-quota",
+            subject: Subject::Active(400),
+            body: |name| scale_to(name, 800),
             code: "LimitExceededException",
-            says: |_| MAX_SHARDS_PER_STREAM.to_string(),
+            says: |_| {
+                format!(
+                    "This request would exceed the shard limit for the account {} in {REGION}.",
+                    engine::EMULATOR_ACCOUNT_ID
+                )
+            },
         },
         Refusal {
             case: "still-creating",

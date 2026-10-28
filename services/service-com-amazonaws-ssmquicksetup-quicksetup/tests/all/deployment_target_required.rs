@@ -22,8 +22,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request below signs for: the Region a created manager owns, and so
-/// the Region a definition naming no `TargetRegions` deploys in.
+/// The region every request below signs for: the Region a created manager owns.
 const REGION: &str = "us-west-2";
 
 /// A configuration type the service publishes (`ListQuickSetupTypes`), so every create
@@ -244,9 +243,10 @@ type TargetCase = (&'static str, Value, bool);
 /// The table: parameter maps spanning what the rule generalises over — WHICH of the two
 /// target keys provides the value, how many entries it names and how that
 /// comma-separated value is written, whether a key is present but provides no value,
-/// which other parameters are named beside it (including `TargetRegions`, which names
-/// Regions rather than a target), and the spelling of the key itself, since a parameter
-/// key is matched as the model writes it.
+/// which other parameters are named beside it, and the spelling of the key itself, since
+/// a parameter key is matched as the model writes it. Every row that must be ACCEPTED
+/// also names `TargetRegions`, which a definition must name whatever it targets, so a
+/// row is refused only for the reason under test.
 fn cases() -> Vec<TargetCase> {
     vec![
         ("no parameter at all", json!({}), false),
@@ -264,22 +264,28 @@ fn cases() -> Vec<TargetCase> {
         ),
         (
             "one targeted account",
-            json!({ "TargetAccounts": "111122223333" }),
+            json!({ "TargetAccounts": "111122223333", "TargetRegions": "us-east-1" }),
             true,
         ),
         (
             "three targeted accounts",
-            json!({ "TargetAccounts": "111122223333,444455556666,777788889999" }),
+            json!({
+                "TargetAccounts": "111122223333,444455556666,777788889999",
+                "TargetRegions": "us-east-1",
+            }),
             true,
         ),
         (
             "one targeted organizational unit",
-            json!({ "TargetOrganizationalUnits": "ou-1234-56789012" }),
+            json!({ "TargetOrganizationalUnits": "ou-1234-56789012", "TargetRegions": "us-east-1" }),
             true,
         ),
         (
             "two targeted organizational units with padding",
-            json!({ "TargetOrganizationalUnits": " ou-1234-56789012 , r-abcd " }),
+            json!({
+                "TargetOrganizationalUnits": " ou-1234-56789012 , r-abcd ",
+                "TargetRegions": "us-east-1",
+            }),
             true,
         ),
         (
@@ -287,6 +293,7 @@ fn cases() -> Vec<TargetCase> {
             json!({
                 "TargetAccounts": "111122223333",
                 "TargetOrganizationalUnits": "ou-1234-56789012",
+                "TargetRegions": "us-east-1",
             }),
             true,
         ),
@@ -316,14 +323,18 @@ fn cases() -> Vec<TargetCase> {
         ),
         (
             "one target key written empty while the other provides a value",
-            json!({ "TargetAccounts": "", "TargetOrganizationalUnits": "ou-1234-56789012" }),
+            json!({
+                "TargetAccounts": "",
+                "TargetOrganizationalUnits": "ou-1234-56789012",
+                "TargetRegions": "us-east-1",
+            }),
             true,
         ),
         (
             // Parameter keys are matched as the model writes them, so a differently
             // cased key is a different parameter and names no target.
             "a target key in lower case",
-            json!({ "targetaccounts": "111122223333" }),
+            json!({ "targetaccounts": "111122223333", "TargetRegions": "us-east-1" }),
             false,
         ),
     ]

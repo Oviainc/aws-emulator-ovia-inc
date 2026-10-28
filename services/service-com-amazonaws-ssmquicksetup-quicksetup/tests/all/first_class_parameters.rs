@@ -25,8 +25,8 @@ use service_com_amazonaws_ssmquicksetup_quicksetup::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request below signs for, and so the Region a definition naming no
-/// `TargetRegions` deploys in.
+/// The region every request below signs for, and so the Region the managers it creates
+/// are served from.
 const REGION: &str = "us-west-2";
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
@@ -353,8 +353,8 @@ async fn a_summary_reports_only_the_common_parameters_of_a_definition() {
             "a definition carrying nothing but common keys",
             "dhmc",
             "AWSQuickSetupType-DHMC",
-            json!({ "TargetOrganizationalUnits": "ou-3" }),
-            json!({ "TargetOrganizationalUnits": "ou-3" }),
+            json!({ "TargetOrganizationalUnits": "ou-3", "TargetRegions": "us-east-2" }),
+            json!({ "TargetOrganizationalUnits": "ou-3", "TargetRegions": "us-east-2" }),
         ),
         (
             "config recording with many options",
@@ -362,13 +362,14 @@ async fn a_summary_reports_only_the_common_parameters_of_a_definition() {
             "AWSQuickSetupType-CFGRecording",
             json!({
                 "TargetOrganizationalUnits": "ou-4",
+                "TargetRegions": "eu-central-1",
                 "RecordAllResources": "true",
                 "ResourceTypesToRecord": "AWS::EC2::Instance",
                 "RecordGlobalResourceTypes": "false",
                 "DeliveryBucketName": "recording-bucket",
                 "NotificationOptions": "NoStreaming",
             }),
-            json!({ "TargetOrganizationalUnits": "ou-4" }),
+            json!({ "TargetOrganizationalUnits": "ou-4", "TargetRegions": "eu-central-1" }),
         ),
         (
             "keys that only resemble a common one",
@@ -376,11 +377,12 @@ async fn a_summary_reports_only_the_common_parameters_of_a_definition() {
             "AWSQuickSetupType-SSMHostMgmt",
             json!({
                 "TargetOrganizationalUnits": "ou-5",
+                "TargetRegions": "ap-south-1",
                 "TargetRegion": "ap-south-1",
                 "targetregions": "ap-south-1",
                 "Target Regions": "ap-south-1",
             }),
-            json!({ "TargetOrganizationalUnits": "ou-5" }),
+            json!({ "TargetOrganizationalUnits": "ou-5", "TargetRegions": "ap-south-1" }),
         ),
     ];
 
@@ -419,10 +421,15 @@ async fn every_published_common_key_is_reported_and_an_option_is_not() {
     for (index, key) in COMMON_PARAMETER_KEYS.iter().enumerate() {
         let case = format!("common key {key}");
         let mut expected = Map::new();
-        // Somewhere to deploy to, so the create is accepted whichever key is under test.
+        // Somewhere to deploy to and the Region to deploy into, so the create is
+        // accepted whichever key is under test.
         expected.insert(
             PARAMETER_TARGET_ORGANIZATIONAL_UNITS.to_string(),
             json!(common_value(PARAMETER_TARGET_ORGANIZATIONAL_UNITS)),
+        );
+        expected.insert(
+            PARAMETER_TARGET_REGIONS.to_string(),
+            json!(common_value(PARAMETER_TARGET_REGIONS)),
         );
         expected.insert((*key).to_string(), json!(common_value(key)));
 

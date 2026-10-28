@@ -891,6 +891,37 @@ impl GroupRecord {
             .find(|declared| STATIC_MEMBERSHIP_CONFIGURATION_TYPES.contains(declared))
     }
 
+    /// Whether this group was POPULATED through a static-membership grouping —
+    /// it holds static members, or it holds the record of a grouping action
+    /// performed against one of its resources.
+    ///
+    /// Only [`GroupRecord::add_member`] and [`GroupRecord::remove_member`] write
+    /// a grouping status, and both run only for a group a static-membership
+    /// operation serves, so either of those two facts is evidence that this
+    /// group is one "you populated using the GroupResources operation"
+    /// (`smithy_query(query="doc",shape="UngroupResources")`) — evidence that
+    /// survives a later replacement of the service configuration, which carries
+    /// the memberships nowhere.
+    pub fn was_populated_by_static_grouping(&self) -> bool {
+        !self.members.is_empty() || !self.grouping_statuses.is_empty()
+    }
+
+    /// Whether a static-membership REMOVAL is served for this group.
+    ///
+    /// Removing memberships "works only with static groups that you populated
+    /// using the GroupResources operation", and a group so populated stays one
+    /// whatever configuration is in effect by the time the removal arrives,
+    /// since replacing a group's service configuration leaves the memberships
+    /// recorded against it where they are. A group that was never populated that
+    /// way is served only while its configuration declares a type a
+    /// static-membership operation works with — there the removal is the no-op an
+    /// empty group answers — and refused otherwise, a group populated from a
+    /// resource query among them.
+    pub fn serves_static_membership_removal(&self) -> bool {
+        self.was_populated_by_static_grouping()
+            || self.static_membership_configuration_type().is_some()
+    }
+
     /// The service-configuration types this group's stored configuration
     /// declares, in the order the configuration holds them.
     ///
