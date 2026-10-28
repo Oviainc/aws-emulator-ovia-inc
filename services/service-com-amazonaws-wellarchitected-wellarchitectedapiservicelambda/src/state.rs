@@ -23,7 +23,9 @@
 //! imports, the versions `CreateLensVersion` publishes from them, the content
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
 //! the same way, and `ListLenses` pages over those
-//! lenses beside the AWS-official lens this emulator ships. The Well-Architected
+//! lenses beside the AWS-official lens this emulator ships; `DeleteLens` drops the lens
+//! content whose publication state the request names, so a lens whose every version and
+//! draft is gone is gone from the store itself. The Well-Architected
 //! Tool profiles (`CreateProfile`, `GetProfile`, `UpdateProfile`, `ListProfiles`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted, and the association of one with a workload
 //! (`AssociateProfiles`, `DisassociateProfiles`) is held on the workload the association is
@@ -3585,6 +3587,31 @@ impl LensRecord {
             .or_else(|| self.reviewed_content())
     }
 
+    /// Drop the content of this lens that no version has been published from, leaving it
+    /// at its latest published version: the content the lens reports becomes that
+    /// version's, and an import still in flight goes too, since the document it carries
+    /// has not been published either.
+    ///
+    /// `false` when no version has been published from this lens, so there is nothing to
+    /// fall back to and no content of the lens would be left at all — the caller removes
+    /// the record itself then ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::remove_lens`]).
+    ///
+    /// The content is taken from [`Self::latest_version`] rather than left empty so that
+    /// every read of the lens keeps agreeing: a lens with a published version is one
+    /// `ExportLens` answers content for and `ListLenses` describes, and the version that
+    /// content was published as is what [`Self::published_version`] then reports it at.
+    pub fn discard_draft(&mut self) -> bool {
+        let Some(published) = self
+            .latest_version()
+            .map(|(_, published)| published.content.clone())
+        else {
+            return false;
+        };
+        self.pending = None;
+        self.draft = Some(published);
+        true
+    }
+
     /// The `LensType` of this lens, as the account that reaches it sees it.
     ///
     /// A custom lens is `CUSTOM_SELF` to the account that owns it and `CUSTOM_SHARED` to
@@ -5956,6 +5983,12 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// bound what a publish can RECORD, not the stream of tokens a caller can spend
     /// against it.
     pub create_lens_version_tokens: TokenLedger<CreateLensVersionToken>,
+    /// `DeleteLens`'s `ClientRequestToken` -> the delete the original request completed
+    /// ([`delete_replay`]), held exactly as [`Self::delete_lens_share_tokens`] is and for
+    /// the same reason: the content the delete removed cannot serve the replay, so the
+    /// completed delete does, and a retry carrying the token answers that success rather
+    /// than the not-found the original request's own work produced.
+    pub delete_lens_tokens: TokenLedger<CompletedDeleteToken>,
     /// Every stored agent profile, keyed by its `AgentProfileArn` — the only identifier
     /// the modelled agent-profile operations take for one (`GetAgentProfile`,
     /// `UpdateAgentProfile`, `DeleteAgentProfile` and every `/goals` route bind
@@ -7323,6 +7356,49 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.create_profile_share_tokens
             .retain(|token| token.profile_arn != profile_arn);
         Some(record)
+    }
+
+    /// Drop a custom lens and everything keyed to it: the import token that resolved to
+    /// the lens and every publish token that resolved to a version of it, so a retry
+    /// carrying one acts afresh rather than replaying a lens that is gone, and the shares
+    /// recorded against it with the create tokens that resolved into them — the same rule
+    /// [`Self::remove_workload`] applies to a workload's shares, which also takes the
+    /// invitations those shares raised, since an invitation is reached only through the
+    /// share that offers it. The lens's draft content, its published versions and its tags
+    /// live INSIDE [`LensRecord`], so they go with the record itself.
+    ///
+    /// [`Self::delete_lens_tokens`] is NOT among them, exactly as in
+    /// [`Self::remove_workload`]: a token that names the delete itself has to survive the
+    /// resource the delete removed, or the retry it was issued for could not be replayed.
+    pub fn remove_lens(&mut self, lens_id: &str) -> Option<LensRecord> {
+        let record = self.lenses.remove(lens_id)?;
+        self.import_lens_tokens
+            .retain(|token| token.lens_id != lens_id);
+        self.create_lens_version_tokens
+            .retain(|token| token.lens_id != lens_id);
+        self.lens_shares.remove(lens_id);
+        self.create_lens_share_tokens
+            .retain(|token| token.lens_id != lens_id);
+        Some(record)
+    }
+
+    /// Drop every version published from a custom lens, leaving the lens itself and the
+    /// content it carries — which is then content no version has been published from, so
+    /// the lens reports [`LENS_STATUS_DRAFT`] again.
+    ///
+    /// The publish tokens that resolved to those versions go with them, so a retry
+    /// carrying one publishes afresh rather than replaying a version that is gone — the
+    /// rule [`Self::remove_lens`] applies to every token of a lens it removes.
+    ///
+    /// `false` when no lens is stored under `lens_id`, so nothing was dropped.
+    pub fn remove_lens_published_versions(&mut self, lens_id: &str) -> bool {
+        let Some(record) = self.lenses.get_mut(lens_id) else {
+            return false;
+        };
+        record.versions.clear();
+        self.create_lens_version_tokens
+            .retain(|token| token.lens_id != lens_id);
+        true
     }
 
     /// The workload already holding `name` under the service's own loose comparison
@@ -9258,6 +9334,20 @@ pub fn unknown_lens_not_found(alias: &str) -> ResourceNotFoundException {
         LENS_RESOURCE_TYPE,
         alias.to_string(),
         &format!("lens with alias {alias}"),
+    )
+}
+
+/// [`resource_not_found`] for a lens carrying no content that a version has not been
+/// published from, so it has no draft a caller could read or delete: "The new or updated
+/// lens will have a status of DRAFT. The lens cannot be applied to workloads or shared
+/// with other Amazon Web Services accounts until it's published with CreateLensVersion"
+/// (`ImportLens` doc), and a lens whose content IS published is past that state. The
+/// `ResourceId` is the alias AS SENT, as the lookup failures above report it.
+pub fn lens_draft_not_found(alias: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        LENS_RESOURCE_TYPE,
+        alias.to_string(),
+        &format!("draft of the lens with alias {alias}"),
     )
 }
 

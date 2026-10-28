@@ -43,7 +43,9 @@ use super::workload_harness::{
 /// `DeleteProfileShare`, `DeleteTemplateShare` and `DeleteWorkloadShare` bind the member too
 /// and assert this same rule in their own suites, each against the resource whose share it
 /// revokes (`lens_share_deletion`, `profile_share_deletion`, `template_share_deletion`,
-/// `workload_share_deletion`); `DeleteLens` binds it and is still a stub with its own issue;
+/// `workload_share_deletion`); `DeleteLens` binds it and asserts this same rule in its own
+/// suite (`custom_lens_deletion`), where a row has to build the lens through an import that
+/// lands first;
 /// `DeleteAgentGoal`, `DeleteAgentContext` and `DeleteAgentProfile` bind no token at
 /// all (`smithy_query(query="operation", operation="DeleteAgentGoal")`), so the rule has
 /// nothing to say about them.

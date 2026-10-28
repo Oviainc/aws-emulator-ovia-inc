@@ -387,6 +387,11 @@ mod lens_share_listing;
 #[path = "all/check_summaries.rs"]
 mod check_summaries;
 
+// Declared last for the same reason as the declarations above: the sorted position for a
+// custom-lens suite falls in a crowded run of this list.
+#[path = "all/custom_lens_deletion.rs"]
+mod custom_lens_deletion;
+
 // Appended at the end of this list rather than inserted among the `profile_*` suites, for
 // the reason the notes above give: an insertion into this list's sorted middle is what
 // repeatedly refused to merge.

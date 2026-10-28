@@ -19,9 +19,9 @@
 //! 3. `ListWorkloadShares` / `ListProfileShares` / `ListTemplateShares` still report every
 //!    share of the resource the delete did not name.
 //!
-//! The rows differ along the resource kind (`WORKLOAD`, `PROFILE` and `TEMPLATE` — the
-//! three kinds whose delete is implemented; a custom lens is shared the same way but
-//! `DeleteLens` is still a stub with its own issue), along how many shares the deleted
+//! The rows differ along the resource kind (`WORKLOAD`, `PROFILE` and `TEMPLATE`; a custom
+//! lens is shared the same way and asserts this same rule in `super::custom_lens_deletion`,
+//! beside the publication states its own delete selects), along how many shares the deleted
 //! resource held, and along the kind of principal each share was granted to.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
@@ -58,8 +58,9 @@ const WORKLOAD_PERMISSION: &str = "READONLY";
 
 /// One resource kind this service shares AND deletes. `ShareResourceType` publishes four
 /// members (`smithy_query(query="shape", shape="ShareResourceType")`); `LENS` is absent
-/// here because `DeleteLens` is still a stub, so a lens cannot be deleted over the wire at
-/// all.
+/// here because a lens is built by an import that LANDS rather than by one create call, so
+/// its rows of this rule live in `super::custom_lens_deletion`, next to the publication
+/// states `DeleteLens` selects.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     Workload,
