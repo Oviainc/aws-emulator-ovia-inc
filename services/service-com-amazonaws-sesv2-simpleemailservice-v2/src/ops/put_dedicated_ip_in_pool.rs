@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDedicatedIpInPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDedicatedIpInPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDedicatedIpInPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the destination pool the request names onto the account's record of the
+//! dedicated IP address it names, so every reader of that address (`GetDedicatedIp`,
+//! `GetDedicatedIps`) then reports it in that pool. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +137,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDedicatedIpInPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDedicatedIpInPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDedicatedIpInPool"))
+        // Request metadata is not needed: a dedicated IP is keyed by the address
+        // itself and a pool by its name, inside the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutDedicatedIpInPool without the shared emulator state",
+            ));
+        };
+
+        let ip = input.ip;
+        let destination_pool_name = input.destination_pool_name;
+
+        // An `Ip` is "an IPv4 address", so a value that is not one names no address at
+        // all: that is invalid input, not an address the account happens not to hold.
+        if !crate::state::ip_is_well_formed(&ip) {
+            return Err(bad_request(crate::state::invalid_ip(&ip)));
+        }
+
+        let mut store = state.lock();
+
+        // The two resources the move needs are checked in the order this operation
+        // documents them: "the dedicated IP address that you specify must already exist,
+        // and must be associated with your Amazon Web Services account. The dedicated IP
+        // pool you specify must already exist." Either one missing is a resource that
+        // does not exist — this call moves an address between pools, it allocates no
+        // address and creates no pool.
+        if !store.dedicated_ips.contains_key(&ip) {
+            return Err(not_found(crate::state::dedicated_ip_not_found(&ip)));
+        }
+        if !store.dedicated_ip_pools.contains_key(&destination_pool_name) {
+            return Err(not_found(crate::state::dedicated_ip_pool_not_found(
+                &destination_pool_name,
+            )));
+        }
+
+        // "Move a dedicated IP address to an existing dedicated IP pool": an address is
+        // in at most one pool at a time (`DedicatedIp$PoolName` is one name), so the
+        // destination REPLACES whatever pool the record was naming, which is also what
+        // makes repeating the move answer the same way and change nothing further.
+        if let Some(record) = store.dedicated_ips.get_mut(&ip) {
+            record.pool_name = Some(destination_pool_name);
+        }
+
+        // `PutDedicatedIpInPoolResponse` carries no members: the new pool membership is
+        // read back with `GetDedicatedIp` and listed by `GetDedicatedIps`.
+        Ok(PutDedicatedIpInPoolOutput {})
     }
+}
+
+/// `BadRequestException` ("the input you provided is invalid") in this operation's error
+/// channel, so every refusal of a bad request is stated the same way.
+fn bad_request(message: impl Into<String>) -> PutDedicatedIpInPoolError {
+    PutDedicatedIpInPoolErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `NotFoundException` ("the resource you attempted to access doesn't exist") in this
+/// operation's error channel, for either resource the move needs.
+fn not_found(message: impl Into<String>) -> PutDedicatedIpInPoolError {
+    PutDedicatedIpInPoolErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.into()),
+    })
+    .into()
 }
