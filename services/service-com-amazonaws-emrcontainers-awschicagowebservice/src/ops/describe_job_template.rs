@@ -160,11 +160,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job_template) = state.job_template_view(&region, &input.id) else {
             return Err(DescribeJobTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // EMR on EKS builds a not-found message from the id the request
-                    // asked for, in the form `<Resource type> <id> doesn't exist.` —
-                    // the form the recorded refusals of this service show for both a
-                    // job template and a security configuration.
-                    message: Some(format!("Job Template {} doesn't exist.", input.id)),
+                    // The one not-found wording of this service
+                    // ([`crate::state::ResourceKind`]), built from the id the request
+                    // asked for.
+                    message: Some(
+                        crate::state::ResourceKind::JobTemplate.not_found_message(&input.id),
+                    ),
                 },
             )
             .into());
