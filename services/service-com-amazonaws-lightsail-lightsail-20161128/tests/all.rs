@@ -55,6 +55,8 @@ mod bucket_resource_access;
 mod bundle_catalog;
 #[path = "all/certificate_delete.rs"]
 mod certificate_delete;
+#[path = "all/certificate_in_use_resources.rs"]
+mod certificate_in_use_resources;
 #[path = "all/certificate_request.rs"]
 mod certificate_request;
 #[path = "all/cloud_formation_stack.rs"]

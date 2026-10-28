@@ -13728,7 +13728,7 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// of its cached content — so removing the record is what removes them all.
     /// A certificate itself is NOT removed with it: a certificate is a resource
     /// of its own, and the number of resources it is attached to is counted from
-    /// the distributions that name it ([`Self::certificate_in_use_resource_count`]),
+    /// the records that name it ([`Self::certificate_in_use_resource_count`]),
     /// so it is released by this removal rather than deleted by it. The
     /// operation log is append-only, so the entries a deleted distribution's
     /// earlier calls wrote stay readable.
@@ -14332,10 +14332,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// it is valid for — so removing the record is what removes them all, and
     /// no later read, listing or tag change can reach a certificate this
     /// account no longer holds. Nothing else in the store is rewritten: a
-    /// distribution is a resource of its own, and whether any distribution
-    /// still serves this certificate is what the caller asks
-    /// [`Self::certificate_in_use_resource_count`] BEFORE removing it, so no
-    /// distribution is ever left naming a certificate that secures nothing.
+    /// distribution and a container service are each a resource of their own,
+    /// and whether any resource still references this certificate is what the
+    /// caller asks [`Self::certificate_in_use_resource_count`] BEFORE removing
+    /// it, so no record is ever left naming a certificate that secures
+    /// nothing.
     /// The operation log is append-only, so the entries this certificate's
     /// earlier calls wrote stay readable.
     pub fn remove_certificate(&mut self, name: &str) -> Option<StoredCertificate> {
@@ -14343,26 +14344,46 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// How many resources of this account the certificate `name` is attached to,
-    /// which is what `Certificate$inUseResourceCount` reports.
+    /// which is what `Certificate$inUseResourceCount` reports — "the number of
+    /// Lightsail resources that the certificate is attached to".
     ///
-    /// Counted from the records that hold the attachment rather than from a
-    /// counter, so the number cannot drift from the distributions that actually
-    /// name the certificate. The walk is bounded by [`MAX_DISTRIBUTIONS`].
+    /// A resource is attached to a certificate exactly when its own record
+    /// references it, and this store records such a reference in the two places
+    /// [`Self::issued_certificate`] guards on the way in: a DISTRIBUTION names
+    /// it in `certificateName`, and a CONTAINER SERVICE keys a group of its
+    /// `publicDomainNames` by it. Both are counted, so every resource whose
+    /// record would be left naming a certificate that secures nothing is one
+    /// this number reports — which is what the delete's in-use refusal rests on.
+    ///
+    /// Counted from the records that hold the reference rather than from a
+    /// counter, so the number cannot drift from the resources that actually
+    /// name the certificate. A certificate of this store is held by its name
+    /// alone while a container service is held per Region, and the write side
+    /// resolves a certificate by name alone too, so a service of ANY Region
+    /// that keys its domains by this certificate is one of the resources it is
+    /// attached to. The walk is bounded by [`MAX_DISTRIBUTIONS`] plus
+    /// [`MAX_CONTAINER_SERVICES`].
     pub fn certificate_in_use_resource_count(&self, name: &str) -> i32 {
-        let count = self
+        let distributions = self
             .distributions
             .values()
             .filter(|distribution| distribution.certificate_name.as_deref() == Some(name))
             .count();
-        i32::try_from(count).unwrap_or(i32::MAX)
+        let container_services = self
+            .container_services
+            .values()
+            .filter(|service| service.public_domain_names.contains_key(name))
+            .count();
+        i32::try_from(distributions.saturating_add(container_services)).unwrap_or(i32::MAX)
     }
 
     /// The certificate `name` names as the modelled `CertificateSummary`, with
     /// the resources it is attached to counted.
     ///
-    /// The one way a reporting operation renders a certificate: the attachment
-    /// lives on the DISTRIBUTION record, so assembling the view needs the whole
-    /// store, not just the certificate.
+    /// The one way a reporting operation renders a certificate: the reference
+    /// lives on the record of the resource that holds it — a distribution, or a
+    /// container service whose public domain names it keys — so assembling the
+    /// view needs the whole store, not just the certificate.
     pub fn certificate_view(&self, name: &str, include_details: bool) -> Option<CertificateSummary> {
         let certificate = self.certificates.get(name)?;
         Some(certificate.view(

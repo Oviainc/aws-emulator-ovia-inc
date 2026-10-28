@@ -651,7 +651,15 @@ const IN_USE_ROWS: &[InUseRow] = &[
 
 /// Require that `DeleteCertificate` refuses `name` as in use by `in_use`
 /// resources and removes nothing.
-async fn assert_in_use_refusal(emulator: &Emulator, case: &str, name: &str, in_use: i64) {
+///
+/// `pub(crate)` so a sibling suite in this test target asserts the one in-use
+/// refusal through this one helper rather than carrying a second copy of it.
+pub(crate) async fn assert_in_use_refusal(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+    in_use: i64,
+) {
     let (status, body) = emulator.call(DELETE, json!({"certificateName": name})).await;
     assert_eq!(
         status, 400,

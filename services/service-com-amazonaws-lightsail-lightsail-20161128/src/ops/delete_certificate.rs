@@ -2,8 +2,10 @@
 
 //! @op DeleteCertificate
 //! Removes one SSL/TLS certificate this account holds, and answers the
-//! operation-log entry the deletion appended. A certificate a distribution is
-//! still serving is in use, so the request is refused rather than served.
+//! operation-log entry the deletion appended. A certificate a resource of this
+//! account still references — a distribution serving it, or a container service
+//! whose public domain names are keyed by it — is in use, so the request is
+//! refused rather than served.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -191,13 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Certificates that are currently attached to a distribution cannot
             // be deleted. Use the DetachCertificateFromDistribution action to
             // detach a certificate from a distribution." Whether anything is
-            // still serving this certificate is counted from the records that
-            // HOLD the attachment — the store's one owner of that count, the
-            // same number `Certificate$inUseResourceCount` reports — so the
-            // refusal cannot drift from what a read of the certificate says. It
-            // is answered BEFORE the removal, so a refused request deletes
-            // nothing and no resource is left naming a certificate that secures
-            // nothing.
+            // still referencing this certificate is counted from the records
+            // that HOLD the reference — the store's one owner of that count, the
+            // same number `Certificate$inUseResourceCount` reports, over every
+            // kind of resource that can name a certificate — so the refusal
+            // cannot drift from what a read of the certificate says. It is
+            // answered BEFORE the removal, so a refused request deletes nothing
+            // and no resource is left naming a certificate that secures nothing.
             let in_use = store.certificate_in_use_resource_count(&name);
             if in_use > 0 {
                 return Err(invalid(format!(

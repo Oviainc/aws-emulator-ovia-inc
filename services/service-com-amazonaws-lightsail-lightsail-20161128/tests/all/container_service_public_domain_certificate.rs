@@ -49,7 +49,10 @@ const SCALE: i64 = 1;
 // ---------------------------------------------------------------------------
 
 /// The `publicDomainNames` map `domains` describes, as the wire carries it.
-fn public_domain_names(domains: &[(&str, &[&str])]) -> Value {
+///
+/// `pub(crate)` so a sibling suite in this test target builds the same member
+/// the same way rather than carrying a second copy of the conversion.
+pub(crate) fn public_domain_names(domains: &[(&str, &[&str])]) -> Value {
     let mut map = Map::new();
     for (certificate, names) in domains {
         map.insert((*certificate).to_string(), json!(names));
@@ -81,7 +84,14 @@ async fn read_service(emulator: &Emulator, region: &str, name: &str) -> (u16, Va
 }
 
 /// The `publicDomainNames` the stored service `name` of `region` reports.
-async fn reported_domains(emulator: &Emulator, case: &str, region: &str, name: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`public_domain_names`].
+pub(crate) async fn reported_domains(
+    emulator: &Emulator,
+    case: &str,
+    region: &str,
+    name: &str,
+) -> Value {
     let (status, body) = read_service(emulator, region, name).await;
     assert_eq!(
         status, 200,
