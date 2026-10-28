@@ -258,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.cluster_identifier.clone(),
             input.ordering.clone(),
             input.format.clone(),
-            fingerprint_target(&input.target_definition),
+            crate::state::fingerprint_target(&input.target_definition),
             crate::state::fingerprint_tags(input.tags.as_ref()),
         ]);
         if let Some(token) = input.client_token.as_deref() {
@@ -276,10 +276,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             created_stream_output(&input.cluster_identifier, existing);
                         // The status this call answered: the clock settles the
                         // stream to `ACTIVE` afterwards, which is not what this
-                        // request produced.
-                        if let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) {
-                            answer.status = status.to_string();
-                        }
+                        // request produced. A served create always records that
+                        // status, so a record without it is refused rather than
+                        // answered with the live stream's.
+                        let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) else {
+                            return Err(CreateStreamErrorModeled::InternalServerException(
+                                crate::state::recorded_result_unavailable(),
+                            )
+                            .into());
+                        };
+                        answer.status = status.to_string();
                         return Ok(answer);
                     }
                 }
@@ -565,13 +571,4 @@ fn unpassable_role(
         return None;
     }
     cross_account_denial(&input.target_definition)
-}
-
-/// Render a `targetDefinition` into one idempotency-fingerprint part.
-fn fingerprint_target(target: &TargetDefinition) -> String {
-    match target {
-        TargetDefinition::Kinesis(kinesis) => {
-            format!("kinesis:{}:{}", kinesis.stream_arn, kinesis.role_arn)
-        }
-    }
 }

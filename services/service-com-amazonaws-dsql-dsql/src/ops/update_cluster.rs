@@ -274,10 +274,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let mut answer = updated_cluster_output(existing);
                         // The status this call answered: the clock settles the
                         // cluster back to `ACTIVE` and a later update moves it
-                        // again, neither of which is this request's result.
-                        if let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) {
-                            answer.status = status.to_string();
-                        }
+                        // again, neither of which is this request's result. A
+                        // served update always records that status, so a record
+                        // without it is refused rather than answered with the
+                        // live cluster's.
+                        let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) else {
+                            return Err(UpdateClusterErrorModeled::InternalServerException(
+                                crate::state::recorded_result_unavailable(),
+                            )
+                            .into());
+                        };
+                        answer.status = status.to_string();
                         return Ok(answer);
                     }
                 }

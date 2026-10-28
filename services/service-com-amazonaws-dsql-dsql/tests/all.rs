@@ -37,6 +37,8 @@ mod error_contract;
 mod harness;
 #[path = "all/idempotent_replay_result.rs"]
 mod idempotent_replay_result;
+#[path = "all/incomplete_replay_record.rs"]
+mod incomplete_replay_record;
 #[path = "all/inline_policy_validation.rs"]
 mod inline_policy_validation;
 #[path = "all/modeled_validation_exception.rs"]

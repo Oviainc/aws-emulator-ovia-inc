@@ -209,11 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // answered, so there is nothing to serve here — and
                             // nothing this request may delete in its place.
                             DeleteStreamErrorModeled::InternalServerException(
-                                InternalServerException {
-                                    message: "the recorded result of this request is unavailable"
-                                        .to_string(),
-                                    retry_after_seconds: None,
-                                },
+                                crate::state::recorded_result_unavailable(),
                             )
                             .into()
                         });

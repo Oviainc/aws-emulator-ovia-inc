@@ -28,7 +28,10 @@
 //! read back the same members, so the encoding and the refusal of an incomplete
 //! record are one implementation, parameterised by the output each handler
 //! builds. The answer a served `CreateCluster` keeps
-//! ([`RecordedClusterCreation`]) lives here on the same terms.
+//! ([`RecordedClusterCreation`]) lives here on the same terms, as does the
+//! refusal every replay path gives for a record that does not hold a member the
+//! original call answered ([`recorded_result_unavailable`]), so no two of them
+//! can decide that case differently.
 //!
 //! The checks a request's own input has to pass before anything is written live
 //! here for the same reason: a cluster's resource-based policy is attached by two
@@ -53,8 +56,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ConflictException, EncryptionDetails, MultiRegionProperties, ResourceNotFoundException,
-    ServiceQuotaExceededException, TargetDefinition, ValidationException, ValidationExceptionField,
+    ConflictException, EncryptionDetails, InternalServerException, MultiRegionProperties,
+    ResourceNotFoundException, ServiceQuotaExceededException, TargetDefinition, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
@@ -562,6 +566,27 @@ impl RecordedCall {
     }
 }
 
+/// The sentence a handler refuses a recognised retry with when the record that
+/// retry has to be served from does not hold a member the original call
+/// answered.
+pub const RECORDED_RESULT_UNAVAILABLE_MESSAGE: &str =
+    "the recorded result of this request is unavailable";
+
+/// The modelled server error EVERY replay path of this service refuses with when
+/// the record it is serving from is missing a member the original call answered.
+///
+/// [`RecordedCall::answered`] holds a value for exactly the members the handler
+/// cannot re-derive, so a handler that finds one absent has no answer to give and
+/// nothing it may derive, mint or retire in its place. The decision is the same
+/// for every one of them, so the refusal is built here rather than once per
+/// handler, and each handler only lifts it into its own error channel.
+pub fn recorded_result_unavailable() -> InternalServerException {
+    InternalServerException {
+        message: RECORDED_RESULT_UNAVAILABLE_MESSAGE.to_string(),
+        retry_after_seconds: None,
+    }
+}
+
 /// One recorded use of a `clientToken`.
 #[derive(Debug, Clone)]
 struct TokenEntry {
@@ -690,6 +715,17 @@ pub fn fingerprint_multi_region(properties: Option<&MultiRegionProperties>) -> S
                 properties.witness_region.as_deref().unwrap_or_default(),
                 clusters.join(",")
             )
+        }
+    }
+}
+
+/// Render a `targetDefinition` into one fingerprint part, naming the destination
+/// the union carries and every member of it, so two targets compare equal only
+/// when they name the same destination with the same values.
+pub fn fingerprint_target(target: &TargetDefinition) -> String {
+    match target {
+        TargetDefinition::Kinesis(kinesis) => {
+            format!("kinesis:{}:{}", kinesis.stream_arn, kinesis.role_arn)
         }
     }
 }
