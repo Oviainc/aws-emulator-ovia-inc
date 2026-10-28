@@ -13,7 +13,11 @@
 //! `@idempotent`: a retry carrying the same `client-token` answers the result the
 //! first call gave — from the `clientToken` ledger, so it still answers once the
 //! clock has removed the cluster — and that token used for a DIFFERENT delete is
-//! refused with `ConflictException` (409).
+//! refused with `ConflictException` (409). A delete arriving while the deletion is
+//! already under way — in either leg of that chain, with no token or with one the
+//! ledger has not seen — answers with the deletion in flight and starts nothing
+//! new; a cluster the clock owes any other transition is refused with
+//! `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -258,15 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A cluster the clock still owes a transition cannot start deleting; one that
-        // is already deleting answers with the delete in flight.
-        if cluster.status != crate::state::STATUS_DELETING {
+        // A cluster the clock still owes some OTHER transition cannot start
+        // deleting; a cluster whose deletion is already under way answers with
+        // that deletion and starts nothing — whichever leg of the delete chain
+        // the call lands in ([`crate::state::Cluster::deletion_in_flight`]), so a
+        // retry is served the same way for a cluster whose peering is being
+        // unwound first as for one whose removal started straight away.
+        if !cluster.deletion_in_flight() {
             if let Some(conflict) = cluster.mutation_conflict("be deleted") {
                 return Err(DeleteClusterErrorModeled::ConflictException(conflict).into());
             }
-        }
 
-        if cluster.status != crate::state::STATUS_DELETING {
             // A multi-Region cluster's deletion unwinds its peering first: it
             // reports `PENDING_DELETE` until the removal itself starts, which the
             // clock then carries on to `DELETING` and to the cluster going away. A

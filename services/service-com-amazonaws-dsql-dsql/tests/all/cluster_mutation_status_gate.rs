@@ -6,8 +6,10 @@
 //! `ConflictException` unless the cluster's status accepts a mutation — only a
 //! settled cluster does, not one the clock still owes a transition and not one
 //! already on its way out — and a refused request leaves the record exactly as it
-//! was. The one exemption is the delete of a cluster that is already deleting,
-//! which answers with the delete already in flight.
+//! was. The one exemption is the delete of a cluster whose deletion is already
+//! under way — either leg of that chain, the peering tear-down
+//! (`PENDING_DELETE`) or the removal (`DELETING`) — which answers with the delete
+//! already in flight.
 //!
 //! The first table is the whole class: every `ClusterStatus` the model declares
 //! crossed with every operation that writes a cluster record, each case on its own
@@ -27,7 +29,7 @@ use serde_json::json;
 use service_com_amazonaws_dsql_dsql::ops::types::CLUSTER_STATUS_VALUES;
 use service_com_amazonaws_dsql_dsql::state::{
     Cluster, ClusterPolicy, ComAmazonawsDsqlDsqlState, PendingTransition, STATUS_ACTIVE,
-    STATUS_DELETED, STATUS_DELETING, STATUS_IDLE, STATUS_UPDATING,
+    STATUS_DELETED, STATUS_DELETING, STATUS_IDLE, STATUS_PENDING_DELETE, STATUS_UPDATING,
 };
 
 use crate::cluster_lifecycle::cluster_id_for;
@@ -106,6 +108,9 @@ impl Mutation {
 /// transition the clock owes a transient status still outstanding.
 fn stored_cluster(identifier: &str, status: &str) -> Cluster {
     let settles_to = match status {
+        // The legs of the deletion chain are owed the next leg of that chain, not
+        // a return to service.
+        STATUS_PENDING_DELETE => Some(STATUS_DELETING),
         STATUS_DELETING => Some(STATUS_DELETED),
         status if status == STATUS_ACTIVE || status == STATUS_IDLE => None,
         _ => Some(STATUS_ACTIVE),
@@ -163,10 +168,13 @@ async fn every_cluster_write_passes_the_same_status_gate() {
 
             let answer = mutation.call(&dsql, &identifier).await;
 
-            // The one exemption: a delete of a cluster that is already deleting
-            // answers with the delete in flight rather than refusing it.
-            let delete_already_in_flight =
-                *status == STATUS_DELETING && mutation == Mutation::DeleteCluster;
+            // The one exemption: a delete of a cluster whose deletion is already
+            // under way answers with that delete rather than refusing it, in
+            // either leg of the chain the deletion reports — the peering
+            // tear-down of a multi-Region cluster and the removal itself.
+            let delete_already_in_flight = [STATUS_PENDING_DELETE, STATUS_DELETING]
+                .contains(status)
+                && mutation == Mutation::DeleteCluster;
             if accepts_a_mutation(status) || delete_already_in_flight {
                 assert_eq!(
                     answer.status, 200,
