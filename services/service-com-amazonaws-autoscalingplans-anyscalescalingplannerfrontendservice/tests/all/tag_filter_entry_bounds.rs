@@ -48,11 +48,11 @@ type FilterForm = (&'static str, fn(usize) -> Value);
 
 /// The refusal a list past its documented bound has to carry, as AWS words a validation
 /// failure: the member at fault and the maximum its documentation states.
+///
+/// The rendering itself is [`crate::documented_entry_count_wording::entry_count_refusal`],
+/// the one sentence this service gives that refusal for ANY bounded member.
 fn expected_refusal(wire_member: &str, bound: usize) -> String {
-    format!(
-        "1 validation error detected: Value at '{wire_member}' failed to satisfy constraint: \
-         Member must have length less than or equal to {bound}"
-    )
+    crate::documented_entry_count_wording::entry_count_refusal(wire_member, bound)
 }
 
 /// An `ApplicationSource` whose `TagFilters` holds `count` entries, each built by `form`.

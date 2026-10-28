@@ -60,7 +60,10 @@ pub(crate) fn with(members: &[(&str, Value)]) -> Value {
 
 /// `count` target tracking configurations, each tracking a DIFFERENT customized metric,
 /// so only the LIST's own length distinguishes the rows that use this.
-fn customized_configurations(count: usize) -> Value {
+///
+/// `pub(crate)` so a suite that varies the LENGTH of this list builds it the same way
+/// rather than from a second copy.
+pub(crate) fn customized_configurations(count: usize) -> Value {
     Value::Array(
         (0..count)
             .map(|n| {
