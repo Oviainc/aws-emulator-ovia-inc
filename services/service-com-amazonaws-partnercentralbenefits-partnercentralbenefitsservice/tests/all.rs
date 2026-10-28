@@ -55,6 +55,8 @@ mod list_applications_filter_members;
 mod member_refusal_one_construction;
 #[path = "all/pagination_cursor_issuance.rs"]
 mod pagination_cursor_issuance;
+#[path = "all/persisted_string_bounds.rs"]
+mod persisted_string_bounds;
 #[path = "all/recall_benefit_application.rs"]
 mod recall_benefit_application;
 #[path = "all/reserved_tag_keys.rs"]

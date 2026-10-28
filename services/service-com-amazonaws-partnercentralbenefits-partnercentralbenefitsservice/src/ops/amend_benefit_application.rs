@@ -222,24 +222,6 @@ fn set_document_member(document: &mut Document, path: &[&str], value: &str) -> R
     set_document_member(child, rest, value).map_err(|depth| depth + 1)
 }
 
-/// Whether `value` satisfies the `@length(min: min, max: max)` of the member it is
-/// written to or stored in.
-///
-/// The requirement is worded by [`crate::service::constraint_requirement`] — the same
-/// words the centralized walk uses for a length — so an in-handler refusal of a length
-/// cannot drift from the walk's refusal of one.
-fn length_clause(value: &str, min: usize, max: usize) -> Option<String> {
-    let length = value.chars().count();
-    let kind = if length < min {
-        ViolationKind::MinLength(min as i64)
-    } else if length > max {
-        ViolationKind::MaxLength(max as i64)
-    } else {
-        return None;
-    };
-    crate::service::constraint_requirement(&kind)
-}
-
 /// One refusal of an input member, as this operation's modelled `ValidationException`.
 ///
 /// Built by the one construction every member refusal of this crate goes through
@@ -296,7 +278,9 @@ fn apply_amendment(
 
     match *head {
         FIELD_NAME if rest.is_empty() => {
-            if let Some(clause) = length_clause(&amendment.new_value, MIN_LEN, NAME_MAX_LEN) {
+            if let Some(clause) =
+                crate::state::length_clause(&amendment.new_value, MIN_LEN, NAME_MAX_LEN)
+            {
                 return Err(AmendmentRefusal::new(
                     member_path(position, "newValue"),
                     clause,
@@ -305,8 +289,11 @@ fn apply_amendment(
             application.name = Some(amendment.new_value.clone());
         }
         FIELD_DESCRIPTION if rest.is_empty() => {
-            if let Some(clause) = length_clause(&amendment.new_value, MIN_LEN, DESCRIPTION_MAX_LEN)
-            {
+            if let Some(clause) = crate::state::length_clause(
+                &amendment.new_value,
+                MIN_LEN,
+                DESCRIPTION_MAX_LEN,
+            ) {
                 return Err(AmendmentRefusal::new(
                     member_path(position, "newValue"),
                     clause,
@@ -325,7 +312,7 @@ fn apply_amendment(
             // A leaf of the document carries no modelled length at all (and an empty
             // string is a valid member of a document), so the only bound on a value
             // written here is this service's own maximum.
-            if let Some(clause) = length_clause(
+            if let Some(clause) = crate::state::length_clause(
                 &amendment.new_value,
                 0,
                 crate::state::MAX_DETAILS_VALUE_LEN,
@@ -463,16 +450,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`AmendmentReason` `@length(max: 1000)`, `ClientToken` `@length(min: 1, max:
         // 64)`), so the centralized walk refuses a longer one first; this is the
         // enforcement the store itself relies on, not a restatement of the walk's job.
-        if let Some(clause) = length_clause(
+        if let Some(clause) = crate::state::length_clause(
             &input.amendment_reason,
             0,
             crate::state::MAX_AMENDMENT_REASON_LEN,
         ) {
             return Err(refused("amendmentReason", &clause));
         }
-        if let Some(clause) =
-            length_clause(&input.client_token, MIN_LEN, crate::state::MAX_CLIENT_TOKEN_LEN)
-        {
+        if let Some(clause) = crate::state::length_clause(
+            &input.client_token,
+            crate::state::MIN_CLIENT_TOKEN_LEN,
+            crate::state::MAX_CLIENT_TOKEN_LEN,
+        ) {
             return Err(refused("clientToken", &clause));
         }
 

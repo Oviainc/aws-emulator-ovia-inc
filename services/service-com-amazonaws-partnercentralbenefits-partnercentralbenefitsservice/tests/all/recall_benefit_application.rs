@@ -51,7 +51,12 @@ async fn read(harness: &Harness, case: &str, catalog: &str, identifier: &str) ->
 }
 
 /// Create one application in `catalog` and return `(id, arn)`.
-async fn seed(harness: &Harness, case: &str, catalog: &str, token: &str) -> (String, String) {
+pub(crate) async fn seed(
+    harness: &Harness,
+    case: &str,
+    catalog: &str,
+    token: &str,
+) -> (String, String) {
     let benefit_id = active_benefit_id(harness, catalog).await;
     let created = harness
         .create(
@@ -68,7 +73,7 @@ async fn seed(harness: &Harness, case: &str, catalog: &str, token: &str) -> (Str
 }
 
 /// Submit one application, which must succeed and leave it `IN_REVIEW`.
-async fn submit(harness: &Harness, case: &str, catalog: &str, identifier: &str) {
+pub(crate) async fn submit(harness: &Harness, case: &str, catalog: &str, identifier: &str) {
     harness
         .ok(
             case,
@@ -85,7 +90,12 @@ async fn submit(harness: &Harness, case: &str, catalog: &str, identifier: &str) 
 }
 
 /// One recall request body.
-fn recall_body(catalog: &str, identifier: &str, reason: &str, token: Option<&str>) -> Value {
+pub(crate) fn recall_body(
+    catalog: &str,
+    identifier: &str,
+    reason: &str,
+    token: Option<&str>,
+) -> Value {
     let mut body = json!({
         "Catalog": catalog,
         "Identifier": identifier,
