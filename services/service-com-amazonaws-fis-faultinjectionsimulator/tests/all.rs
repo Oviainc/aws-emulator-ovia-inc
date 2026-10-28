@@ -63,6 +63,8 @@ mod resource_tagging;
 mod safety_lever;
 #[path = "all/start_experiment_replay.rs"]
 mod start_experiment_replay;
+#[path = "all/start_experiment_token_normalization.rs"]
+mod start_experiment_token_normalization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/target_account_configuration_description.rs"]

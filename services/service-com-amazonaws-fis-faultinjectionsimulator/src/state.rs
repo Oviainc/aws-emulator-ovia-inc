@@ -4516,31 +4516,46 @@ fn policy_grants_service(document: &str, principal: &str) -> Option<bool> {
 /// here is what makes the rendering canonical under EITHER object type.
 fn ordered_entries(map: Option<&HashMap<String, String>>) -> ::serde_json::Value {
     match map {
-        Some(map) => {
-            let ordered: BTreeMap<&str, &str> = map
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str()))
-                .collect();
-            ::serde_json::json!(ordered)
-        }
+        Some(map) => ::serde_json::json!(sorted_entries(map)),
         None => ::serde_json::Value::Null,
     }
 }
 
-/// The canonical rendering of the `StartExperiment` request a `clientToken` belongs to.
+/// `map`'s entries in KEY order, which is what makes a rendering of it canonical — see
+/// [`ordered_entries`] for why.
+fn sorted_entries(map: &HashMap<String, String>) -> BTreeMap<&str, &str> {
+    map.iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+/// `tags` as the store holds them: the map the resource is TAGGED with, which an omitted
+/// map and an explicitly empty one leave behind just the same — so an absent map renders as
+/// the empty object rather than as `null` (see [`ordered_entries`] for the ordering).
+fn stored_tags(tags: Option<&HashMap<String, String>>) -> ::serde_json::Value {
+    ::serde_json::json!(tags.map(sorted_entries).unwrap_or_default())
+}
+
+/// The canonical rendering of the `StartExperiment` request a `clientToken` belongs to,
+/// taken from what the start PERSISTS rather than from the raw request — `actions_mode` is
+/// the mode the start resolved ([`resolve_actions_mode`]).
 ///
 /// Every member of the request that chooses what gets started, and nothing else: two
 /// requests with the same rendering start the same experiment, so one is a retry of the
-/// other. Every map is rendered in key order (see [`ordered_entries`]), so a map's
-/// iteration order cannot make one request look like two.
-pub fn start_experiment_fingerprint(input: &StartExperimentInput) -> String {
+/// other. Each member is rendered as the experiment record would hold it — the RESOLVED
+/// `actionsMode`, so a request spelling [`DEFAULT_ACTIONS_MODE`] out and one leaving it to
+/// the service render alike, and the tags as the map the experiment is tagged with
+/// ([`stored_tags`]) — because such a pair starts a byte-identical experiment and neither
+/// one is a different request wearing the token. This is the normalisation
+/// [`target_account_configuration_fingerprint`] performs on its description and
+/// [`template_fingerprint`] gets by rendering the record. Every map is rendered in key
+/// order (see [`ordered_entries`]), so a map's iteration order cannot make one request look
+/// like two.
+pub fn start_experiment_fingerprint(input: &StartExperimentInput, actions_mode: &str) -> String {
     ::serde_json::json!({
         "experimentTemplateId": input.experiment_template_id,
-        "actionsMode": input
-            .experiment_options
-            .as_ref()
-            .and_then(|options| options.actions_mode.clone()),
-        "tags": ordered_entries(input.tags.as_ref()),
+        "actionsMode": actions_mode,
+        "tags": stored_tags(input.tags.as_ref()),
     })
     .to_string()
 }

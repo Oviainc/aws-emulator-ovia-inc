@@ -170,10 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
     /// A reporting-only pass over the store, asked BEFORE that guard is taken: the writes
     /// the clock owes the replayed experiment take the store lock themselves, so the id
     /// they need has to be resolved with no guard held.
-    fn replayed_experiment_id(&self, input: &StartExperimentInput) -> Option<String> {
+    ///
+    /// `actions_mode` is the mode this request RESOLVED to, which is what the fingerprint
+    /// is taken over — see [`crate::state::start_experiment_fingerprint`].
+    fn replayed_experiment_id(
+        &self,
+        input: &StartExperimentInput,
+        actions_mode: &str,
+    ) -> Option<String> {
         let store = crate::state::service_state(&*self.engine)?;
         let store = store.lock();
-        let fingerprint = crate::state::start_experiment_fingerprint(input);
+        let fingerprint = crate::state::start_experiment_fingerprint(input, actions_mode);
         match store.replayed(
             crate::state::IdempotentResource::Experiment,
             &input.client_token,
@@ -221,8 +228,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
         // The token is `@idempotencyToken`: replaying it with the SAME request reports
         // the experiment the first call started, while reusing it for a different request
         // is the parameter mismatch FIS answers with `ConflictException` rather than
-        // reporting another template's run.
-        let fingerprint = crate::state::start_experiment_fingerprint(input);
+        // reporting another template's run. "The same request" is decided over what the
+        // start PERSISTS — the resolved actions mode and the tag map the experiment is
+        // tagged with — so a retry that spells a default out, or that normalises an
+        // omitted map to an empty one, is still a retry of the call that started the
+        // experiment it describes (see [`crate::state::start_experiment_fingerprint`]).
+        let fingerprint = crate::state::start_experiment_fingerprint(input, actions_mode);
         match store.replayed(
             crate::state::IdempotentResource::Experiment,
             &input.client_token,
@@ -432,7 +443,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // itself and holds it across no call, so it runs before the start below takes its
         // guard; a token that started nothing owes nothing, and a start that mints a new
         // experiment has not ended, so neither reaches it.
-        if let Some(id) = self.replayed_experiment_id(&input) {
+        if let Some(id) = self.replayed_experiment_id(&input, &actions_mode) {
             crate::state::materialise_experiment_report(&*self.engine, ctx, &region, &id, now)
                 .await;
         }
