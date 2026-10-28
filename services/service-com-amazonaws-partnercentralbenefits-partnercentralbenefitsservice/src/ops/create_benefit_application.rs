@@ -34,6 +34,14 @@
 //! set — a map, so a repeated key counts once — can never exceed the cap. Both paths that
 //! add tags are pinned together in `tests/all/tag_cap.rs`.
 //!
+//! `AssociatedResources` and `FulfillmentTypes` are lists of IDENTITIES, so each is stored
+//! as the SET it denotes: a resource ARN or a fulfillment type the request names twice is
+//! stored once, in the order the request first named it. `AssociatedResources` is the very
+//! list `AssociateBenefitApplicationResource` maintains as a set and
+//! [`crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] bounds, so an application's
+//! association count is a count of distinct resources whichever path stored them — see
+//! [`crate::state::distinct_values`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -442,7 +450,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             benefit_id,
             name: input.name,
             description: input.description,
-            fulfillment_types: input.fulfillment_types.unwrap_or_default(),
+            // An identity list, stored as the set it denotes: a fulfillment type named
+            // twice is requested once — see [`crate::state::distinct_values`].
+            fulfillment_types: crate::state::distinct_values(input.fulfillment_types),
             benefit_application_details: input.benefit_application_details,
             programs,
             status: crate::state::STATUS_PENDING_SUBMISSION.to_string(),
@@ -454,7 +464,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_revision: 1,
             // Nothing has recalled this application: it has not been submitted yet.
             recall_client_token: None,
-            associated_resources: input.associated_resources.unwrap_or_default(),
+            // The association list is a SET, the same one
+            // `crate::ops::associate_benefit_application_resource` maintains and
+            // `crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION` bounds, so a create
+            // naming one resource twice links the application to it once — see
+            // [`crate::state::distinct_values`].
+            associated_resources: crate::state::distinct_values(input.associated_resources),
             partner_contacts: input.partner_contacts.unwrap_or_default(),
             file_details: input
                 .file_details
