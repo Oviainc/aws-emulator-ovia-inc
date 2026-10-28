@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::MAX_TARGET_IPS;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, error_type, ok, parse_time, string_member};
+use super::harness::{call, emulator, error_type, ok, parse_time, string_member, Emulator};
 use super::resolver_rule_deletion::outbound_endpoint;
 
 /// The Route 53 Resolver service error code for a rule id the account holds no
@@ -46,7 +46,11 @@ const UNCHANGED_MEMBERS: &[&str] = &[
 
 /// Create an INBOUND Resolver endpoint, which is NOT a direction a rule may
 /// route its queries through.
-async fn inbound_endpoint(router: &MultiServiceRouter, creator: &str) -> String {
+///
+/// Its addresses sit in subnets of the caller's VPC, registered in the account's
+/// own Amazon EC2 store first, as [`outbound_endpoint`] does for its own.
+async fn inbound_endpoint(router: &Emulator, creator: &str) -> String {
+    router.hold_subnets(["subnet-00000000000000003", "subnet-00000000000000004"]);
     let created = ok(
         router,
         "CreateResolverEndpoint",

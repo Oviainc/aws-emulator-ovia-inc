@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUnfilteredTableMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUnfilteredTableMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUnfilteredTableMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! The Lake Formation application-integration read of ONE table: "retrieves table metadata
+//! from the Data Catalog that contains unfiltered metadata", whose public IAM action is
+//! `glue:GetTable` — so an ordinary caller reaches it, and it answers the stored table
+//! definition the single-table read answers ([`crate::ops::get_table`]), plus the Lake
+//! Formation facts about that table.
+//!
+//! Those facts are all negative here, and each for a reason rather than by omission: no
+//! stored table's location is registered with Lake Formation
+//! (`IsRegisteredWithLakeFormation` is false), so no column is withheld
+//! (`AuthorizedColumns`) and no cell filter or row filter applies; no stored table is a
+//! view (`CreateTable` refuses a `ViewDefinition`), so neither view flag is set; and no
+//! query session is vended by this emulator, so no `QueryAuthorizationId` is minted —
+//! inventing one would hand a caller a session identifier nothing issued.
+//!
+//! A table of a FEDERATED database is NOT answered from the catalog: "a database that
+//! points to an entity outside the Glue Data Catalog" (`FederatedDatabase`) keeps its
+//! tables in that entity, so the read has to go through the source its registration names
+//! — and nothing here can reach such a source, which is the retryable federation failure
+//! [`crate::state::federated_source_refusal`] words.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +142,10 @@
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
 //! * `PermissionTypeMismatchException` (HTTP 400) — The operation timed out.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "Access to a resource was denied." A `CatalogId` naming another account's Data
+//!   Catalog is reachable only through that catalog's resource-based policy, so a caller
+//!   with no grant on it is refused here before any database is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -144,9 +161,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `GetUnfilteredTableMetadataError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#GetUnfilteredTableMetadata")]
+// `AccessDeniedException` — "Access to a resource was denied." — is widened in through
+// `extra_errors` for the same reason `GetTables` widens it in: this SERVICE models the
+// shape, this operation's own `errors` list omits it, and a read of a Data Catalog of
+// another account the caller holds no grant on is refused as unauthorized rather than as a
+// missing entity.
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#GetUnfilteredTableMetadata",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetUnfilteredTableMetadataErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     FederationSourceException(FederationSourceException),
     FederationSourceRetryableException(FederationSourceRetryableException),
@@ -208,18 +234,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUnfilteredTableMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUnfilteredTableMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUnfilteredTableMetadata"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetUnfilteredTableMetadataErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(Some(&input.catalog_id));
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the caller may read this catalog at all is decided BEFORE the entity
+        // lookup, exactly as it is for the ungated single-table read (see
+        // `crate::state::foreign_catalog_refusal`).
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
+            return Err(GetUnfilteredTableMetadataErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The answer is built under the store's guard and the guard released before KMS is
+        // asked anything: the key material travels out with the answer.
+        let (table, encryption) = {
+            let store = state.lock();
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(
+                    GetUnfilteredTableMetadataErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
+                            message: Some(crate::state::messages::database_not_found(
+                                &input.database_name,
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // A table of a federated database is held by the source that database points
+            // at, so the read is answered by that source and not out of the catalog.
+            if let Some(message) = crate::state::federated_source_refusal(database) {
+                return Err(
+                    GetUnfilteredTableMetadataErrorModeled::FederationSourceRetryableException(
+                        FederationSourceRetryableException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let Some(entry) = database.tables.get(&crate::state::fold_name(&input.name)) else {
+                return Err(
+                    GetUnfilteredTableMetadataErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
+                            message: Some(
+                                crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                );
+            };
+            (
+                entry.to_table(&database.database_id),
+                entry.encryption.clone(),
+            )
+        };
+
+        // A table written while its catalog encrypted catalog writes under a KMS key is
+        // readable only while that key is, exactly as the ungated read serves it: the
+        // definition is answered once KMS has opened the table's data key again, and KMS's
+        // own refusal is relayed as this operation's `GlueEncryptionException`.
+        if let Err(message) =
+            crate::state::catalog_encryption::unseal(ctx, &region, encryption.as_ref()).await
+        {
+            return Err(GetUnfilteredTableMetadataErrorModeled::GlueEncryptionException(
+                GlueEncryptionException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        Ok(GetUnfilteredTableMetadataOutput {
+            table: Some(table),
+            // No column is withheld, because the table's location is registered with no
+            // Lake Formation that could withhold one; the member is absent rather than a
+            // list, which is how the service reports "every column" (a list would claim
+            // that only the columns in it are authorized).
+            authorized_columns: None,
+            is_registered_with_lake_formation: false,
+            cell_filters: None,
+            row_filter: None,
+            // See this module's docs: no query session is vended here, so there is no
+            // authorization id to report, and no data permission of the caller to report
+            // either.
+            query_authorization_id: None,
+            permissions: None,
+            // No stored table is a view: `CreateTable` and `UpdateTable` refuse a
+            // `ViewDefinition` rather than storing one.
+            is_multi_dialect_view: false,
+            is_materialized_view: false,
+            // "Whether the table is protected": nothing here protects a table, and the
+            // ARN member reports the parent resource a vended session named, of which
+            // there is none.
+            is_protected: false,
+            resource_arn: None,
+        })
     }
 }

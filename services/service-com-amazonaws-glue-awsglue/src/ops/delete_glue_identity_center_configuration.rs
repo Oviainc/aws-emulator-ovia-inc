@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGlueIdentityCenterConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGlueIdentityCenterConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGlueIdentityCenterConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Removes the Glue Identity Center configuration of the account this endpoint serves,
+//! returning the account to the not-configured state a fresh account is in — so the
+//! `GetGlueIdentityCenterConfiguration` that follows reports the miss again and a further
+//! `CreateGlueIdentityCenterConfiguration` is accepted.
+//!
+//! The configuration is an account SINGLETON (see
+//! [`crate::ops::get_glue_identity_center_configuration`]), so this delete takes no input
+//! and an account that has none is answered with the operation's modelled
+//! `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +141,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGlueIdentityCenterConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGlueIdentityCenterConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGlueIdentityCenterConfiguration"))
+        // The request carries nothing: the configuration is the account's own.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteGlueIdentityCenterConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Identity Center store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Taken out under one hold of the guard, so two deletes racing each other cannot
+        // both report that they removed the configuration.
+        let mut store = state.lock();
+        if store.identity_center_configuration.take().is_none() {
+            return Err(
+                DeleteGlueIdentityCenterConfigurationErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(
+                            crate::state::messages::IDENTITY_CENTER_CONFIGURATION_NOT_FOUND
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        ::tracing::info!(
+            operation = "DeleteGlueIdentityCenterConfiguration",
+            "removed the Glue Identity Center configuration of this account"
+        );
+
+        Ok(DeleteGlueIdentityCenterConfigurationOutput {})
     }
 }

@@ -2916,6 +2916,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::DBCluster",
     "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
+    ROUTE53_HEALTH_CHECK,
     ROUTE53_HOSTED_ZONE,
     S3_BUCKET,
     S3VECTORS_INDEX,
@@ -3932,6 +3933,20 @@ fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the health check ID"; Fn::GetAtt: HealthCheckId. Route 53 ASSIGNS
+        // that id — `CreateHealthCheck` takes no identifier, and the type declares no name
+        // at all — so a declaration reports an identifier of Route 53's own shape (the
+        // 8-4-4-4-12 lowercase hex a health check id takes) rather than CloudFormation's
+        // `<stack>-<logical id>-<unique id>` name, which no operation of that service would
+        // accept as a health check id. This is also the type `super::provisioning` creates
+        // in Route 53 itself, which reports the id IT minted back over the `HealthCheckId`
+        // attribute — and THAT id, not this one, is what the stack reports for a health
+        // check Route 53 created.
+        ROUTE53_HEALTH_CHECK => {
+            let id = generated_uuid(resource_type, name);
+            attributes.insert("HealthCheckId".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the key ID"; Fn::GetAtt: Arn, KeyId. KMS ASSIGNS that id —
         // `CreateKey` takes no identifier — so a declaration reports an identifier of KMS's
         // own shape (a version-4 UUID) rather than CloudFormation's
@@ -4113,6 +4128,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
         APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
         GUARDDUTY_DETECTOR => &["Id"],
+        ROUTE53_HEALTH_CHECK => &["HealthCheckId"],
         ROUTE53_HOSTED_ZONE => &["Id"],
         KMS_KEY => &["Arn", "KeyId"],
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
@@ -4224,6 +4240,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == ROUTE53RESOLVER_RULE
         || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION
         || resource_type == ROUTE53_HOSTED_ZONE
+        // An Amazon Route 53 health check is one more: `CreateHealthCheck` takes no
+        // identifier and answers the id Route 53 assigned, "Ref returns the health check
+        // ID", and that id is what `GetHealthCheck` and a record set's own `HealthCheckId`
+        // take — the type declares no name a rule could compute it from.
+        || resource_type == ROUTE53_HEALTH_CHECK
         || resource_type == TRANSFER_SERVER
         // An Amazon MQ broker is one more: `CreateBroker` takes the broker's NAME and
         // answers with the `brokerId` Amazon MQ generated for it, which is the id that
@@ -4679,6 +4700,15 @@ pub const ROUTE53RESOLVER_RULE_ASSOCIATION: &str =
 /// its declaration states.
 pub const ROUTE53_HOSTED_ZONE: &str = "AWS::Route53::HostedZone";
 pub const ROUTE53_RECORD_SET: &str = "AWS::Route53::RecordSet";
+
+/// A health check of Amazon Route 53's, the third type a stack creates in that service.
+///
+/// Its identifier is Route 53's own to mint the same way a hosted zone's is: "Ref returns
+/// the health check ID", `CreateHealthCheck` takes no identifier and answers the id it
+/// assigned, and that id — not any name, since the type declares none — is what every
+/// operation on the health check takes (`GetHealthCheck$HealthCheckId`,
+/// `UpdateHealthCheck$HealthCheckId` and a record set's own `HealthCheckId`).
+pub const ROUTE53_HEALTH_CHECK: &str = "AWS::Route53::HealthCheck";
 
 /// The first character of a hosted zone id, and how many follow it.
 ///

@@ -25,6 +25,8 @@ mod list_monitors_pagination;
 mod monitor_and_probe;
 #[path = "all/monitor_lifecycle_and_front_door.rs"]
 mod monitor_lifecycle_and_front_door;
+#[path = "all/monitor_modified_at_follows_probe_writes.rs"]
+mod monitor_modified_at_follows_probe_writes;
 #[path = "all/monitor_state_follows_probe_activation.rs"]
 mod monitor_state_follows_probe_activation;
 #[path = "all/probe_teardown.rs"]

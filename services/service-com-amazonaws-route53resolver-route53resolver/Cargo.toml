@@ -25,6 +25,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for those digests and for the opaque pagination cursor.
 hex = { workspace = true }
+# The account's own Amazon EC2 inventory: an endpoint's IP addresses are placed
+# in VPC subnets, which are resolved against the subnets that service holds.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The account's own AWS Outposts inventory: `CreateOutpostResolver` resolves its
 # `OutpostArn` against the Outposts that service holds.
 service-com-amazonaws-outposts-outpostsolafservice = { workspace = true }
