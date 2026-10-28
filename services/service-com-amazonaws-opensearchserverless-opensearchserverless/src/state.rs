@@ -4,7 +4,8 @@
 //!
 //! This holds the resources this slice serves — the OpenSearch Serverless
 //! **collection**, the **collection group**, the **security policy**, the **data access
-//! policy**, the **lifecycle policy** and the **security configuration** — plus everything
+//! policy**, the **lifecycle policy**, the **security configuration** and the managed
+//! interface **VPC endpoint** — plus everything
 //! more than one handler of
 //! those resources needs: the server-derived fields (the minted ids, the ARNs, the
 //! endpoints derived from a collection id, the epoch-millisecond timestamps), the
@@ -23,12 +24,12 @@ use crate::ops::types::{
     AccessPolicyDetail, AccountSettingsDetail, CapacityDetails, CapacityLimits, CollectionDetail,
     CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
     CollectionGroupErrorDetail, CollectionGroupStorageConfiguration, CollectionSummary,
-    CreateCollectionDetail, CreateCollectionGroupDetail, CurrentCapacity, DeleteCollectionDetail,
-    FipsEndpoints, IamFederationConfigOptions, IamIdentityCenterConfigOptions,
-    LifecyclePolicyDetail, LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail,
-    SecurityConfigSummary, SecurityPolicyDetail, SecurityPolicySummary, Tag,
-    UpdateCollectionDetail, UpdateCollectionGroupDetail, UpdateIamIdentityCenterConfigOptions,
-    VectorOptions,
+    CreateCollectionDetail, CreateCollectionGroupDetail, CreateVpcEndpointDetail, CurrentCapacity,
+    DeleteCollectionDetail, FipsEndpoints, IamFederationConfigOptions,
+    IamIdentityCenterConfigOptions, LifecyclePolicyDetail, LifecyclePolicyErrorDetail,
+    SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail,
+    SecurityPolicySummary, Tag, UpdateCollectionDetail, UpdateCollectionGroupDetail,
+    UpdateIamIdentityCenterConfigOptions, VectorOptions, VpcEndpointDetail, VpcEndpointErrorDetail,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -99,6 +100,14 @@ pub const AWS_OWNED_KEY: &str = "auto";
 pub const DELETABLE_STATUSES: [&str; 3] =
     [COLLECTION_ACTIVE, COLLECTION_FAILED, COLLECTION_UPDATE_FAILED];
 
+/// `VpcEndpointStatus$PENDING` — "Pending VPCEndpoint resource", the status a managed
+/// interface endpoint is reported in while it is brought up.
+pub const VPC_ENDPOINT_PENDING: &str = "PENDING";
+
+/// `VpcEndpointStatus$ACTIVE` — "VPCEndpoint resource is ready to use", the status a
+/// `PENDING` endpoint settles into.
+pub const VPC_ENDPOINT_ACTIVE: &str = "ACTIVE";
+
 /// `ServerlessGeneration$CLASSIC`, the generation a collection group carries when its
 /// create request does not name one.
 ///
@@ -152,6 +161,14 @@ pub const ERROR_CODE_NOT_FOUND: &str = "NOT_FOUND";
 /// `CollectionErrorDetail$errorMessage`'s own documentation: "A description of the error.
 /// For example, `The specified Collection is not found.`"
 pub const ERROR_MESSAGE_NOT_FOUND: &str = "The specified Collection is not found.";
+
+/// The `errorMessage` a `VpcEndpointErrorDetail` carries for an id that names no managed
+/// interface endpoint. `VpcEndpointErrorDetail$errorMessage` is documented only as "An
+/// error message describing the reason for the failure", so the wording follows the one
+/// this service's other batch readers document for the same cause
+/// ([`ERROR_MESSAGE_NOT_FOUND`], [`ERROR_MESSAGE_GROUP_NOT_FOUND`]) with the resource this
+/// one reads named instead.
+pub const ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND: &str = "The specified Vpc Endpoint is not found.";
 
 /// The `errorMessage` a `LifecyclePolicyErrorDetail` carries for an identifier that names
 /// no lifecycle policy, from `LifecyclePolicyErrorDetail$errorMessage`'s own
@@ -245,6 +262,16 @@ pub const MAX_LIFECYCLE_POLICIES: usize = MAX_ACCESS_POLICIES;
 /// allows", and it is set at the collection quota above so a group per collection still
 /// fits.
 pub const MAX_COLLECTION_GROUPS: usize = MAX_COLLECTIONS;
+
+/// The most managed interface VPC endpoints this emulator stores for one account in one
+/// Region.
+///
+/// An emulator bound rather than a figure this code can cite from the model: nothing in
+/// `CreateVpcEndpoint`'s contract fixes a count, so this exists to keep the store finite.
+/// It is answered with the modelled `ServiceQuotaExceededException` because that is the
+/// error `CreateVpcEndpoint` declares for "more resources than the service allows", and it
+/// is set at the collection quota above, so an endpoint per collection still fits.
+pub const MAX_VPC_ENDPOINTS: usize = MAX_COLLECTIONS;
 
 /// The `maxIndexingCapacityInOCU` an account reports before anything calls
 /// `UpdateAccountSettings`, from AWS's "Managing capacity limits for Amazon OpenSearch
@@ -362,6 +389,17 @@ const ID_MINT_ATTEMPTS: usize = 8;
 /// base64-shaped token: 18 bytes encode to exactly 24 base64 characters, which sits inside
 /// the length bound, is a whole number of four-character groups and so carries no padding.
 const POLICY_VERSION_BYTES: usize = 18;
+
+/// The prefix a `VpcEndpointId` carries, from the shape's own
+/// `@pattern("^vpce-[0-9a-z]*$")`.
+const VPC_ENDPOINT_ID_PREFIX: &str = "vpce-";
+
+/// The number of hexadecimal characters a minted `VpcEndpointId` carries after
+/// [`VPC_ENDPOINT_ID_PREFIX`]: 17, the width an interface VPC endpoint id carries in AWS
+/// (`vpce-` followed by a 17-character hexadecimal identifier). It sits inside
+/// `VpcEndpointId`'s `@length(min: 1, max: 255)`, and hexadecimal is inside the
+/// `[0-9a-z]` class its pattern admits.
+const VPC_ENDPOINT_ID_HEX_LEN: usize = 17;
 
 /// The `errorMessage` a `CollectionGroupErrorDetail` carries for an id or name that names
 /// no collection group, from `CollectionGroupErrorDetail$errorMessage`'s own
@@ -499,6 +537,24 @@ pub fn mint_policy_version() -> String {
     ::aws_smithy_types::base64::encode(&bytes[..POLICY_VERSION_BYTES])
 }
 
+/// The hexadecimal digits a drawn `VpcEndpointId` is built from.
+const HEX_DIGITS: &[u8] = b"0123456789abcdef";
+
+/// Draw a `VpcEndpointId`: [`VPC_ENDPOINT_ID_PREFIX`] followed by
+/// [`VPC_ENDPOINT_ID_HEX_LEN`] hexadecimal characters.
+///
+/// Every character after the prefix comes out of one drawn byte (see [`random_bytes`]), so
+/// the id carries no structure a caller can read — no counter and no clock — and two
+/// endpoints, in this store or in another process, never carry the same one.
+fn draw_vpc_endpoint_id() -> String {
+    let mut id = String::with_capacity(VPC_ENDPOINT_ID_PREFIX.len() + VPC_ENDPOINT_ID_HEX_LEN);
+    id.push_str(VPC_ENDPOINT_ID_PREFIX);
+    for byte in random_bytes().iter().take(VPC_ENDPOINT_ID_HEX_LEN) {
+        id.push(char::from(HEX_DIGITS[usize::from(byte % 16)]));
+    }
+    id
+}
+
 /// The region this request is signed for, which is the region its collections' ARNs and
 /// endpoints carry. Falls back to [`DEFAULT_REGION`] for an unsigned request, which
 /// carries no credential scope.
@@ -508,12 +564,13 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// A status change the clock owes a collection.
+/// A status change the clock owes a resource.
 ///
 /// `CollectionStatus` models `CREATING` beside `ACTIVE`, so a collection is reported in
 /// it while the resources it describes are brought up, and reaches `ACTIVE` on its own a
-/// moment later with nobody calling. The due instant is STORED and applied when a later
-/// call observes the record; no handler ever sleeps for it.
+/// moment later with nobody calling. `VpcEndpointStatus` models `PENDING` beside `ACTIVE`
+/// for the same span of a managed interface endpoint. The due instant is STORED and
+/// applied when a later call observes the record; no handler ever sleeps for it.
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
     /// The instant from which [`status`](Self::status) is the collection's real status.
@@ -1763,6 +1820,11 @@ pub const SECURITY_POLICY_TYPE_ENCRYPTION: &str = "encryption";
 /// `…:collection/<id>`).
 pub const TAGGED_RESOURCE_TYPE: &str = "collection";
 
+/// The `resourceType` a quota refusal names for a managed interface endpoint: the resource
+/// `CreateVpcEndpoint` creates, spelled as this service's other refusals spell theirs (the
+/// resource noun in lower case, hyphenated).
+pub const VPC_ENDPOINT_RESOURCE_TYPE: &str = "vpc-endpoint";
+
 /// The `ResourceType` a security-policy rule carries for a rule about collections, and the
 /// prefix its `Resource` patterns are written with: AWS's security-policy documentation
 /// spells those patterns `collection/<name>`.
@@ -1928,6 +1990,89 @@ pub fn collection_group_error_for_name(name: &str) -> CollectionGroupErrorDetail
     }
 }
 
+/// A `VpcEndpointErrorDetail` for an `ids` entry that names no stored VPC endpoint.
+pub fn vpc_endpoint_error_for_id(id: &str) -> VpcEndpointErrorDetail {
+    VpcEndpointErrorDetail {
+        id: Some(id.to_string()),
+        error_message: Some(ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND.to_string()),
+        error_code: Some(ERROR_CODE_NOT_FOUND.to_string()),
+    }
+}
+
+/// One stored OpenSearch Serverless-managed interface VPC endpoint. Every field a reader
+/// reports is held here; nothing is recomputed from a request.
+#[derive(Debug, Clone)]
+pub struct VpcEndpointRecord {
+    /// The server-minted `VpcEndpointId`, which is also this record's key.
+    pub id: String,
+    pub name: String,
+    /// The `VpcId` the create request named.
+    pub vpc_id: String,
+    /// The subnets the endpoint reaches OpenSearch Serverless through, in the order the
+    /// request listed them.
+    pub subnet_ids: Vec<String>,
+    /// The security groups the endpoint's inbound traffic is authorized by. Empty for an
+    /// endpoint whose create request named none, which the model allows
+    /// (`securityGroupIds` is not `@required`), and reported as absent rather than as an
+    /// empty list — `SecurityGroupIds` is `@length(min: 1)`.
+    pub security_group_ids: Vec<String>,
+    /// The `VpcEndpointStatus` wire value, settled through [`PendingStatus`].
+    pub status: String,
+    pub created_date: i64,
+    /// The transition the clock owes this endpoint, while one is outstanding.
+    pub pending_status: Option<PendingStatus>,
+}
+
+impl VpcEndpointRecord {
+    /// Report `transient` from now, and owe `settled` from [`SETTLE_AFTER`] onwards.
+    pub fn begin_transition(&mut self, transient: &str, settled: &'static str) {
+        self.status = transient.to_string();
+        self.pending_status = Some(PendingStatus {
+            due_at: Instant::now() + SETTLE_AFTER,
+            status: settled,
+        });
+    }
+
+    /// Materialise the transition the clock has already made due, if any — the one write a
+    /// reporting operation may make; see [`CollectionRecord::settle`].
+    pub fn settle(&mut self, now: Instant) {
+        if let Some(pending) = self.pending_status.take_if(|pending| now >= pending.due_at) {
+            self.status = pending.status.to_string();
+        }
+    }
+
+    /// The `CreateVpcEndpointDetail` body for this record — the one place this crate
+    /// renders that shape.
+    pub fn create_detail(&self) -> CreateVpcEndpointDetail {
+        CreateVpcEndpointDetail {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            status: Some(self.status.clone()),
+        }
+    }
+
+    /// The `VpcEndpointDetail` body for this record — the one place this crate renders
+    /// that shape, so `BatchGetVpcEndpoint` cannot report an endpoint differently from the
+    /// create that stored it.
+    pub fn detail(&self) -> VpcEndpointDetail {
+        VpcEndpointDetail {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            vpc_id: Some(self.vpc_id.clone()),
+            subnet_ids: Some(self.subnet_ids.clone()),
+            security_group_ids: (!self.security_group_ids.is_empty())
+                .then(|| self.security_group_ids.clone()),
+            status: Some(self.status.clone()),
+            created_date: Some(self.created_date),
+            // `failureCode` / `failureMessage` describe an endpoint whose create or delete
+            // failed. Nothing in this slice fails an endpoint, so a stored record carries
+            // neither.
+            failure_code: None,
+            failure_message: None,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-opensearchserverless-opensearchserverless. A handler reaches it through [`service_state`].
 ///
 /// Collections are keyed by the server-minted id, which is their identity in this API
@@ -1984,6 +2129,14 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// `UpdateAccountSettings` writes them. Defaulted rather than optional, because an
     /// account always has limits — see [`AccountSettingsRecord`].
     pub account_settings: AccountSettingsRecord,
+    /// Managed interface VPC endpoints by `VpcEndpointId`, which is their identity in this
+    /// API (`BatchGetVpcEndpoint`/`UpdateVpcEndpoint`/`DeleteVpcEndpoint` address them by
+    /// it) — a `BTreeMap`, so `ListVpcEndpoints` walks one deterministic order a page token
+    /// can resume.
+    pub vpc_endpoints: BTreeMap<String, VpcEndpointRecord>,
+    /// `VpcEndpointName` -> `VpcEndpointId`, for the duplicate-name conflict check, held
+    /// beside the records exactly as `collection_name_index` is.
+    pub vpc_endpoint_name_index: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
@@ -1995,6 +2148,9 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     pub fn settle_due_transitions(&mut self) {
         let now = Instant::now();
         for record in self.collections.values_mut() {
+            record.settle(now);
+        }
+        for record in self.vpc_endpoints.values_mut() {
             record.settle(now);
         }
         // The purge was owed at `now` whether or not anybody called, so applying it here
@@ -2369,6 +2525,48 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
             .keys()
             .filter(|(policy_kind, _)| policy_kind == kind)
             .count()
+    }
+
+    /// Mint a fresh `VpcEndpointId` no stored endpoint already carries.
+    ///
+    /// Drawn like every other identifier this store mints ([`draw_vpc_endpoint_id`]), and
+    /// re-drawn while the draw is already in use — [`ID_MINT_ATTEMPTS`] draws in all, the
+    /// last of them answered unchecked, exactly as [`Self::mint_id`] does.
+    pub fn mint_vpc_endpoint_id(&self) -> String {
+        let mut drawn = draw_vpc_endpoint_id();
+        for _ in 1..ID_MINT_ATTEMPTS {
+            if !self.vpc_endpoints.contains_key(&drawn) {
+                return drawn;
+            }
+            drawn = draw_vpc_endpoint_id();
+        }
+        drawn
+    }
+
+    /// The VPC endpoint `name` resolves to, if one is stored under it.
+    pub fn vpc_endpoint_by_name(&self, name: &str) -> Option<&VpcEndpointRecord> {
+        let id = self.vpc_endpoint_name_index.get(name)?;
+        self.vpc_endpoints.get(id)
+    }
+
+    /// Store `record` under its id, indexing its name.
+    pub fn insert_vpc_endpoint(&mut self, record: VpcEndpointRecord) {
+        self.vpc_endpoint_name_index
+            .insert(record.name.clone(), record.id.clone());
+        self.vpc_endpoints.insert(record.id.clone(), record);
+    }
+
+    /// The VPC endpoint a replayed `clientToken` on `operation` already created, if any;
+    /// see [`Self::replayed_collection`] for why a stale token answers `None`.
+    pub fn replayed_vpc_endpoint(
+        &self,
+        operation: &str,
+        token: &str,
+    ) -> Option<&VpcEndpointRecord> {
+        let id = self
+            .idempotency_tokens
+            .get(&idempotency_key(operation, token))?;
+        self.vpc_endpoints.get(id)
     }
 }
 
