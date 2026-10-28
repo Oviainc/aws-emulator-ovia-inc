@@ -35,6 +35,8 @@ mod error_envelope;
 mod history_filter_chain;
 #[path = "all/open_request_plane_scope.rs"]
 mod open_request_plane_scope;
+#[path = "all/pagination_token_scope.rs"]
+mod pagination_token_scope;
 #[path = "all/quota_utilization_usage.rs"]
 mod quota_utilization_usage;
 #[path = "all/quota_workflow.rs"]
