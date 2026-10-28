@@ -105,9 +105,6 @@ pub const GET_SERVICE_LAST_ACCESSED_DETAILS_WITH_ENTITIES: &str =
 /// `iam:ListOpenIDConnectProviders`.
 pub const LIST_OPEN_ID_CONNECT_PROVIDERS: &str = "iam:ListOpenIDConnectProviders";
 
-/// `iam:ChangePassword`.
-pub const CHANGE_PASSWORD: &str = "iam:ChangePassword";
-
 /// `iam:CreateGroup`.
 pub const CREATE_GROUP: &str = "iam:CreateGroup";
 

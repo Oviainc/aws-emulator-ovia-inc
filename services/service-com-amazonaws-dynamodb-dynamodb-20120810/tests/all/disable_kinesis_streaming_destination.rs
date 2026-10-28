@@ -8,7 +8,7 @@
 //! The rules pinned here:
 //!
 //! 1. the command addresses ONE destination of the table it names — the destination
-//!    still replicating to the stream its `StreamArn` names — and stops that
+//!    `ACTIVE`ly replicating to the stream its `StreamArn` names — and stops that
 //!    replication: the destination is `DISABLING` for the transient span and `DISABLED`
 //!    after it, both as the command answers and as the reader reports;
 //! 2. stopping replication changes no configuration, so the precision the destination
@@ -16,11 +16,13 @@
 //!    `EnableKinesisStreamingConfiguration` — the member reports "the destination for
 //!    the Kinesis streaming information that is being enabled", and this command enables
 //!    nothing — whatever configuration the request itself carried;
-//! 3. a table that replicates to no such stream is refused with HTTP 400
-//!    `ValidationException` carrying DynamoDB's no-such-destination sentence over the
-//!    stream ARN and the table name the request carried, whether it never registered the
-//!    stream, registered a different one, or has already stopped (or is stopping)
-//!    replicating to it — so a second stop of the same stream is refused, not idempotent;
+//! 3. a table with no `ACTIVE` destination for that stream is refused with HTTP 400
+//!    `ValidationException` carrying DynamoDB's required-status sentence, whether it
+//!    never registered the stream, registered a different one, or has already stopped
+//!    (or is stopping) replicating to it — so a second stop of the same stream is
+//!    refused, not idempotent. Every status that is not `ACTIVE`, against this command
+//!    and against the configuration change alike, has its own suite
+//!    (`kinesis_destination_state_refusals`);
 //! 4. the table is resolved like every other table-addressed operation's: by bare name
 //!    or by the table's ARN, with a name no table answers for refused as
 //!    `ResourceNotFoundException` and a name outside the documented form refused by the
@@ -31,9 +33,9 @@
 //!    another, exactly as it was.
 //!
 //! Each rule is asserted over a SET of inputs — the precision in force before the stop,
-//! where the destination's lifecycle had got to when the stop arrived, the configuration
-//! the stopping request carries, why the table replicates to no such stream, and how the
-//! table is addressed — rather than one example. Every command and every read is driven
+//! the configuration the stopping request carries, why the table has no `ACTIVE`
+//! destination for the stream, and how the table is addressed — rather than one example.
+//! Every command and every read is driven
 //! over the wire (`POST /` with `X-Amz-Target: DynamoDB_20120810.<OperationName>`)
 //! through the same `MultiServiceRouter` the emulator's front doors use, with nothing
 //! seeded through the store.
@@ -52,57 +54,29 @@ fn stream_arn(name: &str) -> String {
     engine::emulator_arn("kinesis", REGION, &format!("stream/{name}"))
 }
 
-/// How far a destination's lifecycle has got when the stop under test arrives. Each is a
-/// status in which the destination still REPLICATES, so each is a destination the stop
-/// can address.
-#[derive(Clone, Copy, Debug)]
-enum Reached {
-    /// Registered, with the registration span still owed: `ENABLING`.
-    Enabling,
-    /// Registered and settled: `ACTIVE`.
-    Active,
-    /// Updated, with the update span still owed: `UPDATING`.
-    Updating,
-}
-
-/// Register one destination on `table` over the wire and leave it at `reached`.
+/// Register one destination on `table` over the wire, leaving its registration span
+/// owed: a caller that needs it replicating waits that span out with [`settle`].
 async fn register(
     router: &MultiServiceRouter,
     table: &str,
     stream: &str,
     precision: Option<&str>,
-    reached: Reached,
 ) {
     let arn = stream_arn(stream);
-    let mut request = json!({"TableName": table, "StreamArn": arn.clone()});
+    let mut request = json!({"TableName": table, "StreamArn": arn});
     if let Some(precision) = precision {
         request["EnableKinesisStreamingConfiguration"] =
             json!({"ApproximateCreationDateTimePrecision": precision});
     }
     ok(router, "EnableKinesisStreamingDestination", request).await;
-    match reached {
-        Reached::Enabling => {}
-        Reached::Active => settle().await,
-        Reached::Updating => {
-            settle().await;
-            ok(
-                router,
-                "UpdateKinesisStreamingDestination",
-                json!({"TableName": table, "StreamArn": arn}),
-            )
-            .await;
-        }
-    }
 }
 
-/// DynamoDB's refusal of a command against a destination the table does not replicate
-/// to: the invalid-state sentence, the stream ARN the request named and the table it
-/// named it against.
-fn no_destination_message(table: &str, stream_arn: &str) -> String {
-    format!(
-        "Table is not in a valid state to enable Kinesis Streaming Destination: No streaming \
-         destination with streamArn: {stream_arn} found for table with tableName: {table}"
-    )
+/// DynamoDB's refusal of a stop against a destination that is not `ACTIVE`: the status
+/// the command requires, stated over nothing of the request.
+fn not_active_message() -> String {
+    "Table is not in a valid state to enable Kinesis Streaming Destination: \
+     KinesisStreamingDestination must be ACTIVE to perform DISABLE operation."
+        .to_string()
 }
 
 /// The destination the reader reports for `stream_arn`, or `Value::Null` when the table
@@ -123,59 +97,37 @@ async fn described(router: &MultiServiceRouter, table: &str, stream_arn: &str) -
         .unwrap_or(Value::Null)
 }
 
-/// One row of the table below: the case, the precision in force before the stop, where
-/// the destination's lifecycle had got to, and the configuration member the stopping
-/// request carries.
-type StopCase = (
-    &'static str,
-    Option<&'static str>,
-    Reached,
-    Option<Value>,
-);
+/// One row of the table below: the case, the precision in force before the stop, and the
+/// configuration member the stopping request carries.
+type StopCase = (&'static str, Option<&'static str>, Option<Value>);
 
 /// Rules 1 and 2: an accepted stop moves the destination it addresses through
 /// `DISABLING` to `DISABLED` and changes no configuration, whatever precision was in
-/// force, wherever the lifecycle had got to, and whatever the request itself carried.
+/// force and whatever the request itself carried.
 #[tokio::test]
 async fn a_disable_stops_replication_to_the_stream_it_names() {
     let cases: Vec<StopCase> = vec![
-        (
-            "no precision in force, stopped while still registering",
-            None,
-            Reached::Enabling,
-            None,
-        ),
-        (
-            "millisecond in force, stopped while replicating",
-            Some("MILLISECOND"),
-            Reached::Active,
-            None,
-        ),
-        (
-            "microsecond in force, stopped while still updating",
-            Some("MICROSECOND"),
-            Reached::Updating,
-            None,
-        ),
+        ("no precision in force", None, None),
+        ("millisecond in force", Some("MILLISECOND"), None),
+        ("microsecond in force", Some("MICROSECOND"), None),
         (
             "millisecond in force, the stopping request names another precision",
             Some("MILLISECOND"),
-            Reached::Active,
             Some(json!({"ApproximateCreationDateTimePrecision": "MICROSECOND"})),
         ),
         (
             "no precision in force, the stopping request carries an empty configuration",
             None,
-            Reached::Enabling,
             Some(json!({})),
         ),
     ];
 
-    for (index, (case, precision, reached, configuration)) in cases.into_iter().enumerate() {
+    for (index, (case, precision, configuration)) in cases.into_iter().enumerate() {
         let router = emulator();
         let table = format!("Stopped{index}");
         create_table(&router, &table, &[]).await;
-        register(&router, &table, "cdc", precision, reached).await;
+        register(&router, &table, "cdc", precision).await;
+        settle().await;
         let arn = stream_arn("cdc");
 
         let mut request = json!({"TableName": table.clone(), "StreamArn": arn.clone()});
@@ -247,16 +199,9 @@ async fn a_disable_stops_only_the_destination_it_addresses() {
         ("audit", Some("MILLISECOND")),
         ("history", None),
     ] {
-        register(&router, "Addressed", stream, precision, Reached::Enabling).await;
+        register(&router, "Addressed", stream, precision).await;
     }
-    register(
-        &router,
-        "Untouched",
-        "cdc",
-        Some("MICROSECOND"),
-        Reached::Enabling,
-    )
-    .await;
+    register(&router, "Untouched", "cdc", Some("MICROSECOND")).await;
     settle().await;
 
     let addressed = stream_arn("audit");
@@ -348,15 +293,15 @@ async fn a_disable_stops_only_the_destination_it_addresses() {
 /// One row of the refusal table below: the case, the stream the table registers before
 /// the stop under test — with the precision it registers it under, if any — and whether
 /// that registration is stopped first.
-type NoDestinationCase = (&'static str, Option<(&'static str, Option<&'static str>)>, bool);
+type NotActiveCase = (&'static str, Option<(&'static str, Option<&'static str>)>, bool);
 
-/// Rule 3: a table that replicates to no such stream is refused, whichever way it came
-/// to replicate to none — including a stream whose replication this very suite already
+/// Rule 3: a table with no `ACTIVE` destination for the stream is refused, whichever way
+/// it came to have none — including a stream whose replication this very suite already
 /// stopped, so a second stop is refused rather than silently accepted.
 #[tokio::test]
-async fn a_disable_without_a_replicating_destination_is_refused() {
+async fn a_disable_without_an_active_destination_is_refused() {
     // (case, the stream the table registers — if any — and where its lifecycle is left)
-    let cases: Vec<NoDestinationCase> = vec![
+    let cases: Vec<NotActiveCase> = vec![
         ("never registered one", None, false),
         ("registered another stream", Some(("other", None)), false),
         (
@@ -373,11 +318,12 @@ async fn a_disable_without_a_replicating_destination_is_refused() {
 
     for (index, (case, registered, stop_first)) in cases.into_iter().enumerate() {
         let router = emulator();
-        let table = format!("NoDestination{index}");
+        let table = format!("NotActive{index}");
         create_table(&router, &table, &[]).await;
         let arn = stream_arn("cdc");
         if let Some((stream, precision)) = registered {
-            register(&router, &table, stream, precision, Reached::Active).await;
+            register(&router, &table, stream, precision).await;
+            settle().await;
         }
         if stop_first {
             ok(
@@ -410,8 +356,8 @@ async fn a_disable_without_a_replicating_destination_is_refused() {
         );
         assert_eq!(
             message(&body),
-            no_destination_message(&table, &arn),
-            "case {case:?}: expected DynamoDB's no-such-destination sentence, got {}",
+            not_active_message(),
+            "case {case:?}: expected DynamoDB's required-status sentence, got {}",
             message(&body)
         );
 
@@ -452,7 +398,8 @@ async fn a_disable_without_a_replicating_destination_is_refused() {
 async fn a_disable_resolves_the_table_and_the_stream_the_request_names() {
     let router = emulator();
     create_table(&router, "Resolved", &[]).await;
-    register(&router, "Resolved", "cdc", None, Reached::Active).await;
+    register(&router, "Resolved", "cdc", None).await;
+    settle().await;
     let arn = stream_arn("cdc");
 
     // (case, the TableName member, the expected error code, the expected message)

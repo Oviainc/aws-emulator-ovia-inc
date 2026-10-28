@@ -261,6 +261,29 @@ async fn create_rows(router: &MultiServiceRouter) -> (Vec<Row>, String) {
         serde_json::json!({ "name": "tagging-index-api", "tags": tags("restapi") }),
     )
     .await;
+    // A deployment is the snapshot of the API's methods a stage serves, so the API must
+    // carry one before it can be deployed. The method goes on the ROOT resource every
+    // API is created with, so nothing is added to the API's resource tree.
+    let (status, read) = apigateway(router, "GET", &format!("/restapis/{rest_api_id}"), None).await;
+    assert_eq!(
+        status, 200,
+        "case \"restapis\": expected HTTP 200 from GetRestApi, got {status} {read}"
+    );
+    let root_resource_id = read["rootResourceId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case \"restapis\": GetRestApi answered no rootResourceId: {read}"))
+        .to_string();
+    let (status, method) = apigateway(
+        router,
+        "PUT",
+        &format!("/restapis/{rest_api_id}/resources/{root_resource_id}/methods/GET"),
+        Some(serde_json::json!({ "authorizationType": "NONE" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case \"method\": expected HTTP 201 from PutMethod, got {status} {method}"
+    );
     // A stage needs a deployment to point at; the deployment itself carries no tags.
     let deployment_id = created_id(
         router,

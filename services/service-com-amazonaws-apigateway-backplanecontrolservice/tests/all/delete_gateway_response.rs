@@ -353,6 +353,8 @@ async fn a_delete_naming_no_customization_or_no_api_is_refused_and_clears_nothin
     // A response type outside the modelled `GatewayResponseType` enum, in the ways a path
     // label can miss it: a value shaped like the enum's but not in it, the right value in
     // the wrong case, an unknown word, and a declared value with a trailing character.
+    // Each is refused by the CONSTRAINT layer in front of the handler, whose error class
+    // is `ValidationException` rather than the operation's own `BadRequestException`.
     for response_type in [
         "DEFAULT_3XX",
         "integration_timeout",
@@ -362,7 +364,7 @@ async fn a_delete_naming_no_customization_or_no_api_is_refused_and_clears_nothin
         assert_failure(
             &delete_gateway_response(&gateway, &api, response_type).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("DeleteGatewayResponse({response_type})"),
         );
     }

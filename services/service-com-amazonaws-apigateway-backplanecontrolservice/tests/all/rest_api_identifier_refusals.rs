@@ -212,6 +212,8 @@ async fn an_unresolvable_api_identifier_is_stated_with_the_account_and_the_ident
     let (stored, root) = create_api(&gateway, "identifier-refusals").await;
     let resource = create_resource(&gateway, &stored, &root, "pets").await;
     let resource_id = string_member(&resource, "id", "CreateResource(pets)");
+    // A deployment is the snapshot of the API's methods, so the API must carry one.
+    crate::rest_api_lifecycle::make_deployable(&gateway, &stored).await;
     let created = gateway
         .call(
             "POST",

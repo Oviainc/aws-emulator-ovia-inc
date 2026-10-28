@@ -190,6 +190,11 @@ fn default_method_setting() -> MethodSetting {
 
 /// Refuse a deployment id this API has no deployment for: a stage, and a canary of it,
 /// serves a deployment of its own API — the same rule `CreateStage` applies.
+///
+/// A patch VALUE that names no record is a refusal of the REQUEST
+/// (`BadRequestException`), not of the resource the URI addresses: the stage and the API
+/// this patch was sent to both exist, so the caller has to fix the value rather than
+/// abandon the stage. The not-found class stays for the identifiers in the URI.
 fn require_deployment(
     deployments: &BTreeSet<String>,
     deployment_id: &str,
@@ -197,7 +202,7 @@ fn require_deployment(
     if deployments.contains(deployment_id) {
         return Ok(());
     }
-    Err(PatchFailure::NotFound(
+    Err(PatchFailure::BadRequest(
         crate::state::NO_SUCH_DEPLOYMENT.to_string(),
     ))
 }
