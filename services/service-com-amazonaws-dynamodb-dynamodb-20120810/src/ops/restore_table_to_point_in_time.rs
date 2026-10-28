@@ -412,6 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored_bytes: item_bytes,
             // A new table has consumed none of the capacity it is provisioned for.
             write_budget: crate::state::CapacityBudget::new(now),
+            key_write_budgets: crate::state::KeyWriteBudgets::default(),
             contributor_insights: crate::state::ContributorInsights::default(),
             // TTL is one of the settings the doc above has a caller set up again on the
             // restored table, so its items do not expire until `UpdateTimeToLive` says

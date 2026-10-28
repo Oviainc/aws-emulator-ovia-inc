@@ -41,7 +41,10 @@ const IN_USE_MESSAGE: &str = "The specified delegation set contains associated h
 
 /// Send one `DeleteReusableDelegationSet` request, with the `{Id}` label written
 /// exactly as `id` spells it.
-async fn delete_set(router: &MultiServiceRouter, id: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite that needs a set out of the way drives the
+/// same request rather than growing a second copy of it.
+pub(crate) async fn delete_set(router: &MultiServiceRouter, id: &str) -> Reply {
     call(
         router,
         "DELETE",

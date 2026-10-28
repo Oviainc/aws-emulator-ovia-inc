@@ -439,6 +439,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
             }
         }
 
+        // The weekly maintenance window this call would set, checked against its
+        // documented form and its documented minimum length before anything is
+        // applied, under the one rule every operation that takes a window shares.
+        if let Some(window) = input.preferred_maintenance_window.as_deref() {
+            if let Err(message) = st::check_maintenance_window(window) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+            }
+        }
+
         let mut store = state.lock();
         store.settle(::std::time::Instant::now());
 
@@ -498,7 +507,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
             Some((stored_type.as_str(), stored_nodes)),
         ) {
             Ok(shape) => shape,
-            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            Err(message) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message))
+            }
         };
         if let Some(automated_retention) = input.automated_snapshot_retention_period {
             if !(st::AUTOMATED_RETENTION_BOUNDS.0..=st::AUTOMATED_RETENTION_BOUNDS.1)
@@ -680,17 +691,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
         }
         // A port change moves the endpoint the caller connects to.
         if let Some(port) = input.port {
-            let endpoint = stored.cluster.endpoint.get_or_insert_with(Endpoint::default);
-            endpoint.port = Some(port);
+            stored.endpoint.port = Some(port);
         }
         // Renaming re-keys the record and moves the endpoint hostname, which
         // carries the cluster name. The namespace ARN is the cluster's identity
         // and is left exactly as it was minted.
         if let Some(new_identifier) = input.new_cluster_identifier.clone() {
             stored.cluster.cluster_identifier = Some(new_identifier.clone());
-            let endpoint = stored.cluster.endpoint.get_or_insert_with(Endpoint::default);
-            endpoint.address = Some(st::endpoint_address(&new_identifier, &region));
+            stored.endpoint.address = Some(st::endpoint_address(&new_identifier, &region));
         }
+        // Either change moves the endpoint the cluster SERVES on; a cluster that
+        // publishes one reports the moved value, and one still coming up still
+        // publishes none.
+        stored.refresh_endpoint();
 
         // Re-derive every member the service computes from the configuration
         // this call just changed — the node topology, the revision, the public

@@ -31,7 +31,15 @@
 //! `Expected`/`ConditionalOperator`) is read against the item this put would replace,
 //! and an unmet condition is `ConditionalCheckFailedException`, carrying that item when
 //! `ReturnValuesOnConditionCheckFailure=ALL_OLD`. The expression language lives in
-//! [`crate::state`], shared with `UpdateItem` and `DeleteItem`.
+//! [`crate::state`], shared with `UpdateItem` and `DeleteItem`, and every substitution
+//! token the request defines must be referenced by one of its expressions
+//! ([`crate::state::Substitutions::check_all_referenced`]).
+//!
+//! The write is then ADMITTED against the capacity the table is provisioned for and the
+//! per-partition-key ceiling beneath it ([`crate::state::Table::admit_item_write`]): a
+//! write neither covers is `ProvisionedThroughputExceededException`, carrying the
+//! `ThrottlingReasons` entry of the ceiling that bound and the table's ARN, and stores
+//! nothing.
 //!
 //! `ReturnConsumedCapacity=INDEXES` reports the capacity the write consumed on the table
 //! AND on each secondary index whose stored entry this write CHANGES, and
@@ -343,6 +351,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
         );
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid.
+        substitutions
+            .check_all_referenced(&[input.condition_expression.as_deref()])
+            .map_err(lift)?;
         // "Use ReturnValues if you want to get the item attributes as they appeared
         // before they were updated": PutItem accepts only NONE and ALL_OLD
         // (`PutItem$ReturnValues`).
@@ -442,6 +455,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The write is ADMITTED before it lands: the capacity it would consume is
+        // computed from the item it would replace and the item it would store — the same
+        // two images the response bills for — and held to the table's provisioned write
+        // capacity and to the per-partition-key ceiling beneath it. A write neither
+        // covers is throttled, and a throttled write leaves nothing behind.
+        let (capacity, throttle) = {
+            let table = store
+                .active_table_mut(&region, &name, now)
+                .map_err(lift)?;
+            let capacity = table.write_capacity(replaced_before.as_ref(), Some(&item));
+            let throttle = table
+                .admit_item_write(&key.partition, &capacity, now)
+                .err();
+            (capacity, throttle)
+        };
+        if let Some(throttle) = throttle {
+            return Err(PutItemErrorModeled::ProvisionedThroughputExceededException(
+                crate::state::throughput_exceeded(
+                    &crate::state::table_arn(&region, &name),
+                    throttle,
+                ),
+            )
+            .into());
+        }
         // The store enforces its own budgets here: the only growth site this
         // operation has is the item it inserts.
         let replaced = store
@@ -452,7 +489,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fan-out and the item-collection size are computed from stored state rather
         // than from the request alone.
         let table = store.active_table(&region, &name, now).map_err(lift)?;
-        let capacity = table.write_capacity(replaced.as_ref(), Some(&item));
         let item_collection_metrics =
             report_item_collection.then(|| table.item_collection_metrics(&item));
         // The change this write made reaches the table's stream before the response

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCustomDomainAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCustomDomainAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCustomDomainAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's custom domain associations, one record per
+//! CERTIFICATE, each listing the (domain, cluster) pairs tied to it and that
+//! certificate's expiry (see
+//! `crate::state::ComAmazonawsRedshiftRedshiftserviceversion20121201State::custom_domain_associations`),
+//! paged through the service's `MaxRecords` window and `Marker` cursor. A
+//! `CustomDomainName` or `CustomDomainCertificateArn` the request names selects
+//! the pairs it names, and one that selects nothing is refused with
+//! `CustomDomainAssociationNotFoundFault` rather than reported as an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -88,11 +88,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeCustomDomainAssociationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeCustomDomainAssociations")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeCustomDomainAssociations",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeCustomDomainAssociationsErrorModeled {
     CustomDomainAssociationNotFoundFault(CustomDomainAssociationNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -144,20 +148,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCustomDomainAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCustomDomainAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCustomDomainAssociations"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeCustomDomainAssociationsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        // ONE projection decides both the refusal and the report, so an
+        // identifier that selects nothing can never be served as an empty page.
+        let matched = store.custom_domain_associations(
+            input.custom_domain_name.as_deref(),
+            input.custom_domain_certificate_arn.as_deref(),
+        );
+        if matched.is_empty() {
+            let named = input
+                .custom_domain_name
+                .as_deref()
+                .or(input.custom_domain_certificate_arn.as_deref());
+            if let Some(named) = named {
+                return Err(
+                    DescribeCustomDomainAssociationsErrorModeled::CustomDomainAssociationNotFoundFault(
+                        CustomDomainAssociationNotFoundFault {
+                            message: Some(st::custom_domain_association_not_found_message(named)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeCustomDomainAssociationsOutput {
+            associations: Some(matched[start..end].to_vec()),
+            marker: next_marker,
+        })
     }
 }

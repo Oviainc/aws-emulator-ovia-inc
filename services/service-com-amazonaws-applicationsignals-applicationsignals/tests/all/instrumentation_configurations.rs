@@ -1037,6 +1037,10 @@ fn stored_configuration(
         signal_type: SNAPSHOT.to_string(),
         location: Location::CodeLocation(CodeLocation {
             language: "Java".to_string(),
+            // `CodeLocation` documents `ClassName` as required for Java, so a record staged
+            // directly on the store names one too — a store-level fixture should hold what a
+            // create could have written.
+            class_name: Some("PaymentProcessor".to_string()),
             file_path: "src/payment/PaymentProcessor.java".to_string(),
             ..CodeLocation::default()
         }),

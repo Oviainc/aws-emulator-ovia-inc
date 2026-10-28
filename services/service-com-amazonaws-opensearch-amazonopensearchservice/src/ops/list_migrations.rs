@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMigrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMigrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the migration jobs one OpenSearch application holds, each from the ONE
+//! [`crate::state::Migration`] record `StartMigration` persisted and `GetMigration`
+//! reads, so a job's row here and its own read cannot disagree. This is the ONLY file
+//! to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMigrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every status move the clock owes a job is materialised before the page is taken, so a
+//! caller polling the listing sees the export and the import complete without any call
+//! having asked for the move.
+//!
+//! The listing is the application's, so an `applicationId` naming no application of this
+//! account has no set to report; `status` narrows it to the jobs in one published
+//! status, and `nextToken` names the job the next page starts at, so paging resumes from
+//! a place in the set rather than from an offset a later start would have shifted.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +89,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    invalid_next_token, negative_max_results, service_state, state_unavailable,
+    unknown_application_id, unsupported_migration_status, Migration, MIGRATION_STATUS_VALUES,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +165,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMigrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMigrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMigrations"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // `maxResults` publishes no range at all, so the only value that is not a page
+        // size is a negative one, and that is refused rather than reinterpreted. The
+        // modelled default of 0 stays the request that asks for no particular page size.
+        if input.max_results < 0 {
+            return Err(ListMigrationsErrorModeled::ValidationException(
+                negative_max_results(input.max_results),
+            )
+            .into());
+        }
+
+        // "Filters the results by migration status": `status` is typed as a plain string,
+        // so the values its documentation publishes are the ones a filter may name. A
+        // value outside that set names no status a job is ever in, which is malformed
+        // input rather than a listing with nothing in it.
+        if let Some(status) = input.status.as_deref() {
+            if !MIGRATION_STATUS_VALUES.contains(&status) {
+                return Err(ListMigrationsErrorModeled::ValidationException(
+                    unsupported_migration_status(status),
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONLY write this report makes, and it writes only what the clock already
+        // owed each job at this instant had nobody called: a job whose export or import
+        // has fallen due is reported in the status it is then in, which is also what the
+        // `status` filter below selects on.
+        store.settle_migrations(now);
+
+        // The jobs belong to the application they migrate into, so an id the store holds
+        // no application for has no listing to report. `ListMigrations` models no
+        // `ResourceNotFoundException`, so the missing resource is reported through the
+        // client-input error it does model.
+        if !store.applications.contains_key(&input.application_id) {
+            return Err(ListMigrationsErrorModeled::ValidationException(
+                unknown_application_id(&input.application_id),
+            )
+            .into());
+        }
+
+        // The order the jobs were started in, oldest first and total — so the same
+        // request reports the same order twice, which is what lets a token name a place
+        // in the set. A request naming a `status` lists only the jobs in it; one naming
+        // none lists them all. Bounded by the store itself: an application holds at most
+        // `crate::state::MIGRATION_QUOTA` jobs.
+        let selected: Vec<&Migration> = store
+            .migrations_of_application_in_creation_order(&input.application_id)
+            .into_iter()
+            .filter(|migration| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| migration.status == status)
+            })
+            .collect();
+
+        // "The pagination token from a previous call": the token names the job the next
+        // page starts at, so paging resumes from a place in the set rather than from an
+        // offset a later start would have shifted. It is only ever a value this operation
+        // handed out, so one naming no job of the listing — and the listing is what the
+        // filter selected — is a malformed request rather than an empty page.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => selected
+                .iter()
+                .position(|migration| migration.migration_id == token)
+                .ok_or_else(|| {
+                    ListMigrationsErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // "The maximum number of results to return in a single call." `maxResults` is
+        // `@default(0)` and the member publishes no default page size, so a request that
+        // asks for no particular size is answered with the whole remaining listing —
+        // itself bounded by what one application may hold. Every other value reaching
+        // here is positive, the check above having refused the rest.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(selected.len());
+        let end = start.saturating_add(page_size).min(selected.len());
+
+        Ok(ListMigrationsOutput {
+            // Answered from the STORED records, so a job's row here and its own read
+            // report one migration.
+            migrations: Some(
+                selected[start..end]
+                    .iter()
+                    .map(|migration| migration.to_summary())
+                    .collect(),
+            ),
+            // "The pagination token to use in a subsequent call to retrieve the next set
+            // of results": the job the next page starts at, and nothing once this page
+            // ended the listing.
+            next_token: selected
+                .get(end)
+                .map(|migration| migration.migration_id.clone()),
+        })
     }
 }

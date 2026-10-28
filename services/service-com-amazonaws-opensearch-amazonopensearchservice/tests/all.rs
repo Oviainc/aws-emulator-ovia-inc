@@ -83,6 +83,8 @@ mod instance_type_catalog;
 mod instance_type_engine_refusal;
 #[path = "all/instance_type_limits.rs"]
 mod instance_type_limits;
+#[path = "all/migration_listing.rs"]
+mod migration_listing;
 #[path = "all/package_association_listings.rs"]
 mod package_association_listings;
 #[path = "all/package_associations.rs"]

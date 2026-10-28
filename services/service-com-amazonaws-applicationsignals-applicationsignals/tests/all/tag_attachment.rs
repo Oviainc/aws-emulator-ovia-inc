@@ -768,6 +768,7 @@ async fn create_configuration(
             "Location": {
                 "CodeLocation": {
                     "Language": "Java",
+                    "ClassName": "CartService",
                     "FilePath": "src/main/java/com/example/CartService.java",
                     "LineNumber": line_number,
                 }

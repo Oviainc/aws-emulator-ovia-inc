@@ -263,6 +263,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .transpose()
             .map_err(lift)?;
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid.
+        crate::state::Substitutions::new(
+            input.expression_attribute_names.as_ref(),
+            input.expression_attribute_values.as_ref(),
+        )
+        .check_all_referenced(&[
+            input.search_condition_expression.as_deref(),
+            input.projection_expression.as_deref(),
+        ])
+        .map_err(lift)?;
 
         let mut store = state.lock();
         store.apply_due_transitions(now);

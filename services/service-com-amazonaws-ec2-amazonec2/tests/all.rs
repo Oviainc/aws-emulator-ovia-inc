@@ -79,6 +79,17 @@ mod create_local_gateway_route_table_virtual_interface_group_association;
 // inserts its lines, and these two lost three serialized squash merges to exactly that.
 #[path = "all/client_vpn_routes.rs"]
 mod client_vpn_routes;
+// The field vocabulary a `CreateFlowLogs` `LogFormat` draws from: a format naming a field a
+// flow log record does not have is refused and stores nothing. Declared beside the suites
+// above rather than in sorted position, for the reason this file's header note gives: the
+// sorted neighbourhood is where every new ec2 suite inserts its two lines.
+#[path = "all/flow_log_format_fields.rs"]
+mod flow_log_format_fields;
+// The message an authorize is refused with once a security group holds as many rules in one
+// direction as the account's quota allows. Declared beside the suites above for the same
+// reason.
+#[path = "all/security_group_rule_quota_refusal.rs"]
+mod security_group_rule_quota_refusal;
 // What `ModifyReservedInstances` records for the Reserved Instances it names, what the
 // clock's fulfilment of it replaces them with, and what it refuses. Declared beside the
 // suites above rather than in sorted position, for the reason this file's header note

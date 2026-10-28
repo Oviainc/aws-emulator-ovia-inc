@@ -199,24 +199,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tenant_id = tenant.tenant_id.clone();
 
         let key = (resource_arn.clone(), tenant_name.clone());
-        if store.tenant_resource_associations.contains_key(&key) {
-            // "The resource specified in your request already exists": the association
-            // is the resource here, so a repeat is refused rather than stored twice.
-            return Err(
-                CreateTenantResourceAssociationErrorModeled::AlreadyExistsException(
-                    AlreadyExistsException {
-                        message: Some(crate::state::tenant_resource_association_exists(
-                            &tenant_name,
-                            &resource_arn,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+        // "The resource specified in your request already exists": the association is
+        // the resource here, so a repeat is refused rather than stored twice. A row left
+        // behind by a deleted tenant of the same name is NOT a repeat — it records the
+        // resource's association with a tenant record that no longer exists — so the
+        // association being made now takes its place.
+        let stale_row = match store.tenant_resource_associations.get(&key) {
+            Some(existing) if existing.tenant_id == tenant_id => {
+                return Err(
+                    CreateTenantResourceAssociationErrorModeled::AlreadyExistsException(
+                        AlreadyExistsException {
+                            message: Some(crate::state::tenant_resource_association_exists(
+                                &tenant_name,
+                                &resource_arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(_) => true,
+            None => false,
+        };
 
-        if store.tenant_resource_associations.len()
-            >= crate::state::MAX_TENANT_RESOURCE_ASSOCIATIONS
+        // The ceiling is on what the table HOLDS, so replacing a row does not have to
+        // clear it: only an association the table has no row for adds to the count. A
+        // row whose tenant is gone is still a row the table holds, and so still counts:
+        // the ceiling is this emulator's own bound on the table's size, not a quota SES
+        // publishes against live tenants.
+        if !stale_row
+            && store.tenant_resource_associations.len()
+                >= crate::state::MAX_TENANT_RESOURCE_ASSOCIATIONS
         {
             return Err(CreateTenantResourceAssociationErrorModeled::BadRequestException(
                 BadRequestException {
