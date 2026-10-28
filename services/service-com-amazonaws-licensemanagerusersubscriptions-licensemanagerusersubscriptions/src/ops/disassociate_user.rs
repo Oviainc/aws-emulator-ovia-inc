@@ -30,7 +30,12 @@
 //!    names which user, when the association carries one. A request naming neither is an
 //!    argument error the caller must fix, refused with the modelled
 //!    `ValidationException` naming the members it requires, BEFORE anything is looked
-//!    up;
+//!    up. Those members are what SAY which association the caller asked for, so a request
+//!    that supplies an `InstanceUserArn` and one of them too addresses only the
+//!    association all of them are the stored values of: one naming another instance, user
+//!    name, directory or domain beside the ARN addresses no association at all
+//!    ([`crate::state::names_other`]), which matters here because the authorization above
+//!    is about the instance the request NAMES;
 //! 3. then the association is resolved, and the refusal fails CLOSED: an identifier
 //!    state holds no association for cannot be shown to be the caller's, so it is the
 //!    non-modelled `UnauthorizedException`
@@ -211,8 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialise_due(now);
 
-        // Fail closed: an identifier no association is held for is refused without
-        // disclosing whether it names anything.
+        // Fail closed: an identifier no association is held for — including an
+        // `InstanceUserArn` whose stored association is not the one the request's other
+        // members name — is refused without disclosing whether it names anything.
         let arn = state
             .resolve_instance_user(
                 input.instance_user_arn.as_deref(),

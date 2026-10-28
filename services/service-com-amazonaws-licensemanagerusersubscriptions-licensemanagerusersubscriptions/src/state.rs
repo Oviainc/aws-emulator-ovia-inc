@@ -1110,6 +1110,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// identity it was associated with
     /// ([`instance_user_arn_for`](Self::instance_user_arn_for)).
     ///
+    /// Whichever way a request addresses one, every member of an association's identity it
+    /// names has to be the stored association's: the members are what say which association
+    /// the caller asked for, so an ARN combined with a member naming another association
+    /// resolves to nothing rather than to the record the ARN happens to name.
+    ///
     /// `None` when state holds no such association — the caller decides how to refuse,
     /// because this surface fails CLOSED rather than reporting a not-found.
     pub fn resolve_instance_user(
@@ -1120,25 +1125,40 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         username: Option<&str>,
         domain: Option<&str>,
     ) -> Option<&InstanceUserRecord> {
-        let record = if let Some(arn) = instance_user_arn {
-            self.instance_users.get(arn)?
-        } else {
-            let arn = self.instance_user_arn_for(
-                &provider_key(identity_provider?).ok()?,
-                instance_id?,
-                username?,
-                domain,
-            )?;
-            self.instance_users.get(arn)?
-        };
-        // `Domain` is part of which user a request names, so an association addressed by
-        // ARN is also only the one the caller asked for when the domain the request names
-        // is the stored user's. The identity lookup above already matched on it.
-        let named = domain_key(domain);
-        if named.is_some() && named != domain_key(record.domain.as_deref()) {
-            return None;
+        if let Some(arn) = instance_user_arn {
+            let record = self.instance_users.get(arn)?;
+            // Every member of an association's identity that a request names is part of
+            // WHICH association it names — that is the whole of the addressing below — so
+            // an association addressed by ARN is also only the one the caller asked for
+            // when each of those members it ALSO names is the stored association's. A
+            // request naming a directory, an instance, a user name or a domain that is not
+            // the stored one names no association state holds, and is refused by this
+            // surface's fail-closed `None` rather than acted on against a record the
+            // caller never addressed.
+            let named_provider_key = match identity_provider {
+                // A provider union that names no directory at all matches no stored
+                // association, so a request carrying one addresses nothing.
+                Some(provider) => Some(provider_key(provider).ok()?),
+                None => None,
+            };
+            if names_other(named_provider_key.as_deref(), &record.provider_key)
+                || names_other(instance_id, &record.instance_id)
+                || names_other(username, &record.username)
+                || names_other_domain(domain, record.domain.as_deref())
+            {
+                return None;
+            }
+            return Some(record);
         }
-        Some(record)
+        // The member-by-member addressing matches on that same identity, through the
+        // association index.
+        let arn = self.instance_user_arn_for(
+            &provider_key(identity_provider?).ok()?,
+            instance_id?,
+            username?,
+            domain,
+        )?;
+        self.instance_users.get(arn)
     }
 
     /// Store one user association and index it everywhere it is reached from: by ARN, in
@@ -1869,6 +1889,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// `ValidationException` when neither addressing is complete, `ResourceNotFoundException`
     /// when the addressed registration is not registered.
     ///
+    /// Whichever way a request addresses one, every member of a registration's identity it
+    /// names has to be the stored registration's, for the reason the user plane resolves a
+    /// record the same way ([`resolve_instance_user`](Self::resolve_instance_user)): the
+    /// members are what say which registration the caller asked for, so an ARN combined
+    /// with a directory or a product that is another registration's is not registered.
+    ///
     /// Only a LIVE registration resolves: one whose deregistration was accepted is still
     /// REPORTED in its `DEREGISTERING` status, but it is on its way out, so an operation
     /// that acts on a registration is told the identifier is not one of this account's
@@ -1880,9 +1906,20 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         product: Option<&str>,
     ) -> Result<&IdentityProviderRecord, StateError> {
         if let Some(arn) = arn {
-            return self
+            let record = self
                 .live_identity_provider(arn)
-                .ok_or(StateError::ProviderNotRegistered);
+                .ok_or(StateError::ProviderNotRegistered)?;
+            let named_key = match identity_provider {
+                Some(provider) => Some(provider_key(provider)?),
+                None => None,
+            };
+            let stored_key = provider_key(&record.identity_provider).ok();
+            if names_other_option(named_key.as_deref(), stored_key.as_deref())
+                || names_other(product, &record.product)
+            {
+                return Err(StateError::ProviderNotRegistered);
+            }
+            return Ok(record);
         }
         let (Some(identity_provider), Some(product)) = (identity_provider, product) else {
             return Err(StateError::Validation(members_must_be_provided(&[
@@ -1989,6 +2026,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// `ValidationException` when neither addressing is complete, `ResourceNotFoundException`
     /// when no such subscription is in state.
     ///
+    /// Whichever way a request addresses one, every member of a subscription's identity it
+    /// names has to be the stored subscription's, for the reason the association plane
+    /// resolves one the same way
+    /// ([`resolve_instance_user`](Self::resolve_instance_user)): the members are what say
+    /// which subscription the caller asked for.
+    ///
     /// Only a LIVE subscription resolves: one whose end was already accepted is still
     /// REPORTED in its ended status ([`unsubscribe_started`]), but it is on its way out, so
     /// an operation that acts on a subscription is told the identifier names no
@@ -2001,43 +2044,53 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         product: Option<&str>,
         domain: Option<&str>,
     ) -> Result<&ProductUserRecord, StateError> {
-        let record = if let Some(arn) = product_user_arn {
-            self.live_product_user(arn).ok_or_else(|| {
+        if let Some(arn) = product_user_arn {
+            let record = self.live_product_user(arn).ok_or_else(|| {
                 StateError::NotFound(format!("product user {arn} has no subscription"))
-            })?
-        } else {
-            let (Some(username), Some(identity_provider), Some(product)) =
-                (username, identity_provider, product)
-            else {
-                return Err(StateError::Validation(members_must_be_provided(&[
-                    "Username",
-                    "IdentityProvider",
-                    "Product",
-                ])));
+            })?;
+            // The provider union a request names is compared by the directory it names,
+            // which is what the registration a subscription was stored through is indexed
+            // under; a union naming no directory is a parameter that is not valid, exactly
+            // as it is on the member-by-member addressing below.
+            let named_provider_key = match identity_provider {
+                Some(provider) => Some(provider_key(provider)?),
+                None => None,
             };
-            let provider =
-                self.resolve_identity_provider(None, Some(identity_provider), Some(product))?;
-            let arn = self
-                .product_user_arn_for(&provider.arn, product, username, domain)
-                .ok_or_else(|| {
-                    StateError::NotFound(no_such_subscription(username, product, domain))
-                })?;
-            self.live_product_user(arn).ok_or_else(|| {
-                StateError::NotFound(format!("product user {arn} has no subscription"))
-            })?
-        };
-        // `Domain` is part of which user a request names, so a subscription addressed by
-        // ARN is also only the one the caller asked for when the domain the request names
-        // is the stored user's. The identity lookup above already matched on it.
-        let named = domain_key(domain);
-        if named.is_some() && named != domain_key(record.domain.as_deref()) {
-            return Err(StateError::NotFound(no_such_subscription(
-                &record.username,
-                &record.product,
-                domain,
-            )));
+            let stored_provider_key = self
+                .identity_providers
+                .get(&record.identity_provider_arn)
+                .and_then(|registration| provider_key(&registration.identity_provider).ok());
+            if names_other_option(named_provider_key.as_deref(), stored_provider_key.as_deref())
+                || names_other(username, &record.username)
+                || names_other(product, &record.product)
+                || names_other_domain(domain, record.domain.as_deref())
+            {
+                // The members the request named name no subscription state holds, which is
+                // the one wording of that refusal — each member the request left out is
+                // the stored subscription's, so the sentence describes what was asked for.
+                return Err(StateError::NotFound(no_such_subscription(
+                    username.unwrap_or(&record.username),
+                    product.unwrap_or(&record.product),
+                    domain.or(record.domain.as_deref()),
+                )));
+            }
+            return Ok(record);
         }
-        Ok(record)
+        let (Some(username), Some(identity_provider), Some(product)) =
+            (username, identity_provider, product)
+        else {
+            return Err(StateError::Validation(members_must_be_provided(&[
+                "Username",
+                "IdentityProvider",
+                "Product",
+            ])));
+        };
+        let provider = self.resolve_identity_provider(None, Some(identity_provider), Some(product))?;
+        let arn = self
+            .product_user_arn_for(&provider.arn, product, username, domain)
+            .ok_or_else(|| StateError::NotFound(no_such_subscription(username, product, domain)))?;
+        self.live_product_user(arn)
+            .ok_or_else(|| StateError::NotFound(format!("product user {arn} has no subscription")))
     }
 
     /// Accept the deregistration of one registration: it enters `DEREGISTERING` now and
@@ -2306,6 +2359,36 @@ pub fn domain_key(domain: Option<&str>) -> Option<String> {
     domain
         .filter(|domain| !domain.is_empty())
         .map(str::to_string)
+}
+
+/// Whether a member a request NAMES is not the stored resource's.
+///
+/// Every operation here addresses a resource either by its ARN or by the members that
+/// identify it, and a request may supply BOTH. Each member it names is part of which
+/// resource the caller asked for — that is all the member-by-member addressing is — so a
+/// named value that is not the stored one means the request names no resource state holds,
+/// however the rest of it addressed one. A member the request leaves out names nothing, so
+/// there is nothing to compare: it does not narrow what the ARN resolved.
+///
+/// The ONE place that comparison is made, so no resolution can read a member the caller
+/// named as a comment on the resource rather than as part of naming it. A member whose
+/// stored counterpart is itself optional goes through [`names_other_option`], and `Domain`
+/// through [`names_other_domain`], which both decide it the same way.
+pub fn names_other(named: Option<&str>, stored: &str) -> bool {
+    names_other_option(named, Some(stored))
+}
+
+/// [`names_other`] where the STORED value is optional too: a member the request names and
+/// the resource does not have is not the resource's either, so it names another resource.
+pub fn names_other_option(named: Option<&str>, stored: Option<&str>) -> bool {
+    named.is_some_and(|named| stored != Some(named))
+}
+
+/// [`names_other`] for `Domain`, which is normalised before it is compared
+/// ([`domain_key`]): the empty value and no value name the same unqualified user, so
+/// neither narrows what was resolved.
+pub fn names_other_domain(named: Option<&str>, stored: Option<&str>) -> bool {
+    names_other_option(domain_key(named).as_deref(), domain_key(stored).as_deref())
 }
 
 /// The identity of the product subscription a request addresses, or a record holds.
