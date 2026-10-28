@@ -25,6 +25,8 @@ mod access_policy_revocation;
 mod addon_catalog_coverage;
 #[path = "all/addon_catalog_publication.rs"]
 mod addon_catalog_publication;
+#[path = "all/addon_deletion.rs"]
+mod addon_deletion;
 #[path = "all/addon_lifecycle.rs"]
 mod addon_lifecycle;
 #[path = "all/addon_update.rs"]

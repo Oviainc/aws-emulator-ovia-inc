@@ -113,6 +113,12 @@ fn probes(cluster: &str) -> Vec<Probe> {
             String::new(),
         ),
         probe(
+            "DeleteAddon",
+            "DELETE",
+            format!("/clusters/{label}/addons/vpc-cni"),
+            String::new(),
+        ),
+        probe(
             "CreateNodegroup",
             "POST",
             format!("/clusters/{label}/node-groups"),

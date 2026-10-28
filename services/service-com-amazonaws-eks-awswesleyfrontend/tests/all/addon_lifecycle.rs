@@ -115,7 +115,7 @@ pub(crate) async fn describe_addon(
 
 /// One EKS Pod Identity association of a cluster in [`REGION`], read through the
 /// pod identity slice — the reader for the associations an add-on owns.
-async fn describe_association(
+pub(crate) async fn describe_association(
     router: &MultiServiceRouter,
     cluster: &str,
     association_id: &str,

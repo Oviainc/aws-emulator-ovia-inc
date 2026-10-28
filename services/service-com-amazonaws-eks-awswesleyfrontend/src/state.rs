@@ -26,8 +26,10 @@
 //! `platformVersion`) are optional on the record, because a connected cluster
 //! reports none of them — it reports [`ClusterRecord::connector_config`] instead.
 //!
-//! It also holds the add-on slice: `CreateAddon` writes an [`AddonRecord`] here
-//! and `DescribeAddon` reads it back. An add-on lives INSIDE a cluster, so its
+//! It also holds the add-on slice: `CreateAddon` writes an [`AddonRecord`] here,
+//! `DescribeAddon` and `ListAddons` read it back and `DeleteAddon` removes it
+//! ([`ComAmazonawsEksAwswesleyfrontendState::remove_addon`]). An add-on lives
+//! INSIDE a cluster, so its
 //! key carries the cluster's key and `DeleteCluster` drops the add-ons of the
 //! cluster it removes. `UpdateAddon` does not write the change it is asked for
 //! onto that record straight away: the update it starts is asynchronous, so the
@@ -2724,6 +2726,10 @@ pub const ADDON_STATUS_UPDATING: &str = "UPDATING";
 /// See [`ADDON_STATUS_CREATING`] — the status an add-on reports when the change
 /// an update carried could not be made.
 pub const ADDON_STATUS_UPDATE_FAILED: &str = "UPDATE_FAILED";
+/// See [`ADDON_STATUS_CREATING`] — the status an add-on reports once `DeleteAddon`
+/// has taken it off its cluster, which is the final status that call answers with
+/// ([`ComAmazonawsEksAwswesleyfrontendState::remove_addon`]).
+pub const ADDON_STATUS_DELETING: &str = "DELETING";
 
 /// The `AddonIssueCode` an add-on reports for a change an update could not make
 /// because the cluster already holds something it conflicts with
@@ -5248,8 +5254,7 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         };
         let owner_arn = addon.arn.clone();
         let namespace = addon.namespace.clone();
-        self.pod_identity_associations
-            .retain(|_, record| record.owner_arn.as_deref() != Some(owner_arn.as_str()));
+        self.remove_associations_owned_by(&owner_arn);
         let mut association_arns = Vec::with_capacity(requested.len());
         for association in requested {
             association_arns.push(self.create_addon_owned_association(
@@ -5412,6 +5417,62 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         self.addons.retain(|(key_region, key_cluster, _), _| {
             key_region != region || key_cluster != cluster_name
         });
+    }
+
+    /// Drop the EKS Pod Identity associations one owner holds.
+    ///
+    /// An association an add-on owns exists only for that add-on
+    /// (`PodIdentityAssociation$ownerArn`), so whatever stops the add-on owning
+    /// it — the update that replaces the set it owns, or the delete that takes
+    /// the add-on off its cluster — removes it through here, so both write the
+    /// same thing.
+    pub fn remove_associations_owned_by(&mut self, owner_arn: &str) {
+        self.pod_identity_associations
+            .retain(|_, record| record.owner_arn.as_deref() != Some(owner_arn));
+    }
+
+    /// Take one add-on off its cluster and answer the record that left, carrying
+    /// the final status the delete reports it in, or `None` when the cluster
+    /// holds no add-on under that key.
+    ///
+    /// Removing an add-on removes what Amazon EKS manages FOR it, which is the
+    /// EKS Pod Identity associations it owns. `preserve` is the request member
+    /// that asks for the add-on software to stay on the cluster with Amazon EKS
+    /// no longer managing its settings, and then "if an IAM account is associated
+    /// with the add-on, it isn't removed" — so those associations are left in
+    /// place. Either way the add-on itself stops being an Amazon EKS-managed
+    /// add-on of this cluster, which is what this store holds.
+    ///
+    /// A change an update still in flight carries can no longer be made once the
+    /// add-on it would change is gone, so that update stops being owed its
+    /// completion and reports the same status as any other change that could not
+    /// be made (see [`Self::complete_addon_update`]).
+    pub fn remove_addon(
+        &mut self,
+        key: &(String, String, String),
+        preserve: bool,
+        at: SystemTime,
+    ) -> Option<AddonRecord> {
+        let mut record = self.addons.remove(key)?;
+        if !preserve {
+            self.remove_associations_owned_by(&record.arn);
+        }
+        if let Some(pending) = record.pending_update.take() {
+            if let Some(update) = self
+                .clusters
+                .get_mut(&(key.0.clone(), key.1.clone()))
+                .and_then(|cluster| cluster.updates.get_mut(&pending.update_id))
+            {
+                update.status = UPDATE_FAILED.to_string();
+                update.succeeds_at = None;
+            }
+        }
+        record.status = ADDON_STATUS_DELETING.to_string();
+        // The add-on has left the store, so the status move the clock owed it is
+        // no longer owed to anybody.
+        record.active_at = None;
+        record.modified_at = at;
+        Some(record)
     }
 
     /// The next value to mix into a minted update id, counted from this store's
