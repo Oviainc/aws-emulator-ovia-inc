@@ -38,17 +38,21 @@ use super::harness::{b64, error_code, error_message, text, REGION};
 /// The access-key id standing for the account's own published credential: neither STS nor
 /// IAM holds a record of it, so it resolves to the account's ambient identity, which no
 /// identity policy governs — the position AWS account root credentials are in.
-const ACCOUNT_KEY: &str = "AKIDEMULATOR";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEMULATOR";
 
 /// The emulator these tests drive: one shared engine carrying this service beside the IAM
 /// and STS services the principals and their policies are made with — the same set
 /// `core/router`'s `build_router` assembles, narrowed to what this rule touches.
-struct Emulator {
+///
+/// Shared with the sibling suite `tests/all/account_level_authorization.rs`, which
+/// authorizes the operations that name no key: one harness, so both suites make their
+/// principals and their policies the same way.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -70,18 +74,35 @@ impl Emulator {
         Self { router }
     }
 
-    /// One call to this service, signed with `access_key_id` in the SigV4 credential
-    /// scope, with its HTTP status and JSON body.
-    async fn call(&self, access_key_id: &str, operation: &str, body: &Value) -> (u16, Value) {
+    /// One call to this service in [`REGION`], signed with `access_key_id` in the SigV4
+    /// credential scope, with its HTTP status and JSON body.
+    pub(crate) async fn call(
+        &self,
+        access_key_id: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        self.call_in(REGION, access_key_id, operation, body).await
+    }
+
+    /// [`Self::call`], through the endpoint of `region` — which is the Region a handler
+    /// builds its ARNs in, so a decision about a regional resource is made there.
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        access_key_id: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
-            .uri(format!("https://kms.{REGION}.amazonaws.com/"))
+            .uri(format!("https://kms.{region}.amazonaws.com/"))
             .header("content-type", "application/x-amz-json-1.1")
             .header("x-amz-target", format!("TrentService.{operation}"))
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/kms/\
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/kms/\
                      aws4_request, SignedHeaders=host;x-amz-target, Signature=0000"
                 ),
             )
@@ -100,7 +121,7 @@ impl Emulator {
     }
 
     /// One call that must succeed.
-    async fn ok(&self, access_key_id: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, access_key_id: &str, operation: &str, body: &Value) -> Value {
         let (status, payload) = self.call(access_key_id, operation, body).await;
         assert_eq!(
             status, 200,
@@ -110,7 +131,7 @@ impl Emulator {
     }
 
     /// One awsQuery call to IAM or STS.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         signing_name: &str,
         version: &str,
@@ -147,7 +168,7 @@ impl Emulator {
     /// Create an IAM role with `policy` as its inline policy (when one is given), assume
     /// it through STS, and answer the session's access key id and the session ARN STS
     /// reports for it.
-    async fn assumed_role(
+    pub(crate) async fn assumed_role(
         &self,
         role_name: &str,
         policy: Option<&str>,
@@ -215,7 +236,11 @@ impl Emulator {
 
     /// Create an IAM user with `policy` as its inline policy (when one is given) and
     /// answer the access key id of a long-term key minted for it, with the user's ARN.
-    async fn iam_user(&self, user_name: &str, policy: Option<&str>) -> (String, String) {
+    pub(crate) async fn iam_user(
+        &self,
+        user_name: &str,
+        policy: Option<&str>,
+    ) -> (String, String) {
         let (status, body) = self
             .query(
                 "iam",
@@ -266,7 +291,7 @@ impl Emulator {
     }
 
     /// Create a symmetric encryption key carrying `policy`, and answer its key id and ARN.
-    async fn key(&self, policy: Option<&str>) -> (String, String) {
+    pub(crate) async fn key(&self, policy: Option<&str>) -> (String, String) {
         let mut request = json!({"Description": "authorization"});
         if let Some(policy) = policy {
             request["Policy"] = json!(policy);
@@ -310,13 +335,13 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 }
 
 /// A key policy document carrying `statements`.
-fn policy(statements: Value) -> String {
+pub(crate) fn policy(statements: Value) -> String {
     json!({"Version": "2012-10-17", "Statement": statements}).to_string()
 }
 
 /// A key policy statement allowing `actions` to `principal` on every resource the policy
 /// is attached to.
-fn allow_to(principal: &str, actions: Value) -> Value {
+pub(crate) fn allow_to(principal: &str, actions: Value) -> Value {
     json!({
         "Effect": "Allow",
         "Principal": {"AWS": principal},
@@ -329,7 +354,7 @@ fn allow_to(principal: &str, actions: Value) -> Value {
 /// gives the Amazon Web Services account that owns the KMS key permission to use it"
 /// (`smithy_query(query="doc",shape="CreateKeyRequest",member="Policy")`), which names the
 /// account root and so delegates the decision to the account's identity policies.
-fn account_root_statement() -> Value {
+pub(crate) fn account_root_statement() -> Value {
     allow_to(
         &format!("arn:aws:iam::{}:root", engine::emulator_account_id()),
         json!("kms:*"),
@@ -337,7 +362,7 @@ fn account_root_statement() -> Value {
 }
 
 /// An identity policy document allowing `actions` on `resource`.
-fn identity_allow(actions: Value, resource: &str) -> String {
+pub(crate) fn identity_allow(actions: Value, resource: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{"Effect": "Allow", "Action": actions, "Resource": resource}],
@@ -355,7 +380,7 @@ fn denial(principal: &str, operation: &str, key_arn: &str) -> String {
 }
 
 /// Assert `payload` is the authorization refusal, with AWS's own sentence.
-fn assert_denied(case: &str, status: u16, payload: &Value, expected_message: &str) {
+pub(crate) fn assert_denied(case: &str, status: u16, payload: &Value, expected_message: &str) {
     assert_eq!(
         (status, error_code(payload).as_str()),
         (400, "AccessDeniedException"),

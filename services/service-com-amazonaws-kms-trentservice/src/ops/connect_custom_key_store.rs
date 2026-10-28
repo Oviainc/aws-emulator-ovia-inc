@@ -206,6 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `ConnectCustomKeyStore` names no KMS key, so no key policy is in force: its
+        // permission is the caller's own ("Required permissions:
+        // kms:ConnectCustomKeyStore (IAM policy)"), and a principal whose identity
+        // policies do not allow it is refused before any key store is touched.
+        crate::state::authorization::check_account_action(&*self.engine, ctx, Self::NAME)?;
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         // A connection change an earlier call started may already have fallen due.
