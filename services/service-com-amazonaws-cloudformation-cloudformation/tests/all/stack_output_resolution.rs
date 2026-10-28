@@ -31,8 +31,8 @@
 //! what the stack created — is the last row.
 
 use crate::stack_lifecycle::{
-    create_stack, describe_stack, member, router, wait_for_the_transition, xml_text, ACCOUNT_ID,
-    REGION,
+    create_stack, describe_stack, is_service_assigned_id, member, router,
+    wait_for_the_transition, xml_text, ACCOUNT_ID, REGION,
 };
 use crate::stack_outputs::{output_for, wire_outputs};
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
@@ -54,20 +54,18 @@ enum Expect {
     /// something this emulator does not hold.
     NoValue,
     /// An identifier the OWNING service assigns, of the published form `<prefix>-` plus
-    /// [`SERVICE_ID_HEX_DIGITS`] lowercase hexadecimal characters: a resource of an Amazon
-    /// EC2 VPC-network type reports one of those rather than a name, because EC2 takes no
-    /// name on its create. No request fixes the hexadecimal part, so the rule is the FORM.
-    ServiceAssigned { prefix: &'static str },
+    /// [`crate::harness::SERVICE_ID_HEX_DIGITS`] lowercase hexadecimal characters: a
+    /// resource of an Amazon EC2 VPC-network type reports one of those rather than a name,
+    /// because EC2 takes no name on its create. No request fixes the hexadecimal part, so
+    /// the rule is the FORM. `prefix` carries the ARN's head where the value is an ARN built
+    /// on such an identifier, exactly as [`Expect::Generated`]'s does.
+    ServiceAssigned { prefix: String },
     /// The output is not reported at all, because its `Condition` evaluates false.
     Absent,
 }
 
 /// How many hexadecimal characters the unique segment of a generated physical id carries.
 const GENERATED_ID_HEX_DIGITS: usize = 12;
-
-/// How many hexadecimal characters an Amazon EC2 resource id carries after its prefix: the
-/// current (long) id form is 17 (`vpc-0123456789abcdef0`).
-const SERVICE_ID_HEX_DIGITS: usize = 17;
 
 /// One row: a template, the parameters the create supplies, and what each output must
 /// report.
@@ -365,6 +363,8 @@ Resources:
       VPCZoneIdentifier:
         - !Ref SubnetA
         - !Ref SubnetB
+  Notice:
+    Type: AWS::SNS::Topic
 Outputs:
   AsgName:
     Value: !Ref Asg
@@ -388,6 +388,8 @@ Outputs:
     Value: !Join [",", [!GetAtt SubnetA.CidrBlock, !GetAtt SubnetB.CidrBlock]]
   SubnetArn:
     Value: !GetAtt SubnetA.Arn
+  NoticeArn:
+    Value: !Ref Notice
 "#
             .to_string(),
             parameters: params(&[("ImageId", "ami-00000000000000001")]),
@@ -403,16 +405,37 @@ Outputs:
                 value("LaunchTemplateName", "probe-lt"),
                 // The VPC the template does not name reports the `vpc-` identifier its
                 // type's `Ref` returns, and the subnet's `VpcId` attribute is that same id.
-                ("VpcId", Expect::ServiceAssigned { prefix: "vpc" }),
-                ("SubnetVpc", Expect::ServiceAssigned { prefix: "vpc" }),
+                (
+                    "VpcId",
+                    Expect::ServiceAssigned {
+                        prefix: "vpc".to_string(),
+                    },
+                ),
+                (
+                    "SubnetVpc",
+                    Expect::ServiceAssigned {
+                        prefix: "vpc".to_string(),
+                    },
+                ),
                 value("VpcCidrBlock", "10.20.0.0/16"),
                 value("SubnetZones", format!("{REGION}a,{REGION}b")),
                 value("SubnetCidrs", "10.20.0.0/24,10.20.1.0/24"),
+                // The subnet's ARN is the one Amazon EC2 reported for the subnet it
+                // created, which carries that service's own identifier for it.
                 (
                     "SubnetArn",
+                    Expect::ServiceAssigned {
+                        prefix: format!("arn:aws:ec2:{REGION}:{ACCOUNT_ID}:subnet/subnet"),
+                    },
+                ),
+                // The topic the template does NOT name is the other half of the identity
+                // rule: CloudFormation names it itself, and its ARN carries that generated
+                // name.
+                (
+                    "NoticeArn",
                     Expect::Generated {
-                        prefix: format!("arn:aws:ec2:{REGION}:{ACCOUNT_ID}:subnet/"),
-                        logical_id: "SubnetA",
+                        prefix: format!("arn:aws:sns:{REGION}:{ACCOUNT_ID}:"),
+                        logical_id: "Notice",
                     },
                 ),
             ],
@@ -429,19 +452,6 @@ fn is_generated(value: &str, prefix: &str, stack_name: &str, logical_id: &str) -
         .is_some_and(|unique| {
             unique.len() == GENERATED_ID_HEX_DIGITS
                 && unique.chars().all(|c| c.is_ascii_hexdigit())
-        })
-}
-
-/// Whether `value` is a service-assigned identifier of the published Amazon EC2 form:
-/// `<prefix>-` plus [`SERVICE_ID_HEX_DIGITS`] lowercase hexadecimal characters.
-fn is_service_assigned(value: &str, prefix: &str) -> bool {
-    value
-        .strip_prefix(&format!("{prefix}-"))
-        .is_some_and(|digits| {
-            digits.len() == SERVICE_ID_HEX_DIGITS
-                && digits
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         })
 }
 
@@ -517,7 +527,7 @@ async fn every_declared_output_of_a_deployed_stack_carries_its_resolved_value() 
                 Expect::ServiceAssigned { prefix } => {
                     let actual = output.value.as_deref().unwrap_or_default();
                     assert!(
-                        is_service_assigned(actual, prefix),
+                        is_service_assigned_id(actual, prefix),
                         "case {:?}: output {key:?} must carry {prefix}-<17 hexadecimal \
                          characters>, got {:?}",
                         case.case,

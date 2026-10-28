@@ -193,15 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (StartMessageMoveTaskRequest$MaxNumberOfMessagesPerSecond). A rate of zero or
         // less would move nothing, so a fixed rate is an integer from 1 to that
         // maximum; a request that names none leaves the rate to the service.
-        if let Some(rate) = input
+        if input
             .max_number_of_messages_per_second
-            .filter(|rate| !(1..=sqs::MAX_MESSAGES_PER_SECOND).contains(rate))
+            .is_some_and(|rate| {
+                !(sqs::MIN_MESSAGES_PER_SECOND..=sqs::MAX_MESSAGES_PER_SECOND).contains(&rate)
+            })
         {
-            return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
-                &rate.to_string(),
-                "MaxNumberOfMessagesPerSecond",
-                &format!("Must be >= 1 and <= {}.", sqs::MAX_MESSAGES_PER_SECOND),
-            )));
+            return Err(Scaffolded::invalid_parameter_value(
+                sqs::message_move_rate_out_of_range_message(),
+            ));
         }
 
         // Both ARNs are classified BEFORE the store is reached: a value that names no
@@ -434,6 +434,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (index, message) in taken.into_iter().enumerate() {
             destination.messages.push_back(sqs::StoredMessage {
                 sent_at: now,
+                retention_from: now,
                 available_at: task.delivery_instant(u64::try_from(index).unwrap_or(u64::MAX)),
                 invisible_until: None,
                 queue_receive_count: 0,

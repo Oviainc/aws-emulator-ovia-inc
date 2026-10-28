@@ -49,6 +49,7 @@ const EVERY_SYSTEM_ATTRIBUTE_NAME: &[&str] = &[
 const RECORDED_ON_A_STANDARD_QUEUE: &[&str] = &[
     "ApproximateFirstReceiveTimestamp",
     "ApproximateReceiveCount",
+    "SenderId",
     "SentTimestamp",
 ];
 

@@ -103,6 +103,8 @@ mod get_customer_gateway_associations_paging;
 mod get_devices_ids_filter_maximum;
 #[path = "all/get_direct_connect_gateway_attachment.rs"]
 mod get_direct_connect_gateway_attachment;
+#[path = "all/get_transit_gateway_connect_peer_associations_paging.rs"]
+mod get_transit_gateway_connect_peer_associations_paging;
 #[path = "all/get_transit_gateway_registrations_paging.rs"]
 mod get_transit_gateway_registrations_paging;
 #[path = "all/get_vpc_attachment.rs"]

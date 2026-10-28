@@ -49,6 +49,8 @@ mod page_size_rule;
 mod put_group_configuration;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
+#[path = "all/region_scoped_pagination_tokens.rs"]
+mod region_scoped_pagination_tokens;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_group_lifecycle.rs"]

@@ -8293,13 +8293,21 @@ pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<String>
 /// ever carries an edge association that names nothing invocable: the condition is a
 /// property of the submitted configuration alone, which is why it lives here beside
 /// [`alias_certificate_mismatch`] rather than in one handler.
+///
+/// The message names the FIRST association that breaks the rule, read in the order the
+/// configuration states them — the default cache behaviour, then the ordered ones — and
+/// echoes that entry's `LambdaFunctionARN` as submitted, since that value is what tells a
+/// caller which of a configuration's associations was refused
+/// ([`invalid_lambda_function_association_message`]).
 pub fn lambda_association_without_version(config: &DistributionConfig) -> Option<String> {
     behavior_views(config)
         .iter()
         .filter_map(|behavior| behavior.lambda_function_associations)
         .flat_map(|associations| associations.items.as_deref().unwrap_or_default())
-        .any(|association| !names_lambda_function_version(&association.lambda_function_arn))
-        .then(|| INVALID_LAMBDA_FUNCTION_ASSOCIATION_MESSAGE.to_string())
+        .find(|association| !names_lambda_function_version(&association.lambda_function_arn))
+        .map(|association| {
+            invalid_lambda_function_association_message(&association.lambda_function_arn)
+        })
 }
 
 /// Whether `arn` names a PUBLISHED Lambda function version.
@@ -9850,19 +9858,28 @@ pub fn invalid_origin_access_control() -> crate::ops::types::InvalidOriginAccess
 pub const INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE: &str =
     "The specified origin access control does not exist or is not valid.";
 
-/// The message `InvalidLambdaFunctionAssociation` carries for an association whose ARN
-/// names no published function version.
+/// The message `InvalidLambdaFunctionAssociation` carries for the association whose ARN
+/// names no published function version: the fixed sentence stating the FORM the ARN has to
+/// have — the function ARN qualified with the number of a published version — and then the
+/// value the request supplied for that association, echoed verbatim after " ARN: ".
 ///
-/// Fixed text: what the association broke is the FORM the ARN has to have — the function
-/// ARN qualified with the number of a published version — and the sentence states that
-/// requirement, so no value out of the request belongs in it. Like
-/// [`INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE`] it is the SERVED sentence, which differs from
-/// the one the model's documentation of the error shape uses for the same rule ("The
-/// specified Lambda@Edge function association is invalid."): that one describes the
-/// condition, this one is sent.
-pub const INVALID_LAMBDA_FUNCTION_ASSOCIATION_MESSAGE: &str =
+/// A configuration may carry an association on the default cache behaviour and on every
+/// ordered one, so the sentence alone does not say WHICH entry was refused; the ARN named
+/// at the end is the only thing in the response that identifies it, and it is the request's
+/// own string (its partition, Region, account, function name and qualifier all come from
+/// the request, never from a constant here). Like [`INVALID_ORIGIN_ACCESS_CONTROL_MESSAGE`]
+/// the sentence is the SERVED text, which differs from the one the model's documentation of
+/// the error shape uses for the same rule ("The specified Lambda@Edge function association
+/// is invalid."): that one describes the condition, this one is sent.
+pub fn invalid_lambda_function_association_message(lambda_function_arn: &str) -> String {
+    format!("{INVALID_LAMBDA_FUNCTION_ASSOCIATION_PREFIX}{lambda_function_arn}")
+}
+
+/// The fixed part of [`invalid_lambda_function_association_message`], up to and including
+/// the " ARN: " separator the request's value follows.
+pub const INVALID_LAMBDA_FUNCTION_ASSOCIATION_PREFIX: &str =
     "The function ARN must reference a specific function version. (The ARN must end with \
-     the version number.)";
+     the version number.) ARN: ";
 
 /// The sentence `OriginAccessControlAlreadyExists` carries, up to the control that
 /// already holds the submitted parameters, which it names at the end — the one piece of

@@ -39,8 +39,8 @@ use crate::ops::types::{
     AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, AttributeValueTarget,
     AuthenticationProfile, AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
-    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, EventCategoriesMap, EventInfoMap,
-    EventSubscription, HsmConfiguration, MaintenanceTrack,
+    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, Event, EventCategoriesMap,
+    EventInfoMap, EventSubscription, HsmConfiguration, MaintenanceTrack,
     NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
     RedshiftIdcApplication, ReservedNode, ReservedNodeConfigurationOption,
@@ -2292,6 +2292,58 @@ pub const EVENT_CATALOG: &[CatalogEvent] = &[
     },
 ];
 
+/// How long a raised event stays readable: an event leaves the log once this
+/// much time has passed since it happened.
+///
+/// Source: `smithy_query(query="doc", operation="DescribeEvents")` — "Returns
+/// events related to clusters, security groups, snapshots, and parameter groups
+/// for the past 14 days." The window is the service's own published retention,
+/// not a span this emulator chose.
+pub const EVENT_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// How many minutes before the request an event read reaches back when the
+/// request names neither a `StartTime` nor a `Duration`.
+///
+/// Source: `smithy_query(query="doc", shape="DescribeEventsMessage",
+/// member="Duration")` — "The number of minutes prior to the time of the request
+/// for which to retrieve events […] Default: 60", which the operation's own
+/// documentation states as "By default, the past hour of events are returned."
+pub const EVENT_DURATION_DEFAULT_MINUTES: i64 = 60;
+
+/// How many seconds one minute of a `Duration` is, so the member's documented
+/// UNIT is applied in one place.
+const SECONDS_PER_MINUTE: i64 = 60;
+
+/// The closed interval, in whole seconds since the epoch, that one event read
+/// reports over: `(start, end)`.
+///
+/// The three members decide it exactly as they are documented: `EndTime` is "the
+/// end of the time interval for which to retrieve events" and defaults to the
+/// time of the request; `StartTime` is "the beginning of the time interval to
+/// retrieve events for"; and `Duration` is "the number of minutes prior to the
+/// time of the REQUEST" — so when no `StartTime` is named the interval begins
+/// that many minutes before `now`, never before `EndTime`, which is what the
+/// member's own example states ("if the request is sent at 18:00 and you specify
+/// a duration of 60, then only events which have occurred after 17:00 will be
+/// returned").
+pub fn event_window(
+    start_time: Option<::aws_smithy_types::DateTime>,
+    end_time: Option<::aws_smithy_types::DateTime>,
+    duration_minutes: Option<i32>,
+    now: SystemTime,
+) -> (i64, i64) {
+    let now_secs = ::aws_smithy_types::DateTime::from(now).secs();
+    let end = end_time.map_or(now_secs, |at| at.secs());
+    let start = match start_time {
+        Some(at) => at.secs(),
+        None => {
+            let minutes = duration_minutes.map_or(EVENT_DURATION_DEFAULT_MINUTES, i64::from);
+            now_secs.saturating_sub(minutes.saturating_mul(SECONDS_PER_MINUTE))
+        }
+    };
+    (start, end)
+}
+
 /// The identifier of the event a cluster parameter group's creation raises.
 pub const EVENT_ID_PARAMETER_GROUP_CREATED: &str = "REDSHIFT-EVENT-1003";
 
@@ -3230,6 +3282,19 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// one, and no operation adds to or removes from the list (see
     /// [`published_event_catalog`]).
     pub event_catalog: Vec<EventCategoriesMap>,
+    /// Every event a completed control-plane write RAISED, in the order it
+    /// happened — which is chronological, because an event is appended at the
+    /// instant it is raised.
+    ///
+    /// Unlike
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::event_catalog`],
+    /// which is the published description of the events this service CAN raise,
+    /// this is the log of the ones that actually happened: each entry is one
+    /// occurrence, carrying the source it happened to, the instant it happened
+    /// at and the message that occurrence rendered. The log is what an event read
+    /// reports, and an entry leaves it once [`EVENT_RETENTION`] has passed (see
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`]).
+    pub events: Vec<Event>,
     /// Every authentication profile, keyed by `AuthenticationProfileName`, in
     /// creation order.
     ///
@@ -3286,6 +3351,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             namespace_registrations: Vec::new(),
             event_subscriptions: Vec::new(),
             event_catalog: published_event_catalog(),
+            events: Vec::new(),
             authentication_profiles: Vec::new(),
         }
     }
@@ -3417,6 +3483,21 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         // called.
         self.namespace_registrations
             .retain(|registration| registration.removed_at.is_none_or(|due| now < due));
+        // An event is readable for the published retention window and no
+        // longer, so one that happened further back than that was due to leave
+        // the log at this instant whether or not anybody called.
+        let oldest_readable = wall.secs() - EVENT_RETENTION.as_secs() as i64;
+        self.events
+            .retain(|event| event.date.is_none_or(|at| at.secs() >= oldest_readable));
+    }
+
+    /// Append one raised event to the log this store keeps for an event read.
+    ///
+    /// The log is append-only and ordered by when each event happened, so the
+    /// `Marker` cursor an event read hands out is a stable offset into the same
+    /// sequence a later page walks.
+    pub fn record_event(&mut self, event: Event) {
+        self.events.push(event);
     }
 
     /// The namespace a registration request names, checked against the state

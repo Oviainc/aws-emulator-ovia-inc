@@ -48,6 +48,13 @@ mod admin_disassociation_first_in_last_out;
 #[path = "all/resource_set_mutation_admin_scope.rs"]
 mod resource_set_mutation_admin_scope;
 
+// Declared beside them, and for the same reason: the sorted list below is the
+// contended region every fms suite landing in the same window inserts into, and
+// this suite's name sorts right into it. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/resource_set_membership_last_update_time.rs"]
+mod resource_set_membership_last_update_time;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

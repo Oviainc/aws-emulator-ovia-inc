@@ -137,6 +137,25 @@
 //!   is GuardDuty's OWN to mint — `CreateDetector` takes no identifier and answers with
 //!   `detectorId` — so, as for the FIS, AWS WAF Classic and Amazon EMR types above, what
 //!   the stack reports for the resource is the id that create answered with.
+//! * `AWS::EC2::VPC`'s and `AWS::EC2::Subnet`'s are `CreateVpc`'s and `CreateSubnet`'s own
+//!   members under the same names ([`EC2_VPC_CREATE_MEMBERS`],
+//!   [`EC2_SUBNET_CREATE_MEMBERS`]), walked against those catalogues by the same
+//!   [`query_members`] the Amazon RDS arms use — every one of them a scalar — so a property
+//!   neither catalogue holds is REFUSED the way theirs refuse one. Each
+//!   type's identity is Amazon EC2's OWN — neither create takes an identifier, and each
+//!   answers the `vpc-…`/`subnet-…` id it assigned, which is what that type's `Ref`
+//!   returns — so a stack's outputs carry ids EC2 really holds those resources for. The
+//!   properties that are not members of either create are each the call that owns them: a
+//!   VPC's two DNS switches and a subnet's launch-time switches are `ModifyVpcAttribute`
+//!   and `ModifySubnetAttribute`, one attribute per call ("You can only modify one
+//!   attribute at a time"), and the tag set is `CreateTags`, the one EC2 call that admits
+//!   the reserved `aws:cloudformation:*` keys from a service provisioning on a caller's
+//!   behalf. `CreateVpc` answers a VPC `pending` and `DescribeVpcs` reports it `available`
+//!   once that service's own clock makes the move due, which is EC2's transition and not a
+//!   wait on the creation: the resource the create answered exists and takes the calls made
+//!   on it (a subnet is created in it straight away), exactly as the DB instance an
+//!   `AWS::RDS::DBInstance` creates is reported created while Amazon RDS still has it
+//!   `creating`.
 //! * `AWS::RDS::DBInstance`'s and `AWS::RDS::DBSubnetGroup`'s are the members
 //!   `CreateDBInstance` / `CreateDBSubnetGroup` take, named identically on both sides
 //!   except the two Amazon RDS spells differently (`VPCSecurityGroups` is
@@ -375,7 +394,8 @@ use super::template::{
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
-    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
+    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SUBNET, EC2_VPC,
+    ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_ALIAS, KMS_KEY,
@@ -464,6 +484,11 @@ pub(super) enum Provisioner {
     CloudWatchMetricStream,
     CloudWatchDashboard,
     EcrPublicRepository,
+    /// `AWS::EC2::VPC`: a VPC of Amazon EC2, whose `vpc-…` identifier that service assigns.
+    Ec2Vpc,
+    /// `AWS::EC2::Subnet`: a subnet of one of those VPCs, whose `subnet-…` identifier is
+    /// EC2's to assign the same way.
+    Ec2Subnet,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
     /// `AWS::OpenSearchService::Domain`: a domain of Amazon OpenSearch Service, which is a
@@ -556,6 +581,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
         CLOUDWATCH_DASHBOARD => Some(Provisioner::CloudWatchDashboard),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
+        EC2_VPC => Some(Provisioner::Ec2Vpc),
+        EC2_SUBNET => Some(Provisioner::Ec2Subnet),
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
@@ -672,6 +699,8 @@ impl Provisioner {
             Self::EcrPublicRepository => {
                 create_public_repository(ctx, region, resource, propagated).await
             }
+            Self::Ec2Vpc => create_ec2_vpc(ctx, region, resource, propagated).await,
+            Self::Ec2Subnet => create_ec2_subnet(ctx, region, resource, propagated).await,
             Self::S3Bucket => create_bucket(ctx, region, resource, propagated).await,
             Self::S3VectorsVectorBucket => {
                 create_vector_bucket(ctx, region, resource, propagated).await
@@ -1286,6 +1315,8 @@ impl Provisioner {
             Self::EcrPublicRepository => {
                 delete_public_repository(ctx, region, physical_resource_id).await
             }
+            Self::Ec2Vpc => delete_ec2_vpc(ctx, region, physical_resource_id).await,
+            Self::Ec2Subnet => delete_ec2_subnet(ctx, region, physical_resource_id).await,
             Self::OpenSearchServerlessSecurityPolicy => {
                 delete_security_policy(ctx, region, resource).await
             }
@@ -1534,6 +1565,8 @@ impl Provisioner {
             Self::EcrPublicRepository => {
                 describe_public_repository(ctx, region, physical_resource_id).await
             }
+            Self::Ec2Vpc => describe_ec2_vpc(ctx, region, physical_resource_id).await,
+            Self::Ec2Subnet => describe_ec2_subnet(ctx, region, physical_resource_id).await,
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
             Self::S3VectorsVectorBucket => {
                 describe_vector_bucket(ctx, region, physical_resource_id).await
@@ -10205,6 +10238,537 @@ fn push_tag_list(
             format!("{member}.{element}.{position}.Value"),
             value.clone(),
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon EC2: AWS::EC2::VPC and AWS::EC2::Subnet
+// ---------------------------------------------------------------------------
+
+/// Amazon EC2's signing name and the API version a request names beside the action, from
+/// its model (`sigv4Name: ec2`, `version: 2016-11-15`).
+///
+/// That model declares `ec2Query`, whose request is the same `Action`-plus-`Version` form
+/// body an awsQuery one is — so [`call_query`] carries it — answered with XML. What differs
+/// is only how a list is spelled (`ResourceId.1`, `Tag.1.Key`, with no `.member.`
+/// indirection) and that a member's parameter name is its `ec2QueryName`, which every
+/// member these arms send carries as its own name with an upper-case initial: both are what
+/// the parameters below are written in.
+const EC2_SIGNING_NAME: &str = "ec2";
+const EC2_API_VERSION: &str = "2016-11-15";
+
+/// The error codes Amazon EC2 answers for a VPC and a subnet it does not hold
+/// (`InvalidVpcID.NotFound` / `InvalidSubnetID.NotFound`, EC2 API error codes), which is a
+/// delete asking for a state that service is already in.
+const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
+const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
+
+/// The `AWS::EC2::VPC` properties `CreateVpc` takes under the SAME member name.
+///
+/// Source: AWS's CloudFormation resource reference for the type against
+/// `smithy_query(query="operation",operation="CreateVpc")` — `CidrBlock`,
+/// `InstanceTenancy`, `Ipv4IpamPoolId` and `Ipv4NetmaskLength` are spelled identically on
+/// both sides, and every one is a SCALAR, which is why [`query_members`] can write this
+/// catalogue: a LIST member would need the flattening ec2Query gives one (`Tag.1.Key`, with
+/// no `.member.` indirection) and that helper writes the awsQuery spelling. EC2 takes no
+/// name for a VPC on that call and assigns the `vpc-…` id itself, which is why this type's
+/// identity is the owning service's
+/// ([`super::template::identity_is_service_assigned`]).
+const EC2_VPC_CREATE_MEMBERS: &[(&str, QueryMember)] = &[
+    ("CidrBlock", QueryMember::Scalar),
+    ("InstanceTenancy", QueryMember::Scalar),
+    ("Ipv4IpamPoolId", QueryMember::Scalar),
+    ("Ipv4NetmaskLength", QueryMember::Scalar),
+];
+
+/// The `AWS::EC2::VPC` properties another call carries: the two DNS switches, which are VPC
+/// ATTRIBUTES rather than members of the create ([`EC2_VPC_ATTRIBUTES`]), and the tags,
+/// which reach EC2 through the one call that tags a resource that exists
+/// ([`tag_ec2_resource`]).
+const EC2_VPC_PROPERTIES_NOT_SENT: &[&str] =
+    &["EnableDnsHostnames", "EnableDnsSupport", "Tags"];
+
+/// The `AWS::EC2::VPC` properties that are attributes of the VPC, each the
+/// `ModifyVpcAttribute` member that writes it — named identically on both sides
+/// (`smithy_query(query="operation",operation="ModifyVpcAttribute")`), and each an
+/// `AttributeBooleanValue`, whose value is its `Value` member.
+///
+/// "You can only modify one attribute at a time" (`ModifyVpcAttribute`), so each is its own
+/// call, in this order: "You cannot enable DNS hostnames if DNS support is disabled" (Amazon
+/// VPC User Guide, "DNS attributes in your VPC"), so a declaration enabling both has support
+/// written first.
+const EC2_VPC_ATTRIBUTES: &[&str] = &["EnableDnsSupport", "EnableDnsHostnames"];
+
+/// The `AWS::EC2::Subnet` properties `CreateSubnet` takes under the SAME member name, each
+/// a scalar for the reason [`EC2_VPC_CREATE_MEMBERS`] records.
+///
+/// Source: AWS's CloudFormation resource reference for the type against
+/// `smithy_query(query="operation",operation="CreateSubnet")`. `VpcId` is the VPC the
+/// subnet is created in — a `Ref` to the VPC of the same template resolves to the id EC2
+/// assigned it ([`super::provisioning::reconcile`]) — and the subnet's own `subnet-…` id is
+/// EC2's to assign, exactly as the VPC's is.
+const EC2_SUBNET_CREATE_MEMBERS: &[(&str, QueryMember)] = &[
+    ("AvailabilityZone", QueryMember::Scalar),
+    ("AvailabilityZoneId", QueryMember::Scalar),
+    ("CidrBlock", QueryMember::Scalar),
+    ("Ipv6CidrBlock", QueryMember::Scalar),
+    ("Ipv6Native", QueryMember::Scalar),
+    ("OutpostArn", QueryMember::Scalar),
+    ("VpcId", QueryMember::Scalar),
+];
+
+/// The `AWS::EC2::Subnet` properties another call carries: the four that are subnet
+/// ATTRIBUTES ([`EC2_SUBNET_BOOLEAN_ATTRIBUTES`] and the members of
+/// `PrivateDnsNameOptionsOnLaunch`, [`EC2_SUBNET_PRIVATE_DNS_ATTRIBUTES`]) and the tags.
+///
+/// `Ipv6CidrBlocks` is NOT one of them and is not a member of the create either, so a
+/// declaration carrying it is refused: a subnet's further IPv6 blocks are each an
+/// `AssociateSubnetCidrBlock` of their own, and a subnet created without the blocks its
+/// declaration asked for is not the subnet the template declared.
+const EC2_SUBNET_PROPERTIES_NOT_SENT: &[&str] = &[
+    "AssignIpv6AddressOnCreation",
+    "EnableDns64",
+    "MapPublicIpOnLaunch",
+    "PrivateDnsNameOptionsOnLaunch",
+    "Tags",
+];
+
+/// The `AWS::EC2::Subnet` properties that are boolean attributes of the subnet, each the
+/// `ModifySubnetAttribute` member that writes it — named identically on both sides
+/// (`smithy_query(query="operation",operation="ModifySubnetAttribute")`), and each an
+/// `AttributeBooleanValue`.
+const EC2_SUBNET_BOOLEAN_ATTRIBUTES: &[&str] = &[
+    "AssignIpv6AddressOnCreation",
+    "EnableDns64",
+    "MapPublicIpOnLaunch",
+];
+
+/// The members of the type's `PrivateDnsNameOptionsOnLaunch` property, each against the
+/// `ModifySubnetAttribute` member that writes it and whether that member is a boolean
+/// (`AttributeBooleanValue`) or the plain `HostnameType` string.
+const EC2_SUBNET_PRIVATE_DNS_ATTRIBUTES: &[(&str, &str, bool)] = &[
+    (
+        "EnableResourceNameDnsARecord",
+        "EnableResourceNameDnsARecordOnLaunch",
+        true,
+    ),
+    (
+        "EnableResourceNameDnsAAAARecord",
+        "EnableResourceNameDnsAAAARecordOnLaunch",
+        true,
+    ),
+    ("HostnameType", "PrivateDnsHostnameTypeOnLaunch", false),
+];
+
+/// Tag one EC2 resource with the set CloudFormation gives it.
+///
+/// Through `CreateTags` rather than the create's own `TagSpecifications`, because that set
+/// carries the three `aws:cloudformation:*` keys: "Do not use the `aws:` prefix … it is
+/// reserved for AWS use" binds a CALLER, and the services that provision resources on a
+/// caller's behalf are what set those keys — which is the request EC2 admits them from.
+/// Nothing is called for a resource with no tags at all.
+async fn tag_ec2_resource(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource_id: &str,
+    tags: &[(String, String)],
+) -> Result<(), Refusal> {
+    if tags.is_empty() {
+        return Ok(());
+    }
+    let mut parameters = vec![("ResourceId.1".to_string(), resource_id.to_string())];
+    for (index, (key, value)) in tags.iter().enumerate() {
+        let position = index + 1;
+        parameters.push((format!("Tag.{position}.Key"), key.clone()));
+        parameters.push((format!("Tag.{position}.Value"), value.clone()));
+    }
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateTags",
+        &parameters,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// One Amazon EC2 `Modify…Attribute` call: the action, and the member of it that names the
+/// resource the attribute belongs to.
+#[derive(Debug, Clone, Copy)]
+struct Ec2AttributeCall {
+    action: &'static str,
+    id_member: &'static str,
+}
+
+/// The two of them these arms write through: a VPC's attributes and a subnet's.
+const MODIFY_VPC_ATTRIBUTE: Ec2AttributeCall = Ec2AttributeCall {
+    action: "ModifyVpcAttribute",
+    id_member: "VpcId",
+};
+const MODIFY_SUBNET_ATTRIBUTE: Ec2AttributeCall = Ec2AttributeCall {
+    action: "ModifySubnetAttribute",
+    id_member: "SubnetId",
+};
+
+/// Write ONE attribute of a VPC or a subnet: the `Modify…Attribute` call that owns the
+/// attribute, carrying the one member it names.
+///
+/// `boolean` is whether that member is an `AttributeBooleanValue`, whose value travels as
+/// its `Value` member — the shape every switch of either call takes, beside the one plain
+/// string (`PrivateDnsHostnameTypeOnLaunch`).
+async fn modify_ec2_attribute(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    call: Ec2AttributeCall,
+    resource_id: &str,
+    member: &str,
+    value: &Value,
+    boolean: bool,
+) -> Result<(), Refusal> {
+    let name = if boolean {
+        format!("{member}.Value")
+    } else {
+        member.to_string()
+    };
+    let parameters = vec![
+        (call.id_member.to_string(), resource_id.to_string()),
+        (name, attribute_text(value)),
+    ];
+    call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        call.action,
+        &parameters,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The scalar members Amazon EC2 reports a resource with, under the names the TYPE's
+/// properties and return values use.
+///
+/// An ec2Query answer spells a member in lower camel case (`<vpcId>`, `<cidrBlock>`) while
+/// the model's `ec2QueryName` for that same member — and the CloudFormation property it
+/// corresponds to — is that name with an upper-case initial, so the one transformation puts
+/// the reported document in the names a declaration is written in. That is what lets drift
+/// detection compare a declared property against what EC2 reports for it.
+fn ec2_reported(document: &str, parent: &str) -> Map<String, Value> {
+    xml_scalar_children(document, parent)
+        .into_iter()
+        .map(|(member, value)| {
+            let mut characters = member.chars();
+            let named = match characters.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+                None => member,
+            };
+            (named, value)
+        })
+        .collect()
+}
+
+/// The one resource a describe's RESULT SET carries, read the same way: the document from
+/// the `<…Set>` element the answer nests its entries in, so the `<item>` read is that set's
+/// own first entry rather than the first element of that name anywhere in the answer.
+///
+/// `set` is the list member's `@xmlName` (`vpcSet`, `subnetSet`), and `ELEMENT` the name an
+/// ec2Query list's entries carry. Both describes here name ONE id, so that set holds one
+/// entry; a read of several would need the entry matched to the id rather than taken by
+/// position.
+fn ec2_reported_entry(document: &str, set: &str) -> Map<String, Value> {
+    /// The element name an ec2Query list wraps each of its entries in.
+    const ELEMENT: &str = "item";
+
+    let entries = document
+        .find(&format!("<{set}>"))
+        .map_or(document, |start| &document[start..]);
+    ec2_reported(entries, ELEMENT)
+}
+
+/// Create the VPC an `AWS::EC2::VPC` declares, in Amazon EC2.
+///
+/// "Ref returns the ID of the VPC" — an id EC2 ASSIGNS (`vpc-` and 17 hexadecimal
+/// characters), which is what this answers as the resource's physical id, so the stack's
+/// `Ref`, its outputs and its per-resource reads report an id EC2 really holds a VPC for.
+/// The two DNS switches are attributes of the VPC rather than members of the create, and
+/// the tag set is the one call that tags a resource that exists.
+async fn create_ec2_vpc(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let parameters = query_members(
+        &resource.properties,
+        EC2_VPC_CREATE_MEMBERS,
+        &[],
+        EC2_VPC_PROPERTIES_NOT_SENT,
+        EC2_VPC,
+    )?;
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateVpc",
+        &parameters,
+    )
+    .await?;
+    let reported = ec2_reported(&answered, "vpc");
+    let vpc_id = reported
+        .get("VpcId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateVpc answered no vpcId".to_string(),
+        })?
+        .to_string();
+    for attribute in EC2_VPC_ATTRIBUTES {
+        if let Some(value) = resource.properties.get(*attribute) {
+            modify_ec2_attribute(
+                ctx,
+                region,
+                MODIFY_VPC_ATTRIBUTE,
+                &vpc_id,
+                attribute,
+                value,
+                true,
+            )
+            .await?;
+        }
+    }
+    tag_ec2_resource(
+        ctx,
+        region,
+        &vpc_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The attributes the type publishes that EC2 itself decides: the id it assigned (which
+    // this type's `VpcId` return value is) and the block it canonicalised the declared one
+    // into. The ones that are another EC2 resource's id (`DefaultSecurityGroup`,
+    // `DefaultNetworkAcl`) are not reported by this call, so none is invented here.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("VpcId".to_string(), vpc_id.clone());
+    if let Some(cidr_block) = reported.get("CidrBlock").and_then(Value::as_str) {
+        attributes.insert("CidrBlock".to_string(), cidr_block.to_string());
+    }
+    Ok(Created {
+        physical_resource_id: Some(vpc_id),
+        attributes,
+    })
+}
+
+/// Create the subnet an `AWS::EC2::Subnet` declares, in Amazon EC2.
+///
+/// "Ref returns the subnet ID", again an id EC2 assigns, and the subnet is created IN the
+/// VPC its `VpcId` names — the id EC2 assigned the VPC of the same template, since a
+/// deployment creates each resource after the ones it depends on and re-points a reference
+/// at the identifier the owning service minted.
+async fn create_ec2_subnet(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let parameters = query_members(
+        &resource.properties,
+        EC2_SUBNET_CREATE_MEMBERS,
+        &[],
+        EC2_SUBNET_PROPERTIES_NOT_SENT,
+        EC2_SUBNET,
+    )?;
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "CreateSubnet",
+        &parameters,
+    )
+    .await?;
+    let reported = ec2_reported(&answered, "subnet");
+    let subnet_id = reported
+        .get("SubnetId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateSubnet answered no subnetId".to_string(),
+        })?
+        .to_string();
+    for attribute in EC2_SUBNET_BOOLEAN_ATTRIBUTES {
+        if let Some(value) = resource.properties.get(*attribute) {
+            modify_ec2_attribute(
+                ctx,
+                region,
+                MODIFY_SUBNET_ATTRIBUTE,
+                &subnet_id,
+                attribute,
+                value,
+                true,
+            )
+            .await?;
+        }
+    }
+    for (property, member, boolean) in EC2_SUBNET_PRIVATE_DNS_ATTRIBUTES {
+        let Some(value) = resource
+            .properties
+            .get("PrivateDnsNameOptionsOnLaunch")
+            .and_then(|options| options.get(*property))
+        else {
+            continue;
+        };
+        modify_ec2_attribute(
+            ctx,
+            region,
+            MODIFY_SUBNET_ATTRIBUTE,
+            &subnet_id,
+            member,
+            value,
+            *boolean,
+        )
+        .await?;
+    }
+    tag_ec2_resource(
+        ctx,
+        region,
+        &subnet_id,
+        &tags_of(&resource.properties, propagated),
+    )
+    .await?;
+    // The attributes this type publishes that EC2 itself decides: the id it assigned, the
+    // VPC the subnet really sits in, the zone it placed the subnet in (and that zone's id)
+    // where the declaration named none, the canonicalised block, and the subnet's ARN. The
+    // published attributes nothing here holds (`NetworkAclAssociationId`) are left out
+    // rather than invented.
+    let mut attributes = BTreeMap::new();
+    attributes.insert("SubnetId".to_string(), subnet_id.clone());
+    for attribute in [
+        "VpcId",
+        "AvailabilityZone",
+        "AvailabilityZoneId",
+        "CidrBlock",
+        "OutpostArn",
+    ] {
+        if let Some(value) = reported
+            .get(attribute)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            attributes.insert(attribute.to_string(), value.to_string());
+        }
+    }
+    if let Some(arn) = reported
+        .get("SubnetArn")
+        .and_then(Value::as_str)
+        .filter(|arn| !arn.is_empty())
+    {
+        attributes.insert("Arn".to_string(), arn.to_string());
+    }
+    Ok(Created {
+        physical_resource_id: Some(subnet_id),
+        attributes,
+    })
+}
+
+/// Delete the VPC a stack created, addressed by the id EC2 assigned it — this resource's
+/// physical id. A VPC EC2 no longer holds (`InvalidVpcID.NotFound`) is already in the state
+/// the delete asks for.
+async fn delete_ec2_vpc(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![("VpcId".to_string(), vpc_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DeleteVpc",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == INVALID_VPC_ID_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Delete the subnet a stack created, the same way — and before the VPC that holds it, which
+/// is what [`super::provisioning::delete`] walking a stack's resources newest-first gives.
+async fn delete_ec2_subnet(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![("SubnetId".to_string(), subnet_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DeleteSubnet",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == INVALID_SUBNET_ID_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The VPC's configuration as Amazon EC2 reports it, for drift detection. A VPC it no
+/// longer holds (`InvalidVpcID.NotFound`) was deleted.
+async fn describe_ec2_vpc(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("VpcId.1".to_string(), vpc_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DescribeVpcs",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(ec2_reported_entry(&answered, "vpcSet")))),
+        Err(refusal) if refusal.code == INVALID_VPC_ID_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The subnet's configuration as Amazon EC2 reports it, read the same way.
+async fn describe_ec2_subnet(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![("SubnetId.1".to_string(), subnet_id.to_string())];
+    match call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DescribeSubnets",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(ec2_reported_entry(&answered, "subnetSet")))),
+        Err(refusal) if refusal.code == INVALID_SUBNET_ID_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
     }
 }
 

@@ -24,7 +24,9 @@
 //! [`owed`] decides which topics a raised event is owed to (under the lock, from
 //! the subscriptions the store holds) and [`publish`] performs the publishes once
 //! the lock is released. [`raise`] is the whole path, and the one call a handler
-//! makes after its own write is complete and its guard dropped.
+//! makes after its own write is complete and its guard dropped — and, because it
+//! is the one place every raised event passes through, it is also where the event
+//! is RECORDED in the store's event log, which is what an event read reports.
 //!
 //! A publish the topic's own service refuses — most often a topic that does not
 //! exist, or one no SNS is mounted to hold — is not the control-plane operation's
@@ -34,7 +36,7 @@
 
 use std::time::SystemTime;
 
-use crate::ops::types::EventSubscription;
+use crate::ops::types::{Event, EventSubscription};
 
 use super::{CatalogEvent, EVENT_CATALOG, SNS_ARN_SERVICE};
 
@@ -89,6 +91,31 @@ pub fn raised(event_id: &str, source_id: &str, fills: &[(&str, &str)]) -> Option
         at,
         message: message(event, at, fills)?,
     })
+}
+
+impl RaisedEvent {
+    /// This occurrence as the modelled `Event` an event read reports: the
+    /// catalog entry's own identity (its id, the source type that raises it, the
+    /// categories and the severity it is published under) and the three values
+    /// this occurrence supplies — the source it happened to, the instant it
+    /// happened at, and the message it rendered.
+    pub fn to_api(&self) -> Event {
+        Event {
+            source_identifier: Some(self.source_id.clone()),
+            source_type: Some(self.event.source_type.to_string()),
+            message: Some(self.message.clone()),
+            event_categories: Some(
+                self.event
+                    .event_categories
+                    .iter()
+                    .map(|category| (*category).to_string())
+                    .collect(),
+            ),
+            severity: Some(self.event.severity.to_string()),
+            date: Some(::aws_smithy_types::DateTime::from(self.at)),
+            event_id: Some(self.event.event_id.to_string()),
+        }
+    }
 }
 
 /// The message one occurrence of `event` carries: the catalog's description with
@@ -335,12 +362,13 @@ pub async fn publish(
     }
 }
 
-/// Raise the catalog event `event_id` for the source `source_id` and publish it to
-/// every subscription scoped to it.
+/// Raise the catalog event `event_id` for the source `source_id`, record it in
+/// the store's event log, and publish it to every subscription scoped to it.
 ///
 /// The whole path, so a control-plane handler raises an event in one line, AFTER
 /// its own write is complete and its store guard dropped: this takes the lock
-/// itself, for the matching only, and holds none of it across the publish.
+/// itself, for the recording and the matching, and holds none of it across the
+/// publish.
 ///
 /// `fills` names the catalog placeholders this occurrence fills; see [`raised`].
 /// A request that raises an event no subscription is scoped to publishes nothing
@@ -363,7 +391,11 @@ pub async fn raise<Eng: Send + Sync + 'static>(
         return;
     };
     let notifications = {
-        let store = state.lock();
+        let mut store = state.lock();
+        // The event HAPPENED, which an event read reports for as long as the
+        // service keeps it — so it is recorded whether or not any subscription
+        // is scoped to it, and before the matching that decides who is told.
+        store.record_event(raised.to_api());
         owed(&store, &raised)
     };
     if notifications.is_empty() {

@@ -214,11 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .any(|filter| filter.name == RESOURCE_TYPE_FILTER);
 
+        // A group lives in the region whose endpoint created it, and only that
+        // region's callers see it, so this listing enumerates the groups of the
+        // region the request addressed and no other — which is also the listing a
+        // token belongs to, read before any token is.
+        let region = crate::state::request_region(ctx.parts());
+
         // The token is this service's own opaque encoding of the name the previous
-        // page stopped at; anything else cannot name a resume point.
+        // page stopped at, in THIS region's listing; anything else cannot name a
+        // resume point.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) => match crate::state::decode_page_token(LISTING, token) {
+            Some(token) => match crate::state::decode_page_token(&region, LISTING, token) {
                 Some(key) => Some(key),
                 None => {
                     return Err(bad_request(
@@ -230,8 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A group lives in the region whose endpoint created it, and only that
         // region's callers see it, so this listing enumerates the groups of the
-        // region the request addressed and no other.
-        let region = crate::state::request_region(ctx.parts());
+        // region resolved above and no other.
         let store = state.lock();
         let mut remaining: Vec<&crate::state::GroupRecord> = store
             .groups_in(&region)
@@ -263,7 +269,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .min(remaining.len());
         let page = &remaining[..page_size];
         let next_token = (page.len() < remaining.len())
-            .then(|| page.last().map(|group| crate::state::encode_page_token(LISTING, &group.name)))
+            .then(|| {
+                page.last()
+                    .map(|group| crate::state::encode_page_token(&region, LISTING, &group.name))
+            })
             .flatten();
 
         Ok(ListGroupsOutput {
@@ -277,7 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The listing this operation's pagination tokens belong to: a token issued here
-/// resumes THIS listing and no other.
+/// resumes THIS listing and no other. The region the request addressed is the
+/// other half of that listing's identity, and is carried beside this name by the
+/// token codec ([`crate::state::encode_page_token`]), since this listing
+/// enumerates one region's groups.
 const LISTING: &str = "groups";
 
 /// The most `Filters` entries this operation applies to one call.

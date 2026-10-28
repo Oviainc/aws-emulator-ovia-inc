@@ -264,12 +264,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The token is this service's own opaque encoding of the ARN the previous
-        // page stopped at, scoped to THIS listing of THIS group; anything else
-        // cannot name a resume point in it.
+        // page stopped at, scoped to THIS listing of THIS group — the group the
+        // key names IN ITS REGION; anything else cannot name a resume point in it.
         let listing = listing_of(&key.name);
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) => match crate::state::decode_page_token(&listing, token) {
+            Some(token) => match crate::state::decode_page_token(&key.region, &listing, token) {
                 Some(key) => Some(key),
                 None => {
                     return Err(bad_request(
@@ -301,7 +301,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = (page.len() < remaining.len())
             .then(|| {
                 page.last()
-                    .map(|member| crate::state::encode_page_token(&listing, &member.resource_arn))
+                    .map(|member| {
+                        crate::state::encode_page_token(
+                            &key.region,
+                            &listing,
+                            &member.resource_arn,
+                        )
+                    })
             })
             .flatten();
 
@@ -319,7 +325,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The listing one group's pagination tokens belong to: a token issued here
-/// resumes THIS listing of THAT group, and no other.
+/// resumes THIS listing of THAT group, and no other. The region the group lives
+/// in — the other half of its identity — is carried beside this name by the
+/// token codec ([`crate::state::encode_page_token`]), so a same-named group of
+/// another region is another listing.
 fn listing_of(group_name: &str) -> String {
     format!("group-resources/{group_name}")
 }

@@ -870,9 +870,7 @@ impl EnvironmentRecord {
             weekly_maintenance_window_start: Some(
                 self.spec.weekly_maintenance_window_start.clone(),
             ),
-            // `TagMap` is `@length(1, 50)`, so an untagged environment reports no `Tags`
-            // member rather than an empty map outside that bound.
-            tags: (!self.tags.is_empty()).then(|| map_of(&self.tags)),
+            tags: self.tags_member(),
             webserver_access_mode: Some(self.spec.webserver_access_mode.clone()),
             min_workers: Some(self.spec.min_workers),
             schedulers: Some(self.spec.schedulers),
@@ -883,6 +881,18 @@ impl EnvironmentRecord {
             min_webservers: Some(self.spec.min_webservers),
             max_webservers: Some(self.spec.max_webservers),
         }
+    }
+
+    /// This environment's stored tag map as the modelled `Tags` member every response
+    /// carrying it reports.
+    ///
+    /// `TagMap` is `@length(1, 50)`, so an untagged environment reports no `Tags` member
+    /// rather than an empty map outside that bound. The decision — the emptiness test and
+    /// the conversion of the stored `BTreeMap` into the generated `HashMap` — is made HERE
+    /// and nowhere else, so the `Environment` shape and the `ListTagsForResource` response
+    /// cannot drift apart about what an environment's tags are.
+    pub fn tags_member(&self) -> Option<HashMap<String, String>> {
+        (!self.tags.is_empty()).then(|| map_of(&self.tags))
     }
 
     /// Whether this environment is in a status an `UpdateEnvironment` can be applied to:

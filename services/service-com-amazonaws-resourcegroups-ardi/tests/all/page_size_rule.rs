@@ -38,10 +38,13 @@ const ITEMS: usize = MAX_PAGE_SIZE + 1;
 
 /// The group the memberships and the grouping statuses are recorded on. Created
 /// with a configuration that admits static memberships (see `static_group`).
-const MEMBER_GROUP: &str = "page-00";
+///
+/// Shared with the sibling suites of this target that drive the same listings, so
+/// one set of fixtures names the group every table row addresses.
+pub(crate) const MEMBER_GROUP: &str = "page-00";
 
 /// The group the tag-sync tasks are started on.
-const TASK_GROUP: &str = "page-01";
+pub(crate) const TASK_GROUP: &str = "page-01";
 
 /// Where a listing's `MaxResults` and `NextToken` ride: `ListGroups` binds both to
 /// the query string, every other listing of this service takes them in the payload.
@@ -53,8 +56,11 @@ enum PagedIn {
 
 /// One listing of this service: how a page of it is asked for, and how the items of
 /// a page are identified.
-struct Listing {
-    label: &'static str,
+///
+/// Shared with the sibling suites of this target, so every rule that holds of every
+/// listing is asserted over ONE table of them.
+pub(crate) struct Listing {
+    pub(crate) label: &'static str,
     path: &'static str,
     /// The members that address WHAT is listed, without any paging member.
     base: fn() -> Value,
@@ -66,7 +72,7 @@ struct Listing {
 }
 
 /// Every listing of this service, which is every place the page-size rule holds.
-fn listings() -> Vec<Listing> {
+pub(crate) fn listings() -> Vec<Listing> {
     vec![
         Listing {
             label: "ListGroups",
@@ -174,7 +180,11 @@ async fn populated() -> (Emulator, Vec<Vec<String>>) {
 
 /// The path and payload of one page request: `size` is the `MaxResults` asked for
 /// (`None` asks for none) and `token` the `NextToken` to resume after.
-fn page_request(listing: &Listing, size: Option<i64>, token: Option<&str>) -> (String, Value) {
+pub(crate) fn page_request(
+    listing: &Listing,
+    size: Option<i64>,
+    token: Option<&str>,
+) -> (String, Value) {
     let mut body = (listing.base)();
     let mut query: Vec<String> = Vec::new();
     match listing.paged_in {
@@ -204,7 +214,7 @@ fn page_request(listing: &Listing, size: Option<i64>, token: Option<&str>) -> (S
 }
 
 /// The identifiers one page carries, in the order the page lists them.
-fn page_ids(listing: &Listing, page: &Value) -> Vec<String> {
+pub(crate) fn page_ids(listing: &Listing, page: &Value) -> Vec<String> {
     page[listing.items_member]
         .as_array()
         .unwrap_or_else(|| {

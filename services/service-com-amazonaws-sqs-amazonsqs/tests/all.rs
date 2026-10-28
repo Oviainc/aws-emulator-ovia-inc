@@ -13,12 +13,18 @@
 // points it into `tests/all/`.
 #[path = "all/batch_entry_faults.rs"]
 mod batch_entry_faults;
+#[path = "all/batch_payload_ceiling.rs"]
+mod batch_payload_ceiling;
 #[path = "all/cancel_message_move_task.rs"]
 mod cancel_message_move_task;
+#[path = "all/dead_letter_instants.rs"]
+mod dead_letter_instants;
 #[path = "all/dead_letter_redrive.rs"]
 mod dead_letter_redrive;
 #[path = "all/delete_message_batch.rs"]
 mod delete_message_batch;
+#[path = "all/fifo_group_rotation.rs"]
+mod fifo_group_rotation;
 #[path = "all/fifo_queue.rs"]
 mod fifo_queue;
 #[path = "all/fifo_receive_idempotency.rs"]
@@ -57,6 +63,8 @@ mod queue_policy_authorization;
 mod queue_policy_condition_keys;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
+#[path = "all/receipt_handle_leases.rs"]
+mod receipt_handle_leases;
 #[path = "all/receipt_handle_lifetime.rs"]
 mod receipt_handle_lifetime;
 #[path = "all/receipt_handle_provenance.rs"]
@@ -77,6 +85,8 @@ mod request_size_transport_bound;
 mod scratch_probe;
 #[path = "all/send_message_batch.rs"]
 mod send_message_batch;
+#[path = "all/sender_attribution.rs"]
+mod sender_attribution;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

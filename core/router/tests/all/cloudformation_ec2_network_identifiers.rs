@@ -62,6 +62,12 @@ fn build_router() -> MultiServiceRouter {
             &engine,
         )),
     );
+    // Amazon EC2, which OWNS the types these rows declare: the two this emulator creates
+    // there (`AWS::EC2::VPC` and `AWS::EC2::Subnet`) are created by the stack through this
+    // service's own API, so it is mounted beside CloudFormation on the one engine.
+    router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
     router.register_service(
         service_com_amazonaws_route53resolver_route53resolver::EmulatedService::new(engine),
     );
@@ -160,8 +166,13 @@ fn is_ec2_identifier(value: &str, prefix: &str) -> bool {
 
 /// One row of the identifier table: an Amazon EC2 VPC-network resource type, the identifier
 /// prefix that service publishes for it, the `Fn::GetAtt` attribute the type names that
-/// identifier with, and the properties a declaration of it carries (none for the types that
-/// require nothing).
+/// identifier with, the properties a declaration of it carries (none for the types that
+/// require nothing) and the resources its declaration has to be deployed beside.
+///
+/// `properties` takes the index of the resource inside the row's template (0 and 1, for the
+/// two the row declares), so a type whose owning service refuses two resources configured
+/// identically — two subnets cannot share a CIDR block inside one VPC — declares a
+/// different configuration for each.
 ///
 /// Source: each type's "Return values" section in the AWS CloudFormation resource and
 /// property type reference, and Amazon EC2's own identifier forms — `vpc-`, `subnet-`,
@@ -170,60 +181,86 @@ struct IdentityRow {
     resource_type: &'static str,
     prefix: &'static str,
     identifier_attribute: &'static str,
-    properties: fn() -> Value,
+    properties: fn(usize) -> Value,
+    /// Further `Resources` members the row's two resources are declared beside, as the
+    /// object they are written into the template: a subnet is created IN a VPC, so the row
+    /// for it declares the VPC its `VpcId` references.
+    supporting: fn() -> Value,
 }
 
 /// The CIDR block the rows that declare one use, and the subnet block inside it.
 const VPC_CIDR: &str = "10.77.0.0/16";
+
+/// No further resources: what every row but the subnet's is deployed beside.
+fn nothing_else() -> Value {
+    json!({})
+}
 
 const IDENTITY_ROWS: &[IdentityRow] = &[
     IdentityRow {
         resource_type: "AWS::EC2::VPC",
         prefix: "vpc",
         identifier_attribute: "VpcId",
-        properties: || json!({ "CidrBlock": VPC_CIDR }),
+        properties: |_| json!({ "CidrBlock": VPC_CIDR }),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::Subnet",
         prefix: "subnet",
         identifier_attribute: "SubnetId",
-        properties: || json!({ "VpcId": "vpc-0a1b2c3d4e5f60718", "CidrBlock": "10.77.1.0/24" }),
+        // A subnet's block has to sit inside its VPC's and must not overlap another subnet's
+        // in the same VPC, so each of the row's two subnets carves out its own /24.
+        properties: |index| {
+            json!({
+                "VpcId": { "Ref": "Vpc" },
+                "CidrBlock": format!("10.77.{}.0/24", index + 1),
+            })
+        },
+        supporting: || {
+            json!({ "Vpc": { "Type": "AWS::EC2::VPC", "Properties": { "CidrBlock": VPC_CIDR } } })
+        },
     },
     IdentityRow {
         resource_type: "AWS::EC2::SecurityGroup",
         prefix: "sg",
         identifier_attribute: "GroupId",
-        properties: || json!({ "GroupDescription": "the identifier table's group" }),
+        properties: |_| json!({ "GroupDescription": "the identifier table's group" }),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::InternetGateway",
         prefix: "igw",
         identifier_attribute: "InternetGatewayId",
-        properties: || json!({}),
+        properties: |_| json!({}),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::RouteTable",
         prefix: "rtb",
         identifier_attribute: "RouteTableId",
-        properties: || json!({ "VpcId": "vpc-0a1b2c3d4e5f60718" }),
+        properties: |_| json!({ "VpcId": "vpc-0a1b2c3d4e5f60718" }),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::NatGateway",
         prefix: "nat",
         identifier_attribute: "NatGatewayId",
-        properties: || json!({ "SubnetId": "subnet-0a1b2c3d4e5f60718" }),
+        properties: |_| json!({ "SubnetId": "subnet-0a1b2c3d4e5f60718" }),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::DHCPOptions",
         prefix: "dopt",
         identifier_attribute: "DhcpOptionsId",
-        properties: || json!({ "DomainName": "identifiers.test" }),
+        properties: |_| json!({ "DomainName": "identifiers.test" }),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::VPNGateway",
         prefix: "vgw",
         identifier_attribute: "VPNGatewayId",
-        properties: || json!({ "Type": "ipsec.1" }),
+        properties: |_| json!({ "Type": "ipsec.1" }),
+        supporting: nothing_else,
     },
     // The three types whose published return values name the identifier `Id` rather than
     // with a type-specific name, which is the other half of what the rule generalises over.
@@ -231,22 +268,25 @@ const IDENTITY_ROWS: &[IdentityRow] = &[
         resource_type: "AWS::EC2::NetworkAcl",
         prefix: "acl",
         identifier_attribute: "Id",
-        properties: || json!({ "VpcId": "vpc-0a1b2c3d4e5f60718" }),
+        properties: |_| json!({ "VpcId": "vpc-0a1b2c3d4e5f60718" }),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::NetworkInterface",
         prefix: "eni",
         identifier_attribute: "Id",
-        properties: || json!({ "SubnetId": "subnet-0a1b2c3d4e5f60718" }),
+        properties: |_| json!({ "SubnetId": "subnet-0a1b2c3d4e5f60718" }),
+        supporting: nothing_else,
     },
     IdentityRow {
         resource_type: "AWS::EC2::VPCEndpoint",
         prefix: "vpce",
         identifier_attribute: "Id",
-        properties: || json!({
+        properties: |_| json!({
             "VpcId": "vpc-0a1b2c3d4e5f60718",
             "ServiceName": "com.amazonaws.us-east-1.s3",
         }),
+        supporting: nothing_else,
     },
 ];
 
@@ -264,12 +304,21 @@ async fn a_declared_ec2_network_resource_reports_the_identifier_its_type_publish
         let case = row.resource_type;
         let stack_name = format!("ec2-identity-{index}");
         // TWO resources of the type, so the rule's "distinct resources keep distinct
-        // identifiers" half is covered by every row rather than by one special case.
+        // identifiers" half is covered by every row rather than by one special case — beside
+        // whatever resources the row's own declaration has to sit next to.
+        let mut resources = json!({
+            "First": { "Type": case, "Properties": (row.properties)(0) },
+            "Second": { "Type": case, "Properties": (row.properties)(1) },
+        });
+        if let (Some(resources), Some(supporting)) =
+            (resources.as_object_mut(), (row.supporting)().as_object())
+        {
+            for (logical_id, declaration) in supporting {
+                resources.insert(logical_id.clone(), declaration.clone());
+            }
+        }
         let template = json!({
-            "Resources": {
-                "First": { "Type": case, "Properties": (row.properties)() },
-                "Second": { "Type": case, "Properties": (row.properties)() },
-            },
+            "Resources": resources,
             "Outputs": {
                 "FirstRef": { "Value": { "Ref": "First" } },
                 "FirstAttribute": {

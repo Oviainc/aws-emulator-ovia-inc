@@ -220,20 +220,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // A handle this queue currently holds names the message to delete. A handle whose
-        // message a delete has ALREADY removed names a deletion this queue has performed,
-        // so repeating it changes nothing and succeeds: "the request succeeds, but the
-        // message might not be deleted". Anything else — a superseded handle, a handle of
-        // another queue or of an incarnation that is gone, or a value no receive ever
-        // minted — is refused as what the handle NAMES.
-        match queue.handles.get(&input.receipt_handle).cloned() {
-            Some(message_id) => {
+        // A handle this queue holds, or one a later receive of a message it still holds
+        // superseded, names the message to delete. A handle whose message a delete has
+        // ALREADY removed names a deletion this queue has performed, so repeating it
+        // changes nothing and succeeds: "the request succeeds, but the message might not
+        // be deleted". On a FIFO queue a superseded handle's lease has moved on, so it
+        // deletes nothing. Anything else — a handle of another queue or of an incarnation
+        // that is gone, or a value no receive ever minted — is refused as what the handle
+        // NAMES.
+        match queue.message_id_for_handle(&input.receipt_handle) {
+            Ok(message_id) => {
                 // The message goes for good, so the lapsing visibility timeout cannot
                 // bring it back; every other handle minted for it goes with it.
                 queue.remove_message(&message_id);
             }
-            None if queue.deleted_handle(&input.receipt_handle) => {}
-            None => {
+            Err(_) if queue.deleted_handle(&input.receipt_handle) => {}
+            // A handle whose lease a later receive took is refused as the parameter value
+            // it is: the message is another consumer's now, so the caller receives again
+            // rather than retrying or re-addressing.
+            Err(sqs::ReceiptHandleRefusal::Expired) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    sqs::receipt_handle_expired_message(&input.receipt_handle),
+                ))
+            }
+            Err(_) => {
                 return Err(match sqs::unresolvable_receipt_handle(origin) {
                     // The handle names a queue incarnation this store no longer holds, so
                     // the queue it addresses does not exist — whatever queue now carries

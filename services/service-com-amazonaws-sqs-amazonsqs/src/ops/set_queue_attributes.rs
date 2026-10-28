@@ -252,15 +252,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         )?;
-        // A policy document is judged when it is WRITTEN: one naming an action outside
-        // this service's action set, or a principal that does not exist, can never grant
+        // A policy document is judged when it is WRITTEN: one naming an action outside the
+        // set a policy may state, or a principal that does not exist, can never grant
         // anything, so the attribute is left as it was.
-        if let Some(error) = input
+        if let Some(refusal) = input
             .attributes
             .get(state::POLICY)
             .and_then(|value| state::authorization::policy_refusal(&*self.engine, value))
         {
-            return Err(SetQueueAttributesErrorModeled::InvalidAttributeValue(error).into());
+            return Err(match refusal {
+                state::authorization::PolicyRefusal::Document(error) => {
+                    SetQueueAttributesErrorModeled::InvalidAttributeValue(error).into()
+                }
+                state::authorization::PolicyRefusal::ActionName(message) => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+                }
+            });
         }
         // A dead-letter link never crosses an account or a region boundary: a
         // `RedrivePolicy` whose target is some other namespace's queue could never
