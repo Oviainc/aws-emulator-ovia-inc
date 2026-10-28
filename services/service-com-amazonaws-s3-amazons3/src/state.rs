@@ -5312,15 +5312,15 @@ impl Bucket {
     ///   ACL grants, the way IAM combines the two.
     ///
     /// A Requester Pays bucket refuses it ahead of all of that
-    /// ([`REQUESTER_PAYS_ANONYMOUS_MESSAGE`]): there is no account to charge.
+    /// ([`Self::requester_pays_anonymous_refusal`]): there is no account to charge.
     pub fn anonymous_object_read_refusal(
         &self,
         bucket: &str,
         key: &str,
         object: Option<&Object>,
     ) -> Option<&'static str> {
-        if self.payer() == PAYER_REQUESTER {
-            return Some(REQUESTER_PAYS_ANONYMOUS_MESSAGE);
+        if let Some(message) = self.requester_pays_anonymous_refusal() {
+            return Some(message);
         }
         let granted_by_acl = object.is_some_and(|object| {
             acl_grants_to_all_users(&self.object_acl_grants(object), PERMISSION_READ)
@@ -5343,6 +5343,22 @@ impl Bucket {
             ::service_common::iam_authorization::Decision::NotStated => granted_by_acl,
         };
         (!granted).then_some(ACCESS_DENIED_MESSAGE)
+    }
+
+    /// Why REQUESTER PAYS refuses a request against this bucket that carries no credential
+    /// ([`REQUESTER_PAYS_ANONYMOUS_MESSAGE`]), or `None` for a bucket whose owner pays.
+    ///
+    /// "Requests to a Requester Pays bucket must be authenticated: you cannot make anonymous
+    /// requests" (`PutBucketRequestPayment`'s own documentation of the feature), because such
+    /// a request names no account to charge. So the refusal is about the CALLER rather than
+    /// about what the bucket grants: it stands however public the object is, and whether or
+    /// not the request acknowledges the charge, which is why it is answered ahead of every
+    /// grant ([`Self::anonymous_object_read_refusal`]) and why the sentence is the same
+    /// wherever an unauthenticated caller is refused — an operation's own authorization, or
+    /// the signature boundary that refuses a request before a handler sees it
+    /// ([`crate::service::sigv4`]).
+    pub fn requester_pays_anonymous_refusal(&self) -> Option<&'static str> {
+        (self.payer() == PAYER_REQUESTER).then_some(REQUESTER_PAYS_ANONYMOUS_MESSAGE)
     }
 
     /// The bucket's event notification configuration — empty when the bucket has no event

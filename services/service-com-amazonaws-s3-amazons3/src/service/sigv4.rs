@@ -37,9 +37,13 @@
 //!    S3 serves ("if you grant READ access to the anonymous user, the `GetObject` operation
 //!    returns the object without using an authorization header", `GetObject`'s own
 //!    documentation) rather than one that failed to sign. Nothing was signed, so there is no
-//!    signature to diagnose and no credential to name: S3 answers the authorization refusal
-//!    it answers any caller a bucket grants nothing to, the `AccessDenied` of its published
-//!    error list with that list's own sentence.
+//!    signature to diagnose and no credential to name, and WHICH authorization refusal it is
+//!    follows from the bucket the request addresses: the code is the `AccessDenied` of S3's
+//!    published error list either way, and the sentence is the one that bucket's own
+//!    configuration words for an unauthenticated caller
+//!    ([`crate::state::Bucket::requester_pays_anonymous_refusal`] carries that rule, and is
+//!    the same rule an operation's own authorization answers with once a request reaches a
+//!    handler).
 //!
 //! Every one of them is derived from the request as received. Nothing here reads a secret:
 //! the signing key is never named, the signature the service COMPUTED is never answered
@@ -182,9 +186,10 @@ thread_local! {
     static PRESENTED: RefCell<Option<Presented>> = const { RefCell::new(None) };
 }
 
-/// Record what `request` presented as the request this thread is serving.
-pub(super) fn remember(request: &Request) {
-    let presented = Presented::of(request);
+/// Record what `request` presented as the request this thread is serving, `addressed_bucket`
+/// naming the bucket its address resolves to (`None` for a request that addresses none).
+pub(super) fn remember(request: &Request, addressed_bucket: Option<&str>) {
+    let presented = Presented::of(request, addressed_bucket);
     PRESENTED.with(|note| {
         *note.borrow_mut() = Some(presented);
     });
@@ -220,11 +225,16 @@ pub(super) struct Presented {
     /// in the query string of a presigned URL. `false` is the ANONYMOUS caller, which is
     /// refused for what the bucket grants rather than for anything about a signature.
     carries_credential: bool,
+    /// The bucket the request's address names, when it names one: what the refusal of an
+    /// ANONYMOUS caller is worded from, because which refusal that is turns on the bucket's
+    /// own configuration rather than on anything the request signed.
+    addressed_bucket: Option<String>,
 }
 
 impl Presented {
-    /// Read `request` for everything a refusal of it may have to state.
-    fn of(request: &Request) -> Self {
+    /// Read `request` for everything a refusal of it may have to state, `addressed_bucket`
+    /// naming the bucket its address resolves to.
+    fn of(request: &Request, addressed_bucket: Option<&str>) -> Self {
         let headers = request.headers();
         let query = wire::request_query(request.uri());
         let authorization = headers.get(http::header::AUTHORIZATION.as_str());
@@ -272,6 +282,7 @@ impl Presented {
                 signature: bounded(signature),
             }),
             carries_credential,
+            addressed_bucket: addressed_bucket.map(bounded),
         }
     }
 
@@ -556,8 +567,10 @@ fn amz_instant(stamp: &str) -> Option<SystemTime> {
 }
 
 /// How this service answers the authentication refusal of the request `presented` describes,
-/// `issued` answering whether an access key id names a credential this emulator ISSUED; or
-/// `None` for a refusal this service does not word, which keeps the framework's own.
+/// `issued` answering whether an access key id names a credential this emulator ISSUED and
+/// `anonymous_message` the sentence an ANONYMOUS request against the bucket it addresses is
+/// refused with; or `None` for a refusal this service does not word, which keeps the
+/// framework's own.
 ///
 /// The order is AWS's: a query string the service cannot use is answered before anything
 /// about the caller, so a presigned URL whose window is outside the accepted range is
@@ -568,6 +581,7 @@ fn amz_instant(stamp: &str) -> Option<SystemTime> {
 pub(super) fn refusal_for(
     presented: &Presented,
     issued: &dyn Fn(&str) -> bool,
+    anonymous_message: &dyn Fn(Option<&str>) -> &'static str,
 ) -> Option<AuthRefusal> {
     if let Some(message) = presented
         .stated_expires
@@ -591,12 +605,15 @@ pub(super) fn refusal_for(
     }
     if !presented.carries_credential {
         // Nothing was presented, so nothing about a signature or a credential can be said:
-        // the request speaks for the anonymous caller, and what refused it is that the
-        // bucket grants that caller nothing.
+        // the request speaks for the anonymous caller, and what refused it is what the
+        // BUCKET it addresses says about such a caller — the charge it cannot be billed for
+        // where the bucket makes the requester pay, and otherwise that the bucket grants it
+        // nothing. One code either way, which is what makes the sentence the only thing
+        // telling the two refusals apart.
         return Some(AuthRefusal {
             code: crate::state::ACCESS_DENIED_CODE,
             status: UNAUTHENTICATED_STATUS,
-            message: crate::state::ACCESS_DENIED_MESSAGE,
+            message: anonymous_message(presented.addressed_bucket.as_deref()),
             diagnostics: None,
         });
     }
@@ -649,8 +666,8 @@ pub(super) struct AuthRefusal {
     pub(super) code: &'static str,
     /// The HTTP status it is answered with.
     pub(super) status: u16,
-    /// The `<Message>`. Fixed text for every condition here: none of the three states a
-    /// value from the request.
+    /// The `<Message>`. Fixed text for every condition here: none of them states a value
+    /// from the request.
     message: &'static str,
     /// The SigV4 signing diagnostics, for the one refusal that carries them.
     diagnostics: Option<Diagnostics>,

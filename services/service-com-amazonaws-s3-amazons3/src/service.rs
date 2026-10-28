@@ -641,9 +641,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// path.
     fn authentication_refusal_response(&self) -> Option<RtResponse> {
         let presented = sigv4::presented()?;
-        let refusal = sigv4::refusal_for(&presented, &|access_key_id| {
-            self.issued_credential(access_key_id)
-        })?;
+        let refusal = sigv4::refusal_for(
+            &presented,
+            &|access_key_id| self.issued_credential(access_key_id),
+            &|bucket| self.anonymous_refusal_message(bucket),
+        )?;
         self.protocol
             .serialize_error(
                 &refusal,
@@ -652,6 +654,30 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 refusal.status,
             )
             .ok()
+    }
+
+    /// The sentence S3 refuses a request carrying NO credential with, for a request whose
+    /// address resolves to `bucket` (`None` for one that addresses no bucket).
+    ///
+    /// The code is `AccessDenied` for every such refusal, so the sentence is the only thing
+    /// telling a caller WHICH refusal it is — and which one that is turns on the bucket the
+    /// request addresses, read from the store rather than from the request: a bucket that
+    /// makes the REQUESTER pay cannot bill a caller that names no account, whatever it
+    /// grants to everyone ([`crate::state::Bucket::requester_pays_anonymous_refusal`] holds
+    /// that rule, the same one an operation's own authorization answers with), and anything
+    /// else is the authorization refusal S3 answers a caller a bucket grants nothing to.
+    ///
+    /// Read-only: the guard is taken, the bucket's configuration is read, and nothing is
+    /// written — including for a name the store holds no bucket for, which is the generic
+    /// refusal because no bucket's configuration says otherwise.
+    fn anonymous_refusal_message(&self, bucket: Option<&str>) -> &'static str {
+        bucket
+            .and_then(|name| {
+                let state = crate::state::service_state(&*self.engine)?;
+                let store = state.lock();
+                store.bucket(name)?.requester_pays_anonymous_refusal()
+            })
+            .unwrap_or(crate::state::ACCESS_DENIED_MESSAGE)
     }
 
     /// The refusal S3 answers a request against a resource it does not serve at all:
@@ -774,7 +800,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // whole request — its body included, which is what the payload half of a canonical
         // request is built from — and it reaches it BEFORE it authenticates, for the one
         // service that claimed the request.
-        sigv4::remember(req);
+        //
+        // The BUCKET the request addresses travels with it, resolved from the request's
+        // PATH-STYLE address ([`Self::path_style_path`]) so a virtual-hosted-style request
+        // names the same bucket a path-style one does: a refusal of an anonymous caller is
+        // worded from that bucket's own configuration, and the seam that words it is handed
+        // no request to read it from.
+        sigv4::remember(req, first_path_segment(&self.path_style_path(req)));
         // A VIRTUAL-HOSTED-STYLE request names its bucket in the host, so its path is the
         // key alone — `GET /key-name` — which the model's routing table cannot name: every
         // route of this service begins with the `{Bucket}` label, so the key would be read

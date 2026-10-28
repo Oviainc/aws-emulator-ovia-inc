@@ -223,10 +223,26 @@ async fn send_anonymous(
     host: &str,
     uri: &str,
 ) -> Answer {
-    let request = http::Request::builder()
+    send_anonymous_with(router, method, host, uri, &[]).await
+}
+
+/// [`send_anonymous`], with `headers` on the request — the acknowledgement header a client
+/// puts on a Requester Pays read travels there.
+async fn send_anonymous_with(
+    router: &MultiServiceRouter,
+    method: &str,
+    host: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    let mut builder = http::Request::builder()
         .method(method)
         .uri(format!("https://{host}{uri}"))
-        .header("host", host)
+        .header("host", host);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
         .body(bytes::Bytes::new())
         .expect("the test request must build");
     let response = router.dispatch(request).await;
@@ -762,4 +778,372 @@ async fn an_unsigned_read_of_a_bucket_this_emulator_does_not_hold_is_not_served(
         read.status,
         text(&read)
     );
+}
+
+/// The acknowledgement header a client puts on a request it expects to be charged for, and
+/// the value `RequestPayer` takes (`smithy_query(query="shape",shape="RequestPayer")`).
+const REQUEST_PAYER_HEADER: (&str, &str) = ("x-amz-request-payer", "requester");
+
+/// The Block Public Access configuration a bucket must be in for a PUBLIC bucket policy to
+/// take effect while its ACL guardrails stay on: the policy switch off, the ACL ones on
+/// ([`SETTINGS`] order).
+const PUBLIC_POLICY_ALLOWED: Flags = [true, true, false, false];
+
+/// One unsigned request against a bucket configured for a particular payer, and the sentence
+/// its refusal must carry.
+struct PayerRow {
+    /// The case name every assertion of the row reports.
+    case: &'static str,
+    /// The bucket the request addresses.
+    bucket: &'static str,
+    /// The method it asks with.
+    method: &'static str,
+    /// The endpoint host it is addressed to.
+    host: String,
+    /// The request URI, in whichever address form `host` implies.
+    uri: String,
+    /// The headers it carries.
+    headers: Vec<(&'static str, &'static str)>,
+    /// The `<Message>` the refusal must carry.
+    message: &'static str,
+}
+
+/// Stand up `name` holding one object every principal may read by policy, then put each
+/// `payers` entry on it in turn — so a bucket whose payer was CHANGED is judged by the value
+/// it carries now.
+async fn public_bucket_paid_by(router: &MultiServiceRouter, name: &'static str, payers: &[&str]) {
+    let created = create_bucket(router, name, None, None).await;
+    assert_eq!(
+        created.status, 200,
+        "bucket {name:?}: the bucket must be created first, got {} with body {:?}",
+        created.status,
+        text(&created)
+    );
+    let lifted = put_public_access_block(router, name, &members(PUBLIC_ACCESS_ALLOWED), &[]).await;
+    assert_eq!(
+        lifted.status, 200,
+        "bucket {name:?}: Block Public Access must be liftable, got {} with body {:?}",
+        lifted.status,
+        text(&lifted)
+    );
+    let stored = put_object(router, name, KEY, BODY, &[]).await;
+    assert_eq!(
+        stored.status, 200,
+        "bucket {name:?}: the object must be written first, got {} with body {:?}",
+        stored.status,
+        text(&stored)
+    );
+    let policy = put_bucket_policy(
+        router,
+        name,
+        &policy_document(&statement(
+            "Allow",
+            "\"*\"",
+            "s3:GetObject",
+            &object_arn(name, KEY),
+        )),
+    )
+    .await;
+    assert_eq!(
+        policy.status, 204,
+        "bucket {name:?}: the public-read policy must be stored, got {} with body {:?}",
+        policy.status,
+        text(&policy)
+    );
+    let blocked = put_public_access_block(router, name, &members(PUBLIC_POLICY_ALLOWED), &[]).await;
+    assert_eq!(
+        blocked.status, 200,
+        "bucket {name:?}: the Block Public Access configuration must be stored, got {} with \
+         body {:?}",
+        blocked.status,
+        text(&blocked)
+    );
+    for payer in payers {
+        let put = put_request_payment(router, name, payer).await;
+        assert_eq!(
+            put.status, 200,
+            "bucket {name:?}: the {payer:?} request payment configuration must be stored, got \
+             {} with body {:?}",
+            put.status,
+            text(&put)
+        );
+    }
+}
+
+/// The bucket every row of [`payer_rows`] addresses: one that makes the REQUESTER pay, one
+/// whose payer was set to `Requester` and then back to the owner, and one nobody has
+/// configured a payer on at all.
+const REQUESTER_PAYS_BUCKET: &str = "anon-payer-requester";
+/// See [`REQUESTER_PAYS_BUCKET`].
+const PAYER_RESET_BUCKET: &str = "anon-payer-reset";
+/// See [`REQUESTER_PAYS_BUCKET`].
+const PAYER_DEFAULT_BUCKET: &str = "anon-payer-default";
+
+/// The table: one unsigned request per row, and the sentence its refusal must carry.
+fn payer_rows() -> Vec<PayerRow> {
+    let path_style = |bucket: &str| format!("/{bucket}/{KEY}");
+    let mut rows = vec![
+        PayerRow {
+            case: "a Requester Pays bucket, read with no acknowledgement",
+            bucket: REQUESTER_PAYS_BUCKET,
+            method: "GET",
+            host: "localhost".to_string(),
+            uri: path_style(REQUESTER_PAYS_BUCKET),
+            headers: vec![],
+            message: REQUESTER_PAYS_MESSAGE,
+        },
+        PayerRow {
+            case: "a Requester Pays bucket, read WITH the acknowledgement header",
+            bucket: REQUESTER_PAYS_BUCKET,
+            method: "GET",
+            host: "localhost".to_string(),
+            uri: path_style(REQUESTER_PAYS_BUCKET),
+            headers: vec![REQUEST_PAYER_HEADER],
+            message: REQUESTER_PAYS_MESSAGE,
+        },
+        PayerRow {
+            case: "a Requester Pays bucket, addressed virtual-hosted-style",
+            bucket: REQUESTER_PAYS_BUCKET,
+            method: "GET",
+            host: format!("{REQUESTER_PAYS_BUCKET}.s3.us-east-1.amazonaws.com"),
+            uri: format!("/{KEY}"),
+            headers: vec![],
+            message: REQUESTER_PAYS_MESSAGE,
+        },
+        PayerRow {
+            case: "a Requester Pays bucket, read at a key it does not hold",
+            bucket: REQUESTER_PAYS_BUCKET,
+            method: "GET",
+            host: "localhost".to_string(),
+            uri: format!("/{REQUESTER_PAYS_BUCKET}/absent.csv"),
+            headers: vec![],
+            message: REQUESTER_PAYS_MESSAGE,
+        },
+        PayerRow {
+            case: "a Requester Pays bucket, listed rather than read",
+            bucket: REQUESTER_PAYS_BUCKET,
+            method: "GET",
+            host: "localhost".to_string(),
+            uri: format!("/{REQUESTER_PAYS_BUCKET}"),
+            headers: vec![],
+            message: REQUESTER_PAYS_MESSAGE,
+        },
+        PayerRow {
+            case: "a bucket whose payer was reset to the bucket owner",
+            bucket: PAYER_RESET_BUCKET,
+            method: "GET",
+            host: "localhost".to_string(),
+            uri: path_style(PAYER_RESET_BUCKET),
+            headers: vec![],
+            message: ACCESS_DENIED_MESSAGE,
+        },
+        PayerRow {
+            case: "a bucket whose payer was reset, read WITH the acknowledgement header",
+            bucket: PAYER_RESET_BUCKET,
+            method: "GET",
+            host: "localhost".to_string(),
+            uri: path_style(PAYER_RESET_BUCKET),
+            headers: vec![REQUEST_PAYER_HEADER],
+            message: ACCESS_DENIED_MESSAGE,
+        },
+        PayerRow {
+            case: "a bucket nobody has configured a payer on",
+            bucket: PAYER_DEFAULT_BUCKET,
+            method: "GET",
+            host: "localhost".to_string(),
+            uri: path_style(PAYER_DEFAULT_BUCKET),
+            headers: vec![],
+            message: ACCESS_DENIED_MESSAGE,
+        },
+    ];
+    // The same requests again as HEADs, which are authorized by the same permission and
+    // carry no document to state the refusal in — so only their STATUS is read below.
+    let heads: Vec<PayerRow> = rows
+        .iter()
+        .map(|row| PayerRow {
+            case: row.case,
+            bucket: row.bucket,
+            method: "HEAD",
+            host: row.host.clone(),
+            uri: row.uri.clone(),
+            headers: row.headers.clone(),
+            message: row.message,
+        })
+        .collect();
+    rows.extend(heads);
+    rows
+}
+
+/// RULE: a request carrying NO credential names no account to charge, so a bucket that makes
+/// the REQUESTER pay refuses it with its own fixed sentence — nothing in it taken from the
+/// request or from state — instead of with the authorization refusal S3 answers a caller a
+/// bucket grants nothing to. Both carry HTTP 403 and the `AccessDenied` code, which is why
+/// the sentence is the whole difference between "fix the grant" and "authenticate and
+/// acknowledge the charge"; and it holds wherever the unsigned caller is refused, so with
+/// request authentication ON — as the emulator runs it unless started otherwise, which is
+/// the posture this test drives — the signature boundary words it the same way an
+/// operation's own authorization does.
+///
+/// The rows differ along who pays (`Requester`, a payer reset to the owner, a bucket with no
+/// payer configured at all), whether the request acknowledges the charge, which method asks,
+/// whether the address is path-style or virtual-hosted-style, whether the key is one the
+/// bucket holds, and whether the request addresses an object or the bucket itself.
+#[tokio::test]
+async fn an_unsigned_request_against_a_requester_pays_bucket_is_refused_in_its_own_words() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut enforcing = MultiServiceRouter::new();
+    // The fixture is written with signature enforcement off — standing up the buckets is not
+    // what this test is about — and every request under test is dispatched with it on.
+    enforcing.set_request_authentication(false);
+    enforcing.register_service(EmulatedService::new(engine));
+    public_bucket_paid_by(&enforcing, REQUESTER_PAYS_BUCKET, &["Requester"]).await;
+    public_bucket_paid_by(&enforcing, PAYER_RESET_BUCKET, &["Requester", "BucketOwner"]).await;
+    public_bucket_paid_by(&enforcing, PAYER_DEFAULT_BUCKET, &[]).await;
+    enforcing.set_request_authentication(true);
+
+    for row in payer_rows() {
+        let refused =
+            send_anonymous_with(&enforcing, row.method, &row.host, &row.uri, &row.headers).await;
+        assert_eq!(
+            refused.status, 403,
+            "case {:?} ({} {}): expected HTTP 403, got {} with body {:?}",
+            row.case,
+            row.method,
+            row.uri,
+            refused.status,
+            text(&refused)
+        );
+        if row.method == "HEAD" {
+            continue;
+        }
+        assert_eq!(
+            refused.error_code(),
+            ACCESS_DENIED,
+            "case {:?} ({} {}): expected the {ACCESS_DENIED:?} code, got {:?} with body {:?}",
+            row.case,
+            row.method,
+            row.uri,
+            refused.error_code(),
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_message(),
+            row.message,
+            "case {:?} ({} {}): expected {:?}, got {:?}",
+            row.case,
+            row.method,
+            row.uri,
+            row.message,
+            refused.error_message()
+        );
+    }
+}
+
+/// The SAME rule at the other signature posture: with request authentication off the unsigned
+/// request reaches the handler, whose own authorization refuses it — and a Requester Pays
+/// bucket's refusal carries the identical sentence there, because what refuses the caller is
+/// that it names no account to charge rather than where the refusal was decided.
+///
+/// The rows differ along the payer the bucket carries, whether the request acknowledges the
+/// charge, and which method asks.
+#[tokio::test]
+async fn a_requester_pays_refusal_is_worded_the_same_wherever_it_is_decided() {
+    let router = router();
+    public_bucket_paid_by(&router, "anon-payer-handler", &["Requester"]).await;
+    public_bucket_paid_by(&router, "anon-payer-handler-owner", &["BucketOwner"]).await;
+
+    for (case, bucket, headers, expected) in [
+        (
+            "a Requester Pays bucket, read with no acknowledgement",
+            "anon-payer-handler",
+            &[][..],
+            Some(REQUESTER_PAYS_MESSAGE),
+        ),
+        (
+            "a Requester Pays bucket, read WITH the acknowledgement header",
+            "anon-payer-handler",
+            &[REQUEST_PAYER_HEADER][..],
+            Some(REQUESTER_PAYS_MESSAGE),
+        ),
+        (
+            "a bucket the OWNER pays for, whose policy grants the read to everyone",
+            "anon-payer-handler-owner",
+            &[][..],
+            None,
+        ),
+        (
+            "a bucket the OWNER pays for, read WITH the acknowledgement header",
+            "anon-payer-handler-owner",
+            &[REQUEST_PAYER_HEADER][..],
+            None,
+        ),
+    ] {
+        let read = send_anonymous_with(
+            &router,
+            "GET",
+            "localhost",
+            &format!("/{bucket}/{KEY}"),
+            headers,
+        )
+        .await;
+        // The HEAD of the same object, which the same permission authorizes — driven for a
+        // row that does NOT carry the acknowledgement header, because `HeadObject` refuses
+        // that member with its own "not served here" refusal before any authorization
+        // question, which is its own business rather than this rule's.
+        let head = headers.is_empty().then_some(
+            send_anonymous_with(&router, "HEAD", "localhost", &format!("/{bucket}/{KEY}"), &[])
+                .await,
+        );
+        match expected {
+            Some(message) => {
+                assert_eq!(
+                    read.status, 403,
+                    "case {case:?}: expected HTTP 403, got {} with body {:?}",
+                    read.status,
+                    text(&read)
+                );
+                assert_eq!(
+                    read.error_code(),
+                    ACCESS_DENIED,
+                    "case {case:?}: expected the {ACCESS_DENIED:?} code, got {:?} with body \
+                     {:?}",
+                    read.error_code(),
+                    text(&read)
+                );
+                assert_eq!(
+                    read.error_message(),
+                    message,
+                    "case {case:?}: expected {message:?}, got {:?}",
+                    read.error_message()
+                );
+            }
+            // The control: the byte-identical request against a bucket whose OWNER pays is
+            // SERVED, which is what isolates Requester Pays as the cause of the refusals
+            // above rather than the grant.
+            None => {
+                assert_eq!(
+                    read.status, 200,
+                    "case {case:?}: expected the read to be served, got {} with body {:?}",
+                    read.status,
+                    text(&read)
+                );
+                assert_eq!(
+                    read.body.as_ref(),
+                    BODY,
+                    "case {case:?}: a granted read must serve the stored bytes, got {:?}",
+                    text(&read)
+                );
+            }
+        }
+        if let Some(head) = head {
+            assert_eq!(
+                head.status,
+                read.status,
+                "case {case:?}: an unsigned HEAD must answer the status its GET does, expected \
+                 {}, got {}",
+                read.status,
+                head.status
+            );
+        }
+    }
 }
