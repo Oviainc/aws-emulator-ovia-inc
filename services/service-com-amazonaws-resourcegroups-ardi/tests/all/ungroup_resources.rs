@@ -34,7 +34,7 @@ use super::resource_group_lifecycle::{error_code, static_group, Emulator};
 /// `type/id` resource, a `type:id` resource, a region-less and account-less global
 /// resource, another partition, a resource whose type this emulator has no
 /// CloudFormation-style name for, and a bare-name resource.
-const RESOURCES: [&str; 6] = [
+pub(crate) const RESOURCES: [&str; 6] = [
     "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0",
     "arn:aws:lambda:eu-west-1:000000000000:function:report",
     "arn:aws:s3:::ungroup-probe-bucket",
@@ -56,7 +56,7 @@ fn epoch_now() -> f64 {
 
 /// `arns` as owned strings, sorted and deduplicated — the form a membership
 /// listing and a `Succeeded` list are compared in.
-fn sorted<I, S>(arns: I) -> Vec<String>
+pub(crate) fn sorted<I, S>(arns: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -71,7 +71,11 @@ where
 /// Create `name` as a group that holds static memberships, and record `arns` in it.
 ///
 /// Returns the group's own stored ARN.
-async fn group_with_members(emulator: &Emulator, name: &str, arns: &[String]) -> String {
+pub(crate) async fn group_with_members(
+    emulator: &Emulator,
+    name: &str,
+    arns: &[String],
+) -> String {
     let created = emulator.ok("/groups", &static_group(name)).await;
     let group_arn = created["Group"]["GroupArn"]
         .as_str()
@@ -91,7 +95,7 @@ async fn group_with_members(emulator: &Emulator, name: &str, arns: &[String]) ->
 }
 
 /// The ARNs `ListGroupResources` reports as `name`'s memberships, sorted.
-async fn listed_members(emulator: &Emulator, case: &str, name: &str) -> Vec<String> {
+pub(crate) async fn listed_members(emulator: &Emulator, case: &str, name: &str) -> Vec<String> {
     let listed = emulator
         .ok("/list-group-resources", &json!({ "Group": name }))
         .await;
@@ -112,7 +116,7 @@ async fn listed_members(emulator: &Emulator, case: &str, name: &str) -> Vec<Stri
 }
 
 /// The `Succeeded` list of an answer, sorted.
-fn succeeded(case: &str, answered: &Value) -> Vec<String> {
+pub(crate) fn succeeded(case: &str, answered: &Value) -> Vec<String> {
     sorted(
         answered["Succeeded"]
             .as_array()
