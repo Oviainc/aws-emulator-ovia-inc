@@ -35,6 +35,8 @@ mod connected_authorization_rule;
 mod create_app_authorization_contract;
 #[path = "all/create_app_authorization_credential_idempotency.rs"]
 mod create_app_authorization_credential_idempotency;
+#[path = "all/created_resource_tag_set.rs"]
+mod created_resource_tag_set;
 #[path = "all/idempotent_replay_before_preconditions.rs"]
 mod idempotent_replay_before_preconditions;
 #[path = "all/ingestion_authorization_refusal_wording.rs"]

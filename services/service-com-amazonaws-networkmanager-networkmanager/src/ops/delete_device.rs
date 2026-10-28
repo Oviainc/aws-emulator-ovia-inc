@@ -3,8 +3,9 @@
 //! @op DeleteDevice
 //! Deletes an existing device of a global network and reports the removed record as
 //! `DELETING`; an unknown global network or device, or a device that belongs to a
-//! different global network, is a 404, and a device that is still associated with a link
-//! or a customer gateway is refused with the dependency `ValidationException` (400). This
+//! different global network, is a 404, and a device a stored tie still stands on — a link
+//! association, a customer gateway association or a Connect peer association of either
+//! kind — is refused with the dependency `ValidationException` (400). This
 //! is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
@@ -188,7 +189,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && association.device_id == input.device_id
             })
             .count();
-        // Listed in the order the operation's own documentation names them.
+        // The same holds for the two Connect peer association kinds this service stores:
+        // each names the DEVICE the peering is reached over, and the associate that made it
+        // required that device to be one of this global network's
+        // (`AssociateTransitGatewayConnectPeer`, `AssociateConnectPeer`), so deleting the
+        // device would leave the tie standing on a precondition it no longer satisfies —
+        // the same refusal, reached the same way.
+        let transit_gateway_connect_peer_associations = store
+            .transit_gateway_connect_peer_associations
+            .values()
+            .filter(|association| {
+                association.global_network_id == input.global_network_id
+                    && association.device_id == input.device_id
+            })
+            .count();
+        let connect_peer_associations = store
+            .connect_peer_associations
+            .values()
+            .filter(|association| {
+                association.global_network_id == input.global_network_id
+                    && association.device_id == input.device_id
+            })
+            .count();
+        // The two kinds the documentation names first, in its order, then the two Connect
+        // peer association kinds, which it does not name and which block for the reason
+        // above.
         if let Some(refusal) = crate::state::dependents_block_delete(
             crate::state::DEVICE_KIND,
             &[
@@ -196,6 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (
                     crate::state::CUSTOMER_GATEWAY_ASSOCIATION_KIND,
                     gateway_associations,
+                ),
+                (
+                    crate::state::TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND,
+                    transit_gateway_connect_peer_associations,
+                ),
+                (
+                    crate::state::CONNECT_PEER_ASSOCIATION_KIND,
+                    connect_peer_associations,
                 ),
             ],
         ) {

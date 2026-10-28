@@ -300,10 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // MISSING RESOURCE, which this operation (unlike `DescribeInstance`) models.
         let instance = store.instance_mut(&input.instance_arn).ok_or_else(|| {
             UpdateInstanceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "No instance found with the ARN {}",
-                    input.instance_arn
-                )),
+                message: Some(crate::state::instance_not_found_message(&input.instance_arn)),
                 reason: None,
             })
         })?;

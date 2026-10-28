@@ -24,6 +24,14 @@
 //! because the switch is about the DELIVERY of a transition, which every one of those reaches
 //! the same way. The recorded high-resolution `Maximum` case is one row.
 //!
+//! A notification is published after the transition that owes it, and each twin's transition is
+//! materialised by the evaluation that twin's OWN due instant makes due — so one twin's delivery
+//! says nothing about whether the other's has been made yet, and the record accounting for a
+//! delivery is written as that delivery completes, after the target already holds it. Every
+//! count this suite asserts about a delivery, or about the `Action` item recording one, is
+//! therefore AWAITED up to that count and then asserted to be exactly it: waiting is what makes
+//! the count a count of what arrived rather than of what had arrived first.
+//!
 //! Every state this suite asserts is one the evaluation computes from the datapoints a drive
 //! published, so no wait here can outlive the data it is waiting on. An alarm grades the data
 //! inside its evaluation range at the instant it evaluates, and that range is a span of whole
@@ -314,6 +322,30 @@ async fn history(emulator: &Emulator, name: &str, item_type: &str) -> Vec<Value>
         .as_array()
         .cloned()
         .unwrap_or_default()
+}
+
+/// The alarm history items of `item_type` recorded for `name`, read until the alarm has at
+/// least `wanted` of them or the deadline passes.
+///
+/// An `Action` item accounts for ONE delivery and is written as that delivery completes, which
+/// is after the notification itself has reached the target: a client that has just read the
+/// notification off the queue can still read the history before the item accounting for it is
+/// written. So a count of them is read the way the queue is — until the item being asserted
+/// about is there — while the assertion that follows keeps the upper bound the rule states.
+async fn await_history(
+    emulator: &Emulator,
+    name: &str,
+    item_type: &str,
+    wanted: usize,
+) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + DEADLINE;
+    loop {
+        let items = history(emulator, name, item_type).await;
+        if items.len() >= wanted || std::time::Instant::now() >= deadline {
+            return items;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
 }
 
 /// Every notification that has arrived on one queue, accumulated across reads: a receive hides
@@ -614,7 +646,7 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
              notification, got {delivered:?}"
         );
         assert_reports_transition(case, &delivered[0], ENABLED, &before.0, "ALARM", row);
-        let executed = history(&emulator, ENABLED, "Action").await;
+        let executed = await_history(&emulator, ENABLED, "Action", 1).await;
         assert_eq!(
             executed.len(),
             1,
@@ -691,7 +723,7 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
              {delivered:?}"
         );
         assert_reports_transition(case, &delivered[0], MUTED, "OK", "ALARM", row);
-        let muted_actions = history(&emulator, MUTED, "Action").await;
+        let muted_actions = await_history(&emulator, MUTED, "Action", 1).await;
         assert_eq!(
             muted_actions.len(),
             1,
@@ -699,13 +731,19 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
              {muted_actions:?}"
         );
         // The OK transition of either twin fires nothing: only AlarmActions are configured,
-        // so the control alarm has exactly one more delivery than it started with.
-        let control = mailbox.of(ENABLED);
+        // so the control alarm has exactly one more delivery than it started with — AWAITED,
+        // like every other delivery here, because the twins' transitions are materialised by
+        // the evaluations each alarm's own due instant makes due and the notification each owes
+        // is published after it: one twin's delivery says nothing about whether the other's has
+        // been made yet. The assertion is still that there are exactly two, so nothing the OK
+        // transition might have fired can pass unnoticed.
+        let control = mailbox.await_for(&emulator, ENABLED, 2).await;
         assert_eq!(
             control.len(),
             2,
             "case {case:?}: the control alarm must deliver one notification per ALARM \
              transition and nothing for its OK transition, got {control:?}"
         );
+        assert_reports_transition(case, &control[1], ENABLED, "OK", "ALARM", row);
     }
 }

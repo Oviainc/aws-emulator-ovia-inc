@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSecurity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSecurity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a security update on a provisioned cluster registered in
+//! [`crate::state::ComAmazonawsKafkaKafkaState`]: the cluster enters `UPDATING`
+//! with the returned cluster operation as its active one, and the submitted
+//! client authentication and encryption settings become the cluster's own —
+//! together with a new cluster version — when the clock makes that operation due
+//! (see [`crate::state::Cluster::settle`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSecurity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The update is started through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::start_security_update`], the one
+//! path every update of this service comes through, so the cluster operation this
+//! call answers with is filed in the registry and the cluster-operation readers
+//! resolve that ARN.
+//!
+//! The call is accepted only for a provisioned cluster this endpoint's region
+//! holds, that is `ACTIVE`, and whose stored version is the one the request
+//! names; every other case is refused with the modelled error for it and changes
+//! nothing.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
+//!
+//! The scaffold notes below describe the framework; they are kept because they
+//! document the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +172,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSecurity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSecurityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSecurity"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateSecurityErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only refusals first, so the registry lock below is held for the
+        // state-dependent work alone. A value that is not an MSK cluster ARN is a
+        // request this service cannot parse, which is the distinction every reader
+        // in this crate draws between `BadRequestException` and
+        // `NotFoundException`.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                UpdateSecurityErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // Both settings this operation can change are optional in the model, so a
+        // request carrying neither asks for no change at all and there is nothing
+        // for the cluster operation it would mint to do. Refusing it is CHOSEN, as
+        // the same case is in `UpdateConnectivity`: answering a modelled client
+        // error is honest where minting an operation that changes nothing would
+        // not be. `ClientAuthentication` is named as the member at fault because
+        // it is the operation's subject; `EncryptionInfo` is the alternative the
+        // message spells out.
+        if input.client_authentication.is_none() && input.encryption_info.is_none() {
+            return Err(
+                UpdateSecurityErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClientAuthentication".to_string()),
+                    message: Some(
+                        "An UpdateSecurity request must specify ClientAuthentication, \
+                         EncryptionInfo, or both."
+                            .to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+        let now = std::time::SystemTime::now();
+        // Resolved through the settling lookup every other operation uses, so the
+        // transitions the clock already owed this cluster are materialised before
+        // its state and version are judged. An ARN this endpoint's region holds no
+        // cluster for — absent, or belonging to another region — is a resource that
+        // does not exist here.
+        let Some(cluster) = state.settled_cluster_in_mut(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateSecurityErrorModeled::NotFoundException(NotFoundException {
+                    // The member that named the resource, as the other readers of a
+                    // cluster ARN report it.
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+
+        if cluster.is_serverless() {
+            // What this update changes is the broker encryption and the client
+            // authentication of a broker group, and a serverless cluster has
+            // neither: its authentication is the one its create submitted.
+            return Err(
+                UpdateSecurityErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+        // A cluster reconfigures one change at a time, and one that is still being
+        // provisioned, deleted or updated has no settled configuration to update.
+        // `UpdateSecurity` models no conflict error, so this is the bad request it
+        // is: the cluster is not in a state that accepts it. Worded as the sibling
+        // update operations word the same condition.
+        if cluster.state != "ACTIVE" {
+            return Err(
+                UpdateSecurityErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "A cluster can be updated only while it is ACTIVE; this one is {}.",
+                        cluster.state
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The submitted version must be the one the cluster is actually at; a
+        // stale one means the caller has not seen the cluster's latest state.
+        if input.current_version != cluster.current_version {
+            return Err(
+                UpdateSecurityErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("currentVersion".to_string()),
+                    message: Some(format!(
+                        "The cluster's current version is {}, not {}.",
+                        cluster.current_version, input.current_version
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING, stores the instant the change comes due and files
+        // the cluster operation this call answers with, so the ARN below resolves
+        // for every cluster-operation reader.
+        let cluster_arn = cluster.arn.clone();
+        let Some(operation_arn) = state.start_security_update(
+            &region,
+            &cluster_arn,
+            now,
+            input.client_authentication,
+            input.encryption_info,
+        ) else {
+            // Unreachable: the cluster was resolved above under the lock this call
+            // still holds, so the registry path finds the same record. Reported as
+            // a server fault rather than as a success that started nothing, which
+            // is how the sibling update operations answer the same case.
+            return Err(
+                UpdateSecurityErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster vanished while its update was starting".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(UpdateSecurityOutput {
+            // Both members come from the stored cluster, not from the request.
+            cluster_arn: Some(cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
 }

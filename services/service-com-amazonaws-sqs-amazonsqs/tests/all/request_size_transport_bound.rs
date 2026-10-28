@@ -9,11 +9,12 @@
 //! in the service's own envelope, so a field-level refusal and a transport refusal stay
 //! two distinguishable answers.
 //!
-//! The ceiling itself is [`max_request_body_bytes`]: the largest payload any Amazon SQS
-//! request can carry — the largest batch a batch operation can be asked to judge, which is
-//! ten maximum-size messages, since a batch over the service's payload ceiling is refused
-//! by the OPERATION with the modelled `BatchRequestTooLong` and not by the transport —
-//! plus room for the request wrapped around it.
+//! The ceiling itself is [`max_request_body_bytes`]: the most message content any Amazon
+//! SQS request can carry — one maximum total payload, which is the same figure for a single
+//! message and for a whole batch — plus room for the request wrapped around it. A batch
+//! whose entries add up to more than the payload limit but whose body the ceiling still
+//! admits is read and refused by the OPERATION with the modelled `BatchRequestTooLong`
+//! (`batch_payload_ceiling.rs`); a body past the ceiling never gets that far.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::service::max_request_body_bytes;
@@ -215,6 +216,72 @@ async fn the_transport_ceiling_refuses_every_operation_alike() {
             answer.is_empty(),
             "case {operation}: expected an empty body, got {:?}",
             String::from_utf8_lossy(&answer)
+        );
+    }
+}
+
+/// The two refusals stay apart at their own boundary: a batch whose entries add up to
+/// just over the service's payload limit is READ and refused by the operation, while one
+/// so large that its body is past the transport ceiling is the bare 413 — and neither
+/// enqueues anything.
+#[tokio::test]
+async fn a_batch_past_the_transport_ceiling_is_the_bare_413_and_not_the_batch_error() {
+    let payload_limit =
+        usize::try_from(service_com_amazonaws_sqs_amazonsqs::state::maximum_batch_payload_bytes())
+            .unwrap_or(usize::MAX);
+    let entries = |count: usize, bytes: usize| -> Value {
+        Value::Array(
+            (0..count)
+                .map(|index| json!({ "Id": format!("e{index}"), "MessageBody": "x".repeat(bytes) }))
+                .collect(),
+        )
+    };
+
+    // (case, the batch, refused by the transport) — the rows differ in how far past the
+    // payload limit the request reaches: just past it, and the largest batch a client can
+    // spell, whose bodies are ten maximum-size messages.
+    let rows: Vec<(&str, Value, bool)> = vec![
+        (
+            "two entries adding up to just past the payload limit",
+            entries(2, payload_limit / 2 + 1),
+            false,
+        ),
+        (
+            "ten maximum-size entries, far past the body this service reads",
+            entries(10, payload_limit),
+            true,
+        ),
+    ];
+
+    let router = emulator();
+    for (case, batch, refused_by_transport) in rows {
+        let url = create_ok(&router, &format!("batch-vs-transport-{}", case.len()), &json!({})).await;
+        let body = serde_json::to_vec(&json!({ "QueueUrl": url, "Entries": batch }))
+            .expect("the request body serializes");
+        let (status, answer) = post(&router, "SendMessageBatch", body).await;
+        if refused_by_transport {
+            assert_eq!(
+                status, REQUEST_ENTITY_TOO_LARGE,
+                "case {case:?}: expected the transport status, got {status} with {:?}",
+                String::from_utf8_lossy(&answer)
+            );
+            assert!(
+                answer.is_empty(),
+                "case {case:?}: expected an empty body, got {:?}",
+                String::from_utf8_lossy(&answer)
+            );
+        } else {
+            let parsed: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
+            assert_eq!(
+                (status, parsed.get("__type").and_then(Value::as_str)),
+                (400, Some("BatchRequestTooLong")),
+                "case {case:?}: expected the operation's own refusal, got {status} with {parsed}"
+            );
+        }
+        assert_eq!(
+            attribute_count(&router, &url, "ApproximateNumberOfMessages").await,
+            0,
+            "case {case:?}: a refused batch must enqueue nothing"
         );
     }
 }

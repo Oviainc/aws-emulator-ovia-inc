@@ -213,15 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The instance is resolved on its own, before the permission set: a
         // `PermissionSetArn` is resolved WITHIN an instance, so without this lookup an
-        // unknown instance would be reported as a missing permission set. The wording
-        // mirrors the rest of the permission-set surface (`DescribePermissionSet`,
-        // `CreatePermissionSet`), which names the ARN that resolved to nothing.
+        // unknown instance would be reported as a missing permission set. The wording is
+        // the crate's single text for this condition, so one ARN that resolves to nothing
+        // reads the same whichever operation a client called.
         if store.instance(&input.instance_arn).is_none() {
             return Err(UpdatePermissionSetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No instance found with the ARN {}",
-                        input.instance_arn
+                    message: Some(crate::state::instance_not_found_message(
+                        &input.instance_arn,
                     )),
                     reason: None,
                 },

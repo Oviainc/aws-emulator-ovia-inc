@@ -232,23 +232,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // agree on what the run reached.
         event.settle(now);
 
-        let total = event.steps.len();
-        let page: Vec<AutomationEventStep> = event
-            .steps
-            .iter()
-            .skip(offset)
-            .take(page_size)
-            .map(|step| step.to_automation_event_step(&event.event_id))
-            .collect();
-        // A token only when steps remain after this page, and it resumes exactly
-        // where this page stopped.
-        let resumed_at = offset.saturating_add(page.len());
-        let next_token = (resumed_at < total).then(|| {
-            crate::state::encode_page_token(&crate::state::PageCursor {
-                offset: resumed_at,
-                filter_fingerprint: query_fingerprint,
-            })
-        });
+        // The page walk is the one every paginated listing of this service
+        // performs: `crate::state::serve_page`.
+        let (page, next_token): (Vec<AutomationEventStep>, Option<String>) =
+            crate::state::serve_page(
+                event
+                    .steps
+                    .iter()
+                    .map(|step| step.to_automation_event_step(&event.event_id)),
+                offset,
+                page_size,
+                query_fingerprint,
+            );
 
         Ok(ListAutomationEventStepsOutput {
             automation_event_steps: Some(page),

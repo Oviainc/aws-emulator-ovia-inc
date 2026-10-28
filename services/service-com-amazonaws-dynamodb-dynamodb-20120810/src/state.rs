@@ -7144,6 +7144,38 @@ fn invalid_expression_member(member: &str, detail: &str) -> RequestError {
 /// write states its intent through.
 const ENVELOPED_EXPRESSION_MEMBERS: [&str; 2] = ["UpdateExpression", "ConditionExpression"];
 
+/// The clause for a `#alias` an expression dereferences and `ExpressionAttributeNames`
+/// does not define. ONE wording for that fact, whichever expression member carried the
+/// token and whichever reader resolved it.
+fn undefined_name_clause(alias: &str) -> String {
+    format!(
+        "An expression attribute name used in the document path is not defined; \
+         attribute name: {alias}"
+    )
+}
+
+/// The clause for a `:placeholder` an expression dereferences and
+/// `ExpressionAttributeValues` does not define.
+fn undefined_value_clause(placeholder: &str) -> String {
+    format!(
+        "An expression attribute value used in expression is not defined; \
+         attribute value: {placeholder}"
+    )
+}
+
+/// The refusal for an undefined `#alias`, stated behind the expression member that
+/// carried it — what every reader of an expression answers for a token the request never
+/// defined.
+pub fn undefined_name(member: &str, alias: &str) -> RequestError {
+    invalid_expression_member(member, &undefined_name_clause(alias))
+}
+
+/// The refusal for an undefined `:placeholder`, stated behind the expression member that
+/// carried it.
+pub fn undefined_value(member: &str, placeholder: &str) -> RequestError {
+    invalid_expression_member(member, &undefined_value_clause(placeholder))
+}
+
 /// How a refusal names the position past the last token of an expression.
 pub const END_OF_EXPRESSION_TOKEN: &str = "<EOF>";
 
@@ -7538,31 +7570,21 @@ impl<'a> Substitutions<'a> {
         self.names
             .and_then(|names| names.get(alias))
             .cloned()
-            .ok_or_else(|| {
-                RequestError::Validation(format!(
-                    "An expression attribute name used in the document path is not defined; \
-                     attribute name: {alias}"
-                ))
-            })
+            .ok_or_else(|| RequestError::Validation(undefined_name_clause(alias)))
     }
 
     /// The value a `:placeholder` stands for.
-    fn value(&self, placeholder: &str) -> Result<AttributeValue, RequestError> {
+    pub fn value(&self, placeholder: &str) -> Result<AttributeValue, RequestError> {
         self.values
             .and_then(|values| values.get(placeholder))
             .cloned()
-            .ok_or_else(|| {
-                RequestError::Validation(format!(
-                    "An expression attribute value used in expression is not defined; \
-                     attribute value: {placeholder}"
-                ))
-            })
+            .ok_or_else(|| RequestError::Validation(undefined_value_clause(placeholder)))
     }
 
-    /// Hold both substitution tables to the rule that every token they define is
-    /// REFERENCED: each key of `ExpressionAttributeNames`/`ExpressionAttributeValues`
-    /// must be used by at least one of the expression members `expressions` lists, and
-    /// the whole request is refused when one is not.
+    /// Hold the request's expressions and both substitution tables to each other: every
+    /// token an expression DEREFERENCES must be one the tables define, and every token
+    /// the tables define must be one an expression REFERENCES. The whole request is
+    /// refused when either side has a token the other does not.
     ///
     /// Both members exist to be substituted INTO — they hold "substitution tokens for
     /// attribute names in an expression" and "values that can be substituted in an
@@ -7571,16 +7593,28 @@ impl<'a> Substitutions<'a> {
     /// point for every operation that takes expression members, so the rule does not
     /// drift between them.
     ///
-    /// `expressions` is the request's expression members, each as it was sent; an
-    /// expression this does not tokenize is left to the parser that reads it for real,
-    /// which refuses it with the syntax error the member earns.
-    pub fn check_all_referenced(&self, expressions: &[Option<&str>]) -> Result<(), RequestError> {
+    /// PRECEDENCE: a token the expression dereferences and no table defines is what the
+    /// caller is told about FIRST, before any surplus entry, because it is the mistake
+    /// that makes the expression unreadable — dropping a surplus entry would leave the
+    /// request refused for the undefined token anyway. It is stated through the member
+    /// that carried the expression, in the same words the parser that resolves the token
+    /// for real states it in, so one request earns one sentence whichever check reaches
+    /// it first.
+    ///
+    /// `expressions` pairs each expression member of the request with its value as it
+    /// was sent; an expression this does not tokenize is left to the parser that reads
+    /// it for real, which refuses it with the syntax error the member earns.
+    pub fn check_all_referenced(
+        &self,
+        expressions: &[(&str, Option<&str>)],
+    ) -> Result<(), RequestError> {
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut values: BTreeSet<String> = BTreeSet::new();
-        for expression in expressions.iter().flatten() {
-            // The member name only decorates a refusal, and the token kinds below are
-            // the same whichever member carried them.
-            let Ok(tokens) = tokenize_expression("Expression", expression) else {
+        for (member, expression) in expressions {
+            let Some(expression) = expression else {
+                continue;
+            };
+            let Ok(tokens) = tokenize_expression(member, expression) else {
                 // An expression this cannot read tells nothing about which tokens it
                 // references, and the parser that reads it for real refuses it with the
                 // syntax error the member earns — which is the refusal the caller gets.
@@ -7589,9 +7623,15 @@ impl<'a> Substitutions<'a> {
             for token in tokens {
                 match token {
                     ExprToken::Alias(alias) => {
+                        if self.name(&alias).is_err() {
+                            return Err(undefined_name(member, &alias));
+                        }
                         names.insert(alias);
                     }
                     ExprToken::Placeholder(placeholder) => {
+                        if self.value(&placeholder).is_err() {
+                            return Err(undefined_value(member, &placeholder));
+                        }
                         values.insert(placeholder);
                     }
                     _ => {}

@@ -55,7 +55,7 @@
 //!
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`,
-//! `UpdateClusterKafkaVersion`) records a
+//! `UpdateClusterKafkaVersion`, `UpdateSecurity`) records a
 //! [`PendingUpdate`] on the cluster, and [`Cluster::settle`] folds it into the
 //! record once the clock owes its completion — so one place decides what every
 //! reader then reports. The operation itself is kept in the cluster-operation
@@ -188,6 +188,9 @@ pub const OPERATION_TYPE_UPDATE_CONNECTIVITY: &str = "UPDATE_CONNECTIVITY";
 /// The `OperationType` an `UpdateClusterKafkaVersion` call records, in the same
 /// form.
 pub const OPERATION_TYPE_UPDATE_CLUSTER_KAFKA_VERSION: &str = "UPDATE_CLUSTER_KAFKA_VERSION";
+
+/// The `OperationType` an `UpdateSecurity` call records, in the same form.
+pub const OPERATION_TYPE_UPDATE_SECURITY: &str = "UPDATE_SECURITY";
 
 /// The state MSK reports for a cluster operation that is still running.
 pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
@@ -1113,6 +1116,13 @@ pub enum ClusterChange {
     KafkaVersion {
         kafka_version: String,
         configuration_info: Option<ConfigurationInfo>,
+    },
+    /// `UpdateSecurity`: the client authentication the cluster accepts, the
+    /// encryption it runs with, or both. `None` means the request left that
+    /// setting alone.
+    Security {
+        client_authentication: Option<ClientAuthentication>,
+        encryption_info: Option<EncryptionInfo>,
     },
 }
 
@@ -3126,6 +3136,33 @@ impl ComAmazonawsKafkaKafkaState {
         )
     }
 
+    /// Start a security update: the client authentication the cluster accepts,
+    /// the encryption it runs with, or both, as the request named them.
+    pub fn start_security_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        client_authentication: Option<ClientAuthentication>,
+        encryption_info: Option<EncryptionInfo>,
+    ) -> Option<String> {
+        self.start_cluster_update(region, arn, now, OPERATION_TYPE_UPDATE_SECURITY, |cluster| {
+            let source_cluster_info = cluster.security_cluster_info();
+            let target_cluster_info = cluster.security_cluster_info_after(
+                client_authentication.as_ref(),
+                encryption_info.as_ref(),
+            );
+            (
+                source_cluster_info,
+                target_cluster_info,
+                ClusterChange::Security {
+                    client_authentication,
+                    encryption_info,
+                },
+            )
+        })
+    }
+
     /// File `operation` in the registry and in its own cluster's history, so the
     /// ARN a reader resolves and the history a cluster lists cannot drift apart.
     ///
@@ -4763,6 +4800,77 @@ impl Cluster {
         )
     }
 
+    /// The cluster's security settings as the `MutableClusterInfo` a cluster
+    /// operation reports: the client authentication it accepts and the
+    /// encryption it runs with, which are the attributes a security update
+    /// changes and the only ones set — the same rule
+    /// [`Self::storage_cluster_info`] follows.
+    pub fn security_cluster_info(&self) -> MutableClusterInfo {
+        security_cluster_info(
+            self.client_authentication.clone(),
+            self.encryption_info.clone(),
+        )
+    }
+
+    /// The same attributes as a submitted security update leaves them, so what
+    /// the operation reports as its target is what the cluster then runs.
+    pub fn security_cluster_info_after(
+        &self,
+        client_authentication: Option<&ClientAuthentication>,
+        encryption_info: Option<&EncryptionInfo>,
+    ) -> MutableClusterInfo {
+        security_cluster_info(
+            self.client_authentication_after(client_authentication),
+            self.encryption_info_after(encryption_info),
+        )
+    }
+
+    /// The client authentication the cluster accepts once a submitted one has
+    /// landed.
+    ///
+    /// `ClientAuthentication` "includes ALL client authentication information"
+    /// (its model documentation), so a submitted shape REPLACES the cluster's
+    /// own — the mechanisms it does not turn on are off — while an omitted one
+    /// leaves the stored authentication exactly as it is. The same rule
+    /// [`Self::connectivity_cluster_info_after`] applies to a submitted
+    /// `ConnectivityInfo`.
+    fn client_authentication_after(
+        &self,
+        submitted: Option<&ClientAuthentication>,
+    ) -> Option<ClientAuthentication> {
+        submitted
+            .cloned()
+            .or_else(|| self.client_authentication.clone())
+    }
+
+    /// The encryption settings the cluster runs with once a submitted
+    /// `EncryptionInfo` has landed.
+    ///
+    /// The shape carries two independently configured settings, so each one a
+    /// request names replaces the stored one and each one it omits is kept —
+    /// a request that names only the in-transit setting leaves the cluster's
+    /// data-volume key alone. A replaced setting is resolved exactly as a
+    /// create resolves it, so the stored record stays the effective settings
+    /// every reader reports.
+    fn encryption_info_after(&self, submitted: Option<&EncryptionInfo>) -> EncryptionInfo {
+        match submitted {
+            None => self.encryption_info.clone(),
+            Some(submitted) => resolve_encryption_info(
+                &self.region,
+                Some(EncryptionInfo {
+                    encryption_at_rest: submitted
+                        .encryption_at_rest
+                        .clone()
+                        .or_else(|| self.encryption_info.encryption_at_rest.clone()),
+                    encryption_in_transit: submitted
+                        .encryption_in_transit
+                        .clone()
+                        .or_else(|| self.encryption_info.encryption_in_transit.clone()),
+                }),
+            ),
+        }
+    }
+
     /// Record `change` as the cluster's one in-flight update and move it to
     /// `UPDATING`, handing back the ARN of the operation that will apply it.
     ///
@@ -4821,6 +4929,20 @@ impl Cluster {
                 if let Some(info) = configuration_info {
                     self.configuration_info = Some(info);
                 }
+            }
+            ClusterChange::Security {
+                client_authentication,
+                encryption_info,
+            } => {
+                // Resolved through the SAME pair the operation's target
+                // `MutableClusterInfo` was derived from, so the settings the
+                // cluster ends up running are the ones the operation reported
+                // it would apply.
+                let authentication =
+                    self.client_authentication_after(client_authentication.as_ref());
+                let encryption = self.encryption_info_after(encryption_info.as_ref());
+                self.client_authentication = authentication;
+                self.encryption_info = encryption;
             }
         }
     }
@@ -5276,6 +5398,24 @@ fn kafka_version_cluster_info(
     MutableClusterInfo {
         kafka_version: Some(kafka_version.to_string()),
         configuration_info,
+        ..MutableClusterInfo::default()
+    }
+}
+
+/// The security attributes a cluster operation reports, as `MutableClusterInfo`:
+/// the client authentication the cluster accepts and the encryption it runs
+/// with.
+///
+/// Those are what a security update touches, so they are the only members set,
+/// and the encryption is reported resolved rather than as submitted — the same
+/// rule [`storage_cluster_info`] follows.
+fn security_cluster_info(
+    client_authentication: Option<ClientAuthentication>,
+    encryption_info: EncryptionInfo,
+) -> MutableClusterInfo {
+    MutableClusterInfo {
+        client_authentication,
+        encryption_info: Some(encryption_info),
         ..MutableClusterInfo::default()
     }
 }

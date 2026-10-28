@@ -360,15 +360,15 @@ async fn a_control_plane_refusal_renders_one_template_from_the_request_and_the_s
                       DELETING status"
                 .to_string(),
         },
-        // Nothing to disable: the encryption status that leaves nothing to do is stated
-        // the same way an in-flight one is.
+        // Nothing to disable: the stream's encryption is stated as the fact it already
+        // is, rather than as a status the call is waiting on.
         RefusalCase {
             case: "disable encryption that was never enabled".to_string(),
             operation: "StopDeliveryStreamEncryption",
             request: json!({ "DeliveryStreamName": "refusal-active" }),
             code: "InvalidArgumentException",
             message: "Cannot disable encryption on firehose: refusal-active when \
-                      encryption is in DISABLED status"
+                      encryption is already disabled"
                 .to_string(),
         },
         // An update the stream's own status blocks.

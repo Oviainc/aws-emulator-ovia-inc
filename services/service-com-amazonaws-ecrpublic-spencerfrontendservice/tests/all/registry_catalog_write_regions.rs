@@ -3,16 +3,21 @@
 //! The account-singleton registry catalog write, driven end to end from every Region a
 //! caller can reach this endpoint as.
 //!
-//! The rule under test: on this emulator as deployed by default — one endpoint standing in
-//! for whichever Region a caller reaches it as, the operator having declared none
-//! (`state::API_REGION_ENV`) — `PutRegistryCatalogData` is served whatever Region its
-//! request names, and a `displayName` within the modelled `RegistryDisplayName` length
+//! The rule under test: `PutRegistryCatalogData` is the one ECR Public call AWS performs
+//! in a single Region (`state::API_REGION`) — a request signed for that Region is served
+//! and a `displayName` within the modelled `RegistryDisplayName` length
 //! (`smithy_query(query="shape", shape="RegistryDisplayName")`: `length {min: 0, max: 100}`)
-//! is stored verbatim and read back by `GetRegistryCatalogData` signed for any Region, while
-//! one past that length is refused with HTTP 400 `InvalidParameterException` naming the
-//! member and the modelled bound, before the stored value is touched. (The refusal leg of a
-//! deployment that DOES declare which endpoint it stands in for is pinned by
-//! `region_gate.rs`.)
+//! is stored verbatim and read back by `GetRegistryCatalogData` signed for any Region,
+//! while a request signed for any OTHER Region is refused HTTP 400
+//! `UnsupportedCommandException` and stores nothing, and one whose `displayName` is past
+//! the modelled length is refused HTTP 400 `InvalidParameterException` naming the member
+//! and the modelled bound, before the stored value is touched.
+//!
+//! The tables below span the classes the rule generalises over: every Region a caller can
+//! reach this endpoint as — both Regions ECR Public publishes an endpoint in and Regions
+//! from five other partitions — each in the letter cases a Region name arrives in, crossed
+//! with display names at the published lower bound, inside the range, at the published upper
+//! bound and one past it, in several scripts and byte widths.
 //!
 //! The tables below span the classes the rule generalises over: every Region a caller can
 //! reach this endpoint as — both Regions ECR Public publishes an endpoint in and Regions
@@ -21,9 +26,12 @@
 //! bound and one past it, in several scripts and byte widths.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::API_REGION;
+use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{serves_region, API_REGION};
 
-use crate::region_gate::{every_region, every_region_spelling, region_spellings};
+use crate::region_gate::{
+    every_region, every_region_spelling, expected_refusal_message, region_spellings,
+    REGION_SCOPED_OPERATION,
+};
 use crate::repository_image_lifecycle::{call_signed_for, service};
 
 /// The modelled upper bound on `RegistryDisplayName`
@@ -96,15 +104,26 @@ fn over_bound_display_names() -> Vec<(&'static str, String)> {
 }
 
 #[tokio::test]
-async fn the_catalog_write_is_served_for_every_region_a_caller_can_reach_this_endpoint_as() {
+async fn the_catalog_write_is_served_for_the_region_that_performs_it_and_refused_for_every_other() {
     let router = service();
+    let refusal_message = expected_refusal_message(REGION_SCOPED_OPERATION, API_REGION);
 
     // Every Region, in every letter case, crossed with every in-range display name: the
-    // write answers 200 and echoes what it stored.
+    // write answers 200 and echoes what it stored for the Region that performs it, and is
+    // refused for every other without storing anything.
     for region in every_region_spelling() {
         let region = region.as_str();
         for (name_case, name) in in_range_display_names() {
             let case = format!("{name_case}, written from {region}");
+            // What a refused write must leave in place: whatever the catalog holds now.
+            let (status, before) =
+                call_signed_for(&router, "GetRegistryCatalogData", json!({}), API_REGION).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the read to be served, got {status} with {before}"
+            );
+            let held = display_name(&before, &case);
+
             let (status, written) = call_signed_for(
                 &router,
                 "PutRegistryCatalogData",
@@ -112,36 +131,67 @@ async fn the_catalog_write_is_served_for_every_region_a_caller_can_reach_this_en
                 region,
             )
             .await;
+            if serves_region(region) {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the write to be served, got {status} with {written}"
+                );
+                assert_eq!(
+                    display_name(&written, &case).as_deref(),
+                    Some(name.as_str()),
+                    "case {case:?}: the write must report the name it stored, got {written}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 for a Region that does not perform the \
+                 write, got {status} with {written}"
+            );
+            let wire_type = written["__type"].as_str().unwrap_or_default().to_string();
+            assert!(
+                wire_type.contains("UnsupportedCommandException"),
+                "case {case:?}: expected UnsupportedCommandException, got {wire_type:?} in \
+                 {written}"
+            );
+            let said = written["message"].as_str().unwrap_or_default().to_string();
+            assert_eq!(
+                said, refusal_message,
+                "case {case:?}: expected {refusal_message:?}, got {said:?}"
+            );
+
+            // The refusal is pre-mutation: the account-global record still holds what the
+            // last accepted write left there.
+            let (status, after) =
+                call_signed_for(&router, "GetRegistryCatalogData", json!({}), API_REGION).await;
             assert_eq!(
                 status, 200,
-                "case {case:?}: expected the write to be served, got {status} with {written}"
+                "case {case:?}: expected the read to be served, got {status} with {after}"
             );
             assert_eq!(
-                display_name(&written, &case).as_deref(),
-                Some(name.as_str()),
-                "case {case:?}: the write must report the name it stored, got {written}"
+                display_name(&after, &case),
+                held,
+                "case {case:?}: a refused write must leave the stored name alone, got {after}"
             );
         }
     }
 }
 
 #[tokio::test]
-async fn a_name_written_from_one_region_is_read_back_from_every_other() {
+async fn a_name_written_from_the_serving_region_is_read_back_from_every_other() {
     let router = service();
 
-    // One catalog per account: what a write signed for one Region stored is what a read
-    // signed for ANY other Region reports — both legs are served from this one endpoint
-    // whichever Region the client that reaches it is configured for.
-    let writers = every_region();
+    // One catalog per account: what the write stored is what a read signed for ANY Region
+    // reports — the read is served from this one endpoint whichever Region the client that
+    // reaches it is configured for.
     let readers = every_region();
-    for writer in writers {
-        let name = format!("registry of {writer}");
-        let case = format!("a name written from {writer}");
+    for (name_case, name) in in_range_display_names() {
+        let case = format!("{name_case}, written from {API_REGION}");
         let (status, written) = call_signed_for(
             &router,
             "PutRegistryCatalogData",
             json!({"displayName": name}),
-            writer,
+            API_REGION,
         )
         .await;
         assert_eq!(
@@ -187,7 +237,9 @@ async fn a_name_past_the_modelled_bound_is_refused_and_stores_nothing() {
     );
 
     let expected_message = expected_length_refusal("displayName", MAX_DISPLAY_NAME_LEN);
-    for region in every_region_spelling() {
+    // The bound is a property of the member, so it is asserted on the Region that performs
+    // the write: the modelled constraint is what refuses the request there.
+    for region in region_spellings(API_REGION) {
         let region = region.as_str();
         for (name_case, name) in over_bound_display_names() {
             let case = format!("{name_case}, written from {region}");

@@ -69,6 +69,8 @@ mod replicator_listing;
 mod resource_tags;
 #[path = "all/scram_secrets.rs"]
 mod scram_secrets;
+#[path = "all/security_update.rs"]
+mod security_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/storage_updates.rs"]

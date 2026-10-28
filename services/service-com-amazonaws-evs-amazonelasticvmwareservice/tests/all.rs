@@ -52,6 +52,8 @@ mod eip_release_on_environment_deletion;
 mod entitlement_connector;
 #[path = "all/entitlements.rs"]
 mod entitlements;
+#[path = "all/environment_check_input_recompute.rs"]
+mod environment_check_input_recompute;
 #[path = "all/environment_child_change_stamps.rs"]
 mod environment_child_change_stamps;
 #[path = "all/environment_connector_health.rs"]

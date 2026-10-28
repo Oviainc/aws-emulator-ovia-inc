@@ -11,11 +11,13 @@
 //!
 //! * a delete of a record a `Method` of the same API still REFERENCES is refused with the
 //!   modelled `ConflictException` (HTTP 409) whose message names the blocked record and the
-//!   referencing method, the addressed record is left exactly as it was, and the same
+//!   referencing site, the addressed record is left exactly as it was, and the same
 //!   delete succeeds once the reference is cleared. The rows differ along which record is
-//!   referenced (a `Model` through `requestModels`, an `Authorizer` through `authorizerId`),
-//!   along the resource the referencing method sits on (the root resource and a child),
-//!   along its HTTP verb, and along the content type the model is mapped under;
+//!   referenced (a `Model` through a method request's `requestModels`, a `Model` through a
+//!   method response's `responseModels`, an `Authorizer` through `authorizerId`), along the
+//!   resource the referencing method sits on (the root resource and a child), along its
+//!   HTTP verb, along the status code a referencing method response is keyed by, and along
+//!   the content type the model is mapped under;
 //! * `GetModels` still reports a model a REFUSED delete left in place, and no longer
 //!   reports one a successful delete took away — the collection reader's own paging and
 //!   ordering rules are the `model_collection` suite's.
@@ -24,6 +26,7 @@ use serde_json::json;
 
 use crate::authorizer_lifecycle::lambda_uri;
 use crate::execute_api_data_plane::put_method;
+use crate::method_response::put_method_response;
 use crate::patch_updates::{op, patch};
 use crate::rest_api_lifecycle::{
     create_api, page_items, resource_under, string_member, Answer, Gateway,
@@ -239,6 +242,283 @@ async fn a_model_a_methods_request_models_still_names_cannot_be_deleted() {
             row.case
         );
     }
+}
+
+/// One blocked delete whose reference sits on a method RESPONSE rather than on the method
+/// request: the response is keyed by its status code, so the refusal has to name that too.
+struct BlockedByResponse {
+    case: &'static str,
+    /// The path part of the resource the referencing method sits on, or `None` for the
+    /// API's root resource.
+    path_part: Option<&'static str>,
+    /// The verb the referencing method is put under.
+    verb: &'static str,
+    /// The status code the referencing method response is keyed by.
+    status_code: &'static str,
+    /// The content type the model is mapped under in `responseModels`.
+    content_type: &'static str,
+    /// The resource path the refusal must name, which is the root's `/` or the child's.
+    resource_path: &'static str,
+}
+
+/// The table the method-response case runs over: the dimensions that refusal generalises
+/// over are which resource the method sits on, its verb, the status code the response is
+/// keyed by, and the content type the model is mapped under.
+const BLOCKED_BY_RESPONSE: &[BlockedByResponse] = &[
+    BlockedByResponse {
+        case: "a 200 response of a POST on the root resource",
+        path_part: None,
+        verb: "POST",
+        status_code: "200",
+        content_type: JSON,
+        resource_path: "/",
+    },
+    BlockedByResponse {
+        case: "a 404 response of a GET on a child resource",
+        path_part: Some("orders"),
+        verb: "GET",
+        status_code: "404",
+        content_type: JSON,
+        resource_path: "/orders",
+    },
+    BlockedByResponse {
+        case: "a 500 response mapping the model under another content type",
+        path_part: Some("items"),
+        verb: "DELETE",
+        status_code: "500",
+        content_type: "application/xml",
+        resource_path: "/items",
+    },
+];
+
+#[tokio::test]
+async fn a_model_a_method_responses_response_models_still_names_cannot_be_deleted() {
+    for row in BLOCKED_BY_RESPONSE {
+        let gateway = Gateway::new();
+        let (api, root) = create_api(&gateway, "model-in-use-response").await;
+        let resource = match row.path_part {
+            None => root.clone(),
+            Some(path_part) => resource_under(&gateway, &api, &root, path_part).await,
+        };
+        create_model(&gateway, &api, "Order").await;
+        // A second model NOTHING references, so the refusal is about the record addressed
+        // rather than about the API.
+        create_model(&gateway, &api, "Spare").await;
+        put_method(
+            &gateway,
+            &api,
+            &resource,
+            row.verb,
+            json!({ "authorizationType": "NONE" }),
+        )
+        .await;
+        let response = put_method_response(
+            &gateway,
+            &api,
+            &resource,
+            row.verb,
+            row.status_code,
+            json!({ "responseModels": { row.content_type: "Order" } }),
+        )
+        .await;
+        assert_eq!(
+            response.status, 201,
+            "case {}: expected PutMethodResponse to answer 201, got {} with {:?}",
+            row.case, response.status, response.body
+        );
+
+        // While the reference stands the delete is refused, and repeating it is refused the
+        // same way: the refusal takes nothing away.
+        let expected = format!(
+            "Cannot delete model 'Order', is referenced in method response: {}/{}/{}",
+            row.resource_path, row.verb, row.status_code
+        );
+        for round in 0..2 {
+            let refused = delete_model(&gateway, &api, "Order").await;
+            assert_eq!(
+                refused.status, 409,
+                "case {} (round {round}): expected 409, got {} with {:?}",
+                row.case, refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error.as_deref(),
+                Some("ConflictException"),
+                "case {} (round {round}): expected ConflictException, got {:?}",
+                row.case,
+                refused.error
+            );
+            assert_eq!(
+                refused.body["message"].as_str(),
+                Some(expected.as_str()),
+                "case {} (round {round}): expected the message {expected:?}, got {:?}",
+                row.case,
+                refused.body["message"]
+            );
+        }
+        // The refused delete left the model where it was, and the collection still lists
+        // both models in creation order.
+        assert_eq!(
+            get_model(&gateway, &api, "Order").await.status,
+            200,
+            "case {}: expected the blocked model to be readable",
+            row.case
+        );
+        assert_eq!(
+            list_models(&gateway, &api, row.case).await,
+            vec!["Order".to_string(), "Spare".to_string()],
+            "case {}: expected both models in creation order",
+            row.case
+        );
+
+        // A model no method response references is deleted straight away, even while a
+        // sibling of the same API is blocked.
+        let spare = delete_model(&gateway, &api, "Spare").await;
+        assert_eq!(
+            spare.status, 202,
+            "case {}: expected 202 for a model nothing references, got {} with {:?}",
+            row.case, spare.status, spare.body
+        );
+
+        // Clearing the reference is what frees the delete: the patch that removes the
+        // response's `responseModels` entry makes the same call succeed, and the model is
+        // then gone from the collection and from the single reader.
+        let detached = patch(
+            &gateway,
+            &format!(
+                "/restapis/{api}/resources/{resource}/methods/{}/responses/{}",
+                row.verb, row.status_code
+            ),
+            vec![op(
+                "remove",
+                &format!(
+                    "/responseModels/{}",
+                    row.content_type.replace('~', "~0").replace('/', "~1")
+                ),
+                None,
+            )],
+        )
+        .await;
+        // `UpdateMethodResponse`'s modelled success status is 201, not the 200 its sibling
+        // `UpdateMethod` answers with.
+        assert_eq!(
+            detached.status, 201,
+            "case {}: expected UpdateMethodResponse to clear the reference, got {} with {:?}",
+            row.case, detached.status, detached.body
+        );
+        let freed = delete_model(&gateway, &api, "Order").await;
+        assert_eq!(
+            freed.status, 202,
+            "case {}: expected 202 once nothing references the model, got {} with {:?}",
+            row.case, freed.status, freed.body
+        );
+        assert_eq!(
+            get_model(&gateway, &api, "Order").await.status,
+            404,
+            "case {}: expected the deleted model to be gone",
+            row.case
+        );
+        assert!(
+            list_models(&gateway, &api, row.case).await.is_empty(),
+            "case {}: expected no model left in the collection",
+            row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_model_two_sites_reference_is_blocked_until_the_last_reference_is_cleared() {
+    // Both sites of one method name the same model, so the refusal names the method
+    // REQUEST while that reference stands and the method RESPONSE once only it is left:
+    // every reference blocks, and clearing one is not clearing them all.
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "model-in-use-both-sites").await;
+    let resource = resource_under(&gateway, &api, &root, "orders").await;
+    create_model(&gateway, &api, "Order").await;
+    put_method(
+        &gateway,
+        &api,
+        &resource,
+        "POST",
+        json!({
+            "authorizationType": "NONE",
+            "requestModels": { JSON: "Order" },
+        }),
+    )
+    .await;
+    let response = put_method_response(
+        &gateway,
+        &api,
+        &resource,
+        "POST",
+        "201",
+        json!({ "responseModels": { JSON: "Order" } }),
+    )
+    .await;
+    assert_eq!(
+        response.status, 201,
+        "case both sites: expected PutMethodResponse to answer 201, got {} with {:?}",
+        response.status, response.body
+    );
+
+    let refused = delete_model(&gateway, &api, "Order").await;
+    assert_eq!(
+        refused.body["message"].as_str(),
+        Some("Cannot delete model 'Order', is referenced in method request: /orders/POST"),
+        "case both sites: expected the method request site to be named, got {:?}",
+        refused.body["message"]
+    );
+
+    // With the request reference cleared the response one still blocks, and now it is the
+    // site the refusal names.
+    let detached = patch(
+        &gateway,
+        &format!("/restapis/{api}/resources/{resource}/methods/POST"),
+        vec![op("remove", "/requestModels/application~1json", None)],
+    )
+    .await;
+    assert_eq!(
+        detached.status, 200,
+        "case both sites: expected UpdateMethod to clear the request reference, got {} with {:?}",
+        detached.status, detached.body
+    );
+    let refused = delete_model(&gateway, &api, "Order").await;
+    assert_eq!(
+        refused.status, 409,
+        "case the response reference alone: expected 409, got {} with {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.body["message"].as_str(),
+        Some("Cannot delete model 'Order', is referenced in method response: /orders/POST/201"),
+        "case the response reference alone: expected the method response site to be named, got {:?}",
+        refused.body["message"]
+    );
+
+    // Deleting the whole method response clears the last reference, so the delete goes
+    // through and the model is gone.
+    let deleted = gateway
+        .call(
+            "DELETE",
+            &format!("/restapis/{api}/resources/{resource}/methods/POST/responses/201"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 204,
+        "case both sites: expected DeleteMethodResponse to answer 204, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+    let freed = delete_model(&gateway, &api, "Order").await;
+    assert_eq!(
+        freed.status, 202,
+        "case both sites: expected 202 once no site references the model, got {} with {:?}",
+        freed.status, freed.body
+    );
+    assert_eq!(
+        get_model(&gateway, &api, "Order").await.status,
+        404,
+        "case both sites: expected the deleted model to be gone"
+    );
 }
 
 #[tokio::test]

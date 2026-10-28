@@ -27,6 +27,10 @@
 //! [`crate::state::AppAuthorizationRecord::auth_url`]; one authorized by an API
 //! key has no consent step and reports none.
 //!
+//! The `tags` the request carries are stored as the MAP they are (see
+//! [`crate::state::tag_set`]), so a key the list repeats is held once with the
+//! last value the list gave it — exactly what `TagResource` would have stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -262,6 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (see [`crate::state::render_credential`]), so the stored fingerprint
         // keeps no credential material.
         let rendered_credential = crate::state::render_credential(&input.credential);
+        // A tag list is a map of key-value pairs, so the list this request
+        // carried is collapsed onto one entry per key BEFORE it is stored or
+        // fingerprinted (see [`crate::state::tag_set`]).
+        let tags = crate::state::tag_set(input.tags.as_deref());
         let fingerprint = crate::state::request_fingerprint(
             &[
                 ("appBundleArn", app_bundle_arn.as_str()),
@@ -274,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ("authType", input.auth_type.as_str()),
                 ("credential", rendered_credential.as_str()),
             ],
-            input.tags.as_deref(),
+            Some(&tags),
         );
 
         // @idempotencyToken: the same token replays the authorization the first
@@ -378,7 +386,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::APP_AUTHORIZATION_STATUS_PENDING_CONNECT.to_string(),
             created_at,
             updated_at: created_at,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             sequence,
         };
         bundle.app_authorizations.insert(id.clone(), record);

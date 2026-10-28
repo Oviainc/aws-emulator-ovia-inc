@@ -3,7 +3,8 @@
 //! @op DeleteLink
 //! Deletes an existing link of a global network and reports the removed record as
 //! `DELETING`; an unknown global network or link, or a link that belongs to a different
-//! global network, is a 404, and a link still tied to a device or to a customer gateway is
+//! global network, is a 404, and a link a stored tie still stands on — a device, a customer
+//! gateway association or a Connect peer association of either kind — is
 //! refused with the dependency `ValidationException` (400). This is the ONLY file to touch
 //! for this operation.
 //!
@@ -188,7 +189,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && association.link_id.as_deref() == Some(input.link_id.as_str())
             })
             .count();
-        // Listed in the order the operation's own documentation names them.
+        // The same holds for the two Connect peer association kinds this service stores:
+        // each optionally names the LINK the peering is carried over, and the associate that
+        // made it required that link to be one of this global network's, associated with the
+        // device it names (`AssociateTransitGatewayConnectPeer`, `AssociateConnectPeer`), so
+        // deleting the link would leave the tie standing on a precondition it no longer
+        // satisfies — the same refusal, reached the same way.
+        let transit_gateway_connect_peer_associations = store
+            .transit_gateway_connect_peer_associations
+            .values()
+            .filter(|association| {
+                association.global_network_id == input.global_network_id
+                    && association.link_id.as_deref() == Some(input.link_id.as_str())
+            })
+            .count();
+        let connect_peer_associations = store
+            .connect_peer_associations
+            .values()
+            .filter(|association| {
+                association.global_network_id == input.global_network_id
+                    && association.link_id.as_deref() == Some(input.link_id.as_str())
+            })
+            .count();
+        // The two kinds the documentation names first, in its order, then the two Connect
+        // peer association kinds, which it does not name and which block for the reason
+        // above.
         if let Some(refusal) = crate::state::dependents_block_delete(
             crate::state::LINK_KIND,
             &[
@@ -196,6 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (
                     crate::state::CUSTOMER_GATEWAY_ASSOCIATION_KIND,
                     gateway_associations,
+                ),
+                (
+                    crate::state::TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND,
+                    transit_gateway_connect_peer_associations,
+                ),
+                (
+                    crate::state::CONNECT_PEER_ASSOCIATION_KIND,
+                    connect_peer_associations,
                 ),
             ],
         ) {
