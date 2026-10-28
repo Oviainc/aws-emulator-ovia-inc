@@ -151,6 +151,29 @@ pub fn account_not_in_organization_message(operation: &str) -> String {
     )
 }
 
+/// The `ConflictException` message for a registration made by an account that is a
+/// MEMBER of its organization, of a workspace the organization's management account has
+/// not registered for the organization yet.
+///
+/// `ConflictException` enumerates the condition — "Call the
+/// RegisterSlackWorkspaceForOrganization API from a member account, but the management
+/// account hasn't registered that workspace yet for the organization" — and the rule it
+/// protects is the two-step authorization the operation documents: "After the management
+/// account authorizes the Slack workspace, member accounts can call this API to authorize
+/// the same Slack workspace for their individual accounts". The message is built from the
+/// request's `teamId` and the account the emulator presents, so a caller reads which
+/// account was refused for which workspace, and it restates that rule for the operation
+/// that was called; `operation` is the caller's `Operation::NAME`.
+pub fn workspace_not_authorized_for_organization_message(operation: &str, team_id: &str) -> String {
+    format!(
+        "Account {account} is a member account of its organization, and the management \
+         account hasn't registered Slack workspace {team_id} yet for the organization. The \
+         management account must call the {operation} API for a Slack workspace before a \
+         member account can.",
+        account = ::engine::emulator_account_id()
+    )
+}
+
 /// One stored Slack channel configuration: everything
 /// `CreateSlackChannelConfiguration` was given, after the documented defaults were
 /// applied, so `List`/`Update` report the values that were persisted rather than

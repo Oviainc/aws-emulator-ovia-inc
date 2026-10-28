@@ -20,16 +20,25 @@
 //! quota bounds the registry past that — see
 //! [`crate::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS`].
 //!
+//! The role the organization gives the account GOVERNS the call, it is not only reported:
+//! a workspace is authorized for an organization in two steps — "After the management
+//! account authorizes the Slack workspace, member accounts can call this API to authorize
+//! the same Slack workspace for their individual accounts" — so a call from an account
+//! that is only a member of its organization is served for a workspace the registry
+//! already holds and refused, with the second condition this operation's
+//! `ConflictException` enumerates, for one it does not. The refusal registers nothing.
+//!
 //! `teamName` is the name the Slack workspace carries in Slack. A registered workspace
 //! has one, and this operation and `ListSlackWorkspaceConfigurations` both report it, so
 //! the registration RECORDS a name for the workspace — derived from the workspace's own
 //! identifier by [`crate::state::derived_slack_workspace_name`], because the emulator has
 //! no Slack directory to ask and no request member carries it — and every later report of
 //! that workspace reads back the stored value. The stored record's
-//! `allowOrganizationMemberAccount` is set on every successful call, including one for
-//! a workspace the account already held: registering a workspace for the organization
-//! from its management account is what lets member accounts authorize the same
-//! workspace. That field is what `ListSlackWorkspaceConfigurations` reports.
+//! `allowOrganizationMemberAccount` is what "lets member accounts authorize Slack
+//! workspaces", which is what a registration FROM THE MANAGEMENT ACCOUNT grants, so only
+//! that call records it — on a workspace the account already held as much as on one it did
+//! not — and a member account's call leaves it as the management account's registration
+//! left it. That field is what `ListSlackWorkspaceConfigurations` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -230,6 +239,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
+        // Which call this is, in the two-step authorization the operation documents: the
+        // management account's registration is the one that authorizes a workspace FOR THE
+        // ORGANIZATION, a member account's only authorizes an already authorized workspace
+        // for that one account.
+        let registers_for_the_organization = account_type == crate::state::ACCOUNT_TYPE_MANAGEMENT;
+
         let mut store = state.lock();
         // Registering a workspace the account already holds changes nothing: a `teamId`
         // identifies a workspace, and the conflicts this operation documents are about
@@ -239,6 +254,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let already_registered = store
             .slack_workspace_configurations
             .contains_key(&input.team_id);
+        // The second condition this operation's `ConflictException` enumerates: a call
+        // from an account that is a member of its organization, for a workspace the
+        // organization's management account has not registered yet. The registry is what
+        // settles that — it holds the workspaces registered for this organization, the same
+        // presence test `CreateSlackChannelConfiguration` makes — and the refusal registers
+        // nothing, so a member account cannot authorize a workspace, nor record the
+        // organization-wide grant, ahead of the management account.
+        if !registers_for_the_organization && !already_registered {
+            return Err(
+                RegisterSlackWorkspaceForOrganizationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            crate::state::workspace_not_authorized_for_organization_message(
+                                Self::NAME,
+                                &input.team_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         if !already_registered
             && store.slack_workspace_configurations.len()
                 >= crate::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS
@@ -268,12 +306,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 team_name: crate::state::derived_slack_workspace_name(&input.team_id),
                 allow_organization_member_account: None,
             });
-        // Registering a workspace FOR THE ORGANIZATION from its management account is
-        // what lets member accounts authorize the same workspace, so a successful call
-        // always leaves that recorded — on a workspace this account already held as
-        // much as on one it did not, which is the only thing this call changes about an
-        // already registered workspace.
-        record.allow_organization_member_account = Some(true);
+        // `allowOrganizationMemberAccount` is "whether to allow member accounts to
+        // authorize Slack workspaces", which is what registering the workspace FOR THE
+        // ORGANIZATION from its management account grants — so the management account's
+        // call leaves it recorded, on a workspace this account already held as much as on
+        // one it did not, and that is the only thing that call changes about an already
+        // registered workspace. A member account's call authorizes the workspace for its
+        // own account only, so it records no organization-wide grant and leaves the stored
+        // record exactly as the management account's registration left it.
+        if registers_for_the_organization {
+            record.allow_organization_member_account = Some(true);
+        }
 
         Ok(RegisterSlackWorkspaceForOrganizationOutput {
             team_id: Some(record.team_id.clone()),

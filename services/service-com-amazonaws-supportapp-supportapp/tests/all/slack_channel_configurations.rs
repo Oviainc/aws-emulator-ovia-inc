@@ -93,6 +93,9 @@ impl Reply {
 /// arrange the precondition.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one engine both mounted services share, kept so a suite can arrange a state
+    /// no mounted operation can reach (see [`Emulator::hand_organization_to`]).
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -105,10 +108,58 @@ impl Emulator {
         router.register_service(EmulatedService::new(engine.clone()));
         router.register_service(
             service_com_amazonaws_organizations_awsorganizationsv20161128::EmulatedService::new(
-                engine,
+                engine.clone(),
             ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// Hand the organization this account is in over to ANOTHER management account, so
+    /// this account is a MEMBER of its organization rather than the account that manages
+    /// it — the other role an Organizations-scoped call can read for the caller.
+    ///
+    /// Organizations only reaches that state by invitation
+    /// (`InviteAccountToOrganization` then `AcceptHandshake`), and both of those
+    /// operations are still stubs in the Organizations emulator mounted here, so there is
+    /// no wire path to it: the organization's own stored record is edited through that
+    /// service's state module, which is the very state its handlers answer from — the
+    /// management account the arrangement installs is what `DescribeOrganization` reports
+    /// afterwards, so a test confirms the arrangement over the wire rather than assuming
+    /// it. The calling account stays a member account of the organization, as
+    /// `CreateOrganization` recorded it.
+    pub(crate) fn hand_organization_to(&self, master_account_id: &str) {
+        let state = service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(
+            &*self.engine,
+        )
+        .expect("the Organizations store must be reachable on the shared engine");
+        let mut store = state.lock();
+        let organization = store
+            .organization
+            .as_mut()
+            .expect("the account must already be in an organization");
+        let previous = std::mem::replace(
+            &mut organization.master_account_id,
+            master_account_id.to_string(),
+        );
+        // The management account's other stored fields are derived from its id, so they
+        // follow it rather than being invented here.
+        organization.master_account_arn = organization.master_account_arn.replace(&previous, master_account_id);
+        organization.master_account_email = organization
+            .master_account_email
+            .replace(&previous, master_account_id);
+        // The new management account is a member of the organization too, so it has a
+        // record of its own, derived from the one the account it replaces carries.
+        let mut management = store
+            .accounts
+            .get(&previous)
+            .expect("the organization must hold its management account")
+            .clone();
+        management.arn = management.arn.replace(&previous, master_account_id);
+        management.email = management.email.replace(&previous, master_account_id);
+        management.id = master_account_id.to_string();
+        store
+            .accounts
+            .insert(master_account_id.to_string(), management);
     }
 
     pub(crate) async fn call(&self, path: &str, body: Value) -> Reply {

@@ -25,6 +25,8 @@ mod error_message_templates;
 mod listing_pagination;
 #[path = "all/notification_flag_default.rs"]
 mod notification_flag_default;
+#[path = "all/organization_account_role.rs"]
+mod organization_account_role;
 #[path = "all/organization_membership.rs"]
 mod organization_membership;
 #[path = "all/resource_preconditions.rs"]
