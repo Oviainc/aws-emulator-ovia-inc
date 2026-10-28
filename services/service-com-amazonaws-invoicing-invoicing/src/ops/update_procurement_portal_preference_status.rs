@@ -8,8 +8,9 @@
 //! operation states, per plane, the status that plane now holds and the reason that
 //! explains the move:
 //!
-//! * a plane whose status this request STATES takes that status, and its status reason
-//!   becomes the reason stated alongside it — the reason member documents itself as "the
+//! * a plane whose status this request STATES, and whose stored configuration ENABLES it,
+//!   takes that status, and its status reason becomes the reason stated alongside it — the
+//!   reason member documents itself as "the
 //!   reason for the … status update, providing context for the change", so the reason a
 //!   plane reports is the context given with the update that set its current status, and
 //!   an update that gives none leaves the plane with no reason rather than with the
@@ -26,15 +27,24 @@
 //!   members the model cannot express (every member of this input is optional on its own),
 //!   the same way `crate::state::resolve_marketplace_punch_out_enabled` refuses the
 //!   one `PutProcurementPortalPreference` cannot express;
+//! * a status stated for a plane the STORED configuration leaves disabled is refused with
+//!   the modelled `ValidationException` and writes nothing: a plane's status is the state
+//!   of the portal connection its configuration gives it, so a disabled plane has no
+//!   status for this call to move — the rule
+//!   [`crate::state::check_plane_enabled_for_status`] holds, the other face of the
+//!   [`crate::state::apply_plane_verification_statuses`] the create and the configuration
+//!   update apply, so no write of this resource can leave it reporting a status for a
+//!   plane its configuration disables;
 //! * an ARN this service holds no preference for is the modelled
 //!   `ResourceNotFoundException`.
 //!
 //! Which status values a plane may hold is the model's business
 //! (`ProcurementPortalPreferenceStatus`), so the boundary validator refuses a value
-//! outside that enum before this handler runs; nothing here re-states that set. The
-//! operation does not gate a status on the plane's `…Enabled` flag either: the model
-//! documents this call as updating "the activation state of e-invoice delivery and
-//! purchase order retrieval features", and declares no such constraint.
+//! outside that enum before this handler runs; nothing here re-states that set. WHICH
+//! plane may hold a status at all is the resource's own rule instead of the model's: the
+//! model cannot express a constraint between these status members and the configuration's
+//! `…Enabled` flags — they are members of different operations' inputs — so that rule is
+//! applied here, where the stored configuration is known.
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +192,16 @@ const PURCHASE_ORDER_RETRIEVAL_MEMBERS: (&str, &str) = (
     "PurchaseOrderRetrievalPreferenceStatus",
     "PurchaseOrderRetrievalPreferenceStatusReason",
 );
+
+/// The configuration member that enables the e-invoice delivery plane, as the model spells
+/// it on the writes that state a preference's configuration
+/// (`smithy_query(query="operation", operation="PutProcurementPortalPreference")`). Named
+/// here so a refusal reports the member a caller sets to enable the plane whose status it
+/// asked to move.
+const EINVOICE_DELIVERY_ENABLED_MEMBER: &str = "EinvoiceDeliveryEnabled";
+
+/// The same member for the purchase-order-retrieval plane.
+const PURCHASE_ORDER_RETRIEVAL_ENABLED_MEMBER: &str = "PurchaseOrderRetrievalEnabled";
 
 /// The status update this request states for ONE plane: the status it moves to and the
 /// reason stated alongside it, or `None` for a plane the request says nothing about.
@@ -344,6 +364,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     )
                 })?;
+
+            // Only a plane the stored configuration ENABLES has a status to move, the rule
+            // `crate::state::check_plane_enabled_for_status` holds. Both planes are
+            // checked before anything is written, so a request this refuses leaves the
+            // preference — its statuses, its `Version` and its `LastUpdateDate` — exactly
+            // as the last successful write left it.
+            for (stated, enabled, status_member, enabled_member) in [
+                (
+                    einvoice.is_some(),
+                    stored.preference.einvoice_delivery_enabled,
+                    EINVOICE_DELIVERY_MEMBERS.0,
+                    EINVOICE_DELIVERY_ENABLED_MEMBER,
+                ),
+                (
+                    purchase_order.is_some(),
+                    stored.preference.purchase_order_retrieval_enabled,
+                    PURCHASE_ORDER_RETRIEVAL_MEMBERS.0,
+                    PURCHASE_ORDER_RETRIEVAL_ENABLED_MEMBER,
+                ),
+            ] {
+                if stated {
+                    crate::state::check_plane_enabled_for_status(
+                        enabled,
+                        status_member,
+                        enabled_member,
+                    )
+                    .map_err(
+                        UpdateProcurementPortalPreferenceStatusErrorModeled::ValidationException,
+                    )?;
+                }
+            }
+
             let preference = &mut stored.preference;
 
             // A plane the request states takes the stated status, and its reason becomes

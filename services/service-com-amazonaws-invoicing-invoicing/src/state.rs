@@ -654,7 +654,10 @@ pub const STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 /// than in one operation's module: it is one rule about the RESOURCE which every write of
 /// a preference's configuration — the create and the update — applies whole, so two
 /// preferences holding the same configuration cannot report different state because they
-/// reached it by different paths.
+/// reached it by different paths. The one write that states a status without stating a
+/// configuration — `UpdateProcurementPortalPreferenceStatus` — holds to the same rule
+/// through [`check_plane_enabled_for_status`], so no write can leave a preference
+/// reporting the state this function says cannot exist.
 pub fn apply_plane_verification_statuses(preference: &mut ProcurementPortalPreference) {
     // Each plane as the triple the rule acts on: whether the configuration enables it,
     // and the status and reason it reports. The fields are disjoint, so both planes are
@@ -681,6 +684,49 @@ pub fn apply_plane_verification_statuses(preference: &mut ProcurementPortalPrefe
             *reason = None;
         }
     }
+}
+
+/// The plane a status update may move: the other face of the rule
+/// [`apply_plane_verification_statuses`] holds, for the write that states a status without
+/// stating a configuration.
+///
+/// A plane's status is the state of the portal connection the configuration gives that
+/// plane, so only a plane the configuration ENABLES has a status to move: a request
+/// stating the status of a plane the stored configuration leaves DISABLED names no status
+/// that exists, and is refused with the modelled `ValidationException`. The condition is a
+/// combination of an input member and the STORED resource, which the model cannot express
+/// — every status member of that input is optional on its own — so it is refused here
+/// rather than by the boundary validator, the way
+/// [`resolve_marketplace_punch_out_enabled`] refuses the combination a single request
+/// cannot express.
+///
+/// Both faces of the rule live beside the preference registry, for the reason
+/// [`PORTAL_COUPA`] states: they are one rule about the RESOURCE, so no write can leave a
+/// preference reporting a status for a plane that has no connection for one to be about,
+/// and no status a write persisted can be erased by a later configuration write that
+/// restates the configuration it was written under.
+///
+/// The message names the two members whose combination was rejected, so it is built from
+/// what the request is acting on rather than from a constant, and it is keyed the way this
+/// plane's bodies key their text ([`MessageKey::Capitalised`]).
+pub fn check_plane_enabled_for_status(
+    enabled: bool,
+    status_member: &str,
+    enabled_member: &str,
+) -> Result<(), ValidationException> {
+    if enabled {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: Some(format!(
+            "{status_member} can only be updated when {enabled_member} is true"
+        )),
+        // `invalidInput` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
+        reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    })
 }
 
 /// `ProcurementPortalName$COUPA` — the portal whose Marketplace PunchOut configuration

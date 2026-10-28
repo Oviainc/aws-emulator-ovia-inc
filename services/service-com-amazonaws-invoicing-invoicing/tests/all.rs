@@ -57,6 +57,8 @@ mod shared_marketplace_punch_out_rule;
 mod shared_page_walk;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/status_update_needs_an_enabled_plane.rs"]
+mod status_update_needs_an_enabled_plane;
 #[path = "all/tag_write_quota_counts_distinct_keys.rs"]
 mod tag_write_quota_counts_distinct_keys;
 #[path = "all/validation_message_wording.rs"]
