@@ -9,8 +9,13 @@
 //! Two things a request can ask for, and the model documents that it must ask for at
 //! least one: reserve a `MinimumLoadBalancerCapacity`, or `ResetCapacityReservation`.
 //!
-//! Reserving minimum capacity is a capability of the ACCOUNT, and the account this
-//! emulator serves does not have it, so a request that names
+//! A reservation is read against the published capacity-units quota of one load balancer
+//! FIRST: asking to reserve more than that quota allows is the modelled
+//! `CapacityUnitsLimitExceededException`, whatever account the request is signed for,
+//! because the figure is outside the range the API accepts at all.
+//!
+//! Within that quota, reserving minimum capacity is a capability of the ACCOUNT, and the
+//! account this emulator serves does not have it, so a request that names
 //! `MinimumLoadBalancerCapacity` is the modelled `OperationNotPermittedException` — the
 //! refusal that tells a caller to ask AWS Support to enable it, rather than a reservation
 //! nothing in this emulator would honour. Resetting is still served: it clears what a
@@ -204,6 +209,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         if reserving {
+            // The capacity asked for, read against the range the API accepts before the
+            // account capability below: a figure outside it is refused for the figure, and
+            // a caller who corrects it then learns what its account can configure.
+            // `MinimumLoadBalancerCapacity` carries the one member `CapacityUnits`, so a
+            // structure that names no capacity asks for no capacity at all.
+            let units = input
+                .minimum_load_balancer_capacity
+                .as_ref()
+                .and_then(|capacity| capacity.capacity_units);
+            if let Some(units) = units {
+                if units < 0 {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                        "The capacity units to reserve in MinimumLoadBalancerCapacity cannot be \
+                         negative, got {units}"
+                    )));
+                }
+                if units > crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER {
+                    return Err(capacity_units_limit_exceeded(units));
+                }
+            }
             return Err(
                 ModifyCapacityReservationErrorModeled::OperationNotPermittedException(
                     OperationNotPermittedException {
@@ -252,6 +277,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const MINIMUM_CAPACITY_NOT_SUPPORTED: &str = "This AWS account does not support configuring \
      minimum load balancer capacity reservation. For more information, please contact AWS \
      Support.";
+
+/// The modelled "you've exceeded the capacity units limit" refusal, for a reservation of
+/// more capacity units than the published quota of one load balancer allows. The message
+/// carries the quota the request passed and the figure it asked for, so the caller can
+/// correct it.
+fn capacity_units_limit_exceeded(requested: i32) -> ModifyCapacityReservationError {
+    ModifyCapacityReservationErrorModeled::CapacityUnitsLimitExceededException(
+        CapacityUnitsLimitExceededException {
+            message: Some(format!(
+                "You've exceeded the capacity units limit. At most {} capacity units can be \
+                 reserved for a load balancer, and {requested} were requested",
+                crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER
+            )),
+        },
+    )
+    .into()
+}
 
 /// The modelled "the requested configuration is not valid" refusal, for a request that
 /// asks for neither of the two changes this operation makes, or for both at once. The

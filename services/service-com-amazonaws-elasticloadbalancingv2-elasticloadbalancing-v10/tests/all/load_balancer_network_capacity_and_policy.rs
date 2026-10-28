@@ -69,7 +69,10 @@ type Row = (&'static str, Vec<(String, String)>, &'static str);
 /// A load balancer ARN of the form this service mints that no load balancer in the store
 /// carries: the type code, the name, the id and the Region are all the caller's, so a row
 /// can vary any of them.
-fn absent_load_balancer_arn(region: &str, type_code: &str, name: &str, id: &str) -> String {
+///
+/// `pub(crate)` because the capacity-reservation suite addresses an absent load balancer
+/// the same way: one spelling of "an ARN nothing carries" for the crate.
+pub(crate) fn absent_load_balancer_arn(region: &str, type_code: &str, name: &str, id: &str) -> String {
     format!(
         "arn:aws:elasticloadbalancing:{region}:{}:loadbalancer/{type_code}/{name}/{id}",
         account()
@@ -78,7 +81,10 @@ fn absent_load_balancer_arn(region: &str, type_code: &str, name: &str, id: &str)
 
 /// Send one awsQuery request for `operation` against the load balancer `arn` names, with
 /// `fields` beside it.
-async fn call_on(
+///
+/// `pub(crate)` because the capacity-reservation suite addresses one load balancer through
+/// the same required `LoadBalancerArn`: one request builder for the crate.
+pub(crate) async fn call_on(
     router: &MultiServiceRouter,
     operation: &str,
     arn: &str,
@@ -138,7 +144,10 @@ async fn described_security_groups(router: &MultiServiceRouter, arn: &str) -> Ve
 
 /// Assert that `reply` is the modelled refusal `code` and that its message contains
 /// `names`, with the request id the awsQuery error envelope carries.
-fn assert_refused(case: &str, reply: &Reply, code: &str, names: &str) {
+///
+/// `pub(crate)` because the capacity-reservation suite asserts the same envelope: one
+/// reading of a modelled refusal for the crate.
+pub(crate) fn assert_refused(case: &str, reply: &Reply, code: &str, names: &str) {
     assert_eq!(
         (reply.status, reply.error_code().as_str()),
         (400, code),

@@ -192,7 +192,7 @@ const LIMIT_CATALOGUE: &[LimitEntry] = &[
     },
     LimitEntry {
         name: "application-load-balancer-capacity-units",
-        published_max: Some(3_000),
+        published_max: None,
     },
     LimitEntry {
         name: "ca-certificates-per-trust-store",
@@ -220,7 +220,7 @@ const LIMIT_CATALOGUE: &[LimitEntry] = &[
     },
     LimitEntry {
         name: "gateway-load-balancer-capacity-units",
-        published_max: Some(3_000),
+        published_max: None,
     },
     LimitEntry {
         name: "gateway-load-balancers",
@@ -244,7 +244,7 @@ const LIMIT_CATALOGUE: &[LimitEntry] = &[
     },
     LimitEntry {
         name: "network-load-balancer-capacity-units",
-        published_max: Some(3_000),
+        published_max: None,
     },
     LimitEntry {
         name: "network-load-balancer-enis-per-vpc",
@@ -333,11 +333,19 @@ const LIMIT_CATALOGUE: &[LimitEntry] = &[
 /// type) and the per-family target bounds `RegisterTargets` refuses past with
 /// `TooManyTargetsException` (`crate::state::TARGETS_PER_TARGET_GROUP` for an
 /// Application Load Balancer's group, and the Network and Gateway Load Balancer
-/// constants beside it).
+/// constants beside it), and `crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER` (the
+/// capacity units of one load balancer, which `ModifyCapacityReservation` refuses to
+/// reserve past with `CapacityUnitsLimitExceededException`, at the same number for every
+/// family).
 fn enforced_max(name: &str) -> Option<usize> {
     match name {
         "application-load-balancers" | "network-load-balancers" | "gateway-load-balancers" => {
             Some(crate::state::LOAD_BALANCER_QUOTA)
+        }
+        "application-load-balancer-capacity-units"
+        | "network-load-balancer-capacity-units"
+        | "gateway-load-balancer-capacity-units" => {
+            usize::try_from(crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER).ok()
         }
         "target-groups" => Some(crate::state::TARGET_GROUP_QUOTA),
         "targets-per-target-group" => Some(crate::state::TARGETS_PER_TARGET_GROUP),

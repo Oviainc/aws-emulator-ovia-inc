@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/alb_data_plane.rs"]
 mod alb_data_plane;
+#[path = "all/capacity_reservation.rs"]
+mod capacity_reservation;
 #[path = "all/catalog_reads.rs"]
 mod catalog_reads;
 #[path = "all/certificate_resolution_and_redirect_protocol.rs"]

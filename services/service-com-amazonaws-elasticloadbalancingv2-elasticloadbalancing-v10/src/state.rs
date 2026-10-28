@@ -45,6 +45,18 @@ pub const SETTLE_AFTER: Duration = Duration::from_millis(500);
 /// one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// How many capacity units one request can ask `ModifyCapacityReservation` to reserve for
+/// a load balancer before it refuses with the modelled
+/// `CapacityUnitsLimitExceededException`.
+///
+/// The per-Region default Elastic Load Balancing publishes for the capacity units of one
+/// load balancer, which `DescribeAccountLimits` reports under
+/// `application-load-balancer-capacity-units` — and under the Network and Gateway Load
+/// Balancer names beside it, at the same number, so one constant serves every family and
+/// the bound does not depend on which load balancer the request names. Reported there and
+/// enforced here, so the number a caller reads is the number it hits.
+pub const CAPACITY_UNITS_PER_LOAD_BALANCER: i32 = 3_000;
+
 /// How many load balancers this store holds before `CreateLoadBalancer` refuses with
 /// the modelled `TooManyLoadBalancersException`.
 ///
