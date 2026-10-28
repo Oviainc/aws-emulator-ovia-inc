@@ -181,7 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
 
-        // 1. `inputList`'s length is a fact about the REQUEST — "If you are including
+        // 1. What the REQUEST alone settles, before the campaign is resolved.
+        //
+        //    `inputList`'s length is a fact about the REQUEST — "If you are including
         //    metadata in recommendations, the maximum is 50. Otherwise, the maximum is
         //    500." — so it is checked BEFORE the campaign is resolved: a list past the
         //    bound is refused whatever the campaign turns out to be.
@@ -190,6 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ));
         if input.input_list.len() > max_input_list {
             return Err(deny(registry::too_long("inputList", max_input_list)));
+        }
+        //    `userId` is a fact about the request too: this operation serves
+        //    `PERSONALIZED_RANKING` campaigns only, so the personalization input it
+        //    needs never depends on what the ARN resolves to.
+        if input.user_id.is_empty() {
+            return Err(invalid(
+                "userId is required: it is the user the campaign provides a personalized ranking \
+                 for.",
+            ));
         }
 
         // 2. The campaign, and the recipe type this operation serves.
@@ -203,12 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 campaign.recipe_type.as_str(),
                 RecipeType::PersonalizedRanking.as_str()
             )));
-        }
-        if input.user_id.is_empty() {
-            return Err(invalid(
-                "userId is required: it is the user the campaign provides a personalized ranking \
-                 for.",
-            ));
         }
 
         // 3. Metadata, validated against the resolved campaign and its catalog. How
