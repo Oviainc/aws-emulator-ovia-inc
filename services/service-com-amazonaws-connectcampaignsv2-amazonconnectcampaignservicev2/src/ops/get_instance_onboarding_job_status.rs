@@ -162,9 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.instance_onboarding(&region, &input.connect_instance_id) else {
             return Err(GetInstanceOnboardingJobStatusErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "No onboarding job found for Connect instance {}",
-                        input.connect_instance_id
+                    message: crate::state::onboarding_job_not_found_message(
+                        &input.connect_instance_id,
                     ),
                     x_amz_error_type: None,
                 },
