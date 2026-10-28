@@ -18,6 +18,12 @@
 //! signature, and of nothing else — so no stored record can make one of the
 //! request's certificate hashes revoked, and none is reported.
 //!
+//! `certificateHashes` is `@required` and bound to the query string, where a list
+//! carrying no entries and an absent one are the same request, so a request that
+//! supplies nothing for it is refused the way this service words that refusal
+//! ([`crate::service::missing_list_member_constraint`]) rather than as a value
+//! that was null.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -170,6 +176,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and no other region's.
         let region = crate::state::request_region(ctx.parts());
 
+        // `certificateHashes` is `@required`, and what it requires is a
+        // certificate to check — so a request that supplies the parameter but no
+        // element in it is refused for what it actually did (supplied nothing),
+        // not for the absence of a member it did supply. The absent-parameter
+        // form of the same request is worded identically by
+        // `crate::service::missing_list_member_constraint`: on the query string
+        // an empty list and an absent one are the same request.
+        if input.certificate_hashes.is_empty() {
+            return Err(validation(crate::service::missing_list_member_constraint(
+                CERTIFICATE_HASHES_QUERY,
+            )));
+        }
+
         // `platformId` names the signing platform the signature was produced on,
         // and this service publishes the WHOLE set of platforms a signature can
         // be produced on, so an id outside that catalog names no platform at all.
@@ -263,9 +282,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled 400 for a request this operation cannot act on: a `platformId`
-/// naming no published signing platform, or a member that is not an ARN of the
-/// resource it names.
+/// The wire name of the `certificateHashes` input member, as `@httpQuery` binds
+/// it (`smithy_query(query="operation",operation="GetRevocationStatus")`) — the
+/// name a refusal of that member states.
+const CERTIFICATE_HASHES_QUERY: &str = "certificateHashes";
+
+/// The modelled 400 for a request this operation cannot act on: a
+/// `certificateHashes` carrying nothing, a `platformId` naming no published
+/// signing platform, or a member that is not an ARN of the resource it names.
 ///
 /// `code` is the modelled shape's own name — a refusal of the request's own
 /// values, which is what that shape already says (see
