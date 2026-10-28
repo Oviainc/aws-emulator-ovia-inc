@@ -62,6 +62,9 @@
 //! * `AccessDeniedException` (HTTP 403) — You do not have permission to perform this
 //!   operation.
 //! * `InternalServerException` (HTTP 500) — An internal error has occurred.
+//! * `ValidationException` (HTTP 400) — A parameter is not valid. Widened in through
+//!   `extra_errors` (see below): the shape is this SERVICE's own, and every other paged
+//!   list declares it, but this operation's `errors` list omits it.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -77,11 +80,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-outposts-outpostsolafse
 // here — hence the `ListQuotesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.outposts#ListQuotes")]
+//
+// `ValidationException` is widened in through `extra_errors`: refusing a `NextToken`
+// this service did not issue for this list is a defect of the caller's input, and the
+// shape this SERVICE models for that class ("A parameter is not valid.", HTTP 400,
+// member `Message`) is the one every other paged list here answers with — only this
+// operation's own `errors` list omits it. Widening keeps the refusal on the modelled
+// shape, body member included, rather than on a synthetic envelope.
+#[smithy_macros::operation_error(
+    "com.amazonaws.outposts#ListQuotes",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListQuotesErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -149,16 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The resume point the caller's token names. A token this service did not
         // issue for THIS list is a bad request, not an empty page — the rule every
-        // other list in this service applies to theirs. This operation's model
-        // declares no client-input error, so the refusal travels on the service's own
-        // 400 `ValidationException` channel rather than as an invented code.
+        // other list in this service applies to theirs, and on the same shape: the
+        // service's own `ValidationException` (400), widened into this operation's
+        // error enum above.
         let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
             Some(token) => Some(
                 crate::state::decode_page_token(crate::state::QUOTE_PAGE, token).ok_or_else(
                     || {
-                        crate::scaffolded::Scaffolded::validation(crate::state::page_token_report(
-                            Self::NAME,
-                        ))
+                        ListQuotesErrorModeled::ValidationException(ValidationException {
+                            message: Some(crate::state::page_token_report(Self::NAME)),
+                        })
                     },
                 )?,
             ),
