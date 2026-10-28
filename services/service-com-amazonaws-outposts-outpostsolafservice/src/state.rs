@@ -2076,16 +2076,21 @@ pub struct CatalogItemRecord {
 impl CatalogItemRecord {
     /// Whether this item is of ANY of the classes a filter names.
     ///
-    /// "For a filter where you can specify multiple values, the results include
-    /// items that match any of the values that you specify for the filter", as the
-    /// operation documents it — so a filter carrying no value at all narrows
-    /// nothing, exactly as an absent one does.
+    /// The class is a SINGLE-valued fact about an item, so the selection is the one
+    /// rule every list of this service applies to a `*Filter` member — a filter is a
+    /// list of accepted values, and one carrying no value at all narrows nothing,
+    /// exactly as an absent one does. That rule lives in [`filter_accepts`] and is
+    /// stated only there; this method only says which fact the filter selects on.
     pub fn is_class(&self, classes: &[String]) -> bool {
-        classes.is_empty() || classes.contains(&self.item_class)
+        filter_accepts(Some(classes), Some(self.item_class.as_str()))
     }
 
-    /// Whether this item supports ANY of the storage options a filter names. See
-    /// [`Self::is_class`].
+    /// Whether this item supports ANY of the storage options a filter names.
+    ///
+    /// The storage options are a MULTI-valued fact about an item — the item matches
+    /// when any of its own values is one of the accepted ones — which is not the
+    /// single-valued selection [`filter_accepts`] covers, so the quantifier over the
+    /// record's own values is spelled out here.
     pub fn supports_storage(&self, options: &[String]) -> bool {
         options.is_empty()
             || self
@@ -2097,7 +2102,7 @@ impl CatalogItemRecord {
     }
 
     /// Whether this item carries EC2 capacity of ANY of the instance families a
-    /// filter names. See [`Self::is_class`].
+    /// filter names. MULTI-valued, for the reason [`Self::supports_storage`] is.
     pub fn offers_family(&self, families: &[String]) -> bool {
         families.is_empty()
             || self.item.ec2_capacities.iter().flatten().any(|capacity| {
@@ -5841,8 +5846,8 @@ fn push_once(values: &mut Vec<String>, value: &str) {
 /// handler combines one call per filter member with `&&`, which is what makes several
 /// filters narrow rather than widen.
 ///
-/// Shared by the five list operations that take filters so they cannot drift apart on
-/// that rule.
+/// Shared by every list operation of this service that selects on a single-valued
+/// filtered member, so they cannot drift apart on that rule.
 pub fn filter_accepts(filter: Option<&[String]>, value: Option<&str>) -> bool {
     match filter {
         Some(accepted) if !accepted.is_empty() => {

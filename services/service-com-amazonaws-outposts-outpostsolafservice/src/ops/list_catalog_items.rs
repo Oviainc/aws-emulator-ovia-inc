@@ -182,7 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled enum never reaches here: the framework refuses it as a 400
         // `ValidationException` before this handler runs. A selected item is reported
         // WHOLE — a filter narrows which items a page holds, never what one of them
-        // says about itself.
+        // says about itself. The selection rule itself is
+        // [`crate::state::filter_accepts`], which every list of this service selects
+        // with; the record methods below only say which fact each filter selects on.
         let classes = input.item_class_filter.unwrap_or_default();
         let storage = input.supported_storage_filter.unwrap_or_default();
         let families = input.ec2_family_filter.unwrap_or_default();

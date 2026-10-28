@@ -103,6 +103,8 @@ mod renewal_pricing;
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
+#[path = "all/single_valued_filter_rule.rs"]
+mod single_valued_filter_rule;
 #[path = "all/site_address.rs"]
 mod site_address;
 #[path = "all/site_address_order_hold.rs"]
