@@ -262,3 +262,13 @@ mod test_invoke_method_data_plane_parity;
 mod request_validator_precedes_the_integration;
 #[path = "all/model_template.rs"]
 mod model_template;
+
+// Appended rather than folded into the sorted list above, for the reason the note on
+// `update_deployment` gives: the sorted region is contended by every apigateway fix that
+// lands in the same window.
+#[path = "all/constraint_refusal_class.rs"]
+mod constraint_refusal_class;
+#[path = "all/rest_api_import_gateway_responses.rs"]
+mod rest_api_import_gateway_responses;
+#[path = "all/vpc_link_provisioning.rs"]
+mod vpc_link_provisioning;

@@ -2147,6 +2147,10 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 ///   preference was set, at most [`MAX_BILLING_TRANSFER_PREFERENCES`]; nothing in this
 ///   API deletes a billing transfer, so that store evicts the oldest-set preference
 ///   first, which reads back as the "never set" it was before.
+/// * `billing_family_account_ids` records the consolidated billing family's own
+///   roster, which NO request writes (an account joins a family in AWS Organizations,
+///   not here), so it is bounded by whatever recorded it rather than by a cap of this
+///   store, and no caller can grow it.
 /// * `unassociated_accounts` keeps the released accounts a later
 ///   `ListAccountAssociations` has to report as `UNMONITORED`. Nothing deletes a
 ///   linked account, so this one is capped at [`MAX_UNASSOCIATED_ACCOUNTS`] and
@@ -2266,6 +2270,24 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Organizations surface) designates a payer account by setting it, which is the
     /// only way the control plane becomes reachable.
     pub payer_account_id: Option<String>,
+    /// The linked accounts of the consolidated billing family this store records:
+    /// `Some` once the family's roster is known, `None` while it is not.
+    ///
+    /// Which accounts a consolidated billing family holds is an AWS Organizations
+    /// fact — an account joins a family THERE, and this API never adds one — so no
+    /// request writes this field and nothing a caller does grows it. It holds `None`
+    /// by default, for the reason [`Self::payer_account_id`] holds no account: this
+    /// emulator presents one account ([`caller_account_id`]) and emulates no
+    /// Organizations control plane, so there is no family whose roster could be
+    /// recorded, and non-membership is not decidable — the accounts this service has
+    /// seen stay the linked accounts it reports ([`Self::linked_accounts`]). A test
+    /// (or a future Organizations surface) records the family by setting it, and from
+    /// then on membership IS decidable: an account the roster does not hold is outside
+    /// the family ([`Self::is_outside_billing_family`]), so an operation that would
+    /// take it into a billing group's membership refuses the request
+    /// ([`account_not_in_billing_family`]), while every account of the roster is a
+    /// linked account this service reports whether or not a billing group holds it.
+    pub billing_family_account_ids: Option<BTreeSet<String>>,
 }
 
 impl ComAmazonawsBillingconductorAwsbillingconductorState {
@@ -2525,14 +2547,18 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// the billing group it was associated with IN `billing_period` (`None` when it
     /// was in none then).
     ///
-    /// The roster is every account this service has seen, whatever period is asked
-    /// about: a linked account stays in the consolidated billing family whether or
-    /// not it was in a billing group then, so one that joined a group later is
-    /// reported for an earlier period with no group at all.
+    /// The roster is the consolidated billing family's own roster where the store
+    /// records one ([`Self::billing_family_account_ids`]), together with every account
+    /// this service has seen, whatever period is asked about: a linked account stays in
+    /// the consolidated billing family whether or not it was in a billing group then,
+    /// so one that joined a group later is reported for an earlier period with no group
+    /// at all, and a family account no group has ever held is reported with none too.
     pub fn linked_accounts(&self, billing_period: &str) -> BTreeMap<String, Option<String>> {
         let mut accounts: BTreeMap<String, Option<String>> = self
-            .unassociated_accounts
+            .billing_family_account_ids
             .iter()
+            .flatten()
+            .chain(self.unassociated_accounts.iter())
             .map(|account_id| (account_id.clone(), None))
             .collect();
         for (account_id, memberships) in &self.account_associations {
@@ -3056,6 +3082,21 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .filter(|(arn, group)| group.auto_associates() && arn.as_str() != group_arn)
             .map(|(arn, _)| arn.clone())
             .collect()
+    }
+
+    /// Whether `account_id` is known NOT to be a linked account of the consolidated
+    /// billing family this store records — the decision behind "the account IDs must
+    /// be a part of the consolidated billing family".
+    ///
+    /// Refusing an account needs EVIDENCE that it is outside the family, so the answer
+    /// comes from the recorded roster alone ([`Self::billing_family_account_ids`]): a
+    /// store that records no roster knows of no account that it is outside the family,
+    /// while a store whose roster IS recorded answers for every account id, since the
+    /// roster is the family and an id it does not hold is not in it.
+    pub fn is_outside_billing_family(&self, account_id: &str) -> bool {
+        self.billing_family_account_ids
+            .as_ref()
+            .is_some_and(|roster| !roster.contains(account_id))
     }
 
     /// The group an account is already associated with, when it is not `group_arn`.
@@ -4026,6 +4067,35 @@ pub fn accounts_already_associated(
         format!(
             "account {account_id} is already associated with billing group {owner_group_arn}"
         ),
+    )
+}
+
+/// The modelled refusal a request earns when one of the account ids it names is not a
+/// linked account of the payer's consolidated billing family.
+///
+/// A billing group groups the accounts of ONE consolidated billing family: the
+/// operation that connects accounts to a group takes "an array of account IDs in a
+/// consolidated billing family" and "the account IDs must be a part of the
+/// consolidated billing family during the current month", and
+/// `AccountGrouping.LinkedAccountIds` repeats it ("Account IDs must be a part of the
+/// consolidated billing family, and not associated with another billing group"). An
+/// account list naming an account outside the family is therefore a fault in the
+/// INPUT: `ValidationExceptionReason` enumerates `ILLEGAL_ACCOUNTS` for an account
+/// list this service may not take
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), so the answer is
+/// the 400 `ValidationException` with that reason — built here so every operation that
+/// takes account ids answers it the same way, beside the
+/// [`accounts_already_associated`] refusal the other precondition earns; `field` names
+/// the input member that carried the id (`AccountIds`,
+/// `AccountGrouping.LinkedAccountIds`, …), which is what goes in `Fields`.
+pub fn account_not_in_billing_family(
+    field: &str,
+    account_id: &str,
+) -> crate::ops::types::ValidationException {
+    validation_exception(
+        "ILLEGAL_ACCOUNTS",
+        field,
+        format!("account {account_id} is not a part of the consolidated billing family"),
     )
 }
 

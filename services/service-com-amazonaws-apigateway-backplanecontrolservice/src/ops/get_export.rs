@@ -234,7 +234,10 @@ const AUTHORIZER_EXTENSION: &str = "x-amazon-apigateway-authorizer";
 
 /// The document key the API's own gateway responses are exported under — API Gateway's
 /// own OpenAPI extension, keyed by `responseType`; see [`gateway_responses_extension`].
-const GATEWAY_RESPONSES_EXTENSION: &str = "x-amazon-apigateway-gateway-responses";
+///
+/// Reached from the IMPORT side, which reads the same collection back out of the same
+/// key, so the two directions cannot disagree on it.
+use super::put_rest_api::GATEWAY_RESPONSES_EXTENSION;
 
 /// The document key that says which kind of authorization a security scheme stands for.
 const AUTHTYPE_EXTENSION: &str = "x-amazon-apigateway-authtype";

@@ -520,16 +520,19 @@ async fn a_patch_the_stage_shape_does_not_support_is_refused_and_writes_nothing(
             "BadRequestException",
         ),
         (
+            // A patch VALUE that names no record is a refusal of the REQUEST: the stage
+            // and the API the URI addresses both exist, so the caller has to fix the
+            // value rather than abandon the stage.
             "a deployment this API does not have",
             replace("/deploymentId", "zzzzzzzzzz"),
-            404,
-            "NotFoundException",
+            400,
+            "BadRequestException",
         ),
         (
             "a canary deployment this API does not have",
             replace("/canarySettings/deploymentId", "zzzzzzzzzz"),
-            404,
-            "NotFoundException",
+            400,
+            "BadRequestException",
         ),
         (
             "an unsupported op later in the list",

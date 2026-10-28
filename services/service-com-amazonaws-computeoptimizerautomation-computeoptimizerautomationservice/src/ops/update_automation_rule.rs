@@ -283,17 +283,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateAutomationRuleErrorModeled::OptInRequiredException(refusal).into());
         }
 
-        // An update that REPLACES the organization configuration re-scopes the
-        // rule, so it is held to the standing a create is held to: the rule may
-        // apply its actions only in accounts the caller may automate in right
-        // now — see `crate::state::…::may_scope_rule_to`. Judged AHEAD of the
-        // token ledger and of the store, so a refused update neither consumes
-        // its client token, applies a member nor bumps the revision. An update
-        // that carries no configuration re-scopes nothing and is not judged
-        // here: a member account's association governs which accounts a rule is
-        // SCOPED to, not whether the rule's other members stay maintainable.
-        if !guard.may_scope_rule_to(input.organization_configuration.as_ref()) {
-            return Err(access_denied());
+        // An update that decides where the rule's actions land is held to the
+        // standing a create is held to: the MERGED rule may apply its actions
+        // only in accounts the caller may automate in right now — see
+        // `crate::state::…::may_scope_rule_to`. Two members decide that, so
+        // either of them makes this request one about where the rule applies:
+        // the organization configuration, whose `accountIds` ARE that scope, and
+        // the `OrganizationRule` type, which is what puts a configuration into
+        // effect — so an update that turns a rule into an organization rule is
+        // held to the scope it thereby activates, whether that scope arrives in
+        // this request or is already stored, exactly as replacing the scope is.
+        // Judged AHEAD of the token ledger and of the store, so a refused update
+        // neither consumes its client token, applies a member nor bumps the
+        // revision. An update that writes neither member re-points nothing and
+        // is not judged here: a disassociation stops an organization rule
+        // applying to the member account, it does not make the stored rule
+        // unmaintainable.
+        if input.organization_configuration.is_some()
+            || input.rule_type.as_deref() == Some("OrganizationRule")
+        {
+            // The configuration the merged rule would carry: the one this
+            // request writes, or the stored one when it writes none.
+            let scoped_configuration = input.organization_configuration.clone().or_else(|| {
+                guard
+                    .rules
+                    .get(&input.rule_arn)
+                    .and_then(|rule| rule.organization_configuration.clone())
+            });
+            if !guard.may_scope_rule_to(scoped_configuration.as_ref()) {
+                return Err(access_denied());
+            }
         }
 
         match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
@@ -344,7 +363,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The merged rule must still satisfy the rules a create does: an
         // `OrganizationRule` needs an organization configuration, whether it
-        // arrives in this request or is already stored.
+        // arrives in this request or is already stored. (The accounts that
+        // configuration names were judged above, ahead of the token ledger.)
         let merged_rule_type = input.rule_type.clone().unwrap_or(rule.rule_type.clone());
         let merged_org_config = input
             .organization_configuration

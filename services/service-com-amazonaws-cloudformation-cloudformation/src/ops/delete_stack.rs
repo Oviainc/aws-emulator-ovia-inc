@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches
         // another service's own handler, which takes that service's lock.
-        let (stack_id, region, resources) = {
+        let (stack_id, region, resources, held) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -363,13 +363,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // where they have to be deleted.
                 stack.region.clone(),
                 stack.current_resources().to_vec(),
+                // The records the stack HOLDS, which is what this teardown is responsible
+                // for reporting a deletion of — including a resource of a type no service
+                // of this emulator provisions, whose removal a client reads exactly as it
+                // reads every other resource's.
+                stack.held_resource_ids(),
             )
         };
 
         // "Deletes a specified stack. Once the call completes successfully, stack deletion
         // starts" — deleting a stack deletes the resources it created, in the services
         // that own them.
-        let deleted = crate::state::provisioning::delete(ctx, &region, &resources).await;
+        let deleted = crate::state::provisioning::delete(ctx, &region, &resources, &held).await;
 
         let mut store = state.lock();
         if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {

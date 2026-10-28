@@ -114,12 +114,13 @@ async fn an_association_adds_exactly_the_named_resource() {
             vec![bucket.clone(), instance.clone(), role.clone()],
         ),
         (
-            // The create stored the duplicate; an association of a resource already
-            // present stores nothing, so it neither adds a third copy nor removes one.
-            "a resource the create stored twice",
+            // The create stores its association list as a set, so a create naming one
+            // resource twice linked the application to it once; associating that same
+            // resource then stores nothing either.
+            "a resource the create named twice",
             vec![bucket.clone(), bucket.clone()],
             bucket.clone(),
-            vec![bucket.clone(), bucket.clone()],
+            vec![bucket.clone()],
         ),
         (
             "a record already carrying every other ARN form the pattern admits",

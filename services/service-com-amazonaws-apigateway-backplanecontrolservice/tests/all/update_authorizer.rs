@@ -490,11 +490,6 @@ async fn an_op_or_path_the_resource_does_not_support_is_refused_and_changes_noth
             .into_iter()
             .chain([json!({ "op": "test", "path": "/name", "value": "settled" })])
             .collect()),
-        ("an op outside the modelled Op catalog", vec![json!({
-            "op": "increment",
-            "path": "/authorizerResultTtlInSeconds",
-            "value": "1",
-        })]),
         ("an entry carrying no op", vec![json!({ "path": "/name", "value": "x" })]),
         ("an entry carrying no path", vec![json!({ "op": "replace", "value": "x" })]),
         ("a path that is not a JSON Pointer", vec![replace("name", "x")]),
@@ -535,6 +530,30 @@ async fn an_op_or_path_the_resource_does_not_support_is_refused_and_changes_noth
             after.body, before.body
         );
     }
+
+    // An `op` outside the modelled `Op` catalog is refused by the CONSTRAINT layer in
+    // front of the handler instead, whose error class is `ValidationException` rather than
+    // this operation's own `BadRequestException` — and the record is left untouched just
+    // the same.
+    let case = "an op outside the modelled Op catalog";
+    let answer = update(
+        &gateway,
+        &api,
+        &id,
+        vec![json!({
+            "op": "increment",
+            "path": "/authorizerResultTtlInSeconds",
+            "value": "1",
+        })],
+    )
+    .await;
+    assert_failure(&answer, 400, "ValidationException", case);
+    let after = get_authorizer(&gateway, &api, &id).await;
+    assert_eq!(
+        after.body, before.body,
+        "case {case}: a refused patch must leave the record untouched, got {:?} instead of {:?}",
+        after.body, before.body
+    );
 
     // The refusal is the fixed sentence and the path the request sent, and nothing else:
     // it names neither the op nor the paths the resource does have.

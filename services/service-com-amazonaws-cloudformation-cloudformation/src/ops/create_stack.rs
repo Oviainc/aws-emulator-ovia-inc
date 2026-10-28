@@ -824,7 +824,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         } else {
                             stack.begin_rollback(failed_at, failure);
                         }
-                        Some(stack.current_resources())
+                        // With the records the stack HOLDS, which is the set the removal
+                        // reports a deletion of ([`crate::state::provisioning::unwind`]).
+                        Some((stack.current_resources(), stack.held_resource_ids()))
                     }
                 }
             }
@@ -836,8 +838,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // into is already due on the stack's clock; only a delete the owning service
         // REFUSES changes it, and then to the failed status for that unwind rather than to
         // one that claims the resources are gone.
-        if let Some(resources) = unwind {
-            let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+        if let Some((resources, held)) = unwind {
+            let deleted =
+                crate::state::provisioning::unwind(ctx, &region, &resources, &held).await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&region, &stack_id) {
                 stack.schedule_resource_events(&deleted.transitions);
