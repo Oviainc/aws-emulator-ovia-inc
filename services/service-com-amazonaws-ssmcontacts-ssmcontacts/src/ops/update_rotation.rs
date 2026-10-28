@@ -9,6 +9,13 @@
 //! left exactly as it was rather than cleared. `GetRotation`/`ListRotations` read the result
 //! back out of the same record, so there is nothing to recompute here.
 //!
+//! The request is checked WHOLE before any of it is applied, by the same rules
+//! `CreateRotation` admits its own rotation by — the recurrence describes a schedule, the
+//! time zone resolves against the IANA zone database, and the recurrence's `NumberOfOnCalls`
+//! is met by the shift team the update leaves the rotation with — so a refused update leaves
+//! the stored rotation exactly as it was and cannot leave it in a state the create would have
+//! refused.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::check_recurrence;
+        use crate::state::{check_number_of_on_calls, check_recurrence, check_time_zone_id};
 
         // This operation addresses its rotation by ARN and mints nothing, so it reads
         // nothing off the request envelope.
@@ -191,6 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rotation describing a schedule the create would have refused.
         check_recurrence(&input.recurrence).map_err(validation)?;
 
+        // A named `TimeZoneId` must resolve against the IANA zone database, exactly as
+        // `CreateRotation`'s own does: an update cannot move a live rotation onto a zone the
+        // service cannot read its shifts in. An omitted one leaves the stored zone — already
+        // checked when it was written — in place.
+        if let Some(time_zone_id) = &input.time_zone_id {
+            check_time_zone_id(time_zone_id).map_err(validation)?;
+        }
+
         if !state.rotations.contains_key(&input.rotation_id) {
             return Err(not_found(
                 format!("Rotation {} not found", input.rotation_id),
@@ -218,6 +233,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable: the key was found above, under this same lock.
             return Err(internal());
         };
+
+        // How many members are on call at once is bounded by the team the update LEAVES the
+        // rotation with: the one the request names, or the stored one when it names none.
+        let team_size = match &input.contact_ids {
+            Some(contact_ids) => contact_ids.len(),
+            None => rotation.contact_ids.len(),
+        };
+        check_number_of_on_calls(&input.recurrence, team_size).map_err(validation)?;
 
         // Named members replace, omitted members are left alone. `Recurrence` is modelled
         // required, so it always replaces; the others are optional, and clearing a

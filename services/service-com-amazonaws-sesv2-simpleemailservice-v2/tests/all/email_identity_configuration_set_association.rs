@@ -15,8 +15,9 @@
 //! set it does not hold are each refused with a terminal 404 `NotFoundException` naming
 //! the missing one, a name outside `ConfigurationSetName`'s documented character and
 //! length rule with a 400 `BadRequestException`, and nothing is persisted by a refused
-//! call; and because the stored name is a reference to a live set, deleting a set
-//! leaves no identity referencing it.
+//! call; and because what is stored is the name itself and not a key kept pointing at a
+//! live set, this call is the ONLY one that changes it — a name left behind by a deleted
+//! set is cleared by a request of this call carrying no name, and by nothing else.
 //!
 //! The tables below span what the rule generalises over: each identity kind and
 //! spelling, the forms a `ConfigurationSetName` may take (one character, the longest
@@ -26,6 +27,7 @@
 
 use serde_json::{json, Value};
 
+use crate::configuration_set_event_destinations::EventDestinations;
 use crate::configuration_sets::{Reply, Ses};
 
 /// The documented length bound of `ConfigurationSetName`, from the member's own
@@ -35,11 +37,13 @@ const MAX_CONFIGURATION_SET_NAME_LEN: usize = 64;
 
 /// Convenience calls for the identity-to-configuration-set association, over the
 /// harness the sibling suites share.
-trait IdentityConfigurationSet {
+///
+/// The configuration-set side of a case is driven through the sibling
+/// [`EventDestinations`] trait, which already carries those calls.
+pub(crate) trait IdentityConfigurationSet {
     async fn create_identity(&self, identity: &str) -> Reply;
     async fn get_identity(&self, identity: &str) -> Reply;
     async fn delete_identity(&self, identity: &str) -> Reply;
-    async fn delete_set(&self, set: &str) -> Reply;
     /// `PutEmailIdentityConfigurationSetAttributes` with whatever body the case
     /// supplies, so a case can leave the optional member out entirely.
     async fn put_association_body(&self, identity: &str, body: Value) -> Reply;
@@ -68,11 +72,6 @@ impl IdentityConfigurationSet for Ses {
             .await
     }
 
-    async fn delete_set(&self, set: &str) -> Reply {
-        self.call("DELETE", &format!("/v2/email/configuration-sets/{set}"), None)
-            .await
-    }
-
     async fn put_association_body(&self, identity: &str, body: Value) -> Reply {
         self.call(
             "PUT",
@@ -93,7 +92,7 @@ impl IdentityConfigurationSet for Ses {
 
 /// The identity spellings the rule has to hold for: an address, a domain, a subdomain,
 /// and the mixed-case forms of each, so both identity kinds are covered.
-const IDENTITIES: &[&str] = &[
+pub(crate) const IDENTITIES: &[&str] = &[
     "sender@example.com",
     "no-reply@mail.example.net",
     "example.com",
@@ -105,7 +104,7 @@ const IDENTITIES: &[&str] = &[
 /// The configuration-set names every case creates up front, spanning the forms
 /// `ConfigurationSetName` allows: one character, letters with a hyphen, letters with
 /// underscores and a digit, and the longest name the documented rule permits.
-fn set_names() -> Vec<String> {
+pub(crate) fn set_names() -> Vec<String> {
     vec![
         "A".to_string(),
         "primary-set".to_string(),
@@ -116,7 +115,7 @@ fn set_names() -> Vec<String> {
 
 /// Create every name in `sets`, which must succeed: a case associating an identity
 /// with a set needs the set to exist first.
-async fn create_sets(ses: &Ses, sets: &[String]) {
+pub(crate) async fn create_sets(ses: &Ses, sets: &[String]) {
     for set in sets {
         let created = ses.create_set(json!({"ConfigurationSetName": set})).await;
         assert_eq!(
@@ -130,7 +129,7 @@ async fn create_sets(ses: &Ses, sets: &[String]) {
 
 /// The `ConfigurationSetName` a read of `identity` reports, `Value::Null` where it
 /// reports none. The read must be a 200.
-async fn reported_set(ses: &Ses, identity: &str, case: &str) -> Value {
+pub(crate) async fn reported_set(ses: &Ses, identity: &str, case: &str) -> Value {
     let read = ses.get_identity(identity).await;
     assert_eq!(
         read.status, 200,
@@ -506,15 +505,15 @@ async fn a_name_outside_the_documented_rule_is_refused() {
 }
 
 #[tokio::test]
-async fn deleting_a_configuration_set_leaves_no_identity_referencing_it() {
+async fn a_name_left_behind_by_a_deleted_set_is_cleared_only_by_this_call() {
     let sets = set_names();
     for (deleted, kept) in [(&sets[1], &sets[2]), (&sets[3], &sets[0])] {
         let case = format!("({deleted:?}, {kept:?})");
         let ses = Ses::new();
         create_sets(&ses, &sets).await;
         // Several identities on the set that goes, one on the set that stays, and one
-        // on no set at all, so the delete is seen to touch exactly the references to
-        // the set it removed.
+        // on no set at all, so what the delete leaves behind is seen on each kind of
+        // identity record.
         let (on_deleted, on_kept, unassociated) = (&IDENTITIES[..3], &IDENTITIES[3], &IDENTITIES[4]);
         for identity in on_deleted {
             ses.create_identity(identity).await;
@@ -533,23 +532,47 @@ async fn deleting_a_configuration_set_leaves_no_identity_referencing_it() {
         );
 
         for identity in on_deleted {
+            // The stored value is the name the client wrote, not a key kept pointing at
+            // a live set, so the delete leaves it reported verbatim.
+            let seen = reported_set(&ses, identity, &case).await;
+            assert_eq!(
+                seen,
+                Value::String(deleted.clone()),
+                "case {case}: expected {identity:?} to still report {deleted:?} after the delete, got {seen:?}"
+            );
+            // Naming the dead set again IS refused, because this call resolves the name
+            // it is given against the account's sets.
+            let put = ses.put_association(identity, Some(deleted)).await;
+            assert_eq!(
+                put.status, 404,
+                "case {case}: expected naming the deleted set again to be refused for {identity:?}, got {} {}",
+                put.status,
+                put.message()
+            );
+            // And the refusal left the name where it was.
+            let seen = reported_set(&ses, identity, &case).await;
+            assert_eq!(
+                seen,
+                Value::String(deleted.clone()),
+                "case {case}: expected the refused write to leave {deleted:?} on {identity:?}, got {seen:?}"
+            );
+            // This call carrying no name is what clears it.
+            let cleared = ses.put_association_body(identity, json!({})).await;
+            assert_eq!(
+                cleared.status, 200,
+                "case {case}: expected the clearing write on {identity:?} to be accepted, got {} {}",
+                cleared.status,
+                cleared.message()
+            );
             let seen = reported_set(&ses, identity, &case).await;
             assert_eq!(
                 seen,
                 Value::Null,
-                "case {case}: expected {identity:?} to reference no configuration set after the delete, got {seen:?}"
-            );
-            // The reference cannot be restored either: the set is gone.
-            let put = ses.put_association(identity, Some(deleted)).await;
-            assert_eq!(
-                put.status, 404,
-                "case {case}: expected re-associating {identity:?} with the deleted set to be refused, got {} {}",
-                put.status,
-                put.message()
+                "case {case}: expected {identity:?} to report no configuration set once cleared, got {seen:?}"
             );
         }
-        // Only references to the deleted set went: the identity on the set that stays
-        // still reports it, and the one on no set still reports none.
+        // The other identities were not touched by any of it: the one on the set that
+        // stays still reports it, and the one on no set still reports none.
         let seen = reported_set(&ses, on_kept, &case).await;
         assert_eq!(
             seen,

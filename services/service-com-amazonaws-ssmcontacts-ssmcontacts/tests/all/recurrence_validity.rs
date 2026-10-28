@@ -30,7 +30,16 @@ use service_com_amazonaws_ssmcontacts_ssmcontacts::ops::types::DAY_OF_WEEK_VALUE
 
 use crate::contact_lifecycle::{error_code, Emulator};
 
-/// The `Alias` the one pool contact is created with, so both calls can name a stored contact.
+/// How many contacts every row's fixture creates.
+///
+/// `NumberOfOnCalls` is bounded by the rotation's shift team (`tests/all/rotation_time_zone.rs`
+/// is the suite about that rule), and the rows below vary the recurrence FORM rather than the
+/// team: a team of three meets every count they ask for, so each row's verdict is the
+/// settings-list rule's alone.
+const TEAM: usize = 3;
+
+/// The `Alias` prefix the pool contacts are created with, so both calls can name stored
+/// contacts.
 const CONTACT_ALIAS: &str = "oncall-recurrence";
 
 /// A recurrence every row's fixture rotation is created with: the simplest form the rule
@@ -225,22 +234,32 @@ fn every_day_coverage() -> Value {
     Value::Object(coverage)
 }
 
-/// One emulator holding one contact and one rotation created with [`baseline_recurrence`],
-/// answering `(emulator, contact arn, rotation arn)`.
-async fn fixture(case: &str) -> (Emulator, String, String) {
+/// One emulator holding a [`TEAM`]-contact pool and one rotation created with
+/// [`baseline_recurrence`] over that whole team, answering
+/// `(emulator, contact arns, rotation arn)`.
+async fn fixture(case: &str) -> (Emulator, Vec<String>, String) {
     let emulator = Emulator::new();
-    let contact = emulator
-        .create_contact(
-            json!({"Alias": CONTACT_ALIAS, "Type": "PERSONAL", "Plan": {"Stages": []}}),
-            case,
-        )
-        .await;
+    let mut contacts = Vec::with_capacity(TEAM);
+    for index in 0..TEAM {
+        contacts.push(
+            emulator
+                .create_contact(
+                    json!({
+                        "Alias": format!("{CONTACT_ALIAS}-{index}"),
+                        "Type": "PERSONAL",
+                        "Plan": {"Stages": []},
+                    }),
+                    case,
+                )
+                .await,
+        );
+    }
     let (status, body) = emulator
         .call(
             "CreateRotation",
             json!({
                 "Name": "baseline",
-                "ContactIds": [contact.clone()],
+                "ContactIds": contacts.clone(),
                 "TimeZoneId": "UTC",
                 "Recurrence": baseline_recurrence(),
             }),
@@ -254,7 +273,7 @@ async fn fixture(case: &str) -> (Emulator, String, String) {
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a RotationArn, got {body:?}"))
         .to_string();
-    (emulator, contact, rotation)
+    (emulator, contacts, rotation)
 }
 
 /// The refusal message an error body carries.
@@ -316,14 +335,14 @@ async fn rotation_arns(emulator: &Emulator, case: &str) -> Vec<String> {
 async fn create_and_update_judge_a_recurrence_identically() {
     for row in rows() {
         let case = format!("the recurrence rule applied to {}", row.case);
-        let (emulator, contact, baseline) = fixture(&case).await;
+        let (emulator, contacts, baseline) = fixture(&case).await;
 
         let (create_status, create_body) = emulator
             .call(
                 "CreateRotation",
                 json!({
                     "Name": "under-test",
-                    "ContactIds": [contact],
+                    "ContactIds": contacts,
                     "TimeZoneId": "UTC",
                     "Recurrence": row.recurrence.clone(),
                 }),
@@ -449,14 +468,14 @@ async fn both_operations_check_every_day_of_week_against_the_modelled_value_set(
             ),
         ] {
             let case = format!("{day} named by {place}");
-            let (emulator, contact, baseline) = fixture(&case).await;
+            let (emulator, contacts, baseline) = fixture(&case).await;
 
             let (create_status, create_body) = emulator
                 .call(
                     "CreateRotation",
                     json!({
                         "Name": "under-test",
-                        "ContactIds": [contact],
+                        "ContactIds": contacts,
                         "TimeZoneId": "UTC",
                         "Recurrence": recurrence.clone(),
                     }),
@@ -510,14 +529,14 @@ async fn both_operations_check_every_day_of_week_against_the_modelled_value_set(
             ),
         ] {
             let case = format!("{outside:?} named by {place}");
-            let (emulator, contact, baseline) = fixture(&case).await;
+            let (emulator, contacts, baseline) = fixture(&case).await;
 
             let (create_status, create_body) = emulator
                 .call(
                     "CreateRotation",
                     json!({
                         "Name": "under-test",
-                        "ContactIds": [contact],
+                        "ContactIds": contacts,
                         "TimeZoneId": "UTC",
                         "Recurrence": recurrence.clone(),
                     }),

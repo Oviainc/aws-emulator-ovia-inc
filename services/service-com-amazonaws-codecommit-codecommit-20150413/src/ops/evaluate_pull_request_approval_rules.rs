@@ -255,11 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(EvaluatePullRequestApprovalRulesOutput {
             evaluation: Evaluation {
-                // An override sets the rules' conditions aside, so the pull request
-                // is approved either when every rule's conditions are met or when
-                // they no longer need to be — the same question a merge asks.
-                approved: pull_request.approval_rules_satisfied(),
-                overridden: pull_request.approval_rules_overridden,
+                // Whether the pull request is approved is whether its approvals meet
+                // the conditions of every rule applied to it, which an override does
+                // not make them do: an override reports on its own member and sets
+                // the requirements aside for a MERGE, leaving the rules it set aside
+                // reported as the unmet rules they still are.
+                approved: approval_rules_not_satisfied.is_empty(),
+                overridden: pull_request.approval_rules_overridden(),
                 approval_rules_satisfied: Some(approval_rules_satisfied),
                 approval_rules_not_satisfied: Some(approval_rules_not_satisfied),
             },

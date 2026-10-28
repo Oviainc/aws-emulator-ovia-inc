@@ -27,6 +27,8 @@ mod account_vdm_attributes;
 mod boundary_validation_message;
 #[path = "all/cloud_watch_dimension_source.rs"]
 mod cloud_watch_dimension_source;
+#[path = "all/configuration_set_deletion.rs"]
+mod configuration_set_deletion;
 #[path = "all/configuration_set_event_destination_capacity.rs"]
 mod configuration_set_event_destination_capacity;
 #[path = "all/configuration_set_event_destination_ceiling.rs"]

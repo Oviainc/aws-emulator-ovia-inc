@@ -32,6 +32,9 @@ hex = { workspace = true }
 # its ONE grammar of a resource-based policy document, which a contact's resource policy is
 # read against before it is attached.
 service-common = { path = "../common" }
+# Resolves a rotation's `TimeZoneId` against the IANA time zone database it compiles in, so a
+# zone name the service cannot resolve is refused instead of stored.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
