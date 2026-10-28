@@ -36,6 +36,19 @@ the modelled `ResourceNotFoundException` (404) for an identifier naming no enabl
 `//! SCAFFOLDED, NOT IMPLEMENTED:` census line is deleted and
 `tests/all/enabled_baseline_update.rs` exercises it end to end over HTTP. Nothing is left
 to implement here: this report only needs closing, and the stub census (which no longer
-carries the operation) is the authority. `driftStatusSummary` and `parentIdentifier` are
-deliberately absent — this emulator assesses no inheritance drift and models no
-parent/child enablement, and the model makes both members optional.
+carries the operation) is the authority.
+
+## Closing note
+
+Two corrections to the paragraph above, as the handler stands today:
+
+- `driftStatusSummary` is NOT unconditionally absent. The handler reports it from the
+  `inheritanceDriftStatus` stored on the enablement and materialised by `settle`, so it is
+  present for an enablement of a drift-assessed baseline whose deployment the clock has
+  made due and absent otherwise (`tests/all/enabled_baseline_drift.rs` covers it).
+- `parentIdentifier` IS deliberately absent: every enablement this service holds is an
+  OU-level one, so none inherits from a parent, and the model makes the member optional.
+
+Closed with `tests/all/get_enabled_baseline.rs`, which pins the two rules that are this
+read's own — only the exact minted ARN names an enablement, and a read that names none
+changes nothing a later caller sees.

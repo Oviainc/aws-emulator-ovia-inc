@@ -37,7 +37,7 @@ use crate::resource_tags::{apply_tags, read_tags, reported_tags, resources, tags
 /// The substituted character is always `'0'` or `'1'`, both of which `Arn`'s
 /// `@pattern ^arn:aws[0-9a-zA-Z_\-:\/]+$` allows in the part after the literal prefix, so
 /// the mutant stays a value the front door passes and the handler is what refuses it.
-fn one_character_off(arn: &str) -> String {
+pub(crate) fn one_character_off(arn: &str) -> String {
     let mut characters: Vec<char> = arn.chars().collect();
     let last = characters
         .last()

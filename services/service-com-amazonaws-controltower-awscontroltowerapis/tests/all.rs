@@ -53,6 +53,8 @@ mod enabled_control_target_regions;
 mod enabled_control_update;
 #[path = "all/front_door_validation.rs"]
 mod front_door_validation;
+#[path = "all/get_enabled_baseline.rs"]
+mod get_enabled_baseline;
 #[path = "all/get_enabled_control.rs"]
 mod get_enabled_control;
 #[path = "all/in_flight_configuration_change_drift.rs"]
