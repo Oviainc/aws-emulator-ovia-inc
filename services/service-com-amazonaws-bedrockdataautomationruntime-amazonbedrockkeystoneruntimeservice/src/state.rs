@@ -407,6 +407,27 @@ pub fn timestamp_segment_refusal(
 /// in one place so the four readers cannot drift apart.
 pub const INVOCATION_NOT_FOUND_MESSAGE: &str = "Data Automation Invocation ARN not found.";
 
+/// What this service answers when a tag edit would take one invocation past [`MAX_TAGS`]
+/// — the message behind `ServiceQuotaExceededException` for `TagResource`.
+///
+/// Worded on the same rule as [`INVOCATION_NOT_FOUND_MESSAGE`] and
+/// [`invocation_quota_message`]: the bound this service enforces, and the kind of
+/// resource it is enforced on, with NOTHING taken from the request — the caller's
+/// `resourceARN` is not interpolated, because this service does not echo a request value
+/// back in a refusal.
+pub fn tag_quota_message() -> String {
+    format!("Cannot have more than {MAX_TAGS} tags on a data automation invocation")
+}
+
+/// What this service answers when it cannot admit one more invocation — the message
+/// behind `ServiceQuotaExceededException` for the two invoke operations.
+///
+/// Carries only [`MAX_INVOCATIONS`], this service's own constant; see
+/// [`tag_quota_message`] for the rule both quota refusals keep.
+pub fn invocation_quota_message() -> String {
+    format!("Cannot have more than {MAX_INVOCATIONS} data automation invocations in progress")
+}
+
 /// The most invocation records this emulator retains at once.
 ///
 /// Every `InvokeDataAutomationAsync` call persists one record, and one `clientToken`
