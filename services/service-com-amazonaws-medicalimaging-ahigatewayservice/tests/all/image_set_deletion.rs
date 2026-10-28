@@ -37,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
     service_state, ImageFrame, IMAGE_SET_COPY_DELAY, IMAGE_SET_DELETION_DELAY,
-    IMAGE_SET_NOT_ACTIVE_MESSAGE, IMAGE_SET_NOT_DELETABLE_MESSAGE,
+    IMAGE_SET_NOT_DELETABLE_MESSAGE,
 };
 
 use crate::datastore_lifecycle::{Answer, Emulator, SETTLE_MULTIPLE};
@@ -702,8 +702,9 @@ async fn a_delete_refused_under_a_copys_lock_is_admitted_once_the_clock_releases
 }
 
 /// RULE: a retired image set takes part in no further work, and a data store holds none
-/// of them — so the copy of a retired image set is the modelled conflict, and the data
-/// store whose image sets have all been retired is deletable.
+/// of them — so a copy of a retired image set finds the image set itself absent, the
+/// content it would have carried having gone with the deletion, and the data store whose
+/// image sets have all been retired is deletable.
 ///
 /// Rows span how many image sets the data store holds.
 #[tokio::test]
@@ -734,7 +735,10 @@ async fn retiring_every_image_set_frees_the_data_store() {
 
         tokio::time::sleep(SETTLE_MULTIPLE * IMAGE_SET_DELETION_DELAY).await;
 
-        // A retired image set is not copyable: it is not in the one state a copy admits.
+        // A retired image set is not copyable: its content went with the deletion, so what
+        // a copy of it finds absent is the image set — the answer every other call on an
+        // image set's content gives for the same record (`crate::image_set_copy_tombstones`
+        // is that rule's own suite).
         let copied = copy_image_set(
             &emulator,
             &datastore_id,
@@ -744,13 +748,13 @@ async fn retiring_every_image_set_frees_the_data_store() {
         )
         .await;
         assert_eq!(
-            copied.status, 409,
+            copied.status, 404,
             "case held={held}: a retired image set cannot be copied, got {copied:?}"
         );
         assert_eq!(
             copied.string(&["message"]),
-            IMAGE_SET_NOT_ACTIVE_MESSAGE,
-            "case held={held}: expected the not-active text, got {copied:?}"
+            IMAGE_SET_NOT_FOUND,
+            "case held={held}: expected the image-set-not-found text, got {copied:?}"
         );
 
         let deleted = emulator.delete_datastore(&datastore_id).await;
