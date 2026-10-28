@@ -21,6 +21,8 @@ mod anomalies_for_insight;
 mod anomalous_log_groups;
 #[path = "all/anomaly_reads.rs"]
 mod anomaly_reads;
+#[path = "all/app_boundary_key_prefix.rs"]
+mod app_boundary_key_prefix;
 #[path = "all/configuration_lifecycle.rs"]
 mod configuration_lifecycle;
 #[path = "all/cost_estimation.rs"]

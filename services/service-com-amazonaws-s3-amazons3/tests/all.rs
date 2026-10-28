@@ -183,6 +183,8 @@ mod object_write_tagging_header;
 mod objects;
 #[path = "all/presigned_object_reads.rs"]
 mod presigned_object_reads;
+#[path = "all/presigned_query_authentication.rs"]
+mod presigned_query_authentication;
 #[path = "all/published_refusal_wording.rs"]
 mod published_refusal_wording;
 #[path = "all/public_access_block_default.rs"]

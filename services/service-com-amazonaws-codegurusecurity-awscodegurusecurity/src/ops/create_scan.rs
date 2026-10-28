@@ -222,7 +222,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_millis();
         let mut store = state.lock();
         store.settle_due_runs(now);
-        store.expire_due_artifacts(now);
         // A client token stands for one request only while its window is open; once the
         // clock has closed it the token names nothing, so this request is a fresh one.
         store.expire_due_client_tokens(now);
@@ -314,7 +313,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `ResourceId$codeArtifactId` is documented as "Returned by `CreateUploadUrl`",
-        // so an id this service never minted names no resource.
+        // so an id this service never minted names no resource — and that is the ONLY
+        // reason this call resolves none: an id that was minted stays resolvable however
+        // long the caller took to come back with it, since nothing in the model gives a
+        // code artifact a lifetime.
         let Some(artifact) = store.upload_artifacts.get(&code_artifact_id).cloned() else {
             return Err(CreateScanErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

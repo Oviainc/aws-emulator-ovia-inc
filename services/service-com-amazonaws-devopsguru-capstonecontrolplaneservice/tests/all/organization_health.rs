@@ -166,7 +166,7 @@ fn fixture_insights() -> Vec<InsightRecord> {
         insight("p-open-1", PROACTIVE, ONGOING, None, &["alpha"], &[], &[]),
         insight("p-open-2", PROACTIVE, ONGOING, None, &["beta"], &[], &[]),
         insight("p-closed", PROACTIVE, CLOSED, Some(3_600_000), &["alpha"], &[], &[]),
-        insight("r-open-1", REACTIVE, ONGOING, None, &[], &[("boundary", "prod")], &[]),
+        insight("r-open-1", REACTIVE, ONGOING, None, &[], &[("Devops-guru-boundary", "prod")], &[]),
         insight("r-closed", REACTIVE, CLOSED, Some(7_200_000), &["beta"], &[], &[]),
     ]
 }
@@ -196,7 +196,7 @@ async fn administered_emulator() -> Emulator {
     cover(
         &emulator,
         &["alpha", "beta"],
-        &[("boundary", &["prod", "staging"])],
+        &[("Devops-guru-boundary", &["prod", "staging"])],
     )
     .await;
     emulator.seed_insights(fixture_insights());
@@ -238,7 +238,7 @@ async fn health_is_refused_to_a_caller_that_administers_no_organization() {
         for body in &bodies {
             let emulator = Emulator::new();
             if seeded {
-                cover(&emulator, &["alpha"], &[("boundary", &["prod"])]).await;
+                cover(&emulator, &["alpha"], &[("Devops-guru-boundary", &["prod"])]).await;
                 emulator.seed_insights(fixture_insights());
                 emulator.seed_anomalies(fixture_anomalies());
             }
@@ -307,7 +307,7 @@ async fn the_figures_are_the_tallies_over_the_store() {
         TallyCase {
             name: "tag coverage counts one resource per (key, value) pair",
             stacks: &[],
-            tag_entries: &[("boundary", &["prod", "staging", "dev"])],
+            tag_entries: &[("Devops-guru-boundary", &["prod", "staging", "dev"])],
             insights: vec![],
             anomalies: vec![],
             figures: expected(0, 0, 0, 3),
@@ -315,7 +315,7 @@ async fn the_figures_are_the_tallies_over_the_store() {
         TallyCase {
             name: "both halves of the coverage",
             stacks: &["alpha", "beta"],
-            tag_entries: &[("boundary", &["prod"])],
+            tag_entries: &[("Devops-guru-boundary", &["prod"])],
             insights: vec![],
             anomalies: vec![],
             figures: expected(0, 0, 0, 3),
@@ -383,7 +383,7 @@ async fn the_figures_are_the_tallies_over_the_store() {
         TallyCase {
             name: "every set non-empty at once: the fixture store",
             stacks: &["alpha", "beta"],
-            tag_entries: &[("boundary", &["prod", "staging"])],
+            tag_entries: &[("Devops-guru-boundary", &["prod", "staging"])],
             insights: fixture_insights(),
             anomalies: fixture_anomalies(),
             figures: fixture_figures(),
@@ -562,7 +562,7 @@ async fn the_report_agrees_with_the_account_health_read_over_the_same_store() {
         (
             "the fixture store",
             &["alpha", "beta"],
-            &[("boundary", &["prod", "staging"])],
+            &[("Devops-guru-boundary", &["prod", "staging"])],
             fixture_insights(),
             fixture_anomalies(),
         ),

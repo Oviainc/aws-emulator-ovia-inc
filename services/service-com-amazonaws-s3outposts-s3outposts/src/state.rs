@@ -775,23 +775,30 @@ fn s3_provisioned_outpost(
     OutpostRecord::provisioned(outpost_id, owner_id, capacity_in_bytes, &record.region)
 }
 
-/// The Outpost `outpost_id` as it is reached from `region`, or `None` when the
-/// inventory holds no such Outpost in that Region.
+/// The Outpost `outpost_id` as it is reached from `region`, or the modelled
+/// refusal when the inventory holds no such Outpost in that Region.
 ///
 /// An `OutpostId` names one Outpost, which sits in one home Region, so an
 /// Outpost of another Region resolves to nothing here: every reference a
 /// request makes to an Outpost — creating an endpoint on it, listing its
-/// endpoints, deleting one — goes through this lookup, so a resource of
+/// endpoints, deleting one — goes through this ONE resolution, so a resource of
 /// another Region is the modelled 404 rather than something this Region's
 /// endpoint serves.
-pub fn outpost_in<'a>(
+///
+/// The refusal itself lives here rather than once per handler, exactly as
+/// [`list_cursor`]'s does: resolving the Outpost is the whole of what the
+/// handlers taking an `OutpostId` share, so each caller only lifts the payload
+/// ([`not_found`]) into its own error enum and reads what it needs — the home
+/// Region, say — off the record this hands back.
+pub fn resolve_outpost<'a>(
     inventory: &'a OutpostInventory,
     region: &str,
     outpost_id: &str,
-) -> Option<&'a OutpostRecord> {
+) -> Result<&'a OutpostRecord, ResourceNotFoundException> {
     inventory
         .get(outpost_id)
         .filter(|outpost| outpost.region == region)
+        .ok_or_else(not_found)
 }
 
 /// The home Region of the Outpost `outpost_id`, or `None` when the inventory holds

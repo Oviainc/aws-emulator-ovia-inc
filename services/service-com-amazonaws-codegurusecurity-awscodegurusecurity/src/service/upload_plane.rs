@@ -31,9 +31,19 @@
 //! target promises to. What this emulator retains of it is bounded instead of the upload
 //! being refused (see [`crate::state::UploadedResource`]). Two size bounds remain: the
 //! published maximum of one `PUT` ([`crate::state::S3_SINGLE_PUT_MAX_BYTES`]) and what
-//! this process takes in one upload ([`crate::state::UPLOAD_ACCEPTED_MAX_BYTES`]), both
-//! read off the DECLARED length before the body is touched, so neither costs an
-//! allocation.
+//! this process holds against one target ([`crate::state::UPLOAD_ACCEPTED_MAX_BYTES`]).
+//! Both are judged twice, and the second judgement is the authority:
+//!
+//! * on the length the request DECLARES, which is why an upload declaring no length this
+//!   plane can read is refused rather than taken on trust — a `PUT` of an object states
+//!   its `Content-Length`, so a refusal costs a header parse;
+//! * then on the length that actually ARRIVED, for a request that declared one length and
+//!   sent another.
+//!
+//! Neither judgement decides whether the archive is READ: the framework materialises a
+//! request before it dispatches one, so by the time this function is reached the body is
+//! already in memory and a bound on what one request may buffer belongs to that layer,
+//! not here. What these bounds decide is what the store HOLDS.
 //!
 //! Every other method on this path space is refused: the published URL describes an
 //! upload, and answering a read on it would serve a resource the URL grants no read of.
@@ -58,15 +68,26 @@ const ERROR_CONTENT_TYPE: &str = "application/json";
 const METHOD_NOT_ALLOWED_MESSAGE: &str = "This upload target is written with PUT";
 
 /// What this plane says when the path names no upload target of this account — an
-/// artifact this emulator never minted, one whose lifetime has ended, or a path that
-/// crosses one artifact's identifier with another scan name or account. One sentence
-/// carrying nothing from the request.
+/// artifact this emulator never minted, or a path that crosses one artifact's identifier
+/// with another scan name or account. One sentence carrying nothing from the request.
 const NO_SUCH_TARGET_MESSAGE: &str = "The specified upload target does not exist";
+
+/// What this plane says to an upload offered after the signature window of the published
+/// pre-signed URL has closed — the answer a pre-signed S3 URL gives once its signature is
+/// no longer valid. The target and its code artifact are untouched: only the write is
+/// refused.
+const REQUEST_EXPIRED_MESSAGE: &str = "Request has expired";
 
 /// What this plane says when the body could not be read at all. The router buffers every
 /// request before dispatch, so a body it cannot hand back in memory is a failure of the
 /// server, never a caller's malformed upload.
 const UNREADABLE_BODY_MESSAGE: &str = "The server could not read the uploaded resource";
+
+/// What this plane says to a `PUT` that declares no length this plane can read: the
+/// answer S3 gives a `PUT` carrying no `Content-Length`, whose code is
+/// `MissingContentLength` (HTTP 411). Requiring the declaration is also what keeps the
+/// size bounds of this plane judgeable from the headers rather than from the archive.
+const MISSING_CONTENT_LENGTH_MESSAGE: &str = "You must provide the Content-Length HTTP header";
 
 /// What this plane says when this service's store is not reachable.
 const STORE_UNAVAILABLE_MESSAGE: &str = "The CodeGuru Security store is unavailable";
@@ -86,13 +107,14 @@ pub fn serve<Eng: Send + Sync + 'static>(
     if req.method() != "PUT" {
         return refusal(405, "MethodNotAllowed", METHOD_NOT_ALLOWED_MESSAGE);
     }
-    // The DECLARED length is judged first, before the body is read at all: an upload past
-    // a size bound of this plane is then refused without the archive being touched, so
-    // reaching a bound costs a header parse rather than a copy of the request.
-    if let Some(declared) = declared_length(req) {
-        if let Some(max) = crate::state::upload_size_bound_exceeded(declared) {
-            return too_large(max);
-        }
+    // The DECLARED length is judged first, so an upload stating a size past a bound of
+    // this plane is refused from its headers, and one stating no size this plane can read
+    // is refused rather than taken on trust.
+    let Some(declared) = declared_length(req) else {
+        return refusal(411, "MissingContentLength", MISSING_CONTENT_LENGTH_MESSAGE);
+    };
+    if let Some(max) = crate::state::upload_size_bound_exceeded(declared) {
+        return too_large(max);
     }
     let Some(body) = req.body().bytes() else {
         return refusal(500, "InternalFailure", UNREADABLE_BODY_MESSAGE);
@@ -100,9 +122,10 @@ pub fn serve<Eng: Send + Sync + 'static>(
     let Some(state) = crate::state::service_state(engine) else {
         return refusal(500, "InternalServerException", STORE_UNAVAILABLE_MESSAGE);
     };
-    // And the same bounds on what actually arrived, for an upload that declared no length
-    // or declared one it did not send: the length of the body is the authority on the size
-    // of the archive, and no work proportional to it happens before this.
+    // And the same bounds on what actually arrived, which is the authority: a declaration
+    // is a claim, and this is the length of the archive the store would hold. The body was
+    // materialised by the framework before this function was reached (see this module's
+    // header), so what this refusal keeps bounded is the store, not the buffer.
     if let Some(max) =
         crate::state::upload_size_bound_exceeded(u64::try_from(body.len()).unwrap_or(u64::MAX))
     {
@@ -124,12 +147,14 @@ pub fn serve<Eng: Send + Sync + 'static>(
     match outcome {
         UploadOutcome::Stored => stored(),
         UploadOutcome::NoSuchTarget => refusal(404, "NoSuchKey", NO_SUCH_TARGET_MESSAGE),
+        UploadOutcome::UrlExpired => refusal(403, "AccessDenied", REQUEST_EXPIRED_MESSAGE),
     }
 }
 
 /// The length the request declares for the archive, when it declares one this plane can
 /// read as a byte count. A header is caller-controlled text, so a value that is not a
-/// plain byte count is simply not a declaration and the body itself is judged instead.
+/// plain byte count is not a declaration at all and the upload carrying it is refused
+/// ([`MISSING_CONTENT_LENGTH_MESSAGE`]) rather than measured after the fact.
 fn declared_length(req: &RtRequest) -> Option<u64> {
     req.headers()
         .get(::http::header::CONTENT_LENGTH.as_str())

@@ -19,7 +19,7 @@ use service_com_amazonaws_codegurusecurity_awscodegurusecurity::state::{
     EXPRESS_SCAN_SETTLE_MILLIS, QUOTA_CODE_RUNS, QUOTA_CODE_SCANS, QUOTA_CODE_UPLOAD_ARTIFACTS,
     RUNS_PER_SCAN_QUOTA, SCAN_QUOTA, SCAN_STATE_FAILED, SCAN_STATE_IN_PROGRESS,
     SCAN_STATE_SUCCESSFUL, SCAN_TYPE_EXPRESS, SCAN_TYPE_STANDARD, STANDARD_SCAN_SETTLE_MILLIS,
-    UPLOAD_ARTIFACT_QUOTA, UPLOAD_ARTIFACT_TTL_MILLIS,
+    UPLOAD_ARTIFACT_QUOTA, UPLOAD_URL_SIGNATURE_WINDOW_MILLIS,
 };
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1011,7 +1011,7 @@ async fn each_caller_driven_store_refuses_growth_past_its_quota() {
                     s3_url: cgs_state::upload_url(REGION, "seeded", &format!("seed-{index}")),
                     request_headers: BTreeMap::new(),
                     created_at_millis: now,
-                    expires_at_millis: now + UPLOAD_ARTIFACT_TTL_MILLIS,
+                    url_expires_at_millis: now + UPLOAD_URL_SIGNATURE_WINDOW_MILLIS,
                     upload: None,
                 });
             }
@@ -1099,39 +1099,6 @@ async fn each_caller_driven_store_refuses_growth_past_its_quota() {
             Some(QUOTA_CODE_RUNS),
             "CreateScan at the revision quota: the refusal must name the quota, got {}",
             refused.json
-        );
-    }
-
-    // 4. a minted upload target is released once its lifetime has passed, so an
-    //    artifact nobody scanned does not hold a slot for ever.
-    {
-        let (engine, router) = harness();
-        let scan_name = "expired-artifact";
-        let expired = "11111111-2222-3333-4444-555555555555";
-        {
-            let store = store_of(&engine);
-            let mut guard = store.lock();
-            guard.record_artifact(UploadArtifact {
-                code_artifact_id: expired.to_string(),
-                scan_name: scan_name.to_string(),
-                s3_url: cgs_state::upload_url(REGION, scan_name, expired),
-                request_headers: BTreeMap::new(),
-                created_at_millis: now - UPLOAD_ARTIFACT_TTL_MILLIS - 1,
-                expires_at_millis: now - 1,
-                upload: None,
-            });
-        }
-        let refused = create_scan(&router, json!({ "scanName": scan_name }), expired).await;
-        assert_eq!(
-            refused.status, 404,
-            "CreateScan on an expired upload target: expected 404 ResourceNotFoundException, \
-             got {} {}",
-            refused.status, refused.json
-        );
-        let store = store_of(&engine);
-        assert!(
-            store.lock().upload_artifacts.is_empty(),
-            "the expired artifact must have been released from the store"
         );
     }
 }

@@ -13,16 +13,19 @@
 //! Each store a request can grow carries an explicit maximum, enforced in the handler
 //! that writes it, so no sequence of requests can grow the emulator's heap without end:
 //!
-//! * [`UPLOAD_ARTIFACT_QUOTA`] caps `upload_artifacts`, and an artifact also expires
-//!   [`UPLOAD_ARTIFACT_TTL_MILLIS`] after it was minted ([`Store::expire_due_artifacts`]).
+//! * [`UPLOAD_ARTIFACT_QUOTA`] caps `upload_artifacts`. A recorded artifact is NOT
+//!   released on the clock: the window in which the published target accepts an upload
+//!   does close ([`UPLOAD_URL_SIGNATURE_WINDOW_MILLIS`]), but the artifact record behind
+//!   it stays, because `codeArtifactId` is an identifier a later call resolves and the
+//!   quota alone is what bounds the store.
 //! * an upload to a minted target is ACCEPTED whatever the size of a code archive, and
 //!   the bound sits on the RETAINED side instead: [`Store::receive_upload`], the only
 //!   writer of uploaded bytes, records the archive's length and a digest of all of its
 //!   bytes and keeps at most [`UPLOAD_RETAINED_PREFIX_MAX_BYTES`] of its content, so what
 //!   every target holds together cannot exceed that times [`UPLOAD_ARTIFACT_QUOTA`]. One
-//!   upload is bounded too, by what this process can hold at once
-//!   ([`UPLOAD_ACCEPTED_MAX_BYTES`], read off the declared length before the body is
-//!   touched), which is far above any archive a scan is run on.
+//!   upload is bounded too, by [`UPLOAD_ACCEPTED_MAX_BYTES`] — judged on the declared
+//!   length and then on the length that arrived — which is far above any archive a scan is
+//!   run on.
 //! * [`SCAN_QUOTA`] caps `scans`, and [`RUNS_PER_SCAN_QUOTA`] caps the runs of one scan,
 //!   so the (scans x runs) product is bounded.
 //! * [`TAGS_PER_SCAN_QUOTA`] caps the tags of one scan, enforced in every writer of the
@@ -36,9 +39,8 @@
 //!   the readers' page sizes are clamped to the modelled `maxResults` maxima.
 //!
 //! Per-request CPU is bounded too: the clock-owed work the readers do is driven by the
-//! `pending_runs` / `artifact_expiry` / `idempotency_expiry` due-queues, so each call
-//! touches only the entries that actually came due rather than walking everything earlier
-//! requests stored.
+//! `pending_runs` / `idempotency_expiry` due-queues, so each call touches only the
+//! entries that actually came due rather than walking everything earlier requests stored.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -120,17 +122,26 @@ pub const ERROR_CODE_INVALID_FINDING_ID: &str = "INVALID_FINDING_ID";
 /// `serviceCode` of a quota refusal.
 pub const SERVICE_CODE: &str = "codeguru-security";
 
-/// The most code artifacts this emulator keeps minted at once. A quota, not a fidelity
-/// claim: it is what stops `CreateUploadUrl` growing the store without end. Reached, the
-/// call is refused with the modelled `ThrottlingException` (HTTP 429) carrying
-/// [`QUOTA_CODE_UPLOAD_ARTIFACTS`].
+/// The most code artifacts this emulator keeps at once. A quota, not a fidelity claim:
+/// it is what stops `CreateUploadUrl` growing the store without end, and it is the ONLY
+/// bound on that store — a recorded artifact holds its slot for as long as the account
+/// holds it, because the identifier it was handed out under has to keep resolving (see
+/// [`UPLOAD_URL_SIGNATURE_WINDOW_MILLIS`]). Reached, the call is refused with the modelled
+/// `ThrottlingException` (HTTP 429) carrying [`QUOTA_CODE_UPLOAD_ARTIFACTS`].
 pub const UPLOAD_ARTIFACT_QUOTA: usize = 1_000;
 
-/// How long a minted upload target stays usable. CHOSEN, not documented: AWS publishes
-/// no lifetime for `CreateUploadUrl`'s pre-signed URL, only that it IS pre-signed, and a
-/// pre-signed S3 URL is always time-limited. Expiry is driven from the recorded
-/// `created_at_millis`, so an artifact nobody scanned is released rather than kept.
-pub const UPLOAD_ARTIFACT_TTL_MILLIS: i64 = 15 * 60 * 1_000;
+/// How long the target `CreateUploadUrl` publishes accepts an upload: the signature
+/// window of the pre-signed URL, and NOTHING ELSE.
+///
+/// The span is CHOSEN, not documented: AWS publishes no window for `CreateUploadUrl`'s
+/// URL, only that it IS pre-signed, and a pre-signed S3 URL is always time-limited.
+///
+/// What closing the window does NOT do is end the code artifact's existence. Its
+/// identifier is documented only as "Returned by `CreateUploadUrl` when you upload
+/// resources to be scanned" (`ResourceId$codeArtifactId`), with no lifetime of its own, so
+/// a minted `codeArtifactId` stays resolvable for `CreateScan` however long the caller
+/// takes between uploading its resource and starting a scan on it.
+pub const UPLOAD_URL_SIGNATURE_WINDOW_MILLIS: i64 = 15 * 60 * 1_000;
 
 /// The most scans this emulator keeps at once; see [`UPLOAD_ARTIFACT_QUOTA`].
 pub const SCAN_QUOTA: usize = 1_000;
@@ -335,14 +346,16 @@ pub fn exceeds_single_put_maximum(byte_count: u64) -> bool {
 
 /// The most bytes this emulator takes in ONE upload to a published target.
 ///
-/// CHOSEN, not a published AWS limit, and a bound on this PROCESS rather than on the
-/// archive a scan may be run on: the server holds a request body in memory in full before
-/// any handler sees it, so an upload this emulator would have to materialise in one piece
-/// has to be bounded for the process to survive it. It is therefore set far above the
-/// whole zipped source trees CodeGuru Security is run on — a repository archive of tens of
-/// megabytes is accepted, and so is one an order of magnitude larger — and the declared
-/// length is read before the body is touched ([`upload_size_bound_exceeded`]), so reaching
-/// it costs no allocation.
+/// CHOSEN, not a published AWS limit, and a bound on what this emulator HOLDS against one
+/// target rather than on the archive a scan may be run on. It is set far above the whole
+/// zipped source trees CodeGuru Security is run on — a repository archive of tens of
+/// megabytes is accepted, and so is one an order of magnitude larger.
+///
+/// It is judged on the declared length first ([`upload_size_bound_exceeded`]), so an
+/// upload that states a size past it is refused from its headers, and then on the length
+/// that actually arrived. Neither judgement is what keeps the request out of memory: the
+/// server materialises a request body in full before any handler sees it, so a bound on
+/// what ONE request may buffer belongs to that layer.
 pub const UPLOAD_ACCEPTED_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The size bound an upload of `byte_count` bytes is past, or `None` when it is within
@@ -375,9 +388,10 @@ pub struct UploadArtifact {
     pub request_headers: BTreeMap<String, String>,
     /// Epoch milliseconds at which the artifact was minted.
     pub created_at_millis: i64,
-    /// Epoch milliseconds at which the minted target expires; see
-    /// [`UPLOAD_ARTIFACT_TTL_MILLIS`].
-    pub expires_at_millis: i64,
+    /// Epoch milliseconds at which the published URL stops accepting an upload — the end
+    /// of its signature window ([`UPLOAD_URL_SIGNATURE_WINDOW_MILLIS`]), and not a
+    /// lifetime of this record: the artifact stays resolvable past it.
+    pub url_expires_at_millis: i64,
     /// The code resource uploaded to this artifact's target, once it has been, and `None`
     /// while the caller has uploaded nothing. The SINGLE copy of the uploaded bytes: a
     /// scan run resolves the resource it was started on through this record.
@@ -598,12 +612,10 @@ impl Scan {
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// Code artifacts minted by `CreateUploadUrl`, keyed by `codeArtifactId`. Bounded by
-    /// [`UPLOAD_ARTIFACT_QUOTA`] and by [`UPLOAD_ARTIFACT_TTL_MILLIS`].
+    /// [`UPLOAD_ARTIFACT_QUOTA`], and by nothing else: an entry is never dropped on the
+    /// clock, so an identifier this service handed out resolves for as long as the
+    /// account holds it.
     pub upload_artifacts: HashMap<String, UploadArtifact>,
-    /// `(expires_at_millis, codeArtifactId)` of every artifact still minted: the
-    /// due-queue [`Self::expire_due_artifacts`] walks, so releasing expired artifacts
-    /// costs only what actually expired.
-    pub artifact_expiry: BTreeSet<(i64, String)>,
     /// Scans, keyed by `scanName`. A `BTreeMap`, so `ListScans` walks them in one
     /// stable order and a page token resumes exactly where the previous page stopped.
     /// Bounded by [`SCAN_QUOTA`].
@@ -629,8 +641,8 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// window has closed costs only what actually closed.
     pub idempotency_expiry: BTreeSet<(i64, String)>,
     /// How many bytes of uploaded content the resources of `upload_artifacts` retain in
-    /// total, kept in step with every write and release so the figure is available
-    /// without walking the store. Bounded by [`UPLOAD_ARTIFACT_QUOTA`] times
+    /// total, kept in step with every write so the figure is available without walking
+    /// the store. Bounded by [`UPLOAD_ARTIFACT_QUOTA`] times
     /// [`UPLOAD_RETAINED_PREFIX_MAX_BYTES`], whatever sizes were uploaded.
     pub upload_bytes_held: usize,
     /// The account's configuration record, absent until the account is onboarded to
@@ -698,20 +710,6 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         }
     }
 
-    /// Release every minted upload target whose lifetime the clock has already ended at
-    /// `now_millis`. Driven off the `artifact_expiry` due-queue, so the work is
-    /// proportional to what expired.
-    pub fn expire_due_artifacts(&mut self, now_millis: i64) {
-        let horizon = (now_millis.saturating_add(1), String::new());
-        let due: Vec<(i64, String)> = self.artifact_expiry.range(..horizon).cloned().collect();
-        for key in due {
-            self.artifact_expiry.remove(&key);
-            if let Some(released) = self.upload_artifacts.remove(&key.1) {
-                self.release_upload_bytes(&released);
-            }
-        }
-    }
-
     /// Forget every client token whose window the clock has already closed at
     /// `now_millis`, so the next `CreateScan` carrying it is a fresh request rather than a
     /// replay of one made arbitrarily long ago. Driven off the `idempotency_expiry`
@@ -743,15 +741,6 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         self.idempotency_expiry.insert(key);
     }
 
-    /// Take the bytes a released artifact retained out of the retained total.
-    fn release_upload_bytes(&mut self, released: &UploadArtifact) {
-        if let Some(upload) = &released.upload {
-            self.upload_bytes_held = self
-                .upload_bytes_held
-                .saturating_sub(upload.retained_prefix.len());
-        }
-    }
-
     /// Receive one upload to a minted target: hold `received` as the code resource of the
     /// artifact `target` names.
     ///
@@ -759,8 +748,11 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// later caller agree on what a target holds:
     ///
     /// * every part of the published URL must agree with the recorded artifact — an
-    ///   artifact this store no longer holds (its lifetime ended), or a path that crosses
-    ///   one artifact's id with another scan's name or another account, names no target;
+    ///   artifact this store does not hold, or a path that crosses one artifact's id with
+    ///   another scan's name or another account, names no target;
+    /// * the published URL is pre-signed, so it accepts an upload only inside its
+    ///   signature window ([`UPLOAD_URL_SIGNATURE_WINDOW_MILLIS`]): past that the target
+    ///   still exists and still names its artifact, and only this write is refused;
     /// * the archive is accepted whatever its size — what is held of it is the accounting
     ///   [`UploadedResource::received`] already computed, so a large upload is stored
     ///   rather than refused;
@@ -775,9 +767,6 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         target: &UploadTarget,
         received: UploadedResource,
     ) -> UploadOutcome {
-        // The targets whose lifetime the clock has already ended are released first, so an
-        // expired target is not written to.
-        self.expire_due_artifacts(received.received_at_millis);
         let held = self
             .upload_artifacts
             .get(&target.code_artifact_id)
@@ -786,6 +775,11 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         let Some(artifact) = held else {
             return UploadOutcome::NoSuchTarget;
         };
+        // A pre-signed URL is only honoured while its signature is valid. The artifact
+        // itself is untouched: what the window governs is this write, not the record.
+        if received.received_at_millis > artifact.url_expires_at_millis {
+            return UploadOutcome::UrlExpired;
+        }
         let already = artifact
             .upload
             .as_ref()
@@ -858,10 +852,8 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         config.encryption_kms_key_arn.clone()
     }
 
-    /// Record a minted upload target, registering its expiry.
+    /// Record a minted upload target.
     pub fn record_artifact(&mut self, artifact: UploadArtifact) {
-        self.artifact_expiry
-            .insert((artifact.expires_at_millis, artifact.code_artifact_id.clone()));
         self.upload_artifacts
             .insert(artifact.code_artifact_id.clone(), artifact);
     }
@@ -1270,8 +1262,12 @@ pub fn parse_upload_path(path: &str) -> Option<UploadTarget> {
 pub enum UploadOutcome {
     /// The resource is now held against the code artifact the target names.
     Stored,
-    /// The target names no code artifact of this account, or no longer does.
+    /// The target names no code artifact of this account.
     NoSuchTarget,
+    /// The target names a code artifact of this account, but the signature window of the
+    /// published URL has closed, so this write is not honoured; see
+    /// [`UPLOAD_URL_SIGNATURE_WINDOW_MILLIS`].
+    UrlExpired,
 }
 
 /// The region a value this service reports or publishes may name: `region` when it has a

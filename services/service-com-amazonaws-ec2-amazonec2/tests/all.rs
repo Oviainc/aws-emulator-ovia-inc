@@ -361,6 +361,11 @@ mod fpga_image_tasks_and_volume_io;
 mod create_restore_image_task;
 #[path = "all/get_password_data.rs"]
 mod get_password_data;
+// The security groups a network interface in one VPC can be given: the groups created in it,
+// the groups another VPC's association makes usable there, the filters that narrow the report
+// and the refusals.
+#[path = "all/get_security_groups_for_vpc.rs"]
+mod get_security_groups_for_vpc;
 // The JPG-format console screenshot `GetConsoleScreenshot` reports for one instance, what it
 // refuses, and what `DryRun` and `WakeUp` do to it. Declared beside the suite above rather
 // than in sorted position, for the reason this file's header note gives: the sorted

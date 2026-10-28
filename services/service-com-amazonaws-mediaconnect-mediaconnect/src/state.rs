@@ -3124,11 +3124,15 @@ pub const ROUTER_OUTPUT_STATE_RECOVERING: &str = "RECOVERING";
 /// (`smithy_query(query="shape",shape="RouterOutputRoutedState")`: ROUTED | ROUTING |
 /// UNROUTED). A router output is ROUTED exactly while a router input is routed to it
 /// (`RouterOutput$RoutedInputArn`), and UNROUTED otherwise — see
-/// [`StoredRouterOutput::routed_state`]. `ROUTING` is the transient state of the call that
-/// takes an input (TakeRouterInput), which is still scaffolded.
+/// [`StoredRouterOutput::routed_state`].
 pub const ROUTED_STATE_ROUTED: &str = "ROUTED";
 /// See [`ROUTED_STATE_ROUTED`].
 pub const ROUTED_STATE_UNROUTED: &str = "UNROUTED";
+/// See [`ROUTED_STATE_ROUTED`]. The NON-TERMINAL routed state: TakeRouterInput answers
+/// `202 Accepted`, so the association it recorded is not carrying content the instant it
+/// answers, and the clock settles the output into the routed state the association owes it
+/// one [`TRANSITION_SPAN`] later ([`StoredRouterOutput::begin_route`]).
+pub const ROUTED_STATE_ROUTING: &str = "ROUTING";
 
 /// The `RouterOutputType` enum the model declares
 /// (`smithy_query(query="shape",shape="RouterOutputType")`: STANDARD | MEDIACONNECT_FLOW |
@@ -4300,9 +4304,17 @@ pub struct StoredRouterOutput {
     /// The state change the clock owes this output, if any. See [`Self::settle`].
     pub pending: Option<PendingStatus>,
     /// `RouterOutput$RoutedInputArn`: the router input currently routed to this output, or
-    /// `None` while nothing is. Only TakeRouterInput sets it, which is still scaffolded, so
-    /// a created output is UNROUTED.
+    /// `None` while nothing is. TakeRouterInput is the one call that sets it (and the one
+    /// that clears it, by naming no input), so a created output is UNROUTED.
+    ///
+    /// It names a router input the store HOLDS: once the clock completes the deletion of
+    /// that input the association goes with it
+    /// ([`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`]), so no output
+    /// reports a route into an input no later caller can read.
     pub routed_input_arn: Option<String>,
+    /// When the routed state this output's association owes it comes into effect, or `None`
+    /// while the clock owes it none. See [`Self::begin_route`].
+    pub routing_due_at: Option<SystemTime>,
     /// `RouterOutput$Messages`: the messages the service has recorded about this output. A
     /// freshly created output has none, and the operations that record one are still
     /// scaffolded — the member is reported from here either way, never as a literal.
@@ -4358,6 +4370,12 @@ impl StoredRouterOutput {
                 self.pending = Some(pending);
             }
         }
+        // The routed state an accepted association owes this output is due at its own
+        // instant too: once it has passed, the output is settled in the routed state its
+        // `RoutedInputArn` reports ([`Self::routed_state`]) rather than still `ROUTING`.
+        if self.routing_due_at.is_some_and(|due_at| now >= due_at) {
+            self.routing_due_at = None;
+        }
         if self
             .maintenance_schedule
             .as_ref()
@@ -4368,6 +4386,22 @@ impl StoredRouterOutput {
                 now,
             ));
         }
+    }
+
+    /// Record the association `routed_input_arn` names — the router input routed to this
+    /// output, or none at all — and owe the routed state it settles into once
+    /// [`TRANSITION_SPAN`] has passed.
+    ///
+    /// The routed-state counterpart of [`Self::begin_transition`], which moves the output's
+    /// own lifecycle state instead: TakeRouterInput answers `202 Accepted`, so the
+    /// association is reported in the non-terminal `ROUTING` until the clock settles it, and
+    /// a caller that reads the output straight after the call still sees the take in flight.
+    /// The association is a change to the record, so `updated_at` moves with it as it does
+    /// for every other mutation.
+    pub fn begin_route(&mut self, routed_input_arn: Option<String>, now: SystemTime) {
+        self.routed_input_arn = routed_input_arn;
+        self.routing_due_at = Some(now + TRANSITION_SPAN);
+        self.updated_at = now;
     }
 
     /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed — the
@@ -4446,10 +4480,17 @@ impl StoredRouterOutput {
         self.routed_input_arn.is_some()
     }
 
-    /// `RouterOutput$RoutedState`: ROUTED exactly while a router input is routed to this
-    /// output, UNROUTED otherwise.
+    /// `RouterOutput$RoutedState`: ROUTING while the clock still owes the association an
+    /// accepted take recorded, then ROUTED exactly while a router input is routed to this
+    /// output and UNROUTED otherwise.
+    ///
+    /// Every read of a router output materialises what the clock already made due first
+    /// ([`Self::settle`]), so the transient value is reported for exactly as long as the
+    /// association is in flight.
     pub fn routed_state(&self) -> &'static str {
-        if self.is_routed() {
+        if self.routing_due_at.is_some() {
+            ROUTED_STATE_ROUTING
+        } else if self.is_routed() {
             ROUTED_STATE_ROUTED
         } else {
             ROUTED_STATE_UNROUTED
@@ -5330,6 +5371,21 @@ impl ComAmazonawsMediaconnectMediaconnectState {
             .retain(|_, router_output| !router_output.is_removal_due(now));
         self.router_network_interfaces
             .retain(|_, interface| !interface.is_removal_due(now));
+        // A route names a router input the store HOLDS: an input the clock has just taken
+        // away carries content into nothing, so the association TakeRouterInput recorded
+        // goes with it and the outputs that named it are UNROUTED again. Owed at the same
+        // instant as the removal above, whether or not anybody called.
+        let router_inputs = &self.router_inputs;
+        for router_output in self.router_outputs.values_mut() {
+            if router_output
+                .routed_input_arn
+                .as_ref()
+                .is_some_and(|input_arn| !router_inputs.contains_key(input_arn))
+            {
+                router_output.routed_input_arn = None;
+                router_output.routing_due_at = None;
+            }
+        }
     }
 
     /// Whether this account holds an ACTIVE reservation at `now` — the condition
