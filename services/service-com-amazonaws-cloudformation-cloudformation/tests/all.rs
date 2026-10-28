@@ -17,6 +17,8 @@ mod account_limits;
 mod agentcore_stack_outputs;
 #[path = "all/appconfig_resource_types.rs"]
 mod appconfig_resource_types;
+#[path = "all/bucket_analytics_configurations.rs"]
+mod bucket_analytics_configurations;
 #[path = "all/bucket_notification_configuration.rs"]
 mod bucket_notification_configuration;
 #[path = "all/callback_signature.rs"]

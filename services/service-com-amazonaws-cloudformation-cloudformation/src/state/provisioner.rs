@@ -2966,7 +2966,8 @@ async fn read_domain(
 const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// Create the bucket an `AWS::S3::Bucket` declares, and apply the
-/// `VersioningConfiguration`, the `NotificationConfiguration` and the tags it carries.
+/// `VersioningConfiguration`, the `NotificationConfiguration`, the
+/// `AnalyticsConfigurations` and the tags it carries.
 ///
 /// "Ref returns the bucket name" for this type, so the physical resource id the stack
 /// reports IS the bucket a client addresses, and it is the bucket created here.
@@ -2977,9 +2978,12 @@ const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 /// A bucket's sub-resource configurations are not members of `CreateBucket` at all: each is
 /// applied by the one call Amazon S3 publishes for it, made here on the created bucket, so a
 /// read of that sub-resource straight after the stack completes reports what the template
-/// declared. `VersioningConfiguration` is a `PutBucketVersioning` and the whole
+/// declared. `VersioningConfiguration` is a `PutBucketVersioning`, the whole
 /// `NotificationConfiguration` is a `PutBucketNotificationConfiguration`
-/// ([`declared_notification_configuration`]).
+/// ([`declared_notification_configuration`]), and each entry of `AnalyticsConfigurations` is
+/// one `PutBucketAnalyticsConfiguration` ([`declared_analytics_configurations`]) — the call
+/// Amazon S3 publishes for ONE analytics configuration, since the property is a list keyed
+/// by `Id` and the API takes one id per call.
 ///
 /// `CreateBucket` takes no tag set at all, so the bucket's tags are a `PutBucketTagging` of
 /// its own — "sets the tags for a bucket", the one call S3 publishes for them — carrying
@@ -3053,9 +3057,23 @@ async fn create_bucket(
             .await
             .map_err(|error| refusal_of(&error))?;
     }
+    // "AnalyticsConfigurations — specifies the configuration and any analyses for the
+    // analytics filter of an Amazon S3 bucket" (this type's own property): the property is a
+    // LIST keyed by `Id` and `PutBucketAnalyticsConfiguration` sets the configuration "for
+    // the bucket (specified by the analytics configuration ID)", so each declared entry is
+    // installed by its own call under the id it names.
+    for (id, configuration) in declared_analytics_configurations(resource)? {
+        client
+            .put_bucket_analytics_configuration()
+            .bucket(bucket)
+            .id(id)
+            .analytics_configuration(configuration)
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
     // The bucket's whole tag set, in the one call Amazon S3 takes it through.
-    let tags = tags_of(&resource.properties, propagated);
-    if !tags.is_empty() {
+    let tags = tags_of(&resource.properties, propagated);    if !tags.is_empty() {
         let mut tag_set = Vec::with_capacity(tags.len());
         for (key, value) in &tags {
             tag_set.push(
@@ -3302,6 +3320,226 @@ fn declared_notification_configuration(
     ))
 }
 
+/// The property an `AWS::S3::Bucket` declares its storage class analyses under.
+const ANALYTICS_CONFIGURATIONS: &str = "AnalyticsConfigurations";
+
+/// Every analytics configuration a bucket's declaration states, each paired with the `Id`
+/// that identifies it — the `(Id, AnalyticsConfiguration)` pair one
+/// `PutBucketAnalyticsConfiguration` takes. A declaration stating none yields none, which is
+/// the state a bucket is created in.
+///
+/// The template's spelling differs from the API's in two ways, and this is the one place they
+/// are reconciled. The object scope travels as the two FLAT properties `Prefix` and
+/// `TagFilters` where the API takes the single `Filter` union ([`analytics_filter`]), and the
+/// export destination travels FLAT as `{ BucketArn, BucketAccountId, Format, Prefix }` where
+/// the API nests it one level deeper under `Destination.S3BucketDestination` with `BucketArn`
+/// spelled `Bucket` ([`declared_storage_class_analysis`]). An entry declaring no `Id` is
+/// refused rather than installed under an id of this module's invention: the stack must not
+/// complete with an analysis a client cannot address.
+fn declared_analytics_configurations(
+    resource: &StoredResource,
+) -> Result<Vec<(String, ::aws_sdk_s3::types::AnalyticsConfiguration)>, Refusal> {
+    use ::aws_sdk_s3::types::AnalyticsConfiguration;
+
+    let listed = resource
+        .properties
+        .get(ANALYTICS_CONFIGURATIONS)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut configurations = Vec::with_capacity(listed.len());
+    for declared in listed {
+        let id = declared
+            .get("Id")
+            .and_then(scalar_text)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| Refusal {
+                code: MISSING_PROPERTY_CODE.to_string(),
+                message: format!(
+                    "an {ANALYTICS_CONFIGURATIONS} entry of {S3_BUCKET} declares no Id"
+                ),
+            })?;
+        let configuration = AnalyticsConfiguration::builder()
+            .id(&id)
+            .set_filter(analytics_filter(declared, &id)?)
+            .storage_class_analysis(declared_storage_class_analysis(declared, &id)?)
+            .build()
+            .map_err(|error| analytics_not_sendable(&id, &error))?;
+        configurations.push((id, configuration));
+    }
+    Ok(configurations)
+}
+
+/// The refusal for a declared analytics configuration the SDK will not build into the
+/// request shape: the entry is named, so the failing declaration can be found.
+fn analytics_not_sendable(id: &str, error: &dyn ::std::fmt::Display) -> Refusal {
+    Refusal {
+        code: UNIDENTIFIED_FAILURE.to_string(),
+        message: format!(
+            "the {ANALYTICS_CONFIGURATIONS} entry {id} of {S3_BUCKET} cannot be sent to Amazon \
+             S3: {error}"
+        ),
+    }
+}
+
+/// The `AnalyticsFilter` one declared configuration's object scope amounts to, or `None` for
+/// a configuration that narrows nothing — "if no filter is provided, all objects will be
+/// considered in any analysis" (`AnalyticsFilter`).
+///
+/// The template narrows with two flat properties, a `Prefix` and a `TagFilters` list of
+/// `{ Key, Value }`, while "a filter must have exactly one prefix, one tag, or one
+/// conjunction (AnalyticsAndOperator)" and that conjunction "must have at least two
+/// predicates" (`AnalyticsFilter` and `AnalyticsFilter$And`). So a scope naming ONE predicate
+/// is that predicate's own member, and a scope naming several is the conjunction of them —
+/// the prefix and each tag counting as one predicate each.
+fn analytics_filter(
+    declared: &Value,
+    id: &str,
+) -> Result<Option<::aws_sdk_s3::types::AnalyticsFilter>, Refusal> {
+    use ::aws_sdk_s3::types::{AnalyticsAndOperator, AnalyticsFilter};
+
+    let prefix = declared
+        .get("Prefix")
+        .and_then(scalar_text)
+        .filter(|text| !text.is_empty());
+    let tags = analytics_tag_filters(declared, id)?;
+    Ok(match (prefix, tags.len()) {
+        (None, 0) => None,
+        (Some(prefix), 0) => Some(AnalyticsFilter::Prefix(prefix)),
+        (None, 1) => tags.into_iter().next().map(AnalyticsFilter::Tag),
+        (prefix, _) => Some(AnalyticsFilter::And(
+            AnalyticsAndOperator::builder()
+                .set_prefix(prefix)
+                .set_tags(Some(tags))
+                .build(),
+        )),
+    })
+}
+
+/// The tags one declared configuration's `TagFilters` narrows the analysis by, as the API's
+/// own `Tag` list, in the declared order.
+///
+/// A filter stating neither half of the tag is refused rather than sent as a tag on nothing:
+/// `Tag` REQUIRES both `Key` and `Value`, so an incomplete one narrows by a predicate the
+/// service cannot evaluate.
+fn analytics_tag_filters(
+    declared: &Value,
+    id: &str,
+) -> Result<Vec<::aws_sdk_s3::types::Tag>, Refusal> {
+    use ::aws_sdk_s3::types::Tag;
+
+    let listed = declared
+        .get("TagFilters")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut tags = Vec::with_capacity(listed.len());
+    for filter in listed {
+        let missing = |member: &str| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "a TagFilters entry of the {ANALYTICS_CONFIGURATIONS} entry {id} of \
+                 {S3_BUCKET} declares no {member}"
+            ),
+        };
+        let key = filter
+            .get("Key")
+            .and_then(scalar_text)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| missing("Key"))?;
+        let value = filter
+            .get("Value")
+            .and_then(scalar_text)
+            .ok_or_else(|| missing("Value"))?;
+        tags.push(
+            Tag::builder()
+                .key(key)
+                .value(value)
+                .build()
+                .map_err(|error| analytics_not_sendable(id, &error))?,
+        );
+    }
+    Ok(tags)
+}
+
+/// The `StorageClassAnalysis` one declared configuration states, as Amazon S3 takes it.
+///
+/// `StorageClassAnalysis` is REQUIRED on an `AnalyticsConfiguration` and its one member
+/// `DataExport` is not, so a declaration stating no export — or no analysis block at all —
+/// becomes the EMPTY container, which is the analysis that collects access patterns without
+/// exporting them. A declared export is one level deeper on the API than in the template:
+/// `Destination.S3BucketDestination` carries the template's flat destination with `BucketArn`
+/// spelled `Bucket`, "the Amazon Resource Name (ARN) of the bucket to which data is
+/// exported" (`AnalyticsS3BucketDestination$Bucket`), beside the optional `BucketAccountId`
+/// — "the account ID that owns the destination S3 bucket" — and `Prefix`.
+///
+/// A declared export missing a member the API REQUIRES is refused rather than sent
+/// incomplete or quietly dropped to the empty analysis: the stack must not complete with an
+/// export it could not install.
+fn declared_storage_class_analysis(
+    declared: &Value,
+    id: &str,
+) -> Result<::aws_sdk_s3::types::StorageClassAnalysis, Refusal> {
+    use ::aws_sdk_s3::types::{
+        AnalyticsExportDestination, AnalyticsS3BucketDestination, AnalyticsS3ExportFileFormat,
+        StorageClassAnalysis, StorageClassAnalysisDataExport, StorageClassAnalysisSchemaVersion,
+    };
+
+    let Some(export) = declared
+        .get("StorageClassAnalysis")
+        .and_then(|analysis| analysis.get("DataExport"))
+    else {
+        return Ok(StorageClassAnalysis::builder().build());
+    };
+    let missing = |member: &str| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!(
+            "the {ANALYTICS_CONFIGURATIONS} entry {id} of {S3_BUCKET} declares no \
+             StorageClassAnalysis.DataExport.{member}"
+        ),
+    };
+    let destination = export
+        .get("Destination")
+        .ok_or_else(|| missing("Destination"))?;
+    let required_text = |member: &str| {
+        destination
+            .get(member)
+            .and_then(scalar_text)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| missing(&format!("Destination.{member}")))
+    };
+    // The values are the template's: Amazon S3's own deserializer is what judges them
+    // against `AnalyticsS3ExportFileFormat` and `StorageClassAnalysisSchemaVersion`.
+    let bucket_arn = required_text("BucketArn")?;
+    let format = required_text("Format")?;
+    let schema_version = export
+        .get("OutputSchemaVersion")
+        .and_then(scalar_text)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| missing("OutputSchemaVersion"))?;
+    let s3_bucket_destination = AnalyticsS3BucketDestination::builder()
+        .format(AnalyticsS3ExportFileFormat::from(format.as_str()))
+        .bucket(bucket_arn)
+        .set_bucket_account_id(destination.get("BucketAccountId").and_then(scalar_text))
+        .set_prefix(destination.get("Prefix").and_then(scalar_text))
+        .build()
+        .map_err(|error| analytics_not_sendable(id, &error))?;
+    let data_export = StorageClassAnalysisDataExport::builder()
+        .output_schema_version(StorageClassAnalysisSchemaVersion::from(
+            schema_version.as_str(),
+        ))
+        .destination(
+            AnalyticsExportDestination::builder()
+                .s3_bucket_destination(s3_bucket_destination)
+                .build(),
+        )
+        .build()
+        .map_err(|error| analytics_not_sendable(id, &error))?;
+    Ok(StorageClassAnalysis::builder()
+        .data_export(data_export)
+        .build())
+}
+
 /// Delete the bucket a stack created. A bucket S3 no longer has is already in the state
 /// the delete asks for; one that still holds objects is NOT deleted, and that refusal is
 /// what the stack reports.
@@ -3340,8 +3578,9 @@ const BUCKET_NOT_FOUND: &str = "NotFound";
 /// existing with no comparable property rather than failing the whole detection. A declared
 /// property this read does not report is not compared at all ("only resource properties
 /// explicitly defined in the stack template are checked for drift", against what the owning
-/// service reports), so the bucket's notification configuration — which the create installs
-/// but this read does not fetch — is outside this detection rather than reported as changed.
+/// service reports), so the bucket's notification and analytics configurations — which the
+/// create installs but this read does not fetch — are outside this detection rather than
+/// reported as changed.
 async fn describe_bucket(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
