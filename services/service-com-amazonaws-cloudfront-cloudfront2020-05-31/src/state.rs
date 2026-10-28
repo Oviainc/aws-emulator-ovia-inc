@@ -6224,6 +6224,39 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.etag = etag;
         Some(stored)
     }
+
+    /// Replace the configuration of the field-level encryption CONFIGURATION `id` names, and
+    /// report the record as it now stands.
+    ///
+    /// The same write [`Self::apply_field_level_encryption_profile_config`] performs for the
+    /// profile, on the configuration record: `UpdateFieldLevelEncryptionConfig` submits a whole
+    /// `FieldLevelEncryptionConfig` as its payload, so the stored configuration becomes the
+    /// submitted one WHOLE, `LastModifiedTime` becomes `now` — "the last time the field-level
+    /// encryption configuration was changed" — and the version token is freshly minted, so the
+    /// token the caller matched on no longer satisfies an `If-Match` against this
+    /// configuration. Nothing else about a configuration changes: the id is the one the create
+    /// minted, and a configuration carries neither a status nor a propagation deadline, so the
+    /// clock owes it nothing. WHICH members an update may move is the caller's rule, decided
+    /// before it reaches here.
+    ///
+    /// `None` when the store holds no such configuration, checked BEFORE the mint so a version
+    /// token is never spent on a configuration that is not there.
+    pub fn apply_field_level_encryption_config(
+        &mut self,
+        id: &str,
+        config: FieldLevelEncryptionConfig,
+        now: SystemTime,
+    ) -> Option<&StoredFieldLevelEncryptionConfig> {
+        if !self.field_level_encryption_configs.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.field_level_encryption_configs.get_mut(id)?;
+        stored.config = config;
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
 }
 
 /// Why a create was refused, for the calling operation to report as its own modelled

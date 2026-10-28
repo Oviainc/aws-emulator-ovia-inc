@@ -121,13 +121,13 @@ pub(crate) async fn get_config_document(router: &MultiServiceRouter, id: &str) -
 
 /// One `QueryArgProfile`, as a client submits it.
 #[derive(Debug, Clone)]
-struct QueryArgMapping {
+pub(crate) struct QueryArgMapping {
     query_arg: String,
     profile_id: String,
 }
 
 impl QueryArgMapping {
-    fn new(query_arg: &str, profile_id: &str) -> Self {
+    pub(crate) fn new(query_arg: &str, profile_id: &str) -> Self {
         Self {
             query_arg: query_arg.to_string(),
             profile_id: profile_id.to_string(),
@@ -163,14 +163,14 @@ impl QueryArgMapping {
 
 /// One `ContentTypeProfile`, as a client submits it.
 #[derive(Debug, Clone)]
-struct ContentTypeMapping {
+pub(crate) struct ContentTypeMapping {
     content_type: String,
     /// `ProfileId`, or `None` to leave the optional member out entirely.
     profile_id: Option<String>,
 }
 
 impl ContentTypeMapping {
-    fn new(content_type: &str, profile_id: Option<&str>) -> Self {
+    pub(crate) fn new(content_type: &str, profile_id: Option<&str>) -> Self {
         Self {
             content_type: content_type.to_string(),
             profile_id: profile_id.map(str::to_string),
@@ -215,16 +215,16 @@ impl ContentTypeMapping {
 /// `ContentTypeProfileConfig`: a forwarding flag beside an OPTIONAL wrapper holding the
 /// mappings.
 #[derive(Debug, Clone)]
-struct Section<M> {
+pub(crate) struct Section<M> {
     forward_when_unknown: bool,
     /// `None` leaves the wrapper out entirely — an absent wrapper states no quantity at all.
-    mappings: Option<Vec<M>>,
+    pub(crate) mappings: Option<Vec<M>>,
     /// The `Quantity` the request STATES, when it is not the number of mappings carried.
-    stated_quantity: Option<i32>,
+    pub(crate) stated_quantity: Option<i32>,
 }
 
 impl<M> Section<M> {
-    fn new(forward_when_unknown: bool, mappings: Option<Vec<M>>) -> Self {
+    pub(crate) fn new(forward_when_unknown: bool, mappings: Option<Vec<M>>) -> Self {
         Self {
             forward_when_unknown,
             mappings,
@@ -245,17 +245,17 @@ impl<M> Section<M> {
 pub(crate) struct Config {
     /// What this row is a case of, named in every assertion it drives.
     pub(crate) case: String,
-    caller_reference: String,
+    pub(crate) caller_reference: String,
     /// `Comment`, or `None` to leave the optional member out entirely.
-    comment: Option<String>,
+    pub(crate) comment: Option<String>,
     /// The `QueryArgProfileConfig`, or `None` to leave the whole section out.
-    query_arg: Option<Section<QueryArgMapping>>,
+    pub(crate) query_arg: Option<Section<QueryArgMapping>>,
     /// The `ContentTypeProfileConfig`, or `None` to leave the whole section out.
-    content_type: Option<Section<ContentTypeMapping>>,
+    pub(crate) content_type: Option<Section<ContentTypeMapping>>,
 }
 
 impl Config {
-    fn new(
+    pub(crate) fn new(
         case: &str,
         reference: &str,
         comment: Option<&str>,
@@ -336,7 +336,7 @@ impl Config {
 
     /// Assert that `config` — a `FieldLevelEncryptionConfig` element the emulator serialised
     /// — reports exactly this configuration.
-    fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
+    pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
         let case = self.case.as_str();
         for (member, expected) in [
             ("CallerReference", Some(self.caller_reference.clone())),

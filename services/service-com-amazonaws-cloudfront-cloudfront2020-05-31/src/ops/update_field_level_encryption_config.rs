@@ -1,15 +1,51 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFieldLevelEncryptionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFieldLevelEncryptionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFieldLevelEncryptionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored configuration of the field-level encryption CONFIGURATION an id names,
+//! under an `If-Match` precondition, and reports the record as it then stands — read from
+//! [`crate::state`] rather than from the request.
+//!
+//! The submitted `FieldLevelEncryptionConfig` becomes what a later `GetFieldLevelEncryption`,
+//! `GetFieldLevelEncryptionConfig` and `ListFieldLevelEncryptionConfigs` answer with,
+//! `LastModifiedTime` moves to the instant this call wrote it — "the last time the field-level
+//! encryption configuration was changed" — and the mutation mints a fresh version token, which
+//! is the only one a later `If-Match` against this configuration satisfies. The id the create
+//! minted is fixed for the configuration's whole life.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is written, so a
+//! refused update leaves the stored record and its version token exactly as they were:
+//!
+//! * an id no stored configuration holds — `NoSuchFieldLevelEncryptionConfig` (HTTP 404);
+//! * an `If-Match` that is absent or is not a version token at all —
+//!   `InvalidIfMatchVersion` (HTTP 400), "The If-Match version is missing or not valid"; one
+//!   carrying a well-formed token that is not this configuration's current one —
+//!   `PreconditionFailed` (HTTP 412), so an update only lands on the configuration its caller
+//!   actually read ([`crate::state::check_if_match`]);
+//! * a list wrapper whose `Quantity` disagrees with its `Items` — `InconsistentQuantities`
+//!   (HTTP 400), the SAME walk the create path applies over the `QueryArgProfiles` wrapper and
+//!   the `ContentTypeProfiles` wrapper
+//!   ([`crate::state::field_level_encryption_config_quantity_mismatch`]);
+//! * a `Comment` past the documented 128 characters — `InvalidArgument` (HTTP 400), the SAME
+//!   check the create path applies
+//!   ([`crate::state::MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT`]);
+//! * a `QueryArgProfile` stating no profile at all — `QueryArgProfileEmpty` (HTTP 400), the
+//!   SAME check the create path applies: a mapping pairs a query argument with the profile the
+//!   matching fields are encrypted under;
+//! * a mapping list past this service's bound —
+//!   `TooManyFieldLevelEncryptionQueryArgProfiles` /
+//!   `TooManyFieldLevelEncryptionContentTypeProfiles` (HTTP 400), the SAME bounds the create
+//!   path applies, since the whole list is stored inside the configuration record;
+//! * a `ProfileId` no stored profile carries, on either mapping kind —
+//!   `NoSuchFieldLevelEncryptionProfile` (HTTP 404), the SAME resolution the create path makes:
+//!   the mapping names the profile whose encryption entities the matching fields are encrypted
+//!   under;
+//! * a `CallerReference` that is not the one this configuration was created under —
+//!   `IllegalUpdate` (HTTP 400), "The update contains modifications that are not allowed"
+//!   ([`crate::state::illegal_update_caller_reference`]).
+//!
+//! `AccessDenied` is unreachable here, as it is from every other operation in this service:
+//! the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +126,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +206,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFieldLevelEncryptionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFieldLevelEncryptionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFieldLevelEncryptionConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.field_level_encryption_config;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A configuration itself has no transition owed: the
+        // model gives it no status, so one this service accepts is usable at once.
+        store.settle(now);
+
+        // The configuration being updated is looked up first: every refusal below is about the
+        // record this id names, and nothing is written for an id the store does not hold.
+        let Some(current) = store
+            .field_level_encryption_config(&input.id)
+            .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
+        else {
+            return Err(
+                UpdateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(
+                    crate::state::no_such_field_level_encryption_config(),
+                )
+                .into(),
+            );
+        };
+        let (current_etag, current_caller_reference) = current;
+
+        // The precondition is checked against the STORED version, so an update only lands on
+        // the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    UpdateFieldLevelEncryptionConfigErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(
+                    UpdateFieldLevelEncryptionConfigErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Every CloudFront list travels in a wrapper that states its own length beside the
+        // list itself, and a request whose `Quantity` disagrees with its `Items` describes no
+        // list at all. The SAME walk the create path makes — over the `QueryArgProfiles`
+        // wrapper and the `ContentTypeProfiles` wrapper — because a configuration is checked on
+        // every payload that states one, so an update cannot store what a create would refuse.
+        if let Some(message) = crate::state::field_level_encryption_config_quantity_mismatch(&config)
+        {
+            return Err(
+                UpdateFieldLevelEncryptionConfigErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "An optional comment about the configuration. The comment cannot be longer than 128
+        // characters." The documented bound holds on every payload that states a configuration,
+        // so an update cannot store a comment the create would have refused.
+        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
+        if comment_length > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT {
+            return Err(UpdateFieldLevelEncryptionConfigErrorModeled::InvalidArgument(
+                crate::state::comment_too_long(comment_length),
+            )
+            .into());
+        }
+
+        let query_arg_profiles: &[QueryArgProfile] = config
+            .query_arg_profile_config
+            .as_ref()
+            .and_then(|query_arg| query_arg.query_arg_profiles.as_ref())
+            .and_then(|profiles| profiles.items.as_deref())
+            .unwrap_or_default();
+        let content_type_profiles: &[ContentTypeProfile] = config
+            .content_type_profile_config
+            .as_ref()
+            .and_then(|content_type| content_type.content_type_profiles.as_ref())
+            .and_then(|profiles| profiles.items.as_deref())
+            .unwrap_or_default();
+
+        // A query argument-profile mapping pairs a query argument with the profile the matching
+        // fields are encrypted under, so one that states no profile maps its argument to
+        // nothing — the same refusal the create path makes.
+        if query_arg_profiles
+            .iter()
+            .any(|profile| profile.profile_id.trim().is_empty())
+        {
+            return Err(UpdateFieldLevelEncryptionConfigErrorModeled::QueryArgProfileEmpty(
+                crate::state::query_arg_profile_empty(),
+            )
+            .into());
+        }
+
+        // Each mapping list is stored WHOLE inside the configuration record, so the bounds the
+        // create path applies apply to an update's payload too, each with the refusal the model
+        // names for that list.
+        if query_arg_profiles.len() > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_QUERY_ARG_PROFILES {
+            return Err(
+                UpdateFieldLevelEncryptionConfigErrorModeled::TooManyFieldLevelEncryptionQueryArgProfiles(
+                    crate::state::too_many_field_level_encryption_query_arg_profiles(),
+                )
+                .into(),
+            );
+        }
+        if content_type_profiles.len()
+            > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_CONTENT_TYPE_PROFILES
+        {
+            return Err(
+                UpdateFieldLevelEncryptionConfigErrorModeled::TooManyFieldLevelEncryptionContentTypeProfiles(
+                    crate::state::too_many_field_level_encryption_content_type_profiles(),
+                )
+                .into(),
+            );
+        }
+
+        // Both mapping kinds name the PROFILE whose encryption entities the matching fields are
+        // encrypted under, so an id no stored profile carries names no profile to encrypt with —
+        // the same resolution the create path makes. `ContentTypeProfile$ProfileId` is optional,
+        // and a mapping that names none selects no profile at all rather than an unknown one.
+        let names_unknown_profile = query_arg_profiles
+            .iter()
+            .map(|profile| profile.profile_id.as_str())
+            .chain(
+                content_type_profiles
+                    .iter()
+                    .filter_map(|profile| profile.profile_id.as_deref()),
+            )
+            .any(|profile_id| store.field_level_encryption_profile(profile_id).is_none());
+        if names_unknown_profile {
+            return Err(
+                UpdateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionProfile(
+                    crate::state::no_such_field_level_encryption_profile(),
+                )
+                .into(),
+            );
+        }
+
+        // A configuration's caller reference identifies it for its whole life, so an update
+        // that moves it onto another value is not a modification CloudFront allows. The
+        // refusal states that RULE and nothing else: the one fixed sentence this service
+        // refuses a caller-reference change with, carrying no value from the request or from
+        // the stored record.
+        if config.caller_reference != current_caller_reference {
+            return Err(UpdateFieldLevelEncryptionConfigErrorModeled::IllegalUpdate(
+                crate::state::illegal_update_caller_reference(),
+            )
+            .into());
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_field_level_encryption_config(&input.id, config, now) else {
+            return Err(
+                UpdateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(
+                    crate::state::no_such_field_level_encryption_config(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(UpdateFieldLevelEncryptionConfigOutput {
+            // "Return the results of updating the configuration." — the record just written,
+            // never the request that was served.
+            field_level_encryption: Some(stored.to_field_level_encryption()),
+            // "The value of the ETag header that you received when updating the configuration"
+            // — a fresh version token, so the one this caller matched on no longer satisfies
+            // an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }
