@@ -170,19 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `workspaceName` names the workspace whose datasets the request wants, and
         // it is the ONLY resource a `ListDatasets` request names — so a workspace
         // this service holds no record of is the modelled not-found refusal rather
-        // than an empty page, which would report absence as success. "Holds" is
-        // decided by the STORE: a dataset stored under a workspace is such a record,
-        // because the dataset writes key a dataset by its own id without consulting
-        // the workspace registry, so refusing on the registry alone would hide
-        // datasets this service really holds. Resolved BEFORE the page is cut, so a
-        // request that is wrong in both ways reports the resource that is absent.
+        // than an empty page, which would report absence as success. The workspace
+        // registry is the one place that says which workspaces exist — a create that
+        // puts a dataset in a workspace resolves it there too, so no dataset can be
+        // stored under a workspace the registry does not hold. Resolved BEFORE the
+        // page is cut, so a request that is wrong in both ways reports the resource
+        // that is absent.
         if let Some(workspace) = input.workspace_name.as_deref() {
-            let holds_workspace = store.workspaces.contains_key(workspace)
-                || store
-                    .datasets
-                    .values()
-                    .any(|record| record.workspace_name.as_deref() == Some(workspace));
-            if !holds_workspace {
+            if !store.workspaces.contains_key(workspace) {
                 return Err(not_found(crate::state::not_found_message(
                     crate::state::RESOURCE_WORKSPACE,
                     workspace,

@@ -196,6 +196,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store_key = crate::state::pipeline_key(&input.workspace_name, &input.pipeline_name);
         let mut store = state.lock();
 
+        // The pipeline is created IN the workspace the path names ("Creates a new
+        // pipeline in the specified workspace"), so a workspace this store holds no
+        // record of is the same absence every other workspace-scoped operation of
+        // this service reports — resolved before anything is written, so a create
+        // naming a workspace nobody opened persists no pipeline.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(CreatePipelineError::Modeled(
+                CreatePipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::RESOURCE_WORKSPACE,
+                        &input.workspace_name,
+                    ),
+                }),
+            ));
+        }
+
         if let Some(existing) = store.pipelines.get(&store_key) {
             // "If you retry a request that completed successfully using the same client
             // token, the server returns the cached result from the original successful
@@ -228,10 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is bounded: a create is the only thing that adds a pipeline and
         // nothing evicts one, so past either cap this is a quota refusal. The total
-        // is checked as well as the per-workspace count, because `workspaceName` is
-        // a caller-supplied string this service has no registry to resolve, so a
-        // caller naming a fresh workspace each time would otherwise open one more
-        // per-workspace bucket every time.
+        // is checked as well as the per-workspace count, so the pipelines this
+        // emulator holds are bounded whatever the mix of workspaces they are spread
+        // over.
         if store.pipelines.len() >= crate::state::MAX_PIPELINES {
             return Err(CreatePipelineError::Modeled(
                 CreatePipelineErrorModeled::LimitExceededException(LimitExceededException {
