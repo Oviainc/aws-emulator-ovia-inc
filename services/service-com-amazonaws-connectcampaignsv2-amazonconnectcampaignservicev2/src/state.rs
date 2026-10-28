@@ -1507,6 +1507,43 @@ pub enum RenameRejected {
     NameTaken { connect_instance_id: String },
 }
 
+/// Why the store refused a lifecycle action on a campaign, as
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::act_on_campaign`]
+/// reports it. The stored lifecycle state is unchanged in either case.
+///
+/// [`Self::message`] carries the sentence the refusal is worded with, so the four
+/// lifecycle operations refuse alike while each maps the rejection to the error
+/// variant its own model declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleRejected {
+    /// The region holds no campaign under that id, so there is no lifecycle to move.
+    /// The caller answers this with the modelled `ResourceNotFoundException`
+    /// (HTTP 404).
+    NotFound,
+    /// The campaign is at `state` at the instant the call was judged and `action` is
+    /// not legal from there (see [`CampaignState::after`]). The caller answers this
+    /// with the modelled `InvalidCampaignStateException` (HTTP 409), whose `state`
+    /// member carries `state.as_wire()`.
+    IllegalAction {
+        state: CampaignState,
+        action: CampaignAction,
+    },
+}
+
+impl LifecycleRejected {
+    /// The sentence this refusal is reported with.
+    pub fn message(self) -> String {
+        match self {
+            Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+            Self::IllegalAction { state, action } => format!(
+                "A campaign in state {} cannot be {}",
+                state.as_wire(),
+                action.verb()
+            ),
+        }
+    }
+}
+
 /// The records of ONE region: everything a client talking to that region's endpoint
 /// can see or change.
 ///
@@ -1736,6 +1773,42 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
             // this method always means the name was written.
             None => Err(RenameRejected::NotFound),
         }
+    }
+
+    /// Move the campaign `campaign` names through `action`, judging the call against
+    /// the state the campaign is at `now`.
+    ///
+    /// The one place the lifecycle rule of this service lives, so
+    /// `StartCampaign`, `PauseCampaign`, `ResumeCampaign` and `StopCampaign` cannot
+    /// disagree about it: the id is resolved in the region the request was signed for
+    /// (a campaign is reachable only through the endpoint of the region it was created
+    /// in, so a lifecycle write never reaches another region's campaign), the state
+    /// judged is the CLOCK-derived one ([`StoredCampaign::state_at`] — a campaign whose
+    /// scheduled run window has closed is `Completed`, which no action moves out of),
+    /// the move is the one [`CampaignState::after`] names, and the state it moves to is
+    /// written and handed back. A refusal ([`LifecycleRejected`]) writes nothing, and
+    /// names the state it judged so the caller's refusal can report it.
+    ///
+    /// The lookup, the check and the write happen under the one lock the caller holds,
+    /// so two concurrent lifecycle calls cannot both pass the check from one state.
+    pub fn act_on_campaign(
+        &mut self,
+        campaign: CampaignRef<'_>,
+        action: CampaignAction,
+        now: SystemTime,
+    ) -> Result<CampaignState, LifecycleRejected> {
+        let Some(stored) = self.campaign_mut(campaign.region, campaign.id) else {
+            return Err(LifecycleRejected::NotFound);
+        };
+        let current = stored.state_at(now);
+        let Some(next) = current.after(action) else {
+            return Err(LifecycleRejected::IllegalAction {
+                state: current,
+                action,
+            });
+        };
+        stored.lifecycle_state = next;
+        Ok(next)
     }
 
     /// Remove the campaign `region` stores under `id`, returning it when it was there.

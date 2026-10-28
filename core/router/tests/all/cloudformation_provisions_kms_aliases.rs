@@ -690,9 +690,9 @@ async fn a_declaration_kms_cannot_be_asked_for_is_refused() {
     .to_string();
     let (settled, body) = update_and_settle(&router, case, stack_name, &untargeted).await;
     assert_eq!(
-        settled, "UPDATE_FAILED",
-        "case {case:?}: an update KMS cannot be asked for must fail rather than complete, \
-         got {body}"
+        settled, "UPDATE_ROLLBACK_COMPLETE",
+        "case {case:?}: an update KMS cannot be asked for must fail and roll the stack back \
+         rather than complete, got {body}"
     );
     assert!(
         opt_element(&body, "StackStatusReason")

@@ -71,6 +71,8 @@ mod inbound_connections;
 mod index_authorization;
 #[path = "all/index_deletion.rs"]
 mod index_deletion;
+#[path = "all/index_modelled_answers.rs"]
+mod index_modelled_answers;
 #[path = "all/index_registry.rs"]
 mod index_registry;
 #[path = "all/index_schema_updates.rs"]

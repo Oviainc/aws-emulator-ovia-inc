@@ -3138,6 +3138,44 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .map(|(state, count)| (state.to_string(), count.to_string()))
             .collect()
     }
+
+    /// The DISTINCT resources the executed actions of the computation model
+    /// `computation_model_id` resolved to, as the asset ids that name them, in
+    /// ascending id order.
+    ///
+    /// Executing an action on a resource leaves two records of it in this store —
+    /// the action taken on that resource and the run of that action — and each
+    /// carries the detailed resource the action resolved to, so both are read
+    /// here and the ids are de-duplicated: a model acted on many times against
+    /// one asset resolves to that ONE resource, and an action resolving to
+    /// nothing contributes none. The order is the id's own, which is unique
+    /// within the enumeration and stable across calls, so it also serves as the
+    /// resume point of the listing that pages this.
+    ///
+    /// Derived from the stored records on every read, so nothing is written to
+    /// report what the executes already made true.
+    pub fn computation_model_resolved_assets(&self, computation_model_id: &str) -> Vec<String> {
+        let from_executions = self
+            .executions
+            .values()
+            .filter(|record| {
+                record.targets(TARGET_RESOURCE_TYPE_COMPUTATION_MODEL, computation_model_id)
+            })
+            .filter_map(|record| record.resolve_to.as_ref());
+        let from_actions = self
+            .actions
+            .values()
+            .filter(|record| {
+                record.targets(TARGET_RESOURCE_TYPE_COMPUTATION_MODEL, computation_model_id)
+            })
+            .filter_map(|record| record.resolve_to.as_ref());
+        from_executions
+            .chain(from_actions)
+            .map(|resolve_to| resolve_to.asset_id.clone())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 /// `true` when the `(TargetResourceType, ID)` pair a request carries addresses

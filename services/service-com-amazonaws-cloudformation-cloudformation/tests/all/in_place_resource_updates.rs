@@ -429,10 +429,12 @@ async fn a_change_this_emulator_cannot_apply_fails_the_update_naming_the_resourc
     assert_eq!(code, 200, "expected UpdateStack to succeed, got {code} {body}");
     wait_for_the_transition().await;
     let reported = status_of(&router, "inplace-subscribed").await;
+    // The update failed and is therefore UNDONE: rollback is at its default, so the stack
+    // reaches the rolled-back terminal status rather than parking at UPDATE_FAILED.
     assert_eq!(
         reported,
-        status::UPDATE_FAILED,
-        "expected an update this emulator cannot apply to fail, got {reported:?}"
+        status::UPDATE_ROLLBACK_COMPLETE,
+        "expected an update this emulator cannot apply to fail and roll back, got {reported:?}"
     );
     let reason = reason_of(&router, "inplace-subscribed").await;
     let expected = resource_failure_summary(failed_action::UPDATE, ["Topic"]);

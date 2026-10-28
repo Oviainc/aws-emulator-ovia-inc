@@ -730,6 +730,7 @@ pub fn create_lifecycle(
             [PendingTransition {
                 to: STATUS_CREATE_FAILED.to_string(),
                 last_update_status: None,
+                spec: None,
                 due_at: now + CUSTOMER_ENDPOINT_GRACE_PERIOD,
             }]
             .into(),
@@ -740,6 +741,7 @@ pub fn create_lifecycle(
             [PendingTransition {
                 to: STATUS_AVAILABLE.to_string(),
                 last_update_status: None,
+                spec: None,
                 due_at: now + TRANSITION_SPAN,
             }]
             .into(),
@@ -747,17 +749,24 @@ pub fn create_lifecycle(
     }
 }
 
-/// A status change the clock owes an environment: where it lands, and when.
+/// A status change the clock owes an environment: where it lands, when, and what else that
+/// phase makes true of the record.
 ///
 /// A record holds a QUEUE of these ([`EnvironmentRecord::pending`]), because a lifecycle
 /// can walk more than one non-terminal status before it settles: an accepted update
-/// snapshots the environment's database and only then applies the change.
+/// snapshots the environment's database and only then applies the change. Every effect a
+/// phase has is carried HERE and materialised by [`EnvironmentRecord::settle`] when the
+/// phase comes due, so no phase's effect can be applied before the phase that performs it.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     /// The `EnvironmentStatus` the environment settles into.
     pub to: String,
     /// The `UpdateStatus` `LastUpdate` settles into, when this transition is an update's.
     pub last_update_status: Option<String>,
+    /// The configuration this phase APPLIES to the environment, when this transition is
+    /// the one that applies a change a caller asked for. `None` for a phase that only
+    /// moves the status (a create landing, a snapshot being taken, a teardown finishing).
+    pub spec: Option<EnvironmentSpec>,
     /// The instant the transition comes due.
     pub due_at: SystemTime,
 }
@@ -817,6 +826,12 @@ impl EnvironmentRecord {
                 .pop_front()
                 .expect("the queue front was just observed");
             self.status = pending.to;
+            // The configuration a phase applies lands WITH that phase, never earlier: a
+            // caller reading the environment before this instant sees the configuration
+            // the environment is still running on.
+            if let Some(spec) = pending.spec {
+                self.spec = spec;
+            }
             if let (Some(status), Some(last_update)) =
                 (pending.last_update_status, self.last_update.as_mut())
             {
@@ -952,6 +967,7 @@ impl EnvironmentRecord {
         self.pending = [PendingTransition {
             to: STATUS_DELETED.to_string(),
             last_update_status: None,
+            spec: None,
             due_at: now + TRANSITION_SPAN,
         }]
         .into();
@@ -967,11 +983,18 @@ impl EnvironmentRecord {
     /// phases belong to every accepted update — an update of environment details as much
     /// as a version change — so nothing here branches on which members the request
     /// carried.
+    ///
+    /// `spec` is the configuration the accepted update RESOLVED, already merged onto the
+    /// stored one and validated. It is NOT written here: it rides the second phase
+    /// ([`PendingTransition::spec`]) and [`Self::settle`] applies it when that phase comes
+    /// due, so the environment reports the configuration it is still running on for as
+    /// long as it is only snapshotting its database.
     pub fn begin_update(
         &mut self,
         now: SystemTime,
         source: &str,
         worker_replacement_strategy: Option<String>,
+        spec: EnvironmentSpec,
     ) {
         self.status = STATUS_CREATING_SNAPSHOT.to_string();
         self.last_update = Some(LastUpdateRecord {
@@ -986,11 +1009,14 @@ impl EnvironmentRecord {
                 // The update has not landed yet: `LastUpdate` stays `PENDING` across the
                 // snapshot phase and the apply phase alike.
                 last_update_status: None,
+                // The apply phase is the one that applies the change.
+                spec: Some(spec),
                 due_at: now + UPDATE_PHASE_SPAN,
             },
             PendingTransition {
                 to: STATUS_AVAILABLE.to_string(),
                 last_update_status: Some(UPDATE_STATUS_SUCCESS.to_string()),
+                spec: None,
                 due_at: now + UPDATE_PHASE_SPAN * 2,
             },
         ]

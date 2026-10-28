@@ -4042,11 +4042,55 @@ impl DbSubnetGroupRecord {
 /// "`DBSecurityGroupName` doesn't refer to an existing DB security group", naming the
 /// group the request could not resolve in the folded spelling it would be stored under.
 ///
+/// Amazon RDS words this family's fault as a SENTENCE about the group — the resource type,
+/// the name, then "not found." — rather than as the `<type> not found: <name>` form it uses
+/// for a parameter group, so the name goes inside the sentence.
+///
 /// It lives here rather than in one handler because every operation that resolves a
 /// `DBSecurityGroupName` answers the same one fault, and the wording is what a caller
 /// reads to tell which group was missing.
 pub fn db_security_group_not_found_message(name: &str) -> String {
+    format!("DBSecurityGroup {name} not found.")
+}
+
+/// The message a `DBSecurityGroupNotFoundFault` carries where the DB security group is the
+/// SUBJECT of the call and the call acts on the group itself — the delete that removes it.
+///
+/// This front door words the one fault by the ROLE the resource plays in the call, the same
+/// way it words a DB cluster's ([`db_cluster_not_found_message`] beside
+/// [`db_cluster_not_found_colon_message`]) and a DB subnet group's
+/// ([`db_subnet_group_not_found_message`] beside
+/// [`db_subnet_group_does_not_exist_message`]), so a caller can tell "there is no such
+/// group to report" from "there is no such group to change"; both still answer the one
+/// modelled 404. Like the lookup wording it names the group in the folded spelling the
+/// group would be stored under.
+pub fn db_security_group_not_found_colon_message(name: &str) -> String {
     format!("DBSecurityGroup not found: {name}")
+}
+
+/// The name AWS keeps for the DB security group of the account itself.
+/// `DBSecurityGroupName` refuses it on every operation that states the constraint ("Must
+/// not be `Default`", and "You can't delete the default DB security group"), compared after
+/// the value is folded the way that member documents it is stored.
+///
+/// It lives here because the create and the delete refuse the same one name, so neither can
+/// drift from the other.
+pub const DEFAULT_DB_SECURITY_GROUP: &str = "default";
+
+/// The message the `InvalidDBSecurityGroupStateFault` carries where a DB security group
+/// cannot be deleted because a DB instance is still a member of it ("The specified DB
+/// security group must not be associated with any DB instances").
+///
+/// Worded from the request and from the blocking resource — the group the request asked to
+/// delete, in the folded spelling it is stored under, and the identifier of the DB instance
+/// that still names it — like the sibling in-use wording of this service's other group
+/// families. It lives here, beside the not-found wording, so the operation that answers it
+/// and any later one word it the same way.
+pub fn db_security_group_in_use_message(name: &str, holder_identifier: &str) -> String {
+    format!(
+        "The DB security group {name} can't be deleted because it is in use by DB instance \
+         {holder_identifier}"
+    )
 }
 
 /// The refusal this API version answers a request that would MODIFY the ingress rules of a

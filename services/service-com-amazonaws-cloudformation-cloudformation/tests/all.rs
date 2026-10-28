@@ -255,6 +255,8 @@ mod unprovisioned_resources;
 mod unrecognized_resource_types;
 #[path = "all/update_after_a_refused_delete.rs"]
 mod update_after_a_refused_delete;
+#[path = "all/update_rollback_of_a_refused_update.rs"]
+mod update_rollback_of_a_refused_update;
 #[path = "all/update_rollback_recovery.rs"]
 mod update_rollback_recovery;
 #[path = "all/update_stack_instances.rs"]

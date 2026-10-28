@@ -3306,13 +3306,10 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// (`CreateRule` refuses that), so the order is total; the ARN breaks a tie only so
     /// that a page walk is stable whatever the store's iteration order.
     pub fn rules_of(&self, listener: &ListenerRecord) -> Vec<Rule> {
-        let mut added: Vec<&RuleRecord> = listener.rules.iter().collect();
-        added.sort_by(|left, right| {
-            left.priority
-                .cmp(&right.priority)
-                .then_with(|| left.arn.cmp(&right.arn))
-        });
-        let mut rules: Vec<Rule> = added.into_iter().map(RuleRecord::to_shape).collect();
+        let mut rules: Vec<Rule> = rules_in_evaluation_order(listener)
+            .into_iter()
+            .map(RuleRecord::to_shape)
+            .collect();
         rules.push(listener.default_rule());
         rules
     }
@@ -3435,6 +3432,27 @@ pub fn paginate<T>(
         _ => None,
     };
     Ok((page, next))
+}
+
+/// The RULES a caller added to one listener, in the order they are evaluated in: "rules
+/// are evaluated in priority order, from the lowest value to the highest value". Two rules
+/// of one listener never share a priority (`CreateRule` refuses that), so the order is
+/// total; the ARN breaks a tie only so a walk is stable whatever the store's iteration
+/// order.
+///
+/// The ONE definition of that order, for both the read that REPORTS the rules
+/// ([`ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State::rules_of`], which
+/// appends the listener's default rule after them) and the data plane that EVALUATES them
+/// (`crate::service::data_plane`), so the documented evaluation order cannot differ between
+/// what a caller reads and what answers its traffic.
+pub fn rules_in_evaluation_order(listener: &ListenerRecord) -> Vec<&RuleRecord> {
+    let mut added: Vec<&RuleRecord> = listener.rules.iter().collect();
+    added.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.arn.cmp(&right.arn))
+    });
+    added
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

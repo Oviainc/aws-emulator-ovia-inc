@@ -2899,6 +2899,8 @@ pub enum AuditOutcome {
     ProjectDeleted,
     /// A batch build was removed from the store, with the builds of that batch.
     BuildBatchDeleted,
+    /// A batch build that was still running was ended by a caller.
+    BuildBatchStopped,
     /// No resource of that name exists (400 `ResourceNotFoundException`).
     NotFound,
     /// A resource-based policy was stored against a resource's ARN.
@@ -2924,6 +2926,7 @@ impl AuditOutcome {
             Self::ProjectUpdated => "project-updated",
             Self::ProjectDeleted => "project-deleted",
             Self::BuildBatchDeleted => "build-batch-deleted",
+            Self::BuildBatchStopped => "build-batch-stopped",
             Self::NotFound => "not-found",
             Self::ResourcePolicyStored => "resource-policy-stored",
             Self::ResourcePolicyDeleted => "resource-policy-deleted",
@@ -3281,6 +3284,23 @@ fn terminal_batch_phases(start_millis: i64, due_millis: i64) -> Vec<BuildBatchPh
             }]),
         ),
         open_batch_phase("FAILED", due_millis),
+    ]
+}
+
+/// The phases of a batch build that was stopped while it was still running: it
+/// leaves the phase it sat in with the same status the batch took, under
+/// [`stopped_phases`]' rule applied to `BuildBatchPhaseType`.
+pub fn stopped_batch_phases(start_millis: i64, stopped_millis: i64) -> Vec<BuildBatchPhase> {
+    vec![
+        finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
+        finished_batch_phase(
+            "DOWNLOAD_BATCHSPEC",
+            "STOPPED",
+            start_millis,
+            stopped_millis,
+            None,
+        ),
+        open_batch_phase("STOPPED", stopped_millis),
     ]
 }
 

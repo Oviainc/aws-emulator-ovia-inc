@@ -517,6 +517,10 @@ async fn a_defaulted_member_is_stable_across_reads_and_survives_an_unrelated_upd
         "case {}: update must succeed, got {status} {json}",
         case.name
     );
+    // The patched members are read back only once the phase that APPLIES the update has
+    // come due: the environment's database is snapshotted before the change is applied, so
+    // a read before that reports the configuration the environment is still running on.
+    tokio::time::sleep(PAST_TRANSITION).await;
     let after = harness.environment(case.name).await;
     // `Schedulers` / `MinWebservers` / `MaxWebservers` keep what the create resolved: the
     // update named none of them, and an update merges only the members it carries.

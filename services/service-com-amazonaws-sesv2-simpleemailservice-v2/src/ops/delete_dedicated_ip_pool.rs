@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDedicatedIpPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDedicatedIpPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDedicatedIpPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the dedicated IP pool the request names from the account, so
+//! `GetDedicatedIpPool` no longer reports it and `ListDedicatedIpPools` no longer pages
+//! over it, and no dedicated IP address is left naming it. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +134,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDedicatedIpPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDedicatedIpPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDedicatedIpPool"))
+        // Request metadata is not needed: a pool is keyed by the name this request
+        // binds as its path label, within the one emulated account — the same reading
+        // this pool's create and its read take.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteDedicatedIpPool without the shared emulator state",
+            ));
+        };
+
+        let name = input.pool_name;
+        let mut store = state.lock();
+
+        // The delete is not idempotent: a pool the account does not hold is reported as
+        // missing rather than silently accepted. The pool's attributes and its tags live
+        // on the record, so removing the record removes them with it.
+        if store.dedicated_ip_pools.remove(&name).is_none() {
+            return Err(DeleteDedicatedIpPoolErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::dedicated_ip_pool_not_found(&name)),
+                },
+            )
+            .into());
+        }
+
+        // A dedicated IP address's pool membership is a reference to this record, so the
+        // reference goes with it: once the pool is gone no address still names it, and a
+        // later read reports the address as being in no pool rather than in one the
+        // account no longer holds.
+        for address in store.dedicated_ips.values_mut() {
+            if address.pool_name.as_deref() == Some(name.as_str()) {
+                address.pool_name = None;
+            }
+        }
+
+        // `DeleteDedicatedIpPoolResponse` carries no members: the pool is gone, which
+        // `GetDedicatedIpPool` and `ListDedicatedIpPools` are what report.
+        Ok(DeleteDedicatedIpPoolOutput {})
     }
 }
