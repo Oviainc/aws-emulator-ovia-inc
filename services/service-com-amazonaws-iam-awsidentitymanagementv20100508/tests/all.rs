@@ -159,6 +159,8 @@ mod protected_role_refusals;
 mod published_managed_policy_reads;
 #[path = "all/range_refusal_wording.rs"]
 mod range_refusal_wording;
+#[path = "all/resource_tag_condition_context.rs"]
+mod resource_tag_condition_context;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
 #[path = "all/role_deletion.rs"]
@@ -247,6 +249,8 @@ mod user_lifecycle;
 mod user_permissions_boundary;
 #[path = "all/user_policy_listing.rs"]
 mod user_policy_listing;
+#[path = "all/user_record_authorization.rs"]
+mod user_record_authorization;
 #[path = "all/user_renames.rs"]
 mod user_renames;
 #[path = "all/user_tag_listing.rs"]

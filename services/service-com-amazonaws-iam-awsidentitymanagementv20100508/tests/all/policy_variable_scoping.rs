@@ -56,7 +56,11 @@ fn user_resource(tail: &str) -> String {
 
 /// Create a user carrying `tags` and one access key, answering the access key id a
 /// request signs with to speak for it.
-async fn tagged_principal(
+///
+/// `pub(crate)` because the suites about what the decision knows of the caller and of the
+/// TARGET (`tests/all/resource_tag_condition_context.rs`) need the same tagged fixture
+/// principal.
+pub(crate) async fn tagged_principal(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,
