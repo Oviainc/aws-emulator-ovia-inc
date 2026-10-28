@@ -4924,6 +4924,31 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|distribution| references_field_level_encryption_config(&distribution.config, id))
     }
 
+    /// The field-level encryption configuration that uses the profile `id` names in one of
+    /// its mappings, or `None` when no stored configuration does.
+    ///
+    /// A configuration names the profile its matching fields are encrypted under through a
+    /// mapping's `ProfileId` — `QueryArgProfile$ProfileId` is "ID of profile to use for
+    /// field-level encryption query argument-profile mapping" and
+    /// `ContentTypeProfile$ProfileId` is "The profile ID for a field-level encryption content
+    /// type-profile mapping" — so what puts a profile in use is a stored configuration naming
+    /// it, which is the rule [`references_field_level_encryption_profile`] states for the whole
+    /// configuration. The SAME rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_field_level_encryption_config`]
+    /// states for the configuration a cache behaviour names. The scan reads the STORED
+    /// configurations rather than a second index beside them, so it cannot drift out of step
+    /// with what a read of those configurations reports, and both mapping lists are bounded
+    /// ([`MAX_FIELD_LEVEL_ENCRYPTION_CONFIGS`] configurations, each with bounded mapping
+    /// lists).
+    pub fn field_level_encryption_config_using_profile(
+        &self,
+        id: &str,
+    ) -> Option<&StoredFieldLevelEncryptionConfig> {
+        self.field_level_encryption_configs
+            .values()
+            .find(|stored| references_field_level_encryption_profile(&stored.config, id))
+    }
+
     /// The cache policy whose STORED configuration carries `name`, or `None`.
     ///
     /// `CachePolicyConfig$Name` is "A unique name to identify the cache policy", and the
@@ -6551,6 +6576,42 @@ pub fn references_field_level_encryption_config(
         |behavior| behavior.field_level_encryption_id.as_deref(),
     )
     .any(|id| id == field_level_encryption_id)
+}
+
+/// Whether `config` references the field-level encryption profile `profile_id` names in any
+/// of its mappings.
+///
+/// A field-level encryption configuration names the profile a request's matching fields are
+/// encrypted under through a MAPPING: a query argument-profile mapping
+/// (`QueryArgProfile$ProfileId`, required on that mapping) and a content type-profile mapping
+/// (`ContentTypeProfile$ProfileId`, optional, so a mapping that names none selects no profile
+/// at all rather than an unknown one). Both sections are optional, and each carries its
+/// mappings in a wrapper that may be left out — so a configuration references the profile as
+/// soon as ONE mapping of EITHER section names it, and a configuration carrying no mapping
+/// references nothing. The SAME rule [`references_field_level_encryption_config`] states for
+/// the configuration a distribution's cache behaviour names, over that resource's own
+/// attachment members.
+pub fn references_field_level_encryption_profile(
+    config: &FieldLevelEncryptionConfig,
+    profile_id: &str,
+) -> bool {
+    let query_arg = config
+        .query_arg_profile_config
+        .as_ref()
+        .and_then(|section| section.query_arg_profiles.as_ref())
+        .and_then(|profiles| profiles.items.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|mapping| mapping.profile_id.as_str());
+    let content_type = config
+        .content_type_profile_config
+        .as_ref()
+        .and_then(|section| section.content_type_profiles.as_ref())
+        .and_then(|profiles| profiles.items.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|mapping| mapping.profile_id.as_deref());
+    query_arg.chain(content_type).any(|id| id == profile_id)
 }
 
 /// Whether `config` references the key group `key_group_id` names in any of its cache
@@ -10184,6 +10245,24 @@ pub fn no_such_field_level_encryption_profile() -> crate::ops::types::NoSuchFiel
 /// `NoSuchFieldLevelEncryptionProfile`'s message, as the model documents the shape.
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
     "The specified profile for field-level encryption doesn't exist.";
+
+/// The modelled `FieldLevelEncryptionProfileInUse` (HTTP 409) for a delete of a profile a
+/// stored field-level encryption configuration still names.
+///
+/// The SAME rule [`field_level_encryption_config_in_use`] states for the configuration a
+/// cache behaviour names: the sentence is a property of the CONDITION rather than of the
+/// request — the profile is still referenced — so nothing from the request or from the store
+/// belongs in it, and every refusal of this condition reads the same.
+pub fn field_level_encryption_profile_in_use(
+) -> crate::ops::types::FieldLevelEncryptionProfileInUse {
+    crate::ops::types::FieldLevelEncryptionProfileInUse {
+        message: Some(FIELD_LEVEL_ENCRYPTION_PROFILE_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `FieldLevelEncryptionProfileInUse`'s message, as the model documents the shape.
+pub const FIELD_LEVEL_ENCRYPTION_PROFILE_IN_USE_MESSAGE: &str =
+    "The specified profile for field-level encryption is in use.";
 
 /// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries — "The specified profile
 /// for field-level encryption already exists." — up to the profile the caller reference is

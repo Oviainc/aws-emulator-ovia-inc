@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFieldLevelEncryptionProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFieldLevelEncryptionProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFieldLevelEncryptionProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored field-level encryption profile under its version token: the profile a
+//! later read answered from is REMOVED, so the id names nothing afterwards and the caller
+//! reference it held is free again. A profile a stored field-level encryption configuration
+//! still names through one of its mappings is refused with
+//! `FieldLevelEncryptionProfileInUse` (HTTP 409) and stays readable.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFieldLevelEncryptionProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFieldLevelEncryptionProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFieldLevelEncryptionProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this call
+        // reads it, as every handler here does: whether a configuration still names this
+        // profile is decided against the store as it stands at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        // "Request the ID of the profile you want to delete from CloudFront": an id no stored
+        // profile carries names no profile to remove, whatever shape it has, so nothing is
+        // removed and the delete says so rather than reporting a removal it never performed.
+        let Some(current_etag) = store
+            .field_level_encryption_profile(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                DeleteFieldLevelEncryptionProfileErrorModeled::NoSuchFieldLevelEncryptionProfile(
+                    crate::state::no_such_field_level_encryption_profile(),
+                )
+                .into(),
+            );
+        };
+
+        // "The value of the ETag header that you received when retrieving the profile to
+        // delete": the precondition is checked first, the way HTTP evaluates one, so a caller
+        // holding a version that is no longer current is told that before anything about what
+        // the profile is used by.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            crate::state::IfMatch::Current => {}
+            crate::state::IfMatch::Invalid => {
+                return Err(
+                    DeleteFieldLevelEncryptionProfileErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            crate::state::IfMatch::Stale => {
+                return Err(
+                    DeleteFieldLevelEncryptionProfileErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A field-level encryption configuration names the profile its matching fields are
+        // encrypted under through a mapping's `ProfileId` — on a query argument-profile
+        // mapping or on a content type-profile one — so a profile any stored configuration
+        // still names is IN USE: the delete is refused and the profile stays readable, and the
+        // same delete lands once every configuration has let go of it.
+        if store
+            .field_level_encryption_config_using_profile(&input.id)
+            .is_some()
+        {
+            return Err(
+                DeleteFieldLevelEncryptionProfileErrorModeled::FieldLevelEncryptionProfileInUse(
+                    crate::state::field_level_encryption_profile_in_use(),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record a read answered from is removed, so the id names no
+        // profile and the caller reference it held is free for a later create to claim.
+        store.field_level_encryption_profiles.remove(&input.id);
+
+        Ok(DeleteFieldLevelEncryptionProfileOutput)
     }
 }
