@@ -258,6 +258,12 @@ pub const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combinat
 /// refusal is the same sentence for every key.
 pub const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
 
+/// The message a passkey operation's `ResourceNotFoundException` carries for a
+/// `CredentialId` the signed-in user holds no registered passkey for. Like
+/// [`DEVICE_NOT_FOUND_MESSAGE`] it names nothing the request asked for, so the
+/// refusal is the same sentence for every credential id.
+pub const WEB_AUTHN_CREDENTIAL_NOT_FOUND_MESSAGE: &str = "Credential does not exist.";
+
 /// The message a device operation's `InvalidUserPoolConfigurationException`
 /// carries on a pool that stores no `DeviceConfiguration`: "When you provide a
 /// value for any property of `DeviceConfiguration`, you activate the device
@@ -3553,6 +3559,24 @@ impl User {
         self.web_authn_credentials
             .iter()
             .any(|credential| credential.credential_id == credential_id)
+    }
+
+    /// Delete the passkey credential `credential_id` from this user, reporting
+    /// whether one was held under that id.
+    ///
+    /// A credential id identifies ONE passkey, so the FIRST credential held
+    /// under that id is the one removed and the credentials that remain keep
+    /// their registration order ([`User::web_authn_credentials`]).
+    pub fn delete_web_authn_credential(&mut self, credential_id: &str) -> bool {
+        let Some(held) = self
+            .web_authn_credentials
+            .iter()
+            .position(|credential| credential.credential_id == credential_id)
+        else {
+            return false;
+        };
+        self.web_authn_credentials.remove(held);
+        true
     }
 
     /// Store whether passkey MFA is activated for this user, as of `now`.
