@@ -3032,16 +3032,23 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///   configured nothing; and a pool of `Count` zero ("the number of instances for
     ///   the specified instance type") configures no instance of its type, so it names
     ///   no configured instance type.
-    /// * the ORDER its hardware arrived on, until a capacity task reconfigures it. A
-    ///   published configuration carries EC2 capacity of one or more instance
-    ///   families, each at the largest size that hardware runs ([`ec2_capacities`]),
-    ///   so an Outpost is configured with those sizes of the configurations its
-    ///   uncancelled orders subscribe to — the same records the subscribed capacity is
-    ///   read off ([`Self::subscribed_capacity_vcpus`]). A line item naming a catalog
-    ///   item this service publishes no configuration for contributes nothing.
-    ///   Capacity is configured ON compute hardware, so an Outpost holding none —
-    ///   one whose ordered hardware is not installed yet, or one whose form factor names
-    ///   no configuration this service installs — is configured with nothing.
+    /// * the ORDER its hardware arrived on, until a capacity task reconfigures that
+    ///   hardware. A published configuration carries EC2 capacity of one or more
+    ///   instance families, each at the largest size that hardware runs
+    ///   ([`ec2_capacities`]), so an Outpost is configured with those sizes of the
+    ///   configurations its uncancelled orders subscribe to — the same records the
+    ///   subscribed capacity is read off ([`Self::subscribed_capacity_vcpus`]). A line
+    ///   item naming a catalog item this service publishes no configuration for
+    ///   contributes nothing. Capacity is configured ON compute hardware, so an
+    ///   Outpost holding none — one whose ordered hardware is not installed yet, or
+    ///   one whose form factor names no configuration this service installs — is
+    ///   configured with nothing.
+    ///
+    /// Because each record configures the hardware it is about, what the Outpost is
+    /// configured with is what stands across ALL of its hardware together: a task
+    /// scoped to one asset replaces the configuration of that asset alone, and the
+    /// order-derived configuration of every other piece of compute hardware on the
+    /// Outpost goes on standing until something reconfigures that hardware too.
     pub fn configured_instance_types(
         &self,
         region: &str,
@@ -3058,6 +3065,12 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
 
     /// The instance types [`Self::configured_instance_types`] reports, as the bare
     /// type names in the order they are reported in.
+    ///
+    /// Each piece of the Outpost's hardware carries its OWN configuration, so the
+    /// report is the union of what stands on each of them: a capacity task scoped to
+    /// one asset configured that asset alone and leaves every other piece of hardware
+    /// configured as it was, which for hardware no task has named is what it arrived
+    /// carrying.
     fn configured_instance_type_names(&self, region: &str, outpost_id: &str) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         // The capacity task that stands on each piece of hardware a task has
@@ -3076,28 +3089,61 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 standing.insert(scope, task);
             }
         }
-        if !standing.is_empty() {
-            for task in standing.values() {
-                for pool in &task.requested_instance_pools {
-                    if pool.count > 0 {
-                        push_once(&mut names, &pool.instance_type);
+        // What stands on the Outpost ITSELF, reported first: the pools of the task
+        // that reconfigured the whole Outpost or, until one does, what the hardware
+        // the Outpost's uncancelled orders subscribe to arrived carrying. That
+        // order-derived configuration still stands wherever a task has not replaced
+        // it, so it is reported while the Outpost holds compute hardware no task of
+        // its own has reconfigured — and an Outpost holding no such hardware (none at
+        // all, or every piece of it reconfigured) carries none of it.
+        match standing.get(&None) {
+            Some(task) => push_configured_pools(&mut names, task),
+            None => {
+                if self.holds_unreconfigured_compute(region, outpost_id, &standing) {
+                    for instance_type in self.ordered_instance_type_names(region, outpost_id) {
+                        push_once(&mut names, &instance_type);
                     }
                 }
             }
-            return names;
         }
-        // Nothing has reconfigured this Outpost, so what is configured on it is what
-        // its hardware arrived carrying — and an Outpost holding no compute hardware
-        // carries no capacity at all.
-        let holds_compute = self.outpost(region, outpost_id).is_some_and(|record| {
-            record
-                .assets
-                .iter()
-                .any(|asset| asset.compute_attributes.is_some())
-        });
-        if !holds_compute {
-            return names;
+        // Then each ASSET a task has reconfigured, which that task configured alone.
+        for (_, task) in standing.iter().filter(|(scope, _)| scope.is_some()) {
+            push_configured_pools(&mut names, task);
         }
+        names
+    }
+
+    /// Whether the Outpost `outpost_id` names in `region` holds compute hardware that
+    /// none of the capacity tasks `standing` on it has reconfigured — the hardware
+    /// whose configuration is still the one it arrived carrying.
+    ///
+    /// Capacity is configured ON compute hardware, so an Outpost holding none — one
+    /// whose ordered hardware is not installed yet, or one whose form factor names no
+    /// configuration this service installs — holds nothing configured by its orders;
+    /// and neither does one whose every compute asset a task has since reconfigured.
+    fn holds_unreconfigured_compute(
+        &self,
+        region: &str,
+        outpost_id: &str,
+        standing: &BTreeMap<Option<&str>, &CapacityTaskRecord>,
+    ) -> bool {
+        self.outpost(region, outpost_id).is_some_and(|record| {
+            record.assets.iter().any(|asset| {
+                asset.compute_attributes.is_some()
+                    && asset
+                        .asset_id
+                        .as_deref()
+                        .is_none_or(|asset_id| !standing.contains_key(&Some(asset_id)))
+            })
+        })
+    }
+
+    /// The instance types the hardware the Outpost `outpost_id` names in `region`
+    /// arrived carrying: the largest size of each instance family the configurations
+    /// its uncancelled orders subscribe to publish EC2 capacity of, in the order those
+    /// orders name them. See [`Self::configured_instance_types`].
+    fn ordered_instance_type_names(&self, region: &str, outpost_id: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
         let mut orders: Vec<&OrderRecord> = all_in_region(&self.orders, region)
             .filter(|record| {
                 record.order.outpost_id.as_deref() == Some(outpost_id)
@@ -5829,6 +5875,20 @@ pub fn page_size(max_results: Option<i32>) -> usize {
 fn push_once(values: &mut Vec<String>, value: &str) {
     if !values.iter().any(|held| held == value) {
         values.push(value.to_string());
+    }
+}
+
+/// Append the instance types one COMPLETED capacity task leaves CONFIGURED on the
+/// hardware it named, each reported once ([`push_once`]).
+///
+/// A pool of `Count` zero ("the number of instances for the specified instance type")
+/// configures no instance of its type, so it names no configured instance type. See
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::configured_instance_types`].
+fn push_configured_pools(values: &mut Vec<String>, task: &CapacityTaskRecord) {
+    for pool in &task.requested_instance_pools {
+        if pool.count > 0 {
+            push_once(values, &pool.instance_type);
+        }
     }
 }
 

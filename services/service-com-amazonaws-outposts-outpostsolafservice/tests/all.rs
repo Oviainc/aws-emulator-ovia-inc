@@ -15,6 +15,8 @@
 mod arn_partition;
 #[path = "all/asset_instances.rs"]
 mod asset_instances;
+#[path = "all/asset_scoped_capacity_configuration.rs"]
+mod asset_scoped_capacity_configuration;
 #[path = "all/availability_zone_identity.rs"]
 mod availability_zone_identity;
 #[path = "all/blocking_instances.rs"]

@@ -9,11 +9,12 @@
 //!
 //! The rule is stated once on
 //! [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::configured_instance_types`]
-//! and applied here: what is configured on an Outpost is the pools of the capacity
-//! task that completed LAST on each piece of its hardware a task has configured
-//! ("the instance type capacities configured for this asset. This can be changed
-//! through a capacity task"), or — until a capacity task reconfigures it — the
-//! instance types the hardware its orders subscribe to arrived carrying.
+//! and applied here: capacity is configured on a PIECE of hardware, so what stands
+//! on each piece of this Outpost's is the pools of the capacity task that completed
+//! LAST on it ("the instance type capacities configured for this asset. This can be
+//! changed through a capacity task") or, for hardware no task has reconfigured, the
+//! instance types the hardware its orders subscribe to arrived carrying — and the
+//! report is what stands across all of them.
 //!
 //! This is the NARROWER of this service's two instance-type reports:
 //! `GetOutpostSupportedInstanceTypes` answers what an Outpost's hardware can
