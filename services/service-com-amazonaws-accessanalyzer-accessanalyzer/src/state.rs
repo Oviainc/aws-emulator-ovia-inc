@@ -31,9 +31,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AccessPreview, AccessPreviewStatusReason, AnalyzerConfiguration, AnalyzerSummary,
-    ArchiveRuleSummary, Configuration, ConflictException, Criterion, InternalServerException,
-    ResourceNotFoundException, ServiceQuotaExceededException, StatusReason, ValidationException,
-    ValidationExceptionField,
+    ArchiveRuleSummary, CloudTrailProperties, Configuration, ConflictException, Criterion,
+    GeneratedPolicy, GeneratedPolicyProperties, GeneratedPolicyResult, InternalServerException,
+    JobDetails, PolicyGeneration, ResourceNotFoundException, ServiceQuotaExceededException,
+    StatusReason, Trail, TrailProperties, ValidationException, ValidationExceptionField,
 };
 
 /// The HTTP status a successful call that has NO content to report answers with.
@@ -428,6 +429,19 @@ pub struct ComAmazonawsAccessanalyzerAccessanalyzerState {
     /// the analyzer name and ARN it produced, so a retry of the SAME request answers
     /// with the first result instead of a conflict. Bounded; see [`ClientTokens`].
     pub create_analyzer_tokens: ClientTokens<CreatedAnalyzerToken>,
+    /// Every policy generation `StartPolicyGeneration` has started, keyed by its `jobId`.
+    ///
+    /// Account-scoped rather than nested under an analyzer, the way the operations that
+    /// reach it are: a generation is asked for an IAM principal and addressed by `jobId`
+    /// alone, and no analyzer appears anywhere in its contract. A `BTreeMap` for the same
+    /// reason as `analyzers`: `ListPolicyGenerations` pages over it, so its iteration
+    /// order has to be the same for the call that hands out a `nextToken` and the call
+    /// that resumes from it.
+    pub policy_generations: BTreeMap<String, PolicyGenerationJob>,
+    /// `StartPolicyGeneration` idempotency: the `clientToken` of a completed start mapped
+    /// to the `jobId` it produced, so a retry of the SAME request answers with the first
+    /// job instead of generating a second policy. Bounded; see [`ClientTokens`].
+    pub start_policy_generation_tokens: ClientTokens<String>,
 }
 
 impl ComAmazonawsAccessanalyzerAccessanalyzerState {
@@ -747,6 +761,257 @@ impl AccessPreviewRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Policy generation jobs.
+//
+// `StartPolicyGeneration` mints ONE [`PolicyGenerationJob`] per accepted request and
+// stores it in [`ComAmazonawsAccessanalyzerAccessanalyzerState::policy_generations`];
+// `GetGeneratedPolicy`, `CancelPolicyGeneration` and `ListPolicyGenerations` all resolve
+// the SAME record, so the `jobId` the start returns is the one every later call tracks
+// and there is no second copy of a job's status to keep in step.
+// ---------------------------------------------------------------------------
+
+/// The `JobStatus` a generation that is still running reports, from the model's own enum
+/// ([`crate::ops::types::JOB_STATUS_VALUES`]).
+pub const JOB_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `JobStatus` a generation that ran to completion reports.
+pub const JOB_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The `JobStatus` a generation `CancelPolicyGeneration` stopped before it completed
+/// reports.
+///
+/// `FAILED`, the fourth value the enum carries, is what a generation whose analysis could
+/// not run at all reports; it travels with a `JobError`, and an accepted request has no
+/// such failure to report, so no stored job resolves to it.
+pub const JOB_STATUS_CANCELED: &str = "CANCELED";
+
+/// How long a started policy generation runs before the clock owes it its terminal
+/// status.
+///
+/// AWS publishes no duration for the generation, so this span is the emulator's own
+/// choice, made like [`ACCESS_PREVIEW_ANALYSIS_SPAN`]: non-zero, so a caller reading or
+/// cancelling straight after `StartPolicyGeneration` still observes `IN_PROGRESS` and the
+/// state it implies, and short enough that a caller waiting for the policy is not kept
+/// waiting. Nothing sleeps for it — the due instant is stored and every read compares the
+/// clock against it.
+pub const POLICY_GENERATION_SPAN: Duration = Duration::from_secs(3);
+
+/// How long a started generation stays part of `ListPolicyGenerations`' answer.
+///
+/// That operation is documented as listing "all of the policy generations requested in
+/// the last seven days", so a job started longer ago than this is no longer listed — the
+/// listing is filtered against the clock rather than the store being pruned by a read.
+pub const POLICY_GENERATION_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How many policy generation jobs this emulator will hold.
+///
+/// Same reasoning as [`MAX_ANALYZERS`]: jobs are caller-driven growth and
+/// `StartPolicyGeneration` models `ServiceQuotaExceededException` (HTTP 402) for meeting a
+/// quota, so the ceiling is expressed with that error rather than with memory.
+pub const MAX_POLICY_GENERATION_JOBS: usize = 1_000;
+
+/// The `resourceType` a policy-generation-scoped refusal reports.
+pub const POLICY_GENERATION_RESOURCE_TYPE: &str = "policy-generation";
+
+/// The fixed `message` of the `ServiceQuotaExceededException` (HTTP 402) that answers a
+/// start past this emulator's job ceiling. The ceiling is a property of the account and
+/// Region, not of the request, so the text names neither.
+pub const POLICY_GENERATION_QUOTA_EXCEEDED_MESSAGE: &str =
+    "Service quota met for policy generations in this account and Region";
+
+/// The 402 for a start past [`MAX_POLICY_GENERATION_JOBS`].
+///
+/// The start minted no `jobId`, so the refusal names the principal the generation was
+/// asked for in the modelled `resourceId`.
+pub fn policy_generation_quota_exceeded(principal_arn: &str) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: POLICY_GENERATION_QUOTA_EXCEEDED_MESSAGE.to_string(),
+        resource_id: principal_arn.to_string(),
+        resource_type: POLICY_GENERATION_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The 400 for a `jobId` that names no policy generation job.
+///
+/// `GetGeneratedPolicy` and `CancelPolicyGeneration` model no 404 at all (403, 429, 500
+/// and this 400 are every error they declare), so a `jobId` this account and Region never
+/// minted is refused as a field validation of `jobId` — which is also the member a client
+/// has to correct.
+pub fn policy_generation_not_found(job_id: &str) -> ValidationException {
+    field_validation_exception(
+        "jobId",
+        format!("jobId must name a policy generation job, but was {job_id}"),
+    )
+}
+
+/// The 400 for a cancel of a job that is no longer running.
+///
+/// Cancelling stops work that is still in progress; a job that has already reached a
+/// terminal status has none left to stop, so the request is refused rather than silently
+/// doing nothing, and the message reports the status the job is actually in.
+pub fn policy_generation_not_cancelable(job_id: &str, status: &str) -> ValidationException {
+    field_validation_exception(
+        "jobId",
+        format!(
+            "jobId must name a policy generation job in status {JOB_STATUS_IN_PROGRESS}, \
+             but {job_id} is in status {status}"
+        ),
+    )
+}
+
+/// The IAM policy language version a generated policy document carries — the `Version`
+/// element of every policy IAM Access Analyzer generates.
+pub const GENERATED_POLICY_VERSION: &str = "2012-10-17";
+
+/// The policy document a completed generation produces.
+///
+/// A generated policy is the set of actions the principal was OBSERVED using in the
+/// CloudTrail events of the analysed time range. This emulator records no CloudTrail
+/// events for any principal, so the observed set is empty whatever trails and range a job
+/// names, and the document it produces is a policy with no statements: computed from the
+/// activity the store holds, not assembled to look generated. The document is built with
+/// `serde_json`, so it is valid JSON by construction.
+fn generated_policy_document() -> String {
+    ::serde_json::json!({
+        "Version": GENERATED_POLICY_VERSION,
+        "Statement": [],
+    })
+    .to_string()
+}
+
+/// One policy generation job, as `StartPolicyGeneration` records it.
+///
+/// A generation is not instantaneous, so the record keeps the instant it is DUE to have
+/// finished and the instant a cancel stopped it; the status a read reports is computed
+/// from the clock against those by [`PolicyGenerationJob::status_at`], so nothing sleeps
+/// and no read has to write.
+#[derive(Debug, Clone)]
+pub struct PolicyGenerationJob {
+    /// The `jobId` the start returned, the handle every later call names the job by.
+    pub job_id: String,
+    /// The IAM entity the policy is generated for, exactly as
+    /// `policyGenerationDetails.principalArn` named it.
+    pub principal_arn: String,
+    /// Exactly the trails `cloudTrailDetails.trails` named, which
+    /// `GeneratedPolicyProperties$cloudTrailProperties` reports back.
+    pub trails: Vec<Trail>,
+    /// The start of the analysed time range, as the request named it.
+    pub analysis_start_time: ::aws_smithy_types::DateTime,
+    /// The end of the analysed time range: the instant the request named, or — since
+    /// `cloudTrailDetails.endTime` is documented to default to "the current time" — the
+    /// instant the generation was started.
+    pub analysis_end_time: ::aws_smithy_types::DateTime,
+    /// When the generation was started.
+    pub started_at: SystemTime,
+    /// When the generation is DUE to have finished: `started_at` plus
+    /// [`POLICY_GENERATION_SPAN`].
+    pub completes_at: SystemTime,
+    /// When `CancelPolicyGeneration` stopped the generation, while it was still running;
+    /// `None` for a job nobody cancelled.
+    pub canceled_at: Option<SystemTime>,
+}
+
+impl PolicyGenerationJob {
+    /// The status this job is in at `now`, and the instant it reached that status —
+    /// `None` while the generation is still running, which has completed at no instant.
+    ///
+    /// A cancel is what it reports first: a cancelled generation stopped where it was and
+    /// never reaches the status the clock would otherwise owe it.
+    pub fn status_at(&self, now: SystemTime) -> (&'static str, Option<SystemTime>) {
+        if let Some(canceled_at) = self.canceled_at {
+            return (JOB_STATUS_CANCELED, Some(canceled_at));
+        }
+        if now < self.completes_at {
+            (JOB_STATUS_IN_PROGRESS, None)
+        } else {
+            (JOB_STATUS_SUCCEEDED, Some(self.completes_at))
+        }
+    }
+
+    /// Whether the generation is still running at `now`, i.e. whether there is still work
+    /// for a cancel to stop.
+    pub fn is_in_progress(&self, now: SystemTime) -> bool {
+        self.status_at(now).0 == JOB_STATUS_IN_PROGRESS
+    }
+
+    /// Project the stored job onto the modelled `JobDetails`, as of `now`.
+    pub fn job_details_at(&self, now: SystemTime) -> JobDetails {
+        let (status, completed_on) = self.status_at(now);
+        JobDetails {
+            job_id: self.job_id.clone(),
+            status: status.to_string(),
+            started_on: ::aws_smithy_types::DateTime::from(self.started_at),
+            completed_on: completed_on.map(::aws_smithy_types::DateTime::from),
+            // `jobError` is "the job error for the policy generation request" — what a
+            // `FAILED` generation reports; nothing failed here, so there is none.
+            job_error: None,
+        }
+    }
+
+    /// Project the stored job onto the modelled `PolicyGeneration`, as a listing reports
+    /// it at `now`.
+    pub fn summary_at(&self, now: SystemTime) -> PolicyGeneration {
+        let (status, completed_on) = self.status_at(now);
+        PolicyGeneration {
+            job_id: self.job_id.clone(),
+            principal_arn: self.principal_arn.clone(),
+            status: status.to_string(),
+            started_on: ::aws_smithy_types::DateTime::from(self.started_at),
+            completed_on: completed_on.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+
+    /// Whether this job was started within [`POLICY_GENERATION_RETENTION`] of `now`, so a
+    /// listing can report the window the operation documents.
+    ///
+    /// A job the clock reports as started in the FUTURE (the host clock moved backwards
+    /// between the start and this read) is as recent as a job can be, so it is in the
+    /// window: ageing out is for a job that is genuinely old.
+    pub fn is_within_retention(&self, now: SystemTime) -> bool {
+        match now.duration_since(self.started_at) {
+            Ok(age) => age <= POLICY_GENERATION_RETENTION,
+            Err(_) => true,
+        }
+    }
+
+    /// The result this job reports at `now`: the properties of the generation, and the
+    /// policy it produced once it has one.
+    pub fn generated_policy_result_at(&self, now: SystemTime) -> GeneratedPolicyResult {
+        let (status, _) = self.status_at(now);
+        GeneratedPolicyResult {
+            properties: GeneratedPolicyProperties {
+                // "true if the generated policy contains all possible actions for a
+                // service that IAM Access Analyzer identified from the CloudTrail trail
+                // that you specified": the document carries every action of every service
+                // the analysis identified, so nothing was left out of it.
+                is_complete: Some(true),
+                principal_arn: self.principal_arn.clone(),
+                cloud_trail_properties: Some(CloudTrailProperties {
+                    trail_properties: self
+                        .trails
+                        .iter()
+                        .map(|trail| TrailProperties {
+                            cloud_trail_arn: trail.cloud_trail_arn.clone(),
+                            regions: trail.regions.clone(),
+                            all_regions: trail.all_regions,
+                        })
+                        .collect(),
+                    start_time: self.analysis_start_time,
+                    end_time: self.analysis_end_time,
+                }),
+            },
+            // A policy exists only once the generation has run to completion: one still
+            // running, and one a cancel stopped, produced none.
+            generated_policies: (status == JOB_STATUS_SUCCEEDED).then(|| {
+                vec![GeneratedPolicy {
+                    policy: generated_policy_document(),
+                }]
+            }),
+        }
+    }
+}
+
 /// Why a proposed access-preview configuration cannot be analyzed, or `None` when it
 /// can.
 ///
@@ -936,17 +1201,32 @@ pub fn configuration_resource_type(configuration: &Configuration) -> &'static st
     }
 }
 
-/// A fresh `accessPreviewId`: a version-4 UUID in the lowercase hyphenated form the
+/// A fresh `accessPreviewId`: a [`new_uuid_v4`] in the lowercase hyphenated form the
 /// model's `AccessPreviewId` pattern requires
-/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`; RFC 9562 §5.4 —
-/// version `4` in the high nibble of octet 6, variant `0b10` in the top bits of octet 8).
-///
-/// Its bits come from three independent sources, so an id is both unguessable and
-/// unique within the process: the OS entropy `std` seeds a fresh `RandomState` with on
-/// every call, a monotonic counter (so two ids minted in the same nanosecond on
-/// different threads differ by construction), and the wall clock in nanoseconds (so ids
-/// do not repeat across processes).
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`).
 pub fn new_access_preview_id() -> String {
+    new_uuid_v4()
+}
+
+/// A fresh `jobId` for a policy generation.
+///
+/// `JobId` carries no `@pattern` in the model, and the `jobId`s AWS returns from
+/// `StartPolicyGeneration` are UUIDs, so a job is identified the same unguessable,
+/// process-unique way an access preview is ([`new_uuid_v4`]).
+pub fn new_policy_generation_job_id() -> String {
+    new_uuid_v4()
+}
+
+/// A freshly minted version-4 UUID in the lowercase hyphenated 8-4-4-4-12 form (RFC 9562
+/// §5.4 — version `4` in the high nibble of octet 6, variant `0b10` in the top bits of
+/// octet 8), which is the form every identifier this service mints takes.
+///
+/// Its bits come from three independent sources, so an id is both unguessable and unique
+/// within the process: the OS entropy `std` seeds a fresh `RandomState` with on every
+/// call, a monotonic counter (so two ids minted in the same nanosecond on different
+/// threads differ by construction), and the wall clock in nanoseconds (so ids do not
+/// repeat across processes).
+pub fn new_uuid_v4() -> String {
     use std::fmt::Write as _;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1190,6 +1470,16 @@ pub fn validation_reason_wire(discriminator: &str) -> Option<&'static str> {
 /// The `ValidationExceptionReason` for a well-formed request asking for something this
 /// resource does not support, from the same `VALIDATION_EXCEPTION_REASON_VALUES` list.
 pub const VALIDATION_REASON_NOT_SUPPORTED: &str = "notSupported";
+
+/// A `ValidationException` for a request that omits a member the operation cannot run
+/// without, although the model leaves that member optional.
+///
+/// AWS words this refusal as `Missing` followed by the member's own wire name, so the
+/// only part of it that varies is which member was omitted — nothing of the request's
+/// values reaches the text.
+pub fn missing_member_exception(member: &str) -> ValidationException {
+    field_validation_exception(member, format!("Missing {member}"))
+}
 
 /// A `ValidationException` about ONE request member: the reason the model lists for a
 /// member that failed validation, and a `fieldList` naming it.
@@ -1574,6 +1864,10 @@ pub enum AuditOutcome {
     CheckEvaluated,
     /// A scan of one resource's policies was started against an analyzer.
     ResourceScanStarted,
+    /// A policy generation job was started and recorded.
+    PolicyGenerationStarted,
+    /// A running policy generation job was cancelled.
+    PolicyGenerationCanceled,
     /// The request was refused as invalid (400).
     ValidationRefused,
     /// The caller may not perform the operation (403).
@@ -1601,6 +1895,8 @@ impl AuditOutcome {
             Self::NoChange => "no-change",
             Self::CheckEvaluated => "check-evaluated",
             Self::ResourceScanStarted => "resource-scan-started",
+            Self::PolicyGenerationStarted => "policy-generation-started",
+            Self::PolicyGenerationCanceled => "policy-generation-canceled",
             Self::ValidationRefused => "validation-refused",
             Self::AccessDenied => "access-denied",
             Self::NotFound => "not-found",
