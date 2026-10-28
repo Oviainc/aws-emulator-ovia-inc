@@ -914,6 +914,14 @@ pub struct StoredMessage {
     /// counted from here, so a change of this message's visibility timeout cannot keep
     /// it hidden for longer than the span one receive may hide it for.
     pub last_received_at: Option<SystemTime>,
+    /// The ARN of the queue this message was MOVED OUT OF when a `RedrivePolicy` drove it
+    /// to a dead-letter queue — what a receive reports under `DeadLetterQueueSourceArn`,
+    /// and `None` for a message no redrive has moved. Stamped at the move
+    /// ([`ComAmazonawsSqsAmazonsqsState::dead_letter_due`]) and kept with the message
+    /// afterwards, so a dead-letter queue several queues redrive into can still be
+    /// triaged by where each message came from; a later redrive re-stamps it with the
+    /// queue that one moved the message out of.
+    pub dead_letter_source_arn: Option<String>,
 }
 
 impl StoredMessage {
@@ -2302,6 +2310,10 @@ impl ComAmazonawsSqsAmazonsqsState {
     /// governs a move is the one the dead-letter queue carries at the instant of the move,
     /// so a target that no longer admits this source takes none of its messages and the
     /// message stays visible on the source queue, to be handed over again.
+    ///
+    /// Each moved message is stamped with the ARN of the queue it was moved out of
+    /// ([`StoredMessage::dead_letter_source_arn`]), which a receive on the dead-letter
+    /// queue reports under `DeadLetterQueueSourceArn`.
     pub fn dead_letter_due(
         &mut self,
         region: &str,
@@ -2404,6 +2416,11 @@ impl ComAmazonawsSqsAmazonsqsState {
                     // of this one; its cross-queue `receive_count` is untouched.
                     queue_receive_count: 0,
                     retention_from: enqueued_at.unwrap_or(message.retention_from),
+                    // Where the message came FROM: a dead-letter queue is routinely shared
+                    // by several source queues, so the moved message carries the ARN of
+                    // the queue the move took it out of and a consumer of the dead-letter
+                    // queue can tell the two apart.
+                    dead_letter_source_arn: Some(source_arn.clone()),
                     ..message
                 });
             }
@@ -2598,6 +2615,10 @@ impl ComAmazonawsSqsAmazonsqsState {
                     // the instant its sender was answered, whichever queue holds it now.
                     retention_from: now,
                     queue_receive_count: 0,
+                    // A task moves the message it is handed: what it already recorded
+                    // about an earlier redrive travels with it, so a message driven back
+                    // out of a dead-letter queue still names the queue it was
+                    // dead-lettered from.
                     ..message
                 });
             }

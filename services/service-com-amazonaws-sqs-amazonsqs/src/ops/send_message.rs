@@ -528,6 +528,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             queue_receive_count: 0,
             first_received_at: None,
             last_received_at: None,
+            // A send puts the message in this queue directly: no redrive moved it here,
+            // so it names no dead-letter source.
+            dead_letter_source_arn: None,
         });
         if let (Some(key), Some(sequence_number)) = (deduplication_key, sequence_number.clone()) {
             queue.record_deduplication(

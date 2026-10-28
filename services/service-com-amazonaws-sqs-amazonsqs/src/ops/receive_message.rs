@@ -769,9 +769,10 @@ fn wire_message(
 /// Only the attributes the emulator genuinely records are reported: `SenderId`,
 /// `SentTimestamp`, `ApproximateReceiveCount`, `ApproximateFirstReceiveTimestamp`, the
 /// `AWSTraceHeader` a send carried in `MessageSystemAttributes` and, for a message that
-/// carries them, `MessageGroupId`, `MessageDeduplicationId` and `SequenceNumber`. The rest
-/// of the `MessageSystemAttributeName` set belongs to behaviour that is not implemented,
-/// so it is omitted rather than invented.
+/// carries them, `MessageGroupId`, `MessageDeduplicationId`, `SequenceNumber` and the
+/// `DeadLetterQueueSourceArn` a redrive stamped on it. The rest of the
+/// `MessageSystemAttributeName` set belongs to behaviour that is not implemented, so it is
+/// omitted rather than invented.
 fn system_attributes(
     message: &sqs::StoredMessage,
     requested: &[String],
@@ -816,6 +817,13 @@ fn system_attributes(
     }
     if let Some(sequence_number) = &message.sequence_number {
         offer("SequenceNumber", sequence_number.clone());
+    }
+    // Where a redrive moved this message FROM: the ARN of the queue whose `RedrivePolicy`
+    // drove it to the dead-letter queue holding it. Only a message a redrive moved carries
+    // one, so only those report it — a message sent straight to this queue has no
+    // dead-letter source to name.
+    if let Some(source_arn) = &message.dead_letter_source_arn {
+        offer("DeadLetterQueueSourceArn", source_arn.clone());
     }
     attributes
 }

@@ -23,6 +23,8 @@ mod dead_letter_drain_cycle;
 mod dead_letter_instants;
 #[path = "all/dead_letter_redrive.rs"]
 mod dead_letter_redrive;
+#[path = "all/dead_letter_source_attribution.rs"]
+mod dead_letter_source_attribution;
 #[path = "all/delete_message_batch.rs"]
 mod delete_message_batch;
 #[path = "all/fifo_group_rotation.rs"]
