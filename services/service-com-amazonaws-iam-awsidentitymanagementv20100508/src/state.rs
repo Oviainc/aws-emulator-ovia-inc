@@ -4796,13 +4796,13 @@ pub fn access_report_job_status(
 }
 
 /// The message a read of a report job the account holds nothing under is refused with —
-/// the `NoSuchEntityException` message, whose fixed text is `The job ID ` and ` cannot be
-/// found.` around the id the request supplied.
+/// the `NoSuchEntityException` message, whose fixed text is `Job ` and ` does not exist.`
+/// around the id the request supplied.
 ///
 /// ONE wording, shared by every reader of a report job, so two reads cannot describe the
 /// same missing job differently.
 pub fn report_job_not_found(job_id: &str) -> String {
-    format!("The job ID {job_id} cannot be found.")
+    format!("Job {job_id} does not exist.")
 }
 
 /// The `AccessAdvisorUsageGranularityType` value that asks for SERVICE data only: "if you
@@ -4928,6 +4928,18 @@ pub fn reported_service(service_namespace: &str) -> Option<&'static ReportedServ
     REPORTED_SERVICES
         .iter()
         .find(|service| service.service_namespace.eq_ignore_ascii_case(service_namespace))
+}
+
+/// The message a read asked for ONE service's last accessed data under a namespace no
+/// service of [`REPORTED_SERVICES`] is published under is refused with — the
+/// `InvalidInputException` message, whose fixed text is `Service namepace ` and ` is either
+/// invalid or unsupported.` (IAM's own spelling of the word) around the namespace the
+/// request supplied.
+///
+/// The one wording for it, so every read taking a single `ServiceNamespace` to name the
+/// service it reports on describes an unusable namespace the same way.
+pub fn unsupported_service_namespace(service_namespace: &str) -> String {
+    format!("Service namepace {service_namespace} is either invalid or unsupported.")
 }
 
 /// The `jobStatusType` value of a job whose generation is not due yet.

@@ -221,6 +221,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // "Provide the service namespace to learn when the IAM entity last attempted to
+        // access the specified service": the request names ONE service, so a namespace no
+        // service this report family reports on is published under
+        // (`crate::state::reported_service`) names nothing to report and is refused as an
+        // "invalid … value … supplied for an input parameter" rather than answered with an
+        // empty list, which would say the service is in nobody's reach.
+        if crate::state::reported_service(&input.service_namespace).is_none() {
+            return Err(
+                GetServiceLastAccessedDetailsWithEntitiesErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::unsupported_service_namespace(
+                            &input.service_namespace,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The page resumes strictly after the ENTITY the marker names in this report's
         // order for this service, so a token this service did not issue while paging it is
         // refused as an "invalid … value … supplied for an input parameter" rather than
@@ -293,11 +312,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // permissions to access the specified service"): an entity is listed because the
         // report's resource puts that service in its reach, so nothing is listed for a
         // service the resource's policies allow no action of — decided by the one reading
-        // of a policy document this crate holds (`crate::state::grants_service_access`) —
-        // nor for a service outside the catalog a report covers
-        // (`crate::state::reported_service`).
+        // of a policy document this crate holds (`crate::state::grants_service_access`).
+        // The namespace itself is one the report covers: a namespace outside that catalog
+        // was refused above.
         let in_reach = completed
-            && crate::state::reported_service(&input.service_namespace).is_some()
             && carried.iter().any(|policy| {
                 policy.document.as_deref().is_some_and(|document| {
                     crate::state::grants_service_access(document, &input.service_namespace)

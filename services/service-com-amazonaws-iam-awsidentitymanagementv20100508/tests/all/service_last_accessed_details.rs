@@ -896,14 +896,102 @@ async fn the_entities_reported_are_the_ones_the_reports_resource_reaches() {
         );
     }
 
-    // A service outside the ones a report covers is in nobody's reach, however the
-    // resource's policies are written.
-    let body = entities(&router, "a namespace no report covers", &policy_job, "a4b", &[]).await;
-    assert!(
-        elements(&body, "Arn").is_empty(),
-        "a service no report covers reports no entity, got {:?}",
-        elements(&body, "Arn")
-    );
+}
+
+/// RULE: a read that names ONE service by its `ServiceNamespace` is served for a namespace
+/// the report family covers a service under — with an empty list when that service is in
+/// nobody's reach — and refused as an invalid input, naming the value it was given, for a
+/// namespace that covers no service at all.
+#[tokio::test]
+async fn a_service_namespace_covering_no_service_is_refused_as_an_invalid_input() {
+    let router = router();
+    let case = "the namespace fixtures";
+    let arn = create_user(&router, "namespace-user", "/").await;
+    put_policy(
+        &router,
+        "PutUserPolicy",
+        "UserName",
+        "namespace-user",
+        "reads-objects",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#,
+    )
+    .await;
+    let job_id = generate(&router, case, &arn, None).await;
+    tokio::time::sleep(generation_span()).await;
+
+    // SOURCE of which namespaces name a service at all: `state::REPORTED_SERVICES`, the
+    // services a report covers — so the rows that must be SERVED are taken from it, the
+    // first and the last entry included, rather than written out here.
+    let first = state::REPORTED_SERVICES
+        .first()
+        .expect("a report covers at least one service")
+        .service_namespace;
+    let last = state::REPORTED_SERVICES
+        .last()
+        .expect("a report covers at least one service")
+        .service_namespace;
+
+    // Rows spanning the ways a namespace names a service the report covers: the one the
+    // grant reaches, the same one spelled in another case (a service prefix is published in
+    // lower case, and one namespace names one service however it is spelled), a covered
+    // service the grant does not reach, and the two ends of the catalog.
+    for (what, namespace, reaches) in [
+        ("the service the grant reaches", "s3", true),
+        ("that service spelled in another case", "S3", true),
+        ("a covered service the grant does not reach", "dynamodb", false),
+        ("the first service the catalog covers", first, false),
+        ("the last service the catalog covers", last, false),
+    ] {
+        let body = entities(&router, what, &job_id, namespace, &[("MaxItems", "1000")]).await;
+        let expected = if reaches {
+            vec!["namespace-user".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            elements(&body, "Name"),
+            expected,
+            "case {what:?}: expected the entities that service is in reach of, got {:?}",
+            elements(&body, "Name")
+        );
+    }
+
+    // Rows spanning the ways a namespace covers no service: a value naming no service at
+    // all, a published service prefix the report family covers nothing for, one that merely
+    // carries a covered namespace as a prefix, and the two ends of `serviceNamespaceType`'s
+    // own length bounds (1..64), so the refusal is the handler's rather than the boundary
+    // validator's. Each clears that shape, so each reaches the handler.
+    let longest = "n".repeat(64);
+    for (what, namespace) in [
+        ("a value naming no service at all", "not-a-real-aws-service-namespace"),
+        ("a published prefix the report covers nothing for", "a4b"),
+        ("a prefix that merely extends a covered one", "s3outposts"),
+        ("the shortest namespace the shape admits", "x"),
+        ("the longest namespace the shape admits", longest.as_str()),
+    ] {
+        let (status, body) = call(
+            &router,
+            "GetServiceLastAccessedDetailsWithEntities",
+            &[("JobId", job_id.as_str()), ("ServiceNamespace", namespace)],
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {what:?}: expected HTTP 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidInput",
+            "case {what:?}: expected InvalidInput, got {:?}: {body}",
+            error_code(&body)
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            format!("Service namepace {namespace} is either invalid or unsupported."),
+            "case {what:?}: expected the refusal to name the namespace it was given, got {:?}",
+            element(&body, "Message")
+        );
+    }
 }
 
 /// RULE: both reads page through their own list exactly once — at most `MaxItems` items per
@@ -1186,10 +1274,17 @@ async fn an_arn_or_job_id_naming_nothing_is_refused() {
             organizations_job.clone(),
         ),
     ] {
+        // Every reader of a report job, so one missing job cannot be described two ways.
         for action in [
             "GetServiceLastAccessedDetails",
             "GetServiceLastAccessedDetailsWithEntities",
+            "GetOrganizationsAccessReport",
         ] {
+            // The one job this account DOES hold is a report of the other kind, which its
+            // own reader serves rather than refuses.
+            if action == "GetOrganizationsAccessReport" && job_id == organizations_job {
+                continue;
+            }
             let mut params = vec![("JobId", job_id.as_str())];
             if action.ends_with("WithEntities") {
                 params.push(("ServiceNamespace", "s3"));
@@ -1207,8 +1302,9 @@ async fn an_arn_or_job_id_naming_nothing_is_refused() {
             );
             assert_eq!(
                 element(&body, "Message"),
-                format!("The job ID {job_id} cannot be found."),
-                "case {what:?}: {action} must name the job id asked for"
+                format!("Job {job_id} does not exist."),
+                "case {what:?}: {action} must name the job id asked for, got {:?}",
+                element(&body, "Message")
             );
         }
     }
