@@ -31,8 +31,21 @@
 //! silently ignoring it would make the filter claim to filter when it does not.
 //!
 //! A categorical attribute may hold several values separated by `|`, the separator
-//! Personalize's own Items CSV uses, so `IN` matches when ANY of the attribute's
-//! values matches.
+//! Personalize's own Items CSV uses, so a predicate matches when ANY of the attribute's
+//! values matches, and a negated one when none does.
+//!
+//! # What a comparison compares
+//!
+//! `IN`, `NOT IN`, `=` and `<>` all test EQUALITY of the value(s) an entry stores,
+//! whether that metadata is categorical or numerical: two values that both name a
+//! finite number are compared as numbers, and anything else is compared as text, so a
+//! clause over a categorical column is applied rather than silently satisfied by
+//! nothing, and set membership agrees with `=` on when two spellings name one quantity.
+//! The ORDERING operators (`<`, `<=`, `>`, `>=`) are defined over numerical metadata
+//! only, so an operand that names no number leaves the clause unapplicable and is
+//! refused where it becomes known — at [`parse`] for a literal written into the
+//! expression, and at [`bind`] for a `$placeholder` the request binds — never by
+//! applying a clause nothing can satisfy.
 //!
 //! A clause is evaluated against the value the entry STORES for its column, so an entry
 //! that stores none satisfies no clause of any predicate — `NOT IN` included — and such
@@ -92,7 +105,7 @@ pub enum Combinator {
     Or,
 }
 
-/// A numeric comparison a clause can carry.
+/// A comparison a clause can carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Comparison {
     /// `=`
@@ -110,6 +123,28 @@ pub enum Comparison {
 }
 
 impl Comparison {
+    /// Whether this operator ORDERS its operands, and is therefore defined over
+    /// numerical metadata only — as opposed to `=` and `<>`, which test equality of
+    /// categorical or numerical values alike.
+    fn orders(self) -> bool {
+        matches!(
+            self,
+            Self::Less | Self::LessOrEqual | Self::Greater | Self::GreaterOrEqual
+        )
+    }
+
+    /// How the operator is spelled in an expression, for a message that names it.
+    fn spelling(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::NotEqual => "<>",
+            Self::Less => "<",
+            Self::LessOrEqual => "<=",
+            Self::Greater => ">",
+            Self::GreaterOrEqual => ">=",
+        }
+    }
+
     /// Whether `left <op> right` holds.
     fn holds(self, left: f64, right: f64) -> bool {
         match self {
@@ -143,7 +178,7 @@ pub enum Predicate {
         /// True for `NOT IN`.
         negated: bool,
     },
-    /// A numeric comparison against a single operand.
+    /// A comparison against a single operand.
     Compare {
         /// The comparison operator.
         op: Comparison,
@@ -362,6 +397,7 @@ impl Parser {
             ));
         }
         let predicate = self.predicate()?;
+        orderable(dataset, column, &predicate)?;
         Ok(Clause {
             dataset: dataset.to_string(),
             column: column.to_string(),
@@ -440,6 +476,69 @@ fn describe(token: Option<&Token>) -> String {
     }
 }
 
+/// The finite number a value names, or `None` when its text names none.
+///
+/// Surrounding whitespace is not part of a value, and neither infinity nor a
+/// not-a-number is a quantity a dataset column holds, so only a finite number counts as
+/// one: a value that is not one is text, and a clause that needs a number cannot be
+/// applied to it.
+fn numeric(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+}
+
+/// Whether two values are equal: as numbers when both name one — so the same quantity
+/// written two ways is one value — and as the text they hold otherwise.
+fn equal_values(left: &str, right: &str) -> bool {
+    match (numeric(left), numeric(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// The refusal an ordering comparison earns when the value it would compare against
+/// names no number: naming the clause, the operator and the value, plus the
+/// `filterValues` parameter the value came from when it came from one.
+fn unorderable(
+    dataset: &str,
+    column: &str,
+    op: Comparison,
+    value: &str,
+    parameter: Option<&str>,
+) -> String {
+    let source = match parameter {
+        Some(name) => format!("filterValues binds the filter expression parameter ${name} to "),
+        None => "filter expression compares ".to_string(),
+    };
+    format!(
+        "{source}the non-numeric value '{value}', which the {dataset}.{column} {} comparison \
+         cannot apply: {} compares numbers only",
+        op.spelling(),
+        op.spelling()
+    )
+}
+
+/// `Err` when a clause orders `dataset`.`column` against a literal that names no
+/// number.
+///
+/// Checked where the expression is parsed, so a filter whose own text carries such a
+/// comparison is refused when it is CREATED rather than stored as a clause nothing can
+/// satisfy. A `$placeholder` operand is checked where a request binds it ([`bind`]).
+fn orderable(dataset: &str, column: &str, predicate: &Predicate) -> Result<(), String> {
+    match predicate {
+        Predicate::Compare {
+            op,
+            operand: Operand::Literal(literal),
+        } if op.orders() && numeric(literal).is_none() => {
+            Err(unorderable(dataset, column, *op, literal, None))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Parse a `filterExpression`.
 ///
 /// `Err` carries a message naming what was wrong, for the caller that registered the
@@ -499,10 +598,27 @@ struct BoundClause {
 }
 
 /// A predicate with every operand resolved to a concrete value.
+///
+/// A comparison is bound as whichever of the two things it asserts: `=` and `<>` are an
+/// equality test over a value of either kind, while an ordering operator carries the
+/// NUMBER its operand named — so binding is where a value that names none is refused,
+/// and the evaluator has nothing left to answer "never true" for.
 #[derive(Debug, Clone)]
 enum BoundPredicate {
-    In { values: Vec<String>, negated: bool },
-    Compare { op: Comparison, value: String },
+    In {
+        values: Vec<String>,
+        negated: bool,
+    },
+    /// `=` (`negated: false`) or `<>` (`negated: true`) against one value.
+    Equals {
+        value: String,
+        negated: bool,
+    },
+    /// `<`, `<=`, `>` or `>=` against the number the operand named.
+    Order {
+        op: Comparison,
+        value: f64,
+    },
 }
 
 /// A filter expression bound to one request: ready to decide, per catalog entry,
@@ -533,7 +649,10 @@ pub struct BoundFilter {
 ///
 /// A clause over the other dataset cannot be evaluated against this entity's stored
 /// attributes at all, which is an error for either kind: the caller applied an Items
-/// filter to action recommendations, or the reverse.
+/// filter to action recommendations, or the reverse. So is a value the request DID
+/// supply that the clause cannot compare — an ordering operator against text: the
+/// asymmetry above is about a value the request OMITS, and a supplied value the clause
+/// cannot apply is reported here rather than filtering nothing.
 pub fn bind(
     expression: &FilterExpression,
     entity: Entity,
@@ -579,7 +698,9 @@ pub fn bind(
             Predicate::Compare { op, operand } => {
                 match resolve(operand, filter_values).and_then(|resolved| resolved.into_iter().next())
                 {
-                    Some(value) => BoundPredicate::Compare { op: *op, value },
+                    Some(value) => {
+                        bound_comparison(*op, &clause.dataset, &clause.column, operand, value)?
+                    }
                     None => {
                         // Only a parameter can go unbound: a literal operand stands for
                         // itself.
@@ -603,6 +724,40 @@ pub fn bind(
         kind: expression.kind,
         clauses,
     })
+}
+
+/// One comparison of `clause`, bound to the `value` its operand named.
+///
+/// `=` and `<>` test equality, which a value of either kind answers. An ordering
+/// operator compares numbers, so a value naming none leaves the clause unapplicable:
+/// `Err` reports it — naming the `filterValues` parameter it came from — rather than
+/// keeping a clause that could hold for no entry.
+fn bound_comparison(
+    op: Comparison,
+    dataset: &str,
+    column: &str,
+    operand: &Operand,
+    value: String,
+) -> Result<BoundPredicate, String> {
+    if !op.orders() {
+        return Ok(BoundPredicate::Equals {
+            value,
+            negated: op == Comparison::NotEqual,
+        });
+    }
+    match numeric(&value) {
+        Some(number) => Ok(BoundPredicate::Order { op, value: number }),
+        None => Err(unorderable(
+            dataset,
+            column,
+            op,
+            &value,
+            match operand {
+                Operand::Parameter(name) => Some(name.as_str()),
+                Operand::Literal(_) => None,
+            },
+        )),
+    }
 }
 
 /// What an expression of `kind` does with a clause whose parameter `name` the request
@@ -771,27 +926,25 @@ impl BoundFilter {
 /// unknown rather than true. That is decided here, once, before the predicate is read —
 /// so `NOT IN`, `IN` and every comparison answer an attribute-less entry the same way,
 /// and an entry is kept or removed only by the attributes it actually holds.
+///
+/// A column may hold SEVERAL values, so every predicate reads the ones the entry holds
+/// the same way: the clause holds when any of them satisfies it, and a negated one when
+/// none does.
 fn evaluate(clause: &BoundClause, attributes: &BTreeMap<String, String>) -> bool {
     let Some(stored) = attributes.get(&clause.column) else {
         return false;
     };
+    let held = || stored.split('|').map(str::trim);
     match &clause.predicate {
         BoundPredicate::In { values, negated } => {
-            let matched = stored
-                .split('|')
-                .map(str::trim)
-                .any(|held| values.iter().any(|value| value == held));
+            let matched = held().any(|held| values.iter().any(|value| equal_values(held, value)));
             matched != *negated
         }
-        BoundPredicate::Compare { op, value } => {
-            let Ok(right) = value.parse::<f64>() else {
-                return false;
-            };
-            stored
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .is_some_and(|left| op.holds(left, right))
+        BoundPredicate::Equals { value, negated } => {
+            let matched = held().any(|held| equal_values(held, value));
+            matched != *negated
         }
+        BoundPredicate::Order { op, value } => held()
+            .any(|held| numeric(held).is_some_and(|number| op.holds(number, *value))),
     }
 }

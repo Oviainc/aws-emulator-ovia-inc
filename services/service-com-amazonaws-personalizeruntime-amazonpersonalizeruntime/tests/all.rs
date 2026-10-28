@@ -15,6 +15,8 @@
 mod absent_attribute_columns;
 #[path = "all/action_filter_value_forms.rs"]
 mod action_filter_value_forms;
+#[path = "all/comparison_operands.rs"]
+mod comparison_operands;
 #[path = "all/filter_value_quoting.rs"]
 mod filter_value_quoting;
 #[path = "all/inference.rs"]

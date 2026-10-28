@@ -45,7 +45,8 @@
 //!   carries is read from those stored catalogs.
 //! * A filter's expression is validated when the filter is REGISTERED, exactly as
 //!   `CreateFilter` validates it, so a stored filter is always one the runtime can
-//!   apply.
+//!   apply. What a REQUEST binds its placeholders to is a fact about the request, so a
+//!   value a clause cannot apply is reported where the request is served.
 
 pub mod filter;
 pub mod scoring;
