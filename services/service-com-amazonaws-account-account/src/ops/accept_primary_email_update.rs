@@ -12,8 +12,8 @@
 //! ([`crate::state::PRIMARY_EMAIL_UPDATE_COMPLETION`]).
 //!
 //! The order the refusals are decided in: the authorization rule, then the
-//! address's syntax, then whether there is an update at all (the modelled 404
-//! `ResourceNotFoundException`), then the update's status, then the input
+//! address's syntax, then whether there is an update at all (the modelled 400
+//! `ValidationException`, as on the status read), then the update's status, then the input
 //! members the request presents (the address, then the passcode), and last the
 //! conflict with another account's hold on the address — so a refused input
 //! member is reported as the 400 it is, whatever else the store holds.

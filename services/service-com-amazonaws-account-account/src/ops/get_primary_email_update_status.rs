@@ -4,8 +4,10 @@
 //! Reports the status of the MOST RECENT primary email update of the resolved
 //! account (the one the request names, else the caller's own), as
 //! `StartPrimaryEmailUpdate` recorded it. An account with no update has no
-//! status to report, so the call is refused with the modelled 404
-//! `ResourceNotFoundException` rather than answered with an invented status.
+//! status to report, so the call is refused with the modelled 400
+//! `ValidationException` — the in-flight request this call's own parameters
+//! assume is not there ([`crate::state::no_primary_email_update`]) — rather than
+//! answered with an invented status.
 //!
 //! ## Shape of an operation
 //!

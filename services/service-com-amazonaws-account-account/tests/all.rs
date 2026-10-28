@@ -27,6 +27,8 @@ mod contact_information;
 mod enum_input_validation;
 #[path = "all/gov_cloud_account_information.rs"]
 mod gov_cloud_account_information;
+#[path = "all/no_primary_email_update_refusal.rs"]
+mod no_primary_email_update_refusal;
 #[path = "all/one_time_passcode_confirmation.rs"]
 mod one_time_passcode_confirmation;
 #[path = "all/own_account_target_refusal.rs"]
