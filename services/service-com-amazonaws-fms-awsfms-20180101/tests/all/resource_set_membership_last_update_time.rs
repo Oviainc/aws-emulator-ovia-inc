@@ -28,6 +28,15 @@
 //! into the past, so "the timestamp moved" is decided at a distance no timestamp
 //! precision can blur, and a moved timestamp is then pinned to the instant of the
 //! call rather than merely being later than before.
+//!
+//! The seed and the readers here ([`instance`], [`firewall`],
+//! [`create_set_with_members`], [`backdate`], [`epoch_seconds`],
+//! [`reported_last_update_time`], [`summarized_last_update_time`] and
+//! [`reported_membership`]) are `pub(crate)` so the sibling suite that asserts the
+//! same rule in its invariant form over generated memberships
+//! ([`crate::resource_set_disassociation_membership_invariants`]) reads the stored
+//! instant and the membership through the SAME readers instead of growing a second
+//! copy of them.
 
 use std::time::{Duration, SystemTime};
 
@@ -51,12 +60,12 @@ const BACKDATED_BY: Duration = Duration::from_secs(600);
 const OTHER_REGION: &str = "eu-central-1";
 
 /// An EC2 instance ARN of this account and Region, one per index.
-fn instance(index: usize) -> String {
+pub(crate) fn instance(index: usize) -> String {
     format!("arn:aws:ec2:{REGION}:{ACCOUNT}:instance/i-{index:017x}")
 }
 
 /// A Network Firewall ARN of this account and Region.
-fn firewall(name: &str) -> String {
+pub(crate) fn firewall(name: &str) -> String {
     format!("arn:aws:network-firewall:{REGION}:{ACCOUNT}:firewall/{name}")
 }
 
@@ -177,7 +186,7 @@ fn cases() -> Vec<Case> {
 
 /// Epoch seconds as the wire reports a timestamp, for comparing a reported
 /// `LastUpdateTime` with an instant this test observed.
-fn epoch_seconds(when: SystemTime) -> f64 {
+pub(crate) fn epoch_seconds(when: SystemTime) -> f64 {
     when.duration_since(SystemTime::UNIX_EPOCH)
         .expect("an instant after the epoch")
         .as_secs_f64()
@@ -185,7 +194,7 @@ fn epoch_seconds(when: SystemTime) -> f64 {
 
 /// Create a resource set holding `resource_types`, associate `members` with it,
 /// and return the minted `Id`.
-async fn create_set_with_members(
+pub(crate) async fn create_set_with_members(
     router: &MultiServiceRouter,
     case_name: &str,
     resource_types: &[&str],
@@ -239,7 +248,11 @@ async fn create_set_with_members(
 /// Date one stored resource set's last update [`BACKDATED_BY`] into the past, so
 /// the instant a later membership change records is separated from it by more
 /// than any timestamp precision can blur.
-fn backdate(engine: &std::sync::Arc<engine::InMemoryEngine>, case_name: &str, id: &str) {
+pub(crate) fn backdate(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    case_name: &str,
+    id: &str,
+) {
     with_store(engine, |store| {
         let record = store
             .resource_sets
@@ -250,7 +263,7 @@ fn backdate(engine: &std::sync::Arc<engine::InMemoryEngine>, case_name: &str, id
 }
 
 /// The `LastUpdateTime` `GetResourceSet` reports for one set, as epoch seconds.
-async fn reported_last_update_time(
+pub(crate) async fn reported_last_update_time(
     router: &MultiServiceRouter,
     case_name: &str,
     id: &str,
@@ -272,7 +285,7 @@ async fn reported_last_update_time(
 
 /// The `LastUpdateTime` the `ListResourceSets` summary of one set reports, as
 /// epoch seconds: the second reader of the same stored instant.
-async fn summarized_last_update_time(
+pub(crate) async fn summarized_last_update_time(
     router: &MultiServiceRouter,
     case_name: &str,
     id: &str,
@@ -298,7 +311,7 @@ async fn summarized_last_update_time(
 
 /// The membership `ListResourceSetResources` reports, in ascending URI order —
 /// the modelled reader of which resources the set holds.
-async fn reported_membership(
+pub(crate) async fn reported_membership(
     router: &MultiServiceRouter,
     case_name: &str,
     id: &str,

@@ -58,6 +58,12 @@ mod resource_set_membership_last_update_time;
 // Declared beside them, for the same reason: this suite's name sorts right into
 // the contended region of the list below. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.
+#[path = "all/resource_set_disassociation_membership_invariants.rs"]
+mod resource_set_disassociation_membership_invariants;
+
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
 #[path = "all/pagination_token_decoding.rs"]
 mod pagination_token_decoding;
 
