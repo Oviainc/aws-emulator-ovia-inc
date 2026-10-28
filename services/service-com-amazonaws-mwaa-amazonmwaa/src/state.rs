@@ -15,6 +15,11 @@ use crate::ops::types::{
     ModuleLoggingConfiguration, ModuleLoggingConfigurationInput, NetworkConfiguration,
 };
 
+/// STS's own state accessors, which answer who a request's credential speaks for. The
+/// service that MINTS a session is the one asked about it, so the identity this service
+/// reports for a credential is the one `sts:GetCallerIdentity` reports for it.
+use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
+
 /// The sigv4 signing name, endpoint prefix and ARN namespace of this service, from the
 /// model's `aws.auth#sigv4` / `aws.api#service` traits (all three are `airflow`).
 pub const ARN_SERVICE: &str = "airflow";
@@ -1366,24 +1371,93 @@ pub fn webserver_hostname(webserver_url: &str) -> &str {
     }
 }
 
-/// The IAM identity a request was signed by, as this emulator knows it.
+/// The ARN of the IAM identity a request's credential speaks for, the value
+/// `sts:GetCallerIdentity` answers for that same credential.
 ///
-/// MWAA reports the identity that asked for a token (`IamIdentity`: "This might be an IAM
-/// user, or an assumed or federated identity"). The only identity fact this emulator
-/// holds about a request is the access-key id its SigV4 credential presented, so that is
-/// what is reported: no user, role or session is invented around it.
-pub fn caller_iam_identity(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    ::engine::extract_akid(&ctx.parts().headers)
+/// Resolved through STS's OWN accessors rather than from anything this service keeps: the
+/// session the request's access key id names ([`sts_state::resolve_request_caller`]), or —
+/// for a key that names no session — the IAM user that holds the key
+/// ([`sts_state::long_term_identity`]), which is exactly how `sts:GetCallerIdentity`
+/// resolves it. A caller therefore reads one identity back from both services for one
+/// credential.
+///
+/// Falls back to the identity STS answers for a key nothing holds
+/// ([`sts_state::ambient_identity`]) when no session resolves — a credential past its
+/// lifetime, or an engine carrying no STS store at all.
+///
+/// The IAM store is locked and RELEASED before the session store is, so no two services'
+/// stores are ever held at once, and neither is held while this service's own store is.
+fn caller_identity_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let access_key_id = ::service_common::request_access_key_id(ctx.parts());
+    let long_term = {
+        let iam = sts_state::iam_state(engine);
+        match iam.as_ref() {
+            Some(iam) => sts_state::long_term_identity(Some(&iam.lock()), &access_key_id),
+            None => sts_state::long_term_identity(None, &access_key_id),
+        }
+    };
+    match sts_state::service_state(engine) {
+        Some(sts) => {
+            let resolved = sts_state::resolve_request_caller(
+                &mut sts.lock(),
+                &access_key_id,
+                SystemTime::now(),
+                ctx.credential_store(),
+                long_term,
+            );
+            match resolved {
+                Ok(caller) => caller.identity.arn,
+                // A credential past its promised lifetime speaks for no session, which is
+                // the position a key nothing holds is in.
+                Err(_expired) => sts_state::ambient_identity().arn,
+            }
+        }
+        None => long_term.arn,
+    }
+}
+
+/// The IAM identity a request was signed by, as `IamIdentity` reports it.
+///
+/// `IamIdentity` is "the NAME of the IAM identity creating the web login token. This might
+/// be an IAM user, or an assumed or federated identity. For example,
+/// `assumed-role/Admin/your-name`" — a name, which is the RESOURCE field of that
+/// identity's ARN (`user/<path…><name>`, `assumed-role/<role>/<session>`,
+/// `federated-user/<name>`) and never the whole ARN, and never a credential identifier
+/// such as the access key id the request presented. The identity itself is
+/// [`caller_identity_arn`], and the resource field is read off it with the tree's one ARN
+/// parse; a value that is not a well-formed ARN is reported as it stands rather than
+/// replaced.
+pub fn caller_iam_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let arn = caller_identity_arn(engine, ctx);
+    ::service_common::arn::resource(&arn)
+        .unwrap_or(&arn)
+        .to_string()
 }
 
 /// The Apache Airflow user name the calling IAM identity maps to.
 ///
-/// MWAA maps the IAM identity to an Apache Airflow user (`AirflowIdentity`: "The user name
-/// of the Apache Airflow identity creating the web login token"); the mapping here is the
-/// identity itself, truncated to [`AIRFLOW_IDENTITY_MAX_LENGTH`] so the reported value
-/// stays inside the modelled bound.
+/// `AirflowIdentity` is "the USER NAME of the Apache Airflow identity creating the web
+/// login token", so it is the identity's own name: the last segment of the IAM identity
+/// name [`caller_iam_identity`] reports — the role session name of an assumed-role
+/// identity, the user name of an IAM user or a federated user — without the
+/// `user/`, `assumed-role/<role>/` or `federated-user/` prefix that states which KIND of
+/// identity it is. That prefix is what makes the two members differ in form: `IamIdentity`
+/// names the identity, `AirflowIdentity` names the Apache Airflow user it maps to.
+///
+/// Truncated to [`AIRFLOW_IDENTITY_MAX_LENGTH`] so the reported value stays inside the
+/// member's own bound, which every IAM user name and role session name already is.
 pub fn airflow_identity(iam_identity: &str) -> String {
-    iam_identity
+    let user_name = iam_identity
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(iam_identity);
+    user_name
         .chars()
         .take(AIRFLOW_IDENTITY_MAX_LENGTH)
         .collect()

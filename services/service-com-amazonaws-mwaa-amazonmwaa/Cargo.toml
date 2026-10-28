@@ -28,9 +28,23 @@ sha2 = { workspace = true }
 # Opaque pagination cursors: hex-encode the internal list cursor so `NextToken` is a
 # single-token string a client only ever echoes back.
 hex = { workspace = true }
+# `arn` (the tree's one ARN parse, which reads the NAME out of the calling identity's ARN)
+# and `request_access_key_id` (the key id a request presents, wherever SigV4 put it).
+service-common = { path = "../common" }
+# The STS store resolves which IAM identity a request's credential speaks for — the
+# identity `CreateWebLoginToken` reports — so this service reads the state of the service
+# that minted that credential rather than keeping a second copy of the fact.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The identity suite makes the callers it signs as through IAM's and STS's OWN operations
+# (a user and its access key, a role and a session of it), so the identities asserted on
+# are the ones those services minted.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [lints]
 workspace = true

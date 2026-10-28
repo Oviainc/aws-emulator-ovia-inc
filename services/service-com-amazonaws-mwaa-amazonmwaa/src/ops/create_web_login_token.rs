@@ -3,8 +3,11 @@
 //! @op CreateWebLoginToken
 //!
 //! Mints an Apache Airflow web login token for the STORED environment the request names,
-//! and reports it with the web-server host that environment's record carries. A name that
-//! resolves to no stored environment is refused with the operation's modeled 404.
+//! and reports it with the web-server host that environment's record carries, beside WHO
+//! asked for it: the name of the IAM identity the request's credential speaks for, and the
+//! Apache Airflow user name that identity maps to (see
+//! [`crate::state::caller_iam_identity`] and [`crate::state::airflow_identity`]). A name
+//! that resolves to no stored environment is refused with the operation's modeled 404.
 //!
 //! The token is minted by the emulator's credential store and removed from it again (see
 //! [`crate::state::mint_airflow_token`]): it is a secret for the environment's Apache
@@ -196,7 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
-        let iam_identity = crate::state::caller_iam_identity(ctx);
+        // Who asked for the token. `IamIdentity` is the NAME of the calling IAM identity
+        // and `AirflowIdentity` the Apache Airflow user name that identity maps to, so
+        // the two are read from the identity the request's credential speaks for — the
+        // one `sts:GetCallerIdentity` answers for that same credential — and never from
+        // the credential's own identifier.
+        let iam_identity = crate::state::caller_iam_identity(&*self.engine, ctx);
         Ok(CreateWebLoginTokenOutput {
             airflow_identity: Some(crate::state::airflow_identity(&iam_identity)),
             iam_identity: Some(iam_identity),

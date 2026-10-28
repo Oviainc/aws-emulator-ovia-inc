@@ -44,9 +44,19 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTEST/20260101/us-east-1/airflow/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
-/// The access-key id the header above presents: what the token operations report as the
-/// calling `IamIdentity`.
+/// The access-key id the header above presents. Neither STS nor IAM holds a record of it,
+/// so it speaks for the identity this emulator publishes at start — whose NAME is what
+/// `CreateWebLoginToken` reports as the calling `IamIdentity` (see
+/// `tests/all/web_login_token_caller_identity.rs` for the identity rule itself).
 const CALLER_AKID: &str = "AKIDTEST";
+
+/// The name of the identity [`CALLER_AKID`] speaks for: the resource field of that IAM
+/// user's ARN, which is the form `IamIdentity` documents ("the name of the IAM identity …
+/// For example, `assumed-role/Admin/your-name`").
+const CALLER_IAM_IDENTITY: &str = "user/emulator";
+
+/// The Apache Airflow user name that identity maps to: its last path segment.
+const CALLER_AIRFLOW_IDENTITY: &str = "emulator";
 
 /// The region the `AUTHORIZATION` scope signs for.
 const REGION: &str = "us-east-1";
@@ -679,11 +689,21 @@ async fn the_token_operations_report_the_stored_environments_web_server_host() {
         );
         assert_eq!(
             web.member("IamIdentity"),
-            CALLER_AKID,
-            "case {name:?}: the reported IAM identity must be the request's own, got {:?}",
+            CALLER_IAM_IDENTITY,
+            "case {name:?}: the reported IAM identity must name the calling identity, got {:?}",
             web.member("IamIdentity")
         );
+        assert_ne!(
+            web.member("IamIdentity"),
+            CALLER_AKID,
+            "case {name:?}: the access key id is a credential identifier, never an identity"
+        );
         let airflow_identity = web.member("AirflowIdentity");
+        assert_eq!(
+            airflow_identity, CALLER_AIRFLOW_IDENTITY,
+            "case {name:?}: the reported Apache Airflow user name must be the one that \
+             identity maps to, got {airflow_identity:?}"
+        );
         assert!(
             (1..=64).contains(&airflow_identity.chars().count()),
             "case {name:?}: AirflowIdentity is @length(1, 64), got {airflow_identity:?}"

@@ -49,3 +49,5 @@ mod reserved_tag_keys;
 mod state_roundtrip;
 #[path = "all/tags_member_single_rule.rs"]
 mod tags_member_single_rule;
+#[path = "all/web_login_token_caller_identity.rs"]
+mod web_login_token_caller_identity;
