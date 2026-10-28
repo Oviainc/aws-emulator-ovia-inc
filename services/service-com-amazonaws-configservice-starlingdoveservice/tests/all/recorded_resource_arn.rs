@@ -28,9 +28,7 @@ use service_com_amazonaws_configservice_starlingdoveservice::state::{
 };
 use std::time::{Duration, SystemTime};
 
-use crate::config_setup_and_rule_loop::{
-    recorder_request, with_recorder_and_channel, Emulator, ROLE_ARN,
-};
+use crate::config_setup_and_rule_loop::{recorder_request, Emulator, ROLE_ARN};
 
 /// The one account every ARN this emulator mints carries.
 fn account() -> String {
@@ -566,32 +564,26 @@ async fn the_aggregate_reads_report_the_same_arn_as_the_resource_history() {
 
 #[tokio::test]
 async fn a_custom_resource_type_no_aws_service_owns_carries_no_arn() {
-    // A custom resource type is read through the Config query language: the modelled
-    // `ResourceType` enum the other read paths take names Amazon Web Services types
-    // only, while `PutResourceConfig` records custom ones.
+    // A resource type no Amazon Web Services service owns names a resource with no ARN
+    // of the form any service publishes, so nothing is derived for it. Such an item is
+    // SEEDED through the store's own write path, the way the other cases of this suite
+    // are: `PutResourceConfig` records only a resource type the CloudFormation registry
+    // holds a registration for, and a registry type nobody registered is not one.
     let emulator = Emulator::new();
-    with_recorder_and_channel(&emulator).await;
-    // `PutResourceConfig` records a resource's configuration only while a recorder is
-    // RECORDING; a recorder stored with no name of its own is named `default`.
     emulator
         .ok(
-            "StartConfigurationRecorder",
-            &json!({ "ConfigurationRecorderName": "default" }),
+            "PutConfigurationRecorder",
+            &recorder_request(json!({ "roleARN": ROLE_ARN })),
         )
         .await;
     for (resource_type, resource_id) in CUSTOM_RESOURCES {
-        emulator
-            .ok(
-                "PutResourceConfig",
-                &json!({
-                    "ResourceType": resource_type,
-                    "SchemaVersionId": "00000000-0000-0000-0000-000000000001",
-                    "ResourceId": resource_id,
-                    "ResourceName": resource_id,
-                    "Configuration": r#"{"state":"recorded"}"#,
-                }),
-            )
-            .await;
+        record(
+            &emulator,
+            resource_type,
+            resource_id,
+            r#"{"state":"recorded"}"#,
+            captured_at(),
+        );
     }
     // One resource of a type an AWS service DOES own, recorded beside them, so the same
     // query shows the difference rather than the query reporting nothing at all.

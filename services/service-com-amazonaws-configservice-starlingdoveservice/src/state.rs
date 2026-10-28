@@ -4605,8 +4605,11 @@ pub fn assume_role_parameter_names(automatic: bool) -> &'static [&'static str] {
 }
 
 /// Whether `requested` provides the role Config assumes to remediate a resource,
-/// under one of the keys [`assume_role_parameter_names`] accepts for it. Every
-/// remediation configuration needs one: it is what the remediation runs as.
+/// under one of the keys [`assume_role_parameter_names`] accepts for it. An AUTOMATIC
+/// remediation needs one — "you need to provide a value for AutomationAssumeRole to
+/// remediate your resources" — while a manual one takes the role from the SSM document's
+/// own parameters, so this is asked about a manual configuration only where the role
+/// itself is being resolved, never to refuse one.
 pub fn has_assume_role(requested: &RemediationConfiguration) -> bool {
     let Some(parameters) = requested.parameters.as_ref() else {
         return false;

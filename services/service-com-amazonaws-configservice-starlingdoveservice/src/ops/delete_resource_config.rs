@@ -164,20 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
-        // This API records the deletion of a CUSTOM resource, named the way the
-        // operation that recorded its configuration names one, so what a custom
-        // resource type is is decided in ONE place for both halves of the lifecycle.
-        if let Some(message) =
-            crate::ops::put_resource_config::custom_resource_type_refusal(&input.resource_type)
-        {
-            return Err(DeleteResourceConfigErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -194,6 +180,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // This API records the deletion of a resource whose configuration state Config
+        // records, named the way the operation that recorded it names one, so the
+        // registration precondition of the two halves of that lifecycle is decided in
+        // ONE place. Judged after the recorder, as the recording half judges it.
+        if !crate::ops::put_resource_config::is_registered_resource_type(&input.resource_type) {
+            return Err(DeleteResourceConfigErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::ops::put_resource_config::unregistered_resource_type_message(
+                            &input.resource_type,
+                        ),
+                    ),
+                },
+            )
+            .into());
         }
 
         let key = (input.resource_type.clone(), input.resource_id.clone());

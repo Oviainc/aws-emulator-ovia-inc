@@ -215,22 +215,13 @@ async fn listed_tags(
         }
         let page = emulator.ok("ListTagsForResource", &body).await;
         pages += 1;
-        // `Tags` is a `TagList`, whose modelled length minimum is 1, so a page with no
-        // tags on it must OMIT the member rather than serve an empty list.
-        let served = match page.get("Tags") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(value) => {
-                let list = value
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_else(|| panic!("case {case:?}: expected a Tags list, got {page}"));
-                assert!(
-                    !list.is_empty(),
-                    "case {case:?}: expected an empty page to omit Tags, got {page}"
-                );
-                list
-            }
-        };
+        // "The tags for the resource": the member is always served, so a page with no
+        // tags on it carries an EMPTY list rather than omitting it, and a caller reads
+        // it unconditionally.
+        let served = page["Tags"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Tags list, got {page}"));
         for entry in served {
             let key = entry["Key"]
                 .as_str()

@@ -12,9 +12,8 @@
 //! Each case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — using the
 //! `Emulator` harness `config_setup_and_rule_loop` defines. Aggregated resources are
-//! seeded in the store the way a handler reaches it (`service_state`), because the
-//! aggregate identifier's `ResourceType` is the modelled `ResourceType` enum while
-//! `PutResourceConfig` records only custom resource types.
+//! seeded in the store the way a handler reaches it (`service_state`), because the rows
+//! pin members of a configuration item that no write operation takes.
 
 use std::time::{Duration, SystemTime};
 

@@ -4,7 +4,10 @@
 //! Saves a new stored query or updates an existing one in [`crate::state`], keyed by
 //! `QueryName`. A new query is assigned and persisted a `QueryId` and a `QueryArn`, so
 //! `GetStoredQuery` reads back exactly what was saved; an update in place keeps the
-//! identity and the tags the query was created with and answers the same ARN.
+//! identity and the tags the query was created with and answers the same ARN. The
+//! `Expression` has to be a Config query — the language
+//! [`crate::state::read_expression`] reads — so no query is saved for a text a select
+//! could not run.
 //!
 //! ## Shape of an operation
 //!
@@ -185,9 +188,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A stored query's `Expression` is a Config query — the same SQL `SELECT` command
+        // a select operation takes ("The expression of the query. For example, SELECT
+        // resourceId, resourceType ... WHERE resourceType = 'AWS::S3::Bucket'") — so a
+        // text that is not one is an input value that "fails the validation" and no query
+        // is saved for it. The command is READ by the one reader of that language in this
+        // service, so a stored query and a select of the same text are judged alike.
+        if let Err(refusal) = crate::state::read_expression(expression) {
+            return Err(PutStoredQueryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(refusal.message()),
+                },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-
         // A query this account already holds is updated in place; only a NEW one has to
         // fit under this Region's stored-query quota.
         if let Some(existing) = store.stored_queries.get_mut(name) {

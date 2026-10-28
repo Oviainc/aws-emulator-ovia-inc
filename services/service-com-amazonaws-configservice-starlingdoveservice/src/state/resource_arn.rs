@@ -278,8 +278,7 @@ pub fn recorded_resource_arn(
         return Some(resource_id.to_string());
     }
 
-    // Every resource type name carries `Organization::Service::Resource`
-    // (`crate::ops::put_resource_config::RESOURCE_TYPE_SEGMENTS` segments): the
+    // Every resource type name carries `Organization::Service::Resource`: the
     // organization names who owns the type, and the other two the service that serves
     // the resource and the resource itself.
     let segments: Vec<&str> = resource_type.split("::").collect();

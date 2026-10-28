@@ -183,7 +183,7 @@ async fn deleting_a_stored_query_removes_only_that_query() {
             case: "a one-character name, the published minimum length",
             name: "q".to_string(),
             description: None,
-            expression: "*",
+            expression: "SELECT arn",
             tags: vec![("k", "")],
         },
         Row {

@@ -9,8 +9,8 @@
 //! Two failure classes, deliberately answered through different channels:
 //!
 //! * a configuration that is not a usable remediation AS ASKED FOR — a parameter that
-//!   selects neither or both of its two value kinds, or no value for the role the
-//!   remediation runs as — refuses the WHOLE request with the modelled
+//!   selects neither or both of its two value kinds, or an AUTOMATIC remediation with no
+//!   value for the role it runs as — refuses the WHOLE request with the modelled
 //!   `InvalidParameterValueException`, because nothing about the account's state could
 //!   have made that item succeed and a caller has to resend it either way;
 //! * a configuration that is well formed but names a Config rule this account does not
@@ -180,10 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
-        // Every remediation configuration needs the role the remediation runs as, and
-        // a parameter Config cannot resolve at remediation time is no parameter at
-        // all. Both refuse the whole request: this is the configuration being unusable
-        // as asked for, not one item of the batch failing against the account's state.
+        // An AUTOMATIC remediation needs the role the remediation runs as, and a
+        // parameter Config cannot resolve at remediation time is no parameter at all.
+        // Both refuse the whole request: this is the configuration being unusable as
+        // asked for, not one item of the batch failing against the account's state.
         for requested in &input.remediation_configurations {
             if let Some((parameter, wrong)) = crate::state::ill_formed_parameter(requested) {
                 return Err(
@@ -201,7 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            if !crate::state::has_assume_role(requested) {
+            // "For manual remediation configuration, you need to provide a value for
+            // automationAssumeRole or use a value in the assumeRole field to remediate
+            // your resources. The SSM automation document can use either as long as it
+            // maps to a valid parameter. However, for AUTOMATIC remediation
+            // configuration, the only valid assumeRole field value is
+            // AutomationAssumeRole and you need to provide a value for
+            // AutomationAssumeRole to remediate your resources." Only the automatic case
+            // is a requirement of this API: a manual configuration's role is the SSM
+            // document's own parameter, so a request that carries none is accepted and
+            // the document decides.
+            if requested.automatic && !crate::state::has_assume_role(requested) {
                 let accepted = crate::state::assume_role_parameter_names(requested.automatic);
                 return Err(
                     PutRemediationConfigurationsErrorModeled::InvalidParameterValueException(

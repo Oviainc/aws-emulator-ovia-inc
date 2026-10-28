@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourceConfig
-//! Records the configuration state of one custom resource into the discovered-resource
+//! Records the configuration state of one resource into the discovered-resource
 //! inventory in [`crate::state`], which is what `GetDiscoveredResourceCounts` counts.
 //! Every call records a configuration item: a re-record of the same resource type and
 //! id keeps the instant Config first recorded it and leaves the state the resource is
-//! in behind it, so the states it went through are what its history holds.
+//! in behind it, so the states it went through are what its history holds. The resource
+//! type has to be one the CloudFormation registry holds a registration for
+//! ([`is_registered_resource_type`]); anything else is refused and nothing is recorded.
 //!
 //! ## Shape of an operation
 //!
@@ -128,51 +130,38 @@ pub const ACTIVE_CUSTOM_RESOURCES_QUOTA: usize = 100_000;
 /// 64 KB").
 pub const MAX_RESOURCE_CONFIGURATION_BYTES: usize = 64 * 1024;
 
-/// The organization names a custom resource type cannot use — the first segment of a
-/// resource type name, up to the first `::`
-/// (`PutResourceConfigRequest$ResourceType`: "You cannot use the organization names
-/// 'amzn', 'amazon', 'alexa', 'custom' with custom resource types. It is the first
-/// part of the ResourceType up to the first ::"; the CloudFormation registry a custom
-/// type must be registered with reserves `AWS` and `Dev` the same way). Spelled in
-/// lowercase because an organization name is matched case-insensitively.
-pub const RESERVED_RESOURCE_TYPE_ORGANIZATIONS: [&str; 6] =
-    ["alexa", "amazon", "amzn", "aws", "custom", "dev"];
-
-/// How many `::`-separated segments a CloudFormation registry type name carries
-/// (`Organization::Service::Resource`), which is the form a custom resource type
-/// recorded through this operation takes. A registry MODULE name carries a fourth
-/// segment (`::MODULE`) and names no resource, so it is not one of these.
-pub const RESOURCE_TYPE_SEGMENTS: usize = 3;
-
-/// Why `resource_type` cannot name a custom resource type, or `None` when it can.
+/// Whether the CloudFormation registry holds a registration for `resource_type`, which
+/// is what makes a type one whose configuration state Config records at all
+/// (`PutResourceConfig`: "The custom resource type must be registered with
+/// CloudFormation. This API accepts the configuration item registered with
+/// CloudFormation").
 ///
-/// A custom resource type is a CloudFormation registry type name —
-/// `Organization::Service::Resource` — whose organization is none of the reserved
-/// [`RESERVED_RESOURCE_TYPE_ORGANIZATIONS`]. The message is BUILT FROM THE REQUEST:
-/// it names the member, quotes the value sent and states the constraint it failed.
+/// What the registry holds, as this emulator serves it, is the resource types Amazon
+/// Web Services PUBLISHES — the public registry types, which this service's model
+/// enumerates as [`RESOURCE_TYPE_VALUES`] (`smithy_query(query="shape",
+/// shape="ResourceType")`). A type under any other organization is a private or
+/// third-party registry type, recognised only once an account REGISTERS it, and nothing
+/// in this emulator registers one (the CloudFormation registry's writers are scaffold
+/// stubs with issues of their own), so no such type is registered here. Registry type
+/// names are matched exactly: the registry holds a type under the one spelling it was
+/// published with.
+pub(crate) fn is_registered_resource_type(resource_type: &str) -> bool {
+    RESOURCE_TYPE_VALUES.contains(&resource_type)
+}
+
+/// How Config words the registration precondition for a `ResourceType` the
+/// CloudFormation registry holds no type for.
 ///
-/// `DeleteResourceConfig` records the deletion of a resource recorded through this
-/// operation, so it decides what a custom resource type is HERE rather than stating
-/// the same rule twice.
-pub(crate) fn custom_resource_type_refusal(resource_type: &str) -> Option<String> {
-    let segments: Vec<&str> = resource_type.split("::").collect();
-    if segments.len() != RESOURCE_TYPE_SEGMENTS || segments.iter().any(|segment| segment.is_empty())
-    {
-        return Some(format!(
-            "Value '{resource_type}' at 'resourceType' failed to satisfy constraint: a \
-             custom resource type must be registered with CloudFormation under a type \
-             name of the form Organization::Service::Resource"
-        ));
-    }
-    let organization = segments[0];
-    if RESERVED_RESOURCE_TYPE_ORGANIZATIONS.contains(&organization.to_ascii_lowercase().as_str()) {
-        return Some(format!(
-            "Value '{resource_type}' at 'resourceType' failed to satisfy constraint: the \
-             organization name '{organization}' is reserved and cannot be used with \
-             custom resource types"
-        ));
-    }
-    None
+/// BUILT FROM THE REQUEST: the fixed sentence pair carries the `ResourceType` the caller
+/// sent, verbatim, as its one variable part. ONE template for the two operations that
+/// record the configuration state of a resource — `PutResourceConfig` and
+/// `DeleteResourceConfig` — so the two halves of that lifecycle cannot report the one
+/// precondition two ways.
+pub(crate) fn unregistered_resource_type_message(resource_type: &str) -> String {
+    format!(
+        "Cannot find registered Resource Type with name {resource_type}. Please register the \
+         Resource Type with Cloudformation and try again."
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -271,12 +260,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        // This API records CUSTOM resource types: a CloudFormation registry type name
-        // whose organization is not one AWS reserves.
-        if let Some(message) = custom_resource_type_refusal(&input.resource_type) {
-            return Err(refuse(message));
-        }
-
         // "The configuration object of the resource in valid JSON format", and "The
         // configuration JSON must not exceed 64 KB".
         if input.configuration.len() > MAX_RESOURCE_CONFIGURATION_BYTES {
@@ -310,6 +293,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // This API records the configuration state of a resource type the CloudFormation
+        // registry holds a registration for, so a `ResourceType` it holds none for names
+        // nothing Config can record. Judged AFTER the recorder, because a recorder that
+        // is not recording is the precondition Config reports for a request that fails
+        // both.
+        if !is_registered_resource_type(&input.resource_type) {
+            return Err(refuse(unregistered_resource_type_message(
+                &input.resource_type,
+            )));
         }
 
         let key = (input.resource_type.clone(), input.resource_id.clone());

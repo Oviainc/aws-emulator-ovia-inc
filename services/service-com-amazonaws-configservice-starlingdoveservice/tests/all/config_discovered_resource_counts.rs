@@ -15,8 +15,9 @@
 //! 3. a resource type contributes a count only while Config is RECORDING it: nothing
 //!    at all while no configuration recorder is recording, and otherwise only what the
 //!    recording recorder's strategy covers;
-//! 4. `PutResourceConfig` records the configuration state of a CUSTOM resource type
-//!    while a recorder is running, refusing anything else with the modelled error.
+//! 4. `PutResourceConfig` records the configuration state of a resource type the
+//!    CloudFormation registry holds a registration for while a recorder is running,
+//!    refusing anything else with the modelled error.
 //!
 //! The harness (`Emulator`, `with_recorder_and_channel`) is the one
 //! `config_setup_and_rule_loop` already builds; every case drives the emulator the way
@@ -24,6 +25,7 @@
 
 use serde_json::{json, Value};
 
+use crate::config_connectors::refusal;
 use crate::config_setup_and_rule_loop::{recorder_request, with_recorder_and_channel, Emulator};
 
 /// The name Config assigns a configuration recorder created without one
@@ -31,22 +33,22 @@ use crate::config_setup_and_rule_loop::{recorder_request, with_recorder_and_chan
 /// \"default\" ... if you do not specify a name at creation time").
 const RECORDER: &str = "default";
 
-/// Custom resource types, each a CloudFormation registry type name of the form
-/// `Organization::Service::Resource` whose organization is not one of the reserved
-/// ones (`PutResourceConfigRequest$ResourceType`: "You cannot use the organization
-/// names 'amzn', 'amazon', 'alexa', 'custom' with custom resource types. It is the
-/// first part of the ResourceType up to the first ::").
-const CUSTOM_TYPES: [&str; 5] = [
-    "Acme::Network::Switch",
-    "Beta::Storage::Vault",
-    "Contoso::Compute::Node",
-    "Delta::Queue::Topic",
-    "Zeta::Analytics::Stream",
+/// Resource types whose configuration state Config records: entries of the
+/// CloudFormation registry, as `smithy_query(query="shape", shape="ResourceType")`
+/// enumerates the public ones — `PutResourceConfig` records a type the registry holds a
+/// registration for and refuses anything else. Spelled in ascending order, because the
+/// counts of two types holding equally many resources are reported in resource-type
+/// order.
+const RECORDED_TYPES: [&str; 5] = [
+    "AWS::DynamoDB::Table",
+    "AWS::EC2::Volume",
+    "AWS::IAM::Role",
+    "AWS::KMS::Key",
+    "AWS::Lambda::Function",
 ];
 
-/// An AWS native resource type, from `smithy_query(query="shape",
-/// shape="ResourceType")` — the closed enum a recording group enumerates. Used only
-/// inside a recording group, to pin what a recorder does and does not record.
+/// Another resource type of the same registry, which no row records: used inside a
+/// recording group, to pin what a recorder does and does not record.
 const NATIVE_TYPE: &str = "AWS::S3::Bucket";
 
 /// The largest `limit` the operation accepts
@@ -233,47 +235,47 @@ async fn the_counts_group_the_recorded_inventory_by_resource_type() {
         ("nothing recorded at all", &[], &[]),
         (
             "one resource of one type",
-            &[(CUSTOM_TYPES[0], 1)],
-            &[(CUSTOM_TYPES[0], 1)],
+            &[(RECORDED_TYPES[0], 1)],
+            &[(RECORDED_TYPES[0], 1)],
         ),
         (
             "three types with distinct counts",
-            &[(CUSTOM_TYPES[0], 3), (CUSTOM_TYPES[1], 1), (CUSTOM_TYPES[2], 2)],
+            &[(RECORDED_TYPES[0], 3), (RECORDED_TYPES[1], 1), (RECORDED_TYPES[2], 2)],
             &[
-                (CUSTOM_TYPES[0], 3),
-                (CUSTOM_TYPES[2], 2),
-                (CUSTOM_TYPES[1], 1),
+                (RECORDED_TYPES[0], 3),
+                (RECORDED_TYPES[2], 2),
+                (RECORDED_TYPES[1], 1),
             ],
         ),
         (
             "types with equally many resources, ordered by resource type",
-            &[(CUSTOM_TYPES[2], 2), (CUSTOM_TYPES[0], 2), (CUSTOM_TYPES[1], 2)],
+            &[(RECORDED_TYPES[2], 2), (RECORDED_TYPES[0], 2), (RECORDED_TYPES[1], 2)],
             &[
-                (CUSTOM_TYPES[0], 2),
-                (CUSTOM_TYPES[1], 2),
-                (CUSTOM_TYPES[2], 2),
+                (RECORDED_TYPES[0], 2),
+                (RECORDED_TYPES[1], 2),
+                (RECORDED_TYPES[2], 2),
             ],
         ),
         (
             "one busy type beside one with a single resource",
-            &[(CUSTOM_TYPES[4], 7), (CUSTOM_TYPES[3], 1)],
-            &[(CUSTOM_TYPES[4], 7), (CUSTOM_TYPES[3], 1)],
+            &[(RECORDED_TYPES[4], 7), (RECORDED_TYPES[3], 1)],
+            &[(RECORDED_TYPES[4], 7), (RECORDED_TYPES[3], 1)],
         ),
         (
             "five types, one resource more each",
             &[
-                (CUSTOM_TYPES[0], 1),
-                (CUSTOM_TYPES[1], 2),
-                (CUSTOM_TYPES[2], 3),
-                (CUSTOM_TYPES[3], 4),
-                (CUSTOM_TYPES[4], 5),
+                (RECORDED_TYPES[0], 1),
+                (RECORDED_TYPES[1], 2),
+                (RECORDED_TYPES[2], 3),
+                (RECORDED_TYPES[3], 4),
+                (RECORDED_TYPES[4], 5),
             ],
             &[
-                (CUSTOM_TYPES[4], 5),
-                (CUSTOM_TYPES[3], 4),
-                (CUSTOM_TYPES[2], 3),
-                (CUSTOM_TYPES[1], 2),
-                (CUSTOM_TYPES[0], 1),
+                (RECORDED_TYPES[4], 5),
+                (RECORDED_TYPES[3], 4),
+                (RECORDED_TYPES[2], 3),
+                (RECORDED_TYPES[1], 2),
+                (RECORDED_TYPES[0], 1),
             ],
         ),
     ];
@@ -312,9 +314,9 @@ async fn requested_resource_types_narrow_the_counts_and_the_total() {
     // One inventory, read through a table of `resourceTypes` requests: none at all, a
     // single type, a subset, a type nothing was recorded of, and a mixture of both.
     let inventory = [
-        (CUSTOM_TYPES[0], 3),
-        (CUSTOM_TYPES[1], 1),
-        (CUSTOM_TYPES[2], 2),
+        (RECORDED_TYPES[0], 3),
+        (RECORDED_TYPES[1], 1),
+        (RECORDED_TYPES[2], 2),
     ];
     let emulator = with_inventory(&inventory).await;
 
@@ -323,30 +325,30 @@ async fn requested_resource_types_narrow_the_counts_and_the_total() {
             "no resourceTypes at all",
             &[],
             &[
-                (CUSTOM_TYPES[0], 3),
-                (CUSTOM_TYPES[2], 2),
-                (CUSTOM_TYPES[1], 1),
+                (RECORDED_TYPES[0], 3),
+                (RECORDED_TYPES[2], 2),
+                (RECORDED_TYPES[1], 1),
             ],
         ),
         (
             "a single recorded type",
-            &[CUSTOM_TYPES[0]],
-            &[(CUSTOM_TYPES[0], 3)],
+            &[RECORDED_TYPES[0]],
+            &[(RECORDED_TYPES[0], 3)],
         ),
         (
             "two of the three recorded types",
-            &[CUSTOM_TYPES[1], CUSTOM_TYPES[2]],
-            &[(CUSTOM_TYPES[2], 2), (CUSTOM_TYPES[1], 1)],
+            &[RECORDED_TYPES[1], RECORDED_TYPES[2]],
+            &[(RECORDED_TYPES[2], 2), (RECORDED_TYPES[1], 1)],
         ),
         (
             "a type nothing was recorded of",
-            &[CUSTOM_TYPES[3]],
+            &[RECORDED_TYPES[3]],
             &[],
         ),
         (
             "a recorded type beside one nothing was recorded of",
-            &[CUSTOM_TYPES[3], CUSTOM_TYPES[1]],
-            &[(CUSTOM_TYPES[1], 1)],
+            &[RECORDED_TYPES[3], RECORDED_TYPES[1]],
+            &[(RECORDED_TYPES[1], 1)],
         ),
     ];
 
@@ -376,11 +378,11 @@ async fn the_limit_pages_the_counts_and_the_next_token_walks_them_once() {
     // past the number of entries, plus both published bounds of `limit`: 0 (the
     // default page size) and 100.
     let inventory = [
-        (CUSTOM_TYPES[0], 5),
-        (CUSTOM_TYPES[1], 4),
-        (CUSTOM_TYPES[2], 3),
-        (CUSTOM_TYPES[3], 2),
-        (CUSTOM_TYPES[4], 1),
+        (RECORDED_TYPES[0], 5),
+        (RECORDED_TYPES[1], 4),
+        (RECORDED_TYPES[2], 3),
+        (RECORDED_TYPES[3], 2),
+        (RECORDED_TYPES[4], 1),
     ];
     let emulator = with_inventory(&inventory).await;
     let entries = inventory.len();
@@ -429,7 +431,7 @@ async fn the_limit_pages_the_counts_and_the_next_token_walks_them_once() {
 
 #[tokio::test]
 async fn a_limit_past_the_published_range_and_a_token_this_service_did_not_issue_are_refused() {
-    let emulator = with_inventory(&[(CUSTOM_TYPES[0], 2)]).await;
+    let emulator = with_inventory(&[(RECORDED_TYPES[0], 2)]).await;
 
     // One past each published bound of `limit` (`@range(min: 0, max: 100)`).
     for limit in [MAX_LIMIT + 1, -1] {
@@ -493,7 +495,7 @@ async fn a_resource_type_is_counted_only_while_config_is_recording_it() {
         (
             "the recorder records all supported resource types",
             RecorderChange::Group(json!({ "allSupported": true })),
-            &[(CUSTOM_TYPES[0], 2), (CUSTOM_TYPES[1], 1)],
+            &[(RECORDED_TYPES[0], 2), (RECORDED_TYPES[1], 1)],
         ),
         (
             "the recorder records only another resource type",
@@ -506,12 +508,12 @@ async fn a_resource_type_is_counted_only_while_config_is_recording_it() {
                 "exclusionByResourceTypes": { "resourceTypes": [NATIVE_TYPE] },
                 "recordingStrategy": { "useOnly": "EXCLUSION_BY_RESOURCE_TYPES" },
             })),
-            &[(CUSTOM_TYPES[0], 2), (CUSTOM_TYPES[1], 1)],
+            &[(RECORDED_TYPES[0], 2), (RECORDED_TYPES[1], 1)],
         ),
     ];
 
     for (case, change, expected) in cases {
-        let emulator = with_inventory(&[(CUSTOM_TYPES[0], 2), (CUSTOM_TYPES[1], 1)]).await;
+        let emulator = with_inventory(&[(RECORDED_TYPES[0], 2), (RECORDED_TYPES[1], 1)]).await;
         match &change {
             RecorderChange::Stop => {
                 emulator
@@ -566,42 +568,69 @@ async fn a_resource_type_is_counted_only_while_config_is_recording_it() {
 }
 
 #[tokio::test]
-async fn put_resource_config_records_only_a_custom_resource_type() {
-    // Rows differ along why the resource type cannot be a custom one: a reserved
-    // organization (in each spelling the reservation covers), and a type name that is
-    // not a CloudFormation registry type name at all.
-    let refused: [(&str, &str); 7] = [
-        ("an AWS native resource type", NATIVE_TYPE),
+async fn put_resource_config_records_only_a_registered_resource_type() {
+    // A configuration item is recorded only for a resource type the CloudFormation
+    // registry holds a registration for. Rows differ along WHY the type named has none:
+    // an organization nothing registered a type under, each spelling of an organization
+    // reserved against custom types, a name that is not a registry type name at all, a
+    // registry MODULE name, a misspelled AWS type, a registered type in another case,
+    // and the account-level type the registry publishes no resource type for.
+    let refused: [(&str, &str); 11] = [
+        ("an organization nothing registered", "Acme::Network::Switch"),
+        ("another unregistered organization", "MyOrg::MyService::MyResource"),
         ("the reserved organization Amazon", "Amazon::Thing::Widget"),
         ("the reserved organization AMZN", "AMZN::Thing::Widget"),
         ("the reserved organization Alexa", "Alexa::Smart::Home"),
         ("a reserved organization in lower case", "custom::Thing::Widget"),
         ("a type name of one segment", "Switch"),
         ("a type name of two segments", "Acme::Switch"),
+        ("a registry module name", "Acme::Network::Switch::MODULE"),
+        ("a misspelled AWS resource type", "AWS::S3::Buckets"),
+        ("a registered type in another case", "aws::s3::bucket"),
     ];
 
     for (case, resource_type) in refused {
         let emulator = with_inventory(&[]).await;
-        let (status, code) = emulator
-            .refused(
-                "PutResourceConfig",
-                &resource_config(resource_type, "r-1", "{}"),
-            )
-            .await;
+        let (status, code, message) = refusal(
+            &emulator,
+            "PutResourceConfig",
+            &resource_config(resource_type, "r-1", "{}"),
+        )
+        .await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: recording {resource_type:?} must be refused with HTTP 400, got \
-             {status} with {code}"
-        );
-        assert_eq!(
-            code, "ValidationException",
-            "case {case:?}: expected ValidationException for {resource_type:?}, got {code}"
+            (status, code.as_str(), message.as_str()),
+            (
+                400,
+                "ValidationException",
+                format!(
+                    "Cannot find registered Resource Type with name {resource_type}. Please \
+                     register the Resource Type with Cloudformation and try again."
+                )
+                .as_str(),
+            ),
+            "case {case:?}: recording {resource_type:?} must be refused with the \
+             registration precondition, got {status} with {code} and {message:?}"
         );
         let (reported, total) = counts(case, &emulator, &[]).await;
         assert!(
             reported.is_empty() && total == 0,
             "case {case:?}: a refused PutResourceConfig must record nothing, got \
              {reported:?} totalling {total}"
+        );
+    }
+
+    // Every registered type the rows record IS accepted, so the refusals above are
+    // about the registration and not about this operation refusing everything.
+    for resource_type in RECORDED_TYPES {
+        let emulator = with_inventory(&[]).await;
+        emulator
+            .ok("PutResourceConfig", &resource_config(resource_type, "r-1", "{}"))
+            .await;
+        let (reported, total) = counts(resource_type, &emulator, &[]).await;
+        assert_eq!(
+            (reported, total),
+            (vec![(resource_type.to_string(), 1)], 1),
+            "case {resource_type:?}: a registered resource type is recorded"
         );
     }
 
@@ -617,7 +646,7 @@ async fn put_resource_config_records_only_a_custom_resource_type() {
         let (status, code) = emulator
             .refused(
                 "PutResourceConfig",
-                &resource_config(CUSTOM_TYPES[0], "r-1", configuration),
+                &resource_config(RECORDED_TYPES[0], "r-1", configuration),
             )
             .await;
         assert_eq!(
@@ -633,7 +662,7 @@ async fn put_resource_config_records_only_a_custom_resource_type() {
     let (status, code) = no_recorder
         .refused(
             "PutResourceConfig",
-            &resource_config(CUSTOM_TYPES[0], "r-1", "{}"),
+            &resource_config(RECORDED_TYPES[0], "r-1", "{}"),
         )
         .await;
     assert_eq!(
@@ -648,7 +677,7 @@ async fn put_resource_config_records_only_a_custom_resource_type() {
     let (status, code) = idle
         .refused(
             "PutResourceConfig",
-            &resource_config(CUSTOM_TYPES[0], "r-1", "{}"),
+            &resource_config(RECORDED_TYPES[0], "r-1", "{}"),
         )
         .await;
     assert_eq!(
@@ -687,7 +716,7 @@ async fn resources_recorded_under_different_names_are_counted_by_their_identity(
     for (case, resources) in cases {
         let emulator = with_inventory(&[]).await;
         for (resource_id, resource_name) in resources {
-            let mut request = resource_config(CUSTOM_TYPES[0], resource_id, "{\"port\":1}");
+            let mut request = resource_config(RECORDED_TYPES[0], resource_id, "{\"port\":1}");
             match resource_name {
                 Some(name) => request["ResourceName"] = json!(name),
                 None => {
@@ -704,7 +733,7 @@ async fn resources_recorded_under_different_names_are_counted_by_their_identity(
         let (counted, total) = counts(case, &emulator, &[]).await;
         assert_eq!(
             (counted, total),
-            (vec![(CUSTOM_TYPES[0].to_string(), recorded)], recorded),
+            (vec![(RECORDED_TYPES[0].to_string(), recorded)], recorded),
             "case {case:?}: expected {recorded} resource(s) of one type counted by their \
              (resourceType, resourceId) identity"
         );
@@ -721,7 +750,7 @@ async fn re_recording_a_resource_replaces_its_configuration_rather_than_counting
             .ok(
                 "PutResourceConfig",
                 &resource_config(
-                    CUSTOM_TYPES[0],
+                    RECORDED_TYPES[0],
                     "switch-1",
                     &format!("{{\"revision\":{revision}}}"),
                 ),
@@ -730,7 +759,7 @@ async fn re_recording_a_resource_replaces_its_configuration_rather_than_counting
         let (reported, total) = counts(case, &emulator, &[]).await;
         assert_eq!(
             reported,
-            vec![(CUSTOM_TYPES[0].to_string(), 1)],
+            vec![(RECORDED_TYPES[0].to_string(), 1)],
             "case {case:?}: revision {revision} must still be one resource of one type, got \
              {reported:?}"
         );
@@ -741,11 +770,11 @@ async fn re_recording_a_resource_replaces_its_configuration_rather_than_counting
     }
 
     // A different resource id of the same type is a second resource.
-    record(&emulator, CUSTOM_TYPES[0], "switch-2").await;
+    record(&emulator, RECORDED_TYPES[0], "switch-2").await;
     let (reported, total) = counts(case, &emulator, &[]).await;
     assert_eq!(
         (reported.clone(), total),
-        (vec![(CUSTOM_TYPES[0].to_string(), 2)], 2),
+        (vec![(RECORDED_TYPES[0].to_string(), 2)], 2),
         "case {case:?}: a second resource id must be counted, got {reported:?} totalling \
          {total}"
     );

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What recording a custom resource's configuration state and recording its DELETION
-//! put into Config's history, end to end over the wire.
+//! What recording a resource's configuration state and recording its DELETION put
+//! into Config's history, end to end over the wire.
 //!
 //! Two rules are pinned here, each over a TABLE of inputs:
 //!
@@ -10,11 +10,11 @@
 //!    it has left, while recording the state it is already in leaves those states
 //!    alone;
 //! 2. `DeleteResourceConfig` records a new configuration item with a `ResourceDeleted`
-//!    status for a custom resource Config holds a configuration item for, so the
+//!    status for a resource Config holds a configuration item for, so the
 //!    resource keeps its inventory entry — carrying the instant it went away and the
 //!    states it has left — and stops being one of the resources Config reports as
-//!    discovered; it refuses a resource type that is not a custom CloudFormation
-//!    registry type name with `ValidationException` and any call made while no
+//!    discovered; it refuses a resource type the CloudFormation registry holds no
+//!    registration for with `ValidationException` and any call made while no
 //!    configuration recorder is recording with
 //!    `NoRunningConfigurationRecorderException`, recording nothing either way; and a
 //!    resource Config holds nothing for leaves the inventory exactly as it was, because
@@ -23,11 +23,10 @@
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — using the
 //! `Emulator` harness `config_setup_and_rule_loop` defines. What the inventory HOLDS
-//! for one resource is read the way a handler reads it (`service_state`), because every
-//! configuration-item read of this service takes the modelled `ResourceType` enum,
-//! which a CUSTOM resource type is not a member of, so such a read is refused before it
-//! reaches a handler; `GetDiscoveredResourceCounts`, whose `resourceTypes` are plain
-//! strings, is what reports a custom resource over the wire.
+//! for one resource is read the way a handler reads it (`service_state`), because the
+//! configuration-item reads take their own narrowing members;
+//! `GetDiscoveredResourceCounts`, whose `resourceTypes` are plain strings, is what
+//! reports a recorded resource over the wire.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_configservice_starlingdoveservice::state::{
@@ -51,7 +50,7 @@ const RESOURCE_DELETED: &str = "ResourceDeleted";
 /// See [`RESOURCE_DELETED`].
 const OK: &str = "OK";
 
-/// One row of the deletion table: the case name, the custom resource type, the
+/// One row of the deletion table: the case name, the resource type, the
 /// resource id and the configuration document recorded for it.
 type DeletionCase = (&'static str, &'static str, &'static str, &'static str);
 
@@ -109,9 +108,8 @@ fn inventory_size(emulator: &Emulator) -> usize {
 }
 
 /// The `(resourceType, count)` pairs `GetDiscoveredResourceCounts` reports, which is
-/// what Config reports as discovered over the wire for a CUSTOM resource type
-/// (`GetDiscoveredResourceCountsRequest$resourceTypes` is a list of plain strings,
-/// while every configuration-item read takes the modelled `ResourceType` enum). The
+/// what Config reports as discovered over the wire
+/// (`GetDiscoveredResourceCountsRequest$resourceTypes` is a list of plain strings). The
 /// response is read through the one helper the counts suite already defines.
 async fn counts(case: &str, emulator: &Emulator) -> Vec<(String, i64)> {
     let body = emulator.ok("GetDiscoveredResourceCounts", &json!({})).await;
@@ -155,19 +153,19 @@ async fn recording_a_resource_again_records_a_new_configuration_item_per_state()
         ),
     ];
 
-    let resource_type = "Acme::Network::Switch";
+    let resource_type = "AWS::EC2::Volume";
     for (case, configurations, left) in cases {
         let emulator = recording_emulator().await;
         for configuration in configurations {
             emulator
                 .ok(
                     "PutResourceConfig",
-                    &resource_config(resource_type, "switch-1", configuration),
+                    &resource_config(resource_type, "vol-0001", configuration),
                 )
                 .await;
         }
 
-        let entry = held(&emulator, resource_type, "switch-1")
+        let entry = held(&emulator, resource_type, "vol-0001")
             .unwrap_or_else(|| panic!("case {case:?}: the recorded resource has an entry"));
         let current = configurations
             .last()
@@ -209,32 +207,32 @@ async fn deleting_a_recorded_resource_records_a_resource_deleted_configuration_i
     // only member is null).
     let cases: [DeletionCase; 5] = [
         (
-            "a switch recorded with no members at all",
-            "Acme::Network::Switch",
-            "switch-1",
+            "a volume recorded with no members at all",
+            "AWS::EC2::Volume",
+            "vol-0001",
             "{}",
         ),
         (
-            "a vault recorded with a nested document",
-            "Beta::Storage::Vault",
-            "vault-01",
+            "a table recorded with a nested document",
+            "AWS::DynamoDB::Table",
+            "orders-table",
             r#"{"capacity":{"bytes":1024,"tier":"cold"}}"#,
         ),
         (
-            "a node recorded with a list",
-            "Contoso::Compute::Node",
-            "node/7",
+            "a role recorded with a list",
+            "AWS::IAM::Role",
+            "role/7",
             r#"{"cores":[0,1,2,3]}"#,
         ),
         (
-            "a topic recorded with a non-ASCII value",
-            "Delta::Queue::Topic",
-            "topic-é-1",
+            "a queue recorded with a non-ASCII value",
+            "AWS::SQS::Queue",
+            "queue-é-1",
             r#"{"name":"füße"}"#,
         ),
         (
             "a stream recorded with a null member",
-            "Zeta::Analytics::Stream",
+            "AWS::Kinesis::Stream",
             "stream-1",
             r#"{"window":null}"#,
         ),
@@ -318,26 +316,26 @@ async fn deleting_a_recorded_resource_records_a_resource_deleted_configuration_i
 #[tokio::test]
 async fn recording_the_same_deletion_twice_records_one_deletion() {
     let case = "the same resource deleted three times";
-    let resource_type = "Acme::Network::Switch";
+    let resource_type = "AWS::EC2::Volume";
     let emulator = recording_emulator().await;
     emulator
         .ok(
             "PutResourceConfig",
-            &resource_config(resource_type, "switch-1", r#"{"ports":4}"#),
+            &resource_config(resource_type, "vol-0001", r#"{"ports":4}"#),
         )
         .await;
 
     emulator
-        .ok("DeleteResourceConfig", &resource_key(resource_type, "switch-1"))
+        .ok("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
         .await;
-    let first = held(&emulator, resource_type, "switch-1")
+    let first = held(&emulator, resource_type, "vol-0001")
         .unwrap_or_else(|| panic!("case {case:?}: the deleted resource keeps its entry"));
 
     for repeat in 1..3 {
         emulator
-            .ok("DeleteResourceConfig", &resource_key(resource_type, "switch-1"))
+            .ok("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
             .await;
-        let again = held(&emulator, resource_type, "switch-1")
+        let again = held(&emulator, resource_type, "vol-0001")
             .unwrap_or_else(|| panic!("case {case:?}: the deleted resource keeps its entry"));
         assert_eq!(
             (again.deleted_at, again.history.len()),
@@ -360,18 +358,18 @@ async fn deleting_a_resource_config_holds_nothing_for_changes_nothing() {
     let cases: [(&str, &str, &str); 3] = [
         (
             "a resource id nothing was recorded for",
-            "Acme::Network::Switch",
-            "switch-9",
+            "AWS::EC2::Volume",
+            "vol-0009",
         ),
         (
             "a custom resource type nothing was recorded for",
-            "Beta::Storage::Vault",
-            "switch-1",
+            "AWS::DynamoDB::Table",
+            "vol-0001",
         ),
         (
             "an id differing from the recorded one only in case",
-            "Acme::Network::Switch",
-            "SWITCH-1",
+            "AWS::EC2::Volume",
+            "VOL-0001",
         ),
     ];
 
@@ -380,7 +378,7 @@ async fn deleting_a_resource_config_holds_nothing_for_changes_nothing() {
         emulator
             .ok(
                 "PutResourceConfig",
-                &resource_config("Acme::Network::Switch", "switch-1", r#"{"ports":4}"#),
+                &resource_config("AWS::EC2::Volume", "vol-0001", r#"{"ports":4}"#),
             )
             .await;
 
@@ -391,7 +389,7 @@ async fn deleting_a_resource_config_holds_nothing_for_changes_nothing() {
         let reported = counts(case, &emulator).await;
         assert_eq!(
             reported,
-            vec![("Acme::Network::Switch".to_string(), 1)],
+            vec![("AWS::EC2::Volume".to_string(), 1)],
             "case {case:?}: the recorded resource is untouched, got {reported:?}"
         );
         assert_eq!(
@@ -399,7 +397,7 @@ async fn deleting_a_resource_config_holds_nothing_for_changes_nothing() {
             1,
             "case {case:?}: a resource Config holds nothing for must add no entry"
         );
-        let entry = held(&emulator, "Acme::Network::Switch", "switch-1")
+        let entry = held(&emulator, "AWS::EC2::Volume", "vol-0001")
             .unwrap_or_else(|| panic!("case {case:?}: the recorded resource keeps its entry"));
         assert_eq!(
             entry.configuration_item_status(),
@@ -411,20 +409,23 @@ async fn deleting_a_resource_config_holds_nothing_for_changes_nothing() {
 }
 
 #[tokio::test]
-async fn delete_resource_config_records_only_a_custom_resource_type() {
-    // Rows differ along why the resource type names no custom resource: an organization
-    // the registry reserves (in the spellings the reservation covers, since an
-    // organization name is matched case-insensitively) and a type name that is not a
-    // CloudFormation registry type name at all.
+async fn delete_resource_config_records_only_a_registered_resource_type() {
+    // A deletion is recorded only for a resource type the CloudFormation registry holds
+    // a registration for, as the recording half of the lifecycle requires. Rows differ
+    // along WHY the type named has none: an organization nothing registered a type
+    // under, an organization reserved against custom types (in the spellings the
+    // reservation covers, since an organization name is matched case-insensitively), a
+    // name that is not a registry type name at all, a registry MODULE name and a
+    // misspelled AWS type.
     let cases: [(&str, &str); 8] = [
-        ("an AWS native resource type", "AWS::S3::Bucket"),
+        ("an organization nothing registered", "Acme::Network::Switch"),
         ("the reserved organization Amazon", "Amazon::Thing::Widget"),
         ("the reserved organization AMZN", "AMZN::Thing::Widget"),
         ("the reserved organization alexa", "alexa::Smart::Home"),
         ("the reserved organization Custom", "Custom::Thing::Widget"),
         ("a type name of one segment", "Switch"),
         ("a type name of two segments", "Acme::Switch"),
-        ("a registry module name", "Acme::Network::Switch::MODULE"),
+        ("a misspelled AWS resource type", "AWS::EC2::Volumes"),
     ];
 
     for (case, resource_type) in cases {
@@ -432,12 +433,12 @@ async fn delete_resource_config_records_only_a_custom_resource_type() {
         emulator
             .ok(
                 "PutResourceConfig",
-                &resource_config("Acme::Network::Switch", "switch-1", r#"{"ports":4}"#),
+                &resource_config("AWS::EC2::Volume", "vol-0001", r#"{"ports":4}"#),
             )
             .await;
 
         let (status, code) = emulator
-            .refused("DeleteResourceConfig", &resource_key(resource_type, "switch-1"))
+            .refused("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
             .await;
         assert_eq!(
             (status, code.as_str()),
@@ -448,7 +449,7 @@ async fn delete_resource_config_records_only_a_custom_resource_type() {
         let reported = counts(case, &emulator).await;
         assert_eq!(
             reported,
-            vec![("Acme::Network::Switch".to_string(), 1)],
+            vec![("AWS::EC2::Volume".to_string(), 1)],
             "case {case:?}: a refused DeleteResourceConfig records nothing, got {reported:?}"
         );
     }
@@ -456,12 +457,12 @@ async fn delete_resource_config_records_only_a_custom_resource_type() {
 
 #[tokio::test]
 async fn delete_resource_config_needs_a_recording_configuration_recorder() {
-    let resource_type = "Acme::Network::Switch";
+    let resource_type = "AWS::EC2::Volume";
 
     // No configuration recorder in the account at all.
     let bare = Emulator::new();
     let (status, code) = bare
-        .refused("DeleteResourceConfig", &resource_key(resource_type, "switch-1"))
+        .refused("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
         .await;
     assert_eq!(
         (status, code.as_str()),
@@ -474,7 +475,7 @@ async fn delete_resource_config_needs_a_recording_configuration_recorder() {
     let idle = Emulator::new();
     with_recorder_and_channel(&idle).await;
     let (status, code) = idle
-        .refused("DeleteResourceConfig", &resource_key(resource_type, "switch-1"))
+        .refused("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
         .await;
     assert_eq!(
         (status, code.as_str()),
@@ -489,7 +490,7 @@ async fn delete_resource_config_needs_a_recording_configuration_recorder() {
     stopped
         .ok(
             "PutResourceConfig",
-            &resource_config(resource_type, "switch-1", r#"{"ports":4}"#),
+            &resource_config(resource_type, "vol-0001", r#"{"ports":4}"#),
         )
         .await;
     stopped
@@ -499,7 +500,7 @@ async fn delete_resource_config_needs_a_recording_configuration_recorder() {
         )
         .await;
     let (status, code) = stopped
-        .refused("DeleteResourceConfig", &resource_key(resource_type, "switch-1"))
+        .refused("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
         .await;
     assert_eq!(
         (status, code.as_str()),
@@ -507,7 +508,7 @@ async fn delete_resource_config_needs_a_recording_configuration_recorder() {
         "with the recorder turned off, recording a deletion must be refused, got {status} \
          with {code}"
     );
-    let entry = held(&stopped, resource_type, "switch-1")
+    let entry = held(&stopped, resource_type, "vol-0001")
         .expect("the recorded resource keeps its entry");
     assert!(
         entry.deleted_at.is_none(),
@@ -534,11 +535,11 @@ async fn delete_resource_config_needs_a_recording_configuration_recorder() {
     for (operation, request) in [
         (
             "PutResourceConfig",
-            resource_config(resource_type, "switch-1", "{}"),
+            resource_config(resource_type, "vol-0001", "{}"),
         ),
         (
             "DeleteResourceConfig",
-            resource_key(resource_type, "switch-1"),
+            resource_key(resource_type, "vol-0001"),
         ),
     ] {
         let (status, code, message) = refusal(&bare, operation, &request).await;
@@ -558,21 +559,21 @@ async fn delete_resource_config_needs_a_recording_configuration_recorder() {
 #[tokio::test]
 async fn recording_the_configuration_of_a_deleted_resource_discovers_it_again() {
     let case = "a resource recorded, deleted and recorded again";
-    let resource_type = "Acme::Network::Switch";
+    let resource_type = "AWS::EC2::Volume";
     let emulator = recording_emulator().await;
     emulator
         .ok(
             "PutResourceConfig",
-            &resource_config(resource_type, "switch-1", r#"{"ports":4}"#),
+            &resource_config(resource_type, "vol-0001", r#"{"ports":4}"#),
         )
         .await;
     emulator
-        .ok("DeleteResourceConfig", &resource_key(resource_type, "switch-1"))
+        .ok("DeleteResourceConfig", &resource_key(resource_type, "vol-0001"))
         .await;
     emulator
         .ok(
             "PutResourceConfig",
-            &resource_config(resource_type, "switch-1", r#"{"ports":8}"#),
+            &resource_config(resource_type, "vol-0001", r#"{"ports":8}"#),
         )
         .await;
 
@@ -583,7 +584,7 @@ async fn recording_the_configuration_of_a_deleted_resource_discovers_it_again() 
         "case {case:?}: recording the configuration of a deleted resource discovers it \
          again, got {reported:?}"
     );
-    let entry = held(&emulator, resource_type, "switch-1")
+    let entry = held(&emulator, resource_type, "vol-0001")
         .unwrap_or_else(|| panic!("case {case:?}: the resource keeps its entry"));
     assert_eq!(
         (entry.deleted_at.is_none(), entry.configuration.as_deref()),

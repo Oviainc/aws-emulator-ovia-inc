@@ -12,7 +12,9 @@
 //!    rule whose configuration was deleted, or never had one, is);
 //! 2. a configuration Config cannot run is refused rather than stored: one breaking a
 //!    published constraint, one whose parameter selects neither or both kinds of
-//!    value, and one that does not provide the role the remediation runs as;
+//!    value, and an AUTOMATIC one that does not provide the role the remediation runs
+//!    as — while a MANUAL one needs no role parameter from this API, because the SSM
+//!    document's own parameters carry it;
 //! 3. a configuration naming a Config rule this account does not hold is a failed
 //!    item of the batch, and costs the other items of the same batch nothing.
 //!
@@ -631,41 +633,31 @@ async fn a_configuration_for_a_rule_that_does_not_exist_is_a_failed_batch() {
 }
 
 #[tokio::test]
-async fn a_configuration_must_provide_the_role_the_remediation_runs_as() {
+async fn an_automatic_configuration_must_provide_the_role_the_remediation_runs_as() {
     let emulator = Emulator::new();
     let rule = "remediation-assume-role-required";
     with_rules(&emulator, &[rule]).await;
 
-    // Rows differ along what stands in for the role and whether the remediation is
-    // automatic: an automatic configuration remediates only through
-    // `AutomationAssumeRole`, a manual one through either key, and neither accepts a
-    // key that carries no value.
-    let refused: [(&str, bool, Value); 7] = [
-        ("manual with no Parameters at all", false, json!({})),
+    // Rows differ along what stands in for the role: an AUTOMATIC configuration
+    // remediates only through `AutomationAssumeRole` ("for automatic remediation
+    // configuration, the only valid assumeRole field value is AutomationAssumeRole and
+    // you need to provide a value for AutomationAssumeRole"), and a key that carries no
+    // value is no value.
+    let refused: [(&str, bool, Value); 4] = [
         ("automatic with no Parameters at all", true, json!({})),
-        (
-            "manual with other parameters only",
-            false,
-            json!({ "BucketName": { "ResourceValue": { "Value": "RESOURCE_ID" } } }),
-        ),
         (
             "automatic naming only the manual AssumeRole key",
             true,
             role_parameters(ASSUME_ROLE),
         ),
         (
-            "manual with a blank role value",
-            false,
+            "automatic with a blank role value",
+            true,
             json!({ AUTOMATION_ASSUME_ROLE: static_parameter(&["  "]) }),
         ),
         (
-            "manual with an empty role value list",
-            false,
-            json!({ AUTOMATION_ASSUME_ROLE: static_parameter(&[]) }),
-        ),
-        (
-            "manual with a lowercased role parameter name",
-            false,
+            "automatic with a lowercased role parameter name",
+            true,
             json!({ "automationassumerole": static_parameter(&[AUTOMATION_ROLE_ARN]) }),
         ),
     ];
@@ -702,8 +694,11 @@ async fn a_configuration_must_provide_the_role_the_remediation_runs_as() {
         );
     }
 
-    // The accepted rows: whichever key and value kind the role arrives under.
-    let accepted: [(&str, bool, Value); 3] = [
+    // The accepted rows: whichever key and value kind the role arrives under, and every
+    // MANUAL configuration — the API requires no role parameter of one ("The SSM
+    // automation document can use either as long as it maps to a valid parameter"), so
+    // the document's own parameters decide, not this API.
+    let accepted: [(&str, bool, Value); 7] = [
         (
             "automatic with a static AutomationAssumeRole",
             true,
@@ -719,19 +714,38 @@ async fn a_configuration_must_provide_the_role_the_remediation_runs_as() {
             false,
             role_parameters(ASSUME_ROLE),
         ),
+        ("manual with no Parameters at all", false, json!({})),
+        (
+            "manual with other parameters only",
+            false,
+            json!({ "BucketName": { "ResourceValue": { "Value": "RESOURCE_ID" } } }),
+        ),
+        (
+            "manual with a blank role value",
+            false,
+            json!({ AUTOMATION_ASSUME_ROLE: static_parameter(&["  "]) }),
+        ),
+        (
+            "manual with a lowercased role parameter name",
+            false,
+            json!({ "automationassumerole": static_parameter(&[AUTOMATION_ROLE_ARN]) }),
+        ),
     ];
     for (case, automatic, parameters) in accepted {
-        put_all(
-            &emulator,
-            vec![json!({
-                "ConfigRuleName": rule,
-                "TargetType": SSM_DOCUMENT,
-                "TargetId": "AWS-ConfigureS3BucketVersioning",
-                "Automatic": automatic,
-                "Parameters": parameters,
-            })],
-        )
-        .await;
+        let mut configuration = json!({
+            "ConfigRuleName": rule,
+            "TargetType": SSM_DOCUMENT,
+            "TargetId": "AWS-ConfigureS3BucketVersioning",
+            "Automatic": automatic,
+        });
+        if !parameters
+            .as_object()
+            .expect("parameters are an object")
+            .is_empty()
+        {
+            configuration["Parameters"] = parameters;
+        }
+        put_all(&emulator, vec![configuration]).await;
         let reported = described(&emulator, &[rule]).await;
         assert_eq!(
             reported.len(),

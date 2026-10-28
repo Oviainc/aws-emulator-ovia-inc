@@ -40,11 +40,10 @@
 //! `Emulator` harness `config_setup_and_rule_loop` already defines, and creates its
 //! aggregators through `PutConfigurationAggregator` over that wire. The recorded
 //! resources themselves are seeded in the store the way a handler reaches it
-//! (`service_state`, as `discovered_resources` seeds the reader it pins): the
-//! aggregate identifier's `ResourceType` is the modelled `ResourceType` enum, while
-//! `PutResourceConfig` records CUSTOM resource types (`ResourceTypeString`), so a
-//! configuration item of an Amazon Web Services resource type cannot be put over the
-//! wire by any implemented operation.
+//! (`service_state`, as `discovered_resources` seeds the reader it pins), because these
+//! rows pin members of a configuration item that no write operation takes — the
+//! account, the Region, the capture instant and the supplementary blocks a recorder
+//! captures.
 
 use std::time::{Duration, SystemTime};
 
@@ -876,11 +875,9 @@ async fn daily_recording_is_what_puts_the_frequency_and_the_delivery_time_in_the
 #[tokio::test]
 async fn an_identifier_naming_a_resource_type_the_model_does_not_declare_is_refused() {
     // An aggregate resource identifier's `ResourceType` is the modelled `ResourceType`
-    // enum, while `PutResourceConfig` records CUSTOM resource types
-    // (`PutResourceConfigRequest$ResourceType` targets `ResourceTypeString`, a plain
-    // 1..196 string): a configuration item recorded through that operation is
-    // therefore not addressable by this one, which is why the Amazon Web Services
-    // resource types every table above reads are seeded in the store.
+    // enum, so a type outside it is refused at the boundary — whatever the inventory
+    // holds, which is why the Amazon Web Services resource types every table above
+    // reads are seeded in the store.
     let emulator = Emulator::new();
     emulator
         .ok(
@@ -902,27 +899,17 @@ async fn an_identifier_naming_a_resource_type_the_model_does_not_declare_is_refu
         .await;
     put_whole_account_aggregator(&emulator).await;
 
-    // Rows differ along the custom resource type recorded and then asked for, each a
-    // CloudFormation registry type name `PutResourceConfig` accepts.
-    let cases: [(&str, &str, &str); 3] = [
+    // Rows differ along the resource type asked for: a CloudFormation registry type
+    // name of a third-party organization, and the account-level type the modelled enum
+    // does not list.
+    let cases: [(&str, &str, &str); 4] = [
         ("a network switch", "Acme::Network::Switch", "switch-1"),
         ("a storage vault", "Beta::Storage::Vault", "vault-1"),
         ("an analytics stream", "Zeta::Analytics::Stream", "stream-1"),
+        ("the account itself", "AWS::::Account", "000000000000"),
     ];
 
     for (case, resource_type, resource_id) in cases {
-        emulator
-            .ok(
-                "PutResourceConfig",
-                &json!({
-                    "ResourceType": resource_type,
-                    "SchemaVersionId": "00000000-0000-0000-0000-000000000002",
-                    "ResourceId": resource_id,
-                    "Configuration": r#"{"ports":4}"#,
-                }),
-            )
-            .await;
-
         let (status, code) = emulator
             .refused(
                 "BatchGetAggregateResourceConfig",

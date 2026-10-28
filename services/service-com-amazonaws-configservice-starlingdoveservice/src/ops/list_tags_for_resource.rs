@@ -5,7 +5,8 @@
 //! Reports the tags the resource its `ResourceArn` identifies carries in
 //! [`crate::state`], one page at a time in tag-key order: this is the read path of
 //! `TagResource` and `UntagResource`, so it reports what they persisted and nothing
-//! from the request.
+//! from the request. `Tags` is always reported — an empty list for a resource that
+//! carries no tags — so a caller can read it unconditionally.
 //!
 //! ## Shape of an operation
 //!
@@ -243,9 +244,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .next()
             .map(|(key, _)| crate::state::encode_page_token(key));
 
-        // `Tags` is a `TagList`, whose modelled length minimum is 1, so a page with no
-        // tags on it omits the member rather than reporting an empty list.
-        let tags = (!page.is_empty()).then(|| crate::state::tag_list(page));
+        // "The tags for the resource": the member reports the tag set of the resource the
+        // request named, so it is always there to be read — EMPTY when the resource holds
+        // no tags, or when a page has no tags left on it, which is what lets a caller
+        // read the tags of an untagged resource without first asking whether there are
+        // any.
+        let tags = Some(crate::state::tag_list(page));
 
         Ok(ListTagsForResourceOutput { tags, next_token })
     }

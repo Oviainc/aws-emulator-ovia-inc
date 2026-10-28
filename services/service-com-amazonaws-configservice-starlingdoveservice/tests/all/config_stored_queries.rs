@@ -12,8 +12,10 @@
 //!    in the Region the request is signed for;
 //! 3. saving under a name the account already holds UPDATES that query in place: same
 //!    id and ARN, the new expression, and no second resource;
-//! 4. a request that breaks the operation's contract is refused with the modelled
-//!    error and persists nothing, and a name nobody saved is not found.
+//! 4. a request that breaks the operation's contract — a mandatory member missing, a
+//!    published length bound overshot, or an `Expression` that is not a Config query —
+//!    is refused with the modelled error and persists nothing, and a name nobody saved
+//!    is not found.
 //!
 //! The harness (`Emulator`) is the one `config_setup_and_rule_loop` already builds;
 //! every case drives the emulator the way a client does, through the
@@ -54,6 +56,19 @@ fn put_body(name: &str, description: Option<&str>, expression: Option<&str>) -> 
 /// A minimal query expression; its text is never asserted on, only read back.
 const SELECT_BUCKETS: &str =
     "SELECT resourceId, resourceType WHERE resourceType = 'AWS::S3::Bucket'";
+
+/// [`SELECT_BUCKETS`] padded with a trailing comment of `pad` characters to exactly
+/// `length` characters, so a row can exercise a published length bound of `Expression`
+/// with a text that IS a Config query — `PutStoredQuery` saves no query for one that is
+/// not.
+fn padded_query(pad: char, length: usize) -> String {
+    // `SELECT_BUCKETS`, a space, `/*`, a space, the padding, a space and `*/`.
+    let padding = length
+        .checked_sub(SELECT_BUCKETS.chars().count() + 7)
+        .expect("the bound leaves room for the query and its comment");
+    let padding: String = ::std::iter::repeat_n(pad, padding).collect();
+    format!("{SELECT_BUCKETS} /* {padding} */")
+}
 
 /// Save `name` and return the `QueryArn` the service answered with.
 async fn save(emulator: &Emulator, name: &str, expression: &str) -> String {
@@ -147,22 +162,22 @@ async fn a_stored_query_is_read_back_exactly_as_it_was_saved() {
             "SELECT\n\tresourceId\nWHERE\n\tresourceType = 'AWS::EC2::Volume'".to_string(),
         ),
         (
-            "an expression of one character, the published minimum length",
+            "the shortest expression that is a Config query",
             "shortest-expression",
             None,
-            "*".to_string(),
+            "SELECT arn".to_string(),
         ),
         (
             "both members at their published maximum length",
             longest_name.as_str(),
             Some("d".repeat(DESCRIPTION_MAX)),
-            "e".repeat(EXPRESSION_MAX),
+            padded_query('e', EXPRESSION_MAX),
         ),
         (
             "a multi-byte expression at the published maximum length in characters",
             "wide-expression",
             Some("キー".repeat(DESCRIPTION_MAX / 2)),
-            "✓".repeat(EXPRESSION_MAX),
+            padded_query('キ', EXPRESSION_MAX),
         ),
     ];
 
@@ -417,8 +432,20 @@ async fn a_request_outside_the_contract_is_refused_and_persists_nothing() {
             body: put_body(
                 "long-expression",
                 None,
-                Some(&"e".repeat(EXPRESSION_MAX + 1)),
+                Some(&padded_query('e', EXPRESSION_MAX + 1)),
             ),
+            expected: "ValidationException",
+        },
+        Refusal {
+            case: "an expression that is not a Config query at all",
+            operation: "PutStoredQuery",
+            body: put_body("not-a-query", None, Some("this is not a query")),
+            expected: "ValidationException",
+        },
+        Refusal {
+            case: "an expression of one character, the published minimum length",
+            operation: "PutStoredQuery",
+            body: put_body("one-character-expression", None, Some("*")),
             expected: "ValidationException",
         },
         Refusal {

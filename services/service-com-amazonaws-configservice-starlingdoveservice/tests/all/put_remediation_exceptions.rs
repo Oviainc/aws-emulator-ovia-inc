@@ -7,11 +7,13 @@
 //! second put for the same rule and resource REVISES that one in place ("This API adds a
 //! new exception or updates an existing exception for a specified resource with a
 //! specified Config rule"), so every member a read reports is the one the LAST write
-//! carried — an explanation the request omitted is absent rather than empty; a resource
-//! the rule's own verdict places as COMPLIANT or NOT_APPLICABLE takes no exception at all
-//! and comes back in `FailedBatches`; a key naming no resource is refused 400
-//! `InvalidParameterValueException`; and a read of every exception a rule holds is paged,
-//! while a read that names its resources in batch is not.
+//! carried — an explanation the request omitted is absent rather than empty; a rule the
+//! account holds no remediation configuration for takes no exception at all and is
+//! refused 400 `InvalidParameterValueException`; a resource the rule's own verdict
+//! places as COMPLIANT or NOT_APPLICABLE takes no exception at all and comes back in
+//! `FailedBatches`; a key naming no resource is refused 400
+//! `InvalidParameterValueException`; and a read of every exception a rule holds is
+//! paged, while a read that names its resources in batch is not.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds, using the
@@ -42,6 +44,10 @@ const RULE: &str = "encrypted-volumes";
 /// Another rule, whose exceptions no read of [`RULE`] may report.
 const OTHER_RULE: &str = "versioned-buckets";
 
+/// A rule the account holds with NO remediation configuration, which is what makes it a
+/// rule no exception can be placed under.
+const PLAIN_RULE: &str = "unremediated-volumes";
+
 /// Every `ComplianceType` a delivered verdict may carry, from
 /// `smithy_query(query="shape", shape="ComplianceType")`: `COMPLIANT`, `NON_COMPLIANT`,
 /// `NOT_APPLICABLE` (the value set also lists `INSUFFICIENT_DATA`, which Config does not
@@ -59,14 +65,37 @@ const MESSAGE_MIN_LENGTH: usize = 1;
 /// See [`MESSAGE_MIN_LENGTH`].
 const MESSAGE_MAX_LENGTH: usize = 1024;
 
-/// An emulator holding a recorder, a delivery channel and the rules the cases write
-/// exceptions for.
+/// An emulator holding a recorder, a delivery channel, the rules the cases write
+/// exceptions for and the remediation configuration each of those rules needs: an
+/// exception exempts a resource from the remediation a rule's configuration runs, so a
+/// rule holding none takes no exception at all.
 async fn emulator_with_rules() -> Emulator {
     let emulator = Emulator::new();
     with_recorder_and_channel(&emulator).await;
     emulator.ok("PutConfigRule", &managed_rule(RULE)).await;
     emulator.ok("PutConfigRule", &managed_rule(OTHER_RULE)).await;
+    with_remediation_configuration(&emulator, RULE).await;
+    with_remediation_configuration(&emulator, OTHER_RULE).await;
     emulator
+}
+
+/// Give `rule` the remediation configuration a remediation exception exempts a resource
+/// from: the SSM document a `RemediationConfiguration` names as its target, which is all
+/// the model requires beside the rule (`RemediationConfiguration`: ConfigRuleName,
+/// TargetType and TargetId are its required members).
+async fn with_remediation_configuration(emulator: &Emulator, rule: &str) {
+    emulator
+        .ok(
+            "PutRemediationConfigurations",
+            &json!({
+                "RemediationConfigurations": [{
+                    "ConfigRuleName": rule,
+                    "TargetType": "SSM_DOCUMENT",
+                    "TargetId": "AWS-PublishSNSNotification",
+                }],
+            }),
+        )
+        .await;
 }
 
 /// A resource key naming both members, which is what identifies a resource in Config.
@@ -495,6 +524,7 @@ async fn an_exception_is_generated_only_where_the_rule_does_not_place_the_resour
         emulator
             .ok("PutConfigRule", &custom_lambda_rule(RULE))
             .await;
+        with_remediation_configuration(&emulator, RULE).await;
         if let Some((evaluated, compliance_type)) = verdict {
             emulator
                 .ok(
@@ -562,11 +592,20 @@ async fn an_exception_is_generated_only_where_the_rule_does_not_place_the_resour
 }
 
 #[tokio::test]
-async fn a_rule_this_account_does_not_hold_takes_no_exception() {
-    // Rows differ along WHY the rule is not one this account holds: a name nothing
-    // created, a name that differs from a held rule only in case, a name that differs by
-    // surrounding space, and how many keys the request names under it.
-    let cases: [(&str, &str, Vec<Value>); 4] = [
+async fn a_rule_with_no_remediation_configuration_takes_no_exception() {
+    // An exception exempts a resource from the remediation ONE rule's remediation
+    // configuration would run, so a rule holding none has no remediation to exempt it
+    // from and the whole request is refused. Rows differ along WHY the request names no
+    // rule holding a remediation configuration: a rule the account holds but gave no
+    // remediation configuration, a name nothing created, a name that differs from a held
+    // rule only in case, a name that differs by surrounding space, and how many keys the
+    // request names under it.
+    let cases: [(&str, &str, Vec<Value>); 5] = [
+        (
+            "a held rule with no remediation configuration",
+            PLAIN_RULE,
+            vec![key(EC2_VOLUME, "vol-0001")],
+        ),
         (
             "a rule nothing created",
             "no-such-rule",
@@ -595,50 +634,40 @@ async fn a_rule_this_account_does_not_hold_takes_no_exception() {
 
     for (case, rule, keys) in cases {
         let emulator = emulator_with_rules().await;
+        // The rule of the first row exists and holds no remediation configuration.
+        emulator.ok("PutConfigRule", &managed_rule(PLAIN_RULE)).await;
 
-        let answered = emulator
-            .ok(
+        let (status, parsed) = emulator
+            .call(
                 "PutRemediationExceptions",
                 &put(rule, &keys, Some("waiting"), None),
             )
             .await;
-
-        // Every key the request named comes back as failed, naming the rule the request
-        // could not place, and nothing is persisted under it.
-        let failed = failed_items(case, &answered);
-        let expected: Vec<(String, String)> = keys
-            .iter()
-            .map(|named| {
-                (
-                    named["ResourceType"].as_str().unwrap_or_default().to_string(),
-                    named["ResourceId"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        let reported_keys: Vec<(String, String)> = failed
-            .iter()
-            .map(|(resource_type, resource_id, _)| (resource_type.clone(), resource_id.clone()))
-            .collect();
+        let code = parsed["__type"]
+            .as_str()
+            .map(|wire| wire.rsplit('#').next().unwrap_or(wire))
+            .unwrap_or("<none>");
+        let message = parsed["message"].as_str().unwrap_or_default();
         assert_eq!(
-            reported_keys, expected,
-            "case {case:?}: expected every key back as failed, got {answered}"
-        );
-        assert!(
-            failed
-                .iter()
-                .all(|(_, _, message)| message.contains(rule.trim())),
-            "case {case:?}: the failed batch names the rule it could not place, got {answered}"
+            (status, code, message),
+            (
+                400,
+                "InvalidParameterValueException",
+                format!("No RemediationConfiguration found for {rule}").as_str(),
+            ),
+            "case {case:?}: expected the remediation-configuration precondition to be \
+             reported, got {status} {code} {message:?}"
         );
 
         assert_eq!(
             described(case, &emulator, rule, None).await,
             Vec::new(),
-            "case {case:?}: a rule this account does not hold holds no exception"
+            "case {case:?}: a rule with no remediation configuration holds no exception"
         );
         assert_eq!(
             described(case, &emulator, RULE, None).await,
             Vec::new(),
-            "case {case:?}: nothing was written under the rule the account does hold"
+            "case {case:?}: nothing was written under the rule that does hold one"
         );
     }
 }
