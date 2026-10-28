@@ -171,15 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An identity's default configuration set is a reference to this record, so
-        // the reference goes with it: once the set is gone no identity still reports
-        // it, and a later read reports the identity as having no configuration set
-        // rather than naming one the account no longer holds.
-        for identity in store.identities.values_mut() {
-            if identity.configuration_set_name.as_deref() == Some(name.as_str()) {
-                identity.configuration_set_name = None;
-            }
-        }
+        // The delete reaches no further than that record. An email identity's default
+        // configuration set is a name the client wrote onto the identity, reported back
+        // as `GetEmailIdentity`'s plain `ConfigurationSetName` string and not a key this
+        // service keeps pointing at a live set, so removing the set does not rewrite any
+        // identity: an identity that named this set keeps naming it — an inert name no
+        // set answers to — until a later `PutEmailIdentityConfigurationSetAttributes`
+        // replaces it or, carrying no name at all, clears it.
 
         // `DeleteConfigurationSetResponse` carries no members.
         Ok(DeleteConfigurationSetOutput {})

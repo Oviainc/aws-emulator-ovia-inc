@@ -34,7 +34,10 @@ use crate::configuration_sets::{Reply, Ses};
 const SENDING_ENABLED_DEFAULT: bool = false;
 
 /// Write the sending switch of the set `name`, with `body` as the request payload.
-async fn put_sending(ses: &Ses, name: &str, body: Value) -> Reply {
+///
+/// Shared with the sibling suites of this test target, so every case drives the same
+/// wire path for this operation.
+pub(crate) async fn put_sending(ses: &Ses, name: &str, body: Value) -> Reply {
     ses.call(
         "PUT",
         &format!("/v2/email/configuration-sets/{name}/sending"),
