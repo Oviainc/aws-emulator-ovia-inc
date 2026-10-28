@@ -880,6 +880,27 @@ pub fn entitlement_key(connector_id: &str, vm_id: &str) -> String {
     format!("{connector_id}/{vm_id}")
 }
 
+/// The DISTINCT virtual machines a `vmIds` list names, in the order the request first
+/// named each of them.
+///
+/// One entitlement per distinct virtual machine: the (connector, VM) pair is what
+/// identifies an entitlement ([`entitlement_key`]), so a `vmIds` list naming the same
+/// virtual machine twice names ONE entitlement. The rule lives here, beside the identity
+/// it derives from, so `CreateEntitlement` and `DeleteEntitlement` cannot disagree about
+/// which machines one request names. First-seen order is kept, because both operations
+/// report the entitlements of a call in the order the request named their virtual
+/// machines.
+pub fn distinct_vm_ids(vm_ids: &[String]) -> Vec<&str> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut distinct = Vec::with_capacity(vm_ids.len());
+    for vm_id in vm_ids {
+        if seen.insert(vm_id.as_str()) {
+            distinct.push(vm_id.as_str());
+        }
+    }
+    distinct
+}
+
 /// One Windows Server License entitlement, as `CreateEntitlement` stored it: the
 /// record of a virtual machine whose Windows Server usage Amazon EVS tracks.
 #[derive(Debug, Clone)]

@@ -50,6 +50,8 @@ mod eip_ec2_propagation;
 mod eip_release_on_environment_deletion;
 #[path = "all/entitlement_connector.rs"]
 mod entitlement_connector;
+#[path = "all/entitlement_vm_id_identity.rs"]
+mod entitlement_vm_id_identity;
 #[path = "all/entitlements.rs"]
 mod entitlements;
 #[path = "all/environment_check_input_recompute.rs"]

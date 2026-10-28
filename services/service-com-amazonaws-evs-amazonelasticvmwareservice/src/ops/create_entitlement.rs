@@ -244,14 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One entitlement per DISTINCT requested virtual machine: the (connector, VM)
         // pair identifies an entitlement, so a `vmIds` list naming the same VM twice
-        // names one entitlement. `vmIds` holds at most 100 entries (modelled len
-        // 1..100), which bounds this scan.
-        let mut wanted: Vec<&str> = Vec::with_capacity(input.vm_ids.len());
-        for vm_id in &input.vm_ids {
-            if !wanted.contains(&vm_id.as_str()) {
-                wanted.push(vm_id.as_str());
-            }
-        }
+        // names one entitlement. The rule is stated once, beside that identity in
+        // `crate::state`, and `DeleteEntitlement` folds its own list through it too.
+        let wanted = crate::state::distinct_vm_ids(&input.vm_ids);
 
         // The store's own bound on how many entitlements one environment holds. Refused
         // with the operation's modelled ValidationException, naming the member whose
