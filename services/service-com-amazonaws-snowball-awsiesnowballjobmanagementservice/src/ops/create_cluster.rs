@@ -382,27 +382,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
         let mut store = state.lock();
 
         // A cluster is built from the address its devices ship to, exactly as a job is:
-        // an id no stored address answers to names none. A forwarding address is an
-        // address too, so the same rule holds for it.
-        for address_id in [
-            Some(input.address_id.as_str()),
-            input.forwarding_address_id.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
+        // an id no stored address answers to names none. Both members that name an
+        // address, and the refusal an unstored one earns, are the one rule
+        // `crate::state::OrderAddresses` holds for every operation that names an address;
+        // this handler lifts the answer into its own error channel.
+        if let Some(error) =
+            store.first_unstored_address(crate::state::OrderAddresses::from(&input))
         {
-            if !store.addresses.contains_key(address_id) {
-                return Err(CreateClusterErrorModeled::InvalidResourceException(
-                    InvalidResourceException {
-                        message: Some(format!(
-                            "The address ID {address_id} can't be found. Check the information \
-                             you provided in your last request, and try again."
-                        )),
-                        resource_type: Some("address".to_string()),
-                    },
-                )
-                .into());
-            }
+            return Err(CreateClusterErrorModeled::InvalidResourceException(error).into());
         }
 
         // The long-term pricing a cluster's jobs are billed under is a record of this

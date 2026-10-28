@@ -24,10 +24,10 @@ pub mod job_notifications;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Address, ClusterListEntry, ClusterMetadata, CompatibleImage, DeviceConfiguration, JobListEntry,
-    JobMetadata, JobResource, LongTermPricingListEntry, Notification,
-    OnDeviceServiceConfiguration, PickupDetails, ServiceVersion, ShippingDetails, TaxDocuments,
-    UpdateClusterInput, UpdateJobInput,
+    Address, ClusterListEntry, ClusterMetadata, CompatibleImage, CreateClusterInput, CreateJobInput,
+    DeviceConfiguration, InvalidResourceException, JobListEntry, JobMetadata, JobResource,
+    LongTermPricingListEntry, Notification, OnDeviceServiceConfiguration, PickupDetails,
+    ServiceVersion, ShippingDetails, TaxDocuments, UpdateClusterInput, UpdateJobInput,
 };
 
 /// What a handler says when the engine it was constructed with does not carry this
@@ -1281,6 +1281,81 @@ impl<'a> From<&'a UpdateJobInput> for ClusterOrderMembers<'a> {
     }
 }
 
+/// The addresses one order request names: the address the Snow device ships to and the
+/// forwarding address.
+///
+/// Every operation that places or updates an order names an address through these two
+/// members — `CreateJob`, `CreateCluster`, `UpdateJob` and `UpdateCluster`, with only
+/// `CreateClusterRequest` making the first one required — so the one rule asked of them
+/// ([`ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState::first_unstored_address`])
+/// is asked of this projection, borrowed from whichever request carried it, rather than
+/// written out once per handler: the four operations cannot drift into disagreeing about
+/// which members name an address or about how an id that answers to no stored address is
+/// refused, exactly as [`ClusterOrderMembers`] keeps the two updates agreeing about what a
+/// cluster's order carries.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OrderAddresses<'a> {
+    /// `AddressId`: "The ID for the address that you want the Snow device shipped to".
+    pub address_id: Option<&'a str>,
+    /// `ForwardingAddressId`: "The forwarding address ID for a job". A forwarding address
+    /// is an address too, so the same rule holds for it.
+    pub forwarding_address_id: Option<&'a str>,
+}
+
+impl<'a> OrderAddresses<'a> {
+    /// The address ids the request actually supplied, in the order a refusal considers
+    /// them: the address the device ships to first, the forwarding address after it.
+    fn named_ids(self) -> impl Iterator<Item = &'a str> {
+        [self.address_id, self.forwarding_address_id]
+            .into_iter()
+            .flatten()
+    }
+}
+
+impl<'a> From<&'a CreateJobInput> for OrderAddresses<'a> {
+    /// `CreateJobRequest` leaves both members optional: a job ordered into a cluster takes
+    /// the cluster's address instead of naming one.
+    fn from(input: &'a CreateJobInput) -> Self {
+        Self {
+            address_id: input.address_id.as_deref(),
+            forwarding_address_id: input.forwarding_address_id.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a CreateClusterInput> for OrderAddresses<'a> {
+    /// `CreateClusterRequest$AddressId` is required — a cluster is created for the one
+    /// address its devices ship to — so it is always one of the ids the rule is asked
+    /// about.
+    fn from(input: &'a CreateClusterInput) -> Self {
+        Self {
+            address_id: Some(input.address_id.as_str()),
+            forwarding_address_id: input.forwarding_address_id.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a UpdateJobInput> for OrderAddresses<'a> {
+    /// An update names an address only when it is changing one, so an omitted member names
+    /// nothing to resolve.
+    fn from(input: &'a UpdateJobInput) -> Self {
+        Self {
+            address_id: input.address_id.as_deref(),
+            forwarding_address_id: input.forwarding_address_id.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a UpdateClusterInput> for OrderAddresses<'a> {
+    /// `UpdateClusterRequest` models the same two optional members, for the same reason.
+    fn from(input: &'a UpdateClusterInput) -> Self {
+        Self {
+            address_id: input.address_id.as_deref(),
+            forwarding_address_id: input.forwarding_address_id.as_deref(),
+        }
+    }
+}
+
 /// Which of a job's files a published URL addresses.
 ///
 /// `GetSoftwareUpdates` "Returns an Amazon S3 presigned URL for an update file associated
@@ -2047,6 +2122,36 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// are exactly the ones `CreateLongTermPricing` minted a contract for.
     pub fn holds_long_term_pricing(&self, long_term_pricing_id: &str) -> bool {
         self.long_term_pricing.contains_key(long_term_pricing_id)
+    }
+
+    /// The first address `named` names that this store holds no address for, as the refusal
+    /// that id earns — or `None` when every address the request named is one this store
+    /// holds.
+    ///
+    /// An address is a record of this service, created by `CreateAddress`, so an id is
+    /// checked against the addresses the store holds rather than against the id's form,
+    /// exactly as a long-term pricing contract is ([`Self::holds_long_term_pricing`]):
+    /// "The specified resource can't be found. Check the information you provided in your
+    /// last request, and try again" (`InvalidResourceException`) is what an order naming
+    /// one answers, carrying the kind of resource at fault in `ResourceType`.
+    ///
+    /// Each handler lifts the shape into its own error enum and raises it where its own
+    /// refusal ordering puts it, the way the resources an order names outside this service
+    /// are resolved once in [`named_resources`] and refused per operation.
+    pub fn first_unstored_address(
+        &self,
+        named: OrderAddresses<'_>,
+    ) -> Option<InvalidResourceException> {
+        named
+            .named_ids()
+            .find(|address_id| !self.addresses.contains_key(*address_id))
+            .map(|address_id| InvalidResourceException {
+                message: Some(format!(
+                    "The address ID {address_id} can't be found. Check the information you \
+                     provided in your last request, and try again."
+                )),
+                resource_type: Some("address".to_string()),
+            })
     }
 
     /// Every long-term pricing contract this store holds in creation order — the order

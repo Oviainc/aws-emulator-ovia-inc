@@ -69,6 +69,8 @@ mod long_term_pricing_listing;
 mod long_term_pricing_renewal;
 #[path = "all/long_term_pricing_updates.rs"]
 mod long_term_pricing_updates;
+#[path = "all/order_addresses.rs"]
+mod order_addresses;
 #[path = "all/order_named_resources.rs"]
 mod order_named_resources;
 #[path = "all/page_size_rule.rs"]
