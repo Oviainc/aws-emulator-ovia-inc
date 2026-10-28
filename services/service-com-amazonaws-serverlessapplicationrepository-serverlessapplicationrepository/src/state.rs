@@ -1027,9 +1027,12 @@ pub fn application_not_found_message(application_id: &str) -> String {
 /// The wording a 404 carries for a semantic version the named application does not hold,
 /// naming both members the caller asked with. Stated once here because every operation
 /// that resolves a version — GetApplication and both CloudFormation template operations —
-/// answers the same condition.
+/// answers the same condition: the subject is the application, and what is reported about
+/// it is that it carries no such version. The fixed text is "Application " … " does not
+/// have a version " and it ends with the version string, with no closing punctuation; the
+/// two variable parts are the `ApplicationId` and the `SemanticVersion` the request named.
 pub fn version_not_found_message(application_id: &str, semantic_version: &str) -> String {
-    format!("Version {semantic_version} could not be found for application {application_id}.")
+    format!("Application {application_id} does not have a version {semantic_version}")
 }
 
 /// The documented ceiling on `Labels`: "Maximum number of labels: 10"

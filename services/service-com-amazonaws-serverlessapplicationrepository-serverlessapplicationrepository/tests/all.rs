@@ -25,6 +25,8 @@ mod artifact_document_plane;
 mod change_sets;
 #[path = "all/cloudformation_templates.rs"]
 mod cloudformation_templates;
+#[path = "all/deploy_refusal_messages.rs"]
+mod deploy_refusal_messages;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/error_bodies.rs"]
