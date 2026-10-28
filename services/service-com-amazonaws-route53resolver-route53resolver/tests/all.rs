@@ -23,6 +23,8 @@ mod firewall_domain_list_listing;
 mod firewall_domain_lists;
 #[path = "all/firewall_domains.rs"]
 mod firewall_domains;
+#[path = "all/firewall_rule_group_deletion.rs"]
+mod firewall_rule_group_deletion;
 #[path = "all/firewall_rule_groups.rs"]
 mod firewall_rule_groups;
 #[path = "all/harness.rs"]
