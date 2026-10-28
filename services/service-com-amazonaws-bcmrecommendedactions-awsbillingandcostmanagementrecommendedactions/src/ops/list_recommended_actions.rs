@@ -519,6 +519,12 @@ fn parse_token(token: &str, fingerprint: &str) -> Result<usize, ListRecommendedA
 }
 
 /// Project a stored record onto the wire `RecommendedAction`.
+///
+/// `context` is carried over as the ORDERED map it is stored in, so the JSON
+/// object a response renders it as lists its keys in one order: the projection
+/// keeps the store's key order instead of re-bucketing the entries under a fresh
+/// per-map hash seed, which would let two identical reads of unchanged state
+/// answer with different bytes.
 fn to_wire(action: &StoredAction) -> RecommendedAction {
     RecommendedAction {
         id: Some(action.id.clone()),
@@ -526,13 +532,7 @@ fn to_wire(action: &StoredAction) -> RecommendedAction {
         account_id: Some(action.account_id.clone()),
         severity: Some(action.severity.as_str().to_string()),
         feature: Some(action.feature.as_str().to_string()),
-        context: Some(
-            action
-                .context
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        ),
+        context: Some(action.context.clone()),
         next_steps: Some(action.next_steps.clone()),
         last_updated_time_stamp: Some(action.last_updated_timestamp.clone()),
     }
