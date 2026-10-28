@@ -7,11 +7,11 @@
 //! The rules pinned here:
 //!
 //! 1. the command addresses ONE destination of the table it names — the destination
-//!    still replicating to the stream its `StreamArn` names — so a table that
-//!    replicates to no such stream is refused with HTTP 400 `ValidationException`
-//!    carrying DynamoDB's no-such-destination sentence over the stream ARN and the table
-//!    name the request carried, whether that table has never registered a destination,
-//!    registered a different stream, or stopped replicating to this one;
+//!    record its `StreamArn` names, which has to be `ACTIVE` — so a command the table
+//!    cannot serve is refused with HTTP 400 `ValidationException`, carrying DynamoDB's
+//!    no-such-destination sentence over the stream ARN and the table name the request
+//!    carried when the table holds no record of that stream at all, and DynamoDB's
+//!    required-status sentence when the record exists but is not `ACTIVE`;
 //! 2. the table is resolved like every other table-addressed operation's: by bare name
 //!    or by the table's ARN, with a name no table answers for refused as
 //!    `ResourceNotFoundException` and a name outside the documented form refused by the
@@ -23,8 +23,8 @@
 //! 4. a command that names no precision changes none: the precision in force stays what
 //!    it was, and a destination carrying none reports none.
 //!
-//! Each rule is asserted over a SET of inputs — why the table replicates to no such
-//! stream, how the table is addressed, the precision in force before the command, the
+//! Each rule is asserted over a SET of inputs — why the table cannot serve the command,
+//! how the table is addressed, the precision in force before the command, the
 //! precision the command names, and whether it names one at all — rather than one
 //! example. Every command and every read is driven over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -115,13 +115,24 @@ async fn set_up(
     }
 }
 
-/// DynamoDB's refusal of a command against a destination the table does not replicate
-/// to: the invalid-state sentence, the stream ARN the request named and the table it
-/// named it against.
+/// DynamoDB's refusal of a command against a stream the table holds no destination
+/// record for: the invalid-state sentence, the stream ARN the request named and the
+/// table it named it against.
 fn no_destination_message(table: &str, stream_arn: &str) -> String {
     format!(
         "Table is not in a valid state to enable Kinesis Streaming Destination: No streaming \
          destination with streamArn: {stream_arn} found for table with tableName: {table}"
+    )
+}
+
+/// DynamoDB's refusal of a configuration change against a destination record that EXISTS
+/// but is not `ACTIVE`: the status changes are allowed in, over the table name and the
+/// stream ARN the request addressed the destination by.
+fn not_active_message(table: &str, stream_arn: &str) -> String {
+    format!(
+        "Table is not in a valid state to enable Kinesis Streaming Destination: Kinesis \
+         streaming is not in ACTIVE state. Updates are only allowed in ACTIVE state. TableName: \
+         {table}, kdsArn: {stream_arn}"
     )
 }
 
@@ -148,27 +159,32 @@ async fn described(router: &MultiServiceRouter, table: &str, stream_arn: &str) -
         .unwrap_or(Value::Null)
 }
 
-/// Rule 1: a table that replicates to no such stream is refused, whichever way it
-/// came to replicate to none.
+/// Rule 1: a table with no `ACTIVE` destination for the stream the command addresses is
+/// refused — as a lookup miss where it holds no record of that stream, and on the
+/// record's status where it holds one that is not `ACTIVE`.
 #[tokio::test]
-async fn an_update_without_a_replicating_destination_is_refused() {
-    // (case, the destinations the table carries, the stream the command addresses)
-    let cases: Vec<(&str, Vec<Destination>, &str)> = vec![
-        ("never registered one", Vec::new(), "cdc"),
+async fn an_update_without_an_active_destination_is_refused() {
+    // (case, the destinations the table carries, the stream the command addresses,
+    //  whether the table holds a record of that stream)
+    let cases: Vec<(&str, Vec<Destination>, &str, bool)> = vec![
+        ("never registered one", Vec::new(), "cdc", false),
         (
             "registered another stream",
             vec![("other", Some("MICROSECOND"), Replication::Live)],
             "cdc",
+            false,
         ),
         (
             "stopped replicating to it",
             vec![("cdc", Some("MICROSECOND"), Replication::Stopped)],
             "cdc",
+            true,
         ),
         (
             "is still stopping replication to it",
             vec![("cdc", None, Replication::Stopping)],
             "cdc",
+            true,
         ),
         (
             "several destinations, none of them this stream",
@@ -177,10 +193,11 @@ async fn an_update_without_a_replicating_destination_is_refused() {
                 ("two", Some("MILLISECOND"), Replication::Stopped),
             ],
             "cdc",
+            false,
         ),
     ];
 
-    for (index, (case, destinations, addressed)) in cases.into_iter().enumerate() {
+    for (index, (case, destinations, addressed, holds_a_record)) in cases.into_iter().enumerate() {
         let (router, engine) = emulator_and_engine();
         let table = format!("Replication{index}");
         create_table(&router, &table, &[]).await;
@@ -208,10 +225,15 @@ async fn an_update_without_a_replicating_destination_is_refused() {
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body}"
         );
+        let wanted = if holds_a_record {
+            not_active_message(&table, &arn)
+        } else {
+            no_destination_message(&table, &arn)
+        };
         assert_eq!(
             message(&body),
-            no_destination_message(&table, &arn),
-            "case {case:?}: expected DynamoDB's no-such-destination sentence, got {}",
+            wanted,
+            "case {case:?}: expected {wanted:?}, got {}",
             message(&body)
         );
 

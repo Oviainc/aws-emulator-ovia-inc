@@ -462,8 +462,10 @@ async fn an_access_association_names_a_stored_private_custom_domain_name() {
         assert_failure(&answer, 400, BAD_REQUEST, case);
     }
 
-    // A source type outside the modelled enum is refused by the modelled constraint, not
-    // stored as if it had named a source type.
+    // A source type outside the modelled enum is refused by the CONSTRAINT layer in
+    // front of the handler — whose error class is `ValidationException`, not the
+    // operation's own `BadRequestException` — and not stored as if it had named a source
+    // type.
     for source_type in ["VPC", "vpce", "", "VPCE "] {
         let answer = create_association(
             &gateway,
@@ -477,7 +479,7 @@ async fn an_access_association_names_a_stored_private_custom_domain_name() {
         assert_failure(
             &answer,
             400,
-            BAD_REQUEST,
+            "ValidationException",
             &format!("accessAssociationSourceType={source_type:?}"),
         );
     }
@@ -654,12 +656,12 @@ async fn the_resource_owner_filter_selects_by_owner() {
         );
     }
 
-    // A value outside the enum is refused by the modelled constraint, not served as if it
-    // had named an owner.
+    // A value outside the enum is refused by the CONSTRAINT layer under its own error
+    // class, not served as if it had named an owner.
     assert_failure(
         &list_associations(&gateway, "resourceOwner=NOBODY").await,
         400,
-        BAD_REQUEST,
+        "ValidationException",
         "GetDomainNameAccessAssociations(resourceOwner=NOBODY)",
     );
 }

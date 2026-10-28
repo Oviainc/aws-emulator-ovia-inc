@@ -2,10 +2,10 @@
 
 //! @op UpdateKinesisStreamingDestination
 //! The command that changes the configuration of a table's Kinesis data stream
-//! destination. It resolves the table, finds the destination the request's `StreamArn`
-//! addresses among the ones the table replicates to, and applies the configuration the
-//! request names to that record in `crate::state` — this is the ONLY file to touch for
-//! this operation.
+//! destination. It resolves the table, finds the destination record the request's
+//! `StreamArn` addresses, refuses it unless that record is `ACTIVE`, and applies the
+//! configuration the request names to it in `crate::state` — this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -202,14 +202,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The refusal below is stated over the table's STORED name, so reading it cannot
         // overlap the borrow of the destination it is looked up for.
         let table_name = table.name.clone();
+        // A configuration change addresses a destination RECORD of this table, so a
+        // stream it holds no record for is the lookup miss; a record it does hold is
+        // refused instead on the status the change requires, because a destination that
+        // exists but is not replicating yet, is changing, or has stopped is a different
+        // cause for the caller than one that was never registered.
         let destination = table
-            .replicating_kinesis_destination_mut(&input.stream_arn, now)
+            .kinesis_destination_mut(&input.stream_arn)
             .ok_or_else(|| {
                 lift(crate::state::kinesis_destination_not_found(
                     &table_name,
                     &input.stream_arn,
                 ))
             })?;
+        if !destination.active(now) {
+            return Err(lift(crate::state::kinesis_destination_not_active_to_update(
+                &table_name,
+                &input.stream_arn,
+            )));
+        }
         destination.apply_update(precision, now);
         let stream_arn = destination.stream_arn.clone();
         let status = destination.status(now).to_string();

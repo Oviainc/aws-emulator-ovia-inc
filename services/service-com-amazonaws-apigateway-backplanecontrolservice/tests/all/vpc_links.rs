@@ -23,9 +23,11 @@
 //!   modelled `LimitExceededException` (429).
 //!
 //! The tables span what the rules generalise over rather than one recorded call: how many
-//! target ARNs a link names and of which vendor, which optional members the request
-//! carries, how many tags it sets, the forms an unknown id takes, and the ways a request
-//! can fall outside what the service stores.
+//! target ARNs a link names and where the load balancers they name live, which optional
+//! members the request carries, how many tags it sets, the forms an unknown id takes, and
+//! the ways a request can fall outside what the service stores. Which state a link SETTLES
+//! in once the provisioning span has passed is decided by what it targets, which is the
+//! sibling `vpc_link_provisioning` suite's rule.
 
 use std::time::Duration;
 
@@ -98,7 +100,9 @@ pub(crate) async fn created_vpc_link(gateway: &Gateway, name: &str) -> String {
 async fn a_created_vpc_link_is_persisted_and_read_back_member_for_member() {
     // Rows differ along what the rule generalises over: the number of targets, which
     // optional members the request carries, how many tags it sets, and the form of the
-    // name.
+    // name. Every row names network load balancers, so each link provisions: which state
+    // a link whose targets cannot be provisioned settles in is the sibling
+    // `vpc_link_provisioning` suite's rule.
     let rows: Vec<(&str, Value)> = vec![
         (
             "one target and nothing else",
@@ -128,10 +132,14 @@ async fn a_created_vpc_link_is_persisted_and_read_back_member_for_member() {
             }),
         ),
         (
-            "a target of another vendor",
+            // A target in another Region and account: the link's targets are the ARNs the
+            // request listed, wherever the load balancers they name live.
+            "a target in another Region and account",
             json!({
-                "name": "vpce-target",
-                "targetArns": ["arn:aws:ec2:us-east-1:000000000000:vpc-endpoint-service/vpce-svc-1"],
+                "name": "cross-account-target",
+                "targetArns": [
+                    "arn:aws:elasticloadbalancing:eu-west-1:111122223333:loadbalancer/net/nlb/abc123",
+                ],
             }),
         ),
     ];

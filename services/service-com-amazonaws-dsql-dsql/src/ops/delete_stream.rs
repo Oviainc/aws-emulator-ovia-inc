@@ -219,11 +219,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         });
                 }
                 crate::state::TokenVerdict::Mismatch => {
-                    return Err(DeleteStreamErrorModeled::ConflictException(ConflictException {
-                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
-                        resource_id: Some(input.stream_identifier.clone()),
-                        resource_type: Some(crate::state::RESOURCE_TYPE_STREAM.to_string()),
-                    })
+                    return Err(DeleteStreamErrorModeled::ConflictException(
+                        crate::state::ResourceIdentity::stream(&input.stream_identifier)
+                            .client_token_mismatch(),
+                    )
                     .into());
                 }
                 crate::state::TokenVerdict::Unused => {}
