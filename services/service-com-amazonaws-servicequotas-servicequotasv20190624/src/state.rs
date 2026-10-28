@@ -2022,10 +2022,39 @@ pub struct Page<T> {
 #[derive(Debug)]
 pub struct InvalidPageToken;
 
+/// The marker a listing label carries where the caller named NO value for a
+/// selector.
+///
+/// Every value a selector of this service can take is an enum member or a code the
+/// model requires to begin with a letter (`ServiceCode` `^[a-zA-Z][a-zA-Z0-9-]{1,63}$`,
+/// `QuotaCode` `^[a-zA-Z][a-zA-Z0-9-]{1,128}$`), so no present value can spell this
+/// marker and "none named" stays distinguishable from every narrowing.
+const NO_SELECTOR: &str = "-";
+
+/// The label of the listing a request selected, for [`paginate`]'s `listing`.
+///
+/// A page token names an offset, and an offset means something only in ONE ordered
+/// result set, so the label carries the operation name AND every input that chose
+/// which records that set holds — in a fixed order, each in the form the handler
+/// filtered by (a selector the caller left out is passed as the default the listing
+/// applies when none is named, since both select the same records, and otherwise as
+/// [`NO_SELECTOR`]). Two requests that select the same set share a label and so
+/// resume one another; a request that selects a different set gets a different label,
+/// and the other's token is refused instead of resuming at an unrelated position.
+pub fn listing_label(operation: &str, selectors: &[Option<&str>]) -> String {
+    let mut label = String::from(operation);
+    for selector in selectors {
+        label.push(':');
+        label.push_str(selector.unwrap_or(NO_SELECTOR));
+    }
+    label
+}
+
 /// Cut one page out of an ordered listing of this service.
 ///
-/// `listing` names the listing the token belongs to (the operation's own name), so a
-/// token issued by one listing is refused by another instead of resuming at an
+/// `listing` names the listing the token belongs to — the operation's name and the
+/// inputs that selected the listing, as [`listing_label`] spells them — so a token
+/// issued for one listing is refused by another instead of resuming at an
 /// unrelated position. `max_results` is the caller's page size (the model bounds it
 /// to 1..100 before a handler runs), and `next_token` is an opaque position from a
 /// previous page. The token is base64 of `<listing>:<offset>` over the standard

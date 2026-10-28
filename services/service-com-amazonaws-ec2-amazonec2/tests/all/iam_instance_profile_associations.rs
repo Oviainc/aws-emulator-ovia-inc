@@ -28,7 +28,13 @@
 //!    EVERY operation that resolves one;
 //! 7. the describe REPORTS THE STORE, narrowed by the `AssociationIds` and `Filters` the
 //!    request names and cut into `MaxResults`-sized pages, and it is a READ: no shape of
-//!    request changes what a later caller sees, beyond the clock-owed moves above.
+//!    request changes what a later caller sees, beyond the clock-owed moves above;
+//! 8. `ReplaceIamInstanceProfileAssociation` SWAPS the profile an instance runs as: the
+//!    association the request names is GONE and a NEW association over the same instance —
+//!    its own id, its own timestamp and its own `associating` span — carries the profile the
+//!    request named, so the instance runs as the new profile without the caller
+//!    disassociating the old profile first, and the instance still holds exactly one
+//!    association.
 //!
 //! Each table row is a distinct input along what the rule generalises over — how the request
 //! spells the profile, which characters and how many the name carries, which partition and
@@ -83,6 +89,11 @@ const INVALID_INSTANCE_ID_MALFORMED: &str = "InvalidInstanceID.Malformed";
 
 /// One row of a table that expects a refusal: `(case, the parameters, the error code)`.
 type RefusalRow = (&'static str, Vec<Param>, &'static str);
+
+/// One row of the replacement table: `(case, the profile the instance starts out running as,
+/// the profile that replaces it, the ARN the replacement must report, whether to let the
+/// clock settle the first association before replacing it)`.
+type ReplacementRow = (&'static str, Vec<Param>, Vec<Param>, String, bool);
 
 /// Wait until every clock-owed move started before now has certainly fallen due. Derived
 /// from the service's own span, not a literal, so the two cannot drift.
@@ -142,6 +153,18 @@ async fn disassociate(router: &MultiServiceRouter, association_id: &str) -> (u16
         &[param("AssociationId", association_id)],
     )
     .await
+}
+
+/// One `ReplaceIamInstanceProfileAssociation` call swapping the profile the association
+/// `association_id` is over for the one `profile` names.
+async fn replace(
+    router: &MultiServiceRouter,
+    association_id: &str,
+    profile: &[Param],
+) -> (u16, String) {
+    let mut params = vec![param("AssociationId", association_id)];
+    params.extend_from_slice(profile);
+    call(router, "ReplaceIamInstanceProfileAssociation", &params).await
 }
 
 /// One `DescribeIamInstanceProfileAssociations` call carrying `params`.
@@ -737,6 +760,252 @@ async fn disassociate_takes_the_profile_away_and_the_clock_removes_the_associati
 }
 
 #[tokio::test]
+async fn replace_swaps_the_profile_under_a_new_association() {
+    // Each row replaces ONE profile with another, differing along how the request spells the
+    // profile it replaces and the one it names, and along the state the clock has left the
+    // existing association in when the replacement arrives: the fourth element is the ARN the
+    // replacement must report.
+    let rows: Vec<ReplacementRow> = vec![
+        (
+            "a name replaced by another name, while the first is still associating",
+            by_name("first-profile"),
+            by_name("second-profile"),
+            profile_arn("second-profile"),
+            false,
+        ),
+        (
+            "a name replaced once the clock has settled the association",
+            by_name("first-profile"),
+            by_name("settled-second"),
+            profile_arn("settled-second"),
+            true,
+        ),
+        (
+            "a name replaced by an ARN of this account",
+            by_name("first-profile"),
+            by_arn(&profile_arn("arn-named")),
+            profile_arn("arn-named"),
+            false,
+        ),
+        (
+            "an ARN replaced by a name",
+            by_arn(&profile_arn("arn-first")),
+            by_name("name-second"),
+            profile_arn("name-second"),
+            true,
+        ),
+        (
+            "an ARN replaced by an ARN of another account",
+            by_arn(&profile_arn("arn-first")),
+            by_arn("arn:aws:iam::111122223333:instance-profile/shared"),
+            "arn:aws:iam::111122223333:instance-profile/shared".to_string(),
+            false,
+        ),
+        (
+            "the SAME profile named again",
+            by_name("first-profile"),
+            by_name("first-profile"),
+            profile_arn("first-profile"),
+            false,
+        ),
+    ];
+
+    for (case, first, replacement, expected_arn, wait) in rows {
+        let router = emulator();
+        let instance_id = launch(case, &router).await;
+        let (status, body) = associate(&router, &instance_id, &first).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the associate must succeed, got {status}: {body}"
+        );
+        let recorded = one_association(case, &body);
+        if wait {
+            past_the_transition().await;
+        }
+
+        let (status, body) = replace(&router, &recorded.id, &replacement).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the replacement must succeed, got {status}: {body}"
+        );
+        let replaced = one_association(case, &body);
+        assert!(
+            is_long_id(IAM_INSTANCE_PROFILE_ASSOCIATION_ID_PREFIX, &replaced.id),
+            "case {case:?}: expected a minted \
+             {IAM_INSTANCE_PROFILE_ASSOCIATION_ID_PREFIX}- id, got {replaced:?}"
+        );
+        assert_ne!(
+            replaced.id, recorded.id,
+            "case {case:?}: the replacement is a NEW association, so it must carry a new \
+             id, got {replaced:?}"
+        );
+        assert_eq!(
+            replaced.instance_id.as_deref(),
+            Some(instance_id.as_str()),
+            "case {case:?}: expected the replacement over {instance_id}, got {replaced:?}"
+        );
+        assert_eq!(
+            replaced.profile_arn.as_deref(),
+            Some(expected_arn.as_str()),
+            "case {case:?}: expected the profile {expected_arn}, got {replaced:?}"
+        );
+        assert_eq!(
+            replaced.state.as_deref(),
+            Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATING),
+            "case {case:?}: expected the replacement to start out \
+             {IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATING}, got {replaced:?}"
+        );
+        assert!(
+            replaced
+                .timestamp
+                .as_ref()
+                .is_some_and(|timestamp| !timestamp.is_empty()),
+            "case {case:?}: expected the replacement to carry a timestamp, got {replaced:?}"
+        );
+
+        // The instance runs as the NEW profile, read back through an implemented describe,
+        // without the caller having disassociated the old one.
+        assert_eq!(
+            described_profile_arn(case, &router, &instance_id).await,
+            Some(expected_arn.clone()),
+            "case {case:?}: expected {instance_id} to run as {expected_arn}"
+        );
+        // And it holds exactly ONE association: the replaced one is gone, not left beside
+        // the replacement.
+        let (status, body) = describe_associations(&router, &[]).await;
+        assert_eq!(status, 200, "case {case:?}: the describe must succeed: {body}");
+        assert_eq!(
+            reported_ids(case, &body),
+            vec![replaced.id.clone()],
+            "case {case:?}: the replacement must be the account's only association"
+        );
+        // So the replaced id names no association any more, and is refused the one way every
+        // operation that resolves an association id refuses an id it cannot resolve.
+        let (status, body) = replace(&router, &recorded.id, &by_name("third-profile")).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the replaced id to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Invalid Id: {}", recorded.id),
+            "case {case:?}: expected the refusal to name the id, got {body}"
+        );
+
+        // The clock owes the replacement `associated`, exactly as it owes a first
+        // association, and the replacement's own timestamp does not move with it.
+        past_the_transition().await;
+        let (status, body) =
+            describe_associations(&router, &indexed("AssociationId", &[replaced.id.as_str()]))
+                .await;
+        assert_eq!(status, 200, "case {case:?}: the describe must succeed: {body}");
+        let settled = one_association(case, &body);
+        assert_eq!(
+            settled.state.as_deref(),
+            Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATED),
+            "case {case:?}: expected the clock to move the replacement to \
+             {IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATED}, got {settled:?}"
+        );
+        assert_eq!(
+            settled.timestamp, replaced.timestamp,
+            "case {case:?}: the association time is when the profile was associated, so the \
+             move must not change it: {settled:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replace_refuses_a_profile_reference_it_cannot_act_on() {
+    // The SAME reading of the profile reference as the associate's, so the replacement
+    // accepts exactly the references an association does: each row breaks one of its
+    // clauses, and none of them may disturb the association the instance already holds.
+    let too_long_name = "p".repeat(MAX_IAM_INSTANCE_PROFILE_NAME_CHARACTERS + 1);
+    let rows: Vec<RefusalRow> = vec![
+        (
+            // `IamInstanceProfile` is `@required`, so a request carrying none is refused at
+            // the request boundary with the framework's own code.
+            "no profile member at all",
+            Vec::new(),
+            BOUNDARY_MISSING_MEMBER,
+        ),
+        (
+            "an empty name, which names no profile",
+            by_name(""),
+            MISSING_PARAMETER,
+        ),
+        (
+            "both a name and an ARN",
+            vec![
+                param("IamInstanceProfile.Name", "replacement-profile"),
+                param(
+                    "IamInstanceProfile.Arn",
+                    &profile_arn("replacement-profile"),
+                ),
+            ],
+            INVALID_PARAMETER_COMBINATION,
+        ),
+        (
+            "a name carrying a character the name type does not admit",
+            by_name("team/app"),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "a name past the published maximum length",
+            by_name(&too_long_name),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "an ARN naming an IAM role rather than an instance profile",
+            by_arn(&engine::emulator_arn("iam", "", "role/app")),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "an ARN with no profile name after the resource type",
+            by_arn(&profile_arn("")),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "a value that is not an ARN at all",
+            by_arn("instance-profile/app"),
+            INVALID_PARAMETER_VALUE,
+        ),
+    ];
+
+    let router = emulator();
+    let instance_id = launch("the held association", &router).await;
+    let (status, body) = associate(&router, &instance_id, &by_name("held-profile")).await;
+    assert_eq!(status, 200, "the held association must be recorded: {body}");
+    let held = one_association("the held association", &body);
+
+    for (case, profile, expected_code) in rows {
+        let (status, body) = replace(&router, &held.id, &profile).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the replacement to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+        // A refused replacement changes nothing: the association the instance holds still
+        // stands, and the instance still runs as its profile.
+        let (status, body) = describe_associations(&router, &[]).await;
+        assert_eq!(status, 200, "case {case:?}: the describe must succeed: {body}");
+        assert_eq!(
+            reported_ids(case, &body),
+            vec![held.id.clone()],
+            "case {case:?}: a refused replacement must leave the held association alone"
+        );
+        assert_eq!(
+            described_profile_arn(case, &router, &instance_id).await,
+            held.profile_arn,
+            "case {case:?}: the instance must still run as the held profile"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_association_id_that_names_no_association_is_refused() {
     // One refusal, built from the id the request named, whatever shape the value takes —
     // and the SAME refusal from every operation that resolves an association id.
@@ -765,12 +1034,21 @@ async fn an_association_id_that_names_no_association_is_refused() {
     for (case, association_id) in rows {
         for action in [
             "DisassociateIamInstanceProfile",
+            "ReplaceIamInstanceProfileAssociation",
             "DescribeIamInstanceProfileAssociations",
         ] {
-            let params = if action == "DisassociateIamInstanceProfile" {
-                vec![param("AssociationId", association_id)]
-            } else {
-                indexed("AssociationId", &[association_id])
+            let params = match action {
+                "DescribeIamInstanceProfileAssociations" => {
+                    indexed("AssociationId", &[association_id])
+                }
+                // The replacement carries a profile this service CAN act on, so the row is
+                // answered by the id it could not resolve rather than by the profile.
+                "ReplaceIamInstanceProfileAssociation" => {
+                    let mut params = vec![param("AssociationId", association_id)];
+                    params.extend(by_name("replacement-profile"));
+                    params
+                }
+                _ => vec![param("AssociationId", association_id)],
             };
             let (status, body) = call(&router, action, &params).await;
             assert_eq!(

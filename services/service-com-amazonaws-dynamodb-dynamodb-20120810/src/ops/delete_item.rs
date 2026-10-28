@@ -16,7 +16,14 @@
 //! `Expected`/`ConditionalOperator`) is read against the item this delete would remove,
 //! and an unmet condition is `ConditionalCheckFailedException`, carrying that item when
 //! `ReturnValuesOnConditionCheckFailure=ALL_OLD`. The expression language lives in
-//! [`crate::state`], shared with `PutItem` and `UpdateItem`.
+//! [`crate::state`], shared with `PutItem` and `UpdateItem` — including the rule that
+//! every substitution token the request defines is referenced by one of its expressions
+//! ([`crate::state::Substitutions::check_all_referenced`]).
+//!
+//! A delete is a WRITE, so it is admitted against the capacity the table is provisioned
+//! for and the per-partition-key ceiling beneath it
+//! ([`crate::state::Table::admit_item_write`]): one neither covers is
+//! `ProvisionedThroughputExceededException` and removes nothing.
 //!
 //! The `Key` is held to the documented key-value limits
 //! ([`crate::state::Table::check_key_limits`]), and a table whose resource-based
@@ -301,6 +308,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
         );
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid.
+        substitutions
+            .check_all_referenced(&[input.condition_expression.as_deref()])
+            .map_err(lift)?;
         // Like PutItem, DeleteItem accepts only NONE and ALL_OLD
         // (`DeleteItem$ReturnValues`).
         let return_old = match input.return_values.as_deref() {
@@ -362,6 +374,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The delete is ADMITTED before it lands, against the capacity the table is
+        // provisioned for and the per-partition-key ceiling beneath it: a write neither
+        // covers is throttled and the item it addressed stays where it was.
+        let (capacity, throttle) = {
+            let table = store
+                .active_table_mut(&region, &name, now)
+                .map_err(lift)?;
+            let capacity = table.write_capacity(stored.as_ref(), None);
+            let throttle = table
+                .admit_item_write(&key.partition, &capacity, now)
+                .err();
+            (capacity, throttle)
+        };
+        if let Some(throttle) = throttle {
+            return Err(
+                DeleteItemErrorModeled::ProvisionedThroughputExceededException(
+                    crate::state::throughput_exceeded(
+                        &crate::state::table_arn(&region, &name),
+                        throttle,
+                    ),
+                )
+                .into(),
+            );
+        }
         let removed = store
             .delete_item(&region, &name, now, &key)
             .map_err(lift)?;
@@ -371,7 +407,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the indexes charged are the ones the REMOVED item reached, and a delete that
         // found no item touched none of them.
         let table = store.active_table(&region, &name, now).map_err(lift)?;
-        let capacity = table.write_capacity(removed.as_ref(), None);
         let item_collection_metrics =
             report_item_collection.then(|| table.item_collection_metrics(&input.key));
         // The change this write made reaches the table's stream before the response

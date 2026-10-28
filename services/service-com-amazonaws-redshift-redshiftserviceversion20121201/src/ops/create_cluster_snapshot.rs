@@ -299,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterSnap
         }
 
         let snapshot = st::snapshot_of(
-            &stored_cluster.cluster,
+            &stored_cluster,
             &input.snapshot_identifier,
             created_at,
             manual_retention,

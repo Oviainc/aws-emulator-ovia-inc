@@ -31,18 +31,24 @@
 //! is scoped against (see [`published_event_catalog`]), every `Cluster` member this service DERIVES
 //! from a cluster's own configuration (one rule, [`populate_derived_members`],
 //! so the create, modify and read paths cannot report different member sets),
+//! the connection endpoint a cluster serves on (one rule, [`cluster_endpoint`],
+//! reported only once the cluster is serving),
 //! and the clock-owed `creating` -> `available` transitions (see
 //! [`PROVISIONING_SPAN`]) and the faster in-place `modifying` -> `available` one
 //! an IAM role change owes (see [`IAM_ROLE_APPLY_SPAN`]).
 
 use crate::ops::types::{
-    AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, AttributeValueTarget,
-    AuthenticationProfile, AvailabilityZone, Cluster, ClusterIamRole,
+    AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, Association,
+    AttributeValueTarget,
+    AuthenticationProfile, AvailabilityZone, CertificateAssociation, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
-    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, Event, EventCategoriesMap,
-    EventInfoMap, EventSubscription, HsmConfiguration, MaintenanceTrack,
+    ClusterSubnetGroup, ClusterVersion, CreateIntegrationOutput, CreateUsageLimitOutput, Endpoint,
+    Event, EventCategoriesMap, EventInfoMap,
+    EventSubscription, HsmClientCertificate, HsmConfiguration, InboundIntegration,
+    MaintenanceTrack,
     NamespaceIdentifierUnion,
-    NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
+    NetworkInterface, Parameter, PartnerIntegrationInfo, PendingModifiedValues, Qev2IdcApplication,
+    RecurringCharge,
     RedshiftIdcApplication, ReservedNode, ReservedNodeConfigurationOption,
     ReservedNodeExchangeStatus, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
     SupportedOperation,
@@ -823,10 +829,7 @@ pub fn check_maintenance_track(name: &str) -> Result<(), String> {
     if PUBLISHED_MAINTENANCE_TRACKS.contains(&name) {
         return Ok(());
     }
-    Err(format!(
-        "Invalid value for MaintenanceTrackName: '{name}'. Valid values: {}.",
-        PUBLISHED_MAINTENANCE_TRACKS.join(" | ")
-    ))
+    Err(format!("Invalid cluster track: {name}."))
 }
 
 /// The most days a cluster's maintenance may be deferred for — the
@@ -3041,6 +3044,41 @@ pub struct StoredCluster {
     /// create or a modify asked for, and the `adding` / `removing` IAM role
     /// associations a `ModifyClusterIamRoles` reported as in progress.
     pub available_at: Instant,
+    /// The connection endpoint this cluster serves on once it is up: its
+    /// address, its port and its VPC interface endpoint ([`cluster_endpoint`]).
+    ///
+    /// Decided when the cluster is allocated and kept here from then on, because
+    /// a cluster that is still being provisioned HAS no published endpoint:
+    /// `Cluster$Endpoint` is reported only once the cluster is serving, so
+    /// [`StoredCluster::cluster`] carries it only from the moment this record's
+    /// provisioning completed (see [`StoredCluster::publish_endpoint`]).
+    pub endpoint: Endpoint,
+}
+
+impl StoredCluster {
+    /// Report this cluster's connection endpoint from now on: the cluster is up,
+    /// so the address and port a client connects to are its to publish.
+    ///
+    /// Called by the transition that finishes provisioning
+    /// ([`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`]) and
+    /// by nothing else: a cluster reported `creating` has no endpoint, which is
+    /// what stops a client that polls for one from dialling a cluster that is
+    /// not serving yet.
+    pub fn publish_endpoint(&mut self) {
+        self.cluster.endpoint = Some(self.endpoint.clone());
+    }
+
+    /// Re-report an endpoint that is ALREADY published, after a change moved it
+    /// (a new port, or the new hostname a rename moves the cluster to).
+    ///
+    /// A cluster that has not finished provisioning still publishes none, so a
+    /// change applied while it is coming up moves the endpoint it will serve on
+    /// without making it visible early.
+    pub fn refresh_endpoint(&mut self) {
+        if self.cluster.endpoint.is_some() {
+            self.publish_endpoint();
+        }
+    }
 }
 
 /// A cluster parameter group as this service stores it.
@@ -3304,6 +3342,20 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::event_subscriptions`],
     /// this collection needs no `Stored*` wrapper.
     pub authentication_profiles: Vec<AuthenticationProfile>,
+    /// Every partner integration, keyed by the (cluster, database, partner)
+    /// triple it is an integration of, in the order the partners were added.
+    pub partner_integrations: Vec<StoredPartnerIntegration>,
+    /// Every HSM client certificate, keyed by
+    /// `HsmClientCertificateIdentifier`, in creation order.
+    ///
+    /// The modelled `HsmClientCertificate` shape IS the whole record — the
+    /// certificate is its identifier, the public key the service minted for it
+    /// and its tags, and it carries no status the clock moves — so, like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::snapshot_copy_grants`],
+    /// this collection needs no `Stored*` wrapper.
+    pub hsm_client_certificates: Vec<HsmClientCertificate>,
+    /// Every zero-ETL integration, keyed by `IntegrationArn`, in creation order.
+    pub integrations: Vec<StoredIntegration>,
 }
 
 /// Where in the store one resource an ARN names sits: its collection and its
@@ -3353,6 +3405,9 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             event_catalog: published_event_catalog(),
             events: Vec::new(),
             authentication_profiles: Vec::new(),
+            partner_integrations: Vec::new(),
+            hsm_client_certificates: Vec::new(),
+            integrations: Vec::new(),
         }
     }
 }
@@ -3383,9 +3438,18 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                         || status == STATUS_REBOOTING
                 });
             if in_progress && now >= stored.available_at {
+                let was_provisioning =
+                    stored.cluster.cluster_status.as_deref() == Some(STATUS_CREATING);
                 stored.cluster.cluster_status = Some(STATUS_AVAILABLE.to_string());
                 stored.cluster.cluster_availability_status =
                     Some(availability_status(STATUS_AVAILABLE).to_string());
+                // The cluster is serving, so from now on it reports the endpoint
+                // a client connects to — which it did not while it was still
+                // being provisioned. Due at this instant whether or not anybody
+                // called, exactly like the status move that carries it.
+                if was_provisioning {
+                    stored.publish_endpoint();
+                }
                 // A cluster a restore created reports that restore's progress,
                 // and the restore is done exactly when the cluster it was
                 // rebuilding is available.
@@ -3483,6 +3547,17 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         // called.
         self.namespace_registrations
             .retain(|registration| registration.removed_at.is_none_or(|due| now < due));
+        // An integration a create or a modify left in progress is replicating
+        // once that call's span has passed: the transition was due at this
+        // instant whether or not anybody called.
+        for stored in &mut self.integrations {
+            let in_progress = stored.integration.status.as_deref().is_some_and(|status| {
+                status == INTEGRATION_STATUS_CREATING || status == INTEGRATION_STATUS_MODIFYING
+            });
+            if in_progress && now >= stored.active_at {
+                stored.integration.status = Some(INTEGRATION_STATUS_ACTIVE.to_string());
+            }
+        }
         // An event is readable for the published retention window and no
         // longer, so one that happened further back than that was due to leave
         // the log at this instant whether or not anybody called.
@@ -3969,6 +4044,171 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             })
             .filter_map(|stored| stored.cluster.cluster_identifier.clone())
             .collect()
+    }
+
+    /// The stored HSM client certificate with this identifier, if any.
+    pub fn hsm_client_certificate(&self, identifier: &str) -> Option<&HsmClientCertificate> {
+        self.hsm_client_certificates.iter().find(|certificate| {
+            certificate.hsm_client_certificate_identifier.as_deref() == Some(identifier)
+        })
+    }
+
+    /// Where in [`Self::hsm_client_certificates`] that certificate sits, for a
+    /// write that removes it. Resolved exactly as [`Self::hsm_client_certificate`]
+    /// resolves it, so a read and a delete cannot disagree.
+    pub fn hsm_client_certificate_position(&self, identifier: &str) -> Option<usize> {
+        self.hsm_client_certificates.iter().position(|certificate| {
+            certificate.hsm_client_certificate_identifier.as_deref() == Some(identifier)
+        })
+    }
+
+    /// The identifier of every cluster this store holds that connects to its HSM
+    /// with the client certificate `identifier` names, in creation order.
+    ///
+    /// A cluster records the certificate it uses on its `HsmStatus`, exactly as
+    /// it records the configuration ([`Self::clusters_using_hsm_configuration`]),
+    /// so that membership is the whole of what "still in use" can mean here.
+    pub fn clusters_using_hsm_client_certificate(&self, identifier: &str) -> Vec<String> {
+        self.clusters
+            .iter()
+            .filter(|stored| {
+                stored
+                    .cluster
+                    .hsm_status
+                    .as_ref()
+                    .and_then(|status| status.hsm_client_certificate_identifier.as_deref())
+                    == Some(identifier)
+            })
+            .filter_map(|stored| stored.cluster.cluster_identifier.clone())
+            .collect()
+    }
+
+    /// The stored partner integration of this (cluster, database, partner)
+    /// triple, if any — the triple being what a partner integration is keyed by,
+    /// since every operation on one addresses it by all three.
+    pub fn partner_integration(
+        &self,
+        cluster_identifier: &str,
+        database_name: &str,
+        partner_name: &str,
+    ) -> Option<&StoredPartnerIntegration> {
+        self.partner_integration_position(cluster_identifier, database_name, partner_name)
+            .map(|position| &self.partner_integrations[position])
+    }
+
+    /// Where in [`Self::partner_integrations`] that integration sits, for a write
+    /// that changes or removes it.
+    pub fn partner_integration_position(
+        &self,
+        cluster_identifier: &str,
+        database_name: &str,
+        partner_name: &str,
+    ) -> Option<usize> {
+        self.partner_integrations.iter().position(|stored| {
+            stored.cluster_identifier == cluster_identifier
+                && stored.info.database_name.as_deref() == Some(database_name)
+                && stored.info.partner_name.as_deref() == Some(partner_name)
+        })
+    }
+
+    /// The stored zero-ETL integration with this `IntegrationArn`, if any.
+    pub fn integration(&self, integration_arn: &str) -> Option<&StoredIntegration> {
+        self.integrations
+            .iter()
+            .find(|stored| stored.integration.integration_arn.as_deref() == Some(integration_arn))
+    }
+
+    /// Where in [`Self::integrations`] that integration sits, for a write that
+    /// changes or removes it.
+    pub fn integration_position(&self, integration_arn: &str) -> Option<usize> {
+        self.integrations.iter().position(|stored| {
+            stored.integration.integration_arn.as_deref() == Some(integration_arn)
+        })
+    }
+
+    /// The stored integration carrying this `IntegrationName`, if any — the name
+    /// an account's integrations are unique on, which is what makes a second
+    /// create under one name a conflict.
+    pub fn integration_named(&self, integration_name: &str) -> Option<&StoredIntegration> {
+        self.integrations.iter().find(|stored| {
+            stored.integration.integration_name.as_deref() == Some(integration_name)
+        })
+    }
+
+    /// The cluster whose namespace this ARN names, if this account holds one —
+    /// how a zero-ETL integration's `TargetArn` resolves to a target that
+    /// exists.
+    pub fn cluster_with_namespace_arn(&self, namespace_arn: &str) -> Option<&StoredCluster> {
+        self.clusters
+            .iter()
+            .find(|stored| stored.cluster.cluster_namespace_arn.as_deref() == Some(namespace_arn))
+    }
+
+    /// The cluster this custom domain name is associated with, if any — a custom
+    /// domain association being a property of the cluster that serves it
+    /// (`Cluster$CustomDomainName`), so the clusters are the whole of what the
+    /// account's associations are.
+    pub fn cluster_with_custom_domain(&self, custom_domain_name: &str) -> Option<&StoredCluster> {
+        self.clusters
+            .iter()
+            .find(|stored| stored.cluster.custom_domain_name.as_deref() == Some(custom_domain_name))
+    }
+
+    /// The custom domain associations this account holds, one `Association` per
+    /// CERTIFICATE, each listing the (domain, cluster) pairs tied to it.
+    ///
+    /// Source: `smithy_query(query="shape", shape="Association")` — "Contains
+    /// information about the custom domain name association", whose
+    /// `CertificateAssociations` are "a list of all associated clusters and
+    /// domain names tied to a specific certificate". So the grouping key is the
+    /// certificate ARN, and the pairs inside one group keep the clusters'
+    /// creation order.
+    ///
+    /// `custom_domain_name` and `custom_domain_certificate_arn` are the request's
+    /// own filters: each selects the PAIRS it names, so a certificate no selected
+    /// pair belongs to contributes no group at all.
+    pub fn custom_domain_associations(
+        &self,
+        custom_domain_name: Option<&str>,
+        custom_domain_certificate_arn: Option<&str>,
+    ) -> Vec<Association> {
+        let mut associations: Vec<Association> = Vec::new();
+        for stored in &self.clusters {
+            let (Some(domain), Some(certificate)) = (
+                stored.cluster.custom_domain_name.as_deref(),
+                stored.cluster.custom_domain_certificate_arn.as_deref(),
+            ) else {
+                continue;
+            };
+            if custom_domain_name.is_some_and(|wanted| wanted != domain) {
+                continue;
+            }
+            if custom_domain_certificate_arn.is_some_and(|wanted| wanted != certificate) {
+                continue;
+            }
+            let pair = CertificateAssociation {
+                custom_domain_name: Some(domain.to_string()),
+                cluster_identifier: stored.cluster.cluster_identifier.clone(),
+            };
+            match associations.iter_mut().find(|association| {
+                association.custom_domain_certificate_arn.as_deref() == Some(certificate)
+            }) {
+                Some(association) => {
+                    association
+                        .certificate_associations
+                        .get_or_insert_default()
+                        .push(pair);
+                }
+                None => associations.push(Association {
+                    custom_domain_certificate_arn: Some(certificate.to_string()),
+                    custom_domain_certificate_expiry_date: stored
+                        .cluster
+                        .custom_domain_certificate_expiry_date,
+                    certificate_associations: Some(vec![pair]),
+                }),
+            }
+        }
+        associations
     }
 
     /// The stored snapshot copy grant with this `SnapshotCopyGrantName`, if any.
@@ -5278,6 +5518,34 @@ pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> Str
     )
 }
 
+/// The connection endpoint a cluster serves on: its DNS address, the port it
+/// listens on and the VPC interface endpoint it is reached through.
+///
+/// The ONE rule for the whole `Endpoint` structure, so the create, the modify
+/// and the restore paths cannot build one differently. The endpoint is a
+/// property of the cluster's own configuration — its identifier, its Region, the
+/// port it was asked for, and the VPC and Availability Zone its subnet group put
+/// it in — so it is DECIDED when the cluster is allocated and
+/// [`StoredCluster::endpoint`] holds it from then on, whether or not the cluster
+/// is serving yet (see [`StoredCluster::publish_endpoint`]).
+pub fn cluster_endpoint(
+    cluster_identifier: &str,
+    region: &str,
+    port: i32,
+    vpc_id: &str,
+    availability_zone: &str,
+) -> Endpoint {
+    Endpoint {
+        address: Some(endpoint_address(cluster_identifier, region)),
+        port: Some(port),
+        vpc_endpoints: Some(cluster_vpc_endpoints(
+            cluster_identifier,
+            vpc_id,
+            availability_zone,
+        )),
+    }
+}
+
 /// The Availability Zones of one Region, in name order.
 ///
 /// A Region's zones are `<region>` followed by consecutive letters from `a`, as
@@ -5485,11 +5753,11 @@ pub fn default_availability_zone(cluster_identifier: &str, region: &str) -> Stri
 ///
 /// Derived from the cluster identifier, so it is stable across reads.
 pub fn default_maintenance_window(cluster_identifier: &str) -> String {
-    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let days = MAINTENANCE_WINDOW_DAYS;
     let seed = digest_byte(&format!("window/{cluster_identifier}"));
-    let day = DAYS[usize::from(seed) % DAYS.len()];
+    let day = days[usize::from(seed) % days.len()];
     // 0..=22, so the window's end hour is always a valid same-day hour.
-    let hour = (usize::from(seed) / DAYS.len()) % 23;
+    let hour = (usize::from(seed) / days.len()) % 23;
     format!("{day}:{hour:02}:30-{day}:{:02}:00", hour + 1)
 }
 
@@ -5757,7 +6025,6 @@ pub fn next_maintenance_window_start(
     window: &str,
     after: ::aws_smithy_types::DateTime,
 ) -> Option<::aws_smithy_types::DateTime> {
-    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
     const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
     let start = window.split('-').next()?;
@@ -5772,7 +6039,9 @@ pub fn next_maintenance_window_start(
         return None;
     }
     let second_of_day = i64::from(hour) * 3600 + i64::from(minute) * 60;
-    let target_day = DAYS.iter().position(|candidate| *candidate == day)? as i64;
+    let target_day = MAINTENANCE_WINDOW_DAYS
+        .iter()
+        .position(|candidate| *candidate == day)? as i64;
 
     let after_secs = after.secs();
     // Epoch day 0 (1970-01-01) was a Thursday, index 3 of a Monday-first week.
@@ -5840,14 +6109,9 @@ pub fn populate_derived_members(
         cluster.kms_key_id = Some(AWS_OWNED_KMS_KEY.to_string());
     }
 
-    let availability_zone = cluster.availability_zone.clone().unwrap_or_default();
-    if let Some(endpoint) = cluster.endpoint.as_mut() {
-        endpoint.vpc_endpoints = Some(cluster_vpc_endpoints(
-            &identifier,
-            &vpc_id,
-            &availability_zone,
-        ));
-    }
+    // The connection endpoint is NOT derived here: it is decided once, when the
+    // cluster is allocated ([`cluster_endpoint`]), and reported only while the
+    // cluster is serving ([`StoredCluster::publish_endpoint`]).
 
     cluster.cluster_public_key = Some(cluster_public_key(&identifier));
     cluster.cluster_nodes = Some(cluster_nodes(
@@ -6047,20 +6311,25 @@ pub fn subnet_record(subnet_identifier: &str, region: &str) -> Subnet {
 /// the one rule for it, so a snapshot a create minted reports the same retention
 /// bookkeeping a `ModifyClusterSnapshot` would leave for the same period.
 pub fn snapshot_of(
-    cluster: &Cluster,
+    stored: &StoredCluster,
     snapshot_identifier: &str,
     created_at: ::aws_smithy_types::DateTime,
     manual_retention_period: i32,
     tags: Vec<crate::ops::types::Tag>,
     region: &str,
 ) -> Snapshot {
+    let cluster = &stored.cluster;
     let cluster_identifier = cluster.cluster_identifier.clone().unwrap_or_default();
     let mut snapshot = Snapshot {
         snapshot_identifier: Some(snapshot_identifier.to_string()),
         cluster_identifier: Some(cluster_identifier.clone()),
         snapshot_create_time: Some(created_at),
         status: Some(STATUS_CREATING.to_string()),
-        port: cluster.endpoint.as_ref().and_then(|e| e.port),
+        // The port the cluster serves on, taken from the endpoint the cluster
+        // was allocated rather than from the one it PUBLISHES: a snapshot of a
+        // cluster that is still coming up records the same port a snapshot of it
+        // taken a moment later does.
+        port: stored.endpoint.port,
         availability_zone: cluster.availability_zone.clone(),
         cluster_create_time: cluster.cluster_create_time,
         master_username: cluster.master_username.clone(),
@@ -6139,21 +6408,17 @@ pub fn resolve_cluster_shape(
         (Some(nodes), _, _) => nodes,
         (None, CLUSTER_TYPE_SINGLE_NODE, _) => 1,
         (None, _, Some((stored_kind, stored_nodes))) if stored_kind == kind => stored_nodes,
-        (None, _, _) => {
-            return Err(
-                "NumberOfNodes is required when ClusterType is multi-node.".to_string()
-            )
-        }
+        // "Default: 1": a request that names no count asks for the one-node
+        // shape, which the cluster type then has to admit — so a multi-node
+        // cluster with no count named is refused by the lower bound below, under
+        // the same message a count of 1 is, rather than by a rule of its own.
+        (None, _, _) => 1,
     };
     if kind == CLUSTER_TYPE_SINGLE_NODE && nodes != 1 {
-        return Err(format!(
-            "Invalid value for NumberOfNodes: {nodes}. A single-node cluster has exactly 1 node."
-        ));
+        return Err(SINGLE_NODE_COUNT_REFUSAL.to_string());
     }
-    if kind == CLUSTER_TYPE_MULTI_NODE && nodes < 2 {
-        return Err(format!(
-            "Invalid value for NumberOfNodes: {nodes}. A multi-node cluster must have at least 2 nodes."
-        ));
+    if kind == CLUSTER_TYPE_MULTI_NODE && nodes < MIN_MULTI_NODE_NODES {
+        return Err(MULTI_NODE_COUNT_REFUSAL.to_string());
     }
     // The UPPER bound belongs here too, beside the lower ones: this is the one
     // resolver every cluster write goes through, so no caller can carry a node
@@ -6166,6 +6431,114 @@ pub fn resolve_cluster_shape(
         return Err(nodes_per_cluster_limit_message(nodes));
     }
     Ok((kind.to_string(), nodes))
+}
+
+/// The fewest nodes a `multi-node` cluster may have.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="ClusterType")` — "multi-node, the NumberOfNodes parameter is
+/// required" — with `NumberOfNodes`'s own "If you don't specify this parameter,
+/// you get a single-node cluster": a cluster of more than one node is what the
+/// multi-node shape IS, so two is its floor.
+pub const MIN_MULTI_NODE_NODES: i32 = 2;
+
+/// What a `NumberOfNodes` other than one asked for a `single-node` cluster is
+/// refused with. The shape admits exactly one node, so no value of the request
+/// names a count beside it.
+pub const SINGLE_NODE_COUNT_REFUSAL: &str =
+    "Number of nodes must be 1 or not be supplied for cluster type single-node.";
+
+/// What a `NumberOfNodes` below [`MIN_MULTI_NODE_NODES`] asked for a
+/// `multi-node` cluster is refused with — including a request that names no
+/// count at all, which asks for the one-node shape.
+pub const MULTI_NODE_COUNT_REFUSAL: &str =
+    "Number of nodes for cluster type multi-node must be greater than or equal to 2.";
+
+/// The days a weekly maintenance window may name, in week order.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="PreferredMaintenanceWindow")` — "Valid Days: Mon | Tue | Wed | Thu |
+/// Fri | Sat | Sun" — matched case-insensitively, which is how Redshift reports
+/// a window back (`wed:04:00-wed:04:30`).
+pub const MAINTENANCE_WINDOW_DAYS: [&str; 7] =
+    ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+/// How long a weekly maintenance window must span, at the least.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="PreferredMaintenanceWindow")` — "Constraints: Minimum 30-minute
+/// window."
+pub const MIN_MAINTENANCE_WINDOW_MINUTES: i64 = 30;
+
+/// The sentence Amazon Redshift refuses a window shorter than
+/// [`MIN_MAINTENANCE_WINDOW_MINUTES`] with, including the unspaced
+/// "30minutes" the service itself writes it as.
+///
+/// The number is the bound, so it is formatted from the constant above rather
+/// than spelled out; the surrounding words are the service's own and are
+/// reproduced as it words them, which is why nothing here inserts the space a
+/// reader expects.
+fn short_maintenance_window_message() -> String {
+    format!("Maintenance window must be at least {MIN_MAINTENANCE_WINDOW_MINUTES}minutes.")
+}
+
+/// Minutes from the start of the week of one `ddd:hh24:mi` endpoint of a
+/// maintenance window, or `None` when the text is not in that form.
+///
+/// Each clock field is exactly two ASCII digits, which is what `hh24` and `mi`
+/// are: a signed or differently sized field (`+4`, `-1`, `4`, `004`) is not the
+/// documented form and is no window at all.
+fn maintenance_window_instant(endpoint: &str) -> Option<i64> {
+    /// One two-digit clock field, or `None` for anything else.
+    fn clock_field(field: &str) -> Option<i64> {
+        if field.len() != 2 || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        field.parse().ok()
+    }
+
+    let mut parts = endpoint.split(':');
+    let day = parts.next()?.to_ascii_lowercase();
+    let hour = clock_field(parts.next()?)?;
+    let minute = clock_field(parts.next()?)?;
+    if parts.next().is_some() || hour > 23 || minute > 59 {
+        return None;
+    }
+    let day = MAINTENANCE_WINDOW_DAYS
+        .iter()
+        .position(|candidate| *candidate == day)? as i64;
+    Some(day * 24 * 60 + hour * 60 + minute)
+}
+
+/// Refuse a `PreferredMaintenanceWindow` outside the documented form, or one
+/// that spans less than [`MIN_MAINTENANCE_WINDOW_MINUTES`].
+///
+/// One rule for every operation that takes a maintenance window, so a window a
+/// create would refuse cannot be set by a modify or a restore. A window whose
+/// end precedes its start wraps around the week (`sun:23:45-mon:00:30`), so its
+/// span is measured modulo one week — which is also why a window whose two
+/// endpoints are equal spans nothing and is refused.
+pub fn check_maintenance_window(window: &str) -> Result<(), String> {
+    const MINUTES_PER_WEEK: i64 = 7 * 24 * 60;
+    let malformed = || {
+        Err(format!(
+            "Invalid value for PreferredMaintenanceWindow: '{window}'. The window must be in the format ddd:hh24:mi-ddd:hh24:mi, with each day one of {}.",
+            MAINTENANCE_WINDOW_DAYS.join(" | ")
+        ))
+    };
+    let Some((start, end)) = window.split_once('-') else {
+        return malformed();
+    };
+    let (Some(start), Some(end)) = (
+        maintenance_window_instant(start),
+        maintenance_window_instant(end),
+    ) else {
+        return malformed();
+    };
+    if (end - start).rem_euclid(MINUTES_PER_WEEK) < MIN_MAINTENANCE_WINDOW_MINUTES {
+        return Err(short_maintenance_window_message());
+    }
+    Ok(())
 }
 
 /// The ARN resource-type segment of a provisioned cluster.
@@ -6477,6 +6850,181 @@ pub fn tags_match(
     tag_values: Option<&[String]>,
 ) -> bool {
     TagFilter::new(tag_keys, tag_values).matches(tags)
+}
+
+/// One instant as the ISO-8601 text a STRING-typed timestamp member carries
+/// (`CreateCustomDomainAssociationResult$CustomDomainCertExpiryTime` is modelled
+/// as a string, not a timestamp).
+pub fn iso8601(instant: ::aws_smithy_types::DateTime) -> String {
+    instant
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// How long the ACM certificate a custom domain association names is valid for
+/// after the association is created.
+///
+/// `Cluster$CustomDomainCertificateExpiryDate` and
+/// `CreateCustomDomainAssociationResult$CustomDomainCertExpiryTime` are the
+/// expiry of the certificate the request named, which is a resource of AWS
+/// Certificate Manager rather than of this service — so the emulator derives it
+/// from the association's own creation instant and this span, the validity
+/// period ACM issues a public certificate for (13 months, 395 days). Derived
+/// rather than drawn, so every read of one association reports the same expiry.
+pub const CUSTOM_DOMAIN_CERTIFICATE_VALIDITY: Duration =
+    Duration::from_secs(395 * 24 * 60 * 60);
+
+/// What every operation on a custom domain association answers when the name it
+/// resolves names no association at all.
+pub fn custom_domain_association_not_found_message(custom_domain_name: &str) -> String {
+    format!("CustomDomainAssociation not found: {custom_domain_name}")
+}
+
+/// What an operation on the custom domain association OF a cluster answers when
+/// that cluster carries none.
+pub fn cluster_custom_domain_not_found_message(cluster_identifier: &str) -> String {
+    format!(
+        "CustomDomainAssociation not found for cluster: {cluster_identifier}"
+    )
+}
+
+/// How many partner integrations the store holds before `AddPartner` refuses.
+///
+/// The emulator's own bound on a collection keyed by names, of which there are
+/// unboundedly many — the same reasoning as [`QEV2_IDC_APPLICATION_QUOTA`].
+pub const PARTNER_INTEGRATION_QUOTA: usize = 10_000;
+
+/// The `PartnerIntegrationStatus` a partner integration starts in.
+///
+/// The model publishes the value list (`smithy_query(query="shape",
+/// shape="PartnerIntegrationStatus")` — `Active | Inactive | RuntimeFailure |
+/// ConnectionFailure`) but documents no initial value. `UpdatePartnerStatus` is
+/// documented as the call "a partner" makes to "update the status of a partner
+/// integration", so an integration the ACCOUNT has just added, and that no
+/// partner has reported on yet, is not active: it starts `Inactive` and the
+/// partner's own update is what moves it.
+pub const PARTNER_INTEGRATION_INITIAL_STATUS: &str = "Inactive";
+
+/// Every `PartnerIntegrationStatus` the model publishes, in model order.
+pub const PARTNER_INTEGRATION_STATUSES: [&str; 4] =
+    ["Active", "Inactive", "RuntimeFailure", "ConnectionFailure"];
+
+/// A partner integration as this service stores it: the modelled projection
+/// `DescribePartners` reports, plus the cluster and account it belongs to, which
+/// the `PartnerIntegrationInfo` shape has no member for.
+#[derive(Debug, Clone)]
+pub struct StoredPartnerIntegration {
+    /// The cluster whose data the partner reaches.
+    pub cluster_identifier: String,
+    /// The account that owns that cluster, as the request named it.
+    pub account_id: String,
+    /// Exactly what `DescribePartners` reports.
+    pub info: PartnerIntegrationInfo,
+}
+
+/// What every operation on a partner integration answers when the pair it
+/// resolves names none.
+pub fn partner_not_found_message(partner_name: &str, database_name: &str) -> String {
+    format!(
+        "Partner integration not found: partner {partner_name} on database {database_name}"
+    )
+}
+
+/// How many HSM client certificates the store holds before
+/// `CreateHsmClientCertificate` refuses with the modelled
+/// `HsmClientCertificateQuotaExceededFault`.
+///
+/// The same reasoning as [`HSM_CONFIGURATION_QUOTA`]: the emulator's own bound
+/// on a collection keyed by an identifier, and the modelled fault is the
+/// service's own way of saying the bound was reached.
+pub const HSM_CLIENT_CERTIFICATE_QUOTA: usize = 10_000;
+
+/// The public key of an HSM client certificate, in the PEM text Redshift
+/// reports.
+///
+/// Source: `smithy_query(query="doc", shape="HsmClientCertificate",
+/// member="HsmClientCertificatePublicKey")` — "The public key that the Amazon
+/// Redshift cluster will use to connect to the HSM. You must register the public
+/// key in the HSM." The key is MINTED by the service — `CreateHsmClientCertificate`
+/// takes no key material, only the identifier to mint one under — so here it is
+/// DERIVED from that identifier: the same certificate always reports the same
+/// key, so the blob a create answered with is the blob every later read of it
+/// carries, and nothing is drawn per run.
+pub fn hsm_client_certificate_public_key(identifier: &str) -> String {
+    let body = short_digest(&format!("hsm-client-certificate/{identifier}"), 56);
+    format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n")
+}
+
+/// What every operation on an HSM client certificate answers when the
+/// identifier it resolves names none.
+pub fn hsm_client_certificate_not_found_message(identifier: &str) -> String {
+    format!("HsmClientCertificate not found: {identifier}")
+}
+
+/// How many zero-ETL integrations the store holds before `CreateIntegration`
+/// refuses with the modelled `IntegrationQuotaExceededFault`.
+pub const INTEGRATION_QUOTA: usize = 10_000;
+
+/// The `ZeroETLIntegrationStatus` an integration a create just recorded is in,
+/// until [`PROVISIONING_SPAN`] has passed.
+pub const INTEGRATION_STATUS_CREATING: &str = "creating";
+
+/// The `ZeroETLIntegrationStatus` of an integration that is replicating.
+pub const INTEGRATION_STATUS_ACTIVE: &str = "active";
+
+/// The `ZeroETLIntegrationStatus` of an integration a modify is being applied
+/// to, until [`PROVISIONING_SPAN`] has passed.
+pub const INTEGRATION_STATUS_MODIFYING: &str = "modifying";
+
+/// The `ZeroETLIntegrationStatus` of an integration whose deletion is under way.
+pub const INTEGRATION_STATUS_DELETING: &str = "deleting";
+
+/// The ARN of a zero-ETL integration:
+/// `arn:aws:redshift:<region>:<account>:integration:<uuid>`.
+///
+/// Derived from the integration's own name and Region, so the value is stable
+/// across every read of the same integration rather than per-run, exactly as
+/// [`qev2_idc_application_arn`] is; it is computed ONCE, by the create, and then
+/// persisted on the stored integration.
+pub fn integration_arn(integration_name: &str, region: &str) -> String {
+    let uuid = content_uuid(&format!("integration/{integration_name}/{region}"));
+    engine::emulator_arn("redshift", region, &format!("integration:{uuid}"))
+}
+
+/// What every operation on an integration answers when the ARN it resolves
+/// names none.
+pub fn integration_not_found_message(integration_arn: &str) -> String {
+    format!("Integration not found: {integration_arn}")
+}
+
+/// A zero-ETL integration as this service stores it: the modelled projection
+/// `DescribeIntegrations` reports, plus when the status transition the last call
+/// against it started falls due.
+#[derive(Debug, Clone)]
+pub struct StoredIntegration {
+    /// Exactly what `DescribeIntegrations` reports, so a read never recomputes
+    /// it.
+    pub integration: CreateIntegrationOutput,
+    /// When the clock-owed [`INTEGRATION_STATUS_CREATING`] /
+    /// [`INTEGRATION_STATUS_MODIFYING`] -> [`INTEGRATION_STATUS_ACTIVE`]
+    /// transition falls due. See [`PROVISIONING_SPAN`].
+    pub active_at: Instant,
+}
+
+impl StoredIntegration {
+    /// The INBOUND projection of this integration: what
+    /// `DescribeInboundIntegrations` reports for it, which is the same
+    /// integration seen from the target that receives the data.
+    pub fn inbound(&self) -> InboundIntegration {
+        InboundIntegration {
+            integration_arn: self.integration.integration_arn.clone(),
+            source_arn: self.integration.source_arn.clone(),
+            target_arn: self.integration.target_arn.clone(),
+            status: self.integration.status.clone(),
+            errors: self.integration.errors.clone(),
+            create_time: self.integration.create_time,
+        }
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

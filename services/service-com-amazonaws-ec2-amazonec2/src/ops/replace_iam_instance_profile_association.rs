@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReplaceIamInstanceProfileAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReplaceIamInstanceProfileAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReplaceIamInstanceProfileAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Replaces an IAM instance profile for the specified running instance": this operation
+//! WRITES to the associations
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::iam_instance_profile_associations`] holds
+//! — the association the request names is swapped for a NEW one over the same instance,
+//! carrying the profile the request names and the `associating` state the clock then moves
+//! to `associated`, so the instance runs as the new profile "without having to disassociate
+//! the existing IAM instance profile first". An association id this account holds no
+//! association for is refused, as is a profile reference naming neither an ARN nor a name.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +137,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReplaceIamInstanceProfileAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReplaceIamInstanceProfileAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReplaceIamInstanceProfileAssociation"))
+        // `ctx` carries request metadata only, and nothing an association reports is a fact
+        // of the Region (`IamInstanceProfileAssociation` carries no Region member), so this
+        // operation reads none of it. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The IAM instance profile"
+        // (`ReplaceIamInstanceProfileAssociationRequest$IamInstanceProfile`) is read BEFORE
+        // the store is touched, through the ONE reading of that member this crate has, so a
+        // request naming a profile this service cannot act on is refused without the store
+        // being locked and without the association it named being disturbed.
+        let iam_instance_profile =
+            crate::state::resolve_iam_instance_profile(&input.iam_instance_profile)?;
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed moves this call must see before it resolves an id: an association
+        // whose disassociation span has run out is GONE, whether or not anybody called, so
+        // there is nothing left to replace.
+        store.materialize_due_transitions();
+
+        // "The ID of the existing IAM instance profile association"
+        // (`ReplaceIamInstanceProfileAssociationRequest$AssociationId`): the swap acts on the
+        // association that id names, and an id this account holds no association for is
+        // REFUSED the one way every operation of this crate that resolves an association id
+        // refuses it, rather than being read as a request to associate.
+        match store
+            .replace_iam_instance_profile_association(&input.association_id, iam_instance_profile)
+        {
+            crate::state::IamInstanceProfileAssociationReplacement::Replaced(association) => {
+                Ok(ReplaceIamInstanceProfileAssociationOutput {
+                    iam_instance_profile_association: Some(association),
+                })
+            }
+            crate::state::IamInstanceProfileAssociationReplacement::NoSuchAssociation => Err(
+                crate::state::invalid_iam_instance_profile_association_id(&input.association_id),
+            ),
+            crate::state::IamInstanceProfileAssociationReplacement::NoRoom => {
+                Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                    format!(
+                        "This emulator holds {} IAM instance profile associations, which is \
+                         as many as it stores",
+                        crate::state::MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS
+                    ),
+                ))
+            }
+        }
     }
 }

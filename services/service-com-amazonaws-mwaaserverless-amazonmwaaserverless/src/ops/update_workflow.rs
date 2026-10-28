@@ -6,9 +6,9 @@
 //! persists all of it in this service's store (`crate::state`). Every value in the
 //! response is read back out of that record, so `GetWorkflow` reports exactly what was
 //! stored, and every earlier version still answers with the configuration it froze. The
-//! automated trigger in force is the new version's, so an update into or out of the
-//! trigger mode that asks the service to execute the workflow starts or stops the runs it
-//! produces on its own. A
+//! automated trigger in force is the new version's, so an update onto a definition that
+//! declares a schedule, or off one, starts or stops the runs the service produces on its
+//! own. A
 //! workflow whose `DeleteWorkflow` teardown has started (`WorkflowStatus` `DELETING`)
 //! is refused with the modelled `ConflictException`.
 //!

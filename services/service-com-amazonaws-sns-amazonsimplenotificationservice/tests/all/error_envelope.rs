@@ -144,11 +144,15 @@ async fn every_awsquery_error_document_carries_a_request_id() {
         },
         ErrorCase {
             case: "an operation that is still scaffolded",
-            action: "DeletePlatformApplication",
-            params: vec![(
-                "PlatformApplicationArn",
-                "arn:aws:sns:us-east-1:000000000000:app/GCM/push-app",
-            )],
+            action: "SetPlatformApplicationAttributes",
+            params: vec![
+                (
+                    "PlatformApplicationArn",
+                    "arn:aws:sns:us-east-1:000000000000:app/GCM/push-app",
+                ),
+                ("Attributes.entry.1.key", "PlatformCredential"),
+                ("Attributes.entry.1.value", "AIzaSy0123456789"),
+            ],
             status: 501,
             code: "NotImplemented",
         },

@@ -228,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let total_count = report.quotas.len();
         // The token names a position in THIS report, so one report's token cannot
         // resume another's listing.
-        let listing = format!("{}:{}", Self::NAME, report.id);
+        let listing = crate::state::listing_label(Self::NAME, &[Some(&report.id)]);
         let page = crate::state::paginate_bounded(
             &listing,
             report.quotas,

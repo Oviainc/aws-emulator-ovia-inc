@@ -666,7 +666,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                         RestoreFromClusterSnapshotErrorModeled::ClusterParameterGroupNotFoundFault(
                             ClusterParameterGroupNotFoundFault {
                                 message: Some(format!(
-                                    "Cluster parameter group not found: {requested}"
+                                    "ClusterParameterGroup not found: {requested}"
                                 )),
                             },
                         )
@@ -710,8 +710,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             None,
         ) {
             Ok(shape) => shape,
-            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            Err(message) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message))
+            }
         };
+
+        // The weekly maintenance window the request asks for, checked against its
+        // documented form and its documented minimum length under the one rule
+        // every operation that takes a window shares.
+        if let Some(window) = input.preferred_maintenance_window.as_deref() {
+            if let Err(message) = st::check_maintenance_window(window) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+            }
+        }
 
         // "Default: The value selected for the cluster from which the snapshot
         // was taken." This operation models no `InvalidRetentionPeriodFault`, so
@@ -791,6 +802,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             None => Some(default_subnet_group),
         };
 
+        // Where the restored cluster is, decided before the record is built: the
+        // Availability Zone the request asked for or the account's default one,
+        // and the VPC its subnet group's subnets are in.
+        let availability_zone = input
+            .availability_zone
+            .clone()
+            .unwrap_or_else(|| st::default_availability_zone(&identifier, &region));
+        let vpc_id = subnet_group
+            .as_ref()
+            .and_then(|group| group.vpc_id.clone())
+            .unwrap_or_else(|| {
+                st::derived_vpc_id(
+                    subnet_group
+                        .as_ref()
+                        .and_then(|group| group.cluster_subnet_group_name.as_deref())
+                        .unwrap_or(st::DEFAULT_CLUSTER_SUBNET_GROUP),
+                )
+            });
+        // The endpoint the restored cluster will serve on once it is up, at its
+        // OWN hostname rather than the source's and, by default, on "the same
+        // port as the original cluster". A cluster still being restored
+        // publishes none, so the store keeps this one until the provisioning
+        // transition publishes it.
+        let endpoint = st::cluster_endpoint(
+            &identifier,
+            &region,
+            input.port.or(snapshot.port).unwrap_or(st::DEFAULT_PORT),
+            &vpc_id,
+            &availability_zone,
+        );
+
         let mut cluster = Cluster {
             cluster_identifier: Some(identifier.clone()),
             node_type: input
@@ -810,19 +852,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                     .clone()
                     .unwrap_or_else(|| st::DEFAULT_DB_NAME.to_string()),
             ),
-            endpoint: Some(Endpoint {
-                // Derived from the NEW identifier: the restored cluster is
-                // reached at its own hostname, not the source's.
-                address: Some(st::endpoint_address(&identifier, &region)),
-                // "Default: The same port as the original cluster."
-                port: Some(
-                    input
-                        .port
-                        .or(snapshot.port)
-                        .unwrap_or(st::DEFAULT_PORT),
-                ),
-                vpc_endpoints: None,
-            }),
+            endpoint: None,
             // The restored cluster is created now; the instant the SOURCE was
             // created stays on the snapshot.
             cluster_create_time: Some(created_at),
@@ -862,16 +892,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             cluster_subnet_group_name: subnet_group
                 .as_ref()
                 .and_then(|group| group.cluster_subnet_group_name.clone()),
-            vpc_id: subnet_group.as_ref().and_then(|group| group.vpc_id.clone()),
+            vpc_id: Some(vpc_id.clone()),
             // "Default: A random, system-chosen Availability Zone" — the
             // emulator's choice, derived from the new identifier so it is stable
             // across reads.
-            availability_zone: Some(
-                input
-                    .availability_zone
-                    .clone()
-                    .unwrap_or_else(|| st::default_availability_zone(&identifier, &region)),
-            ),
+            availability_zone: Some(availability_zone.clone()),
             // "Default: The value selected for the cluster from which the
             // snapshot was taken."
             preferred_maintenance_window: Some(
@@ -1040,6 +1065,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                 })
                 .flatten(),
             available_at: started + st::PROVISIONING_SPAN,
+            endpoint,
         });
 
         // The snapshot this cluster was built from, as the event naming it

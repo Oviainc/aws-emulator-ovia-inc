@@ -30,7 +30,12 @@
 //!   source with `table.index`, holds every candidate to the whole `WHERE` clause,
 //!   orders by a key attribute when `ORDER BY` names one, and pages at `Limit` and at
 //!   the documented 1 MB — reporting `NextToken` and `LastEvaluatedKey` when it
-//!   stopped early.
+//!   stopped early. Which low-level PLAN serves it follows what its `WHERE` clause
+//!   pins: a partition-key equality is a query of that one partition (narrowed to the
+//!   single item when the sort key is pinned too) and a clause that pins no partition
+//!   key is a full table scan. The plan decides what is read, so the
+//!   `ConsumedCapacity` is the bytes it read and a predicate on a non-key attribute
+//!   never makes a statement cheaper.
 //!
 //! Everything the dialect does not spell, and everything this emulator cannot serve
 //! faithfully, is refused with a `ValidationException` rather than guessed at. The
@@ -380,20 +385,40 @@ fn select_items(
             ));
         }
     }
-    // One partition's items are contiguous in the store, so a statement that pins the
-    // partition key by equality reads a range rather than walking the table. The
-    // narrowing is an optimisation only: every candidate is still held to the whole
-    // `WHERE` clause below.
+    // Which low-level plan the statement is served by is decided HERE, from what its
+    // `WHERE` clause pins: "a WHERE clause on the partition key" is planned as a Query
+    // over that one partition — one partition's items are contiguous in the store, so
+    // that is a range read — narrowed again to the single item when the sort key is
+    // pinned too, and a clause that pins no partition key is planned as a full table
+    // scan. The plan decides what is READ, and therefore what the statement is charged
+    // for; the predicate is applied to each row the plan read, and never narrows the
+    // read itself.
+    let pinned = select
+        .filter
+        .as_ref()
+        .map(crate::state::pinned_equalities)
+        .unwrap_or_default();
     let partition = select
         .index
         .is_none()
         .then(|| {
             let attribute = table.partition_key_name();
-            crate::state::pinned_equalities(select.filter.as_ref()?)
+            pinned
                 .get(attribute)
                 .and_then(|value| table.key_value(attribute, value).ok())
         })
         .flatten();
+    // A sort key pinned by equality addresses ONE item of that partition, which is the
+    // narrowest plan there is; without a partition key it narrows nothing, because the
+    // store is partitioned first.
+    let sort = partition
+        .as_ref()
+        .and_then(|_| table.sort_key_name())
+        .and_then(|attribute| {
+            pinned
+                .get(attribute)
+                .and_then(|value| table.key_value(attribute, value).ok())
+        });
 
     // "ORDER BY clause can only be used on a key attribute" — a statement that asks
     // for any other order is refused rather than served in a different one. An order
@@ -418,45 +443,36 @@ fn select_items(
         }
     }
 
-    let candidates: Vec<(&crate::state::ItemKey, &crate::state::Item)> = match partition {
+    let mut candidates: Vec<(&crate::state::ItemKey, &crate::state::Item)> = match &partition {
         Some(partition) => table
             .items
             .range(crate::state::ItemKey {
                 partition: partition.clone(),
-                sort: None,
+                sort: sort.clone(),
             }..)
-            .take_while(|(key, _)| key.partition == partition)
+            .take_while(|(key, _)| {
+                &key.partition == partition && sort.as_ref().is_none_or(|sort| key.sort.as_ref() == Some(sort))
+            })
             .collect(),
         None => table.items.iter().collect(),
     };
-
-    let mut rows: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
-    for (key, item) in candidates {
-        // An index holds only the items that carry every attribute its key schema
-        // names, so a statement reading an index sees exactly those.
-        if let Some(index) = select.index.as_deref() {
-            if !crate::state::index_holds(table, index, item) {
-                continue;
-            }
-        }
-        if let Some(condition) = condition.as_ref() {
-            if !condition.evaluate(Some(item)).map_err(lift)? {
-                continue;
-            }
-        }
-        rows.push((key, item));
+    // An index holds only the items that carry every attribute its key schema names, so
+    // a statement reading an index has exactly those rows to read: an item it does not
+    // hold is not there to be read, let alone charged for.
+    if let Some(index) = select.index.as_deref() {
+        candidates.retain(|(_, item)| crate::state::index_holds(table, index, item));
     }
     if let Some((attribute, descending)) = select.order_by.as_ref() {
-        rows.sort_by(|(_, left), (_, right)| {
+        candidates.sort_by(|(_, left), (_, right)| {
             crate::state::compare_by_attribute(left, right, attribute, *descending)
         });
     }
     if let Some(resume) = resume.as_ref() {
         // "Set this value to get remaining results" (`NextToken`): the next page
         // starts strictly after the row the previous one stopped on.
-        match rows.iter().position(|(key, _)| *key == resume) {
+        match candidates.iter().position(|(key, _)| *key == resume) {
             Some(position) => {
-                rows.drain(..=position);
+                candidates.drain(..=position);
             }
             // The row that page stopped on has since been removed; resume at the
             // first one that sorts after it IN THE DIRECTION being read. `ORDER BY`
@@ -467,7 +483,7 @@ fn select_items(
                     .order_by
                     .as_ref()
                     .is_some_and(|(_, descending)| *descending);
-                rows.retain(|(key, _)| {
+                candidates.retain(|(key, _)| {
                     if descending {
                         *key < resume
                     } else {
@@ -478,26 +494,43 @@ fn select_items(
         }
     }
 
-    let available = rows.len();
+    // What the page READ: "A single SELECT statement response can return up to the
+    // maximum number of items (if using the Limit parameter) or a maximum of 1 MB of
+    // data (and then apply any filtering to the results using WHERE clause)" (the
+    // operation's own doc), so the caller's `Limit` and the dataset budget bound the
+    // rows the plan EVALUATES, and the `WHERE` clause is applied to each of them
+    // afterwards. The bytes counted here are therefore the bytes the plan read, which
+    // is what the statement consumes: a predicate that keeps fewer rows costs exactly
+    // what the same plan without it costs.
     let limit = input
         .limit
-        .map_or(available, |limit| usize::try_from(limit).unwrap_or(0));
+        .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
     let mut page_size: i64 = 0;
-    let mut page = 0usize;
-    for (_, item) in rows.iter().take(limit) {
+    let mut evaluated = 0usize;
+    let mut rows: Vec<(&crate::state::ItemKey, &crate::state::Item)> = Vec::new();
+    for (key, item) in &candidates {
         // The first row always fits, the way DynamoDB always returns at least one
         // item it found.
-        if page > 0 && page_size >= MAX_PAGE_BYTES {
+        if evaluated >= limit || (evaluated > 0 && page_size >= MAX_PAGE_BYTES) {
             break;
         }
         page_size = page_size.saturating_add(crate::state::item_size(item));
-        page += 1;
+        evaluated += 1;
+        if let Some(condition) = condition.as_ref() {
+            if !condition.evaluate(Some(*item)).map_err(lift)? {
+                continue;
+            }
+        }
+        rows.push((*key, *item));
     }
-    let truncated = available > page;
-    rows.truncate(page);
+    let truncated = candidates.len() > evaluated;
 
-    let stopped_on = rows
-        .last()
+    // "The primary key of the item where the operation stopped": the last row the page
+    // EVALUATED, which is where a resumed page carries on from whether or not the
+    // predicate kept that row.
+    let stopped_on = evaluated
+        .checked_sub(1)
+        .and_then(|last| candidates.get(last))
         .map(|(key, item)| ((*key).clone(), table.key_attributes(item)));
     // An index reports the attributes it PROJECTS — "only the attributes that are
     // projected into the index are reported" — and the statement's own projection

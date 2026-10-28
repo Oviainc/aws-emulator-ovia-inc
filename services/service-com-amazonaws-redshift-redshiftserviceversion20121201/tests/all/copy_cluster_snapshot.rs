@@ -118,7 +118,7 @@ pub(crate) fn seed_automated(
         .expect("the seeded cluster is in the store");
     let created_at = aws_smithy_types::DateTime::from(SystemTime::now());
     let mut snapshot = state::snapshot_of(
-        &stored_cluster.cluster,
+        &stored_cluster,
         identifier,
         created_at,
         state::MANUAL_RETENTION_INDEFINITE,

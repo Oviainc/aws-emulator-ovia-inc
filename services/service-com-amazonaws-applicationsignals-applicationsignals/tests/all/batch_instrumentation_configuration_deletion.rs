@@ -147,6 +147,10 @@ struct Definition {
     label: &'static str,
     scope: Scope,
     language: &'static str,
+    /// The `ClassName` the location names, which `CodeLocation` documents as "required for
+    /// Java and optional for Python module-level functions" — so a Java row carries one and
+    /// a row of another language may leave it out.
+    class_name: Option<&'static str>,
     file_path: &'static str,
     line_number: i64,
     tags: Option<Value>,
@@ -171,6 +175,9 @@ impl Definition {
                 "CodeCapture": { "CaptureLimits": { "MaxHits": 5 } }
             },
         });
+        if let Some(class_name) = self.class_name {
+            body["Location"]["CodeLocation"]["ClassName"] = json!(class_name);
+        }
         if let Some(tags) = self.tags.as_ref() {
             body["Tags"] = tags.clone();
         }
@@ -239,6 +246,7 @@ fn definitions() -> Vec<Definition> {
             label: "A0 breakpoint, tagged",
             scope: SCOPE_A,
             language: "Java",
+            class_name: Some("com.example.checkout.CartController"),
             file_path: "src/main/java/com/example/checkout/CartController.java",
             line_number: 142,
             tags: Some(json!([
@@ -250,6 +258,7 @@ fn definitions() -> Vec<Definition> {
             label: "A1 breakpoint, same file one line further down",
             scope: SCOPE_A,
             language: "Java",
+            class_name: Some("com.example.checkout.CartController"),
             file_path: "src/main/java/com/example/checkout/CartController.java",
             line_number: 143,
             tags: None,
@@ -258,6 +267,7 @@ fn definitions() -> Vec<Definition> {
             label: "A2 breakpoint, another file",
             scope: SCOPE_A,
             language: "Java",
+            class_name: Some("com.example.checkout.Totals"),
             file_path: "src/main/java/com/example/checkout/Totals.java",
             line_number: 7,
             tags: Some(json!([{ "Key": "only", "Value": "one" }])),
@@ -266,6 +276,7 @@ fn definitions() -> Vec<Definition> {
             label: "B0 probe in the same service and environment as A0",
             scope: SCOPE_B,
             language: "Java",
+            class_name: Some("com.example.checkout.Checkout"),
             file_path: "src/main/java/com/example/checkout/Checkout.java",
             line_number: 61,
             tags: Some(json!([{ "Key": "team", "Value": "payments" }])),
@@ -274,6 +285,7 @@ fn definitions() -> Vec<Definition> {
             label: "B1 probe, another file",
             scope: SCOPE_B,
             language: "Javascript",
+            class_name: Some("Cart"),
             file_path: "web/src/cart.js",
             line_number: 1,
             tags: None,
@@ -282,6 +294,7 @@ fn definitions() -> Vec<Definition> {
             label: "C0 breakpoint in another service",
             scope: SCOPE_C,
             language: "Python",
+            class_name: None,
             file_path: "app/inventory/stock.py",
             line_number: 12,
             tags: None,
@@ -290,6 +303,7 @@ fn definitions() -> Vec<Definition> {
             label: "C1 breakpoint in another service, another file",
             scope: SCOPE_C,
             language: "Python",
+            class_name: Some("Reservations"),
             file_path: "app/inventory/reserve.py",
             line_number: 30,
             tags: Some(json!([{ "Key": "team", "Value": "stock" }])),
@@ -298,6 +312,7 @@ fn definitions() -> Vec<Definition> {
             label: "D0 probe, the shortest service and environment names",
             scope: SCOPE_D,
             language: "Python",
+            class_name: None,
             file_path: "main.py",
             line_number: 1,
             tags: None,

@@ -140,15 +140,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The account-global registry catalog record is written from the ONE Region this
-        // instance serves that write as (see `crate::state::API_REGION` and
-        // `crate::state::configured_region`): this is the one Region-scoped ECR Public
-        // call, so a request that reaches this instance as any other Region — including
-        // the other Region ECR Public publishes an endpoint in — is refused with the
-        // service-common `UnsupportedCommandException` before the record is touched. The
-        // matching read (`GetRegistryCatalogData`), and the repository, image, layer, tag
-        // and policy surface, are served from every Region ECR Public publishes an
-        // endpoint in and run no such check.
+        // The account-global registry catalog record is the ONE Region-scoped ECR Public
+        // write: AWS performs it in one Region (`crate::state::API_REGION`) and refuses it
+        // for the others. WHICH endpoint of the service a caller addressed is a property of
+        // the deployment and not of the request — this emulator publishes one endpoint and
+        // a client points at it carrying whatever Region its own configuration holds — so
+        // the refusal is driven by the Region the operator declared this instance stands in
+        // for (`crate::state::API_REGION_ENV`): declared, a request reaching it as any other
+        // Region is refused with the service-common `UnsupportedCommandException` before the
+        // record is touched; undeclared, this instance stands in for whichever Region a
+        // caller reaches it as and the write is served, exactly as the matching read
+        // (`GetRegistryCatalogData`) and the repository, image, layer, tag and policy
+        // surface are. See `crate::state::serves_region`.
         if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
             return Err(
                 PutRegistryCatalogDataErrorModeled::UnsupportedCommandException(unsupported)

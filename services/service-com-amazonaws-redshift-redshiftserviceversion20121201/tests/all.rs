@@ -19,6 +19,8 @@ mod authentication_profiles;
 mod batch_delete_cluster_snapshots;
 #[path = "all/batch_modify_cluster_snapshots.rs"]
 mod batch_modify_cluster_snapshots;
+#[path = "all/cluster_endpoint_publication.rs"]
+mod cluster_endpoint_publication;
 #[path = "all/cluster_iam_roles.rs"]
 mod cluster_iam_roles;
 #[path = "all/cluster_lifecycle.rs"]
@@ -27,6 +29,8 @@ mod cluster_lifecycle;
 mod cluster_parameter_groups;
 #[path = "all/cluster_parameters.rs"]
 mod cluster_parameters;
+#[path = "all/cluster_request_validation.rs"]
+mod cluster_request_validation;
 #[path = "all/cluster_security_groups.rs"]
 mod cluster_security_groups;
 #[path = "all/cluster_structure.rs"]
@@ -37,6 +41,8 @@ mod cluster_transition_convergence;
 mod cluster_versions;
 #[path = "all/copy_cluster_snapshot.rs"]
 mod copy_cluster_snapshot;
+#[path = "all/custom_domain_and_partners.rs"]
+mod custom_domain_and_partners;
 #[path = "all/default_cluster_parameters.rs"]
 mod default_cluster_parameters;
 #[path = "all/error_envelope.rs"]
@@ -51,6 +57,8 @@ mod event_subscriptions;
 mod events;
 #[path = "all/existence_preconditions.rs"]
 mod existence_preconditions;
+#[path = "all/hsm_client_certificates.rs"]
+mod hsm_client_certificates;
 #[path = "all/hsm_configurations.rs"]
 mod hsm_configurations;
 #[path = "all/maintenance_tracks.rs"]
@@ -103,3 +111,5 @@ mod static_catalog;
 mod storage_summary;
 #[path = "all/usage_limits.rs"]
 mod usage_limits;
+#[path = "all/zero_etl_integrations.rs"]
+mod zero_etl_integrations;

@@ -762,22 +762,36 @@ async fn conditional_writes_gate_the_mutation_on_the_stored_item() {
             json!({"TableName": "conditions", "Item": stored}),
         )
         .await;
+        // Every token a request DEFINES has to be one its expressions USE, so each row
+        // sends the slice of the value vocabulary its own condition reads (beside the
+        // one the update reads): an `ExpressionAttributeValues` entry no expression
+        // references makes the whole request invalid.
+        const UPDATE: &str = "SET #n = :touched";
+        let vocabulary = json!({
+            ":touched": {"S": "touched"},
+            ":one": {"N": "1"},
+            ":two": {"N": "2"},
+            ":nine": {"N": "9"},
+            ":ten": {"N": "10"},
+            ":wid": {"S": "wid"},
+            ":red": {"S": "red"},
+            ":string": {"S": "S"},
+        });
+        let stated = serde_json::to_string(condition).expect("the row's members render");
+        let values: Map<String, Value> = vocabulary
+            .as_object()
+            .expect("the vocabulary is a map")
+            .iter()
+            .filter(|(token, _)| UPDATE.contains(token.as_str()) || stated.contains(token.as_str()))
+            .map(|(token, value)| (token.clone(), value.clone()))
+            .collect();
         let body = request(
             json!({
                 "TableName": "conditions",
                 "Key": key,
-                "UpdateExpression": "SET #n = :touched",
+                "UpdateExpression": UPDATE,
                 "ExpressionAttributeNames": {"#n": "name"},
-                "ExpressionAttributeValues": {
-                    ":touched": {"S": "touched"},
-                    ":one": {"N": "1"},
-                    ":two": {"N": "2"},
-                    ":nine": {"N": "9"},
-                    ":ten": {"N": "10"},
-                    ":wid": {"S": "wid"},
-                    ":red": {"S": "red"},
-                    ":string": {"S": "S"},
-                },
+                "ExpressionAttributeValues": values,
             }),
             condition.clone(),
         );

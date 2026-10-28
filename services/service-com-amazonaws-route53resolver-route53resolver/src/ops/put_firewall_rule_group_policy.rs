@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutFirewallRuleGroupPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutFirewallRuleGroupPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutFirewallRuleGroupPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutFirewallRuleGroupPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutFirewallRuleGroupPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutFirewallRuleGroupPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutFirewallRuleGroupPolicyErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The document is checked before the store is touched, so a document
+        // the service will not attach leaves the rule group with whatever
+        // policy it already carried. The refusal names the document it was
+        // handed rather than the element the document misses, so the fault the
+        // check reports is not carried into it. Only the GRAMMAR can be checked
+        // here: whether the document shares the group with another account is
+        // decided against the group's own `OwnerId`, which is not known until
+        // the `Arn` has been resolved against the store below.
+        if crate::state::policy_document_fault(&input.firewall_rule_group_policy).is_some() {
+            return Err(PutFirewallRuleGroupPolicyErrorModeled::ValidationException(
+                crate::state::invalid_iam_policy(&input.firewall_rule_group_policy),
+            )
+            .into());
+        }
+
+        // "Attaches an Identity and Access Management (Amazon Web Services IAM)
+        // policy for sharing the rule group": the document is attached to the
+        // group the `Arn` names, so a read of that group's policy reports
+        // exactly this document, and a second write replaces it.
+        let mut store = state.lock();
+        let Some(record) = store.firewall_rule_group_by_arn_mut(&input.arn) else {
+            return Err(
+                PutFirewallRuleGroupPolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_rule_group_not_found(&input.arn),
+                )
+                .into(),
+            );
+        };
+
+        // A resource policy on a rule group is what shares it with ANOTHER
+        // account, so a document that grants only to the account that already
+        // owns the group — or that states no statement — asks for a share the
+        // service cannot make, and is refused rather than attached. The
+        // Resolver RULE policy write answers the same class of document
+        // differently (it succeeds and leaves the rule with no policy, see
+        // `crate::ops::put_resolver_rule_policy`), so the two are not to be
+        // unified: each follows what its own operation answers.
+        if !crate::state::policy_shares_with_other_account(
+            &input.firewall_rule_group_policy,
+            &record.owner_id,
+        ) {
+            return Err(PutFirewallRuleGroupPolicyErrorModeled::ValidationException(
+                crate::state::invalid_iam_policy(&input.firewall_rule_group_policy),
+            )
+            .into());
+        }
+
+        record.firewall_rule_group_policy = Some(input.firewall_rule_group_policy.clone());
+
+        // `ReturnValue`: the document has been applied to the rule group, so
+        // the request was successful.
+        Ok(PutFirewallRuleGroupPolicyOutput { return_value: true })
     }
 }
