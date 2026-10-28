@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::ephemeris_catalog::program_track_ephemeris;
 use crate::scheduling_loop::{
     create_config, create_tracking_config, harness_with_engine, send, spectrum_config, Reply,
     ABSENT_UUID, AFTER_SETTLE, RECORDING_BUCKET, REGION,
@@ -394,7 +395,13 @@ async fn every_version_is_described_with_the_configuration_that_version_carried(
     let first_satellite = satellite_arn("11111111-1111-4111-8111-111111111111");
     let second_satellite = satellite_arn("22222222-2222-4222-8222-222222222222");
     let third_satellite = satellite_arn("33333333-3333-4333-8333-333333333333");
-    let reserved_overrides = overrides("azEl", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    // One ephemeris of each form a program track may name, stored through
+    // `CreateEphemeris`: the reference a contact version carries has to resolve to an
+    // ephemeris this account holds, of the form the member naming it requires.
+    let az_el_ephemeris = program_track_ephemeris(&router, "azEl").await;
+    let oem_ephemeris = program_track_ephemeris(&router, "oem").await;
+    let tle_ephemeris = program_track_ephemeris(&router, "tle").await;
+    let reserved_overrides = overrides("azEl", &az_el_ephemeris);
 
     let contact_id = reserve_contact(
         &router,
@@ -417,18 +424,18 @@ async fn every_version_is_described_with_the_configuration_that_version_carried(
         ),
         (
             "trackingOverrides alone, oem program track",
-            json!({"trackingOverrides": overrides("oem", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")}),
+            json!({"trackingOverrides": overrides("oem", &oem_ephemeris)}),
             Some(second_satellite.clone()),
-            Some(overrides("oem", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+            Some(overrides("oem", &oem_ephemeris)),
         ),
         (
             "both members, tle program track",
             json!({
                 "satelliteArn": third_satellite,
-                "trackingOverrides": overrides("tle", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+                "trackingOverrides": overrides("tle", &tle_ephemeris),
             }),
             Some(third_satellite.clone()),
-            Some(overrides("tle", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")),
+            Some(overrides("tle", &tle_ephemeris)),
         ),
         (
             "trackingOverrides naming no program track settings",
@@ -492,7 +499,7 @@ async fn a_version_scoped_member_no_version_named_is_reported_absent_and_then_in
 
     // An update naming ONLY the overrides leaves the satellite absent, because no version
     // up to it named one; the next one names a satellite and inherits those overrides.
-    let tracking = overrides("azEl", "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+    let tracking = overrides("azEl", &program_track_ephemeris(&router, "azEl").await);
     let satellite = satellite_arn("44444444-4444-4444-8444-444444444444");
     for (case, body, expected_row) in [
         (
