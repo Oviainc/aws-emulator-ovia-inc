@@ -187,12 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?)
             }
         };
-        // Clamped locally, so the page bound holds whatever reaches the handler and not
-        // only because the boundary validator enforced the modelled 1..100 range.
-        let page_size = input
-            .max_results
-            .unwrap_or(crate::state::MAX_PAGE_SIZE)
-            .clamp(1, crate::state::MAX_PAGE_SIZE) as usize;
+        // The one page bound this service's paginated operations share.
+        let page_size = crate::state::page_size(input.max_results);
 
         let mut state = state.lock();
         // Reporting only: this materialises the VLAN state changes the clock already

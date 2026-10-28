@@ -2874,6 +2874,22 @@ pub fn live_connector_mut<'a>(
 /// names no `maxResults`: the top of the modelled `MaxResults` range (1..100).
 pub const MAX_PAGE_SIZE: i32 = 100;
 
+/// How many items ONE page of a `@paginated` operation of this service reports, for the
+/// `maxResults` the request named.
+///
+/// "If you specify MaxResults in the request, the response includes information up to
+/// the limit specified" (the `maxResults` doc every `@paginated` operation of this
+/// service carries); naming none, the page is bounded by the top of the modelled range
+/// ([`MAX_PAGE_SIZE`]). The bound is clamped into the modelled `1..100` range here as
+/// well, so it holds whatever reaches a handler and not only because the boundary
+/// validator enforced that range.
+///
+/// The rule lives beside the range it is stated over, so no two paginated operations of
+/// this service can bound their pages differently.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE) as usize
+}
+
 /// How long a `nextToken` stays usable: "Each pagination token expires after 24
 /// hours" (`nextToken` doc on every `@paginated` operation of this service).
 pub const PAGE_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);

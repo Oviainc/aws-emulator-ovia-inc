@@ -86,6 +86,8 @@ mod identity_policy_sources;
 mod list_vm_entitlements_connector;
 #[path = "all/list_while_initializing.rs"]
 mod list_while_initializing;
+#[path = "all/page_size_bound.rs"]
+mod page_size_bound;
 #[path = "all/public_vlan_netmask.rs"]
 mod public_vlan_netmask;
 #[path = "all/reserved_tag_keys.rs"]
