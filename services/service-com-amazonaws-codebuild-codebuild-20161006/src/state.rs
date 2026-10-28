@@ -14,7 +14,8 @@
 //! `CreateReportGroup` writes a [`StoredReportGroup`], `UpdateReportGroup`
 //! rewrites one and `DeleteReportGroup` removes one,
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
-//! `BatchDeleteBuilds` removes a build, and the reporting operations
+//! `BatchDeleteBuilds` removes a build, `DeleteBuildBatch` removes a completed
+//! batch build together with the builds of that batch, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
 //! `BatchGetReportGroups`, `BatchGetReports`, `GetReportGroupTrend`, `ListProjects`,
@@ -474,6 +475,15 @@ pub const BUILD_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBui
 pub const BATCH_SPEC_NOT_DOWNLOADED_MESSAGE: &str = "this emulator does not run CodeBuild \
     build containers, so the batch build specification could not be downloaded and no build \
     of the batch was started";
+
+/// The `statusCode` `DeleteBuildBatch` reports for a batch build it removed.
+///
+/// `DeleteBuildBatchOutput$statusCode` is modelled as a plain `String` and
+/// documented only as "The status code", so the token comes from recorded
+/// behaviour: CodeBuild answers a delete of a complete batch build with this code,
+/// after which the batch id reads back in `BatchGetBuildBatches`'s
+/// `buildBatchesNotFound`.
+pub const BATCH_DELETED_STATUS_CODE: &str = "BATCH_DELETED";
 
 
 /// The status a sandbox and its session report between `StartSandbox` and the
@@ -1340,7 +1350,6 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// waiting on survives a round, and the per-project `buildBatchNumber`
     /// counter is retired only once nothing can observe it again.
     fn enforce_build_batch_ceiling(&mut self) {
-        let mut evicted_any = false;
         while self.build_batches.len() > MAX_BUILD_BATCHES {
             let oldest_completed = self
                 .build_batches
@@ -1355,23 +1364,42 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                     .map(|(id, _)| id.clone())
             });
             let Some(id) = evicted else { break };
-            evicted_any = true;
-            let project_name = self
-                .build_batches
-                .remove(&id)
-                .and_then(|stored| stored.build_batch.project_name);
-            if let Some(project_name) = project_name {
-                if let Some(ids) = self.build_batches_by_project.get_mut(&project_name) {
-                    ids.retain(|held| held != &id);
-                    if ids.is_empty() {
-                        self.build_batches_by_project.remove(&project_name);
-                    }
+            self.remove_build_batch(&id);
+        }
+    }
+
+    /// Remove the batch build `id` names, and answer whether a record was held.
+    ///
+    /// The one place a batch build leaves the store — [`Self::remove_build`]'s rule
+    /// for the batch records — so `build_batches_by_project` never keeps an id
+    /// `build_batches` no longer has: `DeleteBuildBatch` deletes through here and so
+    /// does an eviction. The per-project `buildBatchNumber` counter can only be
+    /// orphaned by the removal that empties its project's index, so the scan runs
+    /// there and nowhere else.
+    pub fn remove_build_batch(&mut self, id: &str) -> bool {
+        let Some(stored) = self.build_batches.remove(id) else {
+            return false;
+        };
+        if let Some(project_name) = stored.build_batch.project_name {
+            if let Some(ids) = self.build_batches_by_project.get_mut(&project_name) {
+                ids.retain(|held| held != id);
+                if ids.is_empty() {
+                    self.build_batches_by_project.remove(&project_name);
+                    self.retire_orphaned_build_batch_numbers();
                 }
             }
         }
-        if !evicted_any {
-            return;
-        }
+        true
+    }
+
+    /// Drop the `buildBatchNumber` counters nothing can observe any more —
+    /// [`Self::retire_orphaned_build_numbers`]'s rule for the batch sequence.
+    ///
+    /// A counter is kept while its project exists or any of its batch builds is still
+    /// retained, so a number is never reused for a project a caller can still reach:
+    /// AWS documents that "if a batch build is deleted, the buildBatchNumber of other
+    /// batch builds does not change".
+    fn retire_orphaned_build_batch_numbers(&mut self) {
         let mut counters = ::std::mem::take(&mut self.next_build_batch_numbers);
         counters.retain(|name, _| {
             self.projects.contains_key(name) || self.build_batches_by_project.contains_key(name)
@@ -2520,6 +2548,31 @@ pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
 }
 
+/// The build id an `arn:<partition>:codebuild:<region>:<account>:build/<id>` ARN
+/// identifies, or `None` when the value is not a CodeBuild build ARN.
+///
+/// The inverse of [`build_arn`]'s resource segment, and the counterpart of
+/// [`project_name_from_arn`] for the build records: a batch build names the builds
+/// it is made of by ARN (`BuildSummary$arn`), while the build store is keyed by id,
+/// so an operation that acts on the builds of a batch resolves them through here.
+/// It answers the SYNTAX question only — whether the value is a build ARN of this
+/// service at all — so a caller still keeps only the records it actually holds. The
+/// resource is the whole sixth field, everything after the fifth colon, so a build
+/// id's own `<projectName>:<uuid>` colon is recovered intact.
+pub fn build_id_from_arn(arn: &str) -> Option<&str> {
+    // Walked field by field rather than collected, so resolving an ARN allocates
+    // nothing.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" || fields.next()?.is_empty() || fields.next()? != ARN_NAMESPACE {
+        return None;
+    }
+    // The region and the account are not checked here; see `project_name_from_arn`.
+    fields.next()?;
+    fields.next()?;
+    let id = fields.next()?.strip_prefix("build/")?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// The project name an `arn:<partition>:codebuild:<region>:<account>:project/<name>`
 /// ARN identifies, or `None` when the value is not a CodeBuild project ARN.
 ///
@@ -2844,6 +2897,8 @@ pub enum AuditOutcome {
     /// A build project was removed from the store, with the resource-based policy
     /// attached to it.
     ProjectDeleted,
+    /// A batch build was removed from the store, with the builds of that batch.
+    BuildBatchDeleted,
     /// No resource of that name exists (400 `ResourceNotFoundException`).
     NotFound,
     /// A resource-based policy was stored against a resource's ARN.
@@ -2868,6 +2923,7 @@ impl AuditOutcome {
             Self::ProjectCreated => "project-created",
             Self::ProjectUpdated => "project-updated",
             Self::ProjectDeleted => "project-deleted",
+            Self::BuildBatchDeleted => "build-batch-deleted",
             Self::NotFound => "not-found",
             Self::ResourcePolicyStored => "resource-policy-stored",
             Self::ResourcePolicyDeleted => "resource-policy-deleted",

@@ -10,6 +10,10 @@
 //! pattern writes around it removed). [`constraint_envelope`] is the one place that
 //! sentence is built.
 //!
+//! The one part of a clause that is neither the request's nor the model's is the ORDER an
+//! enum clause lists the enum's admitted values in: the membership is the model's, the
+//! order is this service's own listing of that enum ([`VALUE_LISTINGS`], [`listed`]).
+//!
 //! EDIT THIS FILE. It is emitted once with working defaults and is never
 //! regenerated, so a choice made here survives adding another service or
 //! re-running the generator.
@@ -153,6 +157,63 @@ fn unanchored(pattern: &str) -> &str {
     }
 }
 
+/// The order this service LISTS an enum's admitted values in, for the enums it is
+/// observed to publish a listing for.
+///
+/// An enum clause states a MEMBERSHIP and an ORDER. The membership is the model's,
+/// always. The order is not: this service lists `WorkflowStepType` as `DELETE, DECRYPT,
+/// …` while the model declares it `COPY, CUSTOM, TAG, DELETE, DECRYPT`
+/// (`smithy_query(query="shape",shape="com.amazonaws.transfer#WorkflowStepType")`), and no
+/// order derivable from the model — declaration order, sorted, reversed, by length, by the
+/// bucket order of a hashed set — produces it. It is service metadata the public model does
+/// not carry, so the only source for it is what this service's refusals are observed
+/// stating, and it is recorded per enum HERE, beside the one renderer every
+/// enum-constrained member of every operation goes through, rather than in a handler.
+///
+/// A listing is identified by the SET it orders — which is all a violation carries, the
+/// clause having no shape id — and is applied ONLY to an enum whose admitted set it is a
+/// permutation of. A listing can therefore neither add a value this model does not declare
+/// nor drop one it does, and an enum whose membership changes in the model stops matching a
+/// stale listing and states the model's order rather than an outdated set. An enum this
+/// service publishes no listing for keeps the order the member schema carries, which is the
+/// model's.
+///
+/// The order is a property of the ENUM, not of the member or the operation that reaches it,
+/// so one enum states one ordered set wherever it is reached — at the top level of an
+/// input, inside a nested structure, inside a structure in a list, and beside other clauses
+/// of the same refusal.
+const VALUE_LISTINGS: &[&[&str]] = &[
+    // `WorkflowStepType`, reached by `CreateWorkflow.Steps[].Type` and
+    // `OnExceptionSteps[].Type`. It is the only enum of this model declaring these five
+    // values, so this membership identifies it.
+    &["DELETE", "DECRYPT", "CUSTOM", "COPY", "TAG"],
+];
+
+/// Whether two value lists hold the same values, in whatever order each holds them.
+fn orders_the_same_set(one: &[&str], other: &[&str]) -> bool {
+    if one.len() != other.len() {
+        return false;
+    }
+    let mut one: Vec<&str> = one.to_vec();
+    let mut other: Vec<&str> = other.to_vec();
+    one.sort_unstable();
+    other.sort_unstable();
+    one == other
+}
+
+/// `values` in the order this service lists them, or in the order they arrived — the
+/// model's, off the member schema — when this service publishes no listing for that enum.
+fn listed(values: &[String]) -> Vec<&str> {
+    let arrived: Vec<&str> = values.iter().map(String::as_str).collect();
+    match VALUE_LISTINGS
+        .iter()
+        .find(|listing| orders_the_same_set(listing, &arrived))
+    {
+        Some(listing) => listing.to_vec(),
+        None => arrived,
+    }
+}
+
 /// The REQUIREMENT one violation states, as Transfer words it — the modelled
 /// constraint the member failed, with nothing of the value that failed it.
 ///
@@ -182,10 +243,12 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
             "Member must satisfy regular expression pattern: {}",
             unanchored(pattern)
         ),
-        // The bracketed set is the model's own value order; no documented rule fixes it.
-        ViolationKind::EnumValue(allowed) => {
-            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
-        }
+        // The bracketed set states the MEMBERSHIP the model declares, in the order this
+        // service lists that enum's values ([`listed`]).
+        ViolationKind::EnumValue(allowed) => format!(
+            "Member must satisfy enum value set: [{}]",
+            listed(allowed).join(", ")
+        ),
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     })
@@ -344,5 +407,190 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::types as t;
+
+    /// Every enum value set this service's model declares, as the generated catalog in
+    /// `ops/types/shared_types.rs` carries it — one entry per enum shape of the model,
+    /// REFERENCED rather than copied, so a membership the model changes reaches these
+    /// assertions by a rebuild.
+    const DECLARED_ENUM_SETS: &[&[&str]] = &[
+        t::AGREEMENT_STATUS_TYPE_VALUES,
+        t::AS2_TRANSPORT_VALUES,
+        t::CERTIFICATE_STATUS_TYPE_VALUES,
+        t::CERTIFICATE_TYPE_VALUES,
+        t::CERTIFICATE_USAGE_TYPE_VALUES,
+        t::COMMUNICATION_MODE_VALUES,
+        t::COMPRESSION_ENUM_VALUES,
+        t::CONNECTOR_EGRESS_TYPE_VALUES,
+        t::CONNECTOR_STATUS_VALUES,
+        t::CONNECTORS_IP_ADDRESS_TYPE_VALUES,
+        t::CUSTOM_STEP_STATUS_VALUES,
+        t::DIRECTORY_LISTING_OPTIMIZATION_VALUES,
+        t::DOMAIN_VALUES,
+        t::ENCRYPTION_ALG_VALUES,
+        t::ENCRYPTION_TYPE_VALUES,
+        t::ENDPOINT_TYPE_VALUES,
+        t::ENFORCE_MESSAGE_SIGNING_TYPE_VALUES,
+        t::EXECUTION_ERROR_TYPE_VALUES,
+        t::EXECUTION_STATUS_VALUES,
+        t::HOME_DIRECTORY_TYPE_VALUES,
+        t::HOST_KEY_STORAGE_TYPE_VALUES,
+        t::IDENTITY_PROVIDER_TYPE_VALUES,
+        t::IP_ADDRESS_TYPE_VALUES,
+        t::MAP_TYPE_VALUES,
+        t::MDN_RESPONSE_VALUES,
+        t::MDN_SIGNING_ALG_VALUES,
+        t::OVERWRITE_EXISTING_VALUES,
+        t::PRESERVE_CONTENT_TYPE_VALUES,
+        t::PRESERVE_FILENAME_TYPE_VALUES,
+        t::PROFILE_TYPE_VALUES,
+        t::PROTOCOL_VALUES,
+        t::PROXY_MODE_VALUES,
+        t::SECURITY_POLICY_PROTOCOL_VALUES,
+        t::SECURITY_POLICY_RESOURCE_TYPE_VALUES,
+        t::SET_STAT_OPTION_VALUES,
+        t::SFTP_AUTHENTICATION_METHODS_VALUES,
+        t::SIGNING_ALG_VALUES,
+        t::STATE_VALUES,
+        t::TLS_SESSION_RESUMPTION_MODE_VALUES,
+        t::TRANSFER_TABLE_STATUS_VALUES,
+        t::WEB_APP_ENDPOINT_POLICY_VALUES,
+        t::WEB_APP_ENDPOINT_TYPE_VALUES,
+        t::WEB_APP_VPC_ENDPOINT_IP_ADDRESS_TYPE_VALUES,
+        t::WORKFLOW_STEP_TYPE_VALUES,
+    ];
+
+    /// `values` as a violation carries them: the owned strings the framework's walk builds
+    /// its `EnumValue` kind from.
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// A listing orders a value set this MODEL declares, and EXACTLY one of them: it can
+    /// neither add a value the model does not admit nor drop one it does, and since a
+    /// listing is resolved by its membership alone (a clause carries no shape id), a
+    /// membership two enums declared differently could not be told apart. A listing
+    /// recorded for such a membership fails here rather than silently re-ordering the other
+    /// enum's clause.
+    #[test]
+    fn every_listing_orders_exactly_one_value_set_this_model_declares() {
+        for listing in VALUE_LISTINGS {
+            let sharing: Vec<&&[&str]> = DECLARED_ENUM_SETS
+                .iter()
+                .filter(|declared| orders_the_same_set(listing, declared))
+                .collect();
+            assert_eq!(
+                sharing.len(),
+                1,
+                "case {listing:?}: a listing must order the values of exactly one enum this \
+                 model declares, got {sharing:?}"
+            );
+        }
+    }
+
+    /// A listing is resolved by the SET it orders, whatever order that set arrives in, and
+    /// an enum this service publishes no listing for keeps the order it arrived in — the
+    /// model's.
+    #[test]
+    fn a_listing_is_applied_only_to_the_enum_whose_set_it_orders() {
+        let step_types = ["DELETE", "DECRYPT", "CUSTOM", "COPY", "TAG"];
+        // (case, the set as it arrives off a member schema, the order the clause states)
+        let rows: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+            (
+                "the listed enum, arriving in the model's declaration order",
+                vec!["COPY", "CUSTOM", "TAG", "DELETE", "DECRYPT"],
+                step_types.to_vec(),
+            ),
+            (
+                "the listed enum, arriving sorted",
+                t::WORKFLOW_STEP_TYPE_VALUES.to_vec(),
+                step_types.to_vec(),
+            ),
+            (
+                "the listed enum, arriving already listed",
+                step_types.to_vec(),
+                step_types.to_vec(),
+            ),
+            (
+                "another enum of the same size with another membership",
+                t::SIGNING_ALG_VALUES.to_vec(),
+                t::SIGNING_ALG_VALUES.to_vec(),
+            ),
+            (
+                "a subset of a listed set: not that enum",
+                vec!["COPY", "CUSTOM", "TAG", "DELETE"],
+                vec!["COPY", "CUSTOM", "TAG", "DELETE"],
+            ),
+            (
+                "a listed set with one value more: not that enum either",
+                vec!["COPY", "CUSTOM", "TAG", "DELETE", "DECRYPT", "ENCRYPT"],
+                vec!["COPY", "CUSTOM", "TAG", "DELETE", "DECRYPT", "ENCRYPT"],
+            ),
+            (
+                "an enum with no listing",
+                t::ENDPOINT_TYPE_VALUES.to_vec(),
+                t::ENDPOINT_TYPE_VALUES.to_vec(),
+            ),
+            (
+                "a single-valued enum",
+                t::ENCRYPTION_TYPE_VALUES.to_vec(),
+                t::ENCRYPTION_TYPE_VALUES.to_vec(),
+            ),
+        ];
+        for (case, arriving, expected) in rows {
+            let arriving = owned(&arriving);
+            let actual = listed(&arriving);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            let stated = requirement(&ViolationKind::EnumValue(arriving.clone()));
+            let wanted = Some(format!(
+                "Member must satisfy enum value set: [{}]",
+                expected.join(", ")
+            ));
+            assert_eq!(
+                stated, wanted,
+                "case {case:?}: expected the clause to state {wanted:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// The order lives in the renderer every enum-constrained member goes through, so the
+    /// whole refusal states it — including a refusal that states a second clause beside the
+    /// enum's.
+    #[test]
+    fn the_envelope_states_the_listing_beside_another_clause() {
+        let violations = vec![
+            Violation {
+                path: "steps.1.member.type".to_string(),
+                kind: ViolationKind::EnumValue(owned(t::WORKFLOW_STEP_TYPE_VALUES)),
+                value: None,
+            },
+            Violation {
+                path: "description".to_string(),
+                kind: ViolationKind::MaxLength(200),
+                value: None,
+            },
+        ];
+        let actual = constraint_envelope(&violations);
+        let expected = Some(
+            "2 validation errors detected: Value at 'steps.1.member.type' failed to satisfy \
+             constraint: Member must satisfy enum value set: [DELETE, DECRYPT, CUSTOM, COPY, \
+             TAG]; Value at 'description' failed to satisfy constraint: Member must have \
+             length less than or equal to 200"
+                .to_string(),
+        );
+        assert_eq!(
+            actual, expected,
+            "case \"an enum clause beside a length clause\": expected {expected:?}, got \
+             {actual:?}"
+        );
     }
 }

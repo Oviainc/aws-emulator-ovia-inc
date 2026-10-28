@@ -17,7 +17,10 @@
 //! 3. a bucket name that is not a bucket name, an AMI id the account cannot resolve, a page
 //!    size outside the published range, a filter name the operation does not publish and a
 //!    `MaxResults` beside `ImageIds` are refused with EC2's own error code, and nothing is
-//!    stored;
+//!    stored. For the create, EVERY AMI id it cannot resolve to an image this account can see
+//!    is the one strict refusal `InvalidAMIID.Malformed`, "The image ID '<id>' is malformed",
+//!    whatever form the value has, and a bucket name outside Amazon S3's naming rules is the
+//!    malformed-parameter refusal `CreateRestoreImageTask` answers for the same value;
 //! 4. `ImageIds`, `Filters` and `MaxResults` narrow and page the report, newest task first
 //!    — and `ImageIds` makes the filters it is given beside IGNORED.
 //!
@@ -38,7 +41,9 @@ use ec2::state::{
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{as_timestamp, call, element, elements, error_code, filters, indexed};
+use super::ec2_query::{
+    as_timestamp, call, element, elements, error_code, error_message, filters, indexed,
+};
 
 /// The Region every call here is signed for. A store task carries no Region member, so the
 /// Region only selects the ec2Query envelope.
@@ -49,6 +54,11 @@ const UNKNOWN_IMAGE_ID: &str = "ami-0ffffffffffffffff";
 
 /// Something that is not an AMI id at all.
 const MALFORMED_IMAGE_ID: &str = "ami-not-an-id";
+
+/// An account that is NOT the caller's — the one Amazon publishes its own AMIs from
+/// (`ec2::state::AMAZON_IMAGE_OWNER_ID`) — used here only as the owner of an image this
+/// caller does not own.
+const OTHER_ACCOUNT_ID: &str = ec2::state::AMAZON_IMAGE_OWNER_ID;
 
 /// A `(key, value)` request parameter.
 fn p(key: &str, value: impl Into<String>) -> (String, String) {
@@ -703,7 +713,6 @@ async fn the_create_refuses_a_bad_request() {
     let too_short = bucket_of_length(MIN_S3_BUCKET_NAME_CHARS - 1);
     let too_long = bucket_of_length(MAX_S3_BUCKET_NAME_CHARS + 1);
     let bad_buckets: Vec<(&str, String)> = vec![
-        ("an empty bucket name", String::new()),
         ("one character below the shortest name", too_short),
         ("one character above the longest name", too_long),
         ("an uppercase letter", "AMI-Archive".to_string()),
@@ -729,9 +738,14 @@ async fn the_create_refuses_a_bad_request() {
         );
         let code = error_code(&body);
         assert_eq!(
-            code, "InaccessibleStorageLocation",
-            "case {case:?}: expected the code \"InaccessibleStorageLocation\", got {code:?} \
-             in body {body}"
+            code, "InvalidRequest",
+            "case {case:?}: expected the code \"InvalidRequest\", got {code:?} in body {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message, "The S3 bucket name contains invalid characters.",
+            "case {case:?}: expected the malformed-bucket-name message, got {message:?} in \
+             body {body}"
         );
     }
 
@@ -740,7 +754,7 @@ async fn the_create_refuses_a_bad_request() {
             "an AMI id the account can see no image for",
             vec![p("ImageId", UNKNOWN_IMAGE_ID), p("Bucket", "ami-archive")],
             400,
-            "InvalidAMIID.NotFound",
+            "InvalidAMIID.Malformed",
         ),
         (
             "an id that is not an AMI id at all",
@@ -749,9 +763,10 @@ async fn the_create_refuses_a_bad_request() {
             "InvalidAMIID.Malformed",
         ),
         (
-            // Both members are `required`, so the boundary validator refuses a request that
-            // omits one before the handler runs; the code is the query protocols' own for a
-            // boundary refusal.
+            // Both members are `clientOptional` `@required`: a request that OMITS one is
+            // refused at the boundary, before the handler runs, with the query protocol's own
+            // code, while one that SENDS it empty reaches the handler and is EC2's
+            // `MissingParameter` — the parameter was given no value.
             "no bucket named",
             vec![p("ImageId", image_id.as_str())],
             400,
@@ -764,12 +779,16 @@ async fn the_create_refuses_a_bad_request() {
             "MalformedInput",
         ),
         (
-            // A bucket member that is PRESENT but empty reaches the handler, where it is not
-            // a bucket name.
             "an empty bucket name",
             vec![p("ImageId", image_id.as_str()), p("Bucket", "")],
             400,
-            "InaccessibleStorageLocation",
+            "MissingParameter",
+        ),
+        (
+            "an empty AMI id",
+            vec![p("ImageId", ""), p("Bucket", "ami-archive")],
+            400,
+            "MissingParameter",
         ),
         (
             "a dry run of a request that would have succeeded",
@@ -791,7 +810,7 @@ async fn the_create_refuses_a_bad_request() {
                 p("DryRun", "true"),
             ],
             400,
-            "InvalidAMIID.NotFound",
+            "InvalidAMIID.Malformed",
         ),
     ];
     for (case, params, expected_status, expected) in rows {
@@ -820,5 +839,128 @@ async fn the_create_refuses_a_bad_request() {
     assert!(
         elements(&body, "amiId").is_empty(),
         "a refused create leaves no task to report, got body {body}"
+    );
+}
+
+/// RULE 3, continued: EVERY AMI id the create cannot resolve to an image the calling account
+/// can see is refused with the SAME code and the same message — `InvalidAMIID.Malformed`,
+/// `The image ID '<id>' is malformed` — whatever form the value has, where a describe of the
+/// account's images keeps the malformed/not-found split instead.
+///
+/// The rows differ along the FORM of the id (the long and the short `ami-` form, one hex
+/// digit short of the long form, uppercase hex, a character outside the id alphabet, another
+/// resource kind's id) and along WHY it resolves to nothing (no image stored under it, and an
+/// image of another account this caller cannot see). An EMPTY `ImageId` is not one of them:
+/// it gave the parameter no value at all, which is `MissingParameter`, asserted by
+/// [`the_create_refuses_a_bad_request`]. The positive side of the same rule closes the test:
+/// an image this account CAN see is stored, including a public image of another account.
+#[tokio::test]
+async fn the_create_refuses_every_unresolvable_ami_id() {
+    let (router, engine) = super::ec2_query::emulator();
+    assert_ne!(
+        OTHER_ACCOUNT_ID,
+        engine::emulator_account_id(),
+        "the other account has to be one the caller is not"
+    );
+
+    // Two images of ANOTHER account: the private one is invisible to this caller, so its
+    // well-formed id resolves to nothing here, while the public one is visible to everyone.
+    let (invisible_image_id, public_image_id) = {
+        let store = engine.state::<Ec2State>();
+        let mut guard = store.lock();
+        let invisible = guard.insert_image(ImageSpec {
+            name: "another-accounts-private-image".to_string(),
+            owner_id: OTHER_ACCOUNT_ID.to_string(),
+            public: false,
+            ..ImageSpec::default()
+        });
+        let public = guard.insert_image(ImageSpec {
+            name: "another-accounts-public-image".to_string(),
+            owner_id: OTHER_ACCOUNT_ID.to_string(),
+            public: true,
+            ..ImageSpec::default()
+        });
+        (invisible, public)
+    };
+
+    let unresolvable: Vec<(&str, String)> = vec![
+        ("the long form, no image stored", UNKNOWN_IMAGE_ID.to_string()),
+        ("the short form, no image stored", "ami-0ffffffe".to_string()),
+        (
+            "one hex digit short of the long form",
+            "ami-0fffffffffffffff".to_string(),
+        ),
+        (
+            "the long form in uppercase hex",
+            "ami-0FFFFFFFFFFFFFFFF".to_string(),
+        ),
+        (
+            "a character outside the id alphabet",
+            MALFORMED_IMAGE_ID.to_string(),
+        ),
+        (
+            "another resource kind's id",
+            "i-0ffffffffffffffff".to_string(),
+        ),
+        (
+            "a private image of another account",
+            invisible_image_id.clone(),
+        ),
+    ];
+    for (case, image_id) in &unresolvable {
+        let (status, body) = store(&router, image_id, "ami-archive").await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, "InvalidAMIID.Malformed",
+            "case {case:?}: expected the code \"InvalidAMIID.Malformed\", got {code:?} in \
+             body {body}"
+        );
+        let message = error_message(&body);
+        let expected = format!("The image ID '{image_id}' is malformed");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?} in body {body}"
+        );
+    }
+    let held = stored_count(&engine);
+    assert_eq!(
+        held, 0,
+        "a create refused for an unresolvable AMI id stores nothing, got {held} task(s)"
+    );
+
+    // The same rule's positive side: an image this account can see is stored, and the task
+    // is reported with the object key derived from that image's id.
+    let own_image_id = seed_images(&engine, 1).remove(0);
+    for (case, image_id) in [
+        ("an image of the calling account", &own_image_id),
+        ("a public image of another account", &public_image_id),
+    ] {
+        let (status, body) = store(&router, image_id, "ami-archive").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        );
+        let key = element(&body, "objectKey");
+        assert_eq!(
+            key.as_deref(),
+            Some(object_key(image_id).as_str()),
+            "case {case:?}: expected the object key {:?}, got {key:?} in body {body}",
+            object_key(image_id)
+        );
+    }
+    let (status, body) = describe(&router, &[]).await;
+    assert_eq!(
+        status, 200,
+        "the report after the stores: got {status} with body {body}"
+    );
+    let reported = elements(&body, "amiId");
+    assert_eq!(
+        reported,
+        vec![public_image_id.clone(), own_image_id.clone()],
+        "the two stored tasks are reported newest first, got body {body}"
     );
 }

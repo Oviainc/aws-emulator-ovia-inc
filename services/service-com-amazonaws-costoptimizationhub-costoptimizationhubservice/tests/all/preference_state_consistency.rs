@@ -41,13 +41,10 @@ use cost_optimization_hub::state::{
 };
 
 use crate::cost_optimization_hub::{
-    call, enrolled_router_with_discounts_visible, error_code, fields,
-    management_account_router, ok, DISCOUNT_VISIBILITY_ALL, FIELD_VALIDATION_SUMMARY,
+    assert_stated_rule_refusal, call, enrolled_router_with_discounts_visible,
+    management_account_router, ok, refused_member, DISCOUNT_VISIBILITY_ALL, MODE_MEMBER,
+    VISIBILITY_MEMBER,
 };
-
-/// The input members the rule is about.
-const MODE_MEMBER: &str = "savingsEstimationMode";
-const VISIBILITY_MEMBER: &str = "memberAccountDiscountVisibility";
 
 /// The pair the rule is about, as `GetPreferences` reports it: the effective
 /// savings estimation mode, and the organization's member-account discount
@@ -91,17 +88,6 @@ fn resulting_pair(stored: &Pair, request: &Value) -> Pair {
     }
 }
 
-/// The member a refusal of the rule names: the mode where the request is the one
-/// asking for it, and the visibility where the request is the one withdrawing
-/// the discounts the stored mode is net of.
-fn refused_member(request: &Value) -> &'static str {
-    if request[MODE_MEMBER].is_string() {
-        MODE_MEMBER
-    } else {
-        VISIBILITY_MEMBER
-    }
-}
-
 /// Send one `UpdatePreferences` and assert the service judged it by the rule:
 /// accepted and merged where the record it leaves satisfies the rule, and
 /// otherwise the operation's modelled `ValidationException` (400) stating the
@@ -128,27 +114,7 @@ async fn judged_by_the_rule(router: &MultiServiceRouter, case: &str, request: &V
         return;
     }
 
-    let code = error_code(&payload);
-    assert_eq!(
-        code, "ValidationException",
-        "case {case:?}: expected ValidationException, got {code:?} in {payload}"
-    );
-    let message = payload["message"].as_str().unwrap_or_default();
-    assert!(
-        !message.is_empty() && message != FIELD_VALIDATION_SUMMARY,
-        "case {case:?}: expected a message stating the rule, distinguishable from the \
-         field-validation summary, got {message:?} in {payload}"
-    );
-    let member = refused_member(request);
-    let named: Vec<String> = fields(&payload)
-        .into_iter()
-        .map(|(field_name, _)| field_name)
-        .collect();
-    assert_eq!(
-        named,
-        vec![member.to_string()],
-        "case {case:?}: expected the refusal to name {member}, got {payload}"
-    );
+    assert_stated_rule_refusal(&payload, case, refused_member(request));
     let after = stored_pair(router).await;
     assert_eq!(
         after, before,

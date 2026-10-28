@@ -158,6 +158,62 @@ pub(crate) fn fields(payload: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The two `UpdatePreferences` input members the service's discount rule is
+/// about — the savings estimation mode and the organization-wide member-account
+/// discount visibility — named once here, because more than one suite asserts
+/// which of them a refusal of that rule names.
+pub(crate) const MODE_MEMBER: &str = "savingsEstimationMode";
+pub(crate) const VISIBILITY_MEMBER: &str = "memberAccountDiscountVisibility";
+
+/// The member a refusal of the discount rule names: the mode where the request
+/// is the one asking for it, and the visibility where the request is the one
+/// withdrawing the discounts the stored mode is net of.
+pub(crate) fn refused_member(request: &Value) -> &'static str {
+    if request[MODE_MEMBER].is_string() {
+        MODE_MEMBER
+    } else {
+        VISIBILITY_MEMBER
+    }
+}
+
+/// The whole effective preference record `GetPreferences` reports, which is what
+/// a suite asserting what a write left — or did not leave — reads back.
+pub(crate) async fn preferences_record(router: &MultiServiceRouter) -> Value {
+    ok(router, "GetPreferences", &json!({})).await
+}
+
+/// Assert `payload` is the refusal the service answers a request that breaks one
+/// of its stated rules with: the operation's modelled `ValidationException`,
+/// whose `message` states the rule — so it is distinguishable from the
+/// request-independent summary a value outside its modelled enum is answered
+/// with — and whose `fields` names exactly `member`, the member of that request
+/// the rule stopped.
+///
+/// Shared, because every suite that drives one of those rules asserts the same
+/// shape, and two copies of it could drift apart.
+pub(crate) fn assert_stated_rule_refusal(payload: &Value, case: &str, member: &str) {
+    let code = error_code(payload);
+    assert_eq!(
+        code, "ValidationException",
+        "case {case:?}: expected ValidationException, got {code:?} in {payload}"
+    );
+    let message = payload["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.is_empty() && message != FIELD_VALIDATION_SUMMARY,
+        "case {case:?}: expected a message stating the rule, distinguishable from the \
+         field-validation summary, got {message:?} in {payload}"
+    );
+    let named: Vec<String> = fields(payload)
+        .into_iter()
+        .map(|(field_name, _)| field_name)
+        .collect();
+    assert_eq!(
+        named,
+        vec![member.to_string()],
+        "case {case:?}: expected the refusal to name {member}, got {payload}"
+    );
+}
+
 /// The `recommendationId`s of a `ListRecommendations` answer, in order.
 fn ids(payload: &Value) -> Vec<String> {
     payload["items"]

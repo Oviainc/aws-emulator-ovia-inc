@@ -21,6 +21,8 @@ mod cluster_mutation_status_gate;
 mod cluster_policy;
 #[path = "all/cluster_policy_mutation_status_gate.rs"]
 mod cluster_policy_mutation_status_gate;
+#[path = "all/cluster_region_derived_values.rs"]
+mod cluster_region_derived_values;
 #[path = "all/create_cluster_replay_configuration.rs"]
 mod create_cluster_replay_configuration;
 #[path = "all/delete_cluster_idempotency.rs"]

@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_iotsecuretunneling_iotsecuredtunneling::state::MAX_TAGS_PER_TUNNEL;
 use service_com_amazonaws_iotsecuretunneling_iotsecuredtunneling::{
     ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState as TunnelState, EmulatedService,
 };
@@ -500,6 +501,15 @@ async fn a_tag_write_stamps_the_tunnel_exactly_when_it_changes_what_it_reports()
     }
 }
 
+/// A `TagList` naming one more distinct key than [`MAX_TAGS_PER_TUNNEL`], the
+/// per-tunnel key count this crate publishes, so the request is refused and
+/// stores none of its tags.
+fn past_the_tag_limit() -> Vec<Value> {
+    (0..=MAX_TAGS_PER_TUNNEL)
+        .map(|index| json!({"key": format!("k{index}"), "value": "v"}))
+        .collect()
+}
+
 #[tokio::test]
 async fn a_refused_tag_write_stamps_nothing() {
     // The control for the table: the stamp follows a change the call actually
@@ -539,6 +549,18 @@ async fn a_refused_tag_write_stamps_nothing() {
         (
             "UntagResource",
             json!({"resourceArn": format!("{arn}-missing"), "tagKeys": ["env"]}),
+        ),
+        // The reservation is of the namespace, so a key differing from it only
+        // in letter case is in it too and is refused the same way.
+        (
+            "TagResource",
+            json!({"resourceArn": arn, "tags": [{"key": "AWS:Owner", "value": "x"}]}),
+        ),
+        // A request that would take the tunnel past the per-tunnel key count,
+        // refused by the other guard either tag path applies before it writes.
+        (
+            "TagResource",
+            json!({"resourceArn": arn, "tags": past_the_tag_limit()}),
         ),
     ];
 
