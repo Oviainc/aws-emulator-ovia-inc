@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDelegatedAccessToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDelegatedAccessToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDelegatedAccessToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Exchanges a trade-in token for credentials of the principal that token stands for.
+//!
+//! The exchange is decided by the account's own trade-in token records
+//! ([`crate::state::TradeInToken`]) and by nothing else about the request:
+//!
+//! * a token this account holds no record of is refused with `ValidationError` / HTTP
+//!   400 — the operation models no error for a token it cannot resolve — and that
+//!   decision is taken BEFORE any authorization decision, so a caller a policy denies is
+//!   told the token is invalid rather than that it may not call;
+//! * a token the account holds whose validity window has run out is
+//!   `ExpiredTradeInTokenException` / HTTP 400, the one failure the model declares for a
+//!   token it knows;
+//! * a token the account holds and that is unexpired is exchanged for a session of the
+//!   recorded principal, reported as `AssumedPrincipal` beside the credentials.
+//!
+//! `PackedPolicySize` is left unset: "this field is not populated for
+//! `GetDelegatedAccessToken`" (the member's own `@deprecated` message in this service's
+//! model).
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +175,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDelegatedAccessToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDelegatedAccessTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDelegatedAccessToken"))
+        use crate::state::{
+            NewSession, SessionKind, EXPIRED_TRADE_IN_TOKEN_MESSAGE,
+            INVALID_TRADE_IN_TOKEN_MESSAGE,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service has no store on the engine it was mounted on, so it cannot
+            // serve anything. The router builds the one engine that does, so this is
+            // unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetDelegatedAccessToken",
+            ));
+        };
+        let store = ctx.credential_store();
+        let now = ::std::time::SystemTime::now();
+
+        let mut registry = state.lock();
+        // Expiries the clock has already made due are materialised first, so a record
+        // whose retention window has run out is gone whether or not anybody called.
+        registry.expire_trade_in_tokens(now);
+
+        // What the token stands for is decided by the record the account holds for it and
+        // by nothing in the request: the presented value is the registry key, so a token
+        // nothing recorded resolves to nothing at all. The token is what this operation
+        // takes, so its validity is decided before any authorization question — a caller
+        // a policy denies is told the token is invalid, not that it may not call.
+        let Some(presented) = registry.trade_in_token(&input.trade_in_token).cloned() else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                INVALID_TRADE_IN_TOKEN_MESSAGE,
+            ));
+        };
+        if presented.is_expired(now) {
+            return Err(
+                GetDelegatedAccessTokenErrorModeled::ExpiredTradeInTokenException(
+                    ExpiredTradeInTokenException {
+                        message: Some(EXPIRED_TRADE_IN_TOKEN_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token is evidence at EXCHANGE time only — it "must be valid and unexpired
+        // at the time of the request" (this operation's model) and the credentials it is
+        // exchanged for carry their own session length — so the session is not shortened
+        // to what is left of the token's validity, and the record is left in place:
+        // nothing in the model says one exchange consumes the token.
+        let minted = crate::state::mint_session(
+            store,
+            &mut registry,
+            now,
+            NewSession {
+                role_arn: presented.role_arn.clone(),
+                ..NewSession::new(
+                    presented.assumed_principal.clone(),
+                    SessionKind::AssumedRole,
+                    presented.session_duration_seconds(),
+                )
+            },
+        );
+        let minted = match minted {
+            Ok(minted) => minted,
+            // The bounded session registry is full of sessions that have not expired, so
+            // this one cannot be recorded — and a credential that is not recorded must
+            // not be handed out.
+            Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
+        };
+
+        Ok(GetDelegatedAccessTokenOutput {
+            credentials: Some(minted.credentials),
+            // "The Amazon Resource Name (ARN) of the principal that was assumed when
+            // obtaining the delegated access token", as the record holds it.
+            assumed_principal: Some(presented.assumed_principal.arn),
+            // "This field is not populated for GetDelegatedAccessToken" (the member's
+            // own deprecation message in this service's model).
+            packed_policy_size: None,
+        })
     }
 }

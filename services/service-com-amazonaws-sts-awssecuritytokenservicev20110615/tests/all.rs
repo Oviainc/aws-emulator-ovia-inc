@@ -14,6 +14,9 @@
 #[path = "all/decode_authorization_message.rs"]
 mod decode_authorization_message;
 
+#[path = "all/delegated_access_token.rs"]
+mod delegated_access_token;
+
 #[path = "all/malformed_session_policy.rs"]
 mod malformed_session_policy;
 

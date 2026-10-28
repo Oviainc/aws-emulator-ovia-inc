@@ -282,6 +282,9 @@ pub struct ComAmazonawsStsAwssecuritytokenservicev20110615State {
     /// ever counts up — unlike the registry's size, which shrinks as messages expire
     /// or give way at the cap — which is what makes every token distinct.
     pub authorization_messages_issued: u64,
+    /// Every trade-in token the account holds and has not pruned. At most
+    /// [`MAX_TRADE_IN_TOKENS`] entries. See [`TradeInTokens`].
+    pub trade_in_tokens: TradeInTokens,
 }
 
 /// Shorthand for this service's state, for use inside the crate.
@@ -659,6 +662,216 @@ fn authorization_message_token(document: &str, issued_at: SystemTime, issued: u6
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Trade-in tokens: the delegations a trade-in token can be exchanged for
+// ---------------------------------------------------------------------------
+
+/// The most trade-in tokens this registry holds at once.
+///
+/// A declared ceiling, like the one on every other store here: at the cap the
+/// earliest-issued record gives way, so no path can grow the registry without bound. A
+/// chosen emulator ceiling; AWS publishes no such limit.
+pub const MAX_TRADE_IN_TOKENS: usize = 1024;
+
+/// How long a trade-in token's record is kept after it expires.
+///
+/// Keeping it briefly is what lets a caller still presenting the token be told it
+/// EXPIRED — the one failure the operation models for a token it knows — instead of being
+/// told the token is not one the account holds; past this window the record is pruned, so
+/// an idle emulator's registry shrinks back to the tokens still exchangeable. A chosen
+/// retention window, not a duration AWS documents, and the same one expired sessions get
+/// ([`EXPIRED_SESSION_RETENTION`]).
+pub const EXPIRED_TRADE_IN_TOKEN_RETENTION: Duration = EXPIRED_SESSION_RETENTION;
+
+/// The session length credentials exchanged for a trade-in token last when the record
+/// states none: STS's own default for a session of an assumed principal
+/// ([`ASSUME_ROLE_DEFAULT_DURATION_SECONDS`]), because the credentials this exchange
+/// vends are credentials of an assumed principal and `GetDelegatedAccessToken` takes no
+/// duration of its own.
+pub const DELEGATED_ACCESS_DEFAULT_DURATION_SECONDS: i32 = ASSUME_ROLE_DEFAULT_DURATION_SECONDS;
+
+/// One trade-in token the account holds, keyed in [`TradeInTokens`] by the token value a
+/// request presents.
+///
+/// A trade-in token stands for a DELEGATION established outside this service: no
+/// operation of this model issues one (`smithy_query(query="digest")` binds eleven
+/// operations and none returns a trade-in token), so a record here is what the account
+/// holds about a token some delegation flow handed a caller — which principal the token
+/// speaks for, until when it may be exchanged, and how long the credentials it is
+/// exchanged for last.
+///
+/// No secret lives in the record itself: a trade-in token IS its own bearer credential,
+/// so a registry keyed BY the token holds nothing about it its holder does not already
+/// have, and the record carries nothing that would let a token be derived rather than
+/// presented.
+#[derive(Clone)]
+pub struct TradeInToken {
+    /// The registry key: the token value a request presents.
+    pub token: String,
+    pub issued_at: SystemTime,
+    /// The instant the token stops being exchangeable: "this token must be valid and
+    /// unexpired at the time of the request"
+    /// (`GetDelegatedAccessTokenRequest$TradeInToken`, this service's model).
+    pub expires_at: SystemTime,
+    /// The principal the token stands for — "the principal that was assumed when
+    /// obtaining the delegated access token" — whose ARN the exchange reports as
+    /// `AssumedPrincipal` and whose identity the vended credentials speak for.
+    pub assumed_principal: Identity,
+    /// The ARN of the ROLE the assumed principal is a session of, when it is one: the
+    /// spelling a trust policy names if these credentials chain into another role. See
+    /// [`Session::role_arn`].
+    pub role_arn: Option<String>,
+    /// How long the credentials exchanged for this token last, or `None` for
+    /// [`DELEGATED_ACCESS_DEFAULT_DURATION_SECONDS`].
+    pub duration_seconds: Option<i32>,
+}
+
+/// Renders the delegation and the window, and NOT the token: the value is a bearer of the
+/// principal it names, so a derived rendering would put it into whatever formatted the
+/// record, a log line included.
+impl ::std::fmt::Debug for TradeInToken {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("TradeInToken")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("assumed_principal", &self.assumed_principal)
+            .field("role_arn", &self.role_arn)
+            .field("duration_seconds", &self.duration_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TradeInToken {
+    /// Whether the clock has passed this token's expiry.
+    #[must_use]
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        now >= self.expires_at
+    }
+
+    /// The session length credentials exchanged for this token last.
+    #[must_use]
+    pub fn session_duration_seconds(&self) -> i32 {
+        self.duration_seconds
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(DELEGATED_ACCESS_DEFAULT_DURATION_SECONDS)
+    }
+}
+
+/// Every trade-in token the account holds and this registry has not pruned, keyed by the
+/// token value a request presents.
+#[derive(Default)]
+pub struct TradeInTokens {
+    held: HashMap<String, TradeInToken>,
+}
+
+/// Reports how many records are held and nothing else, for the reason
+/// [`TradeInToken`]'s own rendering withholds the token: the KEYS of this registry are
+/// the tokens themselves, so a derived rendering would put every outstanding one into
+/// whatever formatted the store. A record is still readable through
+/// [`TradeInTokens::held`] by a caller that already holds the token.
+impl ::std::fmt::Debug for TradeInTokens {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("TradeInTokens")
+            .field("held", &self.held.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl TradeInTokens {
+    /// The record a presented token names, EXPIRED OR NOT: a token the account holds and
+    /// that has run out is a different answer from one it holds no record of, so the
+    /// expiry is the caller's decision to take ([`TradeInToken::is_expired`]).
+    ///
+    /// A READ: nothing is dropped here, so two callers presenting one token are answered
+    /// alike.
+    #[must_use]
+    pub fn held(&self, token: &str) -> Option<&TradeInToken> {
+        self.held.get(token)
+    }
+
+    /// How many records the registry holds, expired ones included until they are pruned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether the registry holds no trade-in token at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// Materialise every expiry the clock has already made due: a record whose
+    /// [`EXPIRED_TRADE_IN_TOKEN_RETENTION`] window has run out is dropped, which is owed
+    /// at the same instant whether or not anybody called. Inside the window the record is
+    /// kept, so a caller presenting an expired token is told it EXPIRED rather than that
+    /// the account holds no such token.
+    pub fn prune(&mut self, now: SystemTime) {
+        self.held
+            .retain(|_, token| now < token.expires_at + EXPIRED_TRADE_IN_TOKEN_RETENTION);
+    }
+
+    /// Record a trade-in token the account holds, bounded by [`MAX_TRADE_IN_TOKENS`]:
+    /// expiries the clock has made due are materialised first, and at the cap the
+    /// earliest-issued record gives way, so NO path can push the registry past the cap.
+    pub fn record(&mut self, token: TradeInToken, now: SystemTime) {
+        self.prune(now);
+        while self.held.len() >= MAX_TRADE_IN_TOKENS {
+            let oldest = self
+                .held
+                .iter()
+                .min_by(|(one_key, one), (other_key, other)| {
+                    (one.issued_at, one_key.as_str()).cmp(&(other.issued_at, other_key.as_str()))
+                })
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    self.held.remove(&key);
+                }
+                None => break,
+            }
+        }
+        self.held.insert(token.token.clone(), token);
+    }
+}
+
+impl StsState {
+    /// The trade-in token record a presented token names, expired or not. See
+    /// [`TradeInTokens::held`].
+    pub fn trade_in_token(&self, token: &str) -> Option<&TradeInToken> {
+        self.trade_in_tokens.held(token)
+    }
+
+    /// Materialise every trade-in-token expiry the clock has already made due. See
+    /// [`TradeInTokens::prune`].
+    pub fn expire_trade_in_tokens(&mut self, now: SystemTime) {
+        self.trade_in_tokens.prune(now);
+    }
+
+    /// Record a trade-in token the account holds. See [`TradeInTokens::record`].
+    pub fn record_trade_in_token(&mut self, token: TradeInToken, now: SystemTime) {
+        self.trade_in_tokens.record(token, now);
+    }
+}
+
+/// How AWS words the refusal of a trade-in token this account holds no record of.
+///
+/// The operation models no error for a token it cannot resolve at all — only for one it
+/// knows and that has EXPIRED — so the refusal is the service's own `ValidationError`
+/// (HTTP 400) carrying this sentence. It is fixed text: the token is `@sensitive` in this
+/// service's model, so the value presented is not echoed back, and nothing else of the
+/// request appears in it either.
+pub const INVALID_TRADE_IN_TOKEN_MESSAGE: &str = "Invalid trade-in token";
+
+/// How this service words the refusal of a trade-in token the account HOLDS but whose
+/// validity window has run out: `ExpiredTradeInTokenException`'s runtime message, in the
+/// same sentence shape STS states an expired credential with
+/// ([`ExpiredSession::message`]) and likewise carrying nothing of the request.
+pub const EXPIRED_TRADE_IN_TOKEN_MESSAGE: &str =
+    "The trade-in token included in the request is expired";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
