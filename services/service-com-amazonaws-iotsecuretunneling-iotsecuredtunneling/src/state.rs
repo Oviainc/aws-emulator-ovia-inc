@@ -360,6 +360,21 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
         self.tunnels.get_mut(&tunnel_key(region, tunnel_id))
     }
 
+    /// Stamp the tunnel `tunnel_id` names in `region` as last updated at `at`.
+    ///
+    /// `Tunnel$lastUpdatedAt` is "The last time the tunnel was updated", so
+    /// every call that changes something the tunnel reports goes through here
+    /// with the instant of its change — whichever member of the record it wrote,
+    /// and including the tag set, which `DescribeTunnel` reports inside the same
+    /// `Tunnel` shape as this stamp. A call that changed nothing has nothing to
+    /// report and so does not call this, exactly as [`StoredTunnel::close`]
+    /// leaves an already-closed record's stamps alone.
+    pub fn stamp_tunnel_updated(&mut self, region: &str, tunnel_id: &str, at: SystemTime) {
+        if let Some(tunnel) = self.tunnel_mut(region, tunnel_id) {
+            tunnel.last_updated_at = at;
+        }
+    }
+
     /// Every tunnel `region`'s endpoint holds, in `tunnelId` order.
     ///
     /// The keys are ordered by Region first, so one Region's records are a
@@ -479,6 +494,46 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
             .unwrap_or_default();
         keys.extend(incoming.iter().map(|tag| tag.key.as_str()));
         keys.len()
+    }
+
+    /// Merge `tags` into the tag store of the resource `arn` names, and report
+    /// whether the stored set CHANGED.
+    ///
+    /// A tag whose key is already stored with the same value leaves the set
+    /// exactly as it is, so `false` means the resource is unchanged and its
+    /// `lastUpdatedAt` has nothing to record (see
+    /// [`Self::stamp_tunnel_updated`]).
+    pub fn put_tags(&mut self, arn: &str, tags: &[Tag]) -> bool {
+        if tags.is_empty() {
+            return false;
+        }
+        let stored = self.tags.entry(arn.to_string()).or_default();
+        let mut changed = false;
+        for tag in tags {
+            let previous = stored.insert(tag.key.clone(), tag.value.clone());
+            changed |= previous.as_deref() != Some(tag.value.as_str());
+        }
+        changed
+    }
+
+    /// Remove `keys` from the tag store of the resource `arn` names, and report
+    /// whether the stored set CHANGED.
+    ///
+    /// A key that is not stored is left alone rather than refused, so `false`
+    /// means the resource carried none of the named keys and is unchanged.
+    pub fn remove_tags<'key>(
+        &mut self,
+        arn: &str,
+        keys: impl IntoIterator<Item = &'key str>,
+    ) -> bool {
+        let Some(stored) = self.tags.get_mut(arn) else {
+            return false;
+        };
+        let mut changed = false;
+        for key in keys {
+            changed |= stored.remove(key).is_some();
+        }
+        changed
     }
 
     /// The tags stored for `arn`, as the modelled list — `None` when there are
