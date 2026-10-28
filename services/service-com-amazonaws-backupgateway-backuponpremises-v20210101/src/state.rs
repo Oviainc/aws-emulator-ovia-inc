@@ -735,6 +735,14 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// enforce it.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The prefix an Amazon Web Services tag key must not start with.
+///
+/// From the modelled doc of `Tag$Key`: "The key can't start with `aws:`" — the prefix AWS
+/// reserves for the tags it generates itself. The `TagKey` `@pattern` admits it, so the
+/// rule is not refused at the boundary and [`validate_tag_pair`] enforces it for every
+/// member that targets that shape. Matched case-insensitively, as the reservation is.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// One activation this service has ISSUED and no create has redeemed yet.
 ///
 /// Keyed in the store by the activation key itself: the key is what a create presents, so
@@ -2418,19 +2426,67 @@ fn page_of_where<T: Clone>(
     }
 }
 
+/// Check ONE Amazon Web Services tag key/value pair, wherever in this model a request
+/// carries such a pair to be persisted — `member` is the member it arrived in, which the
+/// refusal names the way the boundary validator names a member it refuses itself.
+///
+/// Two rules, both from the model's docs rather than its traits — so the boundary
+/// validator cannot have refused them already, whichever member targets the `TagKey` and
+/// `TagValue` shapes:
+///
+/// * a tag key "can't start with `aws:`" (that prefix is reserved for AWS-generated
+///   tags), which `TagKey`'s `@pattern` allows;
+/// * "Spaces are not allowed in tag values" (the `Tag` shape's own doc), which
+///   `TagValue`'s `@pattern` of `^[^\x00]*$` admits. A space is read as the whole Unicode
+///   whitespace family — deliberately wider than `U+0020`, since a tab or a line break
+///   separates words exactly as a space does — where a KEY is allowed every separator its
+///   pattern spells out as `\p{Z}`, so a key may carry spaces and a value may not.
+///
+/// `Err` carries the sentence the refusal states, in which case the caller writes
+/// NOTHING.
+pub fn validate_tag_pair(key: &str, value: &str, member: &str) -> Result<(), String> {
+    if key.to_ascii_lowercase().starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Err(format!(
+            "Value '{key}' at '{member}' failed to satisfy constraint: a tag key must not \
+             start with the reserved prefix '{RESERVED_TAG_KEY_PREFIX}'"
+        ));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "Value '{value}' at '{member}' failed to satisfy constraint: a tag value must \
+             not contain spaces"
+        ));
+    }
+    Ok(())
+}
+
+/// Check the AWS tag pairs a request's `VmwareToAwsTagMappings` carries, by the same
+/// rules as every other AWS tag pair this service persists ([`validate_tag_pair`]).
+///
+/// `VmwareToAwsTagMapping$AwsTagKey` and `$AwsTagValue` target the very `TagKey` and
+/// `TagValue` shapes `Tag$Key` and `Tag$Value` do, so a pair this service would refuse as
+/// a resource tag is refused here too. The VMware half of a mapping (`VmwareCategory`,
+/// `VmwareTagName`) names a tag of the hypervisor rather than an AWS tag, so these rules
+/// do not reach it.
+///
+/// `Err` carries the sentence the refusal states, and nothing is written.
+pub fn validate_tag_mappings(mappings: &[VmwareToAwsTagMapping]) -> Result<(), String> {
+    for mapping in mappings {
+        validate_tag_pair(
+            &mapping.aws_tag_key,
+            &mapping.aws_tag_value,
+            "VmwareToAwsTagMappings",
+        )?;
+    }
+    Ok(())
+}
+
 /// Merge a request's `Tags` into the tags a resource already carries, refusing what the
 /// model's own traits cannot express.
 ///
-/// Three rules, all from the model's docs rather than its traits — so the boundary
-/// validator cannot have refused them already:
-///
-/// * `Tag$Key` "can't start with `aws:`" (that prefix is reserved for AWS-generated
-///   tags), which the member's `@pattern` allows;
-/// * "Spaces are not allowed in tag values" (the `Tag` shape's own doc), which
-///   `TagValue`'s `@pattern` of `^[^\x00]*$` admits — a space in any of its forms, the
-///   family the `TagKey` pattern spells out as `\p{Z}` where it deliberately DOES admit
-///   it, so a key may carry spaces and a value may not;
-/// * a resource carries at most [`MAX_TAGS_PER_RESOURCE`] tags.
+/// Each requested pair satisfies the tag rules [`validate_tag_pair`] states, and a
+/// resource carries at most [`MAX_TAGS_PER_RESOURCE`] tags — the one rule of the three
+/// that is about the resource rather than a single pair.
 ///
 /// `Err` carries the sentence the refusal states. Merging is by key, so a key already
 /// present is overwritten rather than duplicated.
@@ -2440,20 +2496,7 @@ pub fn merged_tags(
 ) -> Result<BTreeMap<String, String>, String> {
     let mut merged = existing.clone();
     for tag in requested {
-        if tag.key.to_ascii_lowercase().starts_with("aws:") {
-            return Err(format!(
-                "Value '{}' at 'Tags' failed to satisfy constraint: a tag key must not \
-                 start with the reserved prefix 'aws:'",
-                tag.key
-            ));
-        }
-        if tag.value.chars().any(char::is_whitespace) {
-            return Err(format!(
-                "Value '{}' at 'Tags' failed to satisfy constraint: a tag value must not \
-                 contain spaces",
-                tag.value
-            ));
-        }
+        validate_tag_pair(&tag.key, &tag.value, "Tags")?;
         merged.insert(tag.key.clone(), tag.value.clone());
     }
     if merged.len() > MAX_TAGS_PER_RESOURCE {

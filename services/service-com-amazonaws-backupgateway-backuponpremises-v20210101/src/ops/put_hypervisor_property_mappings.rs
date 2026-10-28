@@ -17,6 +17,12 @@
 //! it leaves the record exactly as one call left it and no mapping of an earlier call
 //! survives a later one.
 //!
+//! A mapping's AWS half is an Amazon Web Services tag pair — `AwsTagKey` and `AwsTagValue`
+//! target the very shapes a resource tag's key and value do — so it satisfies the tag
+//! rules the model states only in prose
+//! ([`crate::state::validate_tag_mappings`]): a put carrying a reserved key or a value
+//! with a space is refused with HTTP 400 `ValidationException` and nothing is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -193,15 +199,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // `HypervisorArn`'s and `IamRoleArn`'s lengths and patterns, and every member of
+        // every `VmwareToAwsTagMapping`, are refused by the boundary validator before
+        // `handle` runs, so reaching here means the input satisfies all of them. What the
+        // model does NOT express is the tag rules its docs state for the AWS half of a
+        // mapping — `AwsTagKey` and `AwsTagValue` target the very `TagKey` and `TagValue`
+        // shapes a resource tag's key and value do — which
+        // `crate::state::validate_tag_mappings` states and refuses, as `tag_map` does for
+        // a request's `Tags`. It is a fact of the REQUEST, so it is answered before the
+        // store is consulted at all and nothing is written.
+        crate::state::validate_tag_mappings(&input.vmware_to_aws_tag_mappings).map_err(
+            |message| {
+                PutHypervisorPropertyMappingsErrorModeled::ValidationException(
+                    ValidationException {
+                        error_code: None,
+                        message: Some(message),
+                    },
+                )
+            },
+        )?;
+
+        // What is left is a fact of the STORE: which appliance would apply these mappings.
+        //
         // One guard spans the gate and the write, so the record the gate passed is the
         // record the mappings are written to.
         let mut store = state.lock();
 
-        // `HypervisorArn`'s and `IamRoleArn`'s lengths and patterns, and every member of
-        // every `VmwareToAwsTagMapping`, are refused by the boundary validator before
-        // `handle` runs, so reaching here means the input satisfies all of them. What is
-        // left is a fact of the STORE: which appliance would apply these mappings.
-        //
         // The GATEWAY gate comes first. A property mapping is applied to the hypervisor's
         // entities by the backup gateway appliance that serves it, so a put for a
         // hypervisor no gateway is associated with reaches no appliance that could carry

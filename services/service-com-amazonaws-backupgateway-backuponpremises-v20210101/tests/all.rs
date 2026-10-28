@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/aws_tag_rules_span_every_tag_pair.rs"]
+mod aws_tag_rules_span_every_tag_pair;
 #[path = "all/bandwidth_rate_limit_schedule.rs"]
 mod bandwidth_rate_limit_schedule;
 #[path = "all/bandwidth_rate_limit_schedule_consistency.rs"]
