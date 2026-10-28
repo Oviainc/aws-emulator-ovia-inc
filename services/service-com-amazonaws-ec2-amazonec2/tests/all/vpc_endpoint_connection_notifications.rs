@@ -793,9 +793,9 @@ async fn a_page_is_cut_from_the_filtered_set() {
     );
 }
 
-/// `MaxResults` is accepted at each bound this service serves and refused outside them: the
-/// model declares no range on the member and this operation documents none, so the bound is
-/// the service's own largest page.
+/// `MaxResults` is accepted at each bound this service serves and above it, and refused
+/// only for a page of none: the model declares no range on the member and this operation
+/// documents none, so a size above the service's largest page asks for that page.
 #[tokio::test]
 async fn max_results_is_accepted_at_its_bounds_and_refused_outside_them() {
     let (router, engine) = super::ec2_query::emulator();
@@ -808,7 +808,7 @@ async fn max_results_is_accepted_at_its_bounds_and_refused_outside_them() {
         (0, 400),
         (1, 200),
         (largest, 200),
-        (largest + 1, 400),
+        (largest + 1, 200),
     ];
     for (max_results, expected_status) in cases {
         let (status, body) = describe(&router, &max_results_param(max_results)).await;

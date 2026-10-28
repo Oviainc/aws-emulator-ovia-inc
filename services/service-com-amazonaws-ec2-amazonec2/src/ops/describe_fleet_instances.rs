@@ -167,18 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model declares no `@range` on `MaxResults`
         // (`smithy_query(query="operation",operation="DescribeFleetInstances")` targets a
-        // plain `Integer`), so the handler is the only place a page size can be bounded —
-        // and an unbounded one is how a caller asks for the whole fleet in one answer.
+        // plain `Integer`), so the only bound on the page size is the largest page this
+        // operation serves: a value above it is not refused, it is served as that page with
+        // a `NextToken` for the rest (the clamp below). A page of NONE is not a page, so
+        // zero and below is still refused.
         if let Some(max_results) = input.max_results {
             if max_results < 1 {
                 return Err(Scaffolded::invalid_parameter_value(format!(
                     "Invalid value '{max_results}' for maxResults. It must be at least 1"
-                )));
-            }
-            if usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. It must be at most \
-                     {MAX_PAGE_SIZE}"
                 )));
             }
         }

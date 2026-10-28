@@ -421,14 +421,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          RunInstances tag specification"
                     )));
                 }
-                // The member documents four resource types; only the instance is a
-                // resource this slice stores, so tags for the other three could
-                // never be read back. Refused rather than accepted and discarded.
-                if resource_type != "instance" {
-                    return Err(Scaffolded::not_implemented(&format!(
-                        "RunInstances tagging a '{resource_type}' on launch"
-                    )));
-                }
             }
             for tag in specification.tags.iter().flatten() {
                 validate_tag_size(
@@ -532,6 +524,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|group_name| (None, Some(group_name.clone()))),
             )
             .collect();
+        // "The tags to apply to the resources that are created during instance launch"
+        // (`TagSpecifications`): each specification tags the resources of ITS OWN type, so
+        // the instance carries the `instance` entries and nothing else. A specification for
+        // one of the other documented types names a resource this launch does not mint
+        // (this slice stores no volume, network interface or Spot Instance request for a
+        // launch), so its tags are carried by no resource here — they must not land on the
+        // instance, which would report a tag the caller set on something else.
         let mut tags = ::std::collections::BTreeMap::new();
         for specification in input.tag_specifications.iter().flatten() {
             if specification.resource_type.as_deref() != Some("instance") {

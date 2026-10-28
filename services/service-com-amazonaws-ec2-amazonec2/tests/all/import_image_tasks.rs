@@ -1288,7 +1288,7 @@ async fn paging_covers_every_task_exactly_once_for_each_page_size() {
     for (case, max_results, expected_status) in [
         ("the smallest page size", "1".to_string(), 200_u16),
         ("the largest page size", MAX_PAGE_SIZE.to_string(), 200),
-        ("one past the largest", (MAX_PAGE_SIZE + 1).to_string(), 400),
+        ("one past the largest", (MAX_PAGE_SIZE + 1).to_string(), 200),
         ("a page of none", "0".to_string(), 400),
     ] {
         let (status, body) = describe(&router, &[p("MaxResults", max_results.clone())]).await;

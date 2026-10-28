@@ -190,17 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The maximum number of items to return for this request" carries a modelled
-        // minimum but no maximum, so the handler is the only place the page size can be
-        // bounded; one above the service's ceiling is refused rather than silently cut
-        // down.
-        if let Some(max_results) = input.max_results {
-            if usize::try_from(max_results).unwrap_or(usize::MAX) > MAX_PAGE_SIZE {
-                return Err(invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. \
-                     It must be at most {MAX_PAGE_SIZE}"
-                )));
-            }
-        }
+        // minimum but no maximum, so above that minimum the only bound on the page size is
+        // the largest page this operation serves: a value above it is not refused, it is
+        // served as that page with a `NextToken` for the rest (the clamp below).
 
         let scope = resolve_scope(
             input.include_all_resource_types.unwrap_or(false),
