@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelImportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelImportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: cancels the import image or import snapshot task the request names in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelImportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Cancels an IN-PROCESS import virtual machine or import snapshot task"
+//! (`CancelImportTask`): a task that is not importing any more has nothing left to cancel,
+//! so it is refused with `IncorrectState` and the state it is in, and only an `active` task
+//! is cancelled. A cancel that is admitted puts the task into the non-terminal `deleting`
+//! state and the clock owes it `deleted`
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::start_import_task_cancellation`]), so
+//! the response reports the state the task was in beside the state it is in now, both read
+//! off the store rather than assumed.
+//!
+//! `ImportTaskId` carries no modelled pattern, so the id form is the one the operations
+//! that MINT an import task id use — `import-ami-<hex>` for an import IMAGE task and
+//! `import-snap-<hex>` for an import SNAPSHOT task, the two kinds the member documents
+//! ("the ID of the import image or import snapshot task to be canceled"), read through the
+//! crate's one reader of that form ([`crate::state::import_image_task_id_is_well_formed`],
+//! [`crate::state::import_snapshot_task_id_is_well_formed`]). An id outside both forms is
+//! not an EC2 resource id at all, so it is refused `InvalidID` BEFORE any lookup, and only
+//! an id EC2 could have issued that resolves to nothing is answered
+//! [`crate::state::invalid_conversion_task_id_not_found`].
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +149,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelImportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelImportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelImportTask"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            IMPORT_TASK_STATE_ACTIVE, MAX_IMPORT_TASK_CANCEL_REASON_CHARS,
+            import_image_task_id_is_well_formed, import_snapshot_task_id_is_well_formed,
+            incorrect_state_of, invalid_conversion_task_id_not_found, require_service_state,
+        };
+
+        // An import task carries no Region member of its own (it has no ARN and no zone),
+        // so nothing here depends on the Region the request was signed for.
+        let _ = ctx;
+
+        // `ImportTaskId` is not modelled `@required`, so a request naming no task at all —
+        // or naming it empty, which an ec2Query body cannot tell from absent — reaches this
+        // handler, and names no task to cancel.
+        let Some(import_task_id) = input
+            .import_task_id
+            .as_deref()
+            .filter(|task_id| !task_id.is_empty())
+        else {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain the parameter importTaskId",
+            ));
+        };
+
+        // An id that is not one EC2 issues for an import task of either kind names no
+        // resource to look up, so it is refused before the store is reached.
+        if !import_image_task_id_is_well_formed(import_task_id)
+            && !import_snapshot_task_id_is_well_formed(import_task_id)
+        {
+            return Err(Scaffolded::invalid_id(import_task_id));
+        }
+
+        // The reason is retained on the task it cancels for the process's lifetime, and the
+        // model bounds its length nowhere, so the bound is enforced here — before anything
+        // is read or written.
+        if input
+            .cancel_reason
+            .as_ref()
+            .is_some_and(|reason| reason.chars().count() > MAX_IMPORT_TASK_CANCEL_REASON_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "cancelReason accepts at most {MAX_IMPORT_TASK_CANCEL_REASON_CHARS} characters"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let now = ::std::time::Instant::now();
+        // Every clock-owed move is applied before the task's state is read, so the cancel is
+        // judged against the state the caller would be shown: an import whose completion
+        // fell due is `completed` here, and a cancellation already working through has
+        // reached `deleted` once its own instant has passed. Each was owed at this instant
+        // whether or not anybody called.
+        store.materialize_due_transitions();
+
+        let Some(previous_state) = store.import_task_state(import_task_id) else {
+            return Err(invalid_conversion_task_id_not_found(import_task_id));
+        };
+        // Only a task that is still importing can be cancelled: one already cancelling,
+        // cancelled or completed is refused with the state it is in, worded the one way this
+        // crate words a refusal for the state of the resource the request names
+        // ([`crate::state::incorrect_state_of`]).
+        if previous_state != IMPORT_TASK_STATE_ACTIVE {
+            return Err(incorrect_state_of(
+                "Import task",
+                import_task_id,
+                &previous_state,
+            ));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        store.start_import_task_cancellation(import_task_id, now, input.cancel_reason.as_deref());
+        // Read the state back OUT of the store, so the caller is told what a later describe
+        // of this task will report rather than what this handler meant to write.
+        let state_now = store.import_task_state(import_task_id).ok_or_else(|| {
+            Scaffolded::internal_error(format!(
+                "import task '{import_task_id}' was not cancelled by this request"
+            ))
+        })?;
+        Ok(CancelImportTaskOutput {
+            import_task_id: Some(import_task_id.to_string()),
+            previous_state: Some(previous_state),
+            state: Some(state_now),
+        })
     }
 }

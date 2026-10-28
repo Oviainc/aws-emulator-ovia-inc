@@ -260,6 +260,12 @@ fn directory(region: &str, endpoint_id: &str) -> RtResponse {
     response(200, JSON_CONTENT_TYPE, document.to_string())
 }
 
+/// The HTTP field the nonce is carried in, under the canonical name RFC 8555 §7.2 spells
+/// it with — the name an ACME client reads the nonce back by, and the one this service's
+/// answer states. HTTP field names are case-insensitive, so what a client matches is this
+/// name however the transport that writes it cases the bytes.
+const REPLAY_NONCE_FIELD: &str = "Replay-Nonce";
+
 /// The `newNonce` answer: an empty body carrying a fresh nonce.
 ///
 /// RFC 8555 §7.2 fixes all three headers: the `Replay-Nonce` field carries the nonce,
@@ -267,7 +273,9 @@ fn directory(region: &str, endpoint_id: &str) -> RtResponse {
 /// directive", and §7.1 asks for the `Link` field pointing at the directory.
 fn nonce(status: u16, directory_url: &str) -> RtResponse {
     let mut answer = response(status, JSON_CONTENT_TYPE, String::new());
-    answer.headers_mut().insert("replay-nonce", mint_nonce());
+    answer
+        .headers_mut()
+        .insert(REPLAY_NONCE_FIELD, mint_nonce());
     answer.headers_mut().insert("cache-control", "no-store");
     index_link(&mut answer, directory_url);
     answer

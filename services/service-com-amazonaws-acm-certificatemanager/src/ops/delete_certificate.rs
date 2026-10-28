@@ -181,7 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at the certificate, so a caller whose identity-based policies
+        // do not allow the action is refused and nothing is deleted. `ctx` carries the
+        // credential the request presented, which is who is judged
+        // ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.certificate_arn,
+        )
+        .map_err(DeleteCertificateErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteCertificateErrorModeled::ValidationException(
                 ValidationException {
