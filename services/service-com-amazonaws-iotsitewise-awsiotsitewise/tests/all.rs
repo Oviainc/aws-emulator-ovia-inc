@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `list_workspaces` is declared HERE, beside the note above, rather than in the
+// sorted list or at the END of the file: those are the two stretches every
+// concurrent iotsitewise change puts a declaration of its own in. Fold it into
+// the list once the churn settles.
+#[path = "all/list_workspaces.rs"]
+mod list_workspaces;
+
 // `delete_dataset` is declared HERE, beside the note above, for the reason it
 // gives: the sorted list and the END of this file are both where every concurrent
 // iotsitewise change puts a declaration of its own. Fold it into the list once the

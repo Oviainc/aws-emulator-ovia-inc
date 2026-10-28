@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkspaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkspaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkspaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below enumerates the workspaces `CreateWorkspace`
+//! persisted, in a stable total order, and answers the page the request's
+//! `maxResults` and `nextToken` select — a pure read, with every reported member
+//! taken off the stored record and the status DERIVED from the instant the
+//! workspace's owed transition falls due.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +148,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkspaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkspacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkspaces"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every member reported below is read off the stored record, and the
+        // status is DERIVED from the instant the transition the workspace owes falls
+        // due, so this listing moves no workspace on and a listed workspace and a
+        // described one cannot disagree.
+        let store = state.lock();
+
+        // Every workspace the store holds: this operation is account-and-region wide
+        // and models no filter, so nothing is excluded.
+        let mut workspaces: Vec<&crate::state::WorkspaceRecord> =
+            store.workspaces.values().collect();
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by name so two workspaces created in the same instant still order
+        // deterministically.
+        workspaces.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        // This enumeration's resume point is a workspace's name — what identifies one
+        // in this account and region — and the page walk every paginated listing of
+        // this service shares takes it from there: it resumes at the token's
+        // workspace, refusing a token whose resume point is not in this enumeration
+        // rather than answering an empty page, which would report absence as success;
+        // it cuts the page at `maxResults`, defaulting to the size this operation's
+        // `maxResults` documents; and it mints "the token for the next set of results,
+        // or null if there are no additional results" off the workspace that follows
+        // the page.
+        let page = crate::state::page_of(
+            &workspaces,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.name.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
+
+        Ok(ListWorkspacesOutput {
+            workspace_summaries: workspaces[page.start..page.end]
+                .iter()
+                .map(|record| summary(record, now))
+                .collect(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The page size this operation's `maxResults` documents when the caller sends none.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored workspace as the summary this operation reports, read straight off the
+/// record `CreateWorkspace` persisted and `UpdateWorkspace` writes to, so a listed
+/// workspace and a described one never disagree.
+fn summary(
+    record: &crate::state::WorkspaceRecord,
+    now: ::std::time::SystemTime,
+) -> WorkspaceSummary {
+    WorkspaceSummary {
+        name: record.name.clone(),
+        arn: record.arn.clone(),
+        // Derived from the stored due instant, so this read reports the state the
+        // clock owes the workspace without writing anything.
+        status: record.status(now),
+        created_at: crate::state::to_date_time(record.creation_date),
+        updated_at: crate::state::to_date_time(record.last_update_date),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListWorkspacesError {
+    ListWorkspacesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListWorkspacesError {
+    ListWorkspacesErrorModeled::InternalFailureException(InternalFailureException { message }).into()
 }
