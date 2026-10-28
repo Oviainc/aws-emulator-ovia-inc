@@ -11,10 +11,11 @@
 //! charge", `smithy_query(query="shape", shape="Charge")`) is refused in the
 //! service's modelled `ValidationException` (HTTP 400) under the
 //! `ValidationExceptionReason` that names the member
-//! (`INVALID_CHARGE_REVISION`), writing nothing — while an association that
-//! states no revision states no precondition and is applied. The rule holds on
-//! both operations the member reaches the store through: `UpdatePurchaseOrders`
-//! and `AcceptAgreementRequest$purchaseOrders`.
+//! (`INVALID_CHARGE_REVISION`), writing nothing — and an association that states
+//! no revision at all states no precondition, so it is refused under the reason
+//! for that member being absent (`MISSING_CHARGE_REVISION`) rather than applied
+//! blind. The rule holds on both operations the member reaches the store
+//! through: `UpdatePurchaseOrders` and `AcceptAgreementRequest$purchaseOrders`.
 //!
 //! The rows differ in what the rule generalises over: whether the member is
 //! stated at all, how far the stated revision is from the charge's own (one
@@ -36,16 +37,22 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_lifecycle::{accept, call, emulator, Answer};
 use crate::payment_requests::{agreement_with_variable_term, get, sent};
-use crate::purchase_order_associations::{order, quote};
+use crate::purchase_order_associations::{order_at, quote};
 use crate::purchase_order_updates::{agreement_holding, charges, items, references, update};
 
 /// The `ValidationExceptionReason` the model publishes for a revision the charge
 /// is not at (`smithy_query(query="shape", shape="ValidationExceptionReason")`).
 const INVALID_CHARGE_REVISION: &str = "INVALID_CHARGE_REVISION";
 
+/// The reason that model publishes for the same member not being stated at all.
+const MISSING_CHARGE_REVISION: &str = "MISSING_CHARGE_REVISION";
+
 /// The sentence this service's `ValidationException` states for that reason,
 /// which names the member the request got wrong.
 const INVALID_CHARGE_REVISION_MESSAGE: &str = "Provided charge revision is invalid.";
+
+/// The sentence stated for the member being absent.
+const MISSING_CHARGE_REVISION_MESSAGE: &str = "Provided charge revision is missing.";
 
 /// `ChargeRevision` is `@range(min: 1)`
 /// (`smithy_query(query="shape", shape="ChargeRevision")`), so this is the
@@ -104,6 +111,16 @@ fn stated(revision: Stated, reported: i64) -> Option<i64> {
     }
 }
 
+/// The `reason` and `message` an element stating `revision` is refused under: a
+/// member left out is the MISSING_ reason, a member stating a revision the
+/// charge is not at the INVALID_ one.
+fn refusal_of(revision: Stated) -> (&'static str, &'static str) {
+    match revision {
+        Stated::Omitted => (MISSING_CHARGE_REVISION, MISSING_CHARGE_REVISION_MESSAGE),
+        _ => (INVALID_CHARGE_REVISION, INVALID_CHARGE_REVISION_MESSAGE),
+    }
+}
+
 /// One element of a row's list: the position of the charge it names among the
 /// agreement's charges, and the revision it states about it.
 type Element = (usize, Stated);
@@ -124,7 +141,7 @@ fn rows() -> Vec<Row> {
             case: "no revision stated at all",
             charges: 2,
             elements: &[(0, Stated::Omitted)],
-            refused_at: None,
+            refused_at: Some(1),
         },
         Row {
             case: "the revision the charge is at",
@@ -175,7 +192,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "every element stating the revision its charge is at",
             charges: 3,
-            elements: &[(0, Stated::Reported), (1, Stated::Omitted), (2, Stated::Reported)],
+            elements: &[(0, Stated::Reported), (1, Stated::Reported), (2, Stated::Reported)],
             refused_at: None,
         },
         Row {
@@ -194,11 +211,29 @@ fn rows() -> Vec<Row> {
             case: "a wrong revision on the last element of three",
             charges: 3,
             elements: &[
-                (0, Stated::Omitted),
+                (0, Stated::Reported),
                 (1, Stated::Reported),
                 (2, Stated::OffsetFromReported(3)),
             ],
             refused_at: Some(3),
+        },
+        Row {
+            case: "no revision on the last element of three",
+            charges: 3,
+            elements: &[(0, Stated::Reported), (1, Stated::Reported), (2, Stated::Omitted)],
+            refused_at: Some(3),
+        },
+        Row {
+            case: "no revision on the first element of two",
+            charges: 2,
+            elements: &[(0, Stated::Omitted), (1, Stated::Reported)],
+            refused_at: Some(1),
+        },
+        Row {
+            case: "no revision on the second element of two",
+            charges: 3,
+            elements: &[(0, Stated::Reported), (2, Stated::Omitted)],
+            refused_at: Some(2),
         },
     ]
 }
@@ -209,9 +244,11 @@ fn reference(position: usize) -> String {
 }
 
 /// Assert `answer` is the modelled refusal of the `chargeRevision` of the
-/// `position`-th element of the request's list.
-fn assert_refused(case: &str, answer: &Answer, position: usize) {
+/// `position`-th element of the request's list, under the reason `stated_as`
+/// earns.
+fn assert_refused(case: &str, answer: &Answer, position: usize, stated_as: Stated) {
     let field = format!("purchaseOrders.{position}.member.chargeRevision");
+    let (reason, message) = refusal_of(stated_as);
     assert_eq!(
         answer.status, 400,
         "case {case:?}: expected HTTP 400, got {} with {:?}",
@@ -225,8 +262,8 @@ fn assert_refused(case: &str, answer: &Answer, position: usize) {
     );
     assert_eq!(
         answer.reason(),
-        INVALID_CHARGE_REVISION,
-        "case {case:?}: expected reason {INVALID_CHARGE_REVISION:?}, got {:?}",
+        reason,
+        "case {case:?}: expected reason {reason:?}, got {:?}",
         answer.body
     );
     assert_eq!(
@@ -237,8 +274,8 @@ fn assert_refused(case: &str, answer: &Answer, position: usize) {
     );
     assert_eq!(
         answer.str_at("/message"),
-        INVALID_CHARGE_REVISION_MESSAGE,
-        "case {case:?}: expected the message {INVALID_CHARGE_REVISION_MESSAGE:?}, got {:?}",
+        message,
+        "case {case:?}: expected the message {message:?}, got {:?}",
         answer.body
     );
 }
@@ -258,11 +295,11 @@ async fn an_update_states_the_revision_the_charge_is_at() {
         for (position, (charge, revision)) in row.elements.iter().enumerate() {
             let charge_id = &charge_ids[*charge];
             let reported = reported_revision(&router, &agreement, charge_id).await;
-            let mut element = order(charge_id, &reference(position));
-            if let Some(revision) = stated(*revision, reported) {
-                element["chargeRevision"] = json!(revision);
-            }
-            orders.push(element);
+            orders.push(order_at(
+                charge_id,
+                &reference(position),
+                stated(*revision, reported),
+            ));
         }
 
         let answered = update(&router, Value::Array(orders)).await;
@@ -285,7 +322,9 @@ async fn an_update_states_the_revision_the_charge_is_at() {
                     expected.insert(charge_ids[*charge].clone(), Some(reference(position)));
                 }
             }
-            Some(position) => assert_refused(case, &answered, position),
+            Some(position) => {
+                assert_refused(case, &answered, position, row.elements[position - 1].1)
+            }
         }
         let reported = references(&router, &agreement).await;
         assert_eq!(
@@ -301,9 +340,7 @@ async fn an_update_states_the_revision_the_charge_is_at() {
                 for (position, (charge, _)) in row.elements.iter().enumerate() {
                     let charge_id = &charge_ids[*charge];
                     let reported = reported_revision(&router, &agreement, charge_id).await;
-                    let mut element = order(charge_id, &reference(position));
-                    element["chargeRevision"] = json!(reported);
-                    corrected.push(element);
+                    corrected.push(order_at(charge_id, &reference(position), Some(reported)));
                 }
                 corrected
             };
@@ -348,7 +385,13 @@ async fn an_accepted_list_states_the_revision_its_charges_are_at() {
             case: "no revision stated at all",
             charges: 1,
             elements: &[(0, Stated::Omitted)],
-            refused_at: None,
+            refused_at: Some(1),
+        },
+        Accepted {
+            case: "no revision on the second element of two",
+            charges: 2,
+            elements: &[(0, Stated::Reported), (1, Stated::Omitted)],
+            refused_at: Some(2),
         },
         Accepted {
             case: "the revision the quote's charges are minted at",
@@ -387,11 +430,11 @@ async fn an_accepted_list_states_the_revision_its_charges_are_at() {
             .iter()
             .enumerate()
             .map(|(position, (charge, revision))| {
-                let mut element = order(&charge_ids[*charge], &reference(position));
-                if let Some(revision) = stated(*revision, minted_at) {
-                    element["chargeRevision"] = json!(revision);
-                }
-                element
+                order_at(
+                    &charge_ids[*charge],
+                    &reference(position),
+                    stated(*revision, minted_at),
+                )
             })
             .collect();
 
@@ -424,7 +467,7 @@ async fn an_accepted_list_states_the_revision_its_charges_are_at() {
                 );
             }
             Some(position) => {
-                assert_refused(case, &answered, position);
+                assert_refused(case, &answered, position, row.elements[position - 1].1);
                 // Nothing was accepted: the quote is still acceptable, which is
                 // only true if the refusal ran before anything was written.
                 let retried = accept(&router, json!({"agreementRequestId": request_id})).await;
@@ -475,11 +518,26 @@ async fn the_revision_of_a_charge_an_approval_created_is_the_one_checked() {
         "expected no charge of {agreement} to carry an association yet, got {unassociated:?}"
     );
 
-    // A revision the charge is not at is refused and associates nothing.
-    let mut wrong = order(&charge_id, "PO-approval");
-    wrong["chargeRevision"] = json!(reported + 1);
-    let refused = update(&router, json!([wrong])).await;
-    assert_refused("a charge created by an approval", &refused, 1);
+    // A revision the charge is not at is refused and associates nothing, and so
+    // is an element that states none at all.
+    let refused = update(
+        &router,
+        json!([order_at(&charge_id, "PO-approval", Some(reported + 1))]),
+    )
+    .await;
+    assert_refused(
+        "a charge created by an approval",
+        &refused,
+        1,
+        Stated::OffsetFromReported(1),
+    );
+    let unstated = update(&router, json!([order_at(&charge_id, "PO-approval", None)])).await;
+    assert_refused(
+        "a charge created by an approval, with no revision stated",
+        &unstated,
+        1,
+        Stated::Omitted,
+    );
     let after_refusal = references(&router, &agreement).await;
     assert_eq!(
         after_refusal, unassociated,
@@ -487,9 +545,11 @@ async fn the_revision_of_a_charge_an_approval_created_is_the_one_checked() {
     );
 
     // The revision the report states applies.
-    let mut right = order(&charge_id, "PO-approval");
-    right["chargeRevision"] = json!(reported);
-    let applied = update(&router, json!([right])).await;
+    let applied = update(
+        &router,
+        json!([order_at(&charge_id, "PO-approval", Some(reported))]),
+    )
+    .await;
     assert_eq!(
         applied.status, 200,
         "an update at the charge's own revision must succeed, got {} with {:?}",

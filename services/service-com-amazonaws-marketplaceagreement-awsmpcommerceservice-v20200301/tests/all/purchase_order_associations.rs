@@ -11,12 +11,13 @@
 //! (`smithy_query(query="shape", shape="PurchaseOrder")`). So a supplied list is
 //! accepted only when every element names one of the charges the accepted quote
 //! minted into `ChargeSummary$expectedCharges`, names it at most once across the
-//! list, and carries the reference the association records; otherwise the call
-//! is refused with the service's modelled `ValidationException` (HTTP 400)
-//! carrying the `ValidationExceptionReason` for the offending member —
-//! `INVALID_CHARGE_ID`, `DUPLICATE_CHARGES` or
+//! list, carries the reference the association records, and states the revision
+//! its charge is at; otherwise the call is refused with the service's modelled
+//! `ValidationException` (HTTP 400) carrying the `ValidationExceptionReason` for
+//! the offending member — `INVALID_CHARGE_ID`, `DUPLICATE_CHARGES` or
 //! `MISSING_PURCHASE_ORDER_REFERENCE` — and `fields[0].name` at that member's
-//! own dotted request path.
+//! own dotted request path. The revision member has its own suites
+//! (`purchase_order_charge_revisions`, `purchase_order_required_members`).
 //!
 //! The rows below differ in what the rule generalises over: how many charges the
 //! quote minted (none, one, several), which of them the list names, how many
@@ -85,9 +86,32 @@ pub(crate) async fn quote(
     (created.str_at("/agreementRequestId"), ids)
 }
 
-/// One purchase order naming `charge_id` and carrying `reference`.
+/// The revision every charge this service holds is at.
+///
+/// `ChargeRevision` is `@range(min: 1)`
+/// (`smithy_query(query="shape", shape="ChargeRevision")`), so a charge nothing
+/// has revised is at that first value — and nothing in this service revises a
+/// charge, so this is the revision `ListAgreementCharges` reports for every one
+/// of them. The rows that are ABOUT the revision read it back from that report
+/// instead (`purchase_order_charge_revisions`); here it is the precondition an
+/// otherwise-unremarkable element has to carry.
+pub(crate) const INITIAL_CHARGE_REVISION: i64 = 1;
+
+/// One purchase order naming `charge_id`, carrying `reference`, and stating the
+/// revision its charge is at — every member an association is made of.
 pub(crate) fn order(charge_id: &str, reference: &str) -> Value {
-    json!({"chargeId": charge_id, "purchaseOrderReference": reference})
+    order_at(charge_id, reference, Some(INITIAL_CHARGE_REVISION))
+}
+
+/// One purchase order naming `charge_id` and carrying `reference`, stating
+/// `revision` as its `chargeRevision` — or leaving that member out of the
+/// element entirely when `revision` is `None`.
+pub(crate) fn order_at(charge_id: &str, reference: &str, revision: Option<i64>) -> Value {
+    let mut element = json!({"chargeId": charge_id, "purchaseOrderReference": reference});
+    if let Some(revision) = revision {
+        element["chargeRevision"] = json!(revision);
+    }
+    element
 }
 
 /// How many agreements the store holds under this proposal, read through

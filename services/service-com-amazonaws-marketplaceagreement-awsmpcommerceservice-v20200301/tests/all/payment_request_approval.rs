@@ -35,6 +35,7 @@ use crate::payment_requests::{
     agreement_with_variable_term, get, is_payment_request_id, items, list, send, sent,
     PENDING_APPROVAL,
 };
+use crate::purchase_order_associations::order;
 use crate::purchase_order_updates::{charges, items as charge_items};
 
 /// `PaymentRequestStatus`'s value for an approved request: "Once accepted, the
@@ -894,7 +895,7 @@ async fn the_purchase_order_of_an_approved_charge_has_one_value() {
         let updated = call(
             &router,
             "UpdatePurchaseOrders",
-            json!({"purchaseOrders": [{"chargeId": charge_id, "purchaseOrderReference": then}]}),
+            json!({"purchaseOrders": [order(&charge_id, then)]}),
         )
         .await;
         assert_eq!(

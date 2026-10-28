@@ -3522,14 +3522,18 @@ pub fn expected_charge_revisions(summary: &ChargeSummary) -> BTreeMap<String, i6
 ///   ([`REASON_DUPLICATE_CHARGES`]);
 /// * it carries the reference the association exists to record — an element
 ///   without one associates nothing (`MISSING_PURCHASE_ORDER_REFERENCE`);
-/// * the revision it states, if it states one, is the revision that charge is
-///   at — a member that restates the current state of the resource being
-///   written is the caller's precondition on it, so a value other than the
-///   charge's own revision describes a charge this store does not hold and is
-///   refused (`INVALID_CHARGE_REVISION`) rather than written over. The member is
-///   not `@required` (`smithy_query(query="shape", shape="PurchaseOrder")`), so
-///   an element that states no revision states no precondition and is applied
-///   to whatever revision the charge is at.
+/// * it states the revision that charge is at — a member that restates the
+///   current state of the resource being written is the caller's precondition on
+///   it, so a value other than the charge's own revision describes a charge this
+///   store does not hold and is refused (`INVALID_CHARGE_REVISION`) rather than
+///   written over, and an element that states no revision at all states no
+///   precondition and is refused (`MISSING_CHARGE_REVISION`) rather than applied
+///   blind. The model marks only `chargeId` `@required`
+///   (`smithy_query(query="shape", shape="PurchaseOrder")`), but it publishes a
+///   dedicated reason for each of these members being absent
+///   (`MISSING_CHARGE_REVISION`, `MISSING_PURCHASE_ORDER_REFERENCE`): an
+///   association is made of the charge, the revision it is at and the reference
+///   to record, so every one of the three has to be stated.
 ///
 /// Each refusal names the element that carried the offending member and the
 /// member of it that failed ([`purchase_order_member_path`]), so a caller with
@@ -3563,8 +3567,18 @@ pub fn validate_purchase_orders(
                 path: reference_path,
             });
         }
-        if order.charge_revision.is_some_and(|named| named != revision) {
-            let revision_path = purchase_order_member_path(index, "chargeRevision");
+        // The precondition on the charge being written, in the two ways it can
+        // fail: stated and wrong, or not stated at all. Both are refusals of the
+        // same member, so both name its own path and differ only in the kind the
+        // reason spells out.
+        let revision_path = purchase_order_member_path(index, "chargeRevision");
+        let Some(stated) = order.charge_revision else {
+            return Err(PurchaseOrderRefusal {
+                reason: member_reason(&revision_path, RefusalKind::Missing),
+                path: revision_path,
+            });
+        };
+        if stated != revision {
             return Err(PurchaseOrderRefusal {
                 reason: member_reason(&revision_path, RefusalKind::Invalid),
                 path: revision_path,

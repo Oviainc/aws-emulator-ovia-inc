@@ -19,7 +19,9 @@
 //! names one twice (`DUPLICATE_CHARGES`), carries no reference
 //! (`MISSING_PURCHASE_ORDER_REFERENCE`) or states an `agreementId` that is not
 //! the agreement holding the charge (`INVALID_AGREEMENT_ID`), with `fields[0]`
-//! naming that element's own member path.
+//! naming that element's own member path. Each element also states the revision
+//! its charge is at, which is the precondition `purchase_order_charge_revisions`
+//! and `purchase_order_required_members` are about.
 //!
 //! The rows differ in what the rule generalises over: how many charges the
 //! agreement holds, which of them the list names, how many agreements one call
@@ -40,7 +42,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_lifecycle::{accept, call, emulator, is_next_token, Answer};
-use crate::purchase_order_associations::{order, quote};
+use crate::purchase_order_associations::{order, quote, INITIAL_CHARGE_REVISION};
 
 /// The `agreementType` every agreement this service mints carries, and the one
 /// `Charge$agreementType` reports ("for example, `PurchaseAgreement`",
@@ -51,10 +53,6 @@ const AGREEMENT_TYPE: &str = "PurchaseAgreement";
 /// agreement of this service is created in.
 const CATALOG: &str = "AWSMarketplace";
 
-/// A charge is minted once and never revised here, so every reported charge is
-/// at `ChargeRevision`'s first value (`@range(min: 1)`,
-/// `smithy_query(query="shape", shape="ChargeRevision")`).
-const INITIAL_REVISION: i64 = 1;
 
 /// Create and accept a quote over `charges` charged terms, answering the
 /// agreement id and the ids of the charges that agreement holds, in the order
@@ -400,6 +398,7 @@ fn refusals() -> Vec<Refused> {
             orders: |fixture| {
                 json!([{
                     "chargeId": fixture.charges[0][0],
+                    "chargeRevision": INITIAL_CHARGE_REVISION,
                     "agreementId": fixture.agreements[1],
                     "purchaseOrderReference": "PO-1",
                 }])
@@ -414,6 +413,7 @@ fn refusals() -> Vec<Refused> {
                     order(&fixture.charges[0][0], "PO-1"),
                     {
                         "chargeId": fixture.charges[1][0],
+                        "chargeRevision": INITIAL_CHARGE_REVISION,
                         "agreementId": "agmt-ffffffffffffffff",
                         "purchaseOrderReference": "PO-2",
                     },
@@ -524,8 +524,8 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
         );
         assert_eq!(
             charge["revision"].as_i64(),
-            Some(INITIAL_REVISION),
-            "expected charge {charge:?} to be at revision {INITIAL_REVISION}"
+            Some(INITIAL_CHARGE_REVISION),
+            "expected charge {charge:?} to be at revision {INITIAL_CHARGE_REVISION}"
         );
         assert!(
             charge["purchaseOrderReference"].is_null(),

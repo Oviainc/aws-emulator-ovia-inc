@@ -13,11 +13,11 @@
 //! carries one reference, so associating a charge that already has one replaces it.
 //!
 //! The list is refused whole, before anything is written, when an element names a
-//! charge no agreement holds, names one twice, carries no reference, or states a
-//! `chargeRevision` other than the revision the charge it names is at
-//! (`crate::state::validate_purchase_orders`, the rule `AcceptAgreementRequest` refuses
-//! its own `purchaseOrders` under) or states an `agreementId` other than the agreement
-//! holding the charge it names.
+//! charge no agreement holds, names one twice, carries no reference, states no
+//! `chargeRevision` or states one other than the revision the charge it names is
+//! at (`crate::state::validate_purchase_orders`, the rule `AcceptAgreementRequest`
+//! refuses its own `purchaseOrders` under) or states an `agreementId` other than
+//! the agreement holding the charge it names.
 //!
 //! ## Shape of an operation
 //!
@@ -178,10 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `purchaseOrders` under, applied to the charges of every agreement this
         // call can reach: an element must name a charge that exists, name it at
         // most once across the list, carry the reference the association exists
-        // to record, and — where it states one — state the revision that charge
-        // is actually at (`crate::state::validate_purchase_orders`). The list
-        // is refused BEFORE anything is written, so a refused call associates
-        // nothing.
+        // to record, and state the revision that charge is actually at
+        // (`crate::state::validate_purchase_orders`). The list is refused BEFORE
+        // anything is written, so a refused call associates nothing.
         if let Err(refusal) =
             crate::state::validate_purchase_orders(&input.purchase_orders, &revisions)
         {

@@ -209,8 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // into `ChargeSummary$expectedCharges` — each at its first revision,
         // since this call is what mints them. A list that names a charge the
         // request does not hold, names one twice, carries no reference to
-        // associate, or states a `chargeRevision` other than the revision its
-        // charge is at is refused before anything is stored — see
+        // associate, or states no `chargeRevision`, or one other than the
+        // revision its charge is at, is refused before anything is stored — see
         // `crate::state::validate_purchase_orders` for the rule.
         let purchase_orders = input.purchase_orders.unwrap_or_default();
         if let Err(refusal) = crate::state::validate_purchase_orders(

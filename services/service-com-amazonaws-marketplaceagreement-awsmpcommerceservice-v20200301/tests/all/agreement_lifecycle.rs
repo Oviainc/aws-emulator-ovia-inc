@@ -912,13 +912,15 @@ async fn an_accepted_request_is_described_from_what_was_stored() {
         let request_id = created.str_at("/agreementRequestId");
 
         // A purchase order associates a reference with one charge OF THIS
-        // quote, so the ids come from the charge summary the create answered;
+        // quote, so the ids come from the charge summary the create answered,
+        // and the element states the revision those charges are minted at;
         // a quote that implies no charge is accepted with no purchase orders.
         let mut request = json!({"agreementRequestId": request_id});
         let charges = expected_charge_ids(&created);
         if let Some(charge_id) = charges.first() {
-            request["purchaseOrders"] =
-                json!([{"chargeId": charge_id, "purchaseOrderReference": "PO-77"}]);
+            request["purchaseOrders"] = json!([crate::purchase_order_associations::order(
+                charge_id, "PO-77"
+            )]);
         }
         let accepted = accept(&router, request).await;
         assert_eq!(
