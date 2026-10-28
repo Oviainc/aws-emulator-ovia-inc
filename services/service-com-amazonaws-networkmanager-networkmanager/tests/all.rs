@@ -149,6 +149,8 @@ mod network_resources;
 mod network_telemetry;
 #[path = "all/organization_service_access.rs"]
 mod organization_service_access;
+#[path = "all/register_transit_gateway_account_ownership.rs"]
+mod register_transit_gateway_account_ownership;
 #[path = "all/resource_not_found_message.rs"]
 mod resource_not_found_message;
 #[path = "all/resource_policy_lifecycle.rs"]

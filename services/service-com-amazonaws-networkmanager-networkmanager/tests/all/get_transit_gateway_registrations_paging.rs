@@ -28,7 +28,7 @@ use serde_json::json;
 
 use crate::global_network_lifecycle::{error_code, Emulator};
 use crate::resource_tagging::escape;
-use crate::transit_gateway_peering::transit_gateway_arn;
+use crate::transit_gateway_peering::{own_account, transit_gateway_arn};
 // The request helpers and the page reader of this slice, shared with the suite that tables
 // its round trip, so the two cannot disagree about either.
 use crate::transit_gateway_registration_lifecycle::{arns_of, get_registrations, register};
@@ -41,15 +41,17 @@ const LIST: &str = "TransitGatewayRegistrations";
 const SMALLEST_PAGE: usize = 1;
 const LARGEST_PAGE: usize = 500;
 
-/// The ARNs the fixture registers, spanning the partition, Region, account and id width an
-/// EC2 transit gateway ARN can carry.
+/// The ARNs the fixture registers, spanning the partition, Region and id width an EC2
+/// transit gateway ARN can carry. Every one of them carries the account that owns the
+/// global network, which is the only account a registration takes.
 fn fixture_arns() -> Vec<String> {
+    let account = own_account();
     let mut arns = vec![
-        transit_gateway_arn("aws", "us-west-2", "123456789012", 1, 8),
-        transit_gateway_arn("aws", "eu-central-1", "123456789012", 2, 17),
-        transit_gateway_arn("aws-cn", "cn-north-1", "210987654321", 3, 12),
-        transit_gateway_arn("aws-us-gov", "us-gov-west-1", "210987654321", 4, 16),
-        transit_gateway_arn("aws", "ap-southeast-2", engine::emulator_account_id(), 5, 10),
+        transit_gateway_arn("aws", "us-west-2", &account, 1, 8),
+        transit_gateway_arn("aws", "eu-central-1", &account, 2, 17),
+        transit_gateway_arn("aws-cn", "cn-north-1", &account, 3, 12),
+        transit_gateway_arn("aws-us-gov", "us-gov-west-1", &account, 4, 16),
+        transit_gateway_arn("aws", "ap-southeast-2", &account, 5, 10),
     ];
     arns.sort();
     arns
@@ -59,8 +61,8 @@ fn fixture_arns() -> Vec<String> {
 /// they are stored — just not under the one being read.
 fn arns_registered_elsewhere() -> Vec<String> {
     vec![
-        transit_gateway_arn("aws", "us-east-1", "123456789012", 0xf1, 9),
-        transit_gateway_arn("aws", "sa-east-1", "210987654321", 0xf2, 17),
+        transit_gateway_arn("aws", "us-east-1", &own_account(), 0xf1, 9),
+        transit_gateway_arn("aws", "sa-east-1", &own_account(), 0xf2, 17),
     ]
 }
 

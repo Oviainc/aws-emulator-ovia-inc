@@ -15,9 +15,10 @@
 //!
 //! The rule holds for every well-formed transit gateway Connect peer ARN and for every way
 //! the optional link member can be spelled, not only the one shape a recording happens to
-//! carry, so the table below spans the ARN's partition, Region, account and id width, a
-//! device that sits at a site and one that sits at none, and the link member named, omitted
-//! and empty.
+//! carry, so the table below spans the ARN's partition, Region and id width, a device that
+//! sits at a site and one that sits at none, and the link member named, omitted and empty.
+//! The ARN's account is fixed: a peer sits on a transit gateway registered with the global
+//! network, and such a gateway belongs to the account that owns it.
 //!
 //! Every call goes through the real `MultiServiceRouter`, so the restJson1 routes, the
 //! label/query bindings and the error envelopes are exercised as a client hits them.
@@ -34,7 +35,7 @@ use crate::device_lifecycle::create_device_ok;
 use crate::global_network_lifecycle::{error_code, Emulator, PAST_SETTLE};
 use crate::link_lifecycle::{create_link_ok, plain_link};
 use crate::resource_tagging::escape;
-use crate::transit_gateway_peering::transit_gateway_arn;
+use crate::transit_gateway_peering::{own_account, transit_gateway_arn};
 
 /// The resource type a refusal names for an association, which has no id of its own.
 pub(crate) const ASSOCIATION_KIND: &str = "transit-gateway-connect-peer-association";
@@ -83,47 +84,48 @@ struct Case {
     /// The Region the row's peer lives in, which is the Region its transit gateway is in.
     region: &'static str,
     /// The account that owns the row's peer, which owns its transit gateway too.
-    account: &'static str,
+    account: String,
     /// Whether the row associates the device that sits at a site.
     sited_device: bool,
     /// How the row spells the optional `LinkId`.
     link: LinkMember,
 }
 
-/// The rows, spanning what the rule generalises over: the ARN's partition, Region, account
-/// and id width, a device at a site and one with none, and all three spellings of the
-/// optional link member.
+/// The rows, spanning what the rule generalises over: the ARN's partition, Region and id
+/// width, a device at a site and one with none, and all three spellings of the optional
+/// link member.
 fn cases() -> Vec<Case> {
+    let account = own_account();
     vec![
         Case {
             name: "the shortest published id, over a link of the device's site",
-            arn: connect_peer_arn("aws", "us-west-2", "123456789012", 1, 8),
+            arn: connect_peer_arn("aws", "us-west-2", &account, 1, 8),
             region: "us-west-2",
-            account: "123456789012",
+            account: account.clone(),
             sited_device: true,
             link: LinkMember::Associated,
         },
         Case {
             name: "the longest published id in another Region, naming no link at all",
-            arn: connect_peer_arn("aws", "eu-central-1", "123456789012", 2, 17),
+            arn: connect_peer_arn("aws", "eu-central-1", &account, 2, 17),
             region: "eu-central-1",
-            account: "123456789012",
+            account: account.clone(),
             sited_device: true,
             link: LinkMember::Absent,
         },
         Case {
             name: "another partition and Region, tied to a device that sits at no site",
-            arn: connect_peer_arn("aws-cn", "cn-north-1", "210987654321", 3, 12),
+            arn: connect_peer_arn("aws-cn", "cn-north-1", &account, 3, 12),
             region: "cn-north-1",
-            account: "210987654321",
+            account: account.clone(),
             sited_device: false,
             link: LinkMember::Absent,
         },
         Case {
-            name: "a peer of another account, spelling the link member empty",
-            arn: connect_peer_arn("aws", "ap-southeast-2", "210987654321", 4, 10),
+            name: "a third Region, spelling the link member empty",
+            arn: connect_peer_arn("aws", "ap-southeast-2", &account, 4, 10),
             region: "ap-southeast-2",
-            account: "210987654321",
+            account,
             sited_device: false,
             link: LinkMember::Empty,
         },
@@ -339,7 +341,7 @@ async fn fixture(emulator: &Emulator, name: &str, base: usize) -> Fixture {
         register_gateway(
             emulator,
             &global_network,
-            &transit_gateway_arn("aws", case.region, case.account, base + index, 17),
+            &transit_gateway_arn("aws", case.region, &case.account, base + index, 17),
         )
         .await;
     }
@@ -451,7 +453,7 @@ async fn every_association_round_trips_through_stored_state_and_is_removed_by_th
         );
         assert_eq!(
             entry["AccountId"].as_str(),
-            Some(case.account),
+            Some(case.account.as_str()),
             "case {:?}: expected account {}, got {entry}",
             case.name,
             case.account
@@ -576,7 +578,7 @@ async fn the_arn_filter_narrows_the_listing_and_the_page_tokens_reach_every_asso
     associate_all(&emulator, &fixture, &rows).await;
 
     // An ARN of the same well-formed shape that names no stored association.
-    let unknown = connect_peer_arn("aws", "us-west-2", "123456789012", 0xdead, 17);
+    let unknown = connect_peer_arn("aws", "us-west-2", &own_account(), 0xdead, 17);
     let all: Vec<String> = {
         let mut arns: Vec<String> = rows.iter().map(|case| case.arn.clone()).collect();
         arns.sort();
@@ -626,7 +628,7 @@ async fn the_arn_filter_narrows_the_listing_and_the_page_tokens_reach_every_asso
             "far more ARNs than the bounded filters of this service allow",
             {
                 let mut arns: Vec<String> = (0..26)
-                    .map(|index| connect_peer_arn("aws", "us-west-2", "123456789012", 0xf00 + index, 17))
+                    .map(|index| connect_peer_arn("aws", "us-west-2", &own_account(), 0xf00 + index, 17))
                     .collect();
                 arns.extend(rows.iter().map(|case| case.arn.clone()));
                 arns
@@ -858,7 +860,7 @@ async fn an_associate_that_cannot_hold_is_refused_and_stores_nothing() {
             "ValidationException",
             json!({
                 "TransitGatewayConnectPeerArn":
-                    connect_peer_arn("aws", "sa-east-1", "123456789012", 7, 17),
+                    connect_peer_arn("aws", "sa-east-1", &own_account(), 7, 17),
                 "DeviceId": fixture.sited_device,
             }),
         ),

@@ -31,7 +31,7 @@ use crate::transit_gateway_connect_peer_association_lifecycle::{
     arns_of, associate, connect_peer_arn, disassociate, get_associations, register_gateway,
     ASSOCIATION_KIND,
 };
-use crate::transit_gateway_peering::transit_gateway_arn;
+use crate::transit_gateway_peering::{own_account, transit_gateway_arn};
 
 /// The remaining wire values a quota refusal of this operation carries, written out here
 /// rather than imported from the handler's own constants, so a rename is caught instead of
@@ -41,12 +41,12 @@ use crate::transit_gateway_peering::transit_gateway_arn;
 const SERVICE_CODE: &str = "networkmanager";
 const LIMIT_CODE: &str = "transit-gateway-connect-peer-associations-per-global-network";
 
-/// The partition, Region and account every peer of these cases lives in: one registered
-/// transit gateway of that Region and account is what lets its peers be associated at all,
-/// so holding them fixed keeps the fixture to a single registration.
+/// The partition and Region every peer of these cases lives in: one registered transit
+/// gateway of that Region and account is what lets its peers be associated at all, so
+/// holding them fixed keeps the fixture to a single registration. The account is the one
+/// that owns the global network, the only account a gateway is registered from.
 const PARTITION: &str = "aws";
 const REGION: &str = "us-west-2";
-const ACCOUNT: &str = "123456789012";
 
 /// A global network with one device and one registered transit gateway, which is everything
 /// an associate of these cases needs. `gateway` offsets the registered gateway's id, since a
@@ -62,7 +62,7 @@ async fn fixture(emulator: &Emulator, name: &str, gateway: usize) -> QuotaFixtur
     register_gateway(
         emulator,
         &global_network,
-        &transit_gateway_arn(PARTITION, REGION, ACCOUNT, gateway, 17),
+        &transit_gateway_arn(PARTITION, REGION, &own_account(), gateway, 17),
     )
     .await;
     QuotaFixture {
@@ -74,7 +74,7 @@ async fn fixture(emulator: &Emulator, name: &str, gateway: usize) -> QuotaFixtur
 /// The ARN of the `index`th Connect peer these cases tie, each a distinct peer of the one
 /// registered gateway's Region and account.
 fn peer(index: usize) -> String {
-    connect_peer_arn(PARTITION, REGION, ACCOUNT, index, 17)
+    connect_peer_arn(PARTITION, REGION, &own_account(), index, 17)
 }
 
 /// Associate `arn` with the fixture's device, answering the call's status and body.

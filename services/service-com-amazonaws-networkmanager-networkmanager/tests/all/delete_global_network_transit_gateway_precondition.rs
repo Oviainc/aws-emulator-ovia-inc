@@ -30,7 +30,7 @@ use crate::core_network_lifecycle::create_core_network;
 use crate::delete_dependency_refusal::assert_dependency_refusal;
 use crate::device_lifecycle::create_device_ok;
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator};
-use crate::transit_gateway_peering::transit_gateway_arn;
+use crate::transit_gateway_peering::{own_account, transit_gateway_arn};
 use crate::transit_gateway_registration_lifecycle::{
     arns_of, deregister, get_registrations, register,
 };
@@ -46,8 +46,9 @@ const PARENT_LABEL: &str = "Global Network";
 /// beside them, and the kinds the refusal must then name.
 struct Case {
     name: &'static str,
-    /// The transit gateway ARNs to register, spanning the ARN's partition, Region, account
-    /// and id width.
+    /// The transit gateway ARNs to register, spanning the ARN's partition, Region and id
+    /// width. The account is the one that owns the global network on every row, because a
+    /// gateway is registered only from that account.
     gateways: Vec<String>,
     /// Sites to create in the global network.
     sites: usize,
@@ -60,27 +61,22 @@ struct Case {
 }
 
 fn cases() -> Vec<Case> {
+    let account = own_account();
     vec![
         Case {
             name: "one registered transit gateway",
-            gateways: vec![transit_gateway_arn("aws", "us-west-2", "123456789012", 1, 8)],
+            gateways: vec![transit_gateway_arn("aws", "us-west-2", &account, 1, 8)],
             sites: 0,
             devices: 0,
             core_network: false,
             blocking: &[REGISTRATION_LABEL],
         },
         Case {
-            name: "three registrations across partitions, Regions and accounts",
+            name: "three registrations across partitions and Regions",
             gateways: vec![
-                transit_gateway_arn("aws", "eu-central-1", "123456789012", 2, 17),
-                transit_gateway_arn("aws-cn", "cn-north-1", "210987654321", 3, 12),
-                transit_gateway_arn(
-                    "aws-us-gov",
-                    "us-gov-west-1",
-                    engine::emulator_account_id(),
-                    4,
-                    16,
-                ),
+                transit_gateway_arn("aws", "eu-central-1", &account, 2, 17),
+                transit_gateway_arn("aws-cn", "cn-north-1", &account, 3, 12),
+                transit_gateway_arn("aws-us-gov", "us-gov-west-1", &account, 4, 16),
             ],
             sites: 0,
             devices: 0,
@@ -89,13 +85,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "a registration beside a site",
-            gateways: vec![transit_gateway_arn(
-                "aws",
-                "ap-southeast-2",
-                "210987654321",
-                5,
-                10,
-            )],
+            gateways: vec![transit_gateway_arn("aws", "ap-southeast-2", &account, 5, 10)],
             sites: 1,
             devices: 0,
             core_network: false,
@@ -103,7 +93,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "a registration beside a device and a core network",
-            gateways: vec![transit_gateway_arn("aws", "us-east-1", "123456789012", 6, 17)],
+            gateways: vec![transit_gateway_arn("aws", "us-east-1", &account, 6, 17)],
             sites: 0,
             devices: 1,
             core_network: true,
@@ -269,8 +259,8 @@ async fn a_registered_transit_gateway_blocks_the_global_network_delete_until_it_
 #[tokio::test]
 async fn a_transit_gateway_survives_the_teardown_of_the_global_network_it_was_registered_with() {
     for (index, arn) in [
-        transit_gateway_arn("aws", "us-west-2", "123456789012", 7, 8),
-        transit_gateway_arn("aws-cn", "cn-northwest-1", "210987654321", 8, 17),
+        transit_gateway_arn("aws", "us-west-2", &own_account(), 7, 8),
+        transit_gateway_arn("aws-cn", "cn-northwest-1", &own_account(), 8, 17),
     ]
     .iter()
     .enumerate()

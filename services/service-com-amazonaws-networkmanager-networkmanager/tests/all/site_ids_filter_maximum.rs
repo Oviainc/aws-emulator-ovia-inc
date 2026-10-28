@@ -46,7 +46,7 @@ use crate::filter_maximum_table::{
 };
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator};
 use crate::resource_tagging::escape;
-use crate::transit_gateway_peering::transit_gateway_arn;
+use crate::transit_gateway_peering::{own_account, transit_gateway_arn};
 
 /// The URI a request addresses: the listing, one `siteIds` parameter per filter value the
 /// way a client binds a list to `@httpQuery`, then the row's other parameter.
@@ -173,7 +173,7 @@ async fn the_registration_listing_filter_takes_the_same_published_maximum() {
     // they were registered and the page order is the fixture order.
     let mut stored: Vec<String> = Vec::new();
     for index in 0..FIXTURE_COUNT {
-        let arn = transit_gateway_arn("aws", "us-west-2", "123456789012", index + 1, 17);
+        let arn = transit_gateway_arn("aws", "us-west-2", &own_account(), index + 1, 17);
         let (status, body) = emulator
             .post(
                 &format!("/global-networks/{network}/transit-gateway-registrations"),

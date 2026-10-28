@@ -32,7 +32,7 @@ use serde_json::json;
 use crate::device_lifecycle::create_device_ok;
 use crate::global_network_lifecycle::{error_code, Emulator};
 use crate::resource_tagging::escape;
-use crate::transit_gateway_peering::transit_gateway_arn;
+use crate::transit_gateway_peering::{own_account, transit_gateway_arn};
 // The request helpers and the page reader of this slice, shared with the suite that tables
 // its round trip, so the two cannot disagree about either.
 use crate::transit_gateway_connect_peer_association_lifecycle::{
@@ -65,43 +65,45 @@ struct Peer {
     digits: usize,
 }
 
-/// The peers one global network holds, spanning the ARN partition, Region, account and id
-/// width a well-formed Connect peer ARN can carry.
+/// The peers one global network holds, spanning the ARN partition, Region and id width a
+/// well-formed Connect peer ARN can carry. The account is the one that owns the global
+/// network on every row: a peer sits on a transit gateway registered with it, and a gateway
+/// is registered only from that account.
 fn peers() -> Vec<Peer> {
     vec![
         Peer {
             name: "the shortest published id",
             partition: "aws",
             region: "us-west-2",
-            account: "123456789012".to_string(),
+            account: own_account(),
             digits: 8,
         },
         Peer {
             name: "the longest published id, in another Region",
             partition: "aws",
             region: "eu-central-1",
-            account: "123456789012".to_string(),
+            account: own_account(),
             digits: 17,
         },
         Peer {
-            name: "another partition and account",
+            name: "another partition and Region",
             partition: "aws-cn",
             region: "cn-north-1",
-            account: "210987654321".to_string(),
+            account: own_account(),
             digits: 12,
         },
         Peer {
             name: "the GovCloud partition",
             partition: "aws-us-gov",
             region: "us-gov-west-1",
-            account: "210987654321".to_string(),
+            account: own_account(),
             digits: 16,
         },
         Peer {
-            name: "the emulator's own account",
+            name: "a third Region",
             partition: "aws",
             region: "ap-southeast-2",
-            account: engine::emulator_account_id().to_string(),
+            account: own_account(),
             digits: 10,
         },
     ]

@@ -14,7 +14,11 @@
 //! gateway offered to another global network the modelled conflict. The transit gateway
 //! itself belongs to Amazon VPC, of which this service holds no inventory, so what is
 //! stored is the reference the request carried, once its form is established
-//! (`crate::state::ec2_resource_region`).
+//! (`crate::state::ec2_resource_region`) and it is established to belong to the account
+//! that owns the global network — "it must be owned by the same Amazon Web Services account
+//! that owns the global network" (`smithy_query query="doc" shape="RegisterTransitGateway"`),
+//! which is the account the global network's own ARN carries
+//! (`crate::state::arn_account_id`).
 //!
 //! ## Reaching this service's state
 //!
@@ -187,11 +191,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The registration ties a gateway to a global network that already exists rather
         // than minting a resource of its own, so a global network the path names and the
         // store does not hold is the missing-resource answer.
-        if !store.global_networks.contains_key(&input.global_network_id) {
+        let Some(network) = store.global_networks.get(&input.global_network_id) else {
             return Err(RegisterTransitGatewayErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     crate::state::GLOBAL_NETWORK_KIND,
                     &input.global_network_id,
+                ),
+            )
+            .into());
+        };
+
+        // "The transit gateway can be in any of the supported Amazon Web Services Regions,
+        // but it must be owned by the same Amazon Web Services account that owns the global
+        // network" (`smithy_query query="doc" shape="RegisterTransitGateway"`). WHICH account
+        // owns the global network is spelled by the global network's own ARN, so the rule is
+        // a comparison of the two ARNs' account segments and needs no second copy of either:
+        // a gateway of any other account — including an ARN carrying no account at all — is
+        // refused on the member that named it, and nothing is stored for it. The Region is
+        // deliberately NOT compared: the sentence allows any supported one, which is why
+        // `crate::state::ec2_resource_region` above only establishes that the ARN names one.
+        let owner_account = crate::state::arn_account_id(&network.arn)
+            .unwrap_or(::engine::emulator_account_id())
+            .to_string();
+        if crate::state::arn_account_id(&input.transit_gateway_arn)
+            != Some(owner_account.as_str())
+        {
+            return Err(RegisterTransitGatewayErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_TRANSIT_GATEWAY_ARN,
+                    crate::state::REASON_FIELD_VALIDATION_FAILED,
+                    format!(
+                        "must name a transit gateway owned by account {owner_account}, the account that owns global network {}",
+                        input.global_network_id
+                    ),
                 ),
             )
             .into());

@@ -13,9 +13,10 @@
 //! not-found. A gateway is registered with at most ONE global network, and a string that
 //! names no transit gateway at all is refused on the member that carried it.
 //!
-//! The rule holds for every well-formed transit gateway ARN, not only the one shape a
-//! recording happens to carry, so the tables below span the ARN's partition, Region,
-//! account and id width.
+//! A gateway is registered only with a global network of its OWN account, so the ARN's
+//! account segment is fixed by the global network and the tables below span what is left
+//! free: the ARN's partition, Region and id width. The account rule itself is tabled by
+//! `crate::transit_gateway_registration_account_ownership`.
 //!
 //! Every call goes through the real `MultiServiceRouter`, so the restJson1 routes, the
 //! label/query bindings and the error envelopes are exercised as a client hits them.
@@ -29,14 +30,14 @@ use serde_json::{json, Value};
 
 use crate::global_network_lifecycle::{error_code, Emulator, PAST_SETTLE};
 use crate::resource_tagging::escape;
-use crate::transit_gateway_peering::transit_gateway_arn;
+use crate::transit_gateway_peering::{own_account, transit_gateway_arn};
 
 /// The resource type a refusal names for a registration, which has no id of its own.
 const REGISTRATION_KIND: &str = "transit-gateway-registration";
 
 /// The request member a refusal names when the transit gateway ARN is at fault: Network
 /// Manager names the offending member in its own lowerCamelCase spelling.
-const ARN_MEMBER: &str = "transitGatewayArn";
+pub(crate) const ARN_MEMBER: &str = "transitGatewayArn";
 
 /// `RegisterTransitGateway` on `network` for `arn`.
 pub(crate) async fn register(emulator: &Emulator, network: &str, arn: &str) -> (u16, Value) {
@@ -122,38 +123,34 @@ struct Row {
     arn: String,
 }
 
-/// The table: rows differing along everything the rule generalises over — the ARN's
-/// partition, Region, account and the width of the gateway id, whose published bounds are
-/// 8 and 17 hex digits (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$`
-/// for `VpcArn`, `smithy_query shape=VpcArn`, is the skeleton every EC2 ARN of this model
-/// spells).
+/// The table: rows differing along everything the rule leaves free — the ARN's partition,
+/// Region and the width of the gateway id, whose published bounds are 8 and 17 hex digits
+/// (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$` for `VpcArn`,
+/// `smithy_query shape=VpcArn`, is the skeleton every EC2 ARN of this model spells). The
+/// account is the one that owns the global network on every row, because that is the only
+/// account a gateway may be registered from.
 fn rows() -> Vec<Row> {
+    let account = own_account();
     vec![
         Row {
             name: "the shortest published id",
-            arn: transit_gateway_arn("aws", "us-west-2", "123456789012", 1, 8),
+            arn: transit_gateway_arn("aws", "us-west-2", &account, 1, 8),
         },
         Row {
             name: "the longest published id",
-            arn: transit_gateway_arn("aws", "eu-central-1", "123456789012", 2, 17),
+            arn: transit_gateway_arn("aws", "eu-central-1", &account, 2, 17),
         },
         Row {
             name: "another partition and Region",
-            arn: transit_gateway_arn("aws-cn", "cn-north-1", "210987654321", 3, 12),
+            arn: transit_gateway_arn("aws-cn", "cn-north-1", &account, 3, 12),
         },
         Row {
-            name: "a gateway of another account",
-            arn: transit_gateway_arn("aws", "ap-southeast-2", "210987654321", 4, 10),
+            name: "a third Region",
+            arn: transit_gateway_arn("aws", "ap-southeast-2", &account, 4, 10),
         },
         Row {
-            name: "the emulator's own account",
-            arn: transit_gateway_arn(
-                "aws-us-gov",
-                "us-gov-west-1",
-                engine::emulator_account_id(),
-                5,
-                16,
-            ),
+            name: "a third partition",
+            arn: transit_gateway_arn("aws-us-gov", "us-gov-west-1", &account, 5, 16),
         },
     ]
 }
@@ -508,7 +505,7 @@ async fn a_string_that_names_no_transit_gateway_is_refused_on_the_member_that_ca
 async fn a_global_network_that_is_not_stored_is_not_found_on_every_registration_operation() {
     let emulator = Emulator::new();
     let absent = "global-network-0000000000000dead";
-    let arn = transit_gateway_arn("aws", "us-west-2", "123456789012", 9, 17);
+    let arn = transit_gateway_arn("aws", "us-west-2", &own_account(), 9, 17);
 
     let calls: [(&str, (u16, Value)); 3] = [
         ("RegisterTransitGateway", register(&emulator, absent, &arn).await),

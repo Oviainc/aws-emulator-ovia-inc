@@ -190,15 +190,17 @@ struct Row {
 }
 
 /// The rows, differing along everything the rule generalises over: the ARN's partition,
-/// Region, account and id width, the optional link member named and omitted, and a device
-/// at a site beside one at none.
+/// Region and id width, the optional link member named and omitted, and a device at a site
+/// beside one at none. The account is the one that owns the global network on every row: a
+/// gateway is registered only from that account, so a peer that sits on a registered
+/// gateway belongs to it too.
 fn rows() -> Vec<Row> {
     vec![
         Row {
             name: "the shortest published id, over a link of the device's site",
             partition: "aws",
             region: "us-west-2",
-            account: "123456789012".to_string(),
+            account: own_account(),
             digits: 8,
             over_link: true,
             sited_device: true,
@@ -207,7 +209,7 @@ fn rows() -> Vec<Row> {
             name: "the longest published id in another Region, naming no link",
             partition: "aws",
             region: "eu-central-1",
-            account: "123456789012".to_string(),
+            account: own_account(),
             digits: 17,
             over_link: false,
             sited_device: true,
@@ -216,22 +218,22 @@ fn rows() -> Vec<Row> {
             name: "another partition and Region, tied to a device that sits at no site",
             partition: "aws-cn",
             region: "cn-north-1",
-            account: "210987654321".to_string(),
+            account: own_account(),
             digits: 12,
             over_link: false,
             sited_device: false,
         },
         Row {
-            name: "a peer of another account",
+            name: "a third Region",
             partition: "aws",
             region: "ap-southeast-2",
-            account: "210987654321".to_string(),
+            account: own_account(),
             digits: 10,
             over_link: false,
             sited_device: false,
         },
         Row {
-            name: "the emulator's own account",
+            name: "a third partition",
             partition: "aws-us-gov",
             region: "us-gov-west-1",
             account: own_account(),
@@ -319,18 +321,19 @@ async fn only_the_last_registration_the_peer_could_have_been_created_on_blocks_t
     let built = network(&emulator, case).await;
 
     // The peer lives in one Region and account, so a registered gateway can carry it only
-    // if it lives in the same two. Two of the four below do.
+    // if it lives in the same two. A gateway is registered only from the account that owns
+    // the global network, so what varies between the registrations below is the Region: two
+    // of the three are in the peer's.
     let region = "us-west-2";
-    let account = "123456789012";
-    let carrying = transit_gateway_arn("aws", region, account, 1, 17);
-    let also_carrying = transit_gateway_arn("aws", region, account, 2, 17);
-    let other_region = transit_gateway_arn("aws", "eu-central-1", account, 3, 17);
-    let other_account = transit_gateway_arn("aws", region, "210987654321", 4, 17);
-    for gateway in [&carrying, &also_carrying, &other_region, &other_account] {
+    let account = own_account();
+    let carrying = transit_gateway_arn("aws", region, &account, 1, 17);
+    let also_carrying = transit_gateway_arn("aws", region, &account, 2, 17);
+    let other_region = transit_gateway_arn("aws", "eu-central-1", &account, 3, 17);
+    for gateway in [&carrying, &also_carrying, &other_region] {
         register_gateway(&emulator, &built.id, gateway).await;
     }
 
-    let peer = connect_peer_arn("aws", region, account, 1, 17);
+    let peer = connect_peer_arn("aws", region, &account, 1, 17);
     let (status, body) = associate_connect_peer(
         &emulator,
         &built.id,
@@ -346,18 +349,13 @@ async fn only_the_last_registration_the_peer_could_have_been_created_on_blocks_t
         "case {case:?}: AssociateTransitGatewayConnectPeer expected 200, got {status} with {body}"
     );
 
-    // No tie stands on a registration of another Region or another account: that gateway
-    // could never have carried this peer, so its deregister is unaffected.
-    for (name, gateway) in [
-        ("a gateway in another Region", &other_region),
-        ("a gateway of another account", &other_account),
-    ] {
-        let (status, removed) = deregister(&emulator, &built.id, gateway).await;
-        assert_eq!(
-            status, 200,
-            "case {name:?}: nothing stands on this registration, so the deregister must succeed, got {status} with {removed}"
-        );
-    }
+    // No tie stands on a registration of another Region: that gateway could never have
+    // carried this peer, so its deregister is unaffected.
+    let (status, removed) = deregister(&emulator, &built.id, &other_region).await;
+    assert_eq!(
+        status, 200,
+        "case a gateway in another Region: nothing stands on this registration, so the deregister must succeed, got {status} with {removed}"
+    );
 
     // One of the two that could carry the peer still leaves the other, so the precondition
     // the tie stands on keeps holding and the deregister succeeds.
@@ -399,14 +397,14 @@ async fn deleting_the_device_or_link_a_transit_gateway_connect_peer_association_
     let case = "a transit gateway Connect peer over a device and a link";
     let built = network(&emulator, case).await;
 
-    let gateway = transit_gateway_arn("aws", "us-west-2", "123456789012", 1, 17);
+    let gateway = transit_gateway_arn("aws", "us-west-2", &own_account(), 1, 17);
     register_gateway(&emulator, &built.id, &gateway).await;
 
     // One peer carried over the device/link pair, and one tied to the device at no site,
     // which names no link at all: the second row is what shows the tie alone blocking the
     // delete, with no link association in the message.
-    let over_link = connect_peer_arn("aws", "us-west-2", "123456789012", 1, 17);
-    let over_device = connect_peer_arn("aws", "us-west-2", "123456789012", 2, 17);
+    let over_link = connect_peer_arn("aws", "us-west-2", &own_account(), 1, 17);
+    let over_device = connect_peer_arn("aws", "us-west-2", &own_account(), 2, 17);
     for (peer, device, link) in [
         (&over_link, &built.sited_device, Some(&built.link)),
         (&over_device, &built.siteless_device, None),
