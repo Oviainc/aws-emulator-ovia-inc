@@ -353,32 +353,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `MaxResults` is modelled `@range(min: 1, max: 50)`. The range is
-        // CHECKED here rather than assumed: a page size outside it is refused
-        // with the modelled `ValidationException`, so no request can reach the
-        // paging arithmetic with a size the model does not allow — and an
-        // absent member serves the largest page the model allows.
-        let page_size = match input.max_results {
-            None => crate::state::LIST_ENTITIES_PAGE_LIMIT,
-            Some(requested)
-                if (1..=crate::state::LIST_ENTITIES_PAGE_LIMIT).contains(&requested) =>
-            {
-                requested
-            }
-            Some(requested) => {
-                return Err(ListEntitiesErrorModeled::ValidationException(
-                    crate::state::validation(
-                        "MaxResults",
-                        format!(
-                            "ListEntities serves between 1 and {} entities a page, not {requested}",
-                            crate::state::LIST_ENTITIES_PAGE_LIMIT
-                        ),
-                    ),
-                )
-                .into())
-            }
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`, judged by the one
+        // page-size rule in `crate::state::page_size`, so no request can reach
+        // the paging arithmetic with a size the model does not allow.
+        let page_size = match crate::state::page_size(
+            "ListEntities",
+            "entities",
+            crate::state::LIST_ENTITIES_PAGE_LIMIT,
+            input.max_results,
+        ) {
+            Ok(page_size) => page_size,
+            Err(fault) => return Err(ListEntitiesErrorModeled::ValidationException(fault).into()),
         };
-        let page_size = usize::try_from(page_size).expect("a page size in 1..=50 fits in usize");
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
