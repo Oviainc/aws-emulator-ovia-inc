@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::workflow_definition::MAX_DEFINITION_BYTES;
+use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::Workflow;
+use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::ComAmazonawsMwaaserverlessAmazonmwaaserverlessState;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::workflow_lifecycle::role_arn;
@@ -40,7 +42,14 @@ pub(crate) const BUCKET: &str = "mwaa-serverless-definitions";
 /// A router with this service and the Amazon S3 service on one shared engine — what
 /// `build_router` assembles, narrowed to the services under test.
 pub(crate) fn definition_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    definition_router_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// The same router, built on an engine the CALLER keeps a handle to, so a suite whose
+/// rule is about a STORED clock field — the instant a workflow's trigger next fires —
+/// can seed and read that field while still driving every request through this wire
+/// path.
+pub(crate) fn definition_router_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -52,6 +61,23 @@ pub(crate) fn definition_router() -> MultiServiceRouter {
         engine,
     ));
     router
+}
+
+/// Edit the workflow `arn` as the STORE holds it. The instant a trigger next fires is a
+/// clock field of that record, so this is how a suite puts a firing in the past, or
+/// reads the trigger, without racing the wall clock.
+pub(crate) fn with_stored_workflow<R>(
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+    edit: impl FnOnce(&mut Workflow) -> R,
+) -> R {
+    let state = engine.state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>();
+    let mut store = state.lock();
+    let workflow = store
+        .workflows
+        .get_mut(arn)
+        .expect("setup: the created workflow is stored");
+    edit(workflow)
 }
 
 /// One path-style request to the emulator's Amazon S3 front door: the bucket and the key
@@ -142,6 +168,34 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Val
 /// Create a workflow whose definition is the object at `key`, and answer its ARN.
 pub(crate) async fn create_workflow(router: &MultiServiceRouter, name: &str, key: &str) -> String {
     create_workflow_at(router, name, BUCKET, key).await
+}
+
+/// Create a workflow whose definition is the object at `key`, carrying `trigger_mode`
+/// when one is named and omitting the optional member entirely when it is `None`, and
+/// answer its ARN.
+pub(crate) async fn create_workflow_with_mode(
+    router: &MultiServiceRouter,
+    name: &str,
+    key: &str,
+    trigger_mode: Option<&str>,
+) -> String {
+    let mut body = json!({
+        "Name": name,
+        "DefinitionS3Location": {"Bucket": BUCKET, "ObjectKey": key},
+        "RoleArn": role_arn(),
+    });
+    if let Some(mode) = trigger_mode {
+        body["TriggerMode"] = Value::String(mode.to_string());
+    }
+    let (status, created) = call(router, "CreateWorkflow", body).await;
+    assert_eq!(
+        status, 200,
+        "case {name:?}: the workflow must be created, got {status} {created:?}"
+    );
+    created["WorkflowArn"]
+        .as_str()
+        .expect("a created workflow has an ARN")
+        .to_string()
 }
 
 /// Create a workflow whose definition is the object `bucket`/`key` addresses, and answer

@@ -79,6 +79,7 @@ async fn create_resource(
                 "Location": {
                     "CodeLocation": {
                         "Language": "Java",
+                        "ClassName": "CartService",
                         "FilePath": "src/main/java/com/example/CartService.java",
                         "LineNumber": 142,
                     }

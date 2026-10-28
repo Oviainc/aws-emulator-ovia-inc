@@ -326,15 +326,6 @@ const DUPLICATE_ITEM_CODE: &str = "DuplicateItem";
 /// The code for a write whose `WHERE` clause the stored item does not satisfy.
 const CONDITIONAL_CHECK_FAILED_CODE: &str = "ConditionalCheckFailed";
 
-/// The code for a write past the write capacity its table is provisioned for.
-const PROVISIONED_THROUGHPUT_EXCEEDED_CODE: &str = "ProvisionedThroughputExceeded";
-
-/// How a write past the capacity its table is provisioned for is reported: the sentence
-/// DynamoDB states for that refusal, naming the table's provisioning and the call that
-/// raises it.
-const THROUGHPUT_EXCEEDED_MESSAGE: &str =
-    "The level of configured provisioned throughput for the table was exceeded. Consider \
-     increasing your provisioning level with the UpdateTable API.";
 
 /// Parse one slot's statement, holding each `?` marker's value to the same rules a
 /// stored value is held to before the statement is read.
@@ -631,7 +622,7 @@ fn insert_item(
     let capacity = store
         .active_table(region, name, now)?
         .write_capacity(None, Some(&item));
-    admit_write(store, region, name, now, &capacity)?;
+    admit_write(store, region, name, now, &key, &capacity)?;
     store.put_item(region, name, now, key, item.clone())?;
     Ok((
         // An `INSERT` states no `RETURNING` clause, so its slot reports the write and
@@ -710,7 +701,7 @@ fn update_item(
     let capacity = store
         .active_table(region, name, now)?
         .write_capacity(before.as_ref(), Some(&item));
-    admit_write(store, region, name, now, &capacity)?;
+    admit_write(store, region, name, now, &key, &capacity)?;
     store.put_item(region, name, now, key, item.clone())?;
 
     let reported = crate::state::projected_return_values(
@@ -765,7 +756,7 @@ fn delete_item(
     let capacity = store
         .active_table(region, name, now)?
         .write_capacity(before.as_ref(), None);
-    admit_write(store, region, name, now, &capacity)?;
+    admit_write(store, region, name, now, &key, &capacity)?;
     let removed = store.delete_item(region, name, now, &key)?;
 
     // A delete removes every attribute of the item, so both OLD forms of a `RETURNING`
@@ -783,32 +774,25 @@ fn delete_item(
     ))
 }
 
-/// Admit a write of `capacity` against the table's provisioned write capacity, or
-/// report the slot failure a throttled statement earns.
+/// Admit a write of `capacity` against both ceilings a write is held to — the capacity
+/// the table is provisioned for and the per-partition-key ceiling beneath it — or report
+/// the slot failure a throttled statement earns.
 ///
-/// A provisioned table serves the write units it is provisioned for each second, plus
-/// whatever of them went unused inside the documented burst window
-/// ([`crate::state::Table::admit_write`]); a statement whose write is past that budget
-/// is not applied, and the slot says so with the throttling code rather than the batch
-/// failing as a whole — the other statements of the batch are served.
+/// A statement whose write neither budget covers is not applied, and the slot says so
+/// with the throttling code rather than the batch failing as a whole: the other
+/// statements of the batch are served ([`crate::state::Table::admit_item_write`]).
 fn admit_write(
     store: &mut Store,
     region: &str,
     name: &str,
     now: ::std::time::SystemTime,
+    key: &crate::state::ItemKey,
     capacity: &crate::state::WriteCapacity,
 ) -> Result<(), SlotFailure> {
-    if store
+    store
         .active_table_mut(region, name, now)?
-        .admit_write(capacity.total(), now)
-    {
-        Ok(())
-    } else {
-        Err(SlotFailure::new(
-            PROVISIONED_THROUGHPUT_EXCEEDED_CODE,
-            THROUGHPUT_EXCEEDED_MESSAGE,
-        ))
-    }
+        .admit_item_write(&key.partition, capacity, now)
+        .map_err(|throttle| SlotFailure::new(throttle.code(), throttle.message()))
 }
 
 /// The slot failure a write whose `WHERE` clause the stored item does not satisfy

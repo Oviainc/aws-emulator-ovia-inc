@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHsmClientCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHsmClientCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHsmClientCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the HSM client certificate the request names and reports it back: the
+//! identifier it was created under, the PUBLIC KEY this service generated for it
+//! (derived from that identifier, see
+//! `crate::state::hsm_client_certificate_public_key`, so every later read of the
+//! certificate carries the same blob) and the tags the request carried. A second
+//! create under one identifier is refused with
+//! `HsmClientCertificateAlreadyExistsFault` and overwrites nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -94,13 +93,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateHsmClientCertificateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateHsmClientCertificate")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateHsmClientCertificate",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateHsmClientCertificateErrorModeled {
     HsmClientCertificateAlreadyExistsFault(HsmClientCertificateAlreadyExistsFault),
     HsmClientCertificateQuotaExceededFault(HsmClientCertificateQuotaExceededFault),
     InvalidTagFault(InvalidTagFault),
     TagLimitExceededFault(TagLimitExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -152,20 +155,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHsmClientCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHsmClientCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHsmClientCertificate"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateHsmClientCertificateErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The request's own tag list is capped BEFORE the store is locked and
+        // before any per-element work: "a resource can have up to 50 tags", so a
+        // request carrying more entries than one resource may hold is refused on
+        // its length alone.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                CreateHsmClientCertificateErrorModeled::TagLimitExceededFault(
+                    TagLimitExceededFault {
+                        message: Some(st::tag_quota_message(tags.len())),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Err(message) = st::check_tags(&tags) {
+            return Err(CreateHsmClientCertificateErrorModeled::InvalidTagFault(
+                InvalidTagFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Identity before capacity: a request that would create nothing keeps
+        // the more specific fault even when the store is at its bound. The
+        // IDENTIFIER is what an account's client certificates are unique on, so
+        // a second create under one identifier is refused and overwrites
+        // nothing.
+        if store
+            .hsm_client_certificate(&input.hsm_client_certificate_identifier)
+            .is_some()
+        {
+            return Err(
+                CreateHsmClientCertificateErrorModeled::HsmClientCertificateAlreadyExistsFault(
+                    HsmClientCertificateAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cannot create the HSM client certificate because a certificate with the identifier {} already exists.",
+                            input.hsm_client_certificate_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.hsm_client_certificates.len() >= st::HSM_CLIENT_CERTIFICATE_QUOTA {
+            return Err(
+                CreateHsmClientCertificateErrorModeled::HsmClientCertificateQuotaExceededFault(
+                    HsmClientCertificateQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of HSM client certificates ({}).",
+                            st::HSM_CLIENT_CERTIFICATE_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record every later `DescribeHsmClientCertificates` reports
+        // verbatim: the identifier the request carried, the public key this
+        // service minted for it — the key a cluster registers in the HSM — and
+        // the tags it carried (an empty list when it carried none, which is what
+        // the certificate then has).
+        let certificate = HsmClientCertificate {
+            hsm_client_certificate_identifier: Some(
+                input.hsm_client_certificate_identifier.clone(),
+            ),
+            hsm_client_certificate_public_key: Some(st::hsm_client_certificate_public_key(
+                &input.hsm_client_certificate_identifier,
+            )),
+            tags: Some(tags),
+        };
+        store.hsm_client_certificates.push(certificate.clone());
+
+        Ok(CreateHsmClientCertificateOutput {
+            hsm_client_certificate: Some(certificate),
+        })
     }
 }

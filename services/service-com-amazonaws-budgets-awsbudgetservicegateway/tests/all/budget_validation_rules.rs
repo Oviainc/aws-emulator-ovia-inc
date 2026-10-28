@@ -23,11 +23,13 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
     BUDGET_TYPE_VALUES, TIME_UNIT_VALUES,
 };
 
-use super::budget_lifecycle::{caller_account, call, carries, civil_secs, is_error, router, same};
+use super::budget_lifecycle::{
+    caller_account, call, carries, civil_secs, is_error, limit_amount_for, router, same,
+};
 
 /// What a write of a given budget must answer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Verdict {
+pub(crate) enum Verdict {
     /// Stored, and read back carrying what was sent.
     Accepted,
     /// Refused with the modelled `InvalidParameterException` (HTTP 400) — a rule the
@@ -66,12 +68,12 @@ fn baseline(name: &str) -> Value {
 /// Every request names the one account this service serves, so a row cannot keep its
 /// budgets out of another row's by naming a second account: it gets a STORE of its own
 /// instead (one per write path, since both paths use the same budget name).
-struct Harness {
+pub(crate) struct Harness {
     account: String,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             account: caller_account(),
         }
@@ -99,7 +101,7 @@ impl Harness {
     /// nothing. On the update path the budget already exists as [`baseline`], so an
     /// accepted budget replaces it and reads back, while a refused one leaves the stored
     /// budget byte-for-byte as it was.
-    async fn check(&self, case: &str, budget: &Value, expect: Verdict) {
+    pub(crate) async fn check(&self, case: &str, budget: &Value, expect: Verdict) {
         let name = budget["BudgetName"]
             .as_str()
             .expect("every case names its budget")
@@ -225,7 +227,13 @@ async fn a_cost_or_usage_budget_must_carry_a_limit() {
         // is only available for cost or usage budgets, so it is offered only there (its
         // own rule has its own test below).
         let mut sources: Vec<(&str, Value)> = vec![
-            ("a fixed BudgetLimit", json!({"BudgetLimit": spend("10")})),
+            (
+                "a fixed BudgetLimit",
+                // The amount a budget of this type may carry
+                // ([`limit_amount_for`]): this row is about WHICH member carries the
+                // limit, not about its amount.
+                json!({"BudgetLimit": spend(limit_amount_for(budget_type, "10"))}),
+            ),
             (
                 "AutoAdjustData",
                 json!({"AutoAdjustData": {"AutoAdjustType": "FORECAST"}}),

@@ -190,7 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A resource policy is what shares the rule with ANOTHER account, so a
         // document that grants only to the account that already owns the rule —
         // or that states no statement — shares it with nobody and leaves it with
-        // no policy at all.
+        // no policy at all. The DNS Firewall rule-group policy write REFUSES the
+        // same class of document instead (see
+        // `crate::ops::put_firewall_rule_group_policy`), so the two are not to
+        // be unified: each follows what its own operation answers.
         let shares = crate::state::policy_shares_with_other_account(
             &input.resolver_rule_policy,
             &record.owner_id,

@@ -639,10 +639,12 @@ pub const PERCENTAGE_LIMIT_BUDGET_TYPES: [&str; 4] = [
     "SAVINGS_PLANS_COVERAGE",
 ];
 
-/// "RI and Savings Plans utilization or coverage budgets default to `100`"
+/// "RI and Savings Plans utilization or coverage budgets default to `100`. This is the
+/// only valid value for RI or Savings Plans utilization or coverage budgets"
 /// (`Budget$BudgetLimit`) — the `Spend$Amount` such a budget is stored with when the
-/// request carries no `BudgetLimit`. `NumericValue` is a string (`^([0-9]*\.)?[0-9]+$`),
-/// so the default is written as the digits AWS documents.
+/// request carries no `BudgetLimit`, and the only one a request may name for it
+/// ([`validate_percentage_limit_amount`]). `NumericValue` is a string
+/// (`^([0-9]*\.)?[0-9]+$`), so the value is written as the digits AWS documents.
 pub const PERCENTAGE_LIMIT_AMOUNT: &str = "100";
 
 /// The `Spend$Unit` of the limit above — a unit this emulator CHOOSES, not one the model
@@ -818,8 +820,11 @@ fn drop_service_derived(budget: &mut Budget) {
 /// budget always reads back with a limit, the way a budget written without a `TimePeriod`
 /// reads back with the defaulted one.
 ///
-/// A limit the caller DID send is kept as sent, and no default is invented for any other
-/// budget type: `BudgetLimit` is required for a cost or usage budget
+/// A limit the caller DID send is kept as sent — for these budget types the only amount a
+/// request can have got this far with is the one value above, since
+/// [`validate_percentage_limit_amount`] refuses any other before anything is stored, while
+/// the unit is the caller's own. No default is invented for any other budget type:
+/// `BudgetLimit` is required for a cost or usage budget
 /// ([`validate_budget_limit_present`] refuses one that carries no limit at all), and an
 /// auto-adjusting budget's amount is the average of cost data this emulator does not hold
 /// (see [`drop_service_derived`]), so none is derived for it either.
@@ -1770,6 +1775,9 @@ pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String>
 ///   [`validate_time_period_end`]
 /// * "`BudgetLimit` is required for cost or usage budgets." (`Budget$BudgetLimit`) —
 ///   [`validate_budget_limit_present`]
+/// * "RI and Savings Plans utilization or coverage budgets default to `100`. This is the
+///   only valid value for RI or Savings Plans utilization or coverage budgets."
+///   (`Budget$BudgetLimit`) — [`validate_percentage_limit_amount`]
 /// * "`PlannedBudgetLimits` is available for cost or usage budget and supports both
 ///   monthly and quarterly `TimeUnit` ... The `key` is the start of the month, `UTC` in
 ///   epoch seconds" (`Budget$PlannedBudgetLimits`) — [`validate_planned_budget_limits`]
@@ -1809,6 +1817,7 @@ pub fn validate_budget(budget: &Budget) -> Result<(), String> {
     }
     validate_time_period_end(budget)?;
     validate_budget_limit_present(budget)?;
+    validate_percentage_limit_amount(budget)?;
     validate_planned_budget_limits(budget)?;
     validate_auto_adjust_data(budget)?;
     Ok(())
@@ -2075,6 +2084,43 @@ fn validate_budget_limit_present(budget: &Budget) -> Result<(), String> {
         "Unable to create/update budget: BudgetLimit is required for cost or usage budgets."
             .to_string(),
     )
+}
+
+/// "RI and Savings Plans utilization or coverage budgets default to `100`. This is the
+/// only valid value for RI or Savings Plans utilization or coverage budgets"
+/// (`Budget$BudgetLimit`) — so a budget whose type tracks a utilization or coverage
+/// percentage ([`PERCENTAGE_LIMIT_BUDGET_TYPES`]) is accepted with no `BudgetLimit` at
+/// all (it is then stored with the documented default, see
+/// [`apply_percentage_limit_default`]) or with one naming that single value, and refused
+/// any other amount — on create and on update alike, so no write path can leave a stored
+/// budget in a shape the model says cannot exist.
+///
+/// The amount is compared as the NUMBER it names rather than as a spelling: `NumericValue`
+/// is a string (`^([0-9]*\.)?[0-9]+$`), so every spelling of that one value (`100`,
+/// `100.0`, `0100`) names it, and the comparison goes through the same
+/// [`numeric_amount`] parser every other amount comparison in this crate uses — a figure
+/// that is no finite number names no valid value either.
+///
+/// The `Spend$Unit` is NOT constrained here: the documentation says nothing about the unit
+/// such a limit is measured in and `UnitValue`'s `.*` pattern accepts anything, so a unit
+/// the caller sent is stored as sent (see [`PERCENTAGE_LIMIT_UNIT`]).
+fn validate_percentage_limit_amount(budget: &Budget) -> Result<(), String> {
+    if !PERCENTAGE_LIMIT_BUDGET_TYPES.contains(&budget.budget_type.as_str()) {
+        return Ok(());
+    }
+    let Some(limit) = &budget.budget_limit else {
+        return Ok(());
+    };
+    let only_valid = numeric_amount(PERCENTAGE_LIMIT_AMOUNT);
+    if numeric_amount(&limit.amount) == only_valid {
+        return Ok(());
+    }
+    // The amount is not echoed back: the member, the value it must name and the budget
+    // types the rule holds for are what a caller needs to correct the request.
+    Err(format!(
+        "Unable to create/update budget: BudgetLimit amount must be \
+         {PERCENTAGE_LIMIT_AMOUNT} for RI or Savings Plans utilization or coverage budgets."
+    ))
 }
 
 /// "`PlannedBudgetLimits` is available for cost or usage budget and supports both monthly

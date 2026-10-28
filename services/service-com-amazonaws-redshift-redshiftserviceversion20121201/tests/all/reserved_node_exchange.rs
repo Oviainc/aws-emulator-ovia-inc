@@ -34,7 +34,7 @@ use service_com_amazonaws_redshift_redshiftserviceversion20121201::ops::types::{
 };
 use service_com_amazonaws_redshift_redshiftserviceversion20121201::state;
 
-use crate::cluster_lifecycle::{element_blocks, Emulator};
+use crate::cluster_lifecycle::{element_blocks, Emulator, REGION};
 use crate::reserved_nodes::{
     catalog, offering_of, one, poll_until_state, purchase, reservation, ONE_YEAR, POLL_DEADLINE,
     POLL_INTERVAL, THREE_YEARS,
@@ -215,6 +215,15 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
         master_user_password: None,
         // Already past, so the record needs no clock-owed transition.
         available_at: std::time::Instant::now(),
+        // A seeded cluster serves on the endpoint the service would have given
+        // it, built by the one rule every cluster's endpoint comes from.
+        endpoint: state::cluster_endpoint(
+            cluster_identifier,
+            REGION,
+            state::DEFAULT_PORT,
+            "vpc-seeded",
+            &format!("{REGION}a"),
+        ),
     });
     store.reserved_nodes.push(state::StoredReservedNode {
         node: ReservedNode {

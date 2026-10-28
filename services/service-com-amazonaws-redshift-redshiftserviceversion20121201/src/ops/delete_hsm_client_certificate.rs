@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHsmClientCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHsmClientCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHsmClientCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the HSM client certificate the request names from this account, which
+//! is what makes the deletion observable: every later read of that identifier
+//! reports it absent. An identifier that names no certificate is refused with
+//! `HsmClientCertificateNotFoundFault`, and a certificate a live cluster
+//! connects to its HSM with is refused with
+//! `InvalidHsmClientCertificateStateFault` — "it is still in use by one or more
+//! Amazon Redshift clusters" — so no cluster is left pointing at a certificate
+//! that is gone.
 //!
 //! ## Shape of an operation
 //!
@@ -97,11 +97,15 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteHsmClientCertifica
 // here — hence the `DeleteHsmClientCertificateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteHsmClientCertificate")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteHsmClientCertificate",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteHsmClientCertificateErrorModeled {
     HsmClientCertificateNotFoundFault(HsmClientCertificateNotFoundFault),
     InvalidHsmClientCertificateStateFault(InvalidHsmClientCertificateStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,20 +157,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHsmClientCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHsmClientCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHsmClientCertificate"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteHsmClientCertificateErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        let identifier = &input.hsm_client_certificate_identifier;
+
+        let Some(position) = store.hsm_client_certificate_position(identifier) else {
+            return Err(
+                DeleteHsmClientCertificateErrorModeled::HsmClientCertificateNotFoundFault(
+                    HsmClientCertificateNotFoundFault {
+                        message: Some(st::hsm_client_certificate_not_found_message(identifier)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "it is still in use by one or more Amazon Redshift clusters": the
+        // clusters this store holds are the whole of what can be using it, and a
+        // certificate in use is not the account's to remove.
+        let in_use_by = store.clusters_using_hsm_client_certificate(identifier);
+        if !in_use_by.is_empty() {
+            return Err(
+                DeleteHsmClientCertificateErrorModeled::InvalidHsmClientCertificateStateFault(
+                    InvalidHsmClientCertificateStateFault {
+                        message: Some(format!(
+                            "The HSM client certificate {identifier} is still in use by cluster(s) {}.",
+                            in_use_by.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record leaves the store, which is what makes the deletion
+        // observable. `remove` keeps the insertion order the `Marker` cursor
+        // pages over.
+        store.hsm_client_certificates.remove(position);
+
+        Ok(DeleteHsmClientCertificateOutput)
     }
 }

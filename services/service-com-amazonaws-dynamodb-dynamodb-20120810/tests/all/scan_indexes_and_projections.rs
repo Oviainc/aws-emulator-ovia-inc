@@ -446,7 +446,9 @@ async fn the_legacy_scan_filter_selects_what_the_expression_selects() {
             json!({"FilterExpression": "#s <> :v",
                    "ExpressionAttributeNames": {"#s": "status"},
                    "ExpressionAttributeValues": {":v": {"S": "OPEN"}}}),
-            vec!["third", "fourth"],
+            // A not-equal comparison needs no attribute: the item carrying no `status`
+            // at all is not equal to "OPEN" either, on both surfaces.
+            vec!["third", "fourth", "fifth"],
         ),
         (
             "GT and >",

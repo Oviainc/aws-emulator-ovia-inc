@@ -400,7 +400,8 @@ use super::template::{
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
-    MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
+    MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER, ROUTE53RESOLVER_ENDPOINT,
+    ROUTE53RESOLVER_RULE,
     ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HOSTED_ZONE, ROUTE53_RECORD_SET,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
@@ -436,7 +437,6 @@ const CODEPIPELINE_PIPELINE: &str = "AWS::CodePipeline::Pipeline";
 /// `AWS::RDS::DBInstance`: "Ref returns the DBInstanceIdentifier", so a resource of this
 /// type is a DB instance of Amazon RDS addressed by its physical resource id.
 const RDS_DB_INSTANCE: &str = "AWS::RDS::DBInstance";
-
 /// `AWS::RDS::DBSubnetGroup`: "Ref returns the DBSubnetGroupName" — the group a DB
 /// instance's `DBSubnetGroupName` names, which Amazon RDS resolves before it will create
 /// an instance in it.
@@ -534,6 +534,7 @@ pub(super) enum Provisioner {
     RdsDbSubnetGroup,
     RdsDbParameterGroup,
     RdsDbClusterParameterGroup,
+    RedshiftCluster,
     EventsRule,
     SsmParameter,
     StepFunctionsActivity,
@@ -618,6 +619,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
         RDS_DB_CLUSTER_PARAMETER_GROUP => Some(Provisioner::RdsDbClusterParameterGroup),
+        REDSHIFT_CLUSTER => Some(Provisioner::RedshiftCluster),
         EVENTS_RULE => Some(Provisioner::EventsRule),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
@@ -791,6 +793,9 @@ impl Provisioner {
             Self::MqBroker => create_mq_broker(ctx, region, resource, propagated).await,
             Self::RdsDbInstance => {
                 create_db_instance(ctx, region, resource, propagated).await
+            }
+            Self::RedshiftCluster => {
+                create_redshift_cluster(ctx, region, resource, propagated).await
             }
             Self::RdsDbSubnetGroup => {
                 create_db_subnet_group(ctx, region, resource, propagated).await
@@ -1394,6 +1399,9 @@ impl Provisioner {
             // The delete carries one member off the resource's own declaration
             // (`DeleteAutomatedBackups`), so it takes the record rather than the id.
             Self::RdsDbInstance => delete_db_instance(ctx, region, resource).await,
+            Self::RedshiftCluster => {
+                delete_redshift_cluster(ctx, region, physical_resource_id).await
+            }
             Self::RdsDbSubnetGroup => {
                 delete_db_subnet_group(ctx, region, physical_resource_id).await
             }
@@ -1789,6 +1797,11 @@ impl Provisioner {
             Self::BackupPlan => describe_backup_plan(ctx, region, physical_resource_id).await,
             // Read back by the same plan-and-selection pair the delete uses.
             Self::BackupSelection => describe_backup_selection(ctx, region, resource).await,
+            // Amazon Redshift's own read of the cluster the stack created, by the
+            // identifier it was created under.
+            Self::RedshiftCluster => {
+                describe_redshift_cluster(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -9620,6 +9633,204 @@ async fn delete_db_instance(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Amazon Redshift: AWS::Redshift::Cluster
+// ---------------------------------------------------------------------------
+
+/// Amazon Redshift's signing name and API version, from its model (`sigv4Name: redshift`,
+/// service shape `RedshiftServiceVersion20121201`, `version: 2012-12-01`), which speaks
+/// `awsQuery` — so its calls ride on [`call_query`], exactly as Amazon RDS's do.
+const REDSHIFT_SIGNING_NAME: &str = "redshift";
+const REDSHIFT_API_VERSION: &str = "2012-12-01";
+
+/// The error code Amazon Redshift answers for a cluster it does not hold:
+/// `ClusterNotFoundFault`'s own `awsQueryError` code, which is what an awsQuery client
+/// branches on.
+const REDSHIFT_CLUSTER_NOT_FOUND: &str = "ClusterNotFound";
+
+/// The members `CreateCluster` takes, from Amazon Redshift's own model
+/// (`smithy_query(query="operation", operation="CreateCluster")`), with each list's element
+/// name from its list shape's member `@xmlName`
+/// (`smithy_query(query="shape", shape="ClusterSecurityGroupNameList,IamRoleArnList,
+/// VpcSecurityGroupIdList,TagList")`).
+///
+/// This is the catalogue the declaration of an `AWS::Redshift::Cluster` is walked against:
+/// the type's properties ARE these members, spelled identically on both sides, so a
+/// property whose name is one of them is passed through under it and one the catalogue does
+/// not carry is refused rather than dropped ([`query_members`]).
+const CREATE_CLUSTER_MEMBERS: &[(&str, QueryMember)] = &[
+    ("AdditionalInfo", QueryMember::Scalar),
+    ("AllowVersionUpgrade", QueryMember::Scalar),
+    ("AquaConfigurationStatus", QueryMember::Scalar),
+    ("AutomatedSnapshotRetentionPeriod", QueryMember::Scalar),
+    ("AvailabilityZone", QueryMember::Scalar),
+    ("AvailabilityZoneRelocation", QueryMember::Scalar),
+    ("CatalogName", QueryMember::Scalar),
+    ("ClusterIdentifier", QueryMember::Scalar),
+    ("ClusterParameterGroupName", QueryMember::Scalar),
+    (
+        "ClusterSecurityGroups",
+        QueryMember::List("ClusterSecurityGroupName"),
+    ),
+    ("ClusterSubnetGroupName", QueryMember::Scalar),
+    ("ClusterType", QueryMember::Scalar),
+    ("ClusterVersion", QueryMember::Scalar),
+    ("DBName", QueryMember::Scalar),
+    ("DefaultIamRoleArn", QueryMember::Scalar),
+    ("ElasticIp", QueryMember::Scalar),
+    ("Encrypted", QueryMember::Scalar),
+    ("EnhancedVpcRouting", QueryMember::Scalar),
+    ("ExtraComputeForAutomaticOptimization", QueryMember::Scalar),
+    ("HsmClientCertificateIdentifier", QueryMember::Scalar),
+    ("HsmConfigurationIdentifier", QueryMember::Scalar),
+    ("IamRoles", QueryMember::List("IamRoleArn")),
+    ("IpAddressType", QueryMember::Scalar),
+    ("KmsKeyId", QueryMember::Scalar),
+    ("LoadSampleData", QueryMember::Scalar),
+    ("MaintenanceTrackName", QueryMember::Scalar),
+    ("ManageMasterPassword", QueryMember::Scalar),
+    ("ManualSnapshotRetentionPeriod", QueryMember::Scalar),
+    ("MasterPasswordSecretKmsKeyId", QueryMember::Scalar),
+    ("MasterUserPassword", QueryMember::Scalar),
+    ("MasterUsername", QueryMember::Scalar),
+    ("MultiAZ", QueryMember::Scalar),
+    ("NodeType", QueryMember::Scalar),
+    ("NumberOfNodes", QueryMember::Scalar),
+    ("Port", QueryMember::Scalar),
+    ("PreferredMaintenanceWindow", QueryMember::Scalar),
+    ("PubliclyAccessible", QueryMember::Scalar),
+    ("RedshiftIdcApplicationArn", QueryMember::Scalar),
+    ("SnapshotScheduleIdentifier", QueryMember::Scalar),
+    ("Tags", QueryMember::List("Tag")),
+    (
+        "VpcSecurityGroupIds",
+        QueryMember::List("VpcSecurityGroupId"),
+    ),
+];
+
+/// The properties of `AWS::Redshift::Cluster` the walk over the declaration does NOT turn
+/// into a `CreateCluster` member, each for a reason of its own — the same split the DB
+/// instance's catalogue is in ([`DB_INSTANCE_PROPERTIES_NOT_SENT`]).
+const CLUSTER_PROPERTIES_NOT_SENT: &[&str] = &[
+    // The identifier CloudFormation decides, which is this resource's physical id ("Ref
+    // returns the name of the cluster"): the arm sets the member from that id, so the walk
+    // must not also push the declared spelling of it.
+    "ClusterIdentifier",
+    // The tag list carries the declared tags AND the ones CloudFormation propagates to the
+    // resource, so the arm builds it out of both ([`tags_of`]).
+    "Tags",
+    // Members of a DIFFERENT Amazon Redshift call, which say nothing about the cluster a
+    // create makes: `EnableLogging` takes the logging destination, `EnableSnapshotCopy` the
+    // cross-Region copy settings, `ModifyClusterMaintenance` the deferral window,
+    // `ModifyCluster` the in-place actions and the revision to move to,
+    // `RestoreFromClusterSnapshot` the snapshot a cluster is rebuilt from, and
+    // `PutResourcePolicy` the namespace's resource policy.
+    "Classic",
+    "DeferMaintenance",
+    "DeferMaintenanceDuration",
+    "DeferMaintenanceEndTime",
+    "DeferMaintenanceStartTime",
+    "DestinationRegion",
+    "LoggingProperties",
+    "NamespaceResourcePolicy",
+    "OwnerAccount",
+    "ResourceAction",
+    "RevisionTarget",
+    "RotateEncryptionKey",
+    "SnapshotClusterIdentifier",
+    "SnapshotCopyGrantName",
+    "SnapshotCopyManual",
+    "SnapshotCopyRetentionPeriod",
+    "SnapshotIdentifier",
+    // Read-only members CloudFormation publishes as this type's RETURN values: a create
+    // neither takes them nor could be told them.
+    "Endpoint",
+];
+
+/// Create the cluster an `AWS::Redshift::Cluster` declares.
+///
+/// The type's properties are `CreateCluster`'s own members ([`CREATE_CLUSTER_MEMBERS`]), so
+/// the evaluated declaration IS the request, with the one value CloudFormation decides —
+/// the `ClusterIdentifier`, which is this resource's physical id — set on the way out, and
+/// the tag list built from the declared tags plus the ones CloudFormation propagates.
+///
+/// The cluster is created in the service that OWNS it, so Amazon Redshift's own
+/// `DescribeClusters` reports the cluster the stack claims to have created. Its identity is
+/// CloudFormation's ("Ref returns the name of the cluster"), so nothing here replaces the
+/// physical id, and the endpoint is NOT reported as an attribute: Amazon Redshift publishes
+/// a cluster's endpoint only once that cluster is serving, so a create answers none.
+async fn create_redshift_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_CLUSTER_MEMBERS,
+        // Every property of this type is its member's own name.
+        &[],
+        CLUSTER_PROPERTIES_NOT_SENT,
+        REDSHIFT_CLUSTER,
+    )?;
+    parameters.push((
+        "ClusterIdentifier".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "Tag",
+        &tags_of(&resource.properties, propagated),
+    );
+    call_query(
+        ctx,
+        REDSHIFT_SIGNING_NAME,
+        region,
+        REDSHIFT_API_VERSION,
+        "CreateCluster",
+        &parameters,
+    )
+    .await?;
+    Ok(Created::attributes(BTreeMap::new()))
+}
+
+/// Delete the cluster a stack created, addressed by its identifier — this resource's
+/// physical id. A cluster Amazon Redshift no longer has (`ClusterNotFound`) is already in
+/// the state the delete asks for.
+///
+/// `DeleteCluster` requires the caller to say what becomes of the data: a final snapshot
+/// identifier, or the skip. This emulator's CloudFormation implements no `DeletionPolicy`,
+/// so the call is the form CloudFormation makes for the `Delete` policy, which skips the
+/// final snapshot — exactly as [`delete_db_instance`] does for a DB instance.
+async fn delete_redshift_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![
+        (
+            "ClusterIdentifier".to_string(),
+            physical_resource_id.to_string(),
+        ),
+        ("SkipFinalClusterSnapshot".to_string(), "true".to_string()),
+    ];
+    match call_query(
+        ctx,
+        REDSHIFT_SIGNING_NAME,
+        region,
+        REDSHIFT_API_VERSION,
+        "DeleteCluster",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == REDSHIFT_CLUSTER_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
 /// The workspace's configuration as Amazon Managed Grafana reports it, for drift
 /// detection: `DescribeWorkspace`'s own record, read by the id that service minted.
 ///
@@ -9719,6 +9930,41 @@ async fn describe_db_instance(
             "DBInstance",
         )))),
         Err(refusal) if refusal.code == DB_INSTANCE_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The cluster's configuration as Amazon Redshift reports it, for drift detection. A
+/// cluster it no longer has (`ClusterNotFound`) was deleted.
+///
+/// A cluster is reported as a STRUCTURE whose scalar members are named exactly as this
+/// type's properties are (`NodeType`, `ClusterType`, `NumberOfNodes`, `DBName`,
+/// `PubliclyAccessible`), so those members are the actual configuration the declared one is
+/// compared against — the same position the DB instance's read is in
+/// ([`describe_db_instance`]), and for the same reason its composite members take no part.
+async fn describe_redshift_cluster(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        "ClusterIdentifier".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        REDSHIFT_SIGNING_NAME,
+        region,
+        REDSHIFT_API_VERSION,
+        "DescribeClusters",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_scalar_children(
+            &answered, "Cluster",
+        )))),
+        Err(refusal) if refusal.code == REDSHIFT_CLUSTER_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

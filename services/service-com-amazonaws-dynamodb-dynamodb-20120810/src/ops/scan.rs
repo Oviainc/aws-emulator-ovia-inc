@@ -48,6 +48,12 @@
 //! A table whose resource-based policy denies the caller `dynamodb:Scan` is
 //! answered `AccessDeniedException` instead of its items.
 //!
+//! Every substitution token the request DEFINES must be one its expressions USE: an
+//! `ExpressionAttributeNames`/`ExpressionAttributeValues` key no expression member
+//! references makes the whole request invalid
+//! ([`crate::state::Substitutions::check_all_referenced`]), the way a token supplied
+//! beside no expression at all does.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -381,6 +387,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "{member} can only be specified when using expressions"
             )));
         }
+        // Every token the request DEFINES must be one an expression uses: an unused
+        // entry of either substitution table makes the whole request invalid, however
+        // well-formed the expressions that ignore it are.
+        crate::state::Substitutions::new(
+            input.expression_attribute_names.as_ref(),
+            input.expression_attribute_values.as_ref(),
+        )
+        .check_all_referenced(&[
+            input.filter_expression.as_deref(),
+            input.projection_expression.as_deref(),
+        ])
+        .map_err(lift)?;
         // Which member names the index is a fact of the request, so what each reported
         // item carries is decided here too: the defaults differ between a table scan
         // and an index scan ([`resolve_selection`]).
