@@ -192,9 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeAccountAssignmentDeletionStatusErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "No instance found with the ARN {}",
-                            input.instance_arn
+                        message: Some(crate::state::instance_not_found_message(
+                            &input.instance_arn,
                         )),
                         reason: None,
                     },
