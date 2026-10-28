@@ -55,6 +55,8 @@ mod metadata_sync_over_the_wire;
 mod metadata_sync_restart_supersedes_the_pending_sync;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
+#[path = "all/page_token_provenance.rs"]
+mod page_token_provenance;
 #[path = "all/put_bandwidth_rate_limit_schedule.rs"]
 mod put_bandwidth_rate_limit_schedule;
 #[path = "all/put_hypervisor_property_mappings.rs"]

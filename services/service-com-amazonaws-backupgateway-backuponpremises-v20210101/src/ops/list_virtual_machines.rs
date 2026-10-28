@@ -159,13 +159,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // One guard for the whole listing: the token is RESOLVED against the store that
+        // issued it and the page is then cut from that same store, so a token cannot be
+        // accepted against one view of the records and spent against another.
+        let store = state.lock();
+
         // A `NextToken` resumes after the page boundary it encodes. One this service did
         // not issue for a virtual-machine listing is refused, never quietly treated as
-        // "start from the top".
+        // "start from the top" — which is a question for the store, since a boundary of
+        // the right SHAPE that this service never minted would include the whole listing
+        // and hand back page one.
         let after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(token, crate::state::VIRTUAL_MACHINE_RESOURCE_TYPE)
+                store
+                    .resume_after(
+                        token,
+                        crate::state::VIRTUAL_MACHINE_RESOURCE_TYPE,
+                        &region,
+                    )
                     .ok_or_else(|| {
                         ListVirtualMachinesErrorModeled::ValidationException(ValidationException {
                             error_code: None,
@@ -200,13 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The clock decides which machines are part of an inventory yet: a sync reports
         // the machines it discovered at the instant it falls due, so the listing is a
         // function of the records and the current time and this read moves nothing.
-        let page = state.lock().page_of_virtual_machines(
+        let page = store.page_of_virtual_machines(
             &region,
             input.hypervisor_arn.as_deref(),
             after.as_deref(),
             limit,
             ::std::time::SystemTime::now(),
         );
+        drop(store);
 
         Ok(ListVirtualMachinesOutput {
             virtual_machines: Some(

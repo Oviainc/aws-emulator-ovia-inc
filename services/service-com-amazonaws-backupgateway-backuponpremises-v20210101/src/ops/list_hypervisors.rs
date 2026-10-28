@@ -152,13 +152,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // One guard for the whole listing: the token is RESOLVED against the store that
+        // issued it and the page is then cut from that same store, so a token cannot be
+        // accepted against one view of the records and spent against another.
+        let store = state.lock();
+
         // A `NextToken` resumes after the page boundary it encodes. One this service did
         // not issue for a hypervisor listing is refused, never quietly treated as "start
-        // from the top".
+        // from the top" — which is a question for the store, since a boundary of the right
+        // SHAPE that this service never minted would include the whole listing and hand
+        // back page one.
         let after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(token, crate::state::HYPERVISOR_RESOURCE_TYPE)
+                store
+                    .resume_after(token, crate::state::HYPERVISOR_RESOURCE_TYPE, &region)
                     .ok_or_else(|| {
                         ListHypervisorsErrorModeled::ValidationException(ValidationException {
                             error_code: None,
@@ -185,9 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One clock reading for the whole page, so two records of the same page cannot
         // report their state as of two different instants.
         let now = ::std::time::SystemTime::now();
-        let page = state
-            .lock()
-            .page_of_hypervisors(&region, after.as_deref(), limit);
+        let page = store.page_of_hypervisors(&region, after.as_deref(), limit);
+        drop(store);
 
         Ok(ListHypervisorsOutput {
             hypervisors: Some(

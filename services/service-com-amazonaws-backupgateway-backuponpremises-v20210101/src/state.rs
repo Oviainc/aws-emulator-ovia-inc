@@ -80,7 +80,13 @@
 //! Every listing pages through one helper ([`page_of_where`], handing back a [`Page`]),
 //! so a page boundary and the token that encodes it mean the same thing whichever
 //! resource is being listed, filtered ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::page_of_virtual_machines`])
-//! or not. Every resource of this service is REGIONAL — its region is a segment of the
+//! or not. A `NextToken` is RESOLVED against this store rather than parsed
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::resume_after`]): only a
+//! boundary this store really minted, for that resource type and in the region the
+//! listing reports, resumes a listing, and every other string is refused — a boundary of
+//! the right shape that nothing was ever stored under would bound the range at a key the
+//! whole listing sorts above, so accepting it would hand a client page one for ever.
+//! Every resource of this service is REGIONAL — its region is a segment of the
 //! ARN it is minted and keyed under — so every listing reports only the records of the
 //! region the listing request itself was addressed to ([`arn_is_in_region`], applied
 //! before the page is cut), whichever resource it lists: one store serves every region a
@@ -122,7 +128,7 @@
 //! together, and a sync started before the previous one fell due supersedes it on both
 //! halves of that fact at once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
@@ -151,6 +157,13 @@ pub const ARN_SERVICE: &str = "backup-gateway";
 /// The ARN resource type of a gateway: `gateway/<id>`.
 pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 
+/// The id prefix of a gateway this store minted: the `bgw-` of
+/// `gateway/bgw-0000000000000000`.
+///
+/// One spelling for the mint and for the question "is this an ARN this store minted?"
+/// ([`minted_resource_id`], [`minted_resource_sequence`]), so the two cannot drift.
+const GATEWAY_ID_PREFIX: &str = "bgw-";
+
 /// The ARN resource type of a hypervisor: `hypervisor/<id>`.
 ///
 /// The hypervisor is the second resource this service's ARNs name
@@ -159,6 +172,10 @@ pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 /// member — so they have to tell them apart. See [`MissingResource`].
 pub const HYPERVISOR_RESOURCE_TYPE: &str = "hypervisor";
 
+/// The id prefix of a hypervisor this store minted, for the same reason as
+/// [`GATEWAY_ID_PREFIX`].
+const HYPERVISOR_ID_PREFIX: &str = "hv-";
+
 /// The ARN resource type of a virtual machine: `vm/<id>`.
 ///
 /// The third resource this service's ARNs name, spelled as the modelled
@@ -166,6 +183,10 @@ pub const HYPERVISOR_RESOURCE_TYPE: &str = "hypervisor";
 /// (`smithy_query(query="shape",shape="VirtualMachine")`: "For example,
 /// `arn:aws:backup-gateway:us-west-1:0000000000000:vm/vm-0000ABCDEFGIJKL`").
 pub const VIRTUAL_MACHINE_RESOURCE_TYPE: &str = "vm";
+
+/// The id prefix of a virtual machine this store minted, for the same reason as
+/// [`GATEWAY_ID_PREFIX`].
+const VIRTUAL_MACHINE_ID_PREFIX: &str = "vm-";
 
 /// `ErrorCode` for a well-formed hypervisor ARN that names no hypervisor, and the
 /// sentence that states it. See [`MissingResource`].
@@ -660,6 +681,19 @@ pub const MAX_STORED_HYPERVISORS: usize = 1_000;
 /// [`MAX_STORED_GATEWAYS`]: the inventory a hypervisor reports grows resident memory one
 /// record per machine, so the store is bounded and a record past the ceiling is not kept.
 pub const MAX_STORED_VIRTUAL_MACHINES: usize = 10_000;
+
+/// The largest number of (resource kind, region) mint sequences this emulator keeps.
+///
+/// A mint sequence is a `u64` per kind per region a record has been minted in, and the
+/// region a record is minted in comes off the request — so the registry is bounded here
+/// for the same reason the stores above are. The ceiling is the stores' own ceilings
+/// together, because a pair with a record stored under it must keep its sequence: once
+/// the registry reaches it, the sequences of the pairs this store holds NO record for are
+/// dropped ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::bound_mint_sequences`]),
+/// which never drops a sequence a stored record needs — and a region holding no record
+/// lists nothing, so a token naming it resumes an empty listing either way.
+pub const MAX_MINT_SEQUENCES: usize =
+    MAX_STORED_GATEWAYS + MAX_STORED_HYPERVISORS + MAX_STORED_VIRTUAL_MACHINES;
 
 /// How many virtual machines a hypervisor reports in the inventory a metadata sync reads.
 ///
@@ -1317,6 +1351,51 @@ pub struct Page<T> {
     pub next_token: Option<String>,
 }
 
+/// The kinds of resource this store MINTS an ARN for: the three resource types of this
+/// service's ARNs, as the `gateway`, `hypervisor` and `vm` of
+/// `arn:aws:backup-gateway:<region>:<account>:<type>/<id>`.
+///
+/// A kind rather than the resource-type string wherever the store has to pick the mint
+/// sequence or the id prefix that goes with it, so the mapping is exhaustive at compile
+/// time and no caller can ask for a type this store does not mint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MintedResource {
+    Gateway,
+    Hypervisor,
+    VirtualMachine,
+}
+
+impl MintedResource {
+    /// The kind `resource_type` names, or `None` for a resource type this store mints no
+    /// ARN for.
+    fn for_resource_type(resource_type: &str) -> Option<Self> {
+        match resource_type {
+            GATEWAY_RESOURCE_TYPE => Some(Self::Gateway),
+            HYPERVISOR_RESOURCE_TYPE => Some(Self::Hypervisor),
+            VIRTUAL_MACHINE_RESOURCE_TYPE => Some(Self::VirtualMachine),
+            _ => None,
+        }
+    }
+
+    /// The resource-type segment of an ARN of this kind.
+    fn resource_type(self) -> &'static str {
+        match self {
+            Self::Gateway => GATEWAY_RESOURCE_TYPE,
+            Self::Hypervisor => HYPERVISOR_RESOURCE_TYPE,
+            Self::VirtualMachine => VIRTUAL_MACHINE_RESOURCE_TYPE,
+        }
+    }
+
+    /// The id prefix this store mints an id of this kind under.
+    fn id_prefix(self) -> &'static str {
+        match self {
+            Self::Gateway => GATEWAY_ID_PREFIX,
+            Self::Hypervisor => HYPERVISOR_ID_PREFIX,
+            Self::VirtualMachine => VIRTUAL_MACHINE_ID_PREFIX,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-backupgateway-backuponpremises-v20210101. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
@@ -1324,9 +1403,19 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// order is total and stable, so a page boundary means the same thing on every call
     /// and a token can name the key it resumes after.
     gateways: BTreeMap<String, StoredGateway>,
-    /// Monotonic counter behind the `gateway/<id>` ARN suffix, so every minted ARN is
-    /// unique within a run and the sequence is reproducible.
-    next_gateway_id: u64,
+    /// The next sequence to mint for each (resource kind, region) pair — the number behind
+    /// the `<kind>/<id>` ARN suffix.
+    ///
+    /// Monotonic per PAIR, so every minted ARN is unique within a run and the sequence a
+    /// test sees is reproducible. Per pair rather than one counter per kind because every
+    /// resource of this service is REGIONAL while one store serves every region a client
+    /// addresses: a sequence is minted in exactly one region, so a counter scoped to the
+    /// region is what lets
+    /// [`Self::is_minted_resource_arn`] tell an ARN a region's own listing handed out from
+    /// one another region's listing did — a global counter answers "minted somewhere",
+    /// which is not the question a page boundary asks. Bounded by
+    /// [`MAX_MINT_SEQUENCES`](crate::state::MAX_MINT_SEQUENCES).
+    next_resource_ids: BTreeMap<(MintedResource, String), u64>,
     /// The activation keys this service has issued and no create has redeemed, by key.
     ///
     /// The registry `CreateGateway` resolves its `ActivationKey` against: the activation
@@ -1340,7 +1429,7 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     pending_activations: BTreeMap<String, PendingActivation>,
     /// Monotonic counter behind an issued activation key, so every key this service hands
     /// out is unique within a run and the sequence is reproducible — the same reason
-    /// `next_gateway_id` sits behind the `gateway/<id>` ARN suffix.
+    /// `next_resource_ids` sits behind the `<kind>/<id>` ARN suffix.
     next_activation_id: u64,
     /// Hypervisors by ARN. A `BTreeMap` for the same reason as `gateways`: the key order
     /// is total and stable, and it is the order `ListHypervisors` reports them in —
@@ -1349,8 +1438,6 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// boundary means the same thing on every call and a token can name the key it
     /// resumes after.
     hypervisors: BTreeMap<String, StoredHypervisor>,
-    /// Monotonic counter behind the `hypervisor/<id>` ARN suffix.
-    next_hypervisor_id: u64,
     /// Virtual machines by ARN. A `BTreeMap` for the same reason as `hypervisors`: the
     /// key order is total and stable, and it is the order `ListVirtualMachines` reports
     /// them in — "a list of your VirtualMachine objects, ordered by their Amazon Resource
@@ -1360,8 +1447,6 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// `HypervisorArn` is a FILTER on an otherwise whole-account listing (the member is
     /// optional), so both listings page over the same order.
     virtual_machines: BTreeMap<String, StoredVirtualMachine>,
-    /// Monotonic counter behind the `vm/<id>` ARN suffix.
-    next_virtual_machine_id: u64,
 }
 
 impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
@@ -1445,13 +1530,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         tags: BTreeMap<String, String>,
         now: SystemTime,
     ) -> StoredGateway {
-        let gateway_id = format!("bgw-{:016x}", self.next_gateway_id);
-        self.next_gateway_id += 1;
-        let arn = ::engine::emulator_arn(
-            ARN_SERVICE,
-            &arn_region(region),
-            &format!("{GATEWAY_RESOURCE_TYPE}/{gateway_id}"),
-        );
+        let (gateway_id, arn) = self.mint_resource(MintedResource::Gateway, region);
         let record = StoredGateway {
             arn: arn.clone(),
             gateway_id,
@@ -1706,13 +1785,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         configuration: HypervisorConfiguration,
         now: SystemTime,
     ) -> StoredHypervisor {
-        let hypervisor_id = format!("hv-{:016x}", self.next_hypervisor_id);
-        self.next_hypervisor_id += 1;
-        let arn = ::engine::emulator_arn(
-            ARN_SERVICE,
-            &arn_region(region),
-            &format!("{HYPERVISOR_RESOURCE_TYPE}/{hypervisor_id}"),
-        );
+        let (_, arn) = self.mint_resource(MintedResource::Hypervisor, region);
         let record = StoredHypervisor {
             arn: arn.clone(),
             name: configuration.name,
@@ -1996,13 +2069,7 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
                 if self.virtual_machines.len() >= MAX_STORED_VIRTUAL_MACHINES {
                     return None;
                 }
-                let machine_id = format!("vm-{:016x}", self.next_virtual_machine_id);
-                self.next_virtual_machine_id += 1;
-                let arn = ::engine::emulator_arn(
-                    ARN_SERVICE,
-                    &arn_region(region),
-                    &format!("{VIRTUAL_MACHINE_RESOURCE_TYPE}/{machine_id}"),
-                );
+                let (_, arn) = self.mint_resource(MintedResource::VirtualMachine, region);
                 (arn, now, BTreeMap::new())
             }
         };
@@ -2170,6 +2237,130 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             .filter(|machine| machine.discovered_as_of(now))?;
         Some((machine.arn.clone(), &mut machine.tags))
     }
+
+    /// The page boundary a client-supplied `NextToken` resumes after, for the listing of
+    /// `resource_type` records of `region` — the `after` every `page_of_*` takes.
+    ///
+    /// `Some` only for a token THIS STORE REALLY ISSUED for THIS listing, which is a
+    /// question about the store and not about the spelling of the token: the boundary a
+    /// token encodes is a key a page of this listing ended on, so it has to be an ARN this
+    /// store MINTED for that resource type IN THAT REGION
+    /// ([`Self::is_minted_resource_arn`]) and one of the region this listing reports
+    /// ([`arn_is_in_region`]). Everything else is `None` —
+    /// not hex, not UTF-8, not an ARN of this service, an ARN naming another resource
+    /// type, an ARN of another region's listing, and an ARN of the right shape that this
+    /// store never minted — and the caller answers `None` with the modelled
+    /// `ValidationException`, never by silently restarting the listing from the top: a
+    /// client that mangled a token must learn that, not receive page one again. Shape
+    /// alone cannot decide this, because an ARN of the right form sorting below every
+    /// stored key would include the whole listing and hand back page one.
+    ///
+    /// A boundary whose record has since been DELETED still resumes the listing: a minted
+    /// ARN stays minted, so the page after it is the records that sort above it, exactly
+    /// as [`page_of_where`] documents for a record deleted between two pages.
+    pub fn resume_after(&self, token: &str, resource_type: &str, region: &str) -> Option<String> {
+        let boundary = decode_page_token(token, resource_type)?;
+        (arn_is_in_region(&boundary, region)
+            && self.is_minted_resource_arn(&boundary, resource_type))
+        .then_some(boundary)
+    }
+
+    /// Whether `arn` is one THIS STORE minted for a `resource_type` record — the question
+    /// [`Self::resume_after`] asks of a token's boundary.
+    ///
+    /// A minted ARN is the ARN of the sequence its id encodes, rendered the ONE way this
+    /// store renders it ([`minted_resource_id`]) and below the sequence this store mints
+    /// next IN THAT REGION — so an id of another spelling, of another account or
+    /// partition, or of a sequence that region has not reached is not minted. The region
+    /// is part of the question because a sequence is minted in exactly one region: a
+    /// listing of one region never handed out a boundary of a record minted in another,
+    /// even where that boundary's own region segment is this listing's.
+    ///
+    /// The mint sequence rather than the record map is what is consulted, because a record
+    /// this store minted and has since removed was still minted.
+    fn is_minted_resource_arn(&self, arn: &str, resource_type: &str) -> bool {
+        let Some(resource) = MintedResource::for_resource_type(resource_type) else {
+            return false;
+        };
+        let Some(parts) = arn_parts(arn) else {
+            return false;
+        };
+        if parts.resource_type != resource_type {
+            return false;
+        }
+        let Some(sequence) = minted_resource_sequence(parts.resource_id, resource.id_prefix())
+        else {
+            return false;
+        };
+        // Comparing against the ARN this store WOULD mint for that sequence in that region
+        // is what settles the account and partition segments too, in one place rather than
+        // segment by segment.
+        sequence < self.next_resource_id(resource, parts.region)
+            && arn == minted_resource_arn(resource, parts.region, sequence)
+    }
+
+    /// The sequence this store mints NEXT for a `resource` record of `region`, which is
+    /// also how many it has minted there.
+    fn next_resource_id(&self, resource: MintedResource, region: &str) -> u64 {
+        self.next_resource_ids
+            .get(&(resource, arn_region(region)))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Mint the next id for a `resource` record of `region`, and the ARN the store keys
+    /// such a record under: `(id, arn)`.
+    ///
+    /// The ONE place an ARN of this store is minted — all three resources go through it —
+    /// so the form an ARN has, the sequence it comes from and the provenance check that
+    /// resumes a page boundary ([`Self::is_minted_resource_arn`]) cannot drift apart.
+    fn mint_resource(&mut self, resource: MintedResource, region: &str) -> (String, String) {
+        self.bound_mint_sequences();
+        let region = arn_region(region);
+        let sequence = self
+            .next_resource_ids
+            .entry((resource, region.clone()))
+            .or_default();
+        let id = minted_resource_id(resource.id_prefix(), *sequence);
+        let arn = minted_resource_arn(resource, &region, *sequence);
+        *sequence += 1;
+        (id, arn)
+    }
+
+    /// Keep the mint registry inside [`MAX_MINT_SEQUENCES`] by dropping the sequences of
+    /// the (kind, region) pairs this store holds no record for.
+    ///
+    /// A pair a record is stored under keeps its sequence, so no minted ARN can ever be
+    /// minted twice; a pair with no record lists nothing, so the page boundaries its
+    /// sequence would have resumed name an empty listing anyway.
+    fn bound_mint_sequences(&mut self) {
+        if self.next_resource_ids.len() < MAX_MINT_SEQUENCES {
+            return;
+        }
+        let stored = self.stored_mint_sequence_keys();
+        self.next_resource_ids.retain(|key, _| stored.contains(key));
+    }
+
+    /// The (kind, region) pairs this store holds at least one record under.
+    fn stored_mint_sequence_keys(&self) -> BTreeSet<(MintedResource, String)> {
+        let keyed = |kind: MintedResource, arn: &String| {
+            arn_parts(arn).map(|parts| (kind, parts.region.to_string()))
+        };
+        self.gateways
+            .keys()
+            .filter_map(|arn| keyed(MintedResource::Gateway, arn))
+            .chain(
+                self.hypervisors
+                    .keys()
+                    .filter_map(|arn| keyed(MintedResource::Hypervisor, arn)),
+            )
+            .chain(
+                self.virtual_machines
+                    .keys()
+                    .filter_map(|arn| keyed(MintedResource::VirtualMachine, arn)),
+            )
+            .collect()
+    }
 }
 
 /// One page of the records of an ARN-keyed map that are stored in `region`, in key order
@@ -2291,18 +2482,62 @@ pub fn encode_page_token(arn: &str) -> String {
     hex::encode(arn)
 }
 
-/// Resolve a client-supplied `NextToken` back to the ARN its page ended on, for a
-/// listing of `resource_type`.
+/// The ARN a `NextToken` SPELLS, for a listing of `resource_type`: the hex-decoded
+/// boundary, once it is an ARN of this service naming that resource type.
 ///
-/// `None` for anything this service cannot have issued for THIS listing: not hex, not
-/// UTF-8, not an ARN of this service, or an ARN naming another resource type — a token
-/// one listing handed out does not resume another, because the page boundary it encodes
-/// is a key of a different map. The caller answers `None` with the modelled
-/// `ValidationException`, never by silently restarting the listing from the top: a
-/// client that mangled a token must learn that, not receive page one again.
-pub fn decode_page_token(token: &str, resource_type: &str) -> Option<String> {
+/// `None` for not hex, not UTF-8, not an ARN of this service, or an ARN naming another
+/// resource type — a token one listing handed out does not resume another, because the
+/// page boundary it encodes is a key of a different map.
+///
+/// SHAPE ONLY, which is why this is private: whether this store ever ISSUED the token is
+/// a question about the store, which only
+/// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::resume_after`] can answer —
+/// and that is the one route a listing resolves a token through, so no handler can accept
+/// a boundary this store never minted.
+fn decode_page_token(token: &str, resource_type: &str) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     is_resource_arn(&decoded, resource_type).then_some(decoded)
+}
+
+/// One resource id as this store mints them: `prefix` followed by `sequence` in 16 hex
+/// digits, the `bgw-0000000000000000` of `gateway/bgw-0000000000000000`.
+///
+/// The ONE rendering of a minted id — every mint of this store goes through it, and
+/// [`minted_resource_sequence`] reads it back — so the form an id has and the form a
+/// resumed page boundary is checked against cannot drift apart.
+fn minted_resource_id(prefix: &str, sequence: u64) -> String {
+    format!("{prefix}{sequence:016x}")
+}
+
+/// The ARN this store mints for the `sequence`-th `resource` of `region`.
+///
+/// The ONE rendering of a minted ARN: the mint writes it
+/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::mint_resource`]) and the
+/// provenance check compares a token's boundary against it
+/// ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::is_minted_resource_arn`]),
+/// so what counts as minted is exactly what was minted.
+fn minted_resource_arn(resource: MintedResource, region: &str, sequence: u64) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{}/{}",
+            resource.resource_type(),
+            minted_resource_id(resource.id_prefix(), sequence)
+        ),
+    )
+}
+
+/// The sequence a minted resource id encodes, or `None` for an id this store would not
+/// have minted under `prefix`.
+///
+/// The inverse of [`minted_resource_id`], and strict about the spelling: the id has to be
+/// EXACTLY what this store renders for that sequence, so an unpadded, over-padded or
+/// upper-case spelling of the same number is not an id this store minted.
+fn minted_resource_sequence(id: &str, prefix: &str) -> Option<u64> {
+    let digits = id.strip_prefix(prefix)?;
+    let sequence = u64::from_str_radix(digits, 16).ok()?;
+    (minted_resource_id(prefix, sequence) == id).then_some(sequence)
 }
 
 /// The segments of an ARN of this service: `arn:(aws|aws-cn|aws-us-gov):backup-gateway:

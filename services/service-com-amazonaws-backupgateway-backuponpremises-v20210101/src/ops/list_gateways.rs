@@ -152,12 +152,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // One guard for the whole listing: the token is RESOLVED against the store that
+        // issued it and the page is then cut from that same store, so a token cannot be
+        // accepted against one view of the records and spent against another.
+        let store = state.lock();
+
         // A `NextToken` resumes after the page boundary it encodes. One this service did
-        // not issue is refused, never quietly treated as "start from the top".
+        // not issue is refused, never quietly treated as "start from the top" — which is
+        // a question for the store, since a boundary of the right SHAPE that this service
+        // never minted would include the whole listing and hand back page one.
         let after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(token, crate::state::GATEWAY_RESOURCE_TYPE)
+                store
+                    .resume_after(token, crate::state::GATEWAY_RESOURCE_TYPE, &region)
                     .ok_or_else(|| {
                         ListGatewaysErrorModeled::ValidationException(ValidationException {
                             error_code: None,
@@ -181,7 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (max.max(1) as usize).min(crate::state::MAX_PAGE_SIZE)
         });
 
-        let page = state.lock().page_of_gateways(&region, after.as_deref(), limit);
+        let page = store.page_of_gateways(&region, after.as_deref(), limit);
+        drop(store);
 
         Ok(ListGatewaysOutput {
             gateways: Some(
