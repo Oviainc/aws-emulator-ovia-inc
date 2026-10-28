@@ -118,6 +118,42 @@ pub fn xml_element(body: &str, name: &str) -> Option<String> {
     Some(body[start..end].to_string())
 }
 
+/// Post `body` VERBATIM as `operation`, and answer the HTTP status with the response's
+/// raw bytes.
+///
+/// The one request builder every helper here goes through. A suite reaches for this
+/// rather than [`call`] when it needs the request's byte LENGTH controlled exactly (a
+/// `Value` is serialized, so its length is not the suite's to choose) or when it has to
+/// read an answer that carries no JSON at all — a transport refusal answers with an empty
+/// body, which parses to the same `Value` as a body holding `null`.
+pub async fn post_bytes(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Vec<u8>,
+) -> (u16, Vec<u8>) {
+    post_bytes_in(router, REGION, operation, body).await
+}
+
+/// The same, addressed to `region`.
+pub async fn post_bytes_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Vec<u8>,
+) -> (u16, Vec<u8>) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", host_in(region))
+        .header("content-type", "application/x-amz-json-1.0")
+        .header("x-amz-target", format!("AmazonSQS.{operation}"))
+        .header("authorization", authorization_in(region))
+        .body(Bytes::from(body))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    (response.status().as_u16(), response.body().to_vec())
+}
+
 /// Send one operation and return its HTTP status and parsed body.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     call_in(router, REGION, operation, body).await
@@ -132,21 +168,14 @@ pub async fn call_in(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", host_in(region))
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("AmazonSQS.{operation}"))
-        .header("authorization", authorization_in(region))
-        .body(Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    (status, parsed)
+    let (status, answer) = post_bytes_in(
+        router,
+        region,
+        operation,
+        serde_json::to_vec(body).expect("the request body serializes"),
+    )
+    .await;
+    (status, serde_json::from_slice(&answer).unwrap_or(Value::Null))
 }
 
 /// Send one operation that must succeed.
@@ -168,6 +197,11 @@ pub async fn ok_in(
     );
     parsed
 }
+
+/// The status a TRANSPORT refusal of an over-sized request body carries (HTTP 413,
+/// Request Entity Too Large). Shared by every suite that tells that refusal apart from
+/// one the service itself made, so the two cannot name different statuses for it.
+pub const REQUEST_ENTITY_TOO_LARGE: u16 = 413;
 
 /// The wire error code of a refusal: awsJson1_0 carries it as the body's `__type`.
 pub fn error_code(body: &Value) -> String {

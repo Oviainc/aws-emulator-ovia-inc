@@ -91,6 +91,8 @@ mod request_size_transport_bound;
 mod scratch_probe;
 #[path = "all/send_message_batch.rs"]
 mod send_message_batch;
+#[path = "all/send_message_size_refusals.rs"]
+mod send_message_size_refusals;
 #[path = "all/sender_attribution.rs"]
 mod sender_attribution;
 #[path = "all/state_roundtrip.rs"]

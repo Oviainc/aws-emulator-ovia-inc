@@ -18,31 +18,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::service::max_request_body_bytes;
-use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{self, attribute_count, create_ok, emulator, messages, ok};
-
-/// The status a transport refusal of an over-sized body carries.
-const REQUEST_ENTITY_TOO_LARGE: u16 = 413;
-
-/// Post `body` verbatim as `operation`, bypassing the shared helper's JSON
-/// serialization: these rows need the request's byte length controlled exactly, which
-/// means building the body rather than handing over a `Value`.
-///
-/// Answers the status and the raw response body.
-async fn post(router: &MultiServiceRouter, operation: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", support::HOST)
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("AmazonSQS.{operation}"))
-        .header("authorization", support::authorization_in(support::REGION))
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    (response.status().as_u16(), response.body().to_vec())
-}
+// These rows need the request's byte length controlled exactly, which means posting the
+// body the suite built rather than handing a `Value` over to be serialized: that is
+// `post_bytes`, the shared harness's raw request.
+use crate::support::{
+    attribute_count, create_ok, emulator, messages, ok, post_bytes, REQUEST_ENTITY_TOO_LARGE,
+};
 
 /// A `SendMessage` request body of exactly `total` bytes: the queue url and the JSON
 /// framing, with `MessageBody` padded out to fill whatever is left.
@@ -84,7 +66,8 @@ async fn a_request_body_above_the_transport_ceiling_is_refused_with_a_bare_413()
     // holding: a row the transport refused stored nothing.
     let mut accepted = 0_i64;
     for (case, length, refused) in rows {
-        let (status, body) = post(&router, "SendMessage", send_message_body_of(&url, length)).await;
+        let (status, body) =
+            post_bytes(&router, "SendMessage", send_message_body_of(&url, length)).await;
         if refused {
             assert_eq!(
                 status, REQUEST_ENTITY_TOO_LARGE,
@@ -206,7 +189,7 @@ async fn the_transport_ceiling_refuses_every_operation_alike() {
             "case {operation}: this row must be past the ceiling, got {} bytes",
             body.len()
         );
-        let (status, answer) = post(&router, operation, body).await;
+        let (status, answer) = post_bytes(&router, operation, body).await;
         assert_eq!(
             status, REQUEST_ENTITY_TOO_LARGE,
             "case {operation}: expected the transport status, got {status} with {:?}",
@@ -258,7 +241,7 @@ async fn a_batch_past_the_transport_ceiling_is_the_bare_413_and_not_the_batch_er
         let url = create_ok(&router, &format!("batch-vs-transport-{}", case.len()), &json!({})).await;
         let body = serde_json::to_vec(&json!({ "QueueUrl": url, "Entries": batch }))
             .expect("the request body serializes");
-        let (status, answer) = post(&router, "SendMessageBatch", body).await;
+        let (status, answer) = post_bytes(&router, "SendMessageBatch", body).await;
         if refused_by_transport {
             assert_eq!(
                 status, REQUEST_ENTITY_TOO_LARGE,
