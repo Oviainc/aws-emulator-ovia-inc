@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with no login profile ("a login profile is created when you create a
         // password for the user", `GetLoginProfile`) is not found, because creating
         // the first password is `CreateLoginProfile`'s job, not this operation's.
-        let Some(held) = store.login_profiles.get_mut(&user_key) else {
+        if !store.login_profiles.contains_key(&user_key) {
             ::tracing::info!(
                 audit = true,
                 operation = "UpdateLoginProfile",
@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
+        }
 
         // Both value members are OPTIONAL and carry no modelled default
         // (`PasswordResetRequired` targets the BOXED `booleanObjectType`:
@@ -249,28 +249,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // absent member means "unspecified", not "false". The update therefore applies
         // the members the request supplies and leaves every member it omits at the
         // value the account already holds.
-        let password_changed = input.password.is_some();
-        if let Some(password) = input.password {
-            // The new password is accepted and then DROPPED here, the one place the
-            // value is consumed, exactly as `CreateLoginProfile` consumes the first
-            // one: no shape reports a password back (`LoginProfile` carries only the
-            // user name, the create date and the reset flag), the model marks the
-            // member sensitive, and this emulator serves no console sign-in, so
-            // keeping it would be holding a secret nothing may ever hand out. It is
-            // never stored, logged or echoed.
-            //
-            // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
-            // arise: it refuses a password that "did not meet the requirements imposed
-            // by the account password policy", and no account password policy can exist
-            // while `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s
-            // own length and alphabet constraints are enforced before this handler
-            // runs. `LimitExceededException` is declined too: an update creates no
-            // entity, so it reaches no quota. So is
-            // `EntityTemporarilyUnmodifiableException`, which reports "a user name that
-            // was deleted and then recreated": every delete and create in this
-            // emulator takes effect at once, so no entity is ever temporarily
-            // unmodifiable.
-            drop(password);
+        //
+        // The new password is consumed HERE, the one place this operation touches it,
+        // exactly as `CreateLoginProfile` consumes the first one: the account keeps
+        // only the VERIFIER of it (`crate::state::hold_password`), which answers
+        // whether a password a later request presents is this one — the question
+        // `ChangePassword` asks of a user's current password — and nothing else. The
+        // password itself is never stored, logged or echoed: no shape reports one back
+        // (`LoginProfile` carries only the user name, the create date and the reset
+        // flag) and the model marks the member sensitive.
+        //
+        // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
+        // arise: it refuses a password that "did not meet the requirements imposed
+        // by the account password policy", and no account password policy can exist
+        // while `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s
+        // own length and alphabet constraints are enforced before this handler
+        // runs. `LimitExceededException` is declined too: an update creates no
+        // entity, so it reaches no quota. So is
+        // `EntityTemporarilyUnmodifiableException`, which reports "a user name that
+        // was deleted and then recreated": every delete and create in this
+        // emulator takes effect at once, so no entity is ever temporarily
+        // unmodifiable.
+        let held_password = input
+            .password
+            .map(|password| store.hold_password(&password));
+        let password_changed = held_password.is_some();
+
+        let Some(held) = store.login_profiles.get_mut(&user_key) else {
+            return Err(UpdateLoginProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the login profile could not be updated".to_string()),
+                },
+            )
+            .into());
+        };
+        if let Some(password) = held_password {
+            held.password = password;
         }
         if let Some(reset_required) = input.password_reset_required {
             held.password_reset_required = reset_required;

@@ -1026,6 +1026,37 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
         effective
     }
 
+    /// The accounts one read of this service's data addresses.
+    ///
+    /// A request that NAMES accounts (`ListEnrollmentStatuses`' `accountId`,
+    /// the recommendation readers' `filter.accountIds`) addresses exactly those
+    /// accounts; naming none it addresses the calling account, widened to every
+    /// account of the organization where the request asks for the
+    /// organization's view (`includeOrganizationInfo`). Written once here
+    /// because it is the same set the permission gates judge — whether the read
+    /// reaches past the caller's own account — so the rows a reader then scopes
+    /// to cannot disagree with what its gate admitted.
+    ///
+    /// The result is sorted and carries each account once, so a paginated
+    /// reader resumes at the row the previous page stopped at.
+    pub fn addressed_accounts(
+        &self,
+        caller: &str,
+        named: &[String],
+        whole_organization: bool,
+    ) -> Vec<String> {
+        let mut accounts: Vec<String> = if !named.is_empty() {
+            named.to_vec()
+        } else if whole_organization {
+            self.enrollments.keys().cloned().collect()
+        } else {
+            vec![caller.to_string()]
+        };
+        accounts.sort();
+        accounts.dedup();
+        accounts
+    }
+
     /// The recommendations this account can read, in catalog order.
     ///
     /// Cost Optimization Hub reports recommendations for an ENROLLED account
@@ -1034,17 +1065,28 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     /// one that opted out, and one that has just opted in all read the empty set
     /// rather than someone else's catalog.
     pub fn visible_recommendations(&self, account_id: &str) -> Vec<StoredRecommendation> {
-        if !self
-            .enrollments
-            .get(account_id)
-            .is_some_and(Enrollment::recommendations_available)
-        {
-            return Vec::new();
-        }
+        self.visible_recommendations_for(&[account_id.to_string()])
+    }
+
+    /// The recommendations `accounts` can be read for, in catalog order: the
+    /// general form of [`Self::visible_recommendations`], because a read may
+    /// address more than one account (a management account naming members in
+    /// `filter.accountIds`). Enrollment is still judged per account, so an
+    /// addressed account whose analysis is not due contributes nothing.
+    pub fn visible_recommendations_for(&self, accounts: &[String]) -> Vec<StoredRecommendation> {
+        let readable: Vec<&str> = accounts
+            .iter()
+            .filter(|account| {
+                self.enrollments
+                    .get(account.as_str())
+                    .is_some_and(Enrollment::recommendations_available)
+            })
+            .map(String::as_str)
+            .collect();
         self.recommendation_order
             .iter()
             .filter_map(|id| self.recommendations.get(id))
-            .filter(|row| row.account_id == account_id)
+            .filter(|row| readable.contains(&row.account_id.as_str()))
             .cloned()
             .collect()
     }
@@ -1057,30 +1099,34 @@ impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
     /// populated `filter.accountIds` — is an organization view, which only the
     /// organization's management account has, so any other caller is refused
     /// ([`OrganizationViewRequired`], which each reader answers through its own
-    /// modelled error); otherwise the rows are the ones this account may read
-    /// ([`Self::visible_recommendations`]) narrowed by every member the filter
-    /// sets, under the account's effective `savingsEstimationMode`.
+    /// modelled error); otherwise the rows are the ones the accounts the
+    /// request ADDRESSES may be read for ([`Self::addressed_accounts`],
+    /// [`Self::visible_recommendations_for`]) narrowed by every member the
+    /// filter sets, under the account's effective `savingsEstimationMode`.
     pub fn recommendation_view(
         &self,
         account_id: &str,
         filter: Option<&Filter>,
     ) -> Result<RecommendationView, OrganizationViewRequired> {
+        let named = filter
+            .and_then(|filter| filter.account_ids.as_deref())
+            .unwrap_or_default();
         // Refused for ANY populated `accountIds`, because what the caller lacks
         // is the view, not one account in it.
-        if filter
-            .and_then(|filter| filter.account_ids.as_ref())
-            .is_some_and(|account_ids| !account_ids.is_empty())
-            && !self.is_management_account(account_id)
-        {
+        if !named.is_empty() && !self.is_management_account(account_id) {
             return Err(OrganizationViewRequired);
         }
 
+        // The rows come from the accounts the request addresses — the ones it
+        // named, else the caller's own — so a read admitted as reaching another
+        // account answers that account's rows rather than an empty list.
+        let addressed = self.addressed_accounts(account_id, named, false);
         Ok(RecommendationView {
             savings_estimation_mode: self
                 .effective_preferences(account_id)
                 .savings_estimation_mode,
             rows: self
-                .visible_recommendations(account_id)
+                .visible_recommendations_for(&addressed)
                 .into_iter()
                 .filter(|row| filter.is_none_or(|filter| row.matches_filter(filter)))
                 .collect(),

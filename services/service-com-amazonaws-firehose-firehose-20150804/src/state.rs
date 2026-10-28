@@ -520,6 +520,14 @@ impl DeliveryStream {
             .and_then(|encryption| encryption.status.as_deref())
     }
 
+    /// The `DeliveryStreamEncryptionStatus` a caller SEES for this stream — the one
+    /// `DescribeDeliveryStream` reports — so a refusal names the status the caller can
+    /// read back. A stream SSE was never configured on reports the disabled status
+    /// ([`disabled_encryption`]).
+    pub fn reported_encryption_status(&self) -> &str {
+        self.encryption_status().unwrap_or(ENCRYPTION_DISABLED)
+    }
+
     /// Whether an SSE change this stream started has yet to settle, in which case another
     /// encryption call on it is refused as `ResourceInUseException`.
     pub fn encryption_change_in_flight(&self) -> bool {

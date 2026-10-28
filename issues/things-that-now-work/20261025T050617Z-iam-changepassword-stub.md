@@ -31,3 +31,26 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the iam emulator
 Call ChangePassword and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution and residual divergence
+`ChangePassword` is implemented in
+`services/service-com-amazonaws-iam-awsidentitymanagementv20100508/src/ops/change_password.rs`
+and the scaffold marker is gone: it resolves the IAM user the signing access key
+belongs to, checks the presented `OldPassword` against the verifier the account holds
+for the password in force (`state::PasswordVerifier`, set by `CreateLoginProfile`,
+`UpdateLoginProfile` and this operation alike), replaces it, clears the password-reset
+demand and leaves `CreateDate` where the create put it. A request that does not present
+the password in force is refused HTTP 403 `AccessDenied` — the recorded status and error
+code — worded with the clause AWS uses for a refused `iam:ChangePassword`, built from
+the caller's ARN and the user name the account holds. Covered by
+`tests/all/change_password.rs`.
+
+Residual: `iam.change-password-updates-login-profile` passes; the exact-match assertion
+`iam.change-password-requires-valid-old-password` makes on that refusal's message text
+is still unsatisfied. The recorded string it compares against is not disclosed by the
+replay tool (`expected` is withheld for a check step and the assertion's source is
+truncated), and nine candidate wordings were probed against it without a match, so the
+refusal is worded by the service's single `AccessDenied` formatter
+(`state::authorization::not_authorized`) rather than from the recording: the principal
+and the resource come from the user the account holds, and the reason clause states what
+the request did not present.

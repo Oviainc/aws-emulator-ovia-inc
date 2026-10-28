@@ -54,12 +54,28 @@ fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 /// `memberAccountDiscountVisibility` preference, and so to reach the savings
 /// estimation mode that preference gates — records the organization here.
 pub(crate) fn management_account_router() -> MultiServiceRouter {
+    management_account_router_with_store().0
+}
+
+/// This service's store, as a suite that has to record what no operation
+/// creates reaches it.
+pub(crate) type Store = engine::ServiceState<
+    cost_optimization_hub::state::ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState,
+>;
+
+/// A [`management_account_router`] together with the store behind it, for a
+/// suite that has to record the organization's MEMBER accounts: this emulator
+/// has no Organizations control plane, so no operation creates a second
+/// account's enrollment or its rows in the catalog.
+pub(crate) fn management_account_router_with_store() -> (MultiServiceRouter, Store) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let state = cost_optimization_hub::state::service_state(&*engine)
         .expect("the Cost Optimization Hub store");
     state.lock().organization_management_account_id =
         Some(engine::emulator_account_id().to_string());
-    router_over(engine)
+    let store = cost_optimization_hub::state::service_state(&*engine)
+        .expect("the Cost Optimization Hub store");
+    (router_over(engine), store)
 }
 
 /// Enable the organization-wide member-account discount visibility over the
@@ -215,7 +231,7 @@ pub(crate) fn assert_stated_rule_refusal(payload: &Value, case: &str, member: &s
 }
 
 /// The `recommendationId`s of a `ListRecommendations` answer, in order.
-fn ids(payload: &Value) -> Vec<String> {
+pub(crate) fn ids(payload: &Value) -> Vec<String> {
     payload["items"]
         .as_array()
         .expect("items is a list")
