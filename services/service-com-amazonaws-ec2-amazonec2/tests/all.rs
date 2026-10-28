@@ -105,6 +105,11 @@ mod unranged_max_results;
 // beside the suites above for the same reason.
 #[path = "all/run_instances_tag_specifications.rs"]
 mod run_instances_tag_specifications;
+// What `RunInstances` does with an `IamInstanceProfile`, and the sentence the association
+// describe answers for a filter name it does not document. Declared beside the launch suite
+// above rather than in sorted position, for the reason this file's header note gives.
+#[path = "all/run_instances_iam_instance_profile.rs"]
+mod run_instances_iam_instance_profile;
 // The virtual private gateway slice: create, read back, delete. Declared here rather than in
 // sorted position for the reason given above — the sorted neighbourhood is the contended
 // region of this file, and this suite lost several serialized squash merges to it.

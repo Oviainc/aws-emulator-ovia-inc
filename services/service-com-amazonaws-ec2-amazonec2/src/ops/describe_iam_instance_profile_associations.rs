@@ -184,14 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A filter name this operation does not document is refused whether or not any
         // association would have matched it, so an unsupported filter can never read as "no
-        // results". Each value is compiled into its pattern ONCE here, rather than recompiled
-        // for every candidate association.
+        // results". The refusal is EC2's own: `InvalidParameterValue`, and the one sentence
+        // it answers for a filter name it does not resolve, carrying the name the REQUEST
+        // sent and nothing of this emulator's own. Each value is compiled into its pattern
+        // ONCE here, rather than recompiled for every candidate association.
         let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
         for filter in filters {
             let name = filter.name.as_deref().unwrap_or_default();
             if !filter_name_is_documented(name) {
                 return Err(crate::state::invalid_parameter_value(format!(
-                    "The filter '{name}' is invalid"
+                    "An unknown filter '{name}' was given"
                 )));
             }
             let values: &[String] = filter.values.as_deref().unwrap_or_default();
