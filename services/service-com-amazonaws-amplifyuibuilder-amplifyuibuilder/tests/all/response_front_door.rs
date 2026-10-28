@@ -352,9 +352,9 @@ async fn every_response_carries_the_front_doors_media_type_and_validator() {
             carries_a_representation: true,
         },
         Case {
-            about: "ListTagsForResource: the scaffold's 501",
+            about: "ListThemes: the scaffold's 501",
             method: "GET",
-            uri: "/tags/some-resource".to_string(),
+            uri: themes_uri(),
             body: None,
             status: 501,
             carries_a_representation: true,

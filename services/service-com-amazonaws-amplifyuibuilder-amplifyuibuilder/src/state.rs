@@ -32,6 +32,15 @@
 //! that record and `DeleteTheme` removes it, all keyed by the same
 //! (appId, environmentName) a component is keyed by and all with the projection
 //! the model asks for.
+//!
+//! ## The tagging surface
+//!
+//! A component, a form and a theme each carry the tag set their create stored, so
+//! the tagging operations hold no store of their own: `ListTagsForResource`
+//! reports, and `TagResource` / `UntagResource` change, the `tags` of the one
+//! record the resource's own reader answers from. [`parse_resource_arn`] is what
+//! resolves a `resourceArn` to that record, and [`resource_tags`] /
+//! [`with_resource_tags_mut`] are the one read and the one write over it.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -1183,6 +1192,174 @@ pub fn item_wrong_scope() -> InvalidParameterException {
 pub fn duplicate_item_name() -> ResourceConflictException {
     ResourceConflictException {
         message: Some(DUPLICATE_ITEM_NAME_MESSAGE.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tagging surface: which resource a `resourceArn` names, and its tag set.
+// ---------------------------------------------------------------------------
+
+/// The `service` element of an ARN naming a resource of this service.
+pub const ARN_SERVICE: &str = "amplifyuibuilder";
+
+/// A resource kind the tagging surface addresses.
+///
+/// Amplify UI Builder names a component, a form and a theme with an ARN of the
+/// documented form
+/// `arn:<partition>:amplifyuibuilder:<region>:<account>:app/<appId>/environment/<environmentName>/<collection>/<id>`,
+/// whose `<collection>` is [`TaggedKind::collection`]. The model declares no ARN
+/// shape to read the form off — each tagging input's `resourceArn` targets the
+/// bare `String` with neither `@length` nor `@pattern`
+/// (`smithy_query(query="operation", operation="ListTagsForResource,TagResource,UntagResource")`)
+/// — so the form is the documented one, and these three are the kinds of this
+/// service whose own records hold a tag set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedKind {
+    Component,
+    Form,
+    Theme,
+}
+
+impl TaggedKind {
+    /// Every kind the tagging surface addresses, in the order the resource's own
+    /// collection URIs are listed in this crate's `OPERATIONS.md`.
+    pub const ALL: [Self; 3] = [Self::Component, Self::Form, Self::Theme];
+
+    /// The ARN path element naming the collection that holds this kind — the same
+    /// element the resource's own REST URIs use
+    /// (`/app/{appId}/environment/{environmentName}/components/{id}`).
+    pub const fn collection(self) -> &'static str {
+        match self {
+            Self::Component => "components",
+            Self::Form => "forms",
+            Self::Theme => "themes",
+        }
+    }
+
+    /// The kind an ARN's collection element names, or `None` when it names no
+    /// kind this service holds a tag set for.
+    pub fn from_collection(collection: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.collection() == collection)
+    }
+}
+
+/// The resource one `resourceArn` names: its kind, plus the (appId,
+/// environmentName, id) every reader of this store is keyed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedResource {
+    pub kind: TaggedKind,
+    pub app_id: String,
+    pub environment_name: String,
+    pub id: String,
+}
+
+/// The resource `arn` names, or `None` when `arn` is not an ARN naming a resource
+/// kind of this service.
+///
+/// The partition, region and account elements have to be PRESENT — an ARN is six
+/// `:`-separated fields — but none of them is part of the lookup: this store keys
+/// every resource by (appId, environmentName, id) alone and the emulator serves a
+/// single account ([`::engine::emulator_account_id`]), so neither element tells
+/// one resource it holds from another.
+pub fn parse_resource_arn(arn: &str) -> Option<TaggedResource> {
+    // The resource field is the sixth, and keeps any `:` of its own.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != ARN_SERVICE {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let segments: Vec<&str> = fields.next()?.split('/').collect();
+    let ["app", app_id, "environment", environment_name, collection, id] = segments.as_slice()
+    else {
+        return None;
+    };
+    let kind = TaggedKind::from_collection(collection)?;
+    if app_id.is_empty() || environment_name.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some(TaggedResource {
+        kind,
+        app_id: (*app_id).to_string(),
+        environment_name: (*environment_name).to_string(),
+        id: (*id).to_string(),
+    })
+}
+
+/// The tags the resource `arn` names carries, or `None` when this store holds no
+/// such resource.
+///
+/// A resource carrying no tag answers the EMPTY map: `tags` is `@required` on
+/// `ListTagsForResourceResponse`, so "no tags" is an empty map there and only "no
+/// such resource" is an absence. A pure read — the tag set every other reader of
+/// that resource reports, cloned out of the one record holding it.
+pub fn resource_tags(
+    state: &ComAmazonawsAmplifyuibuilderAmplifyuibuilderState,
+    arn: &str,
+) -> Option<HashMap<String, String>> {
+    let resource = parse_resource_arn(arn)?;
+    let (app, environment, id) = (
+        resource.app_id.as_str(),
+        resource.environment_name.as_str(),
+        resource.id.as_str(),
+    );
+    match resource.kind {
+        TaggedKind::Component => state
+            .component(app, environment, id)
+            .map(|component| component.tags.clone()),
+        TaggedKind::Form => state
+            .form(app, environment, id)
+            // `Form$tags` is optional, so a form carrying none holds an absence
+            // rather than an empty map; the tag SET it carries is empty either way.
+            .map(|form| form.tags.clone().unwrap_or_default()),
+        TaggedKind::Theme => state
+            .theme(app, environment, id)
+            .map(|theme| theme.tags.clone()),
+    }
+}
+
+/// Hand the tag set of the resource `arn` names to `change`, or answer `None`
+/// when this store holds no such resource.
+///
+/// The one place a tagging WRITE resolves its target, so `TagResource` and
+/// `UntagResource` change exactly the record [`resource_tags`] and the resource's
+/// own reader report. Only the tag set is touched: tagging a resource is not an
+/// update of it, so nothing else about the record moves.
+pub fn with_resource_tags_mut<R>(
+    state: &mut ComAmazonawsAmplifyuibuilderAmplifyuibuilderState,
+    arn: &str,
+    change: impl FnOnce(&mut HashMap<String, String>) -> R,
+) -> Option<R> {
+    let resource = parse_resource_arn(arn)?;
+    let (app, environment, id) = (
+        resource.app_id.as_str(),
+        resource.environment_name.as_str(),
+        resource.id.as_str(),
+    );
+    match resource.kind {
+        TaggedKind::Component => state
+            .component_mut(app, environment, id)
+            .map(|component| change(&mut component.tags)),
+        TaggedKind::Form => state.form_mut(app, environment, id).map(|form| {
+            // A form carrying no tags reports no `tags` member at all
+            // ([`StoredForm::tags`]), so a write that leaves such a form with no
+            // tag keeps that absence rather than turning it into an empty map;
+            // every other write stores the set it leaves behind, empty or not.
+            let was_absent = form.tags.is_none();
+            let mut tags = form.tags.take().unwrap_or_default();
+            let answered = change(&mut tags);
+            form.tags = (!was_absent || !tags.is_empty()).then_some(tags);
+            answered
+        }),
+        TaggedKind::Theme => state
+            .theme_mut(app, environment, id)
+            .map(|theme| change(&mut theme.tags)),
     }
 }
 
