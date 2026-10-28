@@ -272,3 +272,5 @@ mod constraint_refusal_class;
 mod rest_api_import_gateway_responses;
 #[path = "all/vpc_link_provisioning.rs"]
 mod vpc_link_provisioning;
+#[path = "all/vpc_link_records.rs"]
+mod vpc_link_records;
