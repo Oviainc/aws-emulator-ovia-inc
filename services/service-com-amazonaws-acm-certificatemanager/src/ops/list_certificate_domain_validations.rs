@@ -179,7 +179,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at the certificate, so a caller whose identity-based policies
+        // do not allow the action is refused without being told anything about it. `ctx`
+        // carries the credential the request presented, which is who is judged
+        // ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.certificate_arn,
+        )
+        .map_err(ListCertificateDomainValidationsErrorModeled::AccessDeniedException)?;
         // This operation models no error for an unreachable store, so the refusal goes
         // through the wrapper's `ValidationException` rather than through a modelled
         // shape that would claim something else about the request.

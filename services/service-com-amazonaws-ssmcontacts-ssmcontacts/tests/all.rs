@@ -71,6 +71,8 @@ mod recurrence_validity;
 mod replication_set_precondition;
 #[path = "all/rotation_deletes.rs"]
 mod rotation_deletes;
+#[path = "all/rotation_override_idempotency_token.rs"]
+mod rotation_override_idempotency_token;
 #[path = "all/rotation_override_listing.rs"]
 mod rotation_override_listing;
 #[path = "all/rotation_override_reads.rs"]

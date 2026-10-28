@@ -875,9 +875,86 @@ async fn a_taken_or_passed_sequence_number_conflicts() {
     );
 }
 
+/// A store holding every session it retains still accepts a submit against a new session
+/// name: the oldest session that nothing is owed on is released to make room.
+///
+/// A session whose every operation has settled goes first. Where none has settled, the
+/// one released is the oldest whose queue is waiting on an operation nobody submitted —
+/// that session executes nothing until a caller supplies the missing sequence number, so
+/// keeping it would refuse every new session for as long as the caller never does. The
+/// sessions that are still executing are kept.
+#[tokio::test]
+async fn a_full_store_releases_a_session_nothing_is_owed_on_rather_than_refusing() {
+    use service_com_amazonaws_sagemakertrainingsessionruntime_legorouterservice::state::MAX_SESSIONS;
+
+    let router = emulator();
+    // Every session but one is blocked on a gap: slot 1 is never submitted, so the
+    // operation queued at slot 2 can never execute and the session can never settle.
+    let blocked: Vec<String> = (0..MAX_SESSIONS - 1)
+        .map(|index| format!("blocked-{index:04}"))
+        .collect();
+    let mut blocked_ops = Vec::with_capacity(blocked.len());
+    for session in &blocked {
+        blocked_ops.push(submit_training_ok(&router, session, 2, json!({"saveState": {}})).await);
+    }
+    // And one session that HAS settled, which is the one a release must take first.
+    let settled_op = submit_training_ok(&router, "settled", 1, json!({"saveState": {}})).await;
+    poll_training_to_terminal(&router, "settled", &settled_op).await;
+
+    // The store is full. A submit against a new name is accepted, and what it released is
+    // the settled session, not one of the blocked ones.
+    let fresh_op = submit_training_ok(&router, "fresh-one", 1, json!({"saveState": {}})).await;
+    let released = get_training(&router, "settled", &settled_op).await;
+    assert_eq!(
+        released.status,
+        404,
+        "case settled first: the settled session must be the one released, got {} {}",
+        released.status,
+        String::from_utf8_lossy(&released.body)
+    );
+    let kept = get_training(&router, &blocked[0], &blocked_ops[0]).await;
+    assert_eq!(
+        kept.text("status"),
+        "Pending",
+        "case settled first: a blocked session must be kept while a settled one exists, got {}",
+        kept.json()
+    );
+
+    // The store is full again and nothing has settled — the operation the previous submit
+    // created is still executing — so the release takes the OLDEST blocked session, and
+    // the next-oldest stays.
+    let second_op = submit_training_ok(&router, "fresh-two", 1, json!({"saveState": {}})).await;
+    let oldest = get_training(&router, &blocked[0], &blocked_ops[0]).await;
+    assert_eq!(
+        oldest.status,
+        404,
+        "case blocked next: the oldest blocked session must be released, got {} {}",
+        oldest.status,
+        String::from_utf8_lossy(&oldest.body)
+    );
+    let next_oldest = get_training(&router, &blocked[1], &blocked_ops[1]).await;
+    assert_eq!(
+        next_oldest.text("status"),
+        "Pending",
+        "case blocked next: only one session is released per submit, got {}",
+        next_oldest.json()
+    );
+
+    // Both new sessions hold the operation their submit created, and both settle.
+    for (session, id) in [("fresh-one", &fresh_op), ("fresh-two", &second_op)] {
+        let answer = poll_training_to_terminal(&router, session, id).await;
+        assert!(
+            is_terminal(&answer.text("status")),
+            "case {session:?}: the operation the accepted submit created must settle, got {}",
+            answer.json()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rule 7: unknown sessions and operations
 // ---------------------------------------------------------------------------
+
 
 /// A session this emulator has never seen, and an operation that does not belong to the
 /// session named, are `ResourceNotFoundException` — never a canned terminal status.

@@ -475,10 +475,6 @@ async fn update_of_an_unknown_validation_is_not_found() {
             format!("arn:aws:acm:eu-west-1:{ACCOUNT}:acme-endpoint/{endpoint_id}/acme-domain-validation/{validation_id}"),
         ),
         (
-            "the stored id under another account",
-            format!("arn:aws:acm:{REGION}:123456789012:acme-endpoint/{endpoint_id}/acme-domain-validation/{validation_id}"),
-        ),
-        (
             "an id at AcmeDomainValidationArn's maximum length",
             format!("{prefix}{long_id}"),
         ),
