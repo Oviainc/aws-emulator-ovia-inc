@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServiceLinkedRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServiceLinkedRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServiceLinkedRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +76,27 @@
 //!   resource entity that does not exist. The error message describes the resource.
 //! * `ServiceFailureException` (HTTP 500) — The request processing has failed because of an
 //!   unknown error, exception or failure.
+//!
+//! ---
+//!
+//! # How the deletion is served here
+//!
+//! The submit records a deletion TASK — "submits a service-linked role deletion request
+//! and returns a DeletionTaskId, which you can use to check the status of the deletion" —
+//! keyed by the id it answers with
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::service_linked_role_deletions`]),
+//! and removes the role the account holds under the named key. The task carries the
+//! instant its deletion is due ([`crate::state::SERVICE_LINKED_ROLE_DELETION_SECONDS`]),
+//! so `GetServiceLinkedRoleDeletionStatus` reports it `IN_PROGRESS` until then and
+//! `SUCCEEDED` from then on, and a repeated submit for the same role while that task is
+//! incomplete answers with the SAME id rather than recording a second one. A role CREATED
+//! again under that name is a different role: its own deletion is recorded.
+//!
+//! The role record is what every reader of this account's roles answers from, and the
+//! `Role` shape carries no status a reader could report a deletion in flight through
+//! (`smithy_query(query="shape", shape="Role")`), so the record is removed when the
+//! deletion is submitted: the task is the handle the progress of that submitted deletion
+//! is read through.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -159,18 +171,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServiceLinkedRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServiceLinkedRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteServiceLinkedRoleErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+        let now = crate::state::now();
+
+        // IAM entity names "are not distinguished by case", so the submit finds the role
+        // under the case-folded name whatever case it spelled it in.
+        let key = crate::state::name_key(&input.role_name);
+
+        // "If you call this operation more than once for the same service-linked role and
+        // an earlier deletion task is not complete, then the DeletionTaskId of the
+        // earlier request is returned": the repeat records nothing and answers with the
+        // id already in flight for that role.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServiceLinkedRole"))
+        // This operation deletes a SERVICE-LINKED role, and a role's PATH is what says it
+        // is one — exactly as this crate's `DeleteRole` reads it. A name the account holds
+        // no role under, and a name it holds a role under that is linked to no service,
+        // both name no service-linked role, so both "referenced a resource entity that
+        // does not exist".
+        //
+        // IAM words that refusal for THIS operation as one fixed sentence about the role
+        // it was asked to delete, naming nothing of the request, which is why the message
+        // below carries no role name — unlike the sentence this service states a missing
+        // role with elsewhere.
+        //
+        // The ACCOUNT's own record is the only one that resolves here, as
+        // `crate::state::service_provisioned_role` states for every operation that
+        // changes a role: a role a service keeps provisioned under a published name is
+        // not a record of the account's, so this submit does not delete one.
+        //
+        // The task id names the role and its service as the ACCOUNT HOLDS them rather
+        // than as the request spelled them, since a role name is not distinguished by
+        // case.
+        let linked = store.roles.get(&key).and_then(|role| {
+            crate::state::service_linked_role_principal(&role.path)
+                .map(|service_principal| (service_principal.to_string(), role.role_name.clone()))
+        });
+        let Some((service_principal, role_name)) = linked else {
+            // The record is removed when a deletion is submitted, so a name the account
+            // holds no role under is either a role whose deletion is already in flight —
+            // the repeat above — or a name that names nothing at all. The order matters:
+            // a role CREATED again under that name is a new role, and its own deletion is
+            // recorded rather than answered with the earlier role's task.
+            if let Some(deletion_task_id) =
+                store.in_flight_service_linked_role_deletion(&key, now)
+            {
+                return Ok(DeleteServiceLinkedRoleOutput {
+                    deletion_task_id: deletion_task_id.to_string(),
+                });
+            }
+            return Err(DeleteServiceLinkedRoleErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some("Cannot find the service role to delete.".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Deleting the role is work the clock owes: the submit answers a task id a caller
+        // polls, so the instant the deletion is due is stored rather than slept for and a
+        // caller reading straight after the submit still sees it in flight.
+        let completes = ::aws_smithy_types::DateTime::from_secs(
+            now.secs() + crate::state::SERVICE_LINKED_ROLE_DELETION_SECONDS,
+        );
+        let deletion_task_id =
+            store.next_service_linked_role_deletion_task_id(&service_principal, &role_name);
+        store.service_linked_role_deletions.insert(
+            deletion_task_id.clone(),
+            crate::state::ServiceLinkedRoleDeletionTask {
+                role_key: key.clone(),
+                created: now,
+                completes,
+            },
+        );
+        // A finished task is kept for a caller to read again, but the account retains a
+        // bounded number of them: past that, the oldest are dropped, so repeated submits
+        // cannot grow the store without end.
+        while store.service_linked_role_deletions.len()
+            > crate::state::MAX_RETAINED_SERVICE_LINKED_ROLE_DELETION_TASKS
+        {
+            let Some(oldest) = store
+                .service_linked_role_deletions
+                .iter()
+                .min_by(|(left_id, left), (right_id, right)| {
+                    (left.created.secs(), left_id.as_str())
+                        .cmp(&(right.created.secs(), right_id.as_str()))
+                })
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            store.service_linked_role_deletions.remove(&oldest);
+        }
+
+        // The role is gone, and so are the policy sets that hung off it: leaving them
+        // behind would make a later role of the same name look like it inherited the
+        // deleted one's policies, which is the same cleanup `DeleteRole` does.
+        store.roles.remove(&key);
+        store.role_attached_policies.remove(&key);
+        store.role_inline_policies.remove(&key);
+
+        // Audit record for the change: the acting principal, the operation and the task it
+        // recorded, so a state-changing call leaves a local record.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteServiceLinkedRole",
+            outcome = "recorded",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            role_name = %role_name,
+            deletion_task_id = %deletion_task_id,
+            "a service-linked role deletion was submitted"
+        );
+        Ok(DeleteServiceLinkedRoleOutput { deletion_task_id })
     }
 }
