@@ -34,7 +34,7 @@ use crate::ops::types::{
 };
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
-    InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
+    CodeLocation, InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
     InstrumentationStatusEvent, Location, LocationIdentifier,
 };
 // The shapes the audit read projects, on their own `use` for the same reason.
@@ -4053,6 +4053,74 @@ pub fn instrumentation_token_tag(scope: &InstrumentationScope) -> String {
         Some(scope.environment.as_str()),
     ]);
     format!("{INSTRUMENTATION_CONFIGURATIONS_TOKEN_TAG}{fingerprint}/")
+}
+
+/// The member path a refusal of the location a create names states, in the lowerCamel casing
+/// this service's `ValidationException` envelope states a member with — the same casing the
+/// framework-level refusal of the same member's modelled bounds uses.
+pub const LOCATION_MEMBER_PATH: &str = "location";
+
+/// [`LOCATION_MEMBER_PATH`], for the `LocationIdentifier` the reads and the delete take the
+/// instrumentation point under.
+pub const LOCATION_IDENTIFIER_MEMBER_PATH: &str = "locationIdentifier";
+
+/// The `codeLocation` step a refusal names between the location member and one of
+/// `CodeLocation`'s own members: the union member both `Location` and `LocationIdentifier`
+/// carry a full code location under.
+const CODE_LOCATION_PATH_STEP: &str = "codeLocation";
+
+/// The `ProgrammingLanguage` a code location must name a `ClassName` for: `CodeLocation`'s
+/// `ClassName` doc states "This is required for Java and optional for Python module-level
+/// functions", so the requirement holds for exactly this one value of the sibling `Language`
+/// (`smithy_query(query="doc",shape="CodeLocation",member="ClassName")`).
+const CLASS_NAME_REQUIRED_FOR_LANGUAGE: &str = "Java";
+
+/// The refusal a `CodeLocation` carried under `member_path` earns, or `None` when it meets
+/// every requirement its members document.
+///
+/// `ClassName` is modelled OPTIONAL — the model has no way to say "required when a sibling
+/// carries one particular value" — so the boundary validator admits a location of the
+/// language that requires it with the member absent, and the rule is enforced here and
+/// refused with 400 rather than stored as an instrumentation point that names no class to
+/// find the method in.
+///
+/// The path is a parameter because a refusal states the member the REQUEST carries, which is
+/// `Location` for a create and `LocationIdentifier` for the reads and the delete; the
+/// requirement is worded through the same clause builder as every other constraint this
+/// service states.
+pub fn code_location_refusal(member_path: &str, code: &CodeLocation) -> Option<String> {
+    let class_name_missing = code.language == CLASS_NAME_REQUIRED_FOR_LANGUAGE
+        && code.class_name.is_none();
+    class_name_missing.then(|| {
+        validation_envelope(&[constraint_clause(
+            &format!("{member_path}.{CODE_LOCATION_PATH_STEP}.className"),
+            // The language is taken from the REQUEST rather than from the constant, so the
+            // clause states the value the rule fired on whichever language it fires for.
+            &format!("Member must not be null for a {} code location", code.language),
+        )])
+    })
+}
+
+/// [`code_location_refusal`] for the `Location` union a create names the instrumentation
+/// point with.
+pub fn location_refusal(location: &Location) -> Option<String> {
+    match location {
+        Location::CodeLocation(code) => code_location_refusal(LOCATION_MEMBER_PATH, code),
+    }
+}
+
+/// [`code_location_refusal`] for the `LocationIdentifier` union the reads and the delete name
+/// the instrumentation point with.
+///
+/// A pre-computed hash carries no code location, so there is no conditional requirement to
+/// read against it: it is 16 hex characters the model bounds on its own.
+pub fn identified_location_refusal(identifier: &LocationIdentifier) -> Option<String> {
+    match identifier {
+        LocationIdentifier::CodeLocation(code) => {
+            code_location_refusal(LOCATION_IDENTIFIER_MEMBER_PATH, code)
+        }
+        LocationIdentifier::LocationHash(_) => None,
+    }
 }
 
 /// The `LocationHash` of a location: "A stable hash computed from the location that uniquely

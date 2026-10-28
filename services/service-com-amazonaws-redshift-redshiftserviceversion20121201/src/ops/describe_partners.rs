@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePartners
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePartners`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePartners::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the partner integrations recorded on the cluster the request names,
+//! in the order the partners were added: every one, or only those of the
+//! database and partner it names — "If database name is not specified, then all
+//! databases in the cluster are described", and the same for the partner name.
+//! The cluster is resolved against this service's store, so an identifier that
+//! names no cluster answers `ClusterNotFoundFault` rather than an empty list,
+//! and an `AccountId` that owns none of this account's clusters answers
+//! `UnauthorizedPartnerIntegrationFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -93,12 +93,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribePartnersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribePartners")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribePartners",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribePartnersErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     UnauthorizedPartnerIntegrationFault(UnauthorizedPartnerIntegrationFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,20 +154,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePartners` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePartnersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePartners"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribePartnersErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        if store.cluster(&input.cluster_identifier).is_none() {
+            return Err(DescribePartnersErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                },
+            )
+            .into());
+        }
+        if input.account_id != ::engine::emulator_account_id() {
+            return Err(
+                DescribePartnersErrorModeled::UnauthorizedPartnerIntegrationFault(
+                    UnauthorizedPartnerIntegrationFault {
+                        message: Some(format!(
+                            "The account {} does not own cluster {}.",
+                            input.account_id, input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The integrations of THIS cluster, narrowed by the two members the
+        // request may name: each is an inclusive filter, so one the request
+        // omits constrains nothing.
+        let reported: Vec<PartnerIntegrationInfo> = store
+            .partner_integrations
+            .iter()
+            .filter(|stored| stored.cluster_identifier == input.cluster_identifier)
+            .filter(|stored| {
+                input
+                    .database_name
+                    .as_deref()
+                    .is_none_or(|wanted| stored.info.database_name.as_deref() == Some(wanted))
+                    && input
+                        .partner_name
+                        .as_deref()
+                        .is_none_or(|wanted| stored.info.partner_name.as_deref() == Some(wanted))
+            })
+            .map(|stored| stored.info.clone())
+            .collect();
+
+        Ok(DescribePartnersOutput {
+            partner_integration_info_list: Some(reported),
+        })
     }
 }

@@ -77,6 +77,8 @@ mod notification_deletion;
 mod notification_lifecycle;
 #[path = "all/notification_update.rs"]
 mod notification_update;
+#[path = "all/percentage_budget_limit_amount.rs"]
+mod percentage_budget_limit_amount;
 #[path = "all/resource_tag_deletion.rs"]
 mod resource_tag_deletion;
 #[path = "all/resource_tag_reads.rs"]

@@ -161,6 +161,8 @@ mod update_user_pool;
 mod update_user_pool_client;
 #[path = "all/update_user_pool_domain.rs"]
 mod update_user_pool_domain;
+#[path = "all/update_user_pool_domain_not_found.rs"]
+mod update_user_pool_domain_not_found;
 #[path = "all/user_attribute_verification_code.rs"]
 mod user_attribute_verification_code;
 #[path = "all/user_import_job_lifecycle.rs"]

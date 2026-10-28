@@ -373,6 +373,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "LogFormat must include at least one ${field-id} field",
                 ));
             }
+            // "For more information about the available fields, see Flow log records …"
+            // (`$LogFormat`): the format lays out PUBLISHED fields, so a token naming none
+            // of them names a field the service could never write. The whole call is
+            // refused here — before the store is reached — so a format naming an
+            // unrecognised field leaves the monitored resource exactly the flow logs it
+            // already had.
+            let unknown = state::unknown_flow_log_format_fields(log_format);
+            if !unknown.is_empty() {
+                return Err(state::unknown_flow_log_fields(&unknown));
+            }
         }
 
         // "Unique, case-sensitive identifier that you provide to ensure the idempotency of

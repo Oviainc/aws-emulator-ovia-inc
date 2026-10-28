@@ -225,6 +225,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 
+        // Same class of rule for the location: `CodeLocation.ClassName` is required for one
+        // value of its sibling `Language`, which the model cannot express either, so the
+        // documented requirement is enforced here and the location is refused with 400
+        // rather than hashed and stored.
+        if let Some(refusal) = crate::state::location_refusal(&input.location) {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
         let scope = crate::state::InstrumentationScope::new(
             &input.instrumentation_type,
             &input.service,

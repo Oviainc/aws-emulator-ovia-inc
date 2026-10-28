@@ -55,7 +55,21 @@ pub struct Schedule {
     pub archive_rule: Option<ArchiveRule>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dlm#CreateRule")]
+// `Interval` carries `skip_validation`: this service materializes the integer
+// zero for a creation rule that stated no interval — a cron-driven rule — and
+// every read of such a policy reports that zero
+// (`crate::state::UNSET_RULE_INTERVAL`), so the boundary walk's `@range(min: 1)`
+// would refuse the configuration the service itself just reported and no
+// cron-driven policy could be updated by sending its own configuration back.
+// The member's real domain is the narrower set its documentation publishes ("The
+// supported values are 1, 2, 3, 4, 6, 8, 12, and 24"), which the handlers
+// enforce over the value the request actually stated — see
+// `crate::state::schedule_with_unsupported_create_interval`, which refuses every
+// value outside that set and so subsumes the modelled bound.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.dlm#CreateRule",
+    skip_validation = ["Interval"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateRule {
     pub location: Option<String>,

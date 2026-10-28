@@ -1505,6 +1505,88 @@ async fn matching_a_large_value_against_a_large_wildcard_stays_cheap() {
     );
 }
 
+/// Matching an event field that holds a LIST is charged per value visited: the
+/// cost of a walk grows with the list, so a long array of values a candidate
+/// cannot match is never traversed for free. Driven against the matcher directly
+/// so the COST is assertable, over a table of list lengths.
+#[test]
+fn matching_a_list_valued_field_is_charged_for_every_value_visited() {
+    use service_com_amazonaws_cloudwatchevents_awsevents::state::event_pattern;
+
+    // A candidate no value in the lists below equals, so every value is visited:
+    // nothing short-circuits the walk.
+    let pattern = event_pattern::parse(&json!({ "resources": ["absent"] }).to_string())
+        .expect("the pattern is one this service accepts");
+
+    let cost_for = |values: usize| -> u64 {
+        let event = json!({
+            "resources": (0..values).map(|index| json!(format!("arn-{index}"))).collect::<Vec<_>>(),
+        });
+        let mut budget = event_pattern::MatchBudget::new(event_pattern::MAX_MATCH_STEPS_PER_REQUEST);
+        let matched = event_pattern::matches_within(&pattern, &event, &mut budget);
+        assert!(
+            !matched,
+            "case {values} values: no value equals the candidate, so nothing matches"
+        );
+        budget.spent()
+    };
+
+    let short = cost_for(1);
+    for values in [2_usize, 8, 64, 512] {
+        let spent = cost_for(values);
+        assert!(
+            spent >= short + (values as u64 - 1),
+            "case {values} values: visiting each value must cost at least a step of its \
+             own (a 1-value list spent {short}), got {spent}"
+        );
+    }
+}
+
+/// A walk the budget stopped decides nothing, and the one filter whose answer is
+/// a NEGATION must not read that as a match: `anything-but` reports no match when
+/// the budget ran out, over a table of budgets too small to buy the walk.
+#[test]
+fn a_budget_stopped_walk_never_turns_an_anything_but_filter_into_a_match() {
+    use service_com_amazonaws_cloudwatchevents_awsevents::state::event_pattern;
+
+    let pattern =
+        event_pattern::parse(&json!({ "source": [{ "anything-but": ["other"] }] }).to_string())
+            .expect("the pattern is one this service accepts");
+    let event = json!({ "source": "mine" });
+
+    // A budget that buys the whole walk: the value is not one the filter
+    // excludes, so the pattern matches.
+    let mut generous =
+        event_pattern::MatchBudget::new(event_pattern::MAX_MATCH_STEPS_PER_REQUEST);
+    assert!(
+        event_pattern::matches_within(&pattern, &event, &mut generous),
+        "a value the filter does not exclude matches, spent {}",
+        generous.spent()
+    );
+
+    // A budget that fits the walk EXACTLY decided everything it was asked, so
+    // its answer stands: nothing was cut short.
+    let exact = generous.spent();
+    let mut fitted = event_pattern::MatchBudget::new(exact);
+    assert!(
+        event_pattern::matches_within(&pattern, &event, &mut fitted),
+        "case {exact} steps (the walk's exact cost): a walk that finished must keep its \
+         answer, spent {}",
+        fitted.spent()
+    );
+
+    // A budget too small to buy it: no match, rather than the negation of an
+    // answer the walk never reached.
+    for steps in [1_u64, 2, 3, 5] {
+        let mut budget = event_pattern::MatchBudget::new(steps);
+        assert!(
+            !event_pattern::matches_within(&pattern, &event, &mut budget),
+            "case {steps} steps: a stopped walk must report no match, spent {}",
+            budget.spent()
+        );
+    }
+}
+
 /// A bus holds a bounded number of rules: the rule past the quota is refused with the
 /// modelled `LimitExceededException`, while an UPDATE at the quota adds no record.
 #[tokio::test]

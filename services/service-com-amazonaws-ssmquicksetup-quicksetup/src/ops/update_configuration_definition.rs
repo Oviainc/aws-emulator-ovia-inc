@@ -95,8 +95,9 @@ use super::types::*;
 /// * a definition is deployed where its parameters say, so the parameter set this
 ///   request writes must name somewhere to deploy to and must name no more deployments
 ///   than may be served; [`crate::state::deployment_targets_rejection`] is the one place
-///   that rule lives, shared with the create that stores a definition, and it reads the
-///   same parameters the fan-out below deploys from;
+///   that rule lives, shared with the create that stores a definition, and it counts the
+///   very deployments the fan-out below performs — hence the `local_account` and
+///   `local_region` defaults, which it needs to count them;
 /// * `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
 ///   `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to enforce
 ///   it; [`crate::state::iam_role_arn_rejection`] is the one place that rule lives,
@@ -107,7 +108,11 @@ use super::types::*;
 /// only once the `{ManagerArn}/{Id}` pair has been resolved to a stored definition, so
 /// that check lives in the handler beside the lookup
 /// ([`crate::state::resolve_type_version`]).
-fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String> {
+fn update_rejection(
+    input: &UpdateConfigurationDefinitionInput,
+    local_account: &str,
+    local_region: &str,
+) -> Option<String> {
     let parameters = input
         .parameters
         .as_ref()
@@ -122,11 +127,14 @@ fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String
     // A parameter set the request replaces also names where the definition is
     // deployed, so the targets it names are checked the way a create's are —
     // `crate::state` is the one place that rule lives.
-    if let Some(why) = input
-        .parameters
-        .as_ref()
-        .and_then(|parameters| crate::state::deployment_targets_rejection("Parameters", parameters))
-    {
+    if let Some(why) = input.parameters.as_ref().and_then(|parameters| {
+        crate::state::deployment_targets_rejection(
+            "Parameters",
+            parameters,
+            local_account,
+            local_region,
+        )
+    }) {
         return Some(why);
     }
     input
@@ -246,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        if let Some(why) = update_rejection(&input) {
+        if let Some(why) = update_rejection(&input, ::engine::emulator_account_id(), &region) {
             return Err(
                 UpdateConfigurationDefinitionErrorModeled::ValidationException(
                     ValidationException { message: Some(why) },

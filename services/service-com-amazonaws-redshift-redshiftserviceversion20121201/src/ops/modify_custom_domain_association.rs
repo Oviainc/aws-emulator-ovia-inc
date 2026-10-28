@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCustomDomainAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCustomDomainAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCustomDomainAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the certificate the request names onto the custom domain association
+//! of the cluster it names, and reports the association back with that
+//! certificate's expiry. The cluster is resolved against this service's store
+//! first (`ClusterNotFoundFault` for an identifier naming none), and a cluster
+//! carrying no association under the requested domain name answers
+//! `CustomDomainAssociationNotFoundFault`, so a modify never creates one.
 //!
 //! ## Shape of an operation
 //!
@@ -100,13 +98,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyCustomDomainAssociationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyCustomDomainAssociation")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyCustomDomainAssociation",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyCustomDomainAssociationErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     CustomCnameAssociationFault(CustomCnameAssociationFault),
     CustomDomainAssociationNotFoundFault(CustomDomainAssociationNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,20 +160,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCustomDomainAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCustomDomainAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCustomDomainAssociation"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyCustomDomainAssociationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The certificate this call associates is a NEW one, so its expiry is
+        // derived from this instant, exactly as the create derives it.
+        let expires_at = ::aws_smithy_types::DateTime::from(
+            ::std::time::SystemTime::now() + st::CUSTOM_DOMAIN_CERTIFICATE_VALIDITY,
+        );
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(
+                ModifyCustomDomainAssociationErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!(
+                            "Cluster {} not found.",
+                            input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The association has to EXIST on that cluster: a modify changes the
+        // certificate of an association, so a cluster serving another domain
+        // name — or none — has none to change.
+        if store.clusters[position].cluster.custom_domain_name.as_deref()
+            != Some(input.custom_domain_name.as_str())
+        {
+            return Err(
+                ModifyCustomDomainAssociationErrorModeled::CustomDomainAssociationNotFoundFault(
+                    CustomDomainAssociationNotFoundFault {
+                        message: Some(st::custom_domain_association_not_found_message(
+                            &input.custom_domain_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cluster = &mut store.clusters[position].cluster;
+        cluster.custom_domain_certificate_arn = Some(input.custom_domain_certificate_arn.clone());
+        cluster.custom_domain_certificate_expiry_date = Some(expires_at);
+
+        Ok(ModifyCustomDomainAssociationOutput {
+            custom_domain_name: Some(input.custom_domain_name),
+            custom_domain_certificate_arn: Some(input.custom_domain_certificate_arn),
+            cluster_identifier: Some(input.cluster_identifier),
+            custom_domain_cert_expiry_time: Some(st::iso8601(expires_at)),
+        })
     }
 }

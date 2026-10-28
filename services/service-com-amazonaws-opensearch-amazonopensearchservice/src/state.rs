@@ -60,7 +60,7 @@ use crate::ops::types::{
     InvalidPaginationTokenException, InvalidTypeException, JWTOptionsOutput,
     LimitExceededException, Limits,
     LogPublishingOption,
-    LogPublishingOptionsStatus, MigrationSource, MigrationWorkspace,
+    LogPublishingOptionsStatus, MigrationSource, MigrationSummary, MigrationWorkspace,
     NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
@@ -1821,6 +1821,25 @@ impl Migration {
             .collect();
         i32::try_from(distinct.len()).unwrap_or(i32::MAX)
     }
+
+    /// This job as a listing reports it, from the SAME stored record a single read
+    /// answers with — so a job's row in a listing and its own read cannot disagree
+    /// about the status or the progress it is at.
+    pub fn to_summary(&self) -> MigrationSummary {
+        MigrationSummary {
+            migration_id: Some(self.migration_id.clone()),
+            status: Some(self.status.clone()),
+            application_id: Some(self.application_id.clone()),
+            source: Some(self.source.clone()),
+            exported_count: self.exported_count,
+            imported_count: self.imported_count,
+            // "Error details if the migration failed or completed with errors": no path
+            // of this control plane fails a job, so there is nothing to report here.
+            error: None,
+            created_at: Some(datetime(self.created_at)),
+            updated_at: Some(datetime(self.updated_at)),
+        }
+    }
 }
 
 /// The `ResourceNotFoundException` payload for an id that addresses no migration job of
@@ -1904,6 +1923,34 @@ pub fn unsupported_conflict_resolution(value: &str) -> ValidationException {
              {}.",
             CONFLICT_RESOLUTION_VALUES.join(", ")
         )),
+    }
+}
+
+/// The `ValidationException` payload for a migration-status filter outside
+/// [`MIGRATION_STATUS_VALUES`].
+///
+/// "Filters the results by migration status. Valid values are PENDING, IN_PROGRESS,
+/// SUCCEEDED, and FAILED" (`ListMigrationsRequest$status`): a value outside the
+/// published set names no status a job is ever in, so it is refused as the malformed
+/// input it is rather than answered with an empty page.
+pub fn unsupported_migration_status(value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "status {value} is not supported. Supported values are {}.",
+            MIGRATION_STATUS_VALUES.join(", ")
+        )),
+    }
+}
+
+/// The same missing-application statement as [`application_not_found`], carried by the
+/// client-input error an operation that models NO `ResourceNotFoundException` does
+/// model.
+///
+/// One wording for "this account holds no such application", whichever error channel
+/// the asking operation has for it.
+pub fn unknown_application_id(id: &str) -> ValidationException {
+    ValidationException {
+        message: application_not_found(id).message,
     }
 }
 
@@ -7560,12 +7607,39 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// How many migration jobs this account holds for one application — what
     /// [`MIGRATION_QUOTA`] bounds.
     ///
+    /// Counted from the ONE statement of which jobs belong to an application, so the
+    /// bound a start is refused by and the set a listing reports are the same set.
+    ///
     /// Reads ONLY.
     pub fn migrations_of_application(&self, application_id: &str) -> usize {
-        self.migrations
+        self.migrations_of_application_in_creation_order(application_id)
+            .len()
+    }
+
+    /// This application's migration jobs in the order a listing reports them: the order
+    /// they were started in, oldest first.
+    ///
+    /// Two jobs started at one instant are ordered by the `migrationId` they were minted
+    /// under, which is unique per job — so the order is TOTAL, and the same set reports
+    /// the same order twice however the records are held. That is what lets a page token
+    /// name a place in the set.
+    ///
+    /// Reads ONLY.
+    pub fn migrations_of_application_in_creation_order(
+        &self,
+        application_id: &str,
+    ) -> Vec<&Migration> {
+        let mut migrations: Vec<&Migration> = self
+            .migrations
             .values()
             .filter(|migration| migration.application_id == application_id)
-            .count()
+            .collect();
+        migrations.sort_by(|one, other| {
+            one.created_at
+                .cmp(&other.created_at)
+                .then_with(|| one.migration_id.cmp(&other.migration_id))
+        });
+        migrations
     }
 
     /// Store `migration` and hand back the stored copy, so a start answers with the

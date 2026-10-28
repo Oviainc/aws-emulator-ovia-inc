@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddPartner
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddPartner`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddPartner::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the partner integration the request names on the cluster it names,
+//! and reports back the database and partner it was recorded for. The cluster is
+//! resolved against this service's store BEFORE anything is recorded — an
+//! identifier that names no cluster answers `ClusterNotFoundFault`, and an
+//! `AccountId` that is not the one owning this account's clusters answers
+//! `UnauthorizedPartnerIntegrationFault` — so a refused add leaves no
+//! integration behind. The integration a partner has not reported on yet starts
+//! at `crate::state::PARTNER_INTEGRATION_INITIAL_STATUS`, and adding the same
+//! (cluster, database, partner) triple twice leaves ONE integration.
 //!
 //! ## Shape of an operation
 //!
@@ -97,13 +98,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `AddPartnerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#AddPartner")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#AddPartner",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum AddPartnerErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     PartnerNotFoundFault(PartnerNotFoundFault),
     UnauthorizedPartnerIntegrationFault(UnauthorizedPartnerIntegrationFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,20 +160,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddPartner` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddPartnerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddPartner"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(AddPartnerErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let recorded_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        // The cluster whose data the partner would reach has to EXIST: it is a
+        // record of this service's control plane, so the identifier is resolved
+        // against the store before anything is recorded.
+        if store.cluster(&input.cluster_identifier).is_none() {
+            return Err(AddPartnerErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                },
+            )
+            .into());
+        }
+        // "The Amazon Web Services account ID that owns the cluster": an account
+        // that does not own this one's clusters may not integrate a partner with
+        // them.
+        if input.account_id != ::engine::emulator_account_id() {
+            return Err(
+                AddPartnerErrorModeled::UnauthorizedPartnerIntegrationFault(
+                    UnauthorizedPartnerIntegrationFault {
+                        message: Some(format!(
+                            "The account {} does not own cluster {}.",
+                            input.account_id, input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.partner_integrations.len() >= st::PARTNER_INTEGRATION_QUOTA {
+            return Err(AddPartnerErrorModeled::UnsupportedOperationFault(
+                UnsupportedOperationFault {
+                    message: Some(format!(
+                        "The request would exceed the allowed number of partner integrations ({}).",
+                        st::PARTNER_INTEGRATION_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The (cluster, database, partner) triple is what an integration is
+        // keyed by, so adding one that is already recorded leaves ONE record and
+        // only moves the instant the partner last changed.
+        let existing = store.partner_integration_position(
+            &input.cluster_identifier,
+            &input.database_name,
+            &input.partner_name,
+        );
+        match existing {
+            Some(position) => {
+                store.partner_integrations[position].info.updated_at = Some(recorded_at);
+            }
+            None => store
+                .partner_integrations
+                .push(st::StoredPartnerIntegration {
+                    cluster_identifier: input.cluster_identifier.clone(),
+                    account_id: input.account_id.clone(),
+                    info: PartnerIntegrationInfo {
+                        database_name: Some(input.database_name.clone()),
+                        partner_name: Some(input.partner_name.clone()),
+                        status: Some(st::PARTNER_INTEGRATION_INITIAL_STATUS.to_string()),
+                        status_message: None,
+                        created_at: Some(recorded_at),
+                        updated_at: Some(recorded_at),
+                    },
+                }),
+        }
+
+        Ok(AddPartnerOutput {
+            database_name: Some(input.database_name),
+            partner_name: Some(input.partner_name),
+        })
     }
 }

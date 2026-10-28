@@ -88,9 +88,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{
-    datetime, migration_not_found, service_state, state_unavailable,
-};
+use crate::state::{migration_not_found, service_state, state_unavailable};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -178,20 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // Answered from the STORED record, so the start's answer and this read report
-        // one job.
+        // Answered from the STORED record through the ONE projection a listing reports
+        // the same job by, so the start's answer, this read and a row of
+        // `ListMigrations` cannot disagree about where the job stands.
+        let summary = migration.to_summary();
         Ok(GetMigrationOutput {
-            migration_id: Some(migration.migration_id.clone()),
-            status: Some(migration.status.clone()),
-            application_id: Some(migration.application_id.clone()),
-            source: Some(migration.source.clone()),
-            exported_count: migration.exported_count,
-            imported_count: migration.imported_count,
-            // "Error details if the migration failed or completed with errors": no path
-            // of this control plane fails a job, so there is nothing to report here.
-            error: None,
-            created_at: Some(datetime(migration.created_at)),
-            updated_at: Some(datetime(migration.updated_at)),
+            migration_id: summary.migration_id,
+            status: summary.status,
+            application_id: summary.application_id,
+            source: summary.source,
+            exported_count: summary.exported_count,
+            imported_count: summary.imported_count,
+            error: summary.error,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
         })
     }
 }

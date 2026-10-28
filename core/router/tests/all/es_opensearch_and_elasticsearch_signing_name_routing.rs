@@ -435,13 +435,19 @@ fn the_es_endpoint_serves_both_api_versions() {
                     expected_absent: &[],
                 },
                 Call {
+                    // As for `StartMigration` above: the implemented modern-model
+                    // listing answers its own refusal for an `applicationId` naming no
+                    // application of this account. `ListMigrations` declares no
+                    // `ResourceNotFoundException`, so that refusal is the
+                    // `ValidationException` it does declare — which the legacy model,
+                    // declaring no such operation, could not produce.
                     case: "ListMigrations reaches the modern model",
                     method: "GET",
                     path: "/2021-01-01/opensearch/app-migrations?applicationId=abc123xyz",
                     body: None,
-                    expected_status: 501,
-                    expected_error: Some("NotImplemented"),
-                    expected_contains: &["ListMigrations"],
+                    expected_status: 400,
+                    expected_error: Some("ValidationException"),
+                    expected_contains: &["Application not found: abc123xyz"],
                     expected_absent: &[],
                 },
                 Call {

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomDomainAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomDomainAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomDomainAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the custom domain name the request names with the cluster it
+//! names, and reports the association back with the expiry of the certificate it
+//! was created with. The association is a property of the CLUSTER
+//! (`Cluster$CustomDomainName`), so a later `DescribeClusters` reports the
+//! domain, its certificate and that expiry too, and `DescribeCustomDomainAssociations`
+//! reports the association. The cluster is resolved against this service's store
+//! BEFORE anything is written — an identifier that names no cluster answers
+//! `ClusterNotFoundFault` — and a domain name another cluster already serves
+//! answers `CustomCnameAssociationFault`, so one name is never associated twice.
 //!
 //! ## Shape of an operation
 //!
@@ -99,12 +100,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateCustomDomainAssociationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateCustomDomainAssociation")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateCustomDomainAssociation",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateCustomDomainAssociationErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     CustomCnameAssociationFault(CustomCnameAssociationFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,20 +161,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomDomainAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomDomainAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomDomainAssociation"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateCustomDomainAssociationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // When the certificate the association names expires: derived from this
+        // instant and the validity period ACM issues a certificate for, so every
+        // later read of the association reports the same expiry.
+        let expires_at = ::aws_smithy_types::DateTime::from(
+            ::std::time::SystemTime::now() + st::CUSTOM_DOMAIN_CERTIFICATE_VALIDITY,
+        );
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(
+                CreateCustomDomainAssociationErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!(
+                            "Cluster {} not found.",
+                            input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A custom domain name resolves to ONE cluster, so a name another
+        // cluster already serves cannot be associated with this one.
+        let taken_by_another = store
+            .cluster_with_custom_domain(&input.custom_domain_name)
+            .and_then(|stored| stored.cluster.cluster_identifier.clone())
+            .filter(|holder| holder != &input.cluster_identifier);
+        if let Some(holder) = taken_by_another {
+            return Err(
+                CreateCustomDomainAssociationErrorModeled::CustomCnameAssociationFault(
+                    CustomCnameAssociationFault {
+                        message: Some(format!(
+                            "The custom domain name {} is already associated with cluster {holder}.",
+                            input.custom_domain_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The association IS these three members of the cluster record, so the
+        // write is what makes every read of it — this operation's own answer, a
+        // later `DescribeClusters` and a later
+        // `DescribeCustomDomainAssociations` — report the same association.
+        let cluster = &mut store.clusters[position].cluster;
+        cluster.custom_domain_name = Some(input.custom_domain_name.clone());
+        cluster.custom_domain_certificate_arn = Some(input.custom_domain_certificate_arn.clone());
+        cluster.custom_domain_certificate_expiry_date = Some(expires_at);
+
+        Ok(CreateCustomDomainAssociationOutput {
+            custom_domain_name: Some(input.custom_domain_name),
+            custom_domain_certificate_arn: Some(input.custom_domain_certificate_arn),
+            cluster_identifier: Some(input.cluster_identifier),
+            custom_domain_cert_expiry_time: Some(st::iso8601(expires_at)),
+        })
     }
 }

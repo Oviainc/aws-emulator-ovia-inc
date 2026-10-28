@@ -457,6 +457,8 @@ mod personalize_signing_name_routing;
 // this file or beside the other `cloudformation_provisions_*` suites in the `c` span: both
 // of those are where every concurrently landing suite puts its line, so a declaration there
 // conflicts with all of them.
+#[path = "all/cloudformation_provisions_redshift_clusters.rs"]
+mod cloudformation_provisions_redshift_clusters;
 #[path = "all/cloudformation_provisions_route53resolver_rules.rs"]
 mod cloudformation_provisions_route53resolver_rules;
 // `query_wire` and `rds_query_front_door` are declared HERE, in the sorted list,

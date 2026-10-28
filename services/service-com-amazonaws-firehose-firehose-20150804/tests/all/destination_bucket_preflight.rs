@@ -45,12 +45,16 @@ const ABSENT_BACKUP: &str = "preflight-absent-backup";
 const ABSENT_NESTED: &str = "preflight-absent-nested";
 
 /// `bucket` as the `BucketARN` a destination names it by.
-fn bucket_arn(bucket: &str) -> String {
+///
+/// `pub(crate)`, like this crate's other test helpers, so the sibling suite that extends
+/// this table along the remaining members and name forms
+/// (`tests/all/destination_bucket_resolution.rs`) reuses it instead of carrying a copy.
+pub(crate) fn bucket_arn(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}")
 }
 
 /// An `S3DestinationConfiguration` delivering to `bucket`.
-fn s3_configuration(bucket: &str) -> Value {
+pub(crate) fn s3_configuration(bucket: &str) -> Value {
     json!({ "RoleARN": ROLE_ARN, "BucketARN": bucket_arn(bucket), "Prefix": "raw/" })
 }
 
@@ -179,7 +183,13 @@ fn cases() -> Vec<Case> {
 
 /// `(VersionId, DestinationId)` of a stream's sole destination, with the description it was
 /// read from.
-async fn version_and_destination(emulator: &Emulator, stream: &str) -> (String, String, Value) {
+///
+/// `pub(crate)` for the same reason as [`bucket_arn`]: the sibling suite reads a stream's
+/// version and destination id exactly this way.
+pub(crate) async fn version_and_destination(
+    emulator: &Emulator,
+    stream: &str,
+) -> (String, String, Value) {
     let described = emulator
         .firehose_ok(
             "DescribeDeliveryStream",

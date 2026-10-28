@@ -48,7 +48,15 @@ pub struct RecommendedAction {
     pub account_id: Option<String>,
     pub severity: Option<String>,
     pub feature: Option<String>,
-    pub context: Option<std::collections::HashMap<String, String>>,
+    /// `RecommendedAction$context`, a `map<String, String>`.
+    ///
+    /// Held in an ORDERED map: the serializer writes a map's entries in the order
+    /// the Rust map yields them, so a `HashMap` here would order the JSON object's
+    /// keys by a per-instance hash seed and let two identical reads of unchanged
+    /// state answer with different bytes. A `BTreeMap` yields its keys in one
+    /// order, which is also the order the store holds them in
+    /// ([`crate::state::StoredAction::context`]).
+    pub context: Option<std::collections::BTreeMap<String, String>>,
     pub next_steps: Option<Vec<String>>,
     pub last_updated_time_stamp: Option<String>,
 }
