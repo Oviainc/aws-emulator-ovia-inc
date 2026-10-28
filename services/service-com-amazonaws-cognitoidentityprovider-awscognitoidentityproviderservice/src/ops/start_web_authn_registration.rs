@@ -241,8 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 >= crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER
             {
                 return Err(limit_exceeded(format!(
-                    "User {} holds at most {} passkey credentials.",
-                    user.username,
+                    "The limit for registered WebAuthn credentials is: {}.",
                     crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER
                 )));
             }

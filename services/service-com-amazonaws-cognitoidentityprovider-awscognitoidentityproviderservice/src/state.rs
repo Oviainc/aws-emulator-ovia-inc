@@ -37,6 +37,7 @@ use crate::ops::types::{
     UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolReplicaType,
     UserPoolType, UserType,
     UsernameConfigurationType, VerificationMessageTemplateType, WebAuthnConfigurationType,
+    WebAuthnCredentialDescription,
 };
 
 /// The region a request that carries no SigV4 credential scope falls back to, so
@@ -5019,6 +5020,22 @@ pub struct WebAuthnCredential {
     /// (`WebAuthnCredentialDescription.AuthenticatorTransports`).
     pub authenticator_transports: Vec<String>,
     pub created_at: SystemTime,
+}
+
+impl WebAuthnCredential {
+    /// The modelled view of this passkey credential, rendered from what the
+    /// completed registration STORED, so a later read reports the registered
+    /// credential and not the request that registered it.
+    pub fn to_credential_description(&self) -> WebAuthnCredentialDescription {
+        WebAuthnCredentialDescription {
+            credential_id: self.credential_id.clone(),
+            friendly_credential_name: self.friendly_credential_name.clone(),
+            relying_party_id: self.relying_party_id.clone(),
+            authenticator_attachment: self.authenticator_attachment.clone(),
+            authenticator_transports: self.authenticator_transports.clone(),
+            created_at: to_date_time(self.created_at),
+        }
+    }
 }
 
 /// The time unit a token-validity number is counted in
