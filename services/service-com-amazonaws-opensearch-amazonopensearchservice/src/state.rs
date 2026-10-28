@@ -34,7 +34,7 @@ use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
     AccessPoliciesStatus, AdditionalLimit,
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
-    AdvancedSecurityOptionsStatus, AppConfig, AuthorizedPrincipal,
+    AdvancedSecurityOptionsStatus, AppConfig, ApplicationSummary, AuthorizedPrincipal,
     AutoTune, AutoTuneDetails,
     AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
@@ -1311,6 +1311,26 @@ impl Application {
     /// [`Self::reported_data_sources`].
     pub fn reported_tag_list(&self) -> Option<Vec<Tag>> {
         (!self.tags.is_empty()).then(|| tag_list(&self.tags))
+    }
+
+    /// This application as a listing reports it, from the SAME stored record a single
+    /// read answers with — so an application's row in a listing and its own
+    /// `GetApplication` cannot disagree about where it is in its lifecycle or when it
+    /// was last changed.
+    ///
+    /// `ApplicationSummary` is "basic details of an OpenSearch application": the
+    /// members it declares, and no others, so the configuration a read reports in full
+    /// is not duplicated here.
+    pub fn to_summary(&self) -> ApplicationSummary {
+        ApplicationSummary {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            endpoint: Some(self.endpoint.clone()),
+            status: Some(self.status.clone()),
+            created_at: Some(datetime(self.created_at)),
+            last_updated_at: Some(datetime(self.last_updated_at)),
+        }
     }
 
     /// The instant this application becomes usable, or `None` when it already is.
@@ -7572,6 +7592,25 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub fn insert_application(&mut self, application: Application) -> &Application {
         let id = application.id.clone();
         self.applications.entry(id).or_insert(application)
+    }
+
+    /// Every application of this account in the order a listing reports them: the order
+    /// they were created in, oldest first.
+    ///
+    /// Two applications created at one instant are ordered by the `Id` they were minted
+    /// under, which is unique per application — so the order is TOTAL, and the same set
+    /// reports the same order twice however the records are held. That is what lets a
+    /// page token name a place in the set.
+    ///
+    /// Reads ONLY.
+    pub fn applications_in_creation_order(&self) -> Vec<&Application> {
+        let mut applications: Vec<&Application> = self.applications.values().collect();
+        applications.sort_by(|one, other| {
+            one.created_at
+                .cmp(&other.created_at)
+                .then_with(|| one.id.cmp(&other.id))
+        });
+        applications
     }
 
     /// Mint the identifier a saved-object migration job is addressed by, so two jobs

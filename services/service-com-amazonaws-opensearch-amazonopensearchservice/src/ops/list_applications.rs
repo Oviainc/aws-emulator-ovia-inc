@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the OpenSearch UI applications this account holds, each from the ONE
+//! [`crate::state::Application`] record `CreateApplication` persisted and
+//! `GetApplication` reads, so an application's row here and its own read cannot
+//! disagree. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every status move the clock owes an application is materialised before the page is
+//! taken, so a caller polling the listing sees provisioning complete without any call
+//! having asked for the move — and that settled status is what the `statuses` filter
+//! selects on.
+//!
+//! `statuses` narrows the listing to the applications in the statuses it names,
+//! `maxResults` bounds the page and `nextToken` names the application the next page
+//! starts at, so paging resumes from a place in the set rather than from an offset a
+//! later create would have shifted.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +91,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    invalid_next_token, max_results_out_of_range, service_state, state_unavailable, Application,
+};
+
+/// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`, so
+/// 100 results is the most any request can ask for. Held as the modelled member's own
+/// type, for the bound check below.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// [`MAX_PAGE_SIZE`] as a count of results — the page a request that names no page size
+/// gets.
+const MAX_PAGE: usize = MAX_PAGE_SIZE as usize;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +177,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and the
+        // check is repeated here so the rule holds however the request reached us. A
+        // NEGATIVE page size is malformed for the same reason — it is not a page size at
+        // all — so it is refused rather than reinterpreted, while `@default(0)` (no page
+        // size sent) stays the "no particular page size" case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(ListApplicationsErrorModeled::ValidationException(
+                max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
+            )
+            .into());
+        }
+
+        // "Filters the list of OpenSearch applications by status": the member is a list
+        // of `ApplicationStatus`, so a value outside that enum is refused at the request
+        // boundary before this handler runs. A request naming no status — including one
+        // naming an empty list — narrows the listing by status not at all.
+        let statuses = input.statuses.unwrap_or_default();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONLY write this report makes, and it writes only what the clock already
+        // owed each application at this instant had nobody called: one whose
+        // provisioning has fallen due is reported in the status it is then in, which is
+        // also what the `statuses` filter below selects on.
+        store.settle_applications(now);
+
+        // The order the applications were created in, oldest first and total — so the
+        // same request reports the same order twice, which is what lets a token name a
+        // place in the set. Bounded by the store itself: this account holds at most
+        // `crate::state::APPLICATION_QUOTA` applications.
+        let selected: Vec<&Application> = store
+            .applications_in_creation_order()
+            .into_iter()
+            .filter(|application| {
+                statuses.is_empty() || statuses.contains(&application.status)
+            })
+            .collect();
+
+        // "Send the request again using the returned token to retrieve the next page":
+        // the token names the application the next page starts at, so paging resumes
+        // from a place in the set rather than from an offset a later create or delete
+        // would have shifted. It is only ever a value this operation handed out, so one
+        // naming no application of the listing — and the listing is what the filter
+        // selected — is a malformed request rather than an empty page. The EMPTY token
+        // names no place either, and is the one value a client can send without having
+        // been given it, so it starts from the first page.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            None => 0,
+            Some(token) => selected
+                .iter()
+                .position(|application| application.id == token)
+                .ok_or_else(|| {
+                    ListApplicationsErrorModeled::ValidationException(invalid_next_token())
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to return
+        // for a given request": the model defaults it to 0, so a request that asks for
+        // no particular page size gets the largest page the model allows rather than an
+        // empty one. Every other value reaching here is in `1..=MAX_PAGE_SIZE`, the
+        // bound check above having refused the rest.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(selected.len());
+
+        Ok(ListApplicationsOutput {
+            // Answered from the STORED records, so an application's row here and its
+            // own read report one application.
+            application_summaries: Some(
+                selected[start..end]
+                    .iter()
+                    .map(|application| application.to_summary())
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the
+            // application the next page starts at, and nothing once this page ended the
+            // listing.
+            next_token: selected.get(end).map(|application| application.id.clone()),
+        })
     }
 }
