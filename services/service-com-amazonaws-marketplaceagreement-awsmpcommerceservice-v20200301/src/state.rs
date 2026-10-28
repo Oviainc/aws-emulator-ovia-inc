@@ -2172,25 +2172,52 @@ impl Agreement {
         self.updated_at = now;
     }
 
+    /// Move this agreement out of [`STATUS_ACTIVE`] to the terminal `status` at
+    /// `now`: the ONE writer of an agreement's status, so every transition this
+    /// service performs is bounded the same way and the `updated_at` that goes
+    /// with it is stamped in one place.
+    ///
+    /// Only an [`STATUS_ACTIVE`] agreement is moved; one that has already
+    /// reached a terminal status (cancelled, replaced, expired) keeps it rather
+    /// than being moved backwards into or across a status it has already
+    /// passed, whatever later call asks. The answer says whether this call is
+    /// what moved it, so a caller that owes an audit record emits one only for
+    /// the transition it actually made.
+    #[must_use]
+    fn leave_active(&mut self, status: &str, now: SystemTime) -> bool {
+        if self.status != STATUS_ACTIVE {
+            return false;
+        }
+        self.status = status.to_string();
+        self.updated_at = now;
+        true
+    }
+
     /// Cancel this agreement at `now`: the one transition to
     /// [`STATUS_CANCELLED`], which both the acceptor's direct `CancelAgreement`
     /// and the approval of a cancellation request
     /// (`AcceptAgreementCancellationRequest`) perform, so the status and the
     /// `updated_at` that goes with it have exactly one writer.
     ///
-    /// Only an [`STATUS_ACTIVE`] agreement is cancelled; one that has already
-    /// reached a terminal status (cancelled, replaced, expired) keeps it rather
-    /// than being moved backwards. The answer says whether this call is what
-    /// cancelled it, so a caller that owes an audit record emits one only for
-    /// the transition it actually made.
+    /// Guarded by [`Agreement::leave_active`]: an agreement that has already
+    /// reached a terminal status keeps it.
     #[must_use]
     pub fn cancel(&mut self, now: SystemTime) -> bool {
-        if self.status != STATUS_ACTIVE {
-            return false;
-        }
-        self.status = STATUS_CANCELLED.to_string();
-        self.updated_at = now;
-        true
+        self.leave_active(STATUS_CANCELLED, now)
+    }
+
+    /// Record this agreement as superseded at `now`: the one transition to
+    /// [`STATUS_REPLACED`], which accepting a `REPLACE` request naming it as its
+    /// source performs.
+    ///
+    /// Guarded by [`Agreement::leave_active`] exactly as [`Agreement::cancel`]
+    /// is: an agreement that has already reached a terminal status — one the
+    /// acceptor cancelled, one an earlier replacement already superseded — keeps
+    /// it, so the status it reached is never overwritten by a later
+    /// replacement.
+    #[must_use]
+    pub fn replace(&mut self, now: SystemTime) -> bool {
+        self.leave_active(STATUS_REPLACED, now)
     }
 
     /// Whether the acceptor asked for auto-renewal, as the accepted renewal
