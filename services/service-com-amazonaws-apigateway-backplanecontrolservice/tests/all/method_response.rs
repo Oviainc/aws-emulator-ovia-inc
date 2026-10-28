@@ -255,18 +255,20 @@ async fn the_status_codes_a_method_response_takes_are_the_ones_the_pattern_admit
     }
 
     for status in refused {
+        // Refused by the CONSTRAINT layer in front of the handler, whose error class is
+        // `ValidationException` rather than the operation's own `BadRequestException`.
         let answer =
             put_method_response(&gateway, &api, &resource, "GET", status, json!({})).await;
         assert_failure(
             &answer,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("PutMethodResponse({status})"),
         );
         assert_failure(
             &get_method_response(&gateway, &api, &resource, "GET", status).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("GetMethodResponse({status})"),
         );
     }

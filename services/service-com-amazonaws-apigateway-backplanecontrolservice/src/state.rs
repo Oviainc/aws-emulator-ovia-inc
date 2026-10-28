@@ -568,9 +568,13 @@ pub struct VpcLinkEntry {
     /// (`VpcLink$targetArns`).
     pub target_arns: Vec<String>,
     /// When this link finishes being provisioned. It is reported [`VPC_LINK_PENDING`]
-    /// until this instant and [`VPC_LINK_AVAILABLE`] from it on; see
-    /// [`VPC_LINK_PROVISION_SPAN`] and [`Self::status`].
+    /// until this instant and settled from it on; see [`VPC_LINK_PROVISION_SPAN`] and
+    /// [`Self::status`].
     pub available_at: Option<::std::time::Instant>,
+    /// Why provisioning this link cannot succeed, when it cannot: the link settles
+    /// [`VPC_LINK_FAILED`] instead of [`VPC_LINK_AVAILABLE`] and reports this as its
+    /// `statusMessage`. `None` for a link that provisions.
+    pub failure: Option<String>,
     pub tags: BTreeMap<String, String>,
     /// This link's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
@@ -584,15 +588,32 @@ impl VpcLinkEntry {
     ///
     /// `CreateVpcLink` is "an asynchronous operation that typically takes 2-4 minutes to
     /// complete and become operational" (the operation's own documentation), so a link
-    /// is created [`VPC_LINK_PENDING`] and becomes [`VPC_LINK_AVAILABLE`] once
-    /// [`VPC_LINK_PROVISION_SPAN`] has passed — a transition the CLOCK owes, materialised
-    /// from the stored due instant rather than by sleeping or by being read, the way
+    /// is created [`VPC_LINK_PENDING`] and SETTLES once [`VPC_LINK_PROVISION_SPAN`] has
+    /// passed — a transition the CLOCK owes, materialised from the stored due instant
+    /// rather than by sleeping or by being read, the way
     /// [`StageEntry::cache_cluster_status`] materialises its own.
+    ///
+    /// Which state it settles in is decided by what the link targets: a link whose
+    /// provisioning cannot succeed settles [`VPC_LINK_FAILED`] (see [`Self::failure`]),
+    /// and one that can settles [`VPC_LINK_AVAILABLE`].
     pub fn status(&self) -> &'static str {
         match self.available_at {
             Some(available_at) if ::std::time::Instant::now() < available_at => VPC_LINK_PENDING,
+            _ if self.failure.is_some() => VPC_LINK_FAILED,
             _ => VPC_LINK_AVAILABLE,
         }
+    }
+
+    /// The `statusMessage` this link reports now: the reason it could not be provisioned,
+    /// once it has settled [`VPC_LINK_FAILED`].
+    ///
+    /// A link that is still [`VPC_LINK_PENDING`], or that provisioned, reports none: AWS
+    /// publishes no sentence a provisioning or provisioned link carries, so nothing is
+    /// reported rather than a message this emulator made up.
+    pub fn status_message(&self) -> Option<String> {
+        (self.status() == VPC_LINK_FAILED)
+            .then(|| self.failure.clone())
+            .flatten()
     }
 }
 
@@ -1767,6 +1788,10 @@ pub const VPC_LINK_PENDING: &str = "PENDING";
 
 /// The `status` of a VPC link that is provisioned; see [`VPC_LINK_PENDING`].
 pub const VPC_LINK_AVAILABLE: &str = "AVAILABLE";
+
+/// The `status` of a VPC link whose provisioning could not succeed; see
+/// [`VPC_LINK_PENDING`] and [`VpcLinkEntry::failure`].
+pub const VPC_LINK_FAILED: &str = "FAILED";
 
 /// How long a VPC link stays [`VPC_LINK_PENDING`] after `CreateVpcLink`, after which it
 /// reports [`VPC_LINK_AVAILABLE`]. API Gateway documents no duration for it
@@ -3099,6 +3124,33 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             .any(|association| association.domain_name_arn == domain_name_arn)
     }
 
+    /// The method whose integration still reaches the VPC link `vpc_link_id`, with the
+    /// id of the API that method belongs to, or `None` when none does.
+    ///
+    /// An `Integration` names the link it reaches a VPC through in its `connectionId`
+    /// ("The ID of the VpcLink used for the integration when `connectionType=VPC_LINK`"),
+    /// so an integration carrying that identifier is a reference to the link. A VPC link
+    /// belongs to the ACCOUNT rather than to one API, so the walk covers every stored API
+    /// — the same kind of reference [`RestApiEntry::method_referencing_authorizer`] finds
+    /// inside one API. The APIs are walked in id order and each one's methods in the
+    /// order that lookup fixes, so a refusal NAMES the same reference on every call for
+    /// one set of records.
+    pub fn integration_referencing_vpc_link(
+        &self,
+        vpc_link_id: &str,
+    ) -> Option<(String, MethodReference)> {
+        self.rest_apis.values().find_map(|api| {
+            api.referencing_method(|method| {
+                method
+                    .integration
+                    .as_ref()
+                    .and_then(|integration| integration.connection_id.as_deref())
+                    == Some(vpc_link_id)
+            })
+            .map(|reference| (api.id.clone(), reference))
+        })
+    }
+
     /// The tag collection stored on the resource a `resourceArn` named, as
     /// [`parse_tagged_resource`] read it.
     ///
@@ -3418,6 +3470,15 @@ pub const NO_SUCH_STAGE: &str = "Invalid stage identifier specified";
 /// one, so all of them say the same thing about the same failure.
 pub const NO_SUCH_DEPLOYMENT: &str = "Invalid Deployment identifier specified";
 
+/// The `BadRequestException` message for a `CreateDeployment` of an API that carries no
+/// method on any of its resources.
+///
+/// A deployment is the snapshot of the API's methods a stage serves, so an API with no
+/// method has nothing to deploy. A SENTENCE OF ITS OWN, like
+/// [`INVALID_REST_API_IDENTIFIER`]: nothing is interpolated from the request, so the API
+/// is not named back.
+pub const NO_METHODS_TO_DEPLOY: &str = "The REST API doesn't contain any methods";
+
 /// The `NotFoundException` message for an `apiKey` that names no stored API key.
 pub const NO_SUCH_API_KEY: &str = "Invalid API Key identifier specified";
 
@@ -3587,6 +3648,32 @@ pub const INVALID_MODEL_SCHEMA: &str = "Invalid model specified: Validation Resu
 /// The `NotFoundException` message for a `vpcLinkId` that names no stored VPC link, in
 /// the shape of the sibling identifier messages above.
 pub const NO_SUCH_VPC_LINK: &str = "Invalid VPC link identifier specified";
+
+/// The `BadRequestException` message for a VPC link an `Integration` of some API still
+/// reaches through its `connectionId`, which is what `DeleteVpcLink` refuses while the
+/// reference stands (see
+/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::integration_referencing_vpc_link`]).
+///
+/// BUILT FROM STATE, in the shape of the sibling in-use refusals ([`authorizer_in_use`],
+/// [`model_in_use`]): the fixed text names the condition and the variable parts are the
+/// link's own name and the method whose integration still reaches it, so a client is told
+/// which integration has to be changed first.
+pub fn vpc_link_in_use(vpc_link_name: &str, referencing: &MethodReference) -> String {
+    format!("Cannot delete VPC link '{vpc_link_name}', is referenced in integration: {referencing}")
+}
+
+/// The `statusMessage` of a VPC link whose provisioning FAILED because one of its target
+/// ARNs does not name a network load balancer.
+///
+/// `VpcLink$statusMessage` is "a description about the VPC link status" and AWS publishes
+/// no fixed sentence for a failed one, so the description is BUILT FROM THE REQUEST: it
+/// names the target that could not be provisioned, which is the one value the caller has
+/// to change.
+pub fn vpc_link_target_is_not_a_load_balancer(target_arn: &str) -> String {
+    format!(
+        "Unable to provision the VPC link: {target_arn} does not name a network load balancer"
+    )
+}
 
 /// The `NotFoundException` message for a `requestValidatorId` that names no stored
 /// request validator of the API, in the shape of the sibling identifier messages above.

@@ -588,7 +588,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     None
                                 } else {
                                     stack.begin_rollback(failed_at, failure);
-                                    Some(stack.current_resources())
+                                    // With the records the stack HOLDS, which is the set
+                                    // the removal reports a deletion of.
+                                    Some((
+                                        stack.current_resources(),
+                                        stack.held_resource_ids(),
+                                    ))
                                 }
                             } else {
                                 // A failed UPDATE is rolled back to the previous stack
@@ -611,8 +616,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing what the failed create had made, with the store unlocked: the same
         // unwind `CreateStack` performs, since the clock already owes the rolled-back
         // status.
-        if let Some(resources) = unwind {
-            let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+        if let Some((resources, held)) = unwind {
+            let deleted =
+                crate::state::provisioning::unwind(ctx, &region, &resources, &held).await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
                 stack.schedule_resource_events(&deleted.transitions);

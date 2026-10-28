@@ -156,12 +156,14 @@ async fn the_required_name_must_be_present() {
         ("an empty tag map", json!({ "tags": {} })),
     ];
     for (case, request) in rows {
+        // An absent required member is a CONSTRAINT failure, refused by the layer in
+        // front of the handler under its own error class.
         assert_refused_and_nothing_stored(
             &gateway,
             case,
             request,
             400,
-            "BadRequestException",
+            "ValidationException",
         )
         .await;
     }

@@ -377,20 +377,9 @@ async fn an_imported_api_key_file_creates_one_key_per_row_read_back_through_get_
 async fn a_row_the_import_cannot_carry_over_is_a_warning_naming_it_and_the_rest_are_imported() {
     let gateway = Gateway::new();
 
-    // A key value this account already holds, so a row declaring it collides with the
-    // stored record rather than with another row.
-    let stored = "s".repeat(MIN_VALUE_CHARS);
-    create_key(
-        &gateway,
-        "a key the import will collide with",
-        serde_json::json!({ "name": "already-stored", "value": stored }),
-    )
-    .await;
-
     let good = row_value(10, 1);
     let too_short = "t".repeat(MIN_VALUE_CHARS - 1);
     let too_long = "u".repeat(MAX_VALUE_CHARS + 1);
-    let duplicated = row_value(11, 1);
     let planned = row_value(12, 1);
     let partial = row_value(13, 1);
     let mistyped = row_value(15, 1);
@@ -402,28 +391,36 @@ async fn a_row_the_import_cannot_carry_over_is_a_warning_naming_it_and_the_rest_
             "a row with no key cell".to_string(),
             "key,name\n,nameless-key\n".to_string(),
             Vec::new(),
-            vec!["row 1".to_string(), "key is required".to_string()],
+            vec![
+                "Skipped invalid record: 1".to_string(),
+                "API Key value is required".to_string(),
+            ],
         ),
         (
             "a row with no name cell".to_string(),
             format!("key,name\n{good},\n"),
             Vec::new(),
-            vec!["row 1".to_string(), "name is required".to_string()],
+            vec![
+                "Skipped invalid record: 1".to_string(),
+                "API Key name is required".to_string(),
+            ],
         ),
         (
             "a row that stops short of the header's width".to_string(),
             format!("key,name\n{good}\n"),
             Vec::new(),
-            vec!["row 1".to_string(), "name is required".to_string()],
+            vec![
+                "Skipped invalid record: 1".to_string(),
+                "API Key name is required".to_string(),
+            ],
         ),
         (
             "a key value one character under the published bound".to_string(),
             format!("key,name\n{too_short},too-short\n"),
             Vec::new(),
             vec![
-                "row 1".to_string(),
-                format!("between {MIN_VALUE_CHARS} and {MAX_VALUE_CHARS}"),
-                format!("got {}", MIN_VALUE_CHARS - 1),
+                "Skipped invalid record: 1".to_string(),
+                format!("API Key value should be at least {MIN_VALUE_CHARS} characters"),
             ],
         ),
         (
@@ -431,21 +428,9 @@ async fn a_row_the_import_cannot_carry_over_is_a_warning_naming_it_and_the_rest_
             format!("key,name\n{too_long},too-long\n"),
             Vec::new(),
             vec![
-                "row 1".to_string(),
-                format!("got {}", MAX_VALUE_CHARS + 1),
+                "Skipped invalid record: 1".to_string(),
+                format!("API Key value should be at most {MAX_VALUE_CHARS} characters"),
             ],
-        ),
-        (
-            "two rows declaring one key value".to_string(),
-            format!("key,name\n{duplicated},first\n{duplicated},second\n"),
-            vec![duplicated.clone()],
-            vec!["row 2".to_string(), "already exists".to_string()],
-        ),
-        (
-            "a row declaring a key value this account already holds".to_string(),
-            format!("key,name\n{stored},collides\n"),
-            Vec::new(),
-            vec!["row 1".to_string(), "already exists".to_string()],
         ),
         (
             "a row naming a usage plan that does not exist".to_string(),
@@ -460,7 +445,7 @@ async fn a_row_the_import_cannot_carry_over_is_a_warning_naming_it_and_the_rest_
             "one good row beside one bad row".to_string(),
             format!("key,name\n{partial},imported\n{too_short},too-short\n"),
             vec![partial.clone()],
-            vec!["row 2".to_string()],
+            vec!["Skipped invalid record: 2".to_string()],
         ),
         (
             // The one malformed CELL that does not stop the row being imported: the key
@@ -569,67 +554,95 @@ async fn a_warning_list_past_the_reported_bound_is_cut_and_says_how_many_it_left
             );
         } else {
             assert!(
-                last.starts_with("row "),
-                "case {case}: a complete list carries only per-row warnings, got {last:?}"
+                last.starts_with("Skipped invalid record: "),
+                "case {case}: a complete list carries only per-record warnings, got {last:?}"
             );
         }
     }
 }
 
+/// The values of every API key this account holds, read back through `GetApiKeys`.
+///
+/// What says whether a record was COMMITTED when the call that created it answered a
+/// refusal: the import answers no ids then, so the stored collection is the only witness.
+async fn stored_values(gateway: &Gateway, case: &str) -> Vec<String> {
+    let answer = gateway
+        .call("GET", "/apikeys?includeValues=true&limit=500", None)
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200 from GetApiKeys, got {} with {:?}",
+        answer.status, answer.body
+    );
+    crate::rest_api_lifecycle::page_items(&answer.body, case)
+        .iter()
+        .map(|item| crate::rest_api_lifecycle::string_member(item, "value", case))
+        .collect()
+}
+
 #[tokio::test]
-async fn fail_on_warnings_refuses_the_whole_import_and_creates_nothing() {
+async fn fail_on_warnings_refuses_the_answer_and_keeps_what_the_other_records_committed() {
     let gateway = Gateway::new();
 
-    // Each document carries one row that would be imported and one the import cannot
-    // carry over, so the rollback is observable: the good row's value is still free
-    // afterwards.
-    let rows: Vec<(String, String, String)> = vec![
+    // Each document carries one record that imports and one the import must SKIP, so
+    // what `failOnWarnings` does to each is observable: the call is refused, the refusal
+    // names the warning it would not tolerate, the skipped record creates nothing, and
+    // the valid record of the same payload is already committed — the import is not
+    // transactional.
+    //
+    // (case, the good row's value, the bad row's value, the warning the refusal names)
+    let rows: Vec<(String, String, String, String)> = vec![
         (
             "a row with no key cell".to_string(),
             row_value(20, 1),
             String::new(),
+            "Skipped invalid record: 2. API Key value is required".to_string(),
         ),
         (
-            "a key value under the published bound".to_string(),
+            "a key value one character under the published bound".to_string(),
             row_value(21, 1),
             "v".repeat(MIN_VALUE_CHARS - 1),
+            format!(
+                "Skipped invalid record: 2. API Key value should be at least \
+                 {MIN_VALUE_CHARS} characters"
+            ),
         ),
         (
-            "a duplicated key value".to_string(),
+            "a key value one character over the published bound".to_string(),
             row_value(22, 1),
-            row_value(22, 1),
+            "v".repeat(MAX_VALUE_CHARS + 1),
+            format!(
+                "Skipped invalid record: 2. API Key value should be at most \
+                 {MAX_VALUE_CHARS} characters"
+            ),
         ),
     ];
 
-    for (case, good, bad) in rows {
+    for (case, good, bad, warning) in rows {
         let document = format!("key,name\n{good},imported\n{bad},refused\n");
         let refused = import(&gateway, &document, true).await;
         assert_failure(&refused, 400, BAD_REQUEST, &case);
-        assert!(
-            refused.body["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Errors found during import"),
-            "case {case}: expected the refusal to state the import's warnings, got {:?}",
+        let expected_message = format!("Warnings found during import:\n\t{warning}");
+        assert_eq!(
+            refused.body["message"].as_str(),
+            Some(expected_message.as_str()),
+            "case {case}: expected the refusal to name the warning it would not \
+             tolerate ({expected_message:?}), got {:?}",
             refused.body
         );
 
-        // The rollback: nothing was created, so the SAME document imported without
-        // `failOnWarnings` now creates the good row — which it could not do if the
-        // refused import had already stored that value.
-        let accepted = import(&gateway, &document, false).await;
-        assert_eq!(
-            accepted.status, 201,
-            "case {case}: expected 201, got {} with {:?}",
-            accepted.status, accepted.body
+        // The valid record of that same payload is committed, and the skipped one is
+        // not: the import carried over what it could before refusing the answer.
+        let values = stored_values(&gateway, &case).await;
+        assert!(
+            values.contains(&good),
+            "case {case}: expected the valid record {good:?} to be committed, got {values:?}"
         );
-        let ids = imported_ids(&accepted.body, &case);
-        assert_eq!(
-            ids.len(),
-            1,
-            "case {case}: expected the good row to be the only key created, got {ids:?}"
+        assert!(
+            !values.contains(&bad),
+            "case {case}: expected the skipped record {bad:?} not to be committed, \
+             got {values:?}"
         );
-        assert_stored(&gateway, &ids[0], &expected(&good, "imported"), &case).await;
     }
 }
 
@@ -676,8 +689,8 @@ async fn the_format_query_parameter_is_held_to_the_modelled_enum() {
     let document = format!("key,name\n{},formatted\n", row_value(40, 1));
 
     // A format outside the modelled `ApiKeysFormat` enum (`one of: csv`) is refused
-    // before the payload is read at all, with the code this surface answers a modelled
-    // constraint failure with — 400 `BadRequestException`, the classification the sibling
+    // before the payload is read at all, by the CONSTRAINT layer in front of the handler
+    // — 400 `ValidationException`, the classification the sibling
     // `validation_message_rules` suite pins for this service — and no key is created.
     let refused = gateway
         .call_raw(
@@ -686,7 +699,12 @@ async fn the_format_query_parameter_is_held_to_the_modelled_enum() {
             &document,
         )
         .await;
-    assert_failure(&refused, 400, BAD_REQUEST, "a format outside the enum");
+    assert_failure(
+        &refused,
+        400,
+        "ValidationException",
+        "a format outside the enum",
+    );
 
     // The modelled value is read, and the same payload imports.
     let accepted = import(&gateway, &document, false).await;
@@ -854,4 +872,149 @@ async fn a_row_naming_a_stored_usage_plan_is_metered_by_it_and_an_unknown_one_wa
             }
         }
     }
+}
+
+/// RULE: a key VALUE is unique within the submitted payload and nowhere else. Rows that
+/// share one value COLLAPSE to a single `ApiKey` in which the LAST colliding row's
+/// columns win, and no row is checked against the keys the account already holds — so an
+/// import that repeats a value creates keys instead of being refused or warned about.
+///
+/// The rows span what the rule generalises over: how many rows share one value, how far
+/// apart they sit in the payload, how many distinct values the payload declares beside
+/// them, which columns the colliding rows differ in, and whether the value is one the
+/// account already holds.
+#[tokio::test]
+async fn one_payload_declares_each_key_value_once_and_the_last_colliding_row_wins() {
+    let gateway = Gateway::new();
+
+    // (case, document, the records the import must create, in the order it answers their
+    // ids)
+    let mut cases: Vec<(String, String, Vec<Expected>)> = Vec::new();
+
+    // Two rows, one value: one key, carrying the second row's name.
+    let value = row_value(50, 1);
+    cases.push((
+        "two rows sharing one value".to_string(),
+        format!("key,name\n{value},first\n{value},second\n"),
+        vec![expected(&value, "second")],
+    ));
+
+    // Three rows, one value, each differing in another column: the LAST row's columns
+    // win, member for member and not only the name.
+    let value = row_value(51, 1);
+    cases.push((
+        "three rows sharing one value, differing in every column".to_string(),
+        format!(
+            "key,name,description,Enabled\n\
+             {value},first,the first,false\n\
+             {value},second,the second,false\n\
+             {value},third,the third,true\n"
+        ),
+        vec![Expected {
+            value: value.clone(),
+            name: "third".to_string(),
+            description: Some("the third".to_string()),
+            enabled: true,
+        }],
+    ));
+
+    // Colliding rows with a distinct value BETWEEN them: the surviving record keeps the
+    // position of the value's first occurrence, so the ids are answered in row order.
+    let repeated = row_value(52, 1);
+    let between = row_value(52, 2);
+    cases.push((
+        "colliding rows with another value between them".to_string(),
+        format!(
+            "key,name\n{repeated},first\n{between},other\n{repeated},last\n"
+        ),
+        vec![
+            expected(&repeated, "last"),
+            expected(&between, "other"),
+        ],
+    ));
+
+    // Two separate collisions in one payload.
+    let left = row_value(53, 1);
+    let right = row_value(53, 2);
+    cases.push((
+        "two values each repeated".to_string(),
+        format!(
+            "key,name\n{left},left-first\n{right},right-first\n\
+             {left},left-last\n{right},right-last\n"
+        ),
+        vec![
+            expected(&left, "left-last"),
+            expected(&right, "right-last"),
+        ],
+    ));
+
+    for (case, document, records) in cases {
+        let answer = import(&gateway, &document, false).await;
+        assert_eq!(
+            answer.status, 201,
+            "case {case}: expected 201, got {} with {:?}",
+            answer.status, answer.body
+        );
+        // A collapsed row is not a row the import could not carry over: it reports NO
+        // warning, and the member is present and empty rather than absent.
+        let warnings = import_warnings(&answer.body, &case);
+        assert!(
+            warnings.is_empty(),
+            "case {case}: expected no warning for a collapsed row, got {warnings:?}"
+        );
+        assert_eq!(
+            answer.body["warnings"],
+            Value::Array(Vec::new()),
+            "case {case}: expected an empty warnings list, got {:?}",
+            answer.body["warnings"]
+        );
+        let ids = imported_ids(&answer.body, &case);
+        assert_eq!(
+            ids.len(),
+            records.len(),
+            "case {case}: expected {} created key(s), got {ids:?}",
+            records.len()
+        );
+        for (id, record) in ids.iter().zip(&records) {
+            assert_stored(&gateway, id, record, &case).await;
+        }
+    }
+
+    // No account-wide check either: a value an existing key already carries is imported
+    // as a key of its own, and both records stand afterwards.
+    let shared = "z".repeat(MIN_VALUE_CHARS);
+    let created = create_key(
+        &gateway,
+        "a key the import shares a value with",
+        serde_json::json!({ "name": "already-stored", "value": shared }),
+    )
+    .await;
+    let stored_id = created["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a created key id, got {created:?}"))
+        .to_owned();
+    let case = "a row declaring a value the account already holds";
+    let answer = import(&gateway, &format!("key,name\n{shared},imported\n"), false).await;
+    assert_eq!(
+        answer.status, 201,
+        "case {case}: expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let ids = imported_ids(&answer.body, case);
+    assert_eq!(
+        ids.len(),
+        1,
+        "case {case}: expected the row to create one key, got {ids:?}"
+    );
+    assert_ne!(
+        ids[0], stored_id,
+        "case {case}: expected a key of its own, got the stored key's id {stored_id:?}"
+    );
+    assert_stored(&gateway, &ids[0], &expected(&shared, "imported"), case).await;
+    let read = get_key(&gateway, &stored_id, true).await;
+    assert_eq!(
+        read.status, 200,
+        "case {case}: expected the already-stored key to survive, got {} with {:?}",
+        read.status, read.body
+    );
 }

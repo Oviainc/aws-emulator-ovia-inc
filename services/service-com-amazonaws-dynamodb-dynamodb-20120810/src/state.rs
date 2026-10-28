@@ -2840,16 +2840,42 @@ const KINESIS_DESTINATION_INVALID_STATE: &str =
     "Table is not in a valid state to enable Kinesis Streaming Destination";
 
 /// How a command that addresses ONE of a table's Kinesis streaming destinations is
-/// refused when the table replicates to no such stream: the stream ARN the request
-/// named and the table it named it against, under the invalid-state sentence above.
+/// refused when the table holds NO destination record for that stream at all: the stream
+/// ARN the request named and the table it named it against, under the invalid-state
+/// sentence above.
 ///
-/// A destination record is addressed by its `StreamArn`, so a table that has never
-/// replicated to that stream and one whose replication to it has stopped are the same
-/// miss: neither carries a destination the command could act on.
+/// This is the lookup miss proper — the table has no record of ever replicating to that
+/// stream. A record that EXISTS but is not `ACTIVE` is a state refusal instead
+/// ([`kinesis_destination_not_active_to_update`]), because the two are different causes
+/// for the caller: one is terminal, the other is waited out or re-enabled.
 pub fn kinesis_destination_not_found(table: &str, stream_arn: &str) -> RequestError {
     RequestError::Validation(format!(
         "{KINESIS_DESTINATION_INVALID_STATE}: No streaming destination with streamArn: \
          {stream_arn} found for table with tableName: {table}"
+    ))
+}
+
+/// How the command that STOPS replication is refused when the destination it addresses is
+/// not `ACTIVE`: replication can only be stopped once it is running, and the refusal is
+/// stated over that required status alone — it names neither the table nor the stream.
+///
+/// The same sentence answers every status that is not `ACTIVE`, a table that holds no
+/// record for the stream included: in each case there is no running replication to stop.
+pub fn kinesis_destination_not_active_to_disable() -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: KinesisStreamingDestination must be ACTIVE to \
+         perform DISABLE operation."
+    ))
+}
+
+/// How the command that CHANGES a destination's configuration is refused when the
+/// destination it addresses exists but is not `ACTIVE`: the status the change requires,
+/// over the table name and the Kinesis stream ARN the request addressed the destination
+/// by (`kdsArn`).
+pub fn kinesis_destination_not_active_to_update(table: &str, stream_arn: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "{KINESIS_DESTINATION_INVALID_STATE}: Kinesis streaming is not in ACTIVE state. Updates \
+         are only allowed in ACTIVE state. TableName: {table}, kdsArn: {stream_arn}"
     ))
 }
 
@@ -2959,6 +2985,16 @@ impl KinesisDestination {
     pub fn replicating(&self, now: SystemTime) -> bool {
         let status = self.status(now);
         status != DESTINATION_STATUS_DISABLED && status != DESTINATION_STATUS_DISABLING
+    }
+
+    /// Whether this record is `ACTIVE` at `now` — replication running, with no
+    /// asynchronous change of its own still owed.
+    ///
+    /// This is the status a command that CHANGES the destination requires: while a
+    /// registration, a configuration change or a stop is still in flight the destination
+    /// is in a transient status, and the change is refused on that status.
+    pub fn active(&self, now: SystemTime) -> bool {
+        self.status(now) == DESTINATION_STATUS_ACTIVE
     }
 
     /// Apply one update of this destination's configuration: the record is `UPDATING`
@@ -4556,6 +4592,30 @@ impl Table {
         self.kinesis_destinations
             .iter_mut()
             .find(|destination| destination.stream_arn == stream_arn && destination.replicating(now))
+    }
+
+    /// The destination record this table holds for the stream that `stream_arn` names,
+    /// mutably, WHATEVER status it is in — `None` only when the table has no record of
+    /// that stream at all.
+    ///
+    /// This is the lookup a command that refuses a destination on its STATUS needs: a
+    /// record it does not see cannot be told apart from one that was never registered.
+    pub fn kinesis_destination_mut(&mut self, stream_arn: &str) -> Option<&mut KinesisDestination> {
+        self.kinesis_destinations
+            .iter_mut()
+            .find(|destination| destination.stream_arn == stream_arn)
+    }
+
+    /// The destination the command addressed, mutably, only while it is `ACTIVE`
+    /// ([`KinesisDestination::active`]) — the status a command that changes a
+    /// destination requires of it.
+    pub fn active_kinesis_destination_mut(
+        &mut self,
+        stream_arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut KinesisDestination> {
+        self.kinesis_destination_mut(stream_arn)
+            .filter(|destination| destination.active(now))
     }
 
     /// Whether this table already holds as many destination records as it keeps and

@@ -223,6 +223,8 @@ mod stack_set_mutations;
 mod stack_status_accepts_an_update;
 #[path = "all/stack_tag_propagation.rs"]
 mod stack_tag_propagation;
+#[path = "all/stack_teardown_events.rs"]
+mod stack_teardown_events;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_stack_set_operation.rs"]

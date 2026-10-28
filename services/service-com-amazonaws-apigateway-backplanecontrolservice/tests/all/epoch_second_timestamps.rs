@@ -220,6 +220,8 @@ async fn every_timestamp_a_deployment_or_stage_reports_is_a_whole_second_epoch_n
 
     let gateway = Gateway::new();
     let (api, _) = create_api(&gateway, "clock-deployments").await;
+    // A deployment is the snapshot of the API's methods, so the API must carry one.
+    crate::rest_api_lifecycle::make_deployable(&gateway, &api).await;
     for (case, stage_name, request) in &cases {
         let created = gateway
             .call(

@@ -387,12 +387,13 @@ async fn an_unknown_identifier_is_a_not_found_and_removes_nothing() {
 
     // A status code the modelled `StatusCode` pattern `^[1-5]\d\d$` does not admit — one
     // past each published bound, and the lengths it refuses — never reaches the records:
-    // the boundary validator refuses it with a 400.
+    // the constraint layer in front of the handler refuses it with a 400, under its own
+    // error class rather than the operation's `BadRequestException`.
     for status in ["099", "600", "000", "999", "20", "2000", "abc"] {
         assert_failure(
             &delete_method_response(&gateway, &api, &resource, "GET", status).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("DeleteMethodResponse({status})"),
         );
     }

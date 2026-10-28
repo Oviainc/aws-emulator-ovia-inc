@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that put the resources back — or delete them — run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.
-        let (stack_id, region, operation_id, provenance, work) = {
+        let (stack_id, region, operation_id, provenance, work, held) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -269,6 +269,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 operation_id,
                 stack.provenance(),
                 work,
+                // The records the stack HOLDS, which is the set a discarding rollback
+                // reports a deletion of.
+                stack.held_resource_ids(),
             )
         };
 
@@ -282,7 +285,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // removed again in the services that own it, re-asked while one of them has not
             // let a resource go yet, exactly as a failed create's own rollback removes it.
             crate::state::RequestedRollback::Discard(resources) => {
-                let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+                let deleted =
+                    crate::state::provisioning::unwind(ctx, &region, &resources, &held).await;
                 let mut store = state.lock();
                 if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
                     // The resources' own transitions come BEFORE the stack's terminal event:

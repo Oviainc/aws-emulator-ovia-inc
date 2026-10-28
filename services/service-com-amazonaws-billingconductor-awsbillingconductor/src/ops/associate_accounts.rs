@@ -197,6 +197,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "The account IDs must be a part of the consolidated billing family during the
+        // current month" — the FIRST of the two preconditions this operation documents,
+        // checked in the order the documentation states them. A billing group groups the
+        // accounts of ONE consolidated billing family, so an account the family does not
+        // hold is not an account this group can bill, whatever the `AccountId` pattern
+        // admits; the decision is the state predicate `CreateBillingGroup`'s linked
+        // accounts are decided by, so family membership is read in one place, and the
+        // refusal is the reason the model enumerates for an account list this service
+        // may not take.
+        for account_id in &input.account_ids {
+            if state.is_outside_billing_family(account_id) {
+                return Err(AssociateAccountsErrorModeled::ValidationException(
+                    crate::state::account_not_in_billing_family("AccountIds", account_id),
+                )
+                .into());
+            }
+        }
+
         // "not already associated with another billing group" — an account belongs to
         // at most one billing group, so an account owned by a DIFFERENT group refuses
         // the request: the input names an account this call may not take, which is

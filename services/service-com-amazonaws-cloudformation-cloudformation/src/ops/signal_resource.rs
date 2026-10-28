@@ -315,7 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             (stack.stack_id.clone(), None)
                         } else {
                             stack.begin_rollback(now, reason);
-                            (stack.stack_id.clone(), Some(stack.current_resources()))
+                            // With the records the stack HOLDS, which is the set the removal
+                            // reports a deletion of.
+                            (
+                                stack.stack_id.clone(),
+                                Some((stack.current_resources(), stack.held_resource_ids())),
+                            )
                         }
                     }
                 }
@@ -325,8 +330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resources the failed create had made are removed again in the services that
         // own them, with the store UNLOCKED: each delete reaches another service's own
         // handler, exactly as the create's did.
-        if let Some(resources) = unwind {
-            let deleted = crate::state::provisioning::unwind(ctx, &region, &resources).await;
+        if let Some((resources, held)) = unwind {
+            let deleted =
+                crate::state::provisioning::unwind(ctx, &region, &resources, &held).await;
             let mut store = state.lock();
             if let Some(stack) = store.resolve_mut(&region, &stack_id) {
                 stack.record_materialised_resources(deleted.resources);

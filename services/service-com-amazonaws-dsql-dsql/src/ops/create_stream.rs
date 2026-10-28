@@ -284,11 +284,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
-                    return Err(CreateStreamErrorModeled::ConflictException(ConflictException {
-                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
-                        resource_id: Some(input.cluster_identifier.clone()),
-                        resource_type: Some("stream".to_string()),
-                    })
+                    // The refusal names the resource this call ADDRESSED — the
+                    // cluster the stream was to be created on — by that cluster's
+                    // own type and own identifier. No stream of this request
+                    // exists to name: the token belongs to another request.
+                    return Err(CreateStreamErrorModeled::ConflictException(
+                        crate::state::ResourceIdentity::cluster(&input.cluster_identifier)
+                            .client_token_mismatch(),
+                    )
                     .into());
                 }
                 crate::state::TokenVerdict::Unused => {}
@@ -310,19 +313,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Each cluster's stream table is bounded for the same reason the cluster
-        // store is; the modelled quota error is the refusal at the ceiling.
+        // store is; the modelled quota error is the refusal at the ceiling. The
+        // quota is the CLUSTER's — it bounds the streams one cluster holds — so the
+        // refusal reports that cluster's own type and identifier.
         if cluster.streams.len() >= crate::state::MAX_STREAMS_PER_CLUSTER {
             return Err(CreateStreamErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
+                crate::state::ResourceIdentity::cluster(&cluster.identifier).quota_exceeded(
+                    format!(
                         "The maximum number of streams ({}) has already been created for this cluster.",
                         crate::state::MAX_STREAMS_PER_CLUSTER
                     ),
-                    resource_id: cluster.identifier.clone(),
-                    resource_type: "stream".to_string(),
-                    service_code: "dsql".to_string(),
-                    quota_code: "streams-per-cluster".to_string(),
-                },
+                    QUOTA_CODE_STREAMS_PER_CLUSTER,
+                ),
             )
             .into());
         }
@@ -369,6 +371,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(created)
     }
 }
+
+/// The `quotaCode` the refusal at a cluster's stream ceiling carries: the quota
+/// bounds how many streams ONE cluster holds.
+const QUOTA_CODE_STREAMS_PER_CLUSTER: &str = "streams-per-cluster";
 
 /// `CreateStreamOutput` read off the persisted stream: every member of the output
 /// is a field of the stored record, so a repeat of an idempotent call renders the

@@ -542,7 +542,7 @@ pub async fn advance_stabilisations(
                 let Some(stack) = store.resolve_mut(region, &stack_id) else {
                     continue;
                 };
-                match readiness {
+                let taken = match readiness {
                     Ok(Readiness::Ready) => {
                         stack.release_stabilisation(&barrier.logical_id, now);
                         None
@@ -583,17 +583,20 @@ pub async fn advance_stabilisations(
                             None
                         }
                     }
-                }
+                };
+                // The records the stack holds are what the rollback takes down and reports
+                // ([`unwind`]), read off the stack under the same lock the resources were.
+                taken.map(|resources| (resources, stack.held_resource_ids()))
             };
             // "ROLLBACK — Roll back the stack creation. This is the default": the resources
             // the failed create had already made are removed again in the services that own
             // them, exactly as `crate::ops::create_stack`'s own failure path removes them,
             // and only a delete one of those services REFUSES changes the status the
             // rollback settles into.
-            let Some(resources) = unwinding else {
+            let Some((resources, held)) = unwinding else {
                 continue;
             };
-            let deleted = unwind(ctx, region, &resources).await;
+            let deleted = unwind(ctx, region, &resources, &held).await;
             let mut store = state.lock();
             let Some(stack) = store.resolve_mut(region, &stack_id) else {
                 continue;
@@ -1079,7 +1082,13 @@ pub async fn reconcile(
         outcome.resources.extend(replaced);
         return outcome;
     }
-    let deleted = delete(ctx, region, &replaced).await;
+    // The stack held every one of these records before this deployment stopped recording
+    // it, so each one's removal is reported.
+    let held: BTreeSet<String> = replaced
+        .iter()
+        .map(|resource| resource.logical_id.clone())
+        .collect();
+    let deleted = delete(ctx, region, &replaced, &held).await;
     // A resource an owning service refused to delete still exists there, so the stack
     // keeps its record: the deployment failed, and a later deletion is what has to delete
     // it. The ones that were deleted carry `materialised = false` and are not kept.
@@ -1300,18 +1309,23 @@ pub struct Deleted {
 /// resource the service no longer has is a success: the request asks for a state the
 /// service is already in.
 ///
-/// Each resource this really deletes is recorded as the pair of transitions it went through
-/// ([`Deleted::transitions`]), which is what names the resource a deletion failed on. A
-/// record NO owning service holds a resource for — one of a type this emulator provisions
-/// nowhere, one whose create was refused, one a failed deployment never reached — has no
-/// deletion to go through: nothing is asked of anybody and the stack simply drops the
-/// record, so nothing is recorded for it either.
+/// `held` is the logical ids the stack HOLDS a record of
+/// ([`super::StoredStack::held_resource_ids`]) — the resources this teardown is responsible
+/// for. Every one of them goes through its deletion and is recorded as the pair of
+/// transitions it went through ([`Deleted::transitions`]), which is what names the resource
+/// a deletion failed on and what makes the teardown's order observable: a resource of a type
+/// this emulator provisions NOWHERE has no owning service to ask, so nothing is asked of
+/// anybody, but the stack owned the record and its removal is reported exactly as any other
+/// resource's is. A record the stack does NOT hold — one whose create an owning service
+/// refused, one a failed deployment never reached — has nothing to remove and is recorded
+/// nowhere.
 pub async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resources: &[StoredResource],
+    held: &BTreeSet<String>,
 ) -> Deleted {
-    delete_pass(ctx, region, resources, &mut BTreeSet::new()).await
+    delete_pass(ctx, region, resources, held, &mut BTreeSet::new()).await
 }
 
 /// One pass of [`delete`] over the set, recording what it transitioned.
@@ -1326,6 +1340,7 @@ async fn delete_pass(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resources: &[StoredResource],
+    held: &BTreeSet<String>,
     opened: &mut BTreeSet<String>,
 ) -> Deleted {
     let mut outcome = Deleted {
@@ -1336,19 +1351,32 @@ async fn delete_pass(
     // Newest first, over the indices of the set being reported back, so each resource's
     // record is updated in place as its deletion succeeds.
     for index in (0..outcome.resources.len()).rev() {
-        // Nothing was created for a declared-only resource, so there is nothing to
-        // delete.
-        if !outcome.resources[index].materialised {
-            continue;
-        }
         let resource = &outcome.resources[index];
+        // Which service is asked to delete the resource. `None` is a type this emulator
+        // provisions nowhere: there is no API to call for it.
+        let owner = provisioner_for(&resource.resource_type);
+        if !resource.materialised {
+            // Nothing exists in any owning service for this resource, so nothing is asked
+            // of anybody. The stack still HELD the record, though, and its teardown is
+            // reported exactly as every other resource's is — whether an owning service
+            // had one to delete is not something a stack's event stream says. Two records
+            // have no teardown at all: one whose create an owning service refused or never
+            // reached (the stack does not hold it), and one an earlier pass of this same
+            // walk already took down.
+            if owner.is_some()
+                || !held.contains(&resource.logical_id)
+                || opened.contains(&resource.logical_id)
+            {
+                continue;
+            }
+        }
         if opened.insert(resource.logical_id.clone()) {
             outcome.transitions.push(ResourceTransition::starting(
                 resource,
                 super::resource_status::DELETE_IN_PROGRESS,
             ));
         }
-        let deleted = match provisioner_for(&resource.resource_type) {
+        let deleted = match owner {
             Some(provisioner) => provisioner.delete(ctx, region, resource).await,
             None => Ok(()),
         };
@@ -1409,16 +1437,20 @@ const UNWIND_RETRY_DELAY: ::std::time::Duration = ::std::time::Duration::from_mi
 /// LAST attempt answered: a refusal that outlives the bound above is the rollback's own
 /// failure, reported on the stack rather than passed off as a rollback that removed what
 /// it did not.
+///
+/// `held` is the set [`delete`] documents: the records the stack holds, which is what this
+/// takes down and reports.
 pub async fn unwind(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resources: &[StoredResource],
+    held: &BTreeSet<String>,
 ) -> Deleted {
     // The deletions already opened, carried across the attempts: a re-ask of one still in
     // flight does not open it again, and one a stopped pass never reached is opened by the
     // pass that does reach it.
     let mut opened = BTreeSet::new();
-    let mut outcome = delete_pass(ctx, region, resources, &mut opened).await;
+    let mut outcome = delete_pass(ctx, region, resources, held, &mut opened).await;
     for _ in 1..UNWIND_ATTEMPTS {
         if outcome.failure.is_none() {
             break;
@@ -1437,7 +1469,7 @@ pub async fn unwind(
                     transition.status != super::resource_status::DELETE_FAILED
                 })
                 .collect();
-        outcome = delete_pass(ctx, region, &remaining, &mut opened).await;
+        outcome = delete_pass(ctx, region, &remaining, held, &mut opened).await;
         transitioned.append(&mut outcome.transitions);
         outcome.transitions = transitioned;
     }

@@ -1028,7 +1028,8 @@ pub struct BenefitApplication {
     pub benefit_id: String,
     pub name: Option<String>,
     pub description: Option<String>,
-    /// `FulfillmentType` values, as requested on the create.
+    /// `FulfillmentType` values, as requested on the create — each distinct value once,
+    /// in the order the create first named it (see [`distinct_values`]).
     pub fulfillment_types: Vec<String>,
     pub benefit_application_details: Option<Document>,
     /// The partner programs this application belongs to: the programs of the benefit it
@@ -1066,6 +1067,11 @@ pub struct BenefitApplication {
     /// submission makes the application recallable again, at which point the token no
     /// longer matches a recall in effect.
     pub recall_client_token: Option<SpentToken>,
+    /// The AWS resources this application is linked to, as a SET: each distinct ARN once,
+    /// in the order it was first stored, whether by the create (see [`distinct_values`])
+    /// or by `AssociateBenefitApplicationResource`. At most
+    /// [`MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] of them, which is therefore a count of
+    /// distinct resources.
     pub associated_resources: Vec<String>,
     pub partner_contacts: Vec<Contact>,
     pub file_details: Vec<FileDetail>,
@@ -2637,6 +2643,33 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState>)
+}
+
+/// A caller-supplied list of IDENTITIES, as the store keeps it: each distinct value once,
+/// in the order the request first named it.
+///
+/// An application's `AssociatedResources` (resource ARNs) and `FulfillmentTypes`
+/// (`FulfillmentType` enum values) are lists whose elements are identities, so membership
+/// is the whole of what one carries: naming the same resource or the same fulfillment type
+/// twice says nothing a single entry does not. The service itself maintains them that way —
+/// `AssociateBenefitApplicationResource` adds an ARN the record already carries exactly
+/// zero times, `DisassociateBenefitApplicationResource` removes the resource the request
+/// names, and [`MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] bounds how many resources one
+/// application is LINKED to — so the create stores the set its list denotes rather than the
+/// repetitions it was written with, and every read, filter and bound then counts distinct
+/// values whichever path stored them.
+///
+/// Order is first appearance, not sorted: the stored list keeps the order the caller gave,
+/// exactly as [`BenefitApplication::associated_resources`] keeps the order associations
+/// were added in.
+pub fn distinct_values(values: Option<Vec<String>>) -> Vec<String> {
+    let mut distinct: Vec<String> = Vec::new();
+    for value in values.unwrap_or_default() {
+        if !distinct.contains(&value) {
+            distinct.push(value);
+        }
+    }
+    distinct
 }
 
 /// The tags a create supplied, as the store keeps them.

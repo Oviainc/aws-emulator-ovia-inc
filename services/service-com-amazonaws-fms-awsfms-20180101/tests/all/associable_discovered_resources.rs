@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::administrator_gated_operations::{associate_admin, with_store};
 use crate::discovered_resources::{
-    api_gateway_created, ec2_ok, element, emulator, every_uri, p,
+    api_gateway_created, api_gateway_method_on_root, ec2_ok, element, emulator, every_uri, p,
 };
 use crate::policy_lifecycle::{call, emulator_with_engine, error_code, ACCOUNT, REGION};
 
@@ -113,16 +113,19 @@ async fn every_discovered_resource_is_associable() {
     // --- the resources, each created through the service that OWNS it --------
     let distribution_uri = create_distribution(&router, "fms-associable-distribution").await;
 
-    let api = api_gateway_created(
+    let created_api = api_gateway_created(
         "rest api",
         &router,
         "/restapis",
         json!({ "name": "fms-associable-api" }),
     )
-    .await["id"]
+    .await;
+    let api = created_api["id"]
         .as_str()
         .expect("a minted REST API id")
         .to_string();
+    // A deployment is the snapshot of the API's methods, so the API must carry one.
+    api_gateway_method_on_root(&router, &api, &created_api).await;
     api_gateway_created(
         "stage",
         &router,
