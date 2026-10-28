@@ -2710,6 +2710,18 @@ pub struct AutomatedReasoningPolicyTestCaseRecord {
     pub created_at: SystemTime,
     /// When the test was last written. The creation instant until an update rewrites it.
     pub updated_at: SystemTime,
+    /// The `clientRequestToken` the write this test currently holds was made under, when
+    /// that write was an UPDATE that carried one, and `None` while the test still holds
+    /// what the create wrote.
+    ///
+    /// `UpdateAutomatedReasoningPolicyTestCase$clientRequestToken` is an
+    /// `@idempotencyToken` whose purpose is that "the operation completes no more than one
+    /// time", so the token that produced the current write is kept WITH that write: a
+    /// retried update carries it beside the `lastUpdatedAt` the retried request was built
+    /// from, which the landed write has already moved past. Holding it here — rather than
+    /// in a map beside the store — is what lets the retry be recognised and ignored, and
+    /// makes the token go with the test when the test is deleted.
+    pub update_client_request_token: Option<String>,
 }
 
 /// `AutomatedReasoningPolicyTestRunStatus$SCHEDULED` — the status a test run that a test

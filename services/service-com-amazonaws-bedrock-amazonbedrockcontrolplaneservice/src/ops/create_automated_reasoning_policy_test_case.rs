@@ -233,6 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             confidence_threshold: input.confidence_threshold,
             created_at: now,
             updated_at: now,
+            // The write this test holds is the create's, which is replayed through
+            // `automated_reasoning_policy_test_case_create_tokens` rather than through the
+            // record: the token an UPDATE lands under is the one kept here.
+            update_client_request_token: None,
         };
         if let Some(token) = input.client_request_token {
             store

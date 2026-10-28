@@ -190,9 +190,11 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             body: Some(json!({
                 "guardContent": "All returns are accepted within 30 days.",
                 "expectedAggregatedFindingsResult": "VALID",
-                // Epoch seconds: the form this member's codec reads off the body here.
-                // The row is about the threshold's clause, so it carries the timestamp in
-                // the form that reaches the constraint walk rather than asserting one.
+                // Epoch seconds: a JSON number is read as epoch seconds whatever format
+                // the member declares, so the row carries the timestamp in a form that
+                // reaches the constraint walk rather than asserting the wire form (the
+                // modelled `date-time` string is read too — see
+                // `types/update_automated_reasoning_policy_test_case_types.rs`).
                 "lastUpdatedAt": 1_767_225_600_i64,
                 "confidenceThreshold": 2,
             })),
