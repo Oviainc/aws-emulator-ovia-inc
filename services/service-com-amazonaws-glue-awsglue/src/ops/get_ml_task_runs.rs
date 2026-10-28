@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMLTaskRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMLTaskRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMLTaskRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the task runs of ONE machine learning transform, one bounded page at a time:
+//! "Gets a list of runs for a machine learning transform… You can get a sortable,
+//! filterable list of machine learning task runs by calling GetMLTaskRuns with their
+//! parent transform's TransformID and other optional parameters… This operation returns a
+//! list of historic runs and must be paginated." The `Filter` criteria narrow the listing
+//! to the runs that satisfy every criterion they name, the `Sort` criteria order it by one
+//! of the run's own properties, and each element is the whole stored run, so a client that
+//! works from the listing is never less informed than one that re-reads each run.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +86,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `PageSize`, whose range
+/// is 1..1000.
+const MAX_PAGE_SIZE: i32 = 1_000;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +162,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMLTaskRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMLTaskRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMLTaskRuns"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(GetMLTaskRunsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the Glue machine learning transform store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`PageSize`, range 1..1000). The clamp re-states that range in the handler so the
+        // page size is never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `TransformId` is `@required` with `length 1..255`, so an absent or over-long one
+        // is refused at the boundary: reaching here, the only question is whether this
+        // account holds the transform whose runs are asked for. A transform's runs are held
+        // ON that transform, so an id this account holds no transform under addresses no run
+        // history at all and is refused rather than answered with an empty listing.
+        let Some(transform) = store.ml_transforms.get_mut(&input.transform_id) else {
+            return Err(GetMLTaskRunsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::ml_transform_not_found(
+                        &input.transform_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only write a read makes: the status changes the clock had already made due,
+        // which were owed at the same instant whether or not anybody listed the runs. It
+        // happens BEFORE the filter is applied, so a run the clock has already finished is
+        // selected on the status it really stands in.
+        transform.settle_due_task_runs(now);
+
+        // Which runs the filter admits and what order they come in is the transform's own
+        // selection, so every listing of its runs agrees about both.
+        let ordered = transform.task_runs_in_order(input.filter.as_ref(), input.sort.as_ref());
+        let descending = input
+            .sort
+            .as_ref()
+            .is_some_and(|sort| sort.sort_direction == crate::state::SORT_DIRECTION_DESCENDING);
+
+        // The token is the ordering key of the last run of the previous page, so this page
+        // resumes at the first run ordered strictly after it — which stays correct across
+        // runs started or dropped between two calls. A token this service never issued
+        // names a place in that same order rather than earning a refusal, exactly as this
+        // crate's sibling listings resolve a cursor.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|(key, _)| {
+                if descending {
+                    key.as_str() >= cursor
+                } else {
+                    key.as_str() <= cursor
+                }
+            }),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        // `get` rather than an index, so no arithmetic on a request-derived page size can
+        // slice out of range.
+        let page = ordered.get(start..end).unwrap_or_default();
+
+        Ok(GetMLTaskRunsOutput {
+            // "A list of task runs that are associated with the transform": element for
+            // element the whole stored run, which is the projection a single-run read
+            // serves too.
+            task_runs: Some(page.iter().map(|(_, run)| run.to_task_run()).collect()),
+            // The token names the last entry of the page, taken from the page itself so
+            // there is no index arithmetic to underflow on an empty page, and is absent
+            // once the page reaches the end of the listing — "a pagination token, if more
+            // results are available".
+            next_token: if end < ordered.len() {
+                page.last().map(|(key, _)| key.clone())
+            } else {
+                None
+            },
+        })
     }
 }

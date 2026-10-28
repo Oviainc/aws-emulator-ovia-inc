@@ -8,13 +8,14 @@
 //! them. What is asserted is the RULE each operation follows over a SET of inputs, not
 //! one recorded request:
 //!
-//! * a create whose `FromEmailAddress` is not an identity this account has verified is
-//!   refused `FromEmailAddressNotVerified` and persists NOTHING — the following
+//! * a create whose `FromEmailAddress` is an address this account has no identity
+//!   for is refused `FromEmailAddressNotVerified` and persists NOTHING — the following
 //!   `GetCustomVerificationEmailTemplate` for that name reports the template does not
-//!   exist — while the identical call differing only in the sender's verification state
-//!   succeeds and reads back. What decides it is the STATE the identity list holds for
-//!   the sender, not the sender's presence in it: an identity whose verification has not
-//!   succeeded is refused exactly as an absent one is;
+//!   exist — while the identical call differing only in that identity's presence
+//!   succeeds and reads back. What decides it is whether the identity list holds the
+//!   sender at all, not the state it holds for it: RECORDING a template asks only that
+//!   the account have asked SES about the address, so a verification that has not
+//!   succeeded carries one, and whether it succeeded is read where a message is sent;
 //! * an accepted create stores every member the request carried, and
 //!   `GetCustomVerificationEmailTemplate` reports each of them unchanged;
 //! * creating is not replacing: a name the store already holds is refused
@@ -314,8 +315,8 @@ async fn an_unverified_sender_is_refused_and_leaves_nothing_behind() {
         assert_absent(&router, case, name).await;
 
         // The positive control: the SAME call once the sender is an identity of this
-        // account. Only the sender's verification state differs, and now it lands
-        // and reads back.
+        // account. Only the identity's presence differs, and now it lands and reads
+        // back.
         verify_email_identity(&router, &engine, sender).await;
         let (status, body) = create(&router, &template).await;
         assert_eq!(
@@ -327,10 +328,10 @@ async fn an_unverified_sender_is_refused_and_leaves_nothing_behind() {
 }
 
 #[tokio::test]
-async fn a_sender_whose_verification_has_not_succeeded_is_refused_like_an_absent_one() {
+async fn a_sender_the_account_holds_an_identity_for_is_accepted_in_every_state() {
     // The identity list is seeded through this service's own store, because what this
-    // rule reads is the identity's VERIFICATION STATUS and the v1 verify operations
-    // record only one of that enum's values today.
+    // rule reads is the identity's PRESENCE whatever its verification status, and the
+    // v1 verify operations record only one of that enum's values today.
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_over(Arc::clone(&engine));
     // One row per value of the stored status enum (`state::VerificationStatus`), so the
@@ -388,36 +389,39 @@ async fn a_sender_whose_verification_has_not_succeeded_is_refused_like_an_absent
     }
 
     // Every row names an identity this account HOLDS, differing only in the state the
-    // list holds for it; only the one whose verification has succeeded may be a
-    // template's sender.
+    // list holds for it; each one carries a template, because recording one asks only
+    // that the identity exist.
     for (case, address, status) in seeded {
         let template = Template::new(
             &format!("verify-from-{}", status.as_wire()),
             address,
         );
         let (http_status, body) = create(&router, &template).await;
-        if *status == VerificationStatus::Success {
-            assert_eq!(
-                http_status, 200,
-                "case {case:?}: expected 200 for a verified sender, got {http_status} with {body}"
-            );
-            assert_stored(&router, case, &template).await;
-            continue;
-        }
         assert_eq!(
-            http_status, 400,
-            "case {case:?}: expected 400, got {http_status} with {body}"
+            http_status, 200,
+            "case {case:?}: expected 200 for an address this account holds an identity for, got \
+             {http_status} with {body}"
         );
-        assert_eq!(
-            (code(&body).as_str(), message(&body).as_str()),
-            (
-                "FromEmailAddressNotVerified",
-                format!("From email address <{address}> is not verified.").as_str()
-            ),
-            "case {case:?}: expected the unverified-sender refusal, got {body}"
-        );
-        assert_absent(&router, case, &template.name).await;
+        assert_stored(&router, case, &template).await;
     }
+
+    // The counterpart, on the same store: an address NO identity covers is refused,
+    // so the gate is about presence rather than about nothing at all.
+    let absent = Template::new("verify-from-no-identity", "nobody@example.org");
+    let (http_status, body) = create(&router, &absent).await;
+    assert_eq!(
+        http_status, 400,
+        "case an address with no identity: expected 400, got {http_status} with {body}"
+    );
+    assert_eq!(
+        (code(&body).as_str(), message(&body).as_str()),
+        (
+            "FromEmailAddressNotVerified",
+            "From email address <nobody@example.org> is not verified."
+        ),
+        "case an address with no identity: expected the unverified-sender refusal, got {body}"
+    );
+    assert_absent(&router, "an address with no identity", &absent.name).await;
 }
 
 #[tokio::test]

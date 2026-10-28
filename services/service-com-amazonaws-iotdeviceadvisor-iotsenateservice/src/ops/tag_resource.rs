@@ -134,22 +134,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // The resource the request NAMED, exactly as it named it — a `resourceArn` this
+        // service does not mint is still what the attempt was addressed to — so every path
+        // out of this handler leaves exactly one audit record.
+        let mut trail = crate::state::AuditedCall::attempt(
+            Self::NAME,
+            ctx.parts(),
+            &region,
+            &input.resource_arn,
+        );
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            TagResourceErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
-            })
+            trail.refused(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            ))
         })?;
 
         // A `resourceArn` that is not one of this service's ARNs is a bad REQUEST, not a
         // missing resource: it is refused with the modelled client-input error before
         // anything is looked up or written.
         let resource = crate::state::parse_resource_arn(&input.resource_arn).map_err(|message| {
-            TagResourceErrorModeled::ValidationException(ValidationException {
-                message: Some(message),
-            })
+            trail.refused(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.into_iter().collect();
         let mut store = state.lock();
@@ -159,15 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the input member that identified it — the same wording every other lookup
         // in this crate answers with.
         if !store.holds_tagged_resource(&input.resource_arn, &resource) {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
+            return Err(trail.refused(
+                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(crate::state::not_found_message(
                         "resourceArn",
                         &input.resource_arn,
                     )),
-                },
-            )
-            .into());
+                })
+                .into(),
+            ));
         }
 
         // The per-resource tag limit: a merge that would leave the resource holding more
@@ -177,23 +191,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             crate::state::MAX_TAGS_PER_RESOURCE,
         ) {
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "Cannot attach {would_hold} tags to {}: a resource holds at most {} tags",
-                    input.resource_arn,
-                    crate::state::MAX_TAGS_PER_RESOURCE
-                )),
-            })
-            .into());
+            return Err(trail.refused(
+                TagResourceErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Cannot attach {would_hold} tags to {}: a resource holds at most {} tags",
+                        input.resource_arn,
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                })
+                .into(),
+            ));
         }
 
-        crate::state::audit(
-            Self::NAME,
-            ctx.parts(),
-            &region,
-            &input.resource_arn,
-            "tagged",
-        );
+        trail.ended("tagged");
         Ok(TagResourceOutput {})
     }
 }

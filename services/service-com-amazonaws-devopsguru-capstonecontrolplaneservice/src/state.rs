@@ -2183,6 +2183,33 @@ pub struct ResourceCoverage {
 /// account covering a second, different key.
 pub const APP_BOUNDARY_KEYS_PER_ACCOUNT: usize = 1;
 
+/// The prefix a tag key must carry to define DevOps Guru analysis coverage.
+///
+/// Another of DevOps Guru's own rules that the model states only in documentation (the
+/// `AppBoundaryKey` pattern admits any tag key):
+/// `smithy_query(query="doc",shape="UpdateTagCollectionFilter",member="AppBoundaryKey")`
+/// says "the string used for a key in a tag that you use to define your resource
+/// coverage must begin with the prefix Devops-guru-", so a key without it cannot
+/// become the account's analysis boundary and [`defines_analysis_boundary`] is what
+/// decides that.
+pub const APP_BOUNDARY_KEY_PREFIX: &str = "Devops-guru-";
+
+/// Whether `key` may define analysis coverage: whether it begins with
+/// [`APP_BOUNDARY_KEY_PREFIX`], compared WITHOUT case.
+///
+/// The prefix is case-insensitive while the key itself is not: the same documentation
+/// says "when you create a key, the case of characters in the key can be whatever you
+/// choose. After you create a key, it is case-sensitive", and gives both
+/// `DevOps-Guru-deployment-application` and `devops-guru-rds-application` as keys that
+/// define coverage. So the prefix admits either, and the two remain DIFFERENT keys once
+/// created — which is why the store compares whole keys exactly
+/// ([`ResourceCoverage::selects_tagged`]) even though this check ignores case.
+pub fn defines_analysis_boundary(key: &str) -> bool {
+    let prefix_chars = APP_BOUNDARY_KEY_PREFIX.chars().count();
+    let candidate: String = key.chars().take(prefix_chars).collect();
+    candidate.eq_ignore_ascii_case(APP_BOUNDARY_KEY_PREFIX)
+}
+
 impl ResourceCoverage {
     /// The resources a wire `ResourceCollection` names, as the SET form this store keeps
     /// coverage in.

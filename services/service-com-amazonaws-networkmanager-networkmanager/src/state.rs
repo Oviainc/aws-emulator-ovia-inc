@@ -456,6 +456,26 @@ fn kind_label(kind: &str) -> String {
     }
 }
 
+/// What an OPTIONAL reference member of a request names: the id it carries, or `None`
+/// when it names no resource at all.
+///
+/// Every id shape of this service is modelled `len 0..50` over `^[\s\S]*$`
+/// (`smithy_query query="shape" shape="SiteId"`), so the empty string satisfies the
+/// constraint walk and reaches the handler. On a member that is OPTIONAL the empty string
+/// is the ABSENCE of the reference — the spelling the service documents for giving no
+/// value ("To remove information for any of the parameters, specify an empty string",
+/// `smithy_query query="doc" shape="UpdateDevice"`) — and not a reference to a resource
+/// whose id is the empty string, which nothing can ever be stored under. So it resolves
+/// nothing, is never refused as unresolvable, and is held as none, exactly as the omitted
+/// member is: that keeps every stored record's references either naming a resource of the
+/// same global network or naming nothing at all.
+///
+/// A REQUIRED reference is not passed through here: it must name a resource, so the empty
+/// string stays the unresolvable reference its own refusal reports.
+pub fn optional_reference<Id: AsRef<str>>(supplied: Option<Id>) -> Option<Id> {
+    supplied.filter(|id| !id.as_ref().is_empty())
+}
+
 /// The modelled `ValidationException` (HTTP 400) a create answers when one of the
 /// references its input carries — the parent the new resource must hang off — names no
 /// stored resource.

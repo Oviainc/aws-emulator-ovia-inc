@@ -92,10 +92,12 @@
 //!   with a verified signature rather than with a second check written into this service.
 //!
 //! What the data plane resolves, and what it answers for an integration it cannot perform,
-//! is [`invoke`]'s own documentation.
+//! is [`invoke`]'s own documentation; the api's own resource policy, which every invoke is
+//! decided against, is [`resource_policy`]'s.
 
 pub mod invoke;
 pub mod query_coercion;
+pub mod resource_policy;
 mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};

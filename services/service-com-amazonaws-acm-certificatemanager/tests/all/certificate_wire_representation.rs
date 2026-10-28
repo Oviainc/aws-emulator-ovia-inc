@@ -350,9 +350,12 @@ async fn extended_key_usages_report_a_name_and_an_object_identifier() {
             &[("CUSTOM", "1.3.6.1.4.1.311.10.3.4")],
         ),
         (
+            // No extension at all: the absence is itself an `ExtendedKeyUsageName` — the
+            // sentinel the model declares beside the real purposes — and it names no
+            // extension value, so its identifier is empty.
             "no extended key usage extension",
             &[],
-            &[],
+            &[("NONE", "")],
         ),
     ];
 
@@ -374,6 +377,19 @@ async fn extended_key_usages_report_a_name_and_an_object_identifier() {
             reported, wanted,
             "case {case:?}: expected the purposes the certificate asserts, got {detail}"
         );
+        // The sentinel stands for an extension the certificate does not carry, so its
+        // `OID` is reported as the empty identifier rather than left out.
+        for (index, (name, _)) in wanted.iter().enumerate() {
+            if name == "NONE" {
+                let oid = detail["ExtendedKeyUsages"][index]["OID"].as_str();
+                assert_eq!(
+                    oid,
+                    Some(""),
+                    "case {case:?}: the sentinel names no extension value, so its OID is \
+                     the empty identifier, got {oid:?}"
+                );
+            }
+        }
 
         // The summary of the same certificate carries the NAMES alone — the member is
         // a list of `ExtendedKeyUsageName` — and they are the names of those very

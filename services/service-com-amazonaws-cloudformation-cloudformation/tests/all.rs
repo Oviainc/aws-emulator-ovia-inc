@@ -223,6 +223,8 @@ mod stack_status_accepts_an_update;
 mod stack_tag_propagation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_stack_set_operation.rs"]
+mod stop_stack_set_operation;
 #[path = "all/template_by_reference.rs"]
 mod template_by_reference;
 #[path = "all/template_outputs.rs"]

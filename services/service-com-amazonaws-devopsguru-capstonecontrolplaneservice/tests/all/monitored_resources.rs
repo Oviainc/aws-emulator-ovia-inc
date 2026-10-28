@@ -295,11 +295,11 @@ async fn monitored_resources_are_the_persisted_coverage() {
         ),
         (
             "stacks and tags covered together, stacks first",
-            &[("ADD", &["s2", "s1"], &[("boundary", &["v"])])],
+            &[("ADD", &["s2", "s1"], &[("Devops-guru-boundary", &["v"])])],
             &[
                 Expect::Stack("s1", Some("s1")),
                 Expect::Stack("s2", Some("s2")),
-                Expect::Tag("boundary", "v", Some("v")),
+                Expect::Tag("Devops-guru-boundary", "v", Some("v")),
             ],
         ),
         (
@@ -313,10 +313,10 @@ async fn monitored_resources_are_the_persisted_coverage() {
         (
             "the same tag value added by two requests is one resource",
             &[
-                ("ADD", &[], &[("boundary", &["only"])]),
-                ("ADD", &[], &[("boundary", &["only"])]),
+                ("ADD", &[], &[("Devops-guru-boundary", &["only"])]),
+                ("ADD", &[], &[("Devops-guru-boundary", &["only"])]),
             ],
-            &[Expect::Tag("boundary", "only", Some("only"))],
+            &[Expect::Tag("Devops-guru-boundary", "only", Some("only"))],
         ),
         (
             // `TagValue` admits `\p{Z}`, `=`, `:`, `+` and `@`, none of which
@@ -326,22 +326,22 @@ async fn monitored_resources_are_the_persisted_coverage() {
             &[(
                 "ADD",
                 &[],
-                &[("boundary", &["two words", "team=payments", "ops@example"])],
+                &[("Devops-guru-boundary", &["two words", "team=payments", "ops@example"])],
             )],
             &[
-                Expect::Tag("boundary", "ops@example", None),
-                Expect::Tag("boundary", "team=payments", None),
-                Expect::Tag("boundary", "two words", None),
+                Expect::Tag("Devops-guru-boundary", "ops@example", None),
+                Expect::Tag("Devops-guru-boundary", "team=payments", None),
+                Expect::Tag("Devops-guru-boundary", "two words", None),
             ],
         ),
         (
             // The `*` wildcard alternative of `TagValue`, which
             // `MonitoredResourceName` does not admit either.
             "the wildcard tag value",
-            &[("ADD", &[], &[("boundary", &["*", "named"])])],
+            &[("ADD", &[], &[("Devops-guru-boundary", &["*", "named"])])],
             &[
-                Expect::Tag("boundary", "*", None),
-                Expect::Tag("boundary", "named", Some("named")),
+                Expect::Tag("Devops-guru-boundary", "*", None),
+                Expect::Tag("Devops-guru-boundary", "named", Some("named")),
             ],
         ),
         (
@@ -349,8 +349,8 @@ async fn monitored_resources_are_the_persisted_coverage() {
             // admits every one of those but `#`, so a covered value can carry the
             // other four.
             "a covered value spelled with the punctuation both patterns admit",
-            &[("ADD", &[], &[("boundary", &["a.b-c_d/e"])])],
-            &[Expect::Tag("boundary", "a.b-c_d/e", Some("a.b-c_d/e"))],
+            &[("ADD", &[], &[("Devops-guru-boundary", &["a.b-c_d/e"])])],
+            &[Expect::Tag("Devops-guru-boundary", "a.b-c_d/e", Some("a.b-c_d/e"))],
         ),
     ];
 
@@ -403,13 +403,13 @@ async fn filters_select_by_permission_and_resource_type() {
     cover(
         &emulator,
         "two stacks and one tag value",
-        &[("ADD", &["checkout", "payments"], &[("boundary", &["prod"])])],
+        &[("ADD", &["checkout", "payments"], &[("Devops-guru-boundary", &["prod"])])],
     )
     .await;
     let everything: Vec<Reported> = [
         Expect::Stack("checkout", Some("checkout")),
         Expect::Stack("payments", Some("payments")),
-        Expect::Tag("boundary", "prod", Some("prod")),
+        Expect::Tag("Devops-guru-boundary", "prod", Some("prod")),
     ]
     .iter()
     .map(Expect::reported)
@@ -570,7 +570,7 @@ async fn a_walk_reports_every_monitored_resource_exactly_once() {
         &[(
             "ADD",
             &["alpha", "beta", "delta", "epsilon", "gamma"],
-            &[("boundary", &["prod", "staging"])],
+            &[("Devops-guru-boundary", &["prod", "staging"])],
         )],
     )
     .await;
@@ -580,8 +580,8 @@ async fn a_walk_reports_every_monitored_resource_exactly_once() {
         Expect::Stack("delta", Some("delta")),
         Expect::Stack("epsilon", Some("epsilon")),
         Expect::Stack("gamma", Some("gamma")),
-        Expect::Tag("boundary", "prod", Some("prod")),
-        Expect::Tag("boundary", "staging", Some("staging")),
+        Expect::Tag("Devops-guru-boundary", "prod", Some("prod")),
+        Expect::Tag("Devops-guru-boundary", "staging", Some("staging")),
     ]
     .iter()
     .map(Expect::reported)
@@ -750,7 +750,7 @@ async fn listing_monitored_resources_changes_nothing() {
     cover(
         &emulator,
         "stacks and tags",
-        &[("ADD", &["one", "two"], &[("boundary", &["prod"])])],
+        &[("ADD", &["one", "two"], &[("Devops-guru-boundary", &["prod"])])],
     )
     .await;
 

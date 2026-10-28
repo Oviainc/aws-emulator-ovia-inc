@@ -25,12 +25,14 @@
 //! ([`MaintenanceStartTime`], [`BandwidthRateLimitInterval`]) rather than mirroring
 //! them, so a member cannot drift between what is stored and what is serialised.
 //!
-//! The gateway's MAINTENANCE WINDOW ([`StoredGateway::maintenance_start_time`]) is written
-//! by `PutMaintenanceStartTime` and by nothing else
+//! The gateway's MAINTENANCE WINDOW ([`StoredGateway::maintenance_start_time`]) is part of
+//! every gateway record from the moment the gateway is activated: the create gives it the
+//! default window ([`default_maintenance_start_time`]), so the field is NOT optional and a
+//! read of any gateway always reports one. `PutMaintenanceStartTime` is what CHANGES it
 //! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::set_maintenance_start_time`]),
 //! and `GetGateway` reports whatever that field holds: a window is one resource, so a put
 //! REPLACES it whole rather than merging into it, and every reader of the record agrees on
-//! the window the last put wrote.
+//! the window the last write left.
 //!
 //! The second resource this store owns is the **hypervisor** ([`StoredHypervisor`]),
 //! keyed by its own ARN: `GetHypervisor` resolves it out of that map and reports the
@@ -382,6 +384,51 @@ pub const GATEWAY_UPDATED_SOFTWARE_VERSION: &str = "2-0-1";
 /// against it ([`StoredGateway::software_version_as_of`]).
 pub const GATEWAY_SOFTWARE_UPDATE_INSTALLS_AFTER: Duration = Duration::from_millis(500);
 
+/// `MaintenanceStartTime$DayOfWeek` of the window a gateway is activated with.
+///
+/// An appliance has a weekly maintenance window for as long as it exists:
+/// `GatewayDetails$MaintenanceStartTime` "Returns your gateway's weekly maintenance start
+/// time including the day and time of the week"
+/// (`smithy_query(query="shape",shape="GatewayDetails")`), and `PutMaintenanceStartTime`
+/// "Set the maintenance start time for a gateway"
+/// (`smithy_query(query="operation",operation="PutMaintenanceStartTime")`) — it overrides
+/// the window the appliance already has rather than giving it its first one. So the window
+/// is assigned when the gateway is activated ([`default_maintenance_start_time`]) and a
+/// read reports one for a gateway no put has ever touched.
+///
+/// WHICH window that is, is CHOSEN — like [`GATEWAY_SOFTWARE_VERSION`], AWS publishes no
+/// value for it. It is a WEEKLY window, the form the member's own documentation names (the
+/// shape can hold a weekly or a monthly one, so a default has to pick a form), and it falls
+/// in the quiet hours of the week, which is what an appliance maintenance window is for.
+/// `DayOfWeek` is "an ordinal number between 0 and 6 … where 0 represents Sunday", so this
+/// is Sunday, and every default member below is inside its published range
+/// (`DayOfWeek` 0..6, `HourOfDay` 0..23, `MinuteOfHour` 0..59).
+pub const DEFAULT_MAINTENANCE_DAY_OF_WEEK: i32 = 0;
+
+/// `MaintenanceStartTime$HourOfDay` of the window a gateway is activated with. See
+/// [`DEFAULT_MAINTENANCE_DAY_OF_WEEK`].
+pub const DEFAULT_MAINTENANCE_HOUR_OF_DAY: i32 = 3;
+
+/// `MaintenanceStartTime$MinuteOfHour` of the window a gateway is activated with. See
+/// [`DEFAULT_MAINTENANCE_DAY_OF_WEEK`].
+pub const DEFAULT_MAINTENANCE_MINUTE_OF_HOUR: i32 = 0;
+
+/// The maintenance window a gateway is activated with, as the MODELLED shape — the one
+/// [`StoredGateway::maintenance_start_time`] holds until a put replaces it.
+///
+/// `DayOfMonth` is absent because the window is weekly: the two day members are
+/// alternatives (see [`MAINTENANCE_START_TIME_INVALID`]), so a weekly window carries
+/// `DayOfWeek` and nothing else. See [`DEFAULT_MAINTENANCE_DAY_OF_WEEK`] for where the
+/// values come from.
+pub fn default_maintenance_start_time() -> MaintenanceStartTime {
+    MaintenanceStartTime {
+        day_of_month: None,
+        day_of_week: Some(DEFAULT_MAINTENANCE_DAY_OF_WEEK),
+        hour_of_day: DEFAULT_MAINTENANCE_HOUR_OF_DAY,
+        minute_of_hour: DEFAULT_MAINTENANCE_MINUTE_OF_HOUR,
+    }
+}
+
 /// The only `GatewayType` the model declares (`GATEWAY_TYPE_VALUES`).
 pub const BACKUP_VM: &str = "BACKUP_VM";
 
@@ -582,8 +629,12 @@ pub struct StoredGateway {
     pub software_update: Option<GatewaySoftwareUpdate>,
     /// `VpcEndpoint`, set only for a gateway activated through a VPC endpoint.
     pub vpc_endpoint: Option<String>,
-    /// `MaintenanceStartTime`, absent until `PutMaintenanceStartTime` sets one.
-    pub maintenance_start_time: Option<MaintenanceStartTime>,
+    /// `MaintenanceStartTime` — the appliance's weekly or monthly maintenance window.
+    ///
+    /// NOT optional: a gateway has a window from the moment it is activated
+    /// ([`default_maintenance_start_time`]), and `PutMaintenanceStartTime` replaces it, so
+    /// "no window" is not a state a gateway of this service can be in.
+    pub maintenance_start_time: MaintenanceStartTime,
     /// The bandwidth rate-limit schedule, empty until
     /// `PutBandwidthRateLimitSchedule` sets one.
     pub bandwidth_rate_limit_intervals: Vec<BandwidthRateLimitInterval>,
@@ -656,7 +707,7 @@ impl StoredGateway {
             gateway_type: Some(self.gateway_type.clone()),
             hypervisor_id: self.hypervisor_id.clone(),
             last_seen_time: Some(date_time(self.last_seen_time)),
-            maintenance_start_time: self.maintenance_start_time.clone(),
+            maintenance_start_time: Some(self.maintenance_start_time.clone()),
             next_update_availability_time: None,
             vpc_endpoint: self.vpc_endpoint.clone(),
             deprecation_date: None,
@@ -1264,7 +1315,9 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             software_version: GATEWAY_SOFTWARE_VERSION.to_string(),
             software_update: None,
             vpc_endpoint: None,
-            maintenance_start_time: None,
+            // Activating the appliance is what gives it its maintenance window, so the
+            // record carries one before any put: see `default_maintenance_start_time`.
+            maintenance_start_time: default_maintenance_start_time(),
             bandwidth_rate_limit_intervals: Vec::new(),
             tags,
         };
@@ -1381,18 +1434,19 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     ///
     /// `None` — nothing written — when this store holds no gateway under `arn`.
     ///
-    /// The window REPLACES whatever that gateway carried: the request states the window
-    /// the gateway is to have, so a day the request does not carry is not on the record
-    /// afterwards either (a monthly window does not keep the `DayOfWeek` a weekly one left
-    /// behind), and setting the same window again leaves the record exactly as one call
-    /// left it. Nothing else on the record is touched — setting the window neither moves
-    /// the gateway's association nor touches its schedule or tags.
+    /// The window REPLACES whatever that gateway carried — the window the activation
+    /// assigned it ([`default_maintenance_start_time`]) or the one an earlier put wrote:
+    /// the request states the window the gateway is to have, so a day the request does not
+    /// carry is not on the record afterwards either (a monthly window does not keep the
+    /// `DayOfWeek` a weekly one left behind), and setting the same window again leaves the
+    /// record exactly as one call left it. Nothing else on the record is touched — setting
+    /// the window neither moves the gateway's association nor touches its schedule or tags.
     pub fn set_maintenance_start_time(
         &mut self,
         arn: &str,
         window: MaintenanceStartTime,
     ) -> Option<StoredGateway> {
-        self.gateways.get_mut(arn)?.maintenance_start_time = Some(window);
+        self.gateways.get_mut(arn)?.maintenance_start_time = window;
         self.gateways.get(arn).cloned()
     }
 

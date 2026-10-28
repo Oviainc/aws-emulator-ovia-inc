@@ -362,15 +362,22 @@ async fn describe_reports_the_imported_certificate() {
                 "case {case:?}: expected {member} {expected:?}, got {detail}"
             );
         }
-        // A self-signed certificate is its own issuer, so both distinguished names are
-        // the subject's — and each is the certificate's own, not one ACM composed.
-        for member in ["Subject", "Issuer"] {
-            assert_eq!(
-                detail[member].as_str(),
-                Some(*distinguished_name),
-                "case {case:?}: expected {member} {distinguished_name:?}, got {detail}"
-            );
-        }
+        // A self-signed certificate is its own issuer, and each name is the
+        // certificate's own, not one ACM composed: `Subject` is the whole subject
+        // distinguished name, and `Issuer` is the NAME of that authority — the common
+        // name its issuer field carries, or that field's own name where it carries
+        // none.
+        assert_eq!(
+            detail["Subject"].as_str(),
+            Some(*distinguished_name),
+            "case {case:?}: expected Subject {distinguished_name:?}, got {detail}"
+        );
+        let expected_issuer = blueprint.common_name.unwrap_or(distinguished_name);
+        assert_eq!(
+            detail["Issuer"].as_str(),
+            Some(expected_issuer),
+            "case {case:?}: expected Issuer {expected_issuer:?}, got {detail}"
+        );
         assert_eq!(
             detail["Serial"].as_str(),
             Some(generated.serial.as_str()),
@@ -415,6 +422,10 @@ async fn describe_reports_the_imported_certificate() {
             .iter()
             .map(|usage| usage["Name"].as_str().unwrap_or_default().to_string())
             .collect();
+        // A certificate carrying NEITHER key-usage extension is reported under the
+        // sentinel each enum declares for that absence: a key no extension restricts is
+        // open to every usage (`ANY`), and a certificate asserting no extended purpose
+        // is reported under `NONE`.
         let (expected_usages, expected_extended): (Vec<&str>, Vec<&str>) = if blueprint.key_usages {
             (
                 vec!["DIGITAL_SIGNATURE", "KEY_ENCIPHERMENT"],
@@ -424,7 +435,7 @@ async fn describe_reports_the_imported_certificate() {
                 ],
             )
         } else {
-            (Vec::new(), Vec::new())
+            (vec!["ANY"], vec!["NONE"])
         };
         assert_eq!(
             key_usages, expected_usages,
@@ -669,9 +680,12 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
             "InvalidParameterException",
         ),
         (
+            // Material ACM has no `KeyAlgorithm` to report the certificate under is
+            // supplied input that fails the service's constraints, not an invalid
+            // input parameter.
             "the certificate's key algorithm is not one ACM declares",
             import_body(&unsupported),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "the PrivateKey is not PEM",

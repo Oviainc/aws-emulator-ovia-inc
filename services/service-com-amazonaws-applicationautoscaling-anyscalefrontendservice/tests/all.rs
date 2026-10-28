@@ -41,6 +41,8 @@ mod scheduled_action_lifecycle;
 mod scheduled_actions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/step_scaling_execution.rs"]
+mod step_scaling_execution;
 #[path = "all/tags.rs"]
 mod tags;
 #[path = "all/target_tracking_alarms.rs"]

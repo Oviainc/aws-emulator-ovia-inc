@@ -239,12 +239,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `SiteId` is optional, so a device that names none is an unsited device of the
-        // global network. When the request does carry one it is a reference like any
-        // other, resolved WITHIN the global network the path addresses: a site that never
-        // existed, one that was deleted and one stored under a different global network
-        // all leave it naming nothing, which one lookup answers.
-        if let Some(site_id) = input.site_id.as_deref() {
+        // `SiteId` is optional, so a device that names no site is an unsited device of the
+        // global network — and the empty string is one of the two spellings of naming none
+        // ([`crate::state::optional_reference`], the same reading `UpdateDevice` and the
+        // associates give that member), so it resolves nothing and is held as none rather
+        // than being refused as a site that cannot be found. When the request does name a
+        // site it is a reference like any other, resolved WITHIN the global network the
+        // path addresses: a site that never existed, one that was deleted and one stored
+        // under a different global network all leave it naming nothing, which one lookup
+        // answers.
+        let site_id = crate::state::optional_reference(input.site_id);
+        if let Some(site_id) = site_id.as_deref() {
             let site_resolves = store
                 .sites
                 .get(site_id)
@@ -294,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             id: id.clone(),
             global_network_id: input.global_network_id,
-            site_id: input.site_id,
+            site_id,
             aws_location: input.aws_location,
             description: input.description,
             device_type: input.r#type,

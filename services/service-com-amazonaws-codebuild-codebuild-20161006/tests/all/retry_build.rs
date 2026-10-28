@@ -396,8 +396,15 @@ async fn a_retry_starts_a_new_linked_build_from_the_retried_builds_settings() {
             "case {:?}: a retry starts as a fresh in-progress build, got {retry}",
             case.name
         );
+        let (retry_start, original_start) =
+            (retry["startTime"].as_f64(), original["startTime"].as_f64());
+        // Read as `f64`, which is what a restJson1 timestamp carries on the wire: an
+        // instant whose millisecond remainder is zero is written as a whole number and one
+        // that is not carries a fraction, so comparing the two as integers would compare
+        // nothing at all whenever either side has sub-second precision.
         assert!(
-            retry["startTime"].as_i64() >= original["startTime"].as_i64(),
+            retry_start
+                .is_some_and(|retry_at| original_start.is_some_and(|was_at| retry_at >= was_at)),
             "case {:?}: the retry starts no earlier than the build it retries, got {retry}",
             case.name
         );

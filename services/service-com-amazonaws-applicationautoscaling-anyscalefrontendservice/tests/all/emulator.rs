@@ -3,8 +3,9 @@
 //! The emulator the suites beside this file drive, and the request helpers they share.
 //!
 //! Application Auto Scaling does not stand alone: a scalable target is a capacity dimension
-//! of a resource that lives in ANOTHER service, and a target-tracking policy's alarms live
-//! in CloudWatch. So the emulator built here holds the three services over ONE engine —
+//! of a resource that lives in ANOTHER service, a target-tracking policy's alarms live in
+//! CloudWatch, and executing a scaling policy moves the capacity of the resource in the
+//! service that owns it. So the emulator built here holds those services over ONE engine —
 //! exactly what `core/router` assembles — and every call goes through the production
 //! `MultiServiceRouter::dispatch`, so what the suites assert is what a signing AWS client
 //! would see.
@@ -65,6 +66,11 @@ impl Emulator {
         );
         router.register_service(
             service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
                 Arc::clone(&engine),
             ),
         );
@@ -149,6 +155,134 @@ impl Emulator {
             body,
         )
         .await
+    }
+
+    /// Call an Amazon ECS operation.
+    pub async fn call_ecs(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.dispatch(
+            "ecs",
+            "application/x-amz-json-1.1",
+            &format!("AmazonEC2ContainerServiceV20141113.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// Create an ECS service of `desired_count` tasks in a cluster of its own, and answer the
+    /// `ResourceId` an `ecs:service:DesiredCount` scalable target names it by.
+    ///
+    /// The cluster registers no container instance, so nothing is ever placed: what these
+    /// suites read back is the service's `desiredCount`, which is the capacity
+    /// `ecs:service:DesiredCount` scales ("The task count of an ECS service").
+    pub async fn given_ecs_service(
+        &self,
+        cluster: &str,
+        service: &str,
+        desired_count: i64,
+    ) -> String {
+        let (status, body) = self
+            .call_ecs("CreateCluster", json!({"clusterName": cluster}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {cluster:?}: expected CreateCluster to answer 200, got {status} {body:?}"
+        );
+        let family = format!("{service}-task");
+        let (status, body) = self
+            .call_ecs(
+                "RegisterTaskDefinition",
+                json!({
+                    "family": family,
+                    "containerDefinitions": [
+                        {"name": "web", "image": "public.ecr.aws/nginx/nginx:latest", "memory": 128},
+                    ],
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {service:?}: expected RegisterTaskDefinition to answer 200, got {status} {body:?}"
+        );
+        let (status, body) = self
+            .call_ecs(
+                "CreateService",
+                json!({
+                    "cluster": cluster,
+                    "serviceName": service,
+                    "taskDefinition": family,
+                    "launchType": "EC2",
+                    "desiredCount": desired_count,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {service:?}: expected CreateService to answer 200, got {status} {body:?}"
+        );
+        format!("service/{cluster}/{service}")
+    }
+
+    /// The `desiredCount` ECS reports for one service, as `DescribeServices` answers it.
+    pub async fn ecs_desired_count(&self, cluster: &str, service: &str) -> i64 {
+        let (status, body) = self
+            .call_ecs(
+                "DescribeServices",
+                json!({"cluster": cluster, "services": [service]}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {service:?}: expected DescribeServices to answer 200, got {status} {body:?}"
+        );
+        body["services"][0]["desiredCount"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("case {service:?}: expected a desiredCount, got {body:?}"))
+    }
+
+    /// Create the CloudWatch alarm a step scaling policy is wired to: the policy's ARN is the
+    /// action the alarm executes when it moves into `ALARM`, which is how a client attaches a
+    /// step scaling policy to an alarm.
+    pub async fn given_policy_alarm(&self, alarm: &PolicyAlarm<'_>) {
+        let (status, body) = self
+            .call_cloudwatch(
+                "PutMetricAlarm",
+                json!({
+                    "AlarmName": alarm.name,
+                    "Namespace": alarm.metric_namespace,
+                    "MetricName": alarm.metric_name,
+                    "Statistic": "Average",
+                    "Period": 60,
+                    "EvaluationPeriods": 1,
+                    "Threshold": alarm.threshold,
+                    "ComparisonOperator": alarm.comparison_operator,
+                    "AlarmActions": [alarm.policy_arn],
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected PutMetricAlarm to answer 200, got {status} {body:?}",
+            alarm.name
+        );
+    }
+
+    /// Drive one alarm into `state_value` with `SetAlarmState`, the way a client breaches an
+    /// alarm without publishing a datapoint for it.
+    pub async fn set_alarm_state(&self, alarm_name: &str, state_value: &str) {
+        let (status, body) = self
+            .call_cloudwatch(
+                "SetAlarmState",
+                json!({
+                    "AlarmName": alarm_name,
+                    "StateValue": state_value,
+                    "StateReason": "driven by the test suite",
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {alarm_name:?}: expected SetAlarmState to answer 200, got {status} {body:?}"
+        );
     }
 
     /// Dispatch one request, returning the HTTP status and the parsed response.
@@ -320,6 +454,24 @@ impl Emulator {
 /// The prefix Application Auto Scaling gives every alarm it mints, which is what lets a
 /// client find them with `DescribeAlarms`.
 pub const ALARM_NAME_PREFIX: &str = "TargetTracking";
+
+/// One CloudWatch alarm a step scaling policy is wired to
+/// ([`Emulator::given_policy_alarm`]).
+pub struct PolicyAlarm<'a> {
+    /// The alarm's `AlarmName`.
+    pub name: &'a str,
+    /// The `PolicyARN` the alarm executes as its action.
+    pub policy_arn: &'a str,
+    /// The metric namespace the alarm watches.
+    pub metric_namespace: &'a str,
+    /// The metric it watches inside that namespace.
+    pub metric_name: &'a str,
+    /// The `Threshold` a step adjustment's interval is measured from.
+    pub threshold: f64,
+    /// The comparison that puts the alarm in `ALARM`, which is what names the DIRECTION a
+    /// breach of it is in.
+    pub comparison_operator: &'a str,
+}
 
 /// The resource-type suffix a namespace's service-linked role name carries.
 ///

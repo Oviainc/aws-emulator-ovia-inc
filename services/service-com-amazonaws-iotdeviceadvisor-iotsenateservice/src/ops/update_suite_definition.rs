@@ -159,10 +159,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // The definition the request NAMED, resolved before the lookup so every path out
+        // of this handler — the refusals included — leaves one audit record naming it,
+        // without holding a borrow of the store.
+        let requested_arn = crate::state::arn(
+            &region,
+            &format!("suitedefinition/{}", input.suite_definition_id),
+        );
+        let mut trail =
+            crate::state::AuditedCall::attempt(Self::NAME, ctx.parts(), &region, &requested_arn);
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UpdateSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
-            })
+            trail.refused(UpdateSuiteDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            ))
         })?;
 
         // The prose rules on `SuiteDefinitionConfiguration` are properties of the SHAPE,
@@ -171,22 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(violation) =
             crate::state::definition_configuration_violation(&input.suite_definition_configuration)
         {
-            return Err(UpdateSuiteDefinitionErrorModeled::ValidationException(
-                ValidationException {
+            return Err(trail.refused(
+                UpdateSuiteDefinitionErrorModeled::ValidationException(ValidationException {
                     message: Some(violation),
-                },
-            )
-            .into());
+                })
+                .into(),
+            ));
         }
 
-        let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
-        // Resolved before the lookup so the refusal path below can name the resource in
-        // the audit trail without holding a borrow of the store.
-        let requested_arn = crate::state::arn(
-            &region,
-            &format!("suitedefinition/{}", input.suite_definition_id),
-        );
         let mut store = state.lock();
 
         // An update of a definition the store does not hold changes nothing and is refused
@@ -194,22 +200,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // shape's own `httpError` binds it, widened in above because this operation's
         // error list does not advertise it.
         let Some(definition) = store.definitions.get_mut(&input.suite_definition_id) else {
-            crate::state::audit(
-                Self::NAME,
-                ctx.parts(),
-                &region,
-                &requested_arn,
-                "not-found",
-            );
-            return Err(UpdateSuiteDefinitionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::not_found_message(
-                        "suiteDefinitionId",
-                        &input.suite_definition_id,
-                    )),
-                },
-            )
-            .into());
+            return Err(trail.refused(
+                UpdateSuiteDefinitionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            "suiteDefinitionId",
+                            &input.suite_definition_id,
+                        )),
+                    },
+                )
+                .into(),
+            ));
         };
 
         definition.record_version(input.suite_definition_configuration, now);
@@ -219,15 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .definitions
             .get(&input.suite_definition_id)
             .ok_or_else(|| {
-                UpdateSuiteDefinitionErrorModeled::InternalServerException(
+                trail.refused(UpdateSuiteDefinitionErrorModeled::InternalServerException(
                     InternalServerException {
                         message: Some(
                             "the updated suite definition could not be read back".to_string(),
                         ),
                     },
-                )
+                ))
             })?;
-        crate::state::audit(Self::NAME, ctx.parts(), &region, &stored.arn, "updated");
+        trail.acted_on(&stored.arn);
+        trail.ended("updated");
         Ok(UpdateSuiteDefinitionOutput {
             suite_definition_id: Some(stored.id.clone()),
             suite_definition_arn: Some(stored.arn.clone()),

@@ -171,10 +171,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // A start names no run — the one it mints does not exist yet — so the record names
+        // the DEFINITION the request asked to run, and every path out of this handler, the
+        // refusals included, leaves exactly one record for the attempt.
+        let mut trail = crate::state::AuditedCall::attempt(
+            Self::NAME,
+            ctx.parts(),
+            &region,
+            &crate::state::arn(
+                &region,
+                &format!("suitedefinition/{}", input.suite_definition_id),
+            ),
+        );
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            StartSuiteRunErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
-            })
+            trail.refused(StartSuiteRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            ))
         })?;
 
         // The rules the model states in prose for a `SuiteRunConfiguration` and cannot
@@ -186,37 +202,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(violation) =
             crate::state::run_configuration_violation(&input.suite_run_configuration)
         {
-            return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
-                message: Some(violation),
-            })
-            .into());
+            return Err(trail.refused(
+                StartSuiteRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(violation),
+                })
+                .into(),
+            ));
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         let Some(definition) = store.definitions.get(&input.suite_definition_id) else {
-            return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::not_found_message(
-                    "suiteDefinitionId",
-                    &input.suite_definition_id,
-                )),
-            })
-            .into());
+            return Err(trail.refused(
+                StartSuiteRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::not_found_message(
+                        "suiteDefinitionId",
+                        &input.suite_definition_id,
+                    )),
+                })
+                .into(),
+            ));
         };
         let version = input
             .suite_definition_version
             .clone()
             .unwrap_or_else(|| definition.latest_version.clone());
         if !definition.holds_version(&version) {
-            return Err(StartSuiteRunErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::not_found_message(
-                    "suiteDefinitionVersion",
-                    &version,
-                )),
-            })
-            .into());
+            return Err(trail.refused(
+                StartSuiteRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::not_found_message(
+                        "suiteDefinitionVersion",
+                        &version,
+                    )),
+                })
+                .into(),
+            ));
         }
 
         // Concurrency, as `suiteRunConfiguration.parallelRun` governs it: two runs of one
@@ -240,23 +261,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if let Some(in_progress) = blocking {
-            return Err(StartSuiteRunErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Suite run {in_progress} is still in progress for suite definition {}",
-                    input.suite_definition_id
-                )),
-            })
-            .into());
+            return Err(trail.refused(
+                StartSuiteRunErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Suite run {in_progress} is still in progress for suite definition {}",
+                        input.suite_definition_id
+                    )),
+                })
+                .into(),
+            ));
         }
         if in_progress_count >= crate::state::MAX_PARALLEL_RUNS_PER_DEFINITION {
-            return Err(StartSuiteRunErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Suite definition {} already has {in_progress_count} suite runs in \
-                     progress, which is the maximum number that can run in parallel",
-                    input.suite_definition_id
-                )),
-            })
-            .into());
+            return Err(trail.refused(
+                StartSuiteRunErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "Suite definition {} already has {in_progress_count} suite runs in \
+                         progress, which is the maximum number that can run in parallel",
+                        input.suite_definition_id
+                    )),
+                })
+                .into(),
+            ));
         }
 
         let id = crate::state::new_uuid();
@@ -302,12 +327,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         store.runs.insert(id.clone(), run);
 
-        let stored = store.runs.get(&id).ok_or_else(|| {
-            StartSuiteRunErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the created suite run could not be read back".to_string()),
-            })
-        })?;
-        crate::state::audit(Self::NAME, ctx.parts(), &region, &stored.arn, "started");
+        let stored = store
+            .runs
+            .get(&id)
+            .ok_or_else(|| {
+                trail.refused(StartSuiteRunErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the created suite run could not be read back".to_string()),
+                    },
+                ))
+            })?;
+        trail.acted_on(&stored.arn);
+        trail.ended("started");
         Ok(StartSuiteRunOutput {
             suite_run_id: Some(stored.id.clone()),
             suite_run_arn: Some(stored.arn.clone()),

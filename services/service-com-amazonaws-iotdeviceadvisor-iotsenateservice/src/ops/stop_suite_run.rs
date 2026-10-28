@@ -133,24 +133,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // The run the request NAMED, so a stop of a run the store does not hold leaves one
+        // audit record for the attempt exactly as a stop that moves a run does.
+        let requested_arn = crate::state::arn(
+            &region,
+            &format!(
+                "suiterun/{}/{}",
+                input.suite_definition_id, input.suite_run_id
+            ),
+        );
+        let mut trail =
+            crate::state::AuditedCall::attempt(Self::NAME, ctx.parts(), &region, &requested_arn);
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            StopSuiteRunErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
-            })
+            trail.refused(StopSuiteRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            ))
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let run = store
             .run_mut(&input.suite_definition_id, &input.suite_run_id, now)
             .ok_or_else(|| {
-                StopSuiteRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(crate::state::not_found_message(
-                        "suiteRunId",
-                        &input.suite_run_id,
-                    )),
-                })
+                trail.refused(StopSuiteRunErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            "suiteRunId",
+                            &input.suite_run_id,
+                        )),
+                    },
+                ))
             })?;
 
         // Only a run that has not been asked to stop and has not finished is moved: a
@@ -163,7 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "unchanged-already-stopping-or-finished"
         };
         let arn = run.arn.clone();
-        crate::state::audit(Self::NAME, ctx.parts(), &region, &arn, outcome);
+        trail.acted_on(&arn);
+        trail.ended(outcome);
 
         Ok(StopSuiteRunOutput {})
     }

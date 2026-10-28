@@ -43,17 +43,23 @@
 //!    `{parameter}`, which beats a greedy `{proxy+}`;
 //! 4. the request's verb names a method of that resource in the deployment, or the
 //!    `ANY` catch-all;
-//! 5. the method's deployed `authorizationType` and `apiKeyRequired` are enforced — a
-//!    key-required method admits only an enabled API key the records associate with THIS
-//!    stage, through a usage plan over that api stage or the key's own deprecated
-//!    `stageKeys`, and refuses every other request before the integration is reached;
-//! 6. the method's REQUEST VALIDATOR is applied — the `RequestValidator` the live method's
+//! 5. the method's deployed `authorizationType` is enforced, and then the API's own
+//!    RESOURCE POLICY is applied ([`super::resource_policy`]): `RestApi$policy` "applies to
+//!    this RestApi regardless of the caller and Method configuration", so a document the
+//!    developer attached decides every request this endpoint answers — a private API pinned
+//!    to one of its interface VPC endpoints admits the request that arrived through that
+//!    endpoint and refuses the one that did not;
+//! 6. `apiKeyRequired` is enforced — a key-required method admits only an enabled API key
+//!    the records associate with THIS stage, through a usage plan over that api stage or
+//!    the key's own deprecated `stageKeys`, and refuses every other request before the
+//!    integration is reached;
+//! 7. the method's REQUEST VALIDATOR is applied — the `RequestValidator` the live method's
 //!    `requestValidatorId` names decides whether the request's parameters
 //!    ([`parameters_refusal`]) and its payload ([`PendingBodyCheck::refusal`]) are checked
 //!    before the integration is reached;
-//! 7. the usage plan metering the presented API key admits the request at the plan's
+//! 8. the usage plan metering the presented API key admits the request at the plan's
 //!    throttle, or the request is shed ([`metered_refusal`]);
-//! 8. the method's integration decides the response.
+//! 9. the method's integration decides the response.
 //!
 //! A step that resolves nothing is answered the way API Gateway answers it: through the
 //! API's GATEWAY RESPONSE for the matching response type ([`GatewayRefusal`]), so a
@@ -122,6 +128,8 @@ use crate::ops::put_method_response::METHOD_RESPONSE_HEADER_PREFIX;
 use crate::ops::types::{GetIntegrationOutput, GetIntegrationResponseOutput};
 use crate::state::{ApiKeyEntry, DeploymentEntry, MethodEntry, RestApiEntry};
 
+use super::resource_policy;
+
 /// The second label of every `execute-api` endpoint host: `{api-id}.execute-api.…`.
 ///
 /// From `RestApi$disableExecuteApiEndpoint`: "clients can invoke your API with the default
@@ -148,6 +156,25 @@ const EMULATOR_PATH_NAMESPACE: &str = "_aws";
 /// is not a stage invoke and is left to the service that models it. Claiming it here would
 /// make two services claim one request, which the router rejects as `AmbiguousService`.
 const CONNECTIONS_SEGMENT: &str = "@connections";
+
+/// The prefix of every VPC endpoint id, which is also the first label of the
+/// endpoint-specific DNS names an interface endpoint answers on.
+///
+/// An interface endpoint to the Region's `execute-api` service is given endpoint-specific
+/// names of the form `{vpc-endpoint-id}.execute-api.{region}.vpce.amazonaws.com` (and one
+/// `{vpc-endpoint-id}-{zone}.…` per Availability Zone), which is how a client addresses a
+/// PRIVATE api through one endpoint rather than another — see [`endpoint_of_host`].
+const VPC_ENDPOINT_ID_PREFIX: &str = "vpce-";
+
+/// The lengths of the hexadecimal part of a VPC endpoint id, from EC2's own id pattern
+/// (`^vpce-([0-9a-f]{8}|[0-9a-f]{17})$`): the two widths AWS mints.
+const VPC_ENDPOINT_ID_HEX_LENGTHS: &[usize] = &[8, 17];
+
+/// The header a client names the api in when it addresses a PRIVATE api by its VPC
+/// endpoint's own DNS name, which names the endpoint rather than the api: AWS documents
+/// invoking such an api through the endpoint-specific hostname with the api id carried in
+/// `x-apigw-api-id`.
+const API_ID_HEADER: &str = "x-apigw-api-id";
 
 /// The verb-independent catch-all a method may be put under, from
 /// [`crate::ops::put_method::HTTP_METHODS`]: "plus the `ANY` catch-all that matches every
@@ -224,6 +251,14 @@ const PASSTHROUGH_NEVER: &str = "NEVER";
 /// gateway-response template is `{"message":$context.error.messageString}`.
 const MESSAGE_MEMBER: &str = "message";
 
+/// The member an AUTHORIZATION refusal's body carries its sentence under.
+///
+/// The `execute-api` endpoint answers a request its api's resource policy does not allow
+/// with the IAM-shaped body — `{"Message":"User: … is not authorized to perform: …"}` — so
+/// a client reading that sentence reads it from this member rather than from the
+/// [`MESSAGE_MEMBER`] every other gateway response carries.
+const AUTHORIZATION_MESSAGE_MEMBER: &str = "Message";
+
 /// The status code a refusal falls back to when its response type names none and no
 /// customization overrides it. `DEFAULT_5XX`'s own class: this emulator could not place
 /// the refusal, which is a server-side fault, never a caller's.
@@ -260,6 +295,11 @@ pub struct GatewayRefusal {
     /// `$context.error.validationErrorString` reports it; empty for every refusal that is
     /// not the outcome of validating the request against what the method declares.
     validation_detail: Cow<'static, str>,
+    /// The member API Gateway's own default body carries the sentence under. Every gateway
+    /// response's own default template is `{"message":$context.error.messageString}`, so
+    /// that is [`MESSAGE_MEMBER`] for all but the AUTHORIZATION refusal, which API Gateway
+    /// answers with the IAM-shaped [`AUTHORIZATION_MESSAGE_MEMBER`] body.
+    message_member: &'static str,
 }
 
 impl GatewayRefusal {
@@ -280,6 +320,7 @@ const FORBIDDEN: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Forbidden"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// Nothing in the DEPLOYMENT matches the path and verb, or the method's authorization
@@ -291,6 +332,7 @@ const MISSING_AUTHENTICATION_TOKEN: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Missing Authentication Token"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// The method requires an API key and the request presented none this API's records
@@ -300,6 +342,7 @@ const INVALID_API_KEY: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Forbidden"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// An authorizer's identity source is absent from the request, so the authorizer is not
@@ -309,6 +352,7 @@ const UNAUTHORIZED: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Unauthorized"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// The method's configuration cannot serve the call: no integration on the deployed
@@ -319,6 +363,7 @@ const API_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Internal server error"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// The method is authorized by an `Authorizer` whose decision this emulator cannot
@@ -330,6 +375,7 @@ const AUTHORIZER_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Internal server error"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// The request's content type maps to no integration request template and the
@@ -340,6 +386,7 @@ const UNSUPPORTED_MEDIA_TYPE: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Unsupported Media Type"),
     error_type: None,
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// The method's request validator declares `validateRequestBody` and the request's payload
@@ -356,6 +403,7 @@ fn bad_request_body(detail: String) -> GatewayRefusal {
         message: Cow::Borrowed("Invalid request body"),
         error_type: Some("BadRequestException"),
         validation_detail: Cow::Owned(detail),
+        message_member: MESSAGE_MEMBER,
     }
 }
 
@@ -367,6 +415,7 @@ const THROTTLED: GatewayRefusal = GatewayRefusal {
     message: Cow::Borrowed("Too Many Requests"),
     error_type: Some("TooManyRequestsException"),
     validation_detail: Cow::Borrowed(""),
+    message_member: MESSAGE_MEMBER,
 };
 
 /// The method's request validator declares `validateRequestParameters` and the request
@@ -384,6 +433,26 @@ fn bad_request_parameters(missing: &[String]) -> GatewayRefusal {
         message: Cow::Owned(format!("Missing required request parameters: [{named}]")),
         error_type: Some("BadRequestException"),
         validation_detail: Cow::Owned(format!("[{named}]")),
+        message_member: MESSAGE_MEMBER,
+    }
+}
+
+/// The api's own RESOURCE POLICY does not let this request invoke the method: `403`,
+/// carrying the sentence AWS refuses an unauthorized invoke with
+/// ([`resource_policy::denial`]).
+///
+/// Answered through `ACCESS_DENIED`, the gateway response type an authorization failure is
+/// customized under, so a developer's `PutGatewayResponse` for it reaches this refusal too.
+/// The body's member is the IAM-shaped [`AUTHORIZATION_MESSAGE_MEMBER`] rather than the
+/// [`MESSAGE_MEMBER`] every other gateway response carries, because that is the body API
+/// Gateway answers an authorization refusal with.
+fn access_denied(message: String) -> GatewayRefusal {
+    GatewayRefusal {
+        response_type: "ACCESS_DENIED",
+        message: Cow::Owned(message),
+        error_type: None,
+        validation_detail: Cow::Borrowed(""),
+        message_member: AUTHORIZATION_MESSAGE_MEMBER,
     }
 }
 
@@ -392,7 +461,8 @@ fn bad_request_parameters(missing: &[String]) -> GatewayRefusal {
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
 /// What an invoke addresses, as the wire carries it: the request's host — absent on a
-/// request that carries neither a `Host` header nor an absolute URI — and its path.
+/// request that carries neither a `Host` header nor an absolute URI — its path, and the api
+/// id a request addressed to a VPC endpoint's own DNS name carries in a header.
 ///
 /// Built from BOTH shapes the router hands this module, the buffered parts the claim reads
 /// and the runtime-API request the two serving seams read, so one rule resolves both and
@@ -401,6 +471,9 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 pub struct Addressed<'a> {
     host: Option<&'a str>,
     path: &'a str,
+    /// The [`API_ID_HEADER`] the request carries, which is how a request on an endpoint's
+    /// own DNS name — a host that names the ENDPOINT, not the api — names the api.
+    api_id_header: Option<&'a str>,
 }
 
 impl<'a> Addressed<'a> {
@@ -409,6 +482,10 @@ impl<'a> Addressed<'a> {
         Self {
             host: request_host(parts),
             path: parts.uri.path(),
+            api_id_header: parts
+                .headers
+                .get(API_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
         }
     }
 
@@ -417,22 +494,28 @@ impl<'a> Addressed<'a> {
         Self {
             host: req.headers().get("host").or_else(|| authority_of(req.uri())),
             path: path_of(req.uri()),
+            api_id_header: req.headers().get(API_ID_HEADER),
         }
     }
 }
 
-/// What an invoke request addresses, as this service's records resolve it: the api, and
-/// the path WITHIN that api's endpoint — `/{stage}/{resource-path}`, which is what the
-/// stage and the resource are read from.
+/// What an invoke request addresses, as this service's records resolve it: the api, the
+/// path WITHIN that api's endpoint — `/{stage}/{resource-path}`, which is what the stage
+/// and the resource are read from — and the VPC endpoint the request arrived through, when
+/// it was addressed on one's own DNS name.
 #[derive(Debug)]
 struct Resolved<'s, 'r> {
     api: &'s RestApiEntry,
     invoke_path: &'r str,
+    /// The id of the interface VPC endpoint whose endpoint-specific DNS name the request
+    /// was addressed on, or `None` on every other addressing — where the request names no
+    /// endpoint and this service claims none for it.
+    source_vpce: Option<&'r str>,
 }
 
 /// What `addressed` addresses, or `None` when this data plane serves it not at all.
 ///
-/// FOUR addressings resolve, because a client reaches this emulator at a different
+/// FIVE addressings resolve, because a client reaches this emulator at a different
 /// address than it reaches AWS at:
 ///
 /// * HOST-STYLE, the addressing `RestApi$disableExecuteApiEndpoint` documents: the host's
@@ -442,6 +525,13 @@ struct Resolved<'s, 'r> {
 ///   (an API Gateway V2 api is reached on the same host shape, and its own service claims
 ///   it), so reading its path as one of THIS service's stages would make two services claim
 ///   one request;
+/// * VPC-ENDPOINT HOST-STYLE, the addressing a PRIVATE api is reached by through one of its
+///   interface VPC endpoints: the host is that ENDPOINT's own DNS name
+///   (`{vpc-endpoint-id}.execute-api.{region}.vpce.amazonaws.com`, the name EC2 reports in
+///   the endpoint's `DnsEntries`), which names no api at all, so the api travels in the
+///   [`API_ID_HEADER`]. This is the one addressing that tells this service WHICH endpoint a
+///   request arrived through, which is what the api's resource policy can then be
+///   conditioned on ([`super::resource_policy::SOURCE_VPCE_KEY`]);
 /// * PREFIXED PATH-STYLE, the addressing a client reaching an EMULATOR uses: the data
 ///   plane is named by the reserved namespace segment [`EMULATOR_PATH_NAMESPACE`] and the
 ///   [`EXECUTE_API_LABEL`], then the api id, then the invoke path —
@@ -489,20 +579,34 @@ fn resolve<'s, 'r>(
     if addresses_connections(addressed.path) {
         return None;
     }
+    // VPC-ENDPOINT HOST-STYLE first: such a host IS an `execute-api` endpoint host, so the
+    // api-id reading below would take its endpoint id for an api id and resolve nothing.
+    if let Some(endpoint) = addressed.host.and_then(endpoint_of_host) {
+        return addressed
+            .api_id_header
+            .and_then(|api_id| store.rest_apis.get(api_id))
+            .map(|api| Resolved {
+                api,
+                invoke_path: addressed.path,
+                source_vpce: Some(endpoint),
+            });
+    }
     if let Some(api_id) = addressed.host.and_then(api_id_of_host) {
         return store.rest_apis.get(api_id).map(|api| Resolved {
             api,
             invoke_path: addressed.path,
+            source_vpce: None,
         });
     }
     // PREFIXED PATH-STYLE: the path names this data plane before it names the api, so it is
     // read on whatever host it arrives at — the prefix is in no service's modelled path
     // space, and an api id this service does not hold is served by nothing here.
     if let Some((api_id, invoke_path)) = split_execute_api_prefix(addressed.path) {
-        return store
-            .rest_apis
-            .get(api_id)
-            .map(|api| Resolved { api, invoke_path });
+        return store.rest_apis.get(api_id).map(|api| Resolved {
+            api,
+            invoke_path,
+            source_vpce: None,
+        });
     }
     let (first, rest) = split_first_segment(addressed.path)?;
     // Which service the host names, by the front door's own rule: `None` is the emulator's
@@ -522,6 +626,7 @@ fn resolve<'s, 'r>(
         return Some(Resolved {
             api,
             invoke_path: rest,
+            source_vpce: None,
         });
     }
     if host_service.is_some() {
@@ -544,6 +649,7 @@ fn resolve<'s, 'r>(
     holding.next().is_none().then_some(Resolved {
         api,
         invoke_path: addressed.path,
+        source_vpce: None,
     })
 }
 
@@ -623,18 +729,29 @@ fn claims<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -
 /// The first label of `host` when `host` is an `execute-api` endpoint: the API id.
 ///
 /// The shape is `{api-id}.execute-api.{region}.amazonaws.com` — a first label, then the
-/// [`EXECUTE_API_LABEL`] label, then at least a region and a domain. Any `:port` and
-/// userinfo is removed first, as the front door's own host reader does. The region and the
-/// domain are not matched against a list: an emulator serves whatever region a caller
-/// addresses, and a FIPS or a dualstack spelling of the same endpoint is the same endpoint.
+/// [`EXECUTE_API_LABEL`] label, then at least a region and a domain ([`endpoint_labels`]).
 fn api_id_of_host(host: &str) -> Option<&str> {
+    endpoint_labels(host).map(|(api_id, _region)| api_id)
+}
+
+/// The two parts every `execute-api` endpoint host carries: its FIRST label — which names
+/// the api on an api's own endpoint and the VPC endpoint on an endpoint-specific one — and
+/// the Region label that follows the [`EXECUTE_API_LABEL`].
+///
+/// One reader for both forms, because both put the same two parts in the same places:
+/// `{api-id}.execute-api.{region}.amazonaws.com` and
+/// `{vpc-endpoint-id}.execute-api.{region}.vpce.amazonaws.com`. Any `:port` and userinfo is
+/// removed first, as the front door's own host reader does. The region and the domain are
+/// not matched against a list: an emulator serves whatever region a caller addresses, and a
+/// FIPS or a dualstack spelling of the same endpoint is the same endpoint.
+fn endpoint_labels(host: &str) -> Option<(&str, &str)> {
     let without_userinfo = host.rsplit('@').next().unwrap_or(host);
     let without_port = without_userinfo
         .split(':')
         .next()
         .unwrap_or(without_userinfo);
     let mut labels = without_port.split('.');
-    let api_id = labels.next()?;
+    let first = labels.next()?;
     let second = labels.next()?;
     // The label is `execute-api` itself, or one of its endpoint VARIANTS, which AWS spells
     // with a suffix after a hyphen (`execute-api-fips`). A label that merely STARTS with
@@ -643,13 +760,52 @@ fn api_id_of_host(host: &str) -> Option<&str> {
         || second
             .strip_prefix(EXECUTE_API_LABEL)
             .is_some_and(|variant| variant.starts_with('-') && variant.len() > 1);
-    if api_id.is_empty() || !execute_api {
+    if first.is_empty() || !execute_api {
         return None;
     }
     // A region label and a domain: `{api-id}.execute-api.{region}.amazonaws.com` has four
     // labels after the id, and the shortest form this accepts still has two, so a bare
     // `execute-api.something` (no api id in front) is not read as one.
-    (labels.count() >= 2).then_some(api_id)
+    let region = labels.next()?;
+    (labels.count() >= 1).then_some((first, region))
+}
+
+/// The id of the interface VPC endpoint whose own DNS name `host` is, or `None` for a host
+/// that is not one.
+///
+/// An interface endpoint to the Region's `execute-api` service answers on the
+/// endpoint-specific names EC2 reports in its `DnsEntries` — the regional
+/// `{vpc-endpoint-id}.execute-api.{region}.vpce.amazonaws.com` and one zonal
+/// `{vpc-endpoint-id}-{zone}.…` per Availability Zone its interfaces sit in — so the id is
+/// the first label up to the zone suffix, and the zonal and regional names resolve to the
+/// SAME endpoint. The id is [`VPC_ENDPOINT_ID_PREFIX`] and one of the hexadecimal widths
+/// EC2's id pattern admits ([`VPC_ENDPOINT_ID_HEX_LENGTHS`]), which is also what tells an
+/// endpoint's own name apart from an api id that merely begins with those characters.
+fn endpoint_of_host(host: &str) -> Option<&str> {
+    let (first, _region) = endpoint_labels(host)?;
+    let hex = first
+        .strip_prefix(VPC_ENDPOINT_ID_PREFIX)?
+        .split('-')
+        .next()?;
+    if !VPC_ENDPOINT_ID_HEX_LENGTHS.contains(&hex.len())
+        || !hex
+            .chars()
+            .all(|glyph| glyph.is_ascii_hexdigit() && !glyph.is_ascii_uppercase())
+    {
+        return None;
+    }
+    // By `get`, never by a byte-index slice: the label is read off the wire, and the id's
+    // own width is all that has been established about it.
+    first.get(..VPC_ENDPOINT_ID_PREFIX.len() + hex.len())
+}
+
+/// The Region `host` addresses, read off its own labels, or `None` for a host that is not
+/// an `execute-api` endpoint and so names no Region.
+///
+/// It is the Region of the ARN a statement of the api's resource policy names the method by
+/// and a refusal reports, which is the Region the client addressed the endpoint in.
+fn region_of_host(host: Option<&str>) -> Option<&str> {
+    endpoint_labels(host?).map(|(_first, region)| region)
 }
 
 /// Whether `path` addresses the `@connections` space of ApiGatewayManagementApi, in either
@@ -744,6 +900,49 @@ fn serve_resolved<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> 
 
         if let Some(refusal) = authorization_refusal(api, live_method, authorization_type, req) {
             return refusal_response(Some(api), refusal);
+        }
+        // The api's own RESOURCE POLICY, which "applies to this RestApi regardless of the
+        // caller and Method configuration" (`RestApi$policy`): a document the developer
+        // attached decides every request this endpoint answers, so it is applied here —
+        // before the api key, the request validator, the metering and the integration, none
+        // of which a request it refuses ever reaches. An api carrying no document is asked
+        // nothing and is served as it was before resource policies were read at all.
+        if let Some(policy) = api
+            .policy
+            .as_deref()
+            .filter(|policy| !policy.trim().is_empty())
+        {
+            // Who the request speaks for is the METHOD's authorization, not what the
+            // request carries: API Gateway authenticates nobody for a method whose
+            // `authorizationType` is `NONE`, so such a call speaks for nobody however it is
+            // signed, while an `AWS_IAM` method is reached with a credential the emulator
+            // has already verified. `service_common` owns the one definition of the identity
+            // this emulator's published credential speaks for, so the principal a refusal
+            // here blames is the one STS reports for it.
+            let signed_as = (authorization_type == AUTHORIZATION_AWS_IAM)
+                .then(::service_common::caller_principal::ambient_user_arn);
+            let call = resource_policy::Call {
+                region: region_of_host(addressed.host).unwrap_or(crate::state::DEFAULT_REGION),
+                api_id: &api.id,
+                stage: &stage.stage_name,
+                verb,
+                resource_path: matched_path,
+                source_vpce: resolved.source_vpce,
+                caller: match signed_as.as_deref() {
+                    Some(principal) => resource_policy::Caller::Signed(principal),
+                    None => resource_policy::Caller::Anonymous,
+                },
+            };
+            if let Some(message) = resource_policy::denial(policy, &call) {
+                tracing::warn!(
+                    api_id = %api.id,
+                    stage = %stage.stage_name,
+                    path = %matched_path,
+                    verb = %verb,
+                    "the api's resource policy does not allow this invoke"
+                );
+                return refusal_response(Some(api), access_denied(message));
+            }
         }
         // A key-required method is admitted by the key the records associate with this
         // stage, and the association is also what says which usage plans METER the call.
@@ -898,13 +1097,14 @@ fn metered_refusal(
 /// the authorizer running at all (`Authorizer$identitySource`).
 ///
 /// What `AWS_IAM` here does NOT do, stated so a passing test is not read as more than it
-/// is: no authorization DECISION is made. AWS both authenticates the signature and
-/// evaluates `execute-api:Invoke` for the resolved principal against the api's resource
-/// policy and the caller's identity policies, refusing an authenticated but unprivileged
-/// caller. This emulator models no caller identity and no identity-policy evaluation, so
-/// the decision an under-privileged principal would get from AWS is not one it can
-/// produce; a verified credential admits the call, and a test asserting the `403` an
-/// unprivileged principal earns is not one this emulator can satisfy.
+/// is: no IDENTITY-based decision is made. AWS both authenticates the signature and
+/// evaluates `execute-api:Invoke` for the resolved principal against the caller's identity
+/// policies as well as the api's resource policy, refusing an authenticated but
+/// unprivileged caller. This emulator models no identity-policy evaluation for an invoke,
+/// so the decision an under-privileged principal would get from AWS is not one it can
+/// produce; a verified credential gets past THIS gate. The api's own RESOURCE policy is a
+/// decision it does make, on every request whatever the authorization type —
+/// [`super::resource_policy`], applied by [`serve_resolved`] straight after this.
 fn authorization_refusal(
     api: &RestApiEntry,
     method: Option<&MethodEntry>,
@@ -2093,7 +2293,7 @@ pub fn refusal_rendering(api: Option<&RestApiEntry>, refusal: GatewayRefusal) ->
         .and_then(|template| rendered_gateway_template(template, &refusal));
     let body = match templated {
         Some(template) => template.into_bytes(),
-        None => ::serde_json::json!({ MESSAGE_MEMBER: refusal.message.as_ref() })
+        None => ::serde_json::json!({ refusal.message_member: refusal.message.as_ref() })
             .to_string()
             .into_bytes(),
     };
@@ -2213,6 +2413,73 @@ mod tests {
             assert_eq!(
                 resolved, *expected,
                 "case {host:?}: expected the api id {expected:?}, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vpc_endpoints_own_dns_name_names_the_endpoint_and_not_an_api() {
+        // Rows differ along the id width EC2's pattern admits, the zonal suffix an
+        // endpoint's per-zone name carries, the region, the port and the endpoint variant —
+        // plus the hosts that name NO endpoint, which keep resolving by api id.
+        let cases: &[(&str, Option<&str>)] = &[
+            (
+                "vpce-0123456789abcdef0.execute-api.us-west-2.vpce.amazonaws.com",
+                Some("vpce-0123456789abcdef0"),
+            ),
+            // The zonal name of the SAME endpoint, which EC2 reports beside the regional
+            // one: the zone is a suffix of the label, not part of the id.
+            (
+                "vpce-0123456789abcdef0-us-west-2a.execute-api.us-west-2.vpce.amazonaws.com",
+                Some("vpce-0123456789abcdef0"),
+            ),
+            // AWS's own endpoint-specific public name carries a suffix of its own.
+            (
+                "vpce-0123456789abcdef0-01234567.execute-api.eu-west-1.vpce.amazonaws.com:443",
+                Some("vpce-0123456789abcdef0"),
+            ),
+            // The eight-digit width the id pattern also admits.
+            (
+                "vpce-0123abcd.execute-api-fips.us-gov-west-1.vpce.amazonaws.com",
+                Some("vpce-0123abcd"),
+            ),
+            // An api id that merely begins with the prefix is no endpoint id: neither
+            // width, and not hexadecimal.
+            ("vpce-xyz.execute-api.us-west-2.amazonaws.com", None),
+            ("vpcezzzzzzz.execute-api.us-west-2.amazonaws.com", None),
+            ("abc1230000.execute-api.us-east-1.amazonaws.com", None),
+            // Not an `execute-api` endpoint host at all.
+            ("vpce-0123456789abcdef0.s3.us-west-2.vpce.amazonaws.com", None),
+            ("localhost", None),
+        ];
+        for (host, expected) in cases {
+            let resolved = endpoint_of_host(host);
+            assert_eq!(
+                resolved, *expected,
+                "case {host:?}: expected the endpoint id {expected:?}, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_endpoint_host_names_the_region_its_method_arns_carry() {
+        // Rows differ along the endpoint form (an api's own, a VPC endpoint's) and the
+        // region label, plus a host that names no region at all.
+        let cases: &[(Option<&str>, Option<&str>)] = &[
+            (Some("abc1230000.execute-api.us-east-1.amazonaws.com"), Some("us-east-1")),
+            (
+                Some("vpce-0123456789abcdef0.execute-api.eu-west-3.vpce.amazonaws.com"),
+                Some("eu-west-3"),
+            ),
+            (Some("abc1230000.execute-api.ap-southeast-2.amazonaws.com:443"), Some("ap-southeast-2")),
+            (Some("127.0.0.1:9297"), None),
+            (None, None),
+        ];
+        for (host, expected) in cases {
+            let resolved = region_of_host(*host);
+            assert_eq!(
+                resolved, *expected,
+                "case {host:?}: expected the region {expected:?}, got {resolved:?}"
             );
         }
     }

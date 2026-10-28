@@ -22,8 +22,9 @@
 //!    map `GetUser` and `CreateAccessKey` resolve a nameless caller through;
 //! 2. **what it may do** — the identity-based documents in force on that principal, from
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::principal_policies`],
-//!    so a policy just put grants immediately and one just deleted stops granting
-//!    immediately;
+//!    which for a user is the UNION of the documents embedded in and attached to the user
+//!    itself and those in force on every group it belongs to, so a policy just put grants
+//!    immediately and one just deleted stops granting immediately;
 //! 3. **the ceiling on it** — the permissions boundary in force on that principal, from
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::permissions_boundary_document`],
 //!    which sets the maximum permissions those documents can grant and grants nothing
@@ -114,6 +115,9 @@ pub const GET_GROUP: &str = "iam:GetGroup";
 
 /// `iam:UpdateGroup`.
 pub const UPDATE_GROUP: &str = "iam:UpdateGroup";
+
+/// `iam:GetUser`.
+pub const GET_USER: &str = "iam:GetUser";
 
 /// `iam:UpdateUser`.
 pub const UPDATE_USER: &str = "iam:UpdateUser";

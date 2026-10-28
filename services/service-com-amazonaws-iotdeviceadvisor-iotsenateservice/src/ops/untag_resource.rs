@@ -140,10 +140,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // The resource the request NAMED, exactly as it named it, so every path out of
+        // this handler — the refusals included — leaves exactly one audit record.
+        let mut trail = crate::state::AuditedCall::attempt(
+            Self::NAME,
+            ctx.parts(),
+            &region,
+            &input.resource_arn,
+        );
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            UntagResourceErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
-            })
+            trail.refused(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            ))
         })?;
 
         // A `resourceArn` that is not one of this service's ARNs is a bad REQUEST, not a
@@ -151,12 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything is looked up or written — the same order `TagResource` and
         // `ListTagsForResource` follow.
         let resource = crate::state::parse_resource_arn(&input.resource_arn).map_err(|message| {
-            UntagResourceErrorModeled::ValidationException(ValidationException {
-                message: Some(message),
-            })
+            trail.refused(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
         })?;
 
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // Tags live on a resource, so an ARN this store holds no resource for is the
@@ -165,15 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource the request NAMED, so the refusal carries the service's single
         // not-found template, built from the input member that identified it.
         if !store.holds_tagged_resource(&input.resource_arn, &resource) {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
+            return Err(trail.refused(
+                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(crate::state::not_found_message(
                         "resourceArn",
                         &input.resource_arn,
                     )),
-                },
-            )
-            .into());
+                })
+                .into(),
+            ));
         }
 
         // Removal is idempotent: a key the resource does not carry is absent afterwards
@@ -183,13 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let removed =
             store.remove_tags(&input.resource_arn, input.tag_keys.iter().map(String::as_str));
 
-        crate::state::audit(
-            Self::NAME,
-            ctx.parts(),
-            &region,
-            &input.resource_arn,
-            &format!("untagged {removed} of {} key(s)", input.tag_keys.len()),
-        );
+        trail.ended(format!(
+            "untagged {removed} of {} key(s)",
+            input.tag_keys.len()
+        ));
         Ok(UntagResourceOutput {})
     }
 }

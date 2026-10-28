@@ -115,14 +115,14 @@ async fn account_health_counts_the_persisted_coverage() {
             // larger tag coverage is more VALUES under that one key.
             name: "one app boundary key with three tag values, added by two requests",
             steps: &[
-                ("ADD", &[], &[("boundary-one", &["only"])]),
-                ("ADD", &[], &[("boundary-one", &["a", "b"])]),
+                ("ADD", &[], &[("Devops-guru-boundary-one", &["only"])]),
+                ("ADD", &[], &[("Devops-guru-boundary-one", &["a", "b"])]),
             ],
             expect_resources: 3,
         },
         HealthCase {
             name: "stacks and tags covered together",
-            steps: &[("ADD", &["s1", "s2"], &[("boundary", &["v"])])],
+            steps: &[("ADD", &["s1", "s2"], &[("Devops-guru-boundary", &["v"])])],
             expect_resources: 3,
         },
         HealthCase {
@@ -133,8 +133,8 @@ async fn account_health_counts_the_persisted_coverage() {
         HealthCase {
             name: "removing a key's last tag value leaves nothing monitored",
             steps: &[
-                ("ADD", &[], &[("boundary", &["v"])]),
-                ("REMOVE", &[], &[("boundary", &["v"])]),
+                ("ADD", &[], &[("Devops-guru-boundary", &["v"])]),
+                ("REMOVE", &[], &[("Devops-guru-boundary", &["v"])]),
             ],
             expect_resources: 0,
         },
@@ -142,7 +142,7 @@ async fn account_health_counts_the_persisted_coverage() {
             name: "removing coverage that was never added changes nothing",
             steps: &[
                 ("ADD", &["present"], &[]),
-                ("REMOVE", &["absent"], &[("boundary", &["v"])]),
+                ("REMOVE", &["absent"], &[("Devops-guru-boundary", &["v"])]),
             ],
             expect_resources: 1,
         },
@@ -205,7 +205,7 @@ async fn account_health_counts_the_persisted_coverage() {
 async fn account_health_is_a_repeatable_read() {
     let emulator = Emulator::new();
     let setup = emulator
-        .update_resource_collection("ADD", collection(&["one", "two"], &[("boundary", &["v"])]))
+        .update_resource_collection("ADD", collection(&["one", "two"], &[("Devops-guru-boundary", &["v"])]))
         .await;
     assert_eq!(
         setup.status, 200,

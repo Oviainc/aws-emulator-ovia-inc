@@ -14,6 +14,7 @@
 //! in, how many keys the user already holds, whether the request names a user at
 //! all, and which credentials the request is presented as signed by.
 
+use crate::identity_policy_enforcement::grant_get_user;
 use crate::user_lifecycle::{call, call_signed_by, element, elements, error_code, router};
 
 /// One create: the user the account holds, and the case the request spells that
@@ -113,6 +114,7 @@ async fn create_access_key_mints_a_credential_bound_to_the_named_user() {
             status, 200,
             "case {case:?}: CreateUser must succeed, got {status}: {body}"
         );
+        grant_get_user(&router, &case, stored_name).await;
 
         let (status, created) =
             call(&router, "CreateAccessKey", &[("UserName", requested_name)]).await;
@@ -212,6 +214,7 @@ async fn creating_past_the_access_key_quota_is_refused() {
             status, 200,
             "case {case:?}: CreateUser must succeed, got {status}: {body}"
         );
+        grant_get_user(&router, &case, stored_name).await;
 
         // Every key up to the quota is minted, each a distinct credential. The
         // request alternates between the stored case and the requested case, so the
@@ -278,6 +281,7 @@ async fn an_omitted_name_mints_the_key_for_the_signing_user() {
             status, 200,
             "case {stored_name:?}: CreateUser must succeed, got {status}: {body}"
         );
+        grant_get_user(&router, stored_name, stored_name).await;
         let (status, first) = call(&router, "CreateAccessKey", &[("UserName", stored_name)]).await;
         assert_eq!(
             status, 200,
@@ -449,7 +453,10 @@ async fn a_user_holding_an_access_key_cannot_be_deleted() {
             error_code(&refused)
         );
 
-        // The user is still there, and so is its key.
+        // The user is still there, and so is its key. The probe is a signed read IAM
+        // authorizes, so the grant AWS requires for it goes on now — after the refusal
+        // above, which is the access key's doing and must stay so.
+        grant_get_user(&router, &case, stored_name).await;
         let access_key_id = element(&created, "AccessKeyId");
         let (status, fetched) = call_signed_by(&router, Some(&access_key_id), "GetUser", &[]).await;
         assert_eq!(

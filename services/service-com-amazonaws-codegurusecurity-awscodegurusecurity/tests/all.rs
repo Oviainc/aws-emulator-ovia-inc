@@ -17,6 +17,8 @@ mod account_configuration;
 mod account_configuration_kms_key;
 #[path = "all/batch_get_findings_classification.rs"]
 mod batch_get_findings_classification;
+#[path = "all/code_artifact_lifetime.rs"]
+mod code_artifact_lifetime;
 #[path = "all/create_scan_idempotency.rs"]
 mod create_scan_idempotency;
 #[path = "all/create_scan_tag_merge.rs"]
