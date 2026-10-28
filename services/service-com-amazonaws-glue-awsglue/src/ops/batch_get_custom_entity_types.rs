@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetCustomEntityTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetCustomEntityTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetCustomEntityTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A batch read over the custom patterns `CreateCustomEntityType` stored: for each name
+//! the request lists, in that order, either the stored pattern is projected into
+//! `CustomEntityTypes` or the name is reported in `CustomEntityTypesNotFound`. A name no
+//! pattern is stored under is a miss, not an error.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetCustomEntityTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetCustomEntityTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetCustomEntityTypes"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on — the way the
+            // single-pattern read reports it (`crate::ops::get_custom_entity_type`).
+            return Err(
+                BatchGetCustomEntityTypesErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue custom entity type store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `CustomEntityTypeNames` is bounded `length 1..50` and each of its elements
+        // `length 1..255` with a pattern, so a batch too large or empty to serve and a
+        // name too long or too short to address a pattern are all refused at the request
+        // boundary: reaching here, the only question per name is whether the account
+        // holds a pattern of that name. The walk keeps the request's order and its
+        // repeats — one answer per REQUESTED name, not per distinct name — and runs in a
+        // critical section scoped to the lookups alone, bounded above by that modelled
+        // list length, with the guard dropped before the answer is built.
+        let (custom_entity_types, not_found) = {
+            // Read-only: each stored pattern is projected out and nothing is written.
+            let store = state.lock();
+            let mut found = Vec::new();
+            let mut not_found = Vec::new();
+            for name in &input.names {
+                match store.custom_entity_types.get(name) {
+                    Some(entry) => found.push(entry.to_custom_entity_type()),
+                    None => not_found.push(name.clone()),
+                }
+            }
+            (found, not_found)
+        };
+
+        ::tracing::info!(
+            operation = "BatchGetCustomEntityTypes",
+            requested = input.names.len(),
+            found = custom_entity_types.len(),
+            not_found = not_found.len(),
+            "read Glue custom entity types in a batch"
+        );
+
+        Ok(BatchGetCustomEntityTypesOutput {
+            // The list of patterns is reported even when empty: a caller that asked for
+            // names none of which resolved still gets the member it reads the answer out
+            // of, and the shape bounds no minimum length on it.
+            custom_entity_types: Some(custom_entity_types),
+            // `CustomEntityTypesNotFound` targets the same `length 1..50` list as the
+            // request's `Names`, so an empty list is not a value of that shape: when
+            // every requested name resolved, the member is absent rather than empty.
+            custom_entity_types_not_found: if not_found.is_empty() {
+                None
+            } else {
+                Some(not_found)
+            },
+        })
     }
 }
