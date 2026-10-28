@@ -268,8 +268,9 @@ async fn assert_creates(table: &str, rows: &[Row]) {
 }
 
 /// Run `rows` through `UpdateEnvironment`, each against its own environment seeded with
-/// `seed` and settled into AVAILABLE: an accepted row is a 200 whose members read back, a
-/// refused one is a 400 that leaves the whole stored record untouched.
+/// `seed` and settled into AVAILABLE: an accepted row is a 200 whose members read back once
+/// the update has landed, a refused one is a 400 that leaves the whole stored record
+/// untouched.
 async fn assert_updates(table: &str, seed: &Value, rows: &[Row]) {
     let harness = Harness::new();
     for (index, row) in rows.iter().enumerate() {
@@ -284,6 +285,7 @@ async fn assert_updates(table: &str, seed: &Value, rows: &[Row]) {
     // One wait for every row: an update is accepted only once the create has settled.
     tokio::time::sleep(PAST_TRANSITION).await;
 
+    let mut accepted: Vec<(usize, String)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let name = env_name(table, index);
         let case = format!("update/{} {}", row.label, row.members);
@@ -295,21 +297,34 @@ async fn assert_updates(table: &str, seed: &Value, rows: &[Row]) {
                 "case {case}: expected UpdateEnvironment 200, got {} {}",
                 answer.status, answer.body
             );
-            let after = harness.environment(&case, &name).await;
-            for (member, value) in row.members.as_object().expect("an object of members") {
-                assert_eq!(
-                    after.get(member),
-                    Some(value),
-                    "case {case}: {member} must read back as the patch left it, got {:?}",
-                    after.get(member)
-                );
-            }
+            accepted.push((index, case));
         } else {
             assert_refused(&case, &answer);
             let after = harness.environment(&case, &name).await;
             assert_eq!(
                 after, before,
                 "case {case}: a refused update must leave the stored record untouched"
+            );
+        }
+    }
+    // An accepted update is read back only once the phase that APPLIES it has come due:
+    // the environment's database is snapshotted first, so a read before that reports the
+    // configuration the environment is still running on. One wait for every row.
+    tokio::time::sleep(PAST_TRANSITION).await;
+
+    for (index, case) in accepted {
+        let name = env_name(table, index);
+        let after = harness.environment(&case, &name).await;
+        for (member, value) in rows[index]
+            .members
+            .as_object()
+            .expect("an object of members")
+        {
+            assert_eq!(
+                after.get(member),
+                Some(value),
+                "case {case}: {member} must read back as the patch left it, got {:?}",
+                after.get(member)
             );
         }
     }
