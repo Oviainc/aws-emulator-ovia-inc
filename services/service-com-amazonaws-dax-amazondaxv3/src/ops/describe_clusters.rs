@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let name = name.to_lowercase();
                 if !store.clusters.contains_key(&name) {
                     return Err(DescribeClustersErrorModeled::ClusterNotFoundFault(
-                        crate::state::cluster_not_found(),
+                        crate::state::cluster_not_found_named(&name),
                     )
                     .into());
                 }

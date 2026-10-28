@@ -235,7 +235,7 @@ async fn a_subnet_group_is_refused_unless_every_identifier_names_an_existing_sub
         )
         .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a refused create leaves nothing behind, got {status} {read:?}"
         );
         assert_eq!(
@@ -571,12 +571,15 @@ async fn a_truncated_event_page_continues_through_its_next_token() {
 }
 
 // ---------------------------------------------------------------------------
-// Cause 3. Rule: a DAX fault's message comes from ONE template owned by that fault, so
-// every operation raising it answers the same text; the template echoes the requested
-// identifier only where that fault's template does.
-// Source: the recorded DAX answers — `ClusterNotFoundFault` "Cluster not found.",
-// `SubnetGroupNotFoundFault` "Subnet group <name> not found.", and the `MaxResults`
-// refusal "Invalid value for max records. Must be between 20 and 100".
+// Cause 3. Rule: a DAX fault's message is built in ONE place, so every operation
+// raising it answers the same text; the only variable part is the identifier a fault
+// names when it was raised while resolving one element of a requested LIST of names,
+// which is the only case where the request does not already say which name failed.
+// Source: the recorded DAX answers — `ClusterNotFoundFault` "Cluster <name> not found."
+// from the describe that takes `ClusterNames` and "Cluster not found." from the
+// single-`ClusterName` paths, `SubnetGroupNotFoundFault` "Subnet group <name> not
+// found.", and the `MaxResults` refusal "Invalid value for max records. Must be
+// between 20 and 100".
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -587,19 +590,32 @@ async fn one_fault_answers_one_message_whatever_operation_raises_it() {
     // that differ in length and casing, none of which is stored.
     let missing = ["gone", "sim2real-dax-missing-5516309b87dc", "MixedCaseGone"];
     for name in missing {
-        let cases: [(&str, Value); 4] = [
-            ("DeleteCluster", json!({ "ClusterName": name })),
-            ("UpdateCluster", json!({ "ClusterName": name })),
+        let cases: [(&str, Value, String); 4] = [
+            (
+                "DeleteCluster",
+                json!({ "ClusterName": name }),
+                "Cluster not found.".to_string(),
+            ),
+            (
+                "UpdateCluster",
+                json!({ "ClusterName": name }),
+                "Cluster not found.".to_string(),
+            ),
             (
                 "IncreaseReplicationFactor",
                 json!({ "ClusterName": name, "NewReplicationFactor": 2 }),
+                "Cluster not found.".to_string(),
             ),
-            ("DescribeClusters", json!({ "ClusterNames": [name] })),
+            (
+                "DescribeClusters",
+                json!({ "ClusterNames": [name] }),
+                format!("Cluster {} not found.", name.to_lowercase()),
+            ),
         ];
-        for (operation, body) in cases {
+        for (operation, body, expected) in cases {
             let (status, answered) = call(&router, operation, body).await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {operation} {name:?}: expected a not-found, got {status} {answered:?}"
             );
             assert_eq!(
@@ -609,7 +625,7 @@ async fn one_fault_answers_one_message_whatever_operation_raises_it() {
             );
             assert_eq!(
                 error_message(&answered),
-                "Cluster not found.",
+                expected,
                 "case {operation} {name:?}: every site answers this fault's own template, \
                  got {answered:?}"
             );
@@ -634,7 +650,7 @@ async fn one_fault_answers_one_message_whatever_operation_raises_it() {
         for (operation, body) in cases {
             let (status, answered) = call(&router, operation, body).await;
             assert_eq!(
-                status, 404,
+                status, 400,
                 "case {operation} {asked:?}: expected a not-found, got {status} {answered:?}"
             );
             assert_eq!(

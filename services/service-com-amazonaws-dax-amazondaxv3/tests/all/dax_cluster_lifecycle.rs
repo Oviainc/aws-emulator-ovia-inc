@@ -394,7 +394,7 @@ async fn the_cluster_lifecycle_round_trips_through_persisted_state() {
         json!({ "ClusterNames": ["demo"] }),
     )
     .await;
-    assert_eq!(status, 404, "DescribeClusters after deletion: got {gone:?}");
+    assert_eq!(status, 400, "DescribeClusters after deletion: got {gone:?}");
     assert_eq!(
         error_code(&gone),
         "ClusterNotFoundFault",
@@ -533,7 +533,7 @@ async fn a_cluster_name_is_accepted_only_when_it_satisfies_the_documented_gramma
         )
         .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {name:?}: a refused create must store nothing, got {status} {described:?}"
         );
     }
@@ -1030,7 +1030,7 @@ async fn a_name_collision_and_a_dangling_reference_are_refused() {
     body["SubnetGroupName"] = json!("no-such-group");
     let (status, refused) = call(&router, "CreateCluster", body).await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "an unknown subnet group is not found, got {status} {refused:?}"
     );
     assert_eq!(
@@ -1045,7 +1045,7 @@ async fn a_name_collision_and_a_dangling_reference_are_refused() {
     )
     .await;
     assert_eq!(
-        status, 404,
+        status, 400,
         "a refused create must store nothing, got {status} {described:?}"
     );
 
@@ -1159,7 +1159,7 @@ async fn a_subnet_groups_vpc_and_zones_come_from_the_regions_network() {
 
 // ---------------------------------------------------------------------------
 // Rule: an operation naming a cluster that does not exist is answered with
-// `ClusterNotFoundFault` (HTTP 404), whatever the operation.
+// `ClusterNotFoundFault`, whatever the operation.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1179,8 +1179,8 @@ async fn an_unknown_cluster_is_not_found_by_every_operation_that_names_one() {
     for (operation, body) in cases {
         let (status, answered) = call(&router, operation, body).await;
         assert_eq!(
-            status, 404,
-            "case {operation}: expected 404, got {status} {answered:?}"
+            status, 400,
+            "case {operation}: expected 400, got {status} {answered:?}"
         );
         assert_eq!(
             error_code(&answered),

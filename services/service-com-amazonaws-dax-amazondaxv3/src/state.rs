@@ -960,8 +960,9 @@ pub fn max_results_out_of_range_message() -> String {
     )
 }
 
-/// The message `ParameterGroupNotFoundFault` carries. Like DAX's other not-found faults
-/// it is generic: the requested name is NOT echoed back.
+/// The message `ParameterGroupNotFoundFault` carries. This fault has one template and
+/// it names no identifier: the requested name is NOT echoed back, on any path that
+/// raises it.
 pub fn parameter_group_not_found_message() -> String {
     "Parameter Group not found.".to_string()
 }
@@ -1024,17 +1025,30 @@ pub fn from_date_time(at: ::aws_smithy_types::DateTime) -> Option<SystemTime> {
 // ---------------------------------------------------------------------------
 // The message each fault answers with
 //
-// DAX words a fault with ONE template, so the message is a property of the FAULT and
-// not of the operation that raises it: every site raising a given fault builds it
-// here, and a template echoes the request only where that fault's template does.
+// A fault's wording is built here and nowhere else, so every site raising it answers
+// the same text. Most DAX faults have ONE template, which makes the message a property
+// of the FAULT rather than of the operation; the exception is a fault raised while
+// resolving one element of a LIST of requested identifiers, where the text names the
+// element that resolved to nothing — that is the only case in which the caller cannot
+// tell from the request which name failed.
 // ---------------------------------------------------------------------------
 
-/// `ClusterNotFoundFault` for a cluster this store does not hold. The template names
-/// no identifier, so every operation that resolves a cluster by name answers with the
-/// same text.
+/// `ClusterNotFoundFault` for a request addressed to ONE cluster: the template names no
+/// identifier, because the request already carries the only name it could mean.
 pub fn cluster_not_found() -> ClusterNotFoundFault {
     ClusterNotFoundFault {
         message: Some("Cluster not found.".to_string()),
+    }
+}
+
+/// `ClusterNotFoundFault` for one element of a requested LIST of cluster names: the
+/// template NAMES that element, so a caller that asked for several clusters can tell
+/// which of them is missing. `name` is the identifier as this service holds it —
+/// `CreateCluster$ClusterName` documents that it "is stored as a lowercase string", so
+/// the lower-cased form is the cluster's identity rather than a rewrite of the request.
+pub fn cluster_not_found_named(name: &str) -> ClusterNotFoundFault {
+    ClusterNotFoundFault {
+        message: Some(format!("Cluster {name} not found.")),
     }
 }
 

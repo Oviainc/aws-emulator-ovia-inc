@@ -177,13 +177,47 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The status this service puts on every client fault: the `awsJson1_1` client-error
+/// status. The fault's shape travels in the body's `__type`, not in the status line.
+const CLIENT_FAULT_STATUS: u16 = 400;
+
+/// The HTTP status THIS service answers a modeled fault with, given the status
+/// `modeled` that the fault's shape declares.
+///
+/// DAX speaks `awsJson1_1` (`smithy_query(query="service_info")` reports
+/// `protocols: ["awsJson1_1"]`), an RPC protocol: every call is a `POST /` whose
+/// operation is named by the `X-Amz-Target` header, so the REST-shaped traits in the
+/// model — `@http`, `@httpError`, `awsQueryError`'s `httpResponseCode` — are inert on
+/// the wire (`smithy_query` reports them as such for this service's faults). The wire
+/// answers every CLIENT fault with 400 and names the fault's shape in the body's
+/// `__type`; the per-shape statuses the model records for client faults (404 on the
+/// `*NotFoundFault` family, 402 on `ServiceQuotaExceededException`) are not what the
+/// endpoint emits. Taking them verbatim makes a 404 say "this endpoint resolved
+/// nothing" — which is how SDK classifiers, proxies and caches read it — for a fault
+/// that is really about the request's CONTENT.
+///
+/// A SERVER fault keeps the status the model gives it: a 5xx is exactly what an SDK
+/// must see to retry, and nothing here may flatten one into a client fault.
+///
+/// It is one function for the whole service on purpose: a per-operation copy is what
+/// lets two operations disagree about one fault's status.
+pub fn wire_status(modeled: u16) -> u16 {
+    if (400..500).contains(&modeled) {
+        CLIENT_FAULT_STATUS
+    } else {
+        modeled
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service's
+    /// wire answers that fault with — see [`wire_status`], the one place that decides
+    /// it for every operation.
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -278,14 +312,17 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         }
     }
 
-    /// 501 for the scaffold signal.
+    /// 501 for the scaffold signal, [`wire_status`] for a modeled fault.
     ///
-    /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
-    /// retryable, so a client would retry an operation that can never succeed.
+    /// Keep the 501 and not a 5xx server fault: SDK retry classifiers treat those as
+    /// retryable, so a client would retry an operation that can never succeed. Neither
+    /// the scaffold signal nor the synthetic `ValidationException` is a modeled DAX
+    /// fault, so neither goes through [`wire_status`]: both already carry the status
+    /// this service's wire protocol puts on them.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => wire_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

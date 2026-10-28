@@ -290,7 +290,7 @@ async fn the_default_parameter_group_is_identified_by_its_family() {
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ParameterGroupNotFoundFault"),
+            (400, "ParameterGroupNotFoundFault"),
             "case {absent:?}: only the family-qualified name resolves, got {status} {body:?}"
         );
     }
@@ -335,7 +335,7 @@ async fn the_default_parameter_group_is_identified_by_its_family() {
 // ---------------------------------------------------------------------------
 
 /// A name that names no stored group is answered with `ParameterGroupNotFoundFault`
-/// (HTTP 404) by both the describe and the delete — including a name that only differs
+/// by both the describe and the delete — including a name that only differs
 /// from a stored one in case, and a name whose group has just been deleted.
 #[tokio::test]
 async fn an_unknown_parameter_group_name_is_refused_with_not_found() {
@@ -359,8 +359,8 @@ async fn an_unknown_parameter_group_name_is_refused_with_not_found() {
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ParameterGroupNotFoundFault"),
-            "case {absent:?}: describe of an absent group must be 404 \
+            (400, "ParameterGroupNotFoundFault"),
+            "case {absent:?}: describe of an absent group must be 400 \
              ParameterGroupNotFoundFault, got {status} {body:?}"
         );
         assert!(
@@ -380,8 +380,8 @@ async fn an_unknown_parameter_group_name_is_refused_with_not_found() {
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ParameterGroupNotFoundFault"),
-            "case {absent:?}: delete of an absent group must be 404 \
+            (400, "ParameterGroupNotFoundFault"),
+            "case {absent:?}: delete of an absent group must be 400 \
              ParameterGroupNotFoundFault, got {status} {body:?}"
         );
     }
@@ -396,7 +396,7 @@ async fn an_unknown_parameter_group_name_is_refused_with_not_found() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ParameterGroupNotFoundFault"),
+        (400, "ParameterGroupNotFoundFault"),
         "a mixed list must be refused on the absent name, got {status} {body:?}"
     );
 }
@@ -664,7 +664,7 @@ async fn deleting_a_parameter_group_removes_it_from_the_store() {
         .await;
         assert_eq!(
             (status, error_code(&read).as_str()),
-            (404, "ParameterGroupNotFoundFault"),
+            (400, "ParameterGroupNotFoundFault"),
             "case {name:?}: a deleted group is gone, got {status} {read:?}"
         );
     }
@@ -809,7 +809,7 @@ async fn deleting_a_parameter_group_a_cluster_uses_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&read).as_str()),
-        (404, "ParameterGroupNotFoundFault"),
+        (400, "ParameterGroupNotFoundFault"),
         "the group is gone after the delete, got {status} {read:?}"
     );
 }
@@ -880,7 +880,7 @@ async fn a_create_past_the_parameter_group_bound_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&read).as_str()),
-        (404, "ParameterGroupNotFoundFault"),
+        (400, "ParameterGroupNotFoundFault"),
         "case one past the bound: the refused name must name no group, got {status} {read:?}"
     );
 }
