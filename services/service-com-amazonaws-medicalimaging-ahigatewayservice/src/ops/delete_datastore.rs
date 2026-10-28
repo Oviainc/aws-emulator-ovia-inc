@@ -14,7 +14,8 @@
 //!
 //! The model documents a precondition — "before a data store can be deleted, you must
 //! first delete all image sets within it" — so a store that still owns image sets is
-//! refused with `ConflictException`.
+//! refused with `ConflictException`, worded by that rule and nothing else
+//! ([`crate::state::DATASTORE_STILL_HOLDS_IMAGE_SETS_MESSAGE`]).
 //!
 //! The same `ConflictException` ("Updating or deleting a resource can cause an
 //! inconsistent state") refuses the delete of a store whose CREATION is still in flight:
@@ -183,10 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleting every image set in a store would never unblock the store's own delete.
         if datastore.held_image_sets().next().is_some() {
             return Err(DeleteDatastoreErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Datastore {} still contains image sets; delete them before deleting the data store",
-                    datastore.datastore_id
-                ),
+                // Constant, and stated by the RULE the model documents rather than by
+                // which store held what: no identifier from the request and no count of
+                // its contents, exactly like the two refusals above
+                // (`crate::state::DATASTORE_STILL_HOLDS_IMAGE_SETS_MESSAGE`).
+                message: crate::state::DATASTORE_STILL_HOLDS_IMAGE_SETS_MESSAGE.to_string(),
             })
             .into());
         }

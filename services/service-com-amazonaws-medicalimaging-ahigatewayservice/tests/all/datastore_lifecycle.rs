@@ -219,25 +219,47 @@ impl Emulator {
     }
 
     /// Create a data store and wait out the activation the clock owes it, so a case
-    /// that is not about the transition starts from an `ACTIVE` store.
+    /// that is not about the transition starts from an `ACTIVE` store. Signed for
+    /// [`DEFAULT_TEST_REGION`]; [`Emulator::active_datastore_in`] chooses the region.
     pub(crate) async fn active_datastore(&self, datastore_name: &str, client_token: &str) -> String {
+        self.active_datastore_in(DEFAULT_TEST_REGION, datastore_name, client_token)
+            .await
+    }
+
+    /// [`Emulator::active_datastore`], in the region the create and the read are both
+    /// addressed to — a data store exists in ONE region, so a case about a store
+    /// elsewhere starts here.
+    pub(crate) async fn active_datastore_in(
+        &self,
+        region: &str,
+        datastore_name: &str,
+        client_token: &str,
+    ) -> String {
         let created = self
-            .create_datastore(json!({
-                "datastoreName": datastore_name,
-                "clientToken": client_token,
-            }))
+            .call_in(
+                region,
+                "POST",
+                "/datastore",
+                Some(json!({
+                    "datastoreName": datastore_name,
+                    "clientToken": client_token,
+                })),
+            )
             .await;
         assert_eq!(
             created.status, 200,
-            "create {datastore_name}: expected 200, got {created:?}"
+            "create {datastore_name} in {region}: expected 200, got {created:?}"
         );
         let datastore_id = created.string(&["datastoreId"]);
         tokio::time::sleep(SETTLE_MULTIPLE * DATASTORE_ACTIVATION_DELAY).await;
-        let read = self.get_datastore(&datastore_id).await;
+        let read = self
+            .call_in(region, "GET", &format!("/datastore/{datastore_id}"), None)
+            .await;
         assert_eq!(
             read.string(&["datastoreProperties", "datastoreStatus"]),
             "ACTIVE",
-            "create {datastore_name}: expected ACTIVE after the activation span, got {read:?}"
+            "create {datastore_name} in {region}: expected ACTIVE after the activation span, \
+             got {read:?}"
         );
         datastore_id
     }

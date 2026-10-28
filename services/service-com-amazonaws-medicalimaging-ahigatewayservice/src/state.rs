@@ -246,6 +246,14 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 // A malformed resource ARN is NOT one of them: the ARN parse runs before constraint
 // validation, so `crate::service` answers it with the modelled `BadRequestException`
 // and [`MALFORMED_ARN_MESSAGE`] instead.
+//
+// Over all three, and over the state-conflict texts below them, one shape holds: a
+// refusal sentence states the RULE the request broke, as a constant of this module, and
+// carries no identifier naming the resource the request addressed — a store id, an image
+// set id, a job id, an ARN or a token. The only request-derived value any of them
+// interpolates is a COUNT measured against a bound the same sentence names
+// ([`too_many_tags_message`]), which says which side of the published limit the caller landed
+// on and names no resource.
 // ---------------------------------------------------------------------------
 
 /// The text this service answers a request naming a data store it does not hold with.
@@ -350,6 +358,19 @@ pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str =
 /// status it refuses is `CREATING`.
 pub const DATASTORE_STILL_CREATING_MESSAGE: &str =
     "The data store is still being created, so it cannot be deleted yet.";
+
+/// The text this service refuses the DELETE of a data store that still holds image sets
+/// with.
+///
+/// The model states the precondition the sentence restates — "before a data store can be
+/// deleted, you must first delete all image sets within it" — so the refusal is worded by
+/// that RULE: a constant carrying neither the data store it was nor how many image sets
+/// it held, exactly like [`DATASTORE_STILL_CREATING_MESSAGE`] above it, the sibling
+/// refusal of the same operation. AWS's own wording for this conflict is not recorded, so
+/// the spelling is chosen by analogy; what is NOT chosen is the shape.
+pub const DATASTORE_STILL_HOLDS_IMAGE_SETS_MESSAGE: &str =
+    "The data store still contains image sets, which must all be deleted before the data \
+     store can be deleted.";
 
 /// The storage tier every image set this emulator holds reports.
 ///
