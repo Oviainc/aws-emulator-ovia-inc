@@ -226,11 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested = i64::from(input.visibility_timeout);
         if requested < min || requested > max {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                sqs::invalid_parameter_message(
-                    &requested.to_string(),
-                    sqs::VISIBILITY_TIMEOUT,
-                    &format!("{} must be >= {min} and <= {max}.", sqs::VISIBILITY_TIMEOUT),
-                ),
+                sqs::visibility_timeout_out_of_range_message(requested),
             ));
         }
 
@@ -304,6 +300,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 }
             },
+            // A handle this queue minted for a message it STILL holds that a later
+            // receive replaced is a lease that has run out: the message is another
+            // consumer's now, so the caller has to receive again rather than retry or
+            // re-address, which is what this refusal states.
+            Err(sqs::VisibilityRefusal::ExpiredHandle) => {
+                Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    sqs::receipt_handle_expired_message(&input.receipt_handle),
+                ))
+            }
             Err(sqs::VisibilityRefusal::BeyondLimit) => {
                 Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                     sqs::visibility_beyond_limit_message(requested, max),

@@ -479,6 +479,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut successful = Vec::with_capacity(accepted);
         let mut failed = Vec::new();
+        // Who these messages are FROM, read once from the credential that signed this
+        // request: every entry of one batch arrived on the same send.
+        let sender_id = sqs::authorization::sender_id(&*self.engine, ctx);
         for outcome in outcomes {
             let prepared = match outcome {
                 Ok(prepared) => prepared,
@@ -525,6 +528,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message_deduplication_id: prepared.deduplication_id,
                 sequence_number: sequence_number.clone(),
                 sent_at: now,
+                // The queue this send enqueues the entry in is the one it was sent to, so
+                // its retention runs from the same instant.
+                retention_from: now,
+                sender_id: sender_id.clone(),
                 available_at: sqs::after(now, prepared.delay),
                 invisible_until: None,
                 receive_count: 0,

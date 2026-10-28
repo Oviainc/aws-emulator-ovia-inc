@@ -207,11 +207,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A task belongs to the region of the group it syncs, and only that region's
+        // callers see it, so this listing enumerates the tasks of the region the
+        // request addressed and no other — which is also the listing a token belongs
+        // to, read before any token is.
+        let region = crate::state::request_region(ctx.parts());
+
         // The token is this service's own opaque encoding of the task ARN the
-        // previous page stopped at; anything else cannot name a resume point.
+        // previous page stopped at, in THIS region's listing; anything else cannot
+        // name a resume point.
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) => match crate::state::decode_page_token(LISTING, token) {
+            Some(token) => match crate::state::decode_page_token(&region, LISTING, token) {
                 Some(key) => Some(key),
                 None => {
                     return Err(bad_request(
@@ -226,10 +233,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_page_size =
             crate::state::page_size(input.max_results).map_err(bad_request)?;
 
-        // A task belongs to the region of the group it syncs, and only that region's
-        // callers see it, so this listing enumerates the tasks of the region the
-        // request addressed and no other.
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         // Each entry's identifiers are resolved ONCE here rather than once per task:
         // resolving reads the stored GROUPS and the scan below walks the stored
@@ -288,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = (page.len() < matching.len())
             .then(|| {
                 page.last()
-                    .map(|task| crate::state::encode_page_token(LISTING, &task.task_arn))
+                    .map(|task| crate::state::encode_page_token(&region, LISTING, &task.task_arn))
             })
             .flatten();
 
@@ -300,7 +303,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The listing this operation's pagination tokens belong to: a token issued here
-/// resumes THIS listing and no other.
+/// resumes THIS listing and no other. The region the request addressed is the
+/// other half of that listing's identity, and is carried beside this name by the
+/// token codec ([`crate::state::encode_page_token`]), since this listing
+/// enumerates one region's tasks.
 const LISTING: &str = "tag-sync-tasks";
 
 /// The most `Filters` entries this operation applies to one call.

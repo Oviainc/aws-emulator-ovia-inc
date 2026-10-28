@@ -89,12 +89,13 @@ const REQUEST_ENVELOPE_ALLOWANCE_BYTES: usize = 64 * 1024;
 
 /// The largest HTTP request body this service reads at all.
 ///
-/// The biggest payload any Amazon SQS request can carry is one maximum-size message:
-/// `SendMessageRequest$MessageBody` documents its maximum as "The minimum size is one
-/// character. The maximum size is 1 MiB or 1,048,576 bytes", and a whole batch's bodies
-/// are bounded by that same figure ([`crate::state::maximum_batch_payload_bytes`]), which
-/// is why the ceiling is read from there rather than written out a second time. Beyond it
-/// sits [`REQUEST_ENVELOPE_ALLOWANCE_BYTES`] for the request wrapped around that payload.
+/// The biggest payload any Amazon SQS request can carry is the largest batch a batch
+/// operation can be asked to judge — ten maximum-size messages
+/// ([`crate::state::maximum_request_payload_bytes`]) — because a batch over the service's
+/// payload ceiling is refused by the OPERATION, with the modelled `BatchRequestTooLong`
+/// naming the limit it broke, which it can only do once the request has been read. The
+/// ceiling is read from there rather than written out a second time. Beyond it sits
+/// [`REQUEST_ENVELOPE_ALLOWANCE_BYTES`] for the request wrapped around that payload.
 ///
 /// A body larger than the sum cannot carry a payload this service would accept however it
 /// is spelled, so it is refused by the TRANSPORT — a bare HTTP 413 with no error document
@@ -112,7 +113,7 @@ const REQUEST_ENVELOPE_ALLOWANCE_BYTES: usize = 64 * 1024;
 /// the same place `service-com-amazonaws-codecommit-codecommit-20150413` keeps the one
 /// for its git transport.
 pub fn max_request_body_bytes() -> usize {
-    usize::try_from(crate::state::maximum_batch_payload_bytes())
+    usize::try_from(crate::state::maximum_request_payload_bytes())
         .unwrap_or(usize::MAX)
         .saturating_add(REQUEST_ENVELOPE_ALLOWANCE_BYTES)
 }

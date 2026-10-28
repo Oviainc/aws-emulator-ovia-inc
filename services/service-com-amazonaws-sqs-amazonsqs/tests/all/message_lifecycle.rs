@@ -399,16 +399,18 @@ async fn a_handle_the_queue_never_minted_is_receipt_handle_is_invalid() {
     }
 }
 
-/// Re-receiving a message replaces its receipt handle rather than adding another: only
-/// the most recently received handle deletes the message, and a loop of receives leaves
-/// exactly one live handle however many times it runs — so the handle map cannot grow
-/// with the request count.
+/// Re-receiving a message mints a new receipt handle and keeps ONE live handle for it,
+/// while every handle an earlier receive minted still names that message for as long as
+/// the queue holds it: on a standard queue a consumer that kept the handle it was first
+/// handed still acts on the message, and the newest handle deletes it.
 ///
 /// The rule is Amazon SQS's own: "If you receive a message more than once, each time you
-/// receive it, you get a different receipt handle. You must provide the most recently
-/// received receipt handle when you request to delete the message."
+/// receive it, you get a different receipt handle", and a handle is tied to the MESSAGE —
+/// so it stays usable while the message exists rather than only until the next receive.
+/// (A FIFO queue is the exception, where the receive takes the lease with it; that is
+/// [`super::receipt_handle_leases`]'s rule.)
 #[tokio::test]
-async fn only_the_most_recently_received_handle_deletes_a_message() {
+async fn re_receiving_mints_a_handle_without_retiring_the_one_before_it() {
     let sqs = Emulator::new();
     let url = sqs.create_queue("handle-churn-queue").await;
     sqs.call(
@@ -419,7 +421,7 @@ async fn only_the_most_recently_received_handle_deletes_a_message() {
 
     let mut previous: Option<String> = None;
     // Many receives of the SAME still-visible message, the shape that would accumulate
-    // one handle per request if a receive added rather than replaced.
+    // one live handle per request if a receive added rather than replaced.
     for round in 0..50 {
         let (status, received) = sqs
             .call(
@@ -443,22 +445,24 @@ async fn only_the_most_recently_received_handle_deletes_a_message() {
                 stale, handle,
                 "case round {round}: each receive must mint a different handle"
             );
+            // The handle the receive before this one minted still names the message, so a
+            // call carrying it is served rather than refused. Asked through a visibility
+            // change, which leaves the message visible for the next round.
             let (status, answer) = sqs
                 .call(
-                    "DeleteMessage",
-                    &json!({ "QueueUrl": url, "ReceiptHandle": stale }),
+                    "ChangeMessageVisibility",
+                    &json!({ "QueueUrl": url, "ReceiptHandle": stale, "VisibilityTimeout": 0 }),
                 )
                 .await;
             assert_eq!(
-                (status, error_code(&answer).as_str()),
-                (404, "ReceiptHandleIsInvalid"),
-                "case round {round}: the superseded handle must no longer be live, \
-                 got {status} {answer:?}"
+                status, 200,
+                "case round {round}: the handle of an earlier receive still names the \
+                 message, got {status} {answer:?}"
             );
         }
     }
 
-    // Only the newest handle deletes it, and the message really goes.
+    // The newest handle deletes it, and the message really goes.
     let newest = previous.expect("a handle from the last receive");
     let (status, answer) = sqs
         .call(

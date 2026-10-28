@@ -267,14 +267,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateQueueErrorModeled::InvalidAttributeValue(error)
             }
         })?;
-        // A policy document is judged when it is WRITTEN: one naming an action outside
-        // this service's action set, or a principal that does not exist, can never grant
+        // A policy document is judged when it is WRITTEN: one naming an action outside the
+        // set a policy may state, or a principal that does not exist, can never grant
         // anything, so no queue is created carrying it.
-        if let Some(error) = supplied
+        if let Some(refusal) = supplied
             .get(state::POLICY)
             .and_then(|value| state::authorization::policy_refusal(&*self.engine, value))
         {
-            return Err(CreateQueueErrorModeled::InvalidAttributeValue(error).into());
+            return Err(match refusal {
+                state::authorization::PolicyRefusal::Document(error) => {
+                    CreateQueueErrorModeled::InvalidAttributeValue(error).into()
+                }
+                state::authorization::PolicyRefusal::ActionName(message) => {
+                    crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+                }
+            });
         }
 
         // The documented defaults, overlaid with what this request supplied: the
@@ -384,6 +391,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A queue nobody has deleted a message from yet has retired no receipt
             // handle.
             deleted_handles: ::std::collections::VecDeque::new(),
+            // Nor has any receive of it been superseded by a later one.
+            superseded_handles: ::std::collections::VecDeque::new(),
             deduplication: ::std::collections::BTreeMap::new(),
             receive_attempts: ::std::collections::BTreeMap::new(),
             // Nothing has been sequenced yet, so the first message this queue
@@ -396,6 +405,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A queue nobody has purged holds no purge instant, so the first
             // `PurgeQueue` on it is accepted.
             purged_at: None,
+            // No receive has handed anything over yet, so the first FIFO receive starts
+            // its walk at the oldest message group.
+            group_cursor: None,
         };
         store.insert_queue(queue);
 

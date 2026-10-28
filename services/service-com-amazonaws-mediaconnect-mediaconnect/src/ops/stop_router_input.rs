@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopRouterInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopRouterInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopRouterInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the STORED router input its ARN addresses: the input enters the non-terminal
+//! `STOPPING` state and the clock settles it into `STANDBY` one
+//! [`crate::state::TRANSITION_SPAN`] later, which is where a created input also waits
+//! before anything starts it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopRouterInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopRouterInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopRouterInputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router input store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The lookup materialises everything the clock already made due before the stop is
+        // judged — the state change an earlier call owes, and the removal of an input whose
+        // deletion has finished, which is what makes such an input a not-found rather than
+        // something this call can still stop.
+        let Some(router_input) = store.router_input_mut(&input.arn, now) else {
+            return Err(StopRouterInputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // A stop MOVES the input's state, so it cannot be accepted for an input that is on
+        // its way out, or one the clock already owes a DIFFERENT state (a create still
+        // settling, a restart still recovering): the input is leaving or between two states,
+        // which is the conflict `ConflictException` describes ("would cause a conflict with
+        // the current state of a service resource associated with the request", 409 and
+        // retryable — the caller retries once the transition it is waiting on has settled).
+        // The status and the error code are the contract; the sentence states the
+        // precondition, and carries neither of this service's refusal envelopes, which word
+        // a `BadRequestException` (`crate::state::validation_failed_message`) and a
+        // `NotFoundException` (`crate::state::not_found_message`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopRouterInput"))
+        // The on-its-way-out case is judged FIRST, before the already-stopped one below, so
+        // an input whose removal is owed is refused whatever state it is reported in rather
+        // than answered as a stop that succeeded.
+        let conflict = |router_input: &crate::state::StoredRouterInput| {
+            StopRouterInputErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Router input {} is in state {} and a state change is already in \
+                     progress, so it cannot be stopped yet.",
+                    router_input.arn, router_input.state
+                ),
+            })
+        };
+        if router_input.is_deleting() {
+            return Err(conflict(router_input).into());
+        }
+
+        // An input that is already stopped, or already on its way there, keeps the state it
+        // is in: a repeat of the stop answers the same thing rather than restarting the
+        // transition the first one began. Skipping the conflict check below for those two
+        // states masks no other transition: a record the clock owes a state is parked in a
+        // non-terminal one by `begin_transition`, `STANDBY` is settled, and the only
+        // transition that reports `STOPPING` is this operation's own one towards `STANDBY`.
+        let already_stopped = router_input.state == crate::state::ROUTER_INPUT_STATE_STANDBY
+            || router_input.state == crate::state::ROUTER_INPUT_STATE_STOPPING;
+
+        if !already_stopped {
+            if router_input.is_transitioning() {
+                return Err(conflict(router_input).into());
+            }
+
+            // Stopping is not instantaneous: the input reports `STOPPING` and the clock owes
+            // it `STANDBY` — not running, where a created input also waits — one transition
+            // span later, so a caller that reads the input straight afterwards still sees
+            // the stop in flight.
+            router_input.begin_transition(
+                crate::state::ROUTER_INPUT_STATE_STOPPING,
+                crate::state::ROUTER_INPUT_STATE_STANDBY,
+                now,
+            );
+            // The stop changed the resource, so the record's `UpdatedAt` moves with it.
+            router_input.updated_at = now;
+        }
+
+        // The response is the STORED record: "the current state of the router input after
+        // being stopped".
+        Ok(StopRouterInputOutput {
+            arn: router_input.arn.clone(),
+            name: router_input.name.clone(),
+            state: router_input.state.clone(),
+        })
     }
 }

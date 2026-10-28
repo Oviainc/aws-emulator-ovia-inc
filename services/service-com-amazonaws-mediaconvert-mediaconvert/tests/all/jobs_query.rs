@@ -438,6 +438,101 @@ async fn a_query_reports_submitted_until_its_completion_comes_due() {
     );
 }
 
+/// A query's result page is reported WHOLE or not at all: both the jobs it matched and
+/// the cursor for the batch after them appear only once the query has completed, so a
+/// caller polling a query that is still `SUBMITTED` is never handed a cursor past a page
+/// it has not been shown.
+///
+/// The table spans the page sizes the three seeded jobs can be cut into — no `maxResults`
+/// at all, and every size from one match per page up to one page for all of them — so it
+/// covers both a page with a further batch behind it (a cursor to withhold) and a page
+/// that is the last one (no cursor either way).
+#[tokio::test]
+async fn a_held_query_reports_neither_half_of_its_page() {
+    let emulator = Emulator::new();
+    pin_query_span(&emulator, HELD_IN_SUBMITTED);
+    seed_jobs(&emulator).await;
+
+    // (case, maxResults, the page size once complete, whether a further batch exists)
+    let cases: [(&str, Option<usize>, usize, bool); 4] = [
+        ("no maxResults", None, 3, false),
+        ("maxResults 1", Some(1), 1, true),
+        ("maxResults 2", Some(2), 2, true),
+        ("maxResults 3", Some(3), 3, false),
+    ];
+
+    for (case, max_results, page_size, has_more) in cases {
+        let mut body = json!({});
+        if let Some(max_results) = max_results {
+            body["maxResults"] = json!(max_results);
+        }
+
+        // Held in SUBMITTED: the status, and neither half of the page.
+        let started = start_query(&emulator, body.clone()).await;
+        assert_eq!(
+            started.status, 201,
+            "case {case:?}: StartJobsQuery must answer HTTP 201, got {} with body {}",
+            started.status, started.body
+        );
+        let held = started.string("/id");
+        for poll in ["first poll", "second poll"] {
+            let pending = query_results(&emulator, &held).await;
+            assert_eq!(
+                pending.string("/status"),
+                "SUBMITTED",
+                "case {case:?} ({poll}): a held query must still be SUBMITTED, got {}",
+                pending.body
+            );
+            assert!(
+                pending.at("/jobs").is_null(),
+                "case {case:?} ({poll}): a query that has not completed reports no jobs, \
+                 got {}",
+                pending.body
+            );
+            assert!(
+                pending.at("/nextToken").is_null(),
+                "case {case:?} ({poll}): a query that has not completed reports no cursor \
+                 either, got {}",
+                pending.body
+            );
+        }
+
+        // The same query with a span the case can wait past: now BOTH halves are there,
+        // the cursor exactly when a further batch exists.
+        pin_query_span(&emulator, SHORT_QUERY);
+        let completed = run_query(&emulator, body.clone()).await;
+        let page = result_ids(&completed);
+        assert_eq!(
+            page.len(),
+            page_size,
+            "case {case:?}: a completed query reports {page_size} jobs, got {page:?} from \
+             body {}",
+            completed.body
+        );
+        let cursor = completed.at("/nextToken").as_str().map(str::to_string);
+        assert_eq!(
+            cursor.is_some(),
+            has_more,
+            "case {case:?}: expected a cursor present={has_more}, got {cursor:?} from body \
+             {}",
+            completed.body
+        );
+        // A cursor the completed query did report starts the batch after that page.
+        if let Some(cursor) = cursor {
+            let mut next_body = body.clone();
+            next_body["nextToken"] = json!(cursor);
+            let next = run_query(&emulator, next_body).await;
+            let next_page = result_ids(&next);
+            assert!(
+                !next_page.is_empty() && next_page.iter().all(|id| !page.contains(id)),
+                "case {case:?}: the cursor must start the batch after {page:?}, got \
+                 {next_page:?}"
+            );
+        }
+        pin_query_span(&emulator, HELD_IN_SUBMITTED);
+    }
+}
+
 /// The page a query matched is fixed when the query completes: polling it again reports
 /// the same jobs, and a job created after the query completed is not in it.
 #[tokio::test]

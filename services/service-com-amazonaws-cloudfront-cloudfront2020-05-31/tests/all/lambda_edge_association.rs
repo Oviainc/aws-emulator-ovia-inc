@@ -9,7 +9,9 @@
 //! configuration whose association names anything else — a value that is no Lambda function
 //! ARN, the unqualified function ARN, the `$LATEST` of a function nobody published, or an
 //! alias name — is refused with `InvalidLambdaFunctionAssociation` (HTTP 400) and NOTHING is
-//! created or changed.
+//! created or changed. The refusal states the version requirement and then names the
+//! refused entry's `LambdaFunctionARN`, which the rows assert on
+//! (`lambda_edge_association_message` spans that echoed value on its own).
 //!
 //! What the rows span: an association qualified with a one-digit and a many-digit version
 //! number; the unqualified ARN; `$LATEST`; an alias qualifier, including one spelled with
@@ -31,20 +33,26 @@ use crate::distribution_lifecycle::{
     update_distribution, Answer, API_VERSION,
 };
 
-/// The sentence this refusal carries, spelled out here rather than imported from the
-/// implementation: it is CloudFront's own text for this error class, so a constant edited
-/// to some other wording fails these rows.
-const REFUSAL_MESSAGE: &str = concat!(
+/// The fixed part of this refusal's message, spelled out here rather than imported from
+/// the implementation: it is CloudFront's own text for this error class, so a constant
+/// edited to some other wording fails these rows. The refused association's
+/// `LambdaFunctionARN` follows it, which is what [`refusal_message`] builds.
+pub(crate) const REFUSAL_PREFIX: &str = concat!(
     "The function ARN must reference a specific function version. ",
-    "(The ARN must end with the version number.)"
+    "(The ARN must end with the version number.) ARN: "
 );
+
+/// The whole message the refusal of an association naming `arn` has to carry.
+pub(crate) fn refusal_message(arn: &str) -> String {
+    format!("{REFUSAL_PREFIX}{arn}")
+}
 
 /// One Lambda@Edge association a row submits: the ARN it names and the event type it fires
 /// on (one of `EventType`'s four values).
 #[derive(Debug, Clone, Copy)]
-struct Association {
-    arn: &'static str,
-    event_type: &'static str,
+pub(crate) struct Association {
+    pub(crate) arn: &'static str,
+    pub(crate) event_type: &'static str,
 }
 
 impl Association {
@@ -81,7 +89,7 @@ fn associations_xml(associations: &[Association]) -> String {
 
 /// Which cache behaviour of a configuration carries the associations under test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Behavior {
+pub(crate) enum Behavior {
     /// `DefaultCacheBehavior` — the one every distribution has.
     Default,
     /// One entry of `CacheBehaviors` — the ordered behaviours, which declare the same
@@ -94,7 +102,29 @@ enum Behavior {
 /// Members are written in the order the shapes declare them (`DefaultCacheBehavior`:
 /// `TargetOriginId`, `ViewerProtocolPolicy`, `LambdaFunctionAssociations`; `CacheBehavior`
 /// prefixes that with `PathPattern`).
-fn config_xml(reference: &str, behavior: Behavior, associations: &[Association]) -> String {
+pub(crate) fn config_xml(
+    reference: &str,
+    behavior: Behavior,
+    associations: &[Association],
+) -> String {
+    match behavior {
+        Behavior::Default => config_xml_per_behavior(reference, Some(associations), None),
+        Behavior::Ordered => config_xml_per_behavior(reference, None, Some(associations)),
+    }
+}
+
+/// The `DistributionConfig` body for `reference` with the associations each cache behaviour
+/// carries stated separately: `None` leaves that behaviour without the member at all (and,
+/// for the ordered one, without any `CacheBehaviors` at all), while `Some(&[])` states the
+/// empty wrapper.
+///
+/// The ONE body these suites submit, so a row that puts associations on BOTH behaviours
+/// states the same configuration as a row that puts them on one.
+pub(crate) fn config_xml_per_behavior(
+    reference: &str,
+    default: Option<&[Association]>,
+    ordered: Option<&[Association]>,
+) -> String {
     let mut out = format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{reference}</CallerReference>\
@@ -106,11 +136,11 @@ fn config_xml(reference: &str, behavior: Behavior, associations: &[Association])
          <DefaultCacheBehavior><TargetOriginId>primary</TargetOriginId>\
          <ViewerProtocolPolicy>redirect-to-https</ViewerProtocolPolicy>"
     );
-    if behavior == Behavior::Default {
+    if let Some(associations) = default {
         out.push_str(&associations_xml(associations));
     }
     out.push_str("</DefaultCacheBehavior>");
-    if behavior == Behavior::Ordered {
+    if let Some(associations) = ordered {
         out.push_str(
             "<CacheBehaviors><Quantity>1</Quantity><Items>\
              <CacheBehavior><PathPattern>/images/*</PathPattern>\
@@ -127,7 +157,7 @@ fn config_xml(reference: &str, behavior: Behavior, associations: &[Association])
 
 /// `POST /2020-05-31/distribution?WithTags`, so the rule is asserted on the second create
 /// path too — both run the one create.
-async fn create_distribution_with_tags(
+pub(crate) async fn create_distribution_with_tags(
     router: &smithy_server_runtime::MultiServiceRouter,
     config: &str,
 ) -> Answer {
@@ -152,6 +182,9 @@ struct Case {
     associations: &'static [Association],
     /// `true` when every association names a published function version.
     accepted: bool,
+    /// For a refused row, the ARN the refusal has to name: the first association of the
+    /// configuration that breaks the rule. Empty on an accepted row.
+    refused_arn: &'static str,
 }
 
 /// A function version qualifier: the number Lambda assigns when a version is published.
@@ -163,6 +196,7 @@ fn cases() -> Vec<Case> {
             case: "no-association",
             associations: &[],
             accepted: true,
+            refused_arn: "",
         },
         Case {
             case: "version-1",
@@ -171,6 +205,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: true,
+            refused_arn: "",
         },
         Case {
             // A version number is however many digits the function has versions.
@@ -180,6 +215,7 @@ fn cases() -> Vec<Case> {
                 event_type: "origin-response",
             }],
             accepted: true,
+            refused_arn: "",
         },
         Case {
             // Another account and a function name spelled with the other characters a
@@ -194,6 +230,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-response",
             }],
             accepted: true,
+            refused_arn: "",
         },
         Case {
             // Four associations, one per event type, each on a published version.
@@ -217,6 +254,7 @@ fn cases() -> Vec<Case> {
                 },
             ],
             accepted: true,
+            refused_arn: "",
         },
         Case {
             // The function ARN with no qualifier at all: it addresses the function, not one
@@ -227,6 +265,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-greeter",
         },
         Case {
             case: "latest-qualifier",
@@ -235,6 +274,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-greeter:$LATEST",
         },
         Case {
             case: "alias-qualifier",
@@ -243,6 +283,7 @@ fn cases() -> Vec<Case> {
                 event_type: "origin-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-greeter:live",
         },
         Case {
             // An alias name may carry digits; it is still a name, not a version number.
@@ -252,6 +293,7 @@ fn cases() -> Vec<Case> {
                 event_type: "origin-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-greeter:v2",
         },
         Case {
             // Published versions count from 1, so no function has a version 0.
@@ -261,6 +303,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-greeter:0",
         },
         Case {
             case: "version-leading-zero",
@@ -269,6 +312,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-greeter:01",
         },
         Case {
             case: "empty-qualifier",
@@ -277,6 +321,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-greeter:",
         },
         Case {
             // A versioned ARN of another service is no Lambda function version.
@@ -286,6 +331,7 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: false,
+            refused_arn: "arn:aws:states:us-east-1:000000000000:stateMachine:edge-greeter:1",
         },
         Case {
             case: "not-an-arn-at-all",
@@ -294,9 +340,11 @@ fn cases() -> Vec<Case> {
                 event_type: "viewer-request",
             }],
             accepted: false,
+            refused_arn: "edge-greeter:1",
         },
         Case {
-            // Every association is held to the rule, not just the first one.
+            // Every association is held to the rule, not just the first one, and the
+            // refusal names the entry that broke it rather than the first entry.
             case: "second-association-unqualified",
             associations: &[
                 Association {
@@ -309,12 +357,13 @@ fn cases() -> Vec<Case> {
                 },
             ],
             accepted: false,
+            refused_arn: "arn:aws:lambda:us-east-1:000000000000:function:edge-logger",
         },
     ]
 }
 
 /// Every `LambdaFunctionARN` the response reports, wherever it carries one.
-fn reported_arns(answer: &Answer) -> Vec<String> {
+pub(crate) fn reported_arns(answer: &Answer) -> Vec<String> {
     fn walk(node: &crate::distribution_lifecycle::Node, out: &mut Vec<String>) {
         if node.children.is_empty() {
             return;
@@ -400,10 +449,11 @@ async fn an_edge_association_is_stored_only_for_a_published_function_version() {
                     answer.raw
                 );
                 let message = answer.root().find_text("Message").unwrap_or_default();
+                let expected = refusal_message(case.refused_arn);
                 assert_eq!(
-                    message, REFUSAL_MESSAGE,
+                    message, expected,
                     "case {} ({path}, {behavior:?}): expected the refusal to state the \
-                     version requirement, got {message:?}",
+                     version requirement and name the refused association, got {message:?}",
                     case.case
                 );
             }
@@ -524,6 +574,13 @@ async fn an_update_cannot_move_an_association_off_a_published_version() {
             "case {case}: expected InvalidLambdaFunctionAssociation, got {:?} with {}",
             refused.error_code(),
             refused.raw
+        );
+        let message = refused.root().find_text("Message").unwrap_or_default();
+        let expected = refusal_message(arn);
+        assert_eq!(
+            message, expected,
+            "case {case}: expected the refusal to name the submitted association, got \
+             {message:?}"
         );
 
         let read = get_distribution(&router, &id).await;

@@ -17,9 +17,9 @@
 //! record), whether the template declares an endpoint and an association, how many target
 //! addresses a forwarding rule carries and whether they name a port, whether the domain
 //! name is written fully qualified or not, whether the VPC and subnets are literal ids or
-//! `Ref`s to declared-only `AWS::EC2::*` resources, whether the template is JSON or YAML,
-//! and which intrinsic each output reads a resource with (`Ref`, `Fn::GetAtt` of the
-//! conventional `Id` and of the type's own `<Type>Id`, `Fn::Sub`).
+//! `Ref`s to `AWS::EC2::*` resources the stack declares itself, whether the template is
+//! JSON or YAML, and which intrinsic each output reads a resource with (`Ref`, `Fn::GetAtt`
+//! of the conventional `Id` and of the type's own `<Type>Id`, `Fn::Sub`).
 //!
 //! Every expected value is computed here from what the row declares, never read back out of
 //! the answer being checked — except the three identifiers themselves, which are
@@ -55,7 +55,7 @@ const ENDPOINT_ID_PREFIX: &str = "rslvr-out-";
 const RULE_ID_PREFIX: &str = "rslvr-rr-";
 const ASSOCIATION_ID_PREFIX: &str = "rslvr-rrassoc-";
 
-/// The emulator with the two services this suite exercises, mounted on ONE engine exactly
+/// The emulator with the services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every
 /// other suite here; the in-process callback CloudFormation makes signs its request either
 /// way (the credential scope is what routes it).
@@ -68,6 +68,11 @@ fn build_router() -> MultiServiceRouter {
             &engine,
         )),
     );
+    // Amazon EC2, for the `AWS::EC2::VPC` a row declares: a stack creates one in the
+    // service that owns it, so that service has to be mounted beside CloudFormation.
+    router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
     router.register_service(
         service_com_amazonaws_route53resolver_route53resolver::EmulatedService::new(engine),
     );
@@ -288,7 +293,7 @@ const ROWS: &[Row] = &[
         )],
     },
     Row {
-        case: "a SYSTEM rule with no endpoint, associated with a declared-only VPC, YAML",
+        case: "a SYSTEM rule with no endpoint, associated with the stack's own VPC, YAML",
         region: "eu-west-1",
         template: || {
             [
@@ -328,10 +333,10 @@ const ROWS: &[Row] = &[
         expected_domain_name: Some("apex.example.test."),
         expected_delegation_record: None,
         expected_targets: &[],
-        // The VPC is a declared-only `AWS::EC2::VPC`, so its `Ref` is the identifier
-        // CloudFormation's own naming rules computed — and that is what the association
-        // must carry, since it is what the declaration resolved to. Compared against the
-        // stack's own record of it rather than against a value written here.
+        // The VPC is one the stack creates in Amazon EC2, so its `Ref` is the identifier
+        // that service assigned — and that is what the association must carry, since it is
+        // what the declaration resolved to. Compared against the stack's own record of it
+        // rather than against a value written here.
         expected_vpc_id: None,
         expected_association_name: None,
         rule_id_outputs: &["RuleId"],
@@ -639,8 +644,8 @@ async fn a_stack_provisions_the_resolver_rules_its_template_declares() {
                 row.expected_association_name
             );
             // The VPC is whatever the declaration resolved to: a literal id where the row
-            // writes one, and otherwise the id the stack itself reports for the
-            // declared-only VPC resource it references.
+            // writes one, and otherwise the id the stack itself reports for the VPC
+            // resource it references.
             let expected_vpc = row
                 .expected_vpc_id
                 .map(ToString::to_string)
