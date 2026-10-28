@@ -9582,13 +9582,21 @@ pub mod messages {
         format!("Data quality rule recommendation run with id {run_id} does not exist")
     }
 
-    /// A machine learning transform lookup (`GetMLTransform`) for a `TransformId` no
-    /// transform in this account has. NOT recorded: the sentence follows the per-resource
-    /// template of [`column_statistics_task_run_not_found`], built from the requested id,
-    /// which is the whole address of a transform — a `Name` is not, because "Names are not
-    /// guaranteed unique and can be changed at any time" (`MLTransform$Name`).
+    /// A machine learning transform lookup (`GetMLTransform`, `UpdateMLTransform`,
+    /// `DeleteMLTransform`, or a walk over one transform's task runs) for a `TransformId` no
+    /// transform in this account has.
+    ///
+    /// RECORDED template: the sentence is fixed and its two variable parts are the account
+    /// whose namespace holds no such transform and the `TransformId` the request itself
+    /// sent, which is the whole address of a transform — a `Name` is not, because "Names are
+    /// not guaranteed unique and can be changed at any time" (`MLTransform$Name`). Every
+    /// operation that misses a transform refuses it in THESE words, so one miss cannot be
+    /// worded one way by a read and another by a write.
     pub fn ml_transform_not_found(transform_id: &str) -> String {
-        format!("Machine learning transform with id {transform_id} does not exist")
+        format!(
+            "Cannot find MLTransform in account {} with handle {transform_id}",
+            ::engine::emulator_account_id()
+        )
     }
 
     /// `CreateMLTransform` for a `Name` this account already holds a transform under.

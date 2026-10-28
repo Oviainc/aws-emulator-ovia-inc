@@ -155,6 +155,8 @@ mod job_updates;
 mod jobs;
 #[path = "all/ml_task_runs.rs"]
 mod ml_task_runs;
+#[path = "all/ml_transform_deletion.rs"]
+mod ml_transform_deletion;
 #[path = "all/ml_transform_reads.rs"]
 mod ml_transform_reads;
 #[path = "all/ml_transform_updates.rs"]

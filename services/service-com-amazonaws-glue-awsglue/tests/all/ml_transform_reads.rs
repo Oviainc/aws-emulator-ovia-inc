@@ -30,7 +30,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ml_transforms::{given_transform, listed, store_table, ROLE, TRANSFORM_TYPE};
-use crate::wire::{assert_echoed, call, emulator, error_code, error_message, ok};
+use crate::wire::{assert_echoed, call, emulator, error_code, error_message, ok, ACCOUNT_ID};
 
 /// One row of the read-back table: the case, the transform's name, the members the create
 /// sends beside the required ones, and the members the read must then report.
@@ -279,11 +279,11 @@ async fn an_id_this_account_holds_no_transform_under_is_refused() {
             "case {case:?}: expected EntityNotFoundException, got {}",
             error_code(&body)
         );
-        // The sentence follows this crate's per-resource template for a resource addressed
-        // by a minted id, and its one variable part is the id the request itself sent.
+        // The sentence is the crate's one wording for a transform this account holds none
+        // of, and its variable parts are the account and the id the request itself sent.
         assert_eq!(
             error_message(&body),
-            format!("Machine learning transform with id {transform_id} does not exist"),
+            format!("Cannot find MLTransform in account {ACCOUNT_ID} with handle {transform_id}"),
             "case {case:?}: expected the refusal to name the requested id, got {body}"
         );
     }

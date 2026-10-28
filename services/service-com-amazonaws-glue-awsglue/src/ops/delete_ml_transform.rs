@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMLTransform
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMLTransform`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMLTransform::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one machine learning transform from this account's per-account transform
+//! namespace ([`crate::state::ComAmazonawsGlueAwsglueState::ml_transforms`]) — the record
+//! `CreateMLTransform` wrote, together with the task runs that record holds — and reports
+//! the `TransformId` it was stored under. A transform is addressed by that minted id
+//! alone, because "Names are not guaranteed unique and can be changed at any time"
+//! (`MLTransform$Name`), and an id this account holds no transform under removes nothing
+//! and is refused with the operation's modelled `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMLTransform` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMLTransformErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMLTransform"))
+        // A transform is addressed by the id its create minted and carries no `CatalogId`,
+        // so nothing here depends on the request's Region or on a catalog id.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(DeleteMLTransformErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the Glue machine learning transform store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // "If you no longer need a transform, you can delete it": the delete removes the
+        // ONE record stored under that id, so every later read of it misses and the name it
+        // carried is free for a create again. The task runs that record holds go with it,
+        // because a run is addressed through its parent transform and nothing can reach one
+        // whose transform is gone. `TransformId` is `@required` with `length 1..255`, so an
+        // absent or over-long one is refused at the boundary; reaching here, the only
+        // question is whether this account holds a transform under that id — a `Name` is
+        // not an address, since "Names are not guaranteed unique and can be changed at any
+        // time" (`MLTransform$Name`).
+        if store.ml_transforms.remove(&input.transform_id).is_none() {
+            return Err(DeleteMLTransformErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // The same miss `GetMLTransform` answers, on the same resource and
+                    // through the same lookup, so it is refused in the same words
+                    // ([`crate::state::messages::ml_transform_not_found`]).
+                    message: Some(crate::state::messages::ml_transform_not_found(
+                        &input.transform_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        ::tracing::info!(
+            operation = "DeleteMLTransform",
+            transform = %input.transform_id,
+            "deleted a Glue machine learning transform"
+        );
+
+        // "The unique identifier of the transform that was deleted" — the id the removed
+        // record was stored under, which is the id the request addressed it by.
+        Ok(DeleteMLTransformOutput {
+            transform_id: Some(input.transform_id),
+        })
     }
 }

@@ -49,7 +49,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_runs::{already_past, emulator_with_engine, far_future};
 use crate::ml_transforms::given_transform;
-use crate::wire::{call, emulator, error_code, error_message, ok};
+use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID};
 
 /// Every `TaskType` the model publishes. Source: the generated `TASK_TYPE_VALUES`
 /// (`smithy_query shape=TaskType`), so a filter row exists for each kind of task and not
@@ -100,7 +100,7 @@ const MAX_PAGES_PER_WALK: usize = 64;
 
 /// Start one labelling set generation task run of `transform_id` and answer the
 /// `TaskRunId` it reports.
-async fn start_labeling_run(
+pub(crate) async fn start_labeling_run(
     router: &MultiServiceRouter,
     transform_id: &str,
     output_s3_path: &str,
@@ -682,7 +682,7 @@ async fn a_start_for_a_transform_this_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Machine learning transform with id {transform_id} does not exist"),
+            format!("Cannot find MLTransform in account {ACCOUNT_ID} with handle {transform_id}"),
             "case {case:?}: expected the refusal to name the requested id, got {body}"
         );
         assert!(
@@ -783,11 +783,11 @@ async fn an_id_this_account_holds_no_transform_under_is_refused() {
             "case {case:?}: expected EntityNotFoundException, got {}",
             error_code(&body)
         );
-        // The sentence follows this crate's per-resource template for a resource addressed
-        // by a minted id, and its one variable part is the id the request itself sent.
+        // The sentence is the crate's one wording for a transform this account holds none
+        // of, and its variable parts are the account and the id the request itself sent.
         assert_eq!(
             error_message(&body),
-            format!("Machine learning transform with id {transform_id} does not exist"),
+            format!("Cannot find MLTransform in account {ACCOUNT_ID} with handle {transform_id}"),
             "case {case:?}: expected the refusal to name the requested id, got {body}"
         );
     }
