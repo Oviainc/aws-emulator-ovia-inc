@@ -9,12 +9,14 @@
 //! in the service's own envelope, so a field-level refusal and a transport refusal stay
 //! two distinguishable answers.
 //!
-//! The ceiling itself is [`max_request_body_bytes`]: the most message content any Amazon
-//! SQS request can carry — one maximum total payload, which is the same figure for a single
-//! message and for a whole batch — plus room for the request wrapped around it. A batch
-//! whose entries add up to more than the payload limit but whose body the ceiling still
-//! admits is read and refused by the OPERATION with the modelled `BatchRequestTooLong`
-//! (`batch_payload_ceiling.rs`); a body past the ceiling never gets that far.
+//! The ceiling itself is [`max_request_body_bytes`]: the maximum total payload any Amazon
+//! SQS request may legally carry — the same figure for a single message and for a whole
+//! batch — plus headroom for an aggregate that breaks that payload bound and plus room for
+//! the request wrapped around it. A batch whose entries add up to more than the payload
+//! limit but whose body the ceiling still admits is read and refused by the OPERATION with
+//! the modelled `BatchRequestTooLong` (`batch_payload_ceiling.rs`,
+//! `batch_aggregate_refusal_reaches_the_operation.rs`); a body past the ceiling never gets
+//! that far.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::service::max_request_body_bytes;

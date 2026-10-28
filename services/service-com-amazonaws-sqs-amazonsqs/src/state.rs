@@ -4067,10 +4067,11 @@ pub fn empty_batch_entry_value_message(operation: &str, position: usize, member:
 /// range rather than written twice. A queue's own (possibly lowered)
 /// `MaximumMessageSize` bounds EACH message, not the sum of a batch's entries.
 ///
-/// It is also the most message content ANY request of this service can carry, batch or
-/// not, which is what the transport ceiling is built from
-/// (`crate::service::max_request_body_bytes`): a request carrying more than this many
-/// bytes of payload is past what the service accepts however it is spelled.
+/// It is also the most message content ANY request of this service may legally carry,
+/// batch or not, which is what the transport ceiling is built from
+/// (`crate::service::max_request_body_bytes`): that ceiling sits above this figure, because
+/// a request carrying MORE than it is one the operation measures and refuses with
+/// `BatchRequestTooLong` rather than one the transport drops.
 pub fn maximum_batch_payload_bytes() -> i64 {
     integer_bounds(MAXIMUM_MESSAGE_SIZE).1
 }

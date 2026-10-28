@@ -87,25 +87,47 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// (`service-com-amazonaws-codecommit-codecommit-20150413`'s `MAX_REQUEST_BODY_BYTES`).
 const REQUEST_ENVELOPE_ALLOWANCE_BYTES: usize = 64 * 1024;
 
+/// How far PAST the maximum total payload a request's message content may reach and still
+/// be read.
+///
+/// A request that breaks the payload bound is one the OPERATION refuses, not the
+/// transport: a batch whose entries are each individually acceptable and together carry
+/// more than the maximum total payload is answered with the modelled
+/// `BatchRequestTooLong`, which names the limit and the number of bytes the request sent.
+/// That answer exists only if the request was READ and MEASURED, so the ceiling has to sit
+/// above the payload limit by more than the envelope around it — an over-limit aggregate
+/// is payload, and a client spells one by sending a handful of entries each well inside
+/// the per-message bound (four entries of a third of the limit each add up to a third more
+/// than it).
+///
+/// Amazon SQS publishes no figure for the request body its frontend reads, so how much
+/// headroom is this emulator's own choice: half the payload limit again, which admits
+/// every aggregate up to one and a half times the limit while a body several times it (a
+/// single message of a few megabytes, ten maximum-size batch entries) is still refused on
+/// the wire. Written as the divisor of the payload limit so the headroom tracks that limit
+/// rather than being a second figure to maintain.
+const OVER_LIMIT_PAYLOAD_HEADROOM_DIVISOR: usize = 2;
+
 /// The largest HTTP request body this service reads at all.
 ///
-/// The biggest payload any Amazon SQS request can carry is ONE maximum total payload
-/// ([`crate::state::maximum_batch_payload_bytes`]) — "the maximum allowed individual
-/// message size and the maximum total payload size (the sum of the individual lengths of
-/// all of the batched messages)" are the same figure, so a single message and a whole
-/// batch are bounded alike and a request carrying more than that figure of message bytes
-/// is past what the service accepts however it is spelled. The ceiling is read from there
-/// rather than written out a second time. Beyond it sits
-/// [`REQUEST_ENVELOPE_ALLOWANCE_BYTES`] for the request wrapped around that payload, which
-/// is what keeps the modelled `BatchRequestTooLong` reachable: a batch whose entries add
-/// up to more than the payload limit is still read, and refused by the OPERATION with the
-/// limit and the bytes it was sent.
+/// The message content any Amazon SQS request may legally carry is ONE maximum total
+/// payload ([`crate::state::maximum_batch_payload_bytes`]) — "the maximum allowed
+/// individual message size and the maximum total payload size (the sum of the individual
+/// lengths of all of the batched messages)" are the same figure, so a single message and a
+/// whole batch are bounded alike. The ceiling is read from there rather than written out a
+/// second time, and sits above it by two allowances: payload headroom
+/// ([`OVER_LIMIT_PAYLOAD_HEADROOM_DIVISOR`]), which is what keeps the modelled
+/// `BatchRequestTooLong` reachable — a batch whose entries add up to more than the payload
+/// limit is still read, and refused by the OPERATION with the limit and the bytes it was
+/// sent — and [`REQUEST_ENVELOPE_ALLOWANCE_BYTES`] for the request wrapped around that
+/// payload.
 ///
-/// A body larger than the sum cannot carry a payload this service would accept however it
-/// is spelled, so it is refused by the TRANSPORT — a bare HTTP 413 with no error document
-/// — before the body is deserialized and before any handler looks at a field. That is a
-/// different refusal from a field-level one: a parameter refusal says the service read the
-/// request and disliked a value, while this one says the request never fit on the wire.
+/// A body larger than that sum carries more message content than any answer of this
+/// service could even state, so it is refused by the TRANSPORT — a bare HTTP 413 with no
+/// error document — before the body is deserialized and before any handler looks at a
+/// field. That is a different refusal from a field-level one: a parameter refusal says the
+/// service read the request and disliked a value, while this one says the request never fit
+/// on the wire.
 ///
 /// This is not a second copy of the framework's own 413. The core's two body caps
 /// (`vendor/server/src/lib.rs`'s `MAX_PRODUCTION_BODY_BYTES`, 16 MiB on the serve path,
@@ -117,8 +139,9 @@ const REQUEST_ENVELOPE_ALLOWANCE_BYTES: usize = 64 * 1024;
 /// the same place `service-com-amazonaws-codecommit-codecommit-20150413` keeps the one
 /// for its git transport.
 pub fn max_request_body_bytes() -> usize {
-    usize::try_from(crate::state::maximum_batch_payload_bytes())
-        .unwrap_or(usize::MAX)
+    let payload = usize::try_from(crate::state::maximum_batch_payload_bytes()).unwrap_or(usize::MAX);
+    payload
+        .saturating_add(payload / OVER_LIMIT_PAYLOAD_HEADROOM_DIVISOR)
         .saturating_add(REQUEST_ENVELOPE_ALLOWANCE_BYTES)
 }
 
