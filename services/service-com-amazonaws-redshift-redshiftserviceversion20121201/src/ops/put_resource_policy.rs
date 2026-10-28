@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches the policy document the request carries to the resource its
+//! `ResourceArn` names, replacing whatever document that resource held, and
+//! reports the resource and the document now attached to it.
+//!
+//! The document is stored and reported back VERBATIM — the characters the
+//! request sent, never a re-rendering of the JSON they parse as — so a reader
+//! sees the same bytes the writer sent.
 //!
 //! ## Shape of an operation
 //!
@@ -84,10 +83,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `PutResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#PutResourcePolicy")]
+//
+// `DependentServiceUnavailableFault` — the fault this SERVICE models for "a
+// dependent internal service is temporarily unavailable", which every other
+// handler here answers an unreachable shared store with and which this
+// operation's own error list omits — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#PutResourcePolicy",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum PutResourcePolicyErrorModeled {
     ConflictPolicyUpdateFault(ConflictPolicyUpdateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     InvalidPolicyFault(InvalidPolicyFault),
     ResourceNotFoundFault(ResourceNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
@@ -139,23 +147,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::PUT_RESOURCE_POLICY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Attach one policy document to one resource, or refuse the request without
+    /// writing anything.
+    ///
+    /// The ARN is resolved first and the document checked second, so a request
+    /// naming no resource is refused before its document is parsed, and a
+    /// document this service cannot hold leaves the resource carrying exactly
+    /// what it carried.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                PutResourcePolicyErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Which resource the policy is attached to is settled before the
+        // document is read, so a request naming nothing a Redshift resource
+        // policy attaches to is refused without parsing what it carried.
+        if let Err(refusal) = st::check_policy_resource_arn(&input.resource_arn) {
+            return Err(match refusal {
+                st::PolicyResourceRefusal::NotAResource(message) => {
+                    PutResourcePolicyErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+                        message: Some(message),
+                    })
+                }
+                st::PolicyResourceRefusal::UnsupportedResource(message) => {
+                    PutResourcePolicyErrorModeled::UnsupportedOperationFault(
+                        UnsupportedOperationFault {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        if let Err(message) = st::check_resource_policy(&input.policy) {
+            return Err(
+                PutResourcePolicyErrorModeled::InvalidPolicyFault(InvalidPolicyFault {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Attaching a policy to a resource this store holds none for is what
+        // grows the collection, so the bound is checked before the insert and
+        // only for a resource that is not already a policy holder: replacing one
+        // resource's document grows nothing.
+        if store.resource_policies.len() >= st::RESOURCE_POLICY_QUOTA
+            && store.resource_policy(&input.resource_arn).is_none()
+        {
+            return Err(PutResourcePolicyErrorModeled::UnsupportedOperationFault(
+                UnsupportedOperationFault {
+                    message: Some(st::resource_policy_quota_message()),
+                },
+            )
+            .into());
+        }
+        store.set_resource_policy(&input.resource_arn, input.policy.clone());
+
+        Ok(PutResourcePolicyOutput {
+            resource_policy: Some(ResourcePolicy {
+                resource_arn: Some(input.resource_arn),
+                policy: Some(input.policy),
+            }),
+        })
     }
 }
