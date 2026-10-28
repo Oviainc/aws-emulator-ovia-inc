@@ -64,7 +64,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::no_such_health_check;
+use crate::state::{monitored_alarm, no_such_health_check};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -147,15 +147,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: nothing here writes to the store. A health check is
         // addressed by the bare id `CreateHealthCheck` assigned it, which is the
         // id the store is keyed by.
-        let store = state.lock();
-        let health_check = store.health_checks.get(&input.health_check_id).ok_or_else(|| {
-            GetHealthCheckErrorModeled::NoSuchHealthCheck(no_such_health_check(
-                &input.health_check_id,
-            ))
-        })?;
+        let health_check = {
+            let store = state.lock();
+            store
+                .health_checks
+                .get(&input.health_check_id)
+                .cloned()
+                .ok_or_else(|| {
+                    GetHealthCheckErrorModeled::NoSuchHealthCheck(no_such_health_check(
+                        &input.health_check_id,
+                    ))
+                })?
+        };
+        // The guard above is released first: the configuration of the CloudWatch
+        // alarm an alarm-reading check monitors is read from CloudWatch's own
+        // store, and the two stores are never locked at once.
+        let monitored_alarm = monitored_alarm::configuration(&*self.engine, &health_check.config);
 
         Ok(GetHealthCheckOutput {
-            health_check: health_check.to_health_check(),
+            health_check: health_check.to_health_check(monitored_alarm),
         })
     }
 }

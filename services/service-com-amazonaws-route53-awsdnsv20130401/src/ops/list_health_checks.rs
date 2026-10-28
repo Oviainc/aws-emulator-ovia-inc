@@ -89,6 +89,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::monitored_alarm;
+
 /// The most health checks one response carries.
 ///
 /// `ListHealthChecksRequest$MaxItems`'s own documentation: "Amazon Route 53
@@ -186,25 +188,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let marker = input.marker.clone().unwrap_or_default();
 
         // A pure read: nothing below writes to the store.
-        let store = state.lock();
-        // The store keys health checks by id in a BTreeMap, so this walk is a
-        // stable total order and a marker always resumes at the same place.
-        let matching = store
-            .health_checks
-            .values()
-            .filter(|check| marker.is_empty() || check.id.as_str() >= marker.as_str());
+        let (page, next_marker) = {
+            let store = state.lock();
+            // The store keys health checks by id in a BTreeMap, so this walk is a
+            // stable total order and a marker always resumes at the same place.
+            let matching = store
+                .health_checks
+                .values()
+                .filter(|check| marker.is_empty() || check.id.as_str() >= marker.as_str());
 
-        let mut health_checks = Vec::new();
-        let mut next_marker = None;
-        for check in matching {
-            if health_checks.len() >= page_size as usize {
-                // "the value of NextMarker identifies the first health check that
-                // Amazon Route 53 returns if you submit another request".
-                next_marker = Some(check.id.clone());
-                break;
+            let mut page = Vec::new();
+            let mut next_marker = None;
+            for check in matching {
+                if page.len() >= page_size as usize {
+                    // "the value of NextMarker identifies the first health check that
+                    // Amazon Route 53 returns if you submit another request".
+                    next_marker = Some(check.id.clone());
+                    break;
+                }
+                page.push(check.clone());
             }
-            health_checks.push(check.to_health_check());
-        }
+            (page, next_marker)
+        };
+        // The guard above is released first: the configuration of the CloudWatch
+        // alarm an alarm-reading check monitors comes from CloudWatch's own store,
+        // and the two stores are never locked at once. One read covers the whole
+        // page.
+        let configs: Vec<HealthCheckConfig> =
+            page.iter().map(|check| check.config.clone()).collect();
+        let health_checks = page
+            .iter()
+            .zip(monitored_alarm::configurations(&*self.engine, &configs))
+            .map(|(check, monitored)| check.to_health_check(monitored))
+            .collect();
 
         Ok(ListHealthChecksOutput {
             health_checks,

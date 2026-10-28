@@ -103,7 +103,7 @@ use super::types::*;
 
 use crate::state::{
     health_check_config_problem, health_check_config_with_defaults, health_check_status,
-    now_millis, resource_location, StoredHealthCheck, FIRST_HEALTH_CHECK_VERSION,
+    monitored_alarm, now_millis, resource_location, StoredHealthCheck, FIRST_HEALTH_CHECK_VERSION,
     MAX_HEALTH_CHECKS,
 };
 use std::collections::BTreeMap;
@@ -247,9 +247,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // already there, so it is reported rather than duplicated —
                 // nothing is created and no version moves.
                 Some(existing) if existing.config == config => {
+                    let location =
+                        resource_location(ctx, &format!("healthcheck/{}", existing.id));
+                    // The guard goes before the alarm read: the configuration of
+                    // the CloudWatch alarm an alarm-reading check monitors lives
+                    // in CloudWatch's store, and the two stores are never locked
+                    // at once.
+                    drop(store);
+                    let monitored_alarm =
+                        monitored_alarm::configuration(&*self.engine, &existing.config);
                     return Ok(CreateHealthCheckOutput {
-                        health_check: existing.to_health_check(),
-                        location: resource_location(ctx, &format!("healthcheck/{}", existing.id)),
+                        health_check: existing.to_health_check(monitored_alarm),
+                        location,
                     });
                 }
                 // Everything else is the collision: "the same value for
@@ -315,14 +324,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .health_checks
             .entry(id.clone())
             .or_insert(health_check)
-            .to_health_check();
+            .clone();
         // The store guard goes before the assessment runs: publishing a probe
-        // reaches the CloudWatch metric store, and the two stores are never
-        // locked at once.
+        // reaches the CloudWatch metric store, and reporting the alarm an
+        // alarm-reading check monitors reads that service's alarm store — and the
+        // two stores are never locked at once.
         drop(store);
         health_check_status::drive_health_check_metrics(&self.engine);
+        let monitored_alarm = monitored_alarm::configuration(&*self.engine, &stored.config);
         Ok(CreateHealthCheckOutput {
-            health_check: stored,
+            health_check: stored.to_health_check(monitored_alarm),
             location: resource_location(ctx, &format!("healthcheck/{id}")),
         })
     }

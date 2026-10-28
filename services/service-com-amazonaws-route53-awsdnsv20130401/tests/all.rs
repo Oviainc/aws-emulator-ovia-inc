@@ -45,6 +45,11 @@ mod health_check_deletion;
 mod health_check_last_failure_reason;
 #[path = "all/health_check_listing.rs"]
 mod health_check_listing;
+// Declared beside the other health-check suites: the CloudWatch alarm an
+// alarm-reading health check monitors, which is the one part of a reported health
+// check that comes from another service's store.
+#[path = "all/health_check_monitored_alarm.rs"]
+mod health_check_monitored_alarm;
 #[path = "all/health_check_not_found_message.rs"]
 mod health_check_not_found_message;
 #[path = "all/health_check_refusal_messages.rs"]

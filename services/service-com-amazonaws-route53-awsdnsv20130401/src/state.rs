@@ -37,11 +37,16 @@ pub mod health_check_status;
 /// record set is selected by.
 pub mod client_location;
 
+/// The CloudWatch alarm an alarm-reading health check monitors, as the reported
+/// health check carries it.
+pub mod monitored_alarm;
+
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
 use crate::ops::types::shared_types::{
-    ChangeInfo, ConflictingDomainExists, DelegationSet, HealthCheck, HealthCheckConfig,
+    ChangeInfo, CloudWatchAlarmConfiguration, ConflictingDomainExists, DelegationSet, HealthCheck,
+    HealthCheckConfig,
     HealthCheckObservation, HostedZone, HostedZoneConfig, HostedZoneFeatures,
     InvalidPaginationToken, InvalidTrafficPolicyDocument, KeySigningKey, NoSuchDelegationSet,
     NoSuchHealthCheck, NoSuchHostedZone, NoSuchTrafficPolicy, NoSuchTrafficPolicyInstance,
@@ -1033,11 +1038,17 @@ pub struct StoredHealthCheck {
 }
 
 impl StoredHealthCheck {
-    /// The modelled `HealthCheck` for this record.
+    /// The modelled `HealthCheck` for this record, reporting
+    /// `monitored_alarm` as the configuration of the CloudWatch alarm this check
+    /// is monitoring ([`monitored_alarm::configuration`] reads it, since that
+    /// alarm lives in CloudWatch's store rather than this one).
     ///
     /// The ONE projection every health-check response is built from, so a create
     /// and a later read cannot report one health check differently.
-    pub fn to_health_check(&self) -> HealthCheck {
+    pub fn to_health_check(
+        &self,
+        monitored_alarm: Option<CloudWatchAlarmConfiguration>,
+    ) -> HealthCheck {
         HealthCheck {
             id: self.id.clone(),
             caller_reference: self.caller_reference.clone(),
@@ -1051,7 +1062,10 @@ impl StoredHealthCheck {
             // The alarm's own configuration belongs to CloudWatch, which is
             // where Route 53 reads it from; this store holds the alarm's
             // identity (`HealthCheckConfig$AlarmIdentifier`), not its settings.
-            cloud_watch_alarm_configuration: None,
+            // So the caller reads it out of CloudWatch's store and hands it in
+            // ([`monitored_alarm::configuration`]), with this service's own
+            // guard already released.
+            cloud_watch_alarm_configuration: monitored_alarm,
         }
     }
 

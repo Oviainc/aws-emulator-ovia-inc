@@ -168,7 +168,7 @@ use super::types::*;
 
 use crate::state::{
     health_check_config_problem, health_check_config_with_defaults, health_check_member_given,
-    health_check_status, no_such_health_check, StoredHealthCheck,
+    health_check_status, monitored_alarm, no_such_health_check, StoredHealthCheck,
 };
 
 /// The refusal text this operation answers a `HealthCheckVersion` that is not
@@ -489,14 +489,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The response is read back out of the store, so what the caller is told
         // is what a later GetHealthCheck will tell it.
-        let health_check = stored.to_health_check();
+        let stored = stored.clone();
         // The store guard goes before the assessment runs: this update may have
         // changed what the check assesses (the threshold it debounces by, the
         // alarm it reads, the children it adds up, whether it is disabled or
         // inverted), and publishing a probe reaches the CloudWatch metric store,
-        // which is never locked at the same time as this one.
+        // which is never locked at the same time as this one. Reporting the alarm
+        // an alarm-reading check monitors reads that service's alarm store under
+        // the same rule.
         drop(store);
         health_check_status::drive_health_check_metrics(&self.engine);
-        Ok(UpdateHealthCheckOutput { health_check })
+        let monitored_alarm = monitored_alarm::configuration(&*self.engine, &stored.config);
+        Ok(UpdateHealthCheckOutput {
+            health_check: stored.to_health_check(monitored_alarm),
+        })
     }
 }

@@ -36,7 +36,10 @@ use crate::hosted_zone_records::{call, router, Reply};
 const DOCUMENTED_MAX_ITEMS: usize = 1_000;
 
 /// Send one `ListHealthChecks` request, with `query` as its query string.
-async fn list_health_checks(router: &MultiServiceRouter, query: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite lists the account's health checks through the
+/// SAME request rather than growing a second copy of it.
+pub(crate) async fn list_health_checks(router: &MultiServiceRouter, query: &str) -> Reply {
     call(router, "GET", &format!("/2013-04-01/healthcheck{query}"), "").await
 }
 
