@@ -58,10 +58,10 @@ const DATA_SOURCE_TYPES: &[&str] = &[
 /// owes a task whose import file this emulator holds no object for. Spelled out
 /// independently of the crate's constants so a wrong status in `src/state.rs` fails here.
 ///
-/// This suite's emulator carries Strategy Recommendations alone, so there is no S3 service
-/// holding the object the import names: the import reads nothing and reaches the terminal
-/// status for an import that read none of what it was asked to read. What a readable
-/// import file produces is the subject of `import_ingestion.rs`, whose emulator mounts S3.
+/// This suite's account holds the import BUCKET but no object under the key the import
+/// names, so the import reads nothing and reaches the terminal status for an import that
+/// read none of what it was asked to read. What a readable import file produces is the
+/// subject of `import_ingestion.rs`, which puts the object there first.
 const IMPORT_IN_PROGRESS: &str = "ImportInProgress";
 const IMPORT_FAILED: &str = "ImportFailed";
 
@@ -81,15 +81,90 @@ fn matches_async_task_id(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '-' || c == ':')
 }
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// Every bucket name the start requests in this crate's suites name and expect to get
+/// past the bucket members, held by the account so each case is decided on the member it
+/// is probing rather than on a bucket nothing ever created.
+///
+/// A start call reads its import file out of `S3Bucket` and writes its results into
+/// `s3bucketForReportData`, so it resolves each bucket member against object storage and
+/// refuses a name no bucket answers to — which is what these are for. A suite probing a
+/// bucket of its own adds it with [`emulator_holding`].
+pub(crate) const TEST_BUCKETS: &[&str] = &[
+    "migrationhub-strategy-import",
+    "migrationhub-strategy-analysis",
+    "migrationhub-strategy-reports",
+    "migrationhub-strategy-a",
+    "migrationhub-strategy-ab",
+    "migrationhub-strategy-r",
+    "migrationhub-strategy-in",
+    "migrationhub-strategy-my-bucket",
+    "migrationhub-strategy-bucket.with.dots",
+    "migrationhub-strategy-import.data",
+    "migrationhub-strategy-analysis.data",
+    "migrationhub-strategy-analysis.two",
+    "migrationhub-strategy-analysis-data.1",
+];
+
+/// Record `buckets` in the emulator's own object storage, as the account's owner would
+/// before naming one to a start call.
+///
+/// Written through S3's own store — the one map its `CreateBucket` writes and its
+/// `HeadBucket` reads — so a start call's in-process lookup finds exactly the buckets a
+/// suite says the account holds.
+///
+/// `pub(crate)` so a suite standing up its own harness gives its account the same buckets.
+pub(crate) fn hold_buckets(engine: &Arc<engine::InMemoryEngine>, buckets: &[&str]) {
+    let state = service_com_amazonaws_s3_amazons3::state::service_state(&**engine)
+        .expect("the in-memory engine holds every mounted service's store");
+    let mut store = state.lock();
+    for bucket in buckets {
+        // `NameTaken` is a bucket the account already holds, which is what this asks for;
+        // anything else leaves the account WITHOUT the bucket a suite says it holds, and a
+        // start call would then be refused for the harness's reason rather than the case's.
+        let outcome = store.create_bucket(bucket, TEST_REGION);
+        assert_ne!(
+            outcome,
+            service_com_amazonaws_s3_amazons3::state::BucketCreation::QuotaReached,
+            "the harness must be able to hold the bucket {bucket:?}, got {outcome:?}"
+        );
+    }
+}
+
+/// Mount the emulator's own Amazon S3 on `router` over the shared `engine`, its account
+/// holding `buckets`.
+///
+/// Every harness in this crate mounts it: a start call resolves its bucket members by
+/// calling S3 in process, exactly as the assembled emulator does, so a router without it
+/// could answer nothing but the missing-bucket refusal.
+pub(crate) fn mount_object_storage(
+    router: &mut MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    buckets: &[&str],
+) {
+    hold_buckets(engine, buckets);
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(engine),
+    ));
+}
+
+/// One emulator: a router carrying this service beside the emulator's own Amazon S3, over
+/// one shared engine, its account holding [`TEST_BUCKETS`].
 ///
 /// `pub(crate)` so the suites beside this one drive the same emulator through the same
 /// harness rather than standing up a second copy of it.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_holding(&[])
+}
+
+/// [`emulator`] whose account holds `extra` beside [`TEST_BUCKETS`] — for a suite whose
+/// start requests name a bucket of their own.
+pub(crate) fn emulator_holding(extra: &[&str]) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    mount_object_storage(&mut router, &engine, TEST_BUCKETS);
+    hold_buckets(&engine, extra);
     router
 }
 
@@ -170,11 +245,21 @@ pub(crate) fn bring_every_completion_forward(engine: &Arc<engine::InMemoryEngine
 /// `StartAssessment` through to an assessment runs against this harness, and the one that
 /// drives it against an account with NO data source runs against [`emulator`].
 pub(crate) fn emulator_with_collector_in(regions: &[&str]) -> MultiServiceRouter {
+    emulator_with_collector_holding(regions, &[])
+}
+
+/// [`emulator_with_collector_in`] whose account holds `extra` beside [`TEST_BUCKETS`].
+pub(crate) fn emulator_with_collector_holding(
+    regions: &[&str],
+    extra: &[&str],
+) -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     register_collector_in(&engine, regions);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    mount_object_storage(&mut router, &engine, TEST_BUCKETS);
+    hold_buckets(&engine, extra);
     router
 }
 

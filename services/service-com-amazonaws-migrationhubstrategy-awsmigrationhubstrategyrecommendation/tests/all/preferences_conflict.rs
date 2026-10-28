@@ -23,15 +23,25 @@ use serde_json::{json, Value};
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::state::COMPLETION_SPAN;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{call, emulator_with_collector, stop_assessment, Answer};
+use crate::import_and_assess::{
+    call, emulator_with_collector_holding, stop_assessment, Answer, TEST_REGION,
+};
 
 /// The wire error code a save refused for an ongoing task carries, and its status.
 const CONFLICT_EXCEPTION: &str = "ConflictException";
 const CONFLICT_STATUS: u16 = 409;
 
 /// A bucket name carrying the `migrationhub-strategy-` prefix every bucket member of this
-/// service documents, so a start call here is refused for nothing else.
+/// service documents, held by the account below so a start call here is refused for
+/// nothing else.
 const BUCKET: &str = "migrationhub-strategy-conflict-probe";
+
+/// The harness every case here runs against: an account with a data collector to assess
+/// from and [`BUCKET`] in object storage, which a start call resolves its bucket member
+/// against.
+fn emulator_with_collector() -> MultiServiceRouter {
+    emulator_with_collector_holding(&[TEST_REGION], &[BUCKET])
+}
 
 async fn put_preferences(router: &MultiServiceRouter, body: Value) -> Answer {
     call(router, "POST", "/put-portfolio-preferences", Some(body)).await

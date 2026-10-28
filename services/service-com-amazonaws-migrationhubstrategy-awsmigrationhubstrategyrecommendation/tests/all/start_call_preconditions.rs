@@ -19,10 +19,10 @@
 //!    `[S3BucketNotFound]` reason — and never as the permissions one, which asserts that
 //!    the bucket is there and that only its name keeps the service out: a client told that
 //!    renames a bucket that does not exist instead of creating it. The rule holds for every
-//!    bucket member of both start calls, and nothing is minted either way. The emulator
-//!    here mounts no object storage, so no name it does not provision for itself answers to
-//!    a bucket; which refusal each case earns when object storage IS mounted is tabled in
-//!    `start_call_bucket_reachability.rs`.
+//!    bucket member of both start calls, and nothing is minted either way. The account here
+//!    holds only the buckets the harness creates, so every name the rows probe answers to no
+//!    bucket; which refusal a name earns once the account DOES hold a bucket of that name is
+//!    tabled in `start_call_bucket_reachability.rs`.
 //!
 //! The rows span what each rule generalises over: for the first, what the request carries
 //! (every `AssessmentDataSourceType`, targets, a report bucket) across accounts with no
@@ -40,8 +40,8 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
-    at, call, get_latest_assessment_id, register_collector_in, start_assessment, start_import,
-    Answer, TEST_REGION,
+    at, call, get_latest_assessment_id, mount_object_storage, register_collector_in,
+    start_assessment, start_import, Answer, TEST_BUCKETS, TEST_REGION,
 };
 
 /// Every value `AssessmentDataSourceType` declares, from
@@ -128,7 +128,10 @@ fn emulator_holding(source: DataSource) -> MultiServiceRouter {
     }
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    // And object storage holding the buckets the conforming members of these requests name,
+    // so a row is decided on the name it is probing.
+    mount_object_storage(&mut router, &engine, TEST_BUCKETS);
     router
 }
 

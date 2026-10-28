@@ -41,7 +41,9 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::import_and_assess::{at, call, minimal_import, start_import, Answer, TEST_REGION};
+use crate::import_and_assess::{
+    at, call, minimal_import, mount_object_storage, start_import, Answer, TEST_BUCKETS, TEST_REGION,
+};
 
 /// Every value `CollectorHealth` admits, from
 /// `smithy_query(query="shape",shape="CollectorHealth")`. Spelled out here rather than
@@ -88,7 +90,9 @@ fn emulator_with(collectors: Vec<CollectorRecord>) -> MultiServiceRouter {
     }
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    // And the buckets a start call names, in the object storage it resolves them against.
+    mount_object_storage(&mut router, &engine, TEST_BUCKETS);
     router
 }
 
