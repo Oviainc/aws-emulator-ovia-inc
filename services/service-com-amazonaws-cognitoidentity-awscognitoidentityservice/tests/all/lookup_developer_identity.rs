@@ -13,10 +13,12 @@
 //!   the previous page ended, with no token on the last page;
 //! * a pair the mapping does not verify is a 409 `ResourceConflictException`, a resource
 //!   this service does not hold is a 404 `ResourceNotFoundException`, an identifier the
-//!   pool holds no mapping for and an identity of ANOTHER pool are both a 403
-//!   `NotAuthorizedException`, and a request naming neither side of the mapping is a 400
-//!   `InvalidParameterException`, while a value outside a constraint the MODEL states is
-//!   refused ahead of the operation with a 400 `ValidationException`;
+//!   pool holds no mapping for, an identity of ANOTHER pool and an identity every login has
+//!   been taken off (a DISABLED one, which no provider's user reaches any more) are all a 403
+//!   `NotAuthorizedException` — the pair is verified first, so a request supplying both values
+//!   with a disabled identity is the conflict — and a request naming neither side of the
+//!   mapping is a 400 `InvalidParameterException`, while a value outside a constraint the
+//!   MODEL states is refused ahead of the operation with a 400 `ValidationException`;
 //! * the lookup is a REPORT: repeating it answers the same thing and leaves the pool's
 //!   identities exactly as they were.
 //!
@@ -33,6 +35,11 @@ const OPERATION: &str = "LookupDeveloperIdentity";
 
 /// A well-formed `IdentityId` that nothing ever minted.
 const ABSENT_IDENTITY_ID: &str = "us-east-1:33333333-3333-3333-3333-333333333333";
+
+/// A public login provider, one of the names `GetId$Logins` publishes for this service
+/// (`smithy_query(query="doc",shape="GetIdInput",member="Logins")`) — a login that is not a
+/// developer one, so an unlink may take it off an identity.
+const PUBLIC_PROVIDER: &str = "graph.facebook.com";
 
 /// Register `identifier` as a developer login of `pool_id` through the operation that
 /// writes the mapping, and return the `IdentityId` it resolved to. `identity_id` names an
@@ -313,9 +320,9 @@ async fn an_identity_answers_every_identifier_linked_to_it_one_page_at_a_time() 
 
 /// RULE: a request the mapping cannot answer is refused with the modelled error for what
 /// is wrong with it — a pair the store does not link is a conflict, a resource this service
-/// does not hold is not found, an identifier the pool holds no mapping for and an identity
-/// of another pool are forbidden, and an input the operation cannot act on is a bad
-/// parameter.
+/// does not hold is not found, an identifier the pool holds no mapping for, an identity
+/// of another pool and an identity every login has been taken off are forbidden, and an
+/// input the operation cannot act on is a bad parameter.
 #[tokio::test]
 async fn a_request_the_mapping_cannot_answer_is_refused() {
     let emulator = Emulator::new();
@@ -325,6 +332,21 @@ async fn a_request_the_mapping_cannot_answer_is_refused() {
     let registered = register(&emulator, &pool_id, developer_provider, "user-1", None).await;
     let bare = emulator.identity(&pool_id, None).await;
     let foreign = emulator.identity(&other_pool, None).await;
+    // An identity an unlink left linked to NO login provider at all: a DISABLED one, which
+    // the store still holds and no user of any provider reaches any more.
+    let disabled = emulator
+        .identity(&pool_id, Some(json!({PUBLIC_PROVIDER: "public-user-2"})))
+        .await;
+    emulator
+        .ok(
+            "UnlinkIdentity",
+            &json!({
+                "IdentityId": &disabled,
+                "Logins": {PUBLIC_PROVIDER: "public-user-2"},
+                "LoginsToRemove": [PUBLIC_PROVIDER],
+            }),
+        )
+        .await;
     // A pagination token ANOTHER pool issued: two identifiers on one identity of that
     // pool, listed one at a time, so the first page carries a token scoped to that pool.
     let foreign_identity = register(&emulator, &other_pool, developer_provider, "a-user", None).await;
@@ -381,6 +403,18 @@ async fn a_request_the_mapping_cannot_answer_is_refused() {
             lookup_request(&pool_id, Some(&foreign), None, None, None),
             403,
             "NotAuthorizedException",
+        ),
+        (
+            "an identity an unlink left linked to no login provider",
+            lookup_request(&pool_id, Some(&disabled), None, None, None),
+            403,
+            "NotAuthorizedException",
+        ),
+        (
+            "an identity an unlink disabled, named beside an identifier of another user",
+            lookup_request(&pool_id, Some(&disabled), Some("user-1"), None, None),
+            409,
+            "ResourceConflictException",
         ),
         (
             "a pair the store does not link",

@@ -55,8 +55,9 @@ async fn pool(emulator: &Emulator, name: &str) -> String {
         .to_string()
 }
 
-/// `DescribeIdentity` for `identity_id`.
-async fn describe(emulator: &Emulator, identity_id: &str) -> (u16, Value) {
+/// `DescribeIdentity` for `identity_id`. `pub(crate)` so a sibling suite in this test target
+/// reads an identity back through the same call rather than keeping a second copy of it.
+pub(crate) async fn describe(emulator: &Emulator, identity_id: &str) -> (u16, Value) {
     emulator
         .call(OPERATION, &json!({"IdentityId": identity_id}))
         .await

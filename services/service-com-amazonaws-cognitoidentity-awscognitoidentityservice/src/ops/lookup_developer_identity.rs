@@ -388,6 +388,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> LookupDeveloperId
             }
         };
 
+        // The identity the request resolved to may be a DISABLED one: every login has been
+        // taken off it — by an unlink of the last one, or by a merge that moved them onto the
+        // identity it merged this one into — so nothing reaches it any more and it is no
+        // longer a user of any provider whose mappings this lookup resolves. Asking which
+        // developer user it is is then refused exactly as asking about a developer user
+        // identifier this pool has not registered is. The record itself stays readable
+        // through the describe, which reports a stored identity rather than resolving a login
+        // of it. This comes AFTER the pair above was verified, so a request supplying both
+        // values still gets the conflict its own documentation states for a pair the store
+        // cannot verify ("If you supply both, DeveloperUserIdentifier will be matched against
+        // IdentityID [...] Otherwise, a ResourceConflictException is thrown").
+        if store
+            .identities
+            .get(&identity_id)
+            .is_some_and(crate::state::Identity::is_disabled)
+        {
+            return Err(
+                LookupDeveloperIdentityErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(
+                            crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // A page resumes at the identifier the previous page's token named. The list is
         // sorted, so the resumption point is the first identifier that is not before the
         // cursor: a token this pool issued keeps advancing even if the identifier it named
