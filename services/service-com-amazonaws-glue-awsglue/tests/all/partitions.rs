@@ -27,7 +27,7 @@ use service_com_amazonaws_glue_awsglue::state::MAX_PARTITIONS_PER_TABLE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::error_messages::assert_refusal;
-use crate::wire::{assert_echoed, call, emulator, ok, ACCOUNT_ID, ERROR_DETAIL_TAG};
+use crate::wire::{assert_echoed, call, emulator, error_code, ok, ACCOUNT_ID, ERROR_DETAIL_TAG};
 
 /// The largest `PartitionInputList` one batch may carry: `PartitionInputList`, length
 /// 0..100, from `smithy_query` on `BatchCreatePartition`.
@@ -324,10 +324,11 @@ struct FailureCase {
 /// that item in `Errors` with the error code for the reason it was refused, and leaves
 /// every other item of the same batch created.
 ///
-/// The rows differ along the way one item fails — a duplicate inside one batch, fewer
-/// values than the table has partition keys, more values than it has, no values at all,
-/// a table that defines no partition keys — and along how many items of the batch
-/// succeed beside it.
+/// The rows differ along the way one item fails — a duplicate inside one batch, a
+/// duplicate of a partition an earlier item of the same batch created — and along how many
+/// items of the batch succeed beside it. An item whose value count is not the table's
+/// partition-key count is NOT one of these: that refuses the whole request
+/// ([`an_arity_mismatch_refuses_the_whole_request`]).
 #[tokio::test]
 async fn an_item_that_cannot_be_created_fails_only_itself() {
     let router = emulator();
@@ -346,56 +347,20 @@ async fn an_item_that_cannot_be_created_fails_only_itself() {
             missing: vec![],
         },
         FailureCase {
-            case: "fewer values than the table has partition keys",
+            case: "two good items beside a duplicate of the first",
             keys: vec!["dt", "region"],
-            inputs: vec![json!({ "Values": ["2026-01-01"] })],
-            expected_codes: vec!["InvalidInputException"],
-            expected_values: vec![Some(vec!["2026-01-01"])],
-            readable: vec![],
-            missing: vec![vec!["2026-01-01"]],
-        },
-        FailureCase {
-            case: "more values than the table has partition keys",
-            keys: vec!["dt"],
-            inputs: vec![json!({ "Values": ["2026-01-01", "us-east-1"] })],
-            expected_codes: vec!["InvalidInputException"],
-            expected_values: vec![Some(vec!["2026-01-01", "us-east-1"])],
-            readable: vec![],
-            missing: vec![vec!["2026-01-01", "us-east-1"], vec!["2026-01-01"]],
-        },
-        FailureCase {
-            case: "an input that names no values at all",
-            keys: vec!["dt"],
-            inputs: vec![json!({ "Parameters": { "classification": "csv" } })],
-            expected_codes: vec!["InvalidInputException"],
-            expected_values: vec![None],
-            readable: vec![],
-            missing: vec![],
-        },
-        FailureCase {
-            case: "a table that defines no partition keys",
-            keys: vec![],
-            inputs: vec![json!({ "Values": ["2026-01-01"] })],
-            expected_codes: vec!["InvalidInputException"],
-            expected_values: vec![Some(vec!["2026-01-01"])],
-            readable: vec![],
-            missing: vec![vec!["2026-01-01"]],
-        },
-        FailureCase {
-            case: "one good item beside two bad ones",
-            keys: vec!["dt"],
             inputs: vec![
-                json!({ "Values": ["2026-01-01"] }),
-                json!({ "Values": ["2026-01-02", "extra"] }),
-                json!({ "Values": ["2026-01-01"] }),
+                json!({ "Values": ["2026-01-01", "us-east-1"] }),
+                json!({ "Values": ["2026-01-02", "eu-west-1"] }),
+                json!({ "Values": ["2026-01-01", "us-east-1"] }),
             ],
-            expected_codes: vec!["InvalidInputException", "AlreadyExistsException"],
-            expected_values: vec![
-                Some(vec!["2026-01-02", "extra"]),
-                Some(vec!["2026-01-01"]),
+            expected_codes: vec!["AlreadyExistsException"],
+            expected_values: vec![Some(vec!["2026-01-01", "us-east-1"])],
+            readable: vec![
+                vec!["2026-01-01", "us-east-1"],
+                vec!["2026-01-02", "eu-west-1"],
             ],
-            readable: vec![vec!["2026-01-01"]],
-            missing: vec![vec!["2026-01-02", "extra"], vec!["2026-01-02"]],
+            missing: vec![vec!["2026-01-03", "us-east-1"]],
         },
     ];
 
@@ -467,6 +432,121 @@ async fn an_item_that_cannot_be_created_fails_only_itself() {
                 status, 400,
                 "case {case}: the refused item {values:?} must not have been stored; got \
                  {status} with {read}"
+            );
+        }
+    }
+}
+
+/// One row of the request-level refusal table.
+struct ArityCase {
+    case: &'static str,
+    /// The partition keys the addressed table defines.
+    keys: Vec<&'static str>,
+    /// The batch's `PartitionInputList`, at least one item of which carries a value count
+    /// other than the table's key count.
+    inputs: Vec<Value>,
+    /// Value lists a read must NOT serve after the refused batch, because a refused
+    /// request creates nothing at all — including the items that were well-formed.
+    created_nothing: Vec<Vec<&'static str>>,
+}
+
+/// A `PartitionInput` whose value count is not the addressed table's partition-key count
+/// refuses the WHOLE request with `InvalidInputException`: a partition is one value per
+/// partition key of its table, so such an item describes a slice of no table and the
+/// request is malformed rather than partly servable. The response carries no `Errors` list
+/// at all, and nothing is created — not even the items of the same batch that were
+/// well-formed.
+///
+/// The rows differ along how the count is wrong (fewer values than keys, more values than
+/// keys, no `Values` member at all, a value for a table that defines no partition keys),
+/// how many partition keys the table defines (0, 1, 2, 3), how many items the batch
+/// carries and where in it the malformed item sits.
+#[tokio::test]
+async fn an_arity_mismatch_refuses_the_whole_request() {
+    let router = emulator();
+
+    let cases = [
+        ArityCase {
+            case: "fewer values than the table has partition keys",
+            keys: vec!["dt", "region"],
+            inputs: vec![json!({ "Values": ["2026-01-01"] })],
+            created_nothing: vec![vec!["2026-01-01", "us-east-1"]],
+        },
+        ArityCase {
+            case: "more values than the table has partition keys",
+            keys: vec!["dt"],
+            inputs: vec![json!({ "Values": ["2026-01-01", "us-east-1"] })],
+            created_nothing: vec![vec!["2026-01-01"]],
+        },
+        ArityCase {
+            case: "an input that names no values at all",
+            keys: vec!["dt"],
+            inputs: vec![json!({ "Parameters": { "classification": "csv" } })],
+            created_nothing: vec![vec!["2026-01-01"]],
+        },
+        ArityCase {
+            case: "a table that defines no partition keys",
+            keys: vec![],
+            inputs: vec![json!({ "Values": ["2026-01-01"] })],
+            created_nothing: vec![vec!["2026-01-01"]],
+        },
+        ArityCase {
+            case: "the malformed item last, after two well-formed ones",
+            keys: vec!["dt"],
+            inputs: vec![
+                json!({ "Values": ["2026-01-01"] }),
+                json!({ "Values": ["2026-01-02"] }),
+                json!({ "Values": ["2026-01-03", "extra"] }),
+            ],
+            created_nothing: vec![vec!["2026-01-01"], vec!["2026-01-02"]],
+        },
+        ArityCase {
+            case: "three keys and an item carrying two values",
+            keys: vec!["year", "month", "day"],
+            inputs: vec![
+                json!({ "Values": ["2026", "01"] }),
+                json!({ "Values": ["2026", "01", "02"] }),
+            ],
+            created_nothing: vec![vec!["2026", "01", "02"]],
+        },
+    ];
+
+    for (index, row) in cases.iter().enumerate() {
+        let case = row.case;
+        let database = format!("arity_db_{index}");
+        let table = format!("arity_table_{index}");
+        seed_table(&router, &database, &table, &row.keys).await;
+
+        let (status, body) = call(
+            &router,
+            "BatchCreatePartition",
+            &json!({
+                "DatabaseName": database,
+                "TableName": table,
+                "PartitionInputList": row.inputs
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: the whole request must be refused, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("InvalidInputException"),
+            "case {case}: expected InvalidInputException, got {} in {body}",
+            error_code(&body)
+        );
+        assert!(
+            body["Errors"].is_null(),
+            "case {case}: a request-level refusal carries no Errors list, got {body}"
+        );
+
+        for values in &row.created_nothing {
+            let (status, read) = get_partition(&router, &database, &table, values).await;
+            assert_eq!(
+                status, 400,
+                "case {case}: a refused request creates nothing, so {values:?} must not be \
+                 readable; got {status} with {read}"
             );
         }
     }

@@ -29,7 +29,9 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, emulator_on, error_type, ok, string_member, ACCOUNT};
+use super::harness::{
+    call, emulator, emulator_on, error_type, ok, string_member, Emulator, ACCOUNT,
+};
 
 /// The bounds of `ListResolverConfigs$MaxResults`, from the range the model puts
 /// on it (`smithy_query(query="operation",operation="ListResolverConfigs")`:
@@ -129,11 +131,16 @@ fn listed_entry(listing: &[Value], resource_id: &str) -> Option<Value> {
 
 /// Create an OUTBOUND Resolver endpoint on `subnets`, and return
 /// `(endpoint id, HostVPCId)`.
+///
+/// The subnets are registered in the account's own Amazon EC2 store first: an
+/// endpoint's addresses are placed in subnets of the caller's VPC, which the
+/// create resolves against that store.
 async fn outbound_endpoint(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     creator: &str,
     subnets: (&str, &str),
 ) -> (String, String) {
+    router.hold_subnets([subnets.0, subnets.1]);
     let created = ok(
         router,
         "CreateResolverEndpoint",
