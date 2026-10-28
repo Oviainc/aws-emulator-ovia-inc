@@ -32,13 +32,23 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::state::{
     service_state, TAG_KEY_MAX_LENGTH, TAG_KEY_MIN_LENGTH,
 };
 
+use crate::application_lifecycle::create_workspace;
 use crate::asset_lifecycle::{call, error_code, router, router_with_engine};
+use crate::computation_model_lifecycle::{anomaly_detection, asset_model_property, id_of};
 use crate::gateway_lifecycle::{greengrass_v2, GATEWAYS};
 use crate::resource_tags::list_tags;
 
 /// The workspace the workspace-scoped routes work in. `WorkspaceName` is
 /// modelled `^[a-zA-Z0-9_-]+$`.
 const WORKSPACE: &str = "tag-key-workspace";
+
+/// An IAM Identity Center instance of the form `CreateApplication`'s
+/// `idcInstanceArn` models (`ARN`, `^arn:aws(-cn|-us-gov)?:[a-zA-Z0-9-:\/_\.]+$`).
+const IDC_INSTANCE_ARN: &str = "arn:aws:sso:::instance/ssoins-1212121212121212";
+
+/// A non-empty `DashboardDefinition`: the shape is modelled `^.+$`, so any
+/// non-empty literal is one.
+const DASHBOARD_DEFINITION: &str = "{\"widgets\":[]}";
 
 /// An ECR image URI and an execution role of the forms `ContainerTaskConfiguration`
 /// models (`ecrUri`, `taskExecutionRole`).
@@ -92,11 +102,13 @@ fn member(body: &Value, name: &str) -> String {
 /// beside the ARN of the asset model the rows were built around — the resource
 /// `TagResource` tags, and the one whose tag set a refusal must leave untouched.
 ///
-/// The list is the `tags`-bearing inputs this crate implements (the remaining
-/// `tags`-bearing operations — `CreateProject` and `CreateDashboard` — are still
-/// scaffolded 501 stubs and are left to their own stub issues;
-/// `CreateApplication` and `CreateComputationModel` are implemented and carry
-/// this same tag-key cover in their own suites).
+/// The list is EVERY `tags`-bearing input this crate implements — the create of
+/// each taggable kind, plus `TagResource` — so a tag-key rule driven over this
+/// table is pinned over the whole set of operations that take caller-supplied
+/// tag keys rather than over a sample of them. The containers some rows need (a
+/// portal for a project, a project for a dashboard, a workspace for an
+/// application) are opened first, because a create naming a container the store
+/// does not hold is answered as absence whatever tags it carries.
 ///
 /// `pub(crate)` for the reason [`Target`] is.
 pub(crate) async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>) {
@@ -136,6 +148,29 @@ pub(crate) async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>
         "the host portal must be created, got {status} {portal}"
     );
     let host_portal_id = member(&portal, "portalId");
+    // The portal is named by two rows — the access policy is about it, and a
+    // project is created in it — so each closure owns its own copy.
+    let portal_for_projects = host_portal_id.clone();
+
+    // A stored workspace: an application is created IN one.
+    create_workspace(router, WORKSPACE).await;
+
+    // A stored project: a dashboard is created IN one.
+    let (status, project) = call(
+        router,
+        "POST",
+        "/projects",
+        Some(json!({
+            "portalId": host_portal_id,
+            "projectName": "tag-key-host-project",
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the host project must be created, got {status} {project}"
+    );
+    let host_project_id = member(&project, "projectId");
 
     let rows = vec![
         Target {
@@ -240,6 +275,60 @@ pub(crate) async fn targets(router: &MultiServiceRouter) -> (String, Vec<Target>
             arn: Box::new(|created| member(created, "accessPolicyArn")),
         },
         Target {
+            label: "CreateProject",
+            uri: "/projects".to_string(),
+            success: 201,
+            body: Box::new(move |suffix| {
+                json!({
+                    "portalId": portal_for_projects,
+                    "projectName": format!("project-{suffix}"),
+                })
+            }),
+            arn: Box::new(|created| member(created, "projectArn")),
+        },
+        Target {
+            label: "CreateDashboard",
+            uri: "/dashboards".to_string(),
+            success: 201,
+            body: Box::new(move |suffix| {
+                json!({
+                    "projectId": host_project_id,
+                    "dashboardName": format!("dashboard-{suffix}"),
+                    "dashboardDefinition": DASHBOARD_DEFINITION,
+                })
+            }),
+            arn: Box::new(|created| member(created, "dashboardArn")),
+        },
+        Target {
+            label: "CreateApplication",
+            uri: "/applications".to_string(),
+            success: 200,
+            body: Box::new(|suffix| {
+                json!({
+                    "workspaceName": WORKSPACE,
+                    "name": format!("application-{suffix}"),
+                    "idcInstanceArn": IDC_INSTANCE_ARN,
+                })
+            }),
+            arn: Box::new(|created| member(created, "arn")),
+        },
+        Target {
+            label: "CreateComputationModel",
+            uri: "/computation-models".to_string(),
+            success: 202,
+            body: Box::new(|suffix| {
+                json!({
+                    "computationModelName": format!("model-{suffix}"),
+                    "computationModelConfiguration": anomaly_detection("input", "result"),
+                    "computationModelDataBinding": {
+                        "input": asset_model_property(&id_of('1'), &id_of('2')),
+                        "result": asset_model_property(&id_of('1'), &id_of('3')),
+                    },
+                })
+            }),
+            arn: Box::new(|created| member(created, "computationModelArn")),
+        },
+        Target {
             label: "TagResource",
             uri: format!("/tags?resourceArn={host_model_arn}"),
             success: 200,
@@ -275,10 +364,14 @@ pub(crate) async fn fingerprint(
         let store = state.lock();
         store.asset_models.len()
             + store.access_policies.len()
+            + store.applications.len()
             + store.assets.len()
+            + store.computation_models.len()
+            + store.dashboards.len()
             + store.gateways.len()
             + store.portals.len()
             + store.pipelines.len()
+            + store.projects.len()
             + store.tasks.len()
             + store.datasets.len()
             + store.workspaces.len()
