@@ -17,6 +17,10 @@ mod health_events;
 mod internet_events;
 #[path = "all/monitor_lifecycle.rs"]
 mod monitor_lifecycle;
+#[path = "all/query_interface.rs"]
+mod query_interface;
+#[path = "all/refusal_shapes.rs"]
+mod refusal_shapes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/untag_resource.rs"]

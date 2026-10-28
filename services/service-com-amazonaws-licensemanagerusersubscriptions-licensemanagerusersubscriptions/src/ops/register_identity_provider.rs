@@ -21,6 +21,15 @@
 //! whose licensing goes through a license server endpoint needs no VPC endpoints for.
 //! The summary reports exactly that empty configuration; nothing is invented for it.
 //!
+//! What a supplied `Settings` names, though, has to EXIST: the registration creates the
+//! activation-server VPC endpoints in those subnets with that security group, so each id
+//! is resolved against what the account has, asked of the service that owns those
+//! resources ([`crate::state::ec2_fleet::resolve_settings_network`]), and a request naming
+//! a network resource the account does not have, or mixing resources of two VPCs, is
+//! refused. The subnets a self-managed Active Directory's
+//! `DomainNetworkSettings.Subnets` names are resolved against the same owner, by the same
+//! existence rule ([`crate::state::ec2_fleet::resolve_domain_subnets`]).
+//!
 //! Two request values are refused here that no modelled constraint can express:
 //!
 //! * `Product` is modelled as a plain `String`, but its documentation lists the only
@@ -190,6 +199,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(tags) = input.tags.as_ref() {
             crate::state::validate_tags(tags).map_err(into_error)?;
         }
+
+        // The subnets and the security group a supplied `Settings` names are resources of
+        // the caller's own VPC — this registration CREATES the activation-server VPC
+        // endpoints in them — so each id is resolved against what the account has, asked of
+        // the service that owns those resources, and one the account has no such resource
+        // for, or one that belongs to another VPC than the rest, is refused before anything
+        // is minted or stored. Resolved AFTER the facts about the request itself (the
+        // product, the tags) and before this service's own store is locked at all, because
+        // like the directory below it is a question for another service rather than a fact
+        // about the request.
+        if let Some(settings) = input.settings.as_ref() {
+            crate::state::ec2_fleet::resolve_settings_network(ctx, settings)
+                .await
+                .map_err(into_error)?;
+        }
+
+        // A self-managed Active Directory's `DomainNetworkSettings.Subnets` name subnets of
+        // the account too ("a list of subnets that apply for the Active Directory domain"),
+        // so they are resolved by the same rule, against the same owner. Existence only:
+        // nothing is provisioned in them, so there is no endpoint to confine to one VPC.
+        crate::state::ec2_fleet::resolve_domain_subnets(ctx, &input.identity_provider)
+            .await
+            .map_err(into_error)?;
 
         let now = std::time::SystemTime::now();
 

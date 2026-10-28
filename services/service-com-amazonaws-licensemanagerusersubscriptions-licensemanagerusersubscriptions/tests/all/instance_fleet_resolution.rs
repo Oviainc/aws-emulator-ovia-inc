@@ -37,7 +37,8 @@ use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubs
 // ONE wire harness per service: the dispatch plumbing, the directory fleet and the reply
 // reader come from the sibling suite rather than a second copy of them here.
 use crate::identity_provider_subscriptions::{
-    as_str, call, create_directories, provider_union, register, Harness, Reply, PRODUCTS, REGION,
+    as_str, call, create_directories, create_network, provider_union, register, Harness, Reply,
+    ACCOUNT_SECURITY_GROUPS, ACCOUNT_SUBNETS, ACCOUNT_VPC, PRODUCTS, REGION,
 };
 
 /// The directory the registration these associations are made through is for, put in the
@@ -103,6 +104,14 @@ impl Fleet {
         // `RegisterIdentityProvider` resolves a `DirectoryId` against the account's
         // directories, so the directory the registration names is in that fleet first.
         create_directories(&engine, &[DIRECTORY]);
+        // And it resolves the `Settings` of that registration against what the account has
+        // in Amazon EC2, so the network [`register_provider`] names is created there first.
+        create_network(
+            &engine,
+            ACCOUNT_VPC,
+            ACCOUNT_SUBNETS,
+            ACCOUNT_SECURITY_GROUPS,
+        );
         let callback = EmbeddedEmulator::from_router(router.clone());
         let config = ::aws_sdk_ec2::Config::builder()
             .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
@@ -254,8 +263,8 @@ pub(crate) async fn register_provider(h: &Harness) {
             "IdentityProvider": provider_union(DIRECTORY),
             "Product": PRODUCTS[0],
             "Settings": {
-                "Subnets": ["subnet-0123456789abcdef0"],
-                "SecurityGroupId": "sg-0123abcd",
+                "Subnets": [ACCOUNT_SUBNETS[0]],
+                "SecurityGroupId": ACCOUNT_SECURITY_GROUPS[0],
             },
         }),
     )

@@ -316,6 +316,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Both encryption contexts are INPUT: a context that is not a legal encryption
+        // context is a malformed request, refused by the validation every operation
+        // taking one shares — ahead of the source ciphertext's authentication and of
+        // anything being sealed under the destination key.
+        crate::state::check_encryption_context(input.source_encryption_context.as_ref())?;
+        crate::state::check_encryption_context(input.destination_encryption_context.as_ref())?;
+
         // Who the request speaks for, resolved BEFORE this service's store is locked, so
         // the IAM and STS stores the resolution reads are never reached while this
         // service's guard is held.
@@ -378,12 +385,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let source_key = match &envelope {
                 Some(envelope) => {
                     // The key the envelope names is the only one that can open the
-                    // ciphertext. A key that no longer exists in this Region cannot.
+                    // ciphertext, and this endpoint can use only a key of its OWN
+                    // Region: a ciphertext whose key is not held here names material
+                    // this endpoint cannot authorize, which is an authorization refusal
+                    // rather than a report that the key is missing. Material the keys of
+                    // a multi-Region set share is held by every member, so a replica
+                    // re-encrypts its primary's ciphertext as usual.
                     let Some(sealed_under) = state.key_in(&region, &envelope.key_id) else {
-                        return Err(not_found(crate::state::key_not_found_message(
-                            &region,
-                            &envelope.key_id,
-                        )));
+                        return Err(crate::state::foreign_key_material());
                     };
                     // "When you use the SourceKeyId parameter to specify a KMS key, KMS
                     // uses only the KMS key you specify. If the ciphertext was encrypted
@@ -407,6 +416,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             }
                             crate::state::KeyRef::UnauthorizedAccount => {
                                 return Err(crate::state::unauthorized_account(Self::NAME));
+                            }
+                            // A `SourceKeyId` that is an ARN of another Region names a
+                            // key this endpoint cannot authorize for the ciphertext
+                            // either, so it is refused the way the ciphertext's own
+                            // foreign key is.
+                            crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn
+                                if crate::state::names_another_region(&region, requested) =>
+                            {
+                                return Err(crate::state::foreign_key_material());
                             }
                             crate::state::KeyRef::NotFound
                             | crate::state::KeyRef::MalformedArn => {

@@ -1415,7 +1415,8 @@ use crate::ops::types::{
     Byoasn, ByoipCidr, ConnectionNotification,
     DhcpConfiguration, DhcpOptions,
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
-    CapacityReservationCommitmentInfo, CapacityReservationInfo, ExportTask, FpgaImage,
+    CapacityReservationCommitmentInfo, CapacityReservationInfo, CustomerGateway, ExportTask,
+    FpgaImage,
     FpgaImageState, ImageUsageReport,
     DestinationOptionsResponse, FlowLog, TagFieldSpecificationResponse,
     LoadPermission,
@@ -3382,6 +3383,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// by that id, which is the order `DescribeVpcEndpointAssociations` reports and pages
     /// over.
     pub vpc_endpoint_associations: BTreeMap<String, VpcEndpointAssociation>,
+    /// Every customer gateway the account holds, by `CustomerGatewayId`, as
+    /// [`CustomerGatewayRecord`]s — the modelled [`CustomerGateway`] every operation that
+    /// reports one answers with, plus the move the clock owes one written in a non-terminal
+    /// state (see that type, and the "Customer gateways" section of this module). Ordered by
+    /// id, which is the order `DescribeCustomerGateways` reports in.
+    pub customer_gateways: BTreeMap<String, CustomerGatewayRecord>,
     /// Every Site-to-Site VPN connection the account holds, by `VpnConnectionId`, as
     /// [`VpnConnectionRecord`]s — the modelled [`VpnConnection`] every operation that reports
     /// one answers with, plus the move the clock owes each static route that is not in a
@@ -3870,6 +3877,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoint_client_tokens: HashMap::new(),
             vpc_endpoint_connection_notifications: BTreeMap::new(),
             vpc_endpoint_associations: BTreeMap::new(),
+            customer_gateways: BTreeMap::new(),
             vpn_connections: BTreeMap::new(),
             transit_gateway_attachments: BTreeMap::new(),
             transit_gateway_multicast_domains: BTreeMap::new(),
@@ -6705,6 +6713,20 @@ impl ComAmazonawsEc2Amazonec2State {
                 false
             });
         }
+        // A customer gateway written in a non-terminal `CustomerGateway$State` reaches the
+        // state recorded for it once its due instant has passed, whether or not anybody
+        // called — the same contract as the VPN connection's own move above.
+        for record in self.customer_gateways.values_mut() {
+            if let Some(state) = record
+                .pending
+                .as_ref()
+                .and_then(|owed| owed.due_by(now))
+                .map(str::to_string)
+            {
+                record.view.state = Some(state);
+                record.pending = None;
+            }
+        }
         // A target network association `AssociateClientVpnTargetNetwork` answered as
         // `associating` is `associated` once its due instant has passed, whether or not
         // anybody called again — the same contract as a `pending` VPC's move above.
@@ -8133,6 +8155,7 @@ impl ComAmazonawsEc2Amazonec2State {
             carrier_gateways,
             client_vpn_endpoints,
             coip_pools,
+            customer_gateways => view,
             dedicated_hosts,
             dhcp_options,
             export_tasks => view,
@@ -33961,6 +33984,311 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.apply_due_move(to);
             }
         }
+    }
+}
+
+// =============================================================================
+// Customer gateways
+// =============================================================================
+
+/// The id prefix a customer gateway's `CustomerGatewayId` carries (`cgw-0123456789abcdef0`),
+/// which [`ComAmazonawsEc2Amazonec2State::next_id`] mints the long form of.
+pub const CUSTOMER_GATEWAY_ID_PREFIX: &str = "cgw";
+
+/// The `ResourceType` a `CreateCustomerGateway` tag specification may name: the customer
+/// gateway it creates ("The tags to apply to the customer gateway",
+/// `CreateCustomerGatewayRequest$TagSpecifications`), which is the `ResourceType` enum's
+/// `customer-gateway` member ([`crate::ops::types::RESOURCE_TYPE_VALUES`]).
+pub const RESOURCE_TYPE_CUSTOMER_GATEWAY: &str = "customer-gateway";
+
+/// The ASN a customer gateway gets when the request names neither `BgpAsn` nor
+/// `BgpAsnExtended`: "Default: 65000" (`CreateCustomerGatewayRequest$BgpAsn`).
+pub const DEFAULT_CUSTOMER_GATEWAY_BGP_ASN: i64 = 65_000;
+
+/// The ASN range `BgpAsn` carries: "Valid values: 1 to 2,147,483,647"
+/// (`CreateCustomerGatewayRequest$BgpAsn`).
+pub const CUSTOMER_GATEWAY_BGP_ASN: ::std::ops::RangeInclusive<i64> = 1..=2_147_483_647;
+
+/// The ASN range `BgpAsnExtended` carries: "Valid values: 2,147,483,648 to 4,294,967,295"
+/// (`CreateCustomerGatewayRequest$BgpAsnExtended`) — "If the ASN is larger than 2,147,483,647,
+/// you must use BgpAsnExtended", which is what makes the two ranges disjoint.
+pub const CUSTOMER_GATEWAY_BGP_ASN_EXTENDED: ::std::ops::RangeInclusive<i64> =
+    2_147_483_648..=4_294_967_295;
+
+/// How many characters a customer gateway device name may carry: "Length Constraints: Up to
+/// 255 characters" (`CreateCustomerGatewayRequest$DeviceName`), which the model publishes as
+/// prose rather than as a `@length` the boundary validator could apply.
+pub const MAX_CUSTOMER_GATEWAY_DEVICE_NAME_CHARS: usize = 255;
+
+/// The ASN a customer gateway create asks for, as the gateway reports it: the member the
+/// request named it in, holding each to the range that member publishes, or
+/// [`DEFAULT_CUSTOMER_GATEWAY_BGP_ASN`] when it named neither.
+///
+/// "You must specify either BgpAsn or BgpAsnExtended when creating the customer gateway. If
+/// the ASN is larger than 2,147,483,647, you must use BgpAsnExtended"
+/// (`CreateCustomerGatewayRequest$BgpAsn`): the two members are two halves of ONE ASN, so a
+/// request naming both names two ASNs for one device and is refused rather than having one
+/// silently win. The answer is the pair the gateway reports — the modelled `CustomerGateway`
+/// carries the ASN as text, in whichever of its two members the ASN's size puts it.
+pub fn customer_gateway_bgp_asn<E>(
+    bgp_asn: Option<i32>,
+    bgp_asn_extended: Option<i64>,
+) -> Result<(Option<String>, Option<String>), Scaffolded<E>> {
+    match (bgp_asn, bgp_asn_extended) {
+        (Some(_), Some(_)) => Err(invalid_parameter_combination(
+            "Either BgpAsn or BgpAsnExtended may be specified for a customer gateway, not \
+             both",
+        )),
+        (Some(asn), None) => {
+            let asn = i64::from(asn);
+            if !CUSTOMER_GATEWAY_BGP_ASN.contains(&asn) {
+                return Err(invalid_parameter_value(format!(
+                    "Value ({asn}) for parameter bgpAsn is invalid. Valid values: {min} to \
+                     {max}.",
+                    min = CUSTOMER_GATEWAY_BGP_ASN.start(),
+                    max = CUSTOMER_GATEWAY_BGP_ASN.end(),
+                )));
+            }
+            Ok((Some(asn.to_string()), None))
+        }
+        (None, Some(asn)) => {
+            if !CUSTOMER_GATEWAY_BGP_ASN_EXTENDED.contains(&asn) {
+                return Err(invalid_parameter_value(format!(
+                    "Value ({asn}) for parameter bgpAsnExtended is invalid. Valid values: \
+                     {min} to {max}.",
+                    min = CUSTOMER_GATEWAY_BGP_ASN_EXTENDED.start(),
+                    max = CUSTOMER_GATEWAY_BGP_ASN_EXTENDED.end(),
+                )));
+            }
+            Ok((None, Some(asn.to_string())))
+        }
+        (None, None) => Ok((Some(DEFAULT_CUSTOMER_GATEWAY_BGP_ASN.to_string()), None)),
+    }
+}
+
+/// The code EC2 answers a request naming a customer gateway id this account holds no gateway
+/// for.
+///
+/// There is no second refusal for an id that is not SHAPED like a `CustomerGatewayId`:
+/// `smithy_query(query="shape",shape="CustomerGatewayId")` is a plain string with no pattern,
+/// so nothing here knows the form of an id this service did not mint, and the recorded wire
+/// corpus shows both the short (`cgw-` plus 8 hexadecimal digits) and the long (17) form of an
+/// id nothing holds answered with this one code. Every value that resolves to no gateway is
+/// therefore answered the same way, as it is on the VPN connection's static-route surface
+/// ([`invalid_vpn_connection_id`]).
+pub const INVALID_CUSTOMER_GATEWAY_ID_NOT_FOUND: &str = "InvalidCustomerGatewayID.NotFound";
+
+/// Refuse a request that named a customer gateway id this account holds no gateway for: HTTP
+/// 400 [`INVALID_CUSTOMER_GATEWAY_ID_NOT_FOUND`], worded by the one place this module words a
+/// missing resource id ([`id_not_found`]).
+pub fn invalid_customer_gateway_id_not_found<E>(customer_gateway_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_CUSTOMER_GATEWAY_ID_NOT_FOUND,
+        "customerGateway ID",
+        customer_gateway_id,
+    )
+}
+
+/// EC2's error code for a create that would take the account past its customer gateway quota.
+pub const CUSTOMER_GATEWAY_LIMIT_EXCEEDED: &str = "CustomerGatewayLimitExceeded";
+
+/// Refuse a create that would take the store past [`MAX_STORED_RECORDS_PER_STORE`]: HTTP 400
+/// [`CUSTOMER_GATEWAY_LIMIT_EXCEEDED`], on the contract of [`vpn_gateway_limit_exceeded`].
+pub fn customer_gateway_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        CUSTOMER_GATEWAY_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "The maximum number of customer gateways has been reached \
+             ({MAX_STORED_RECORDS_PER_STORE})"
+        ),
+    )
+}
+
+/// One stored customer gateway: the modelled [`CustomerGateway`] every operation that reports
+/// one answers with, plus the move the clock owes it while its state is not a terminal one.
+///
+/// "The current state of the customer gateway (`pending | available | deleting | deleted`)"
+/// (`CustomerGateway$State`) is the same four words the `VpnState` enum publishes, so this
+/// section holds no second copy of them: [`VPN_STATE_PENDING`], [`VPN_STATE_AVAILABLE`],
+/// [`VPN_STATE_DELETING`] and [`VPN_STATE_DELETED`] are the words a gateway's state is
+/// spelled with.
+#[derive(Debug, Clone, Default)]
+pub struct CustomerGatewayRecord {
+    /// The gateway as the model shapes it — what every reporting operation answers with.
+    pub view: CustomerGateway,
+    /// The state the clock owes this gateway while it is in a non-terminal one. `None` once
+    /// nothing is owed.
+    pub pending: Option<PendingStateMove>,
+}
+
+impl CustomerGatewayRecord {
+    /// The gateway's own `CustomerGatewayId`.
+    pub fn customer_gateway_id(&self) -> &str {
+        self.view.customer_gateway_id.as_deref().unwrap_or_default()
+    }
+
+    /// The gateway's `CustomerGateway$State` as it was last reported.
+    pub fn state(&self) -> &str {
+        self.view.state.as_deref().unwrap_or_default()
+    }
+
+    /// The caller-chosen bytes this record holds, through the one definition of that charge
+    /// ([`customer_gateway_payload_bytes`]).
+    pub fn payload_bytes(&self) -> usize {
+        customer_gateway_payload_bytes(&self.view)
+    }
+
+    /// Take this gateway out of service: move it to the terminal [`VPN_STATE_DELETED`] and
+    /// leave nothing owed.
+    ///
+    /// `deleted` is a `CustomerGateway$State` word, so a deleted gateway is still a gateway the
+    /// API reports rather than a record that vanishes. The move is immediate and NOT a span the
+    /// clock owes: a customer gateway is a RECORD of a device the customer operates, with
+    /// nothing to provision or tear down, which is also why a create answers one already in
+    /// service. One already gone is left exactly as it is, so repeating the request reports no
+    /// second deletion.
+    ///
+    /// Reach it through [`ComAmazonawsEc2Amazonec2State::require_customer_gateway_mut`], the one
+    /// place an operation resolves the gateway it is about.
+    pub fn delete(&mut self) {
+        self.view.state = Some(VPN_STATE_DELETED.to_string());
+        self.pending = None;
+    }
+}
+
+/// The caller-chosen bytes one stored customer gateway holds: its tags and each text member a
+/// request chooses the value of. Everything else on the record — the id and the state — is
+/// derived by this module, so it is fixed-size.
+///
+/// The ONE definition of that charge: `CreateCustomerGateway` asks it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_customer_gateway`] charges exactly it.
+pub fn customer_gateway_payload_bytes(view: &CustomerGateway) -> usize {
+    let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+    tag_list_bytes(view.tags.as_deref().unwrap_or_default())
+        .saturating_add(text(&view.ip_address))
+        .saturating_add(text(&view.device_name))
+        .saturating_add(text(&view.certificate_arn))
+        .saturating_add(text(&view.bgp_asn))
+        .saturating_add(text(&view.bgp_asn_extended))
+}
+
+/// The move the clock owes a customer gateway whose state is `state`, or `None` when that
+/// state is already terminal.
+///
+/// The ONE place that rule is written for this resource: a gateway reported in a non-terminal
+/// state still owes the move to its terminal one, and that move falls due at its own instant
+/// whether or not anybody calls again — `pending` becomes `available`, `deleting` becomes
+/// `deleted`.
+fn owed_customer_gateway_move(state: &str) -> Option<PendingStateMove> {
+    match state {
+        VPN_STATE_PENDING => Some(PendingStateMove::starting_now(VPN_STATE_AVAILABLE)),
+        VPN_STATE_DELETING => Some(PendingStateMove::starting_now(VPN_STATE_DELETED)),
+        _ => None,
+    }
+}
+
+/// The store's customer gateways, and the one way one is written.
+///
+/// [`Self::has_customer_gateway_capacity`] and [`Self::insert_customer_gateway`] are that
+/// write path, reached from `CreateCustomerGateway` — the one operation that mints a gateway —
+/// and from the test harness that seeds one in a state a create does not answer with.
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another customer gateway fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]), on the contract of
+    /// [`Self::has_vpn_connection_capacity`].
+    pub fn has_customer_gateway_capacity(&self) -> bool {
+        self.customer_gateways.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The customer gateway `customer_gateway_id` names, if this account holds one.
+    pub fn customer_gateway(&self, customer_gateway_id: &str) -> Option<&CustomerGatewayRecord> {
+        self.customer_gateways.get(customer_gateway_id)
+    }
+
+    /// The customer gateway `customer_gateway_id` names, or the one refusal every operation
+    /// that resolves such an id answers for a value it cannot resolve:
+    /// [`invalid_customer_gateway_id_not_found`].
+    pub fn require_customer_gateway<E>(
+        &self,
+        customer_gateway_id: &str,
+    ) -> Result<&CustomerGatewayRecord, Scaffolded<E>> {
+        self.customer_gateways
+            .get(customer_gateway_id)
+            .ok_or_else(|| invalid_customer_gateway_id_not_found(customer_gateway_id))
+    }
+
+    /// The customer gateway `customer_gateway_id` names, for a writer — the same refusal
+    /// [`Self::require_customer_gateway`] answers for an id it cannot resolve.
+    pub fn require_customer_gateway_mut<E>(
+        &mut self,
+        customer_gateway_id: &str,
+    ) -> Result<&mut CustomerGatewayRecord, Scaffolded<E>> {
+        self.customer_gateways
+            .get_mut(customer_gateway_id)
+            .ok_or_else(|| invalid_customer_gateway_id_not_found(customer_gateway_id))
+    }
+
+    /// The `VpnConnectionId` of a VPN connection still USING the customer gateway
+    /// `customer_gateway_id` names, if the account holds one.
+    ///
+    /// "You must delete the VPN connection before you can delete the customer gateway"
+    /// (`DeleteCustomerGateway`): a connection in a terminal or outgoing state no longer uses
+    /// its gateway, so only one in [`VPN_STATE_PENDING`] or [`VPN_STATE_AVAILABLE`] counts. The
+    /// ONE place that question is asked, so the delete and any later reader of the dependency
+    /// cannot disagree about it.
+    pub fn vpn_connection_using_customer_gateway(&self, customer_gateway_id: &str) -> Option<&str> {
+        self.vpn_connections
+            .values()
+            .find(|record| {
+                record.view.customer_gateway_id.as_deref() == Some(customer_gateway_id)
+                    && matches!(record.state(), VPN_STATE_PENDING | VPN_STATE_AVAILABLE)
+            })
+            .map(VpnConnectionRecord::vpn_connection_id)
+    }
+
+    /// The customer gateway an IDENTICAL create would be answered with: "An identical request
+    /// returns information about the existing customer gateway; it doesn't create a new
+    /// customer gateway" (`CreateCustomerGateway`).
+    ///
+    /// What makes two requests identical is what that documentation names: "To create more
+    /// than one customer gateway with the same VPN type, IP address, and BGP ASN, specify a
+    /// unique device name for each customer gateway" — the type, the outside address, the ASN
+    /// and the device name together. A gateway on its way out or already gone is NOT one such
+    /// a request can be answered with, so only a gateway in [`VPN_STATE_PENDING`] or
+    /// [`VPN_STATE_AVAILABLE`] is matched: a create that repeats a deleted gateway's
+    /// description creates a new one.
+    pub fn customer_gateway_like(&self, view: &CustomerGateway) -> Option<&CustomerGatewayRecord> {
+        self.customer_gateways.values().find(|record| {
+            matches!(record.state(), VPN_STATE_PENDING | VPN_STATE_AVAILABLE)
+                && record.view.r#type == view.r#type
+                && record.view.ip_address == view.ip_address
+                && record.view.bgp_asn == view.bgp_asn
+                && record.view.bgp_asn_extended == view.bgp_asn_extended
+                && record.view.device_name == view.device_name
+        })
+    }
+
+    /// Store a customer gateway and answer the `CustomerGatewayId` it was given — or `None`
+    /// when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
+    ///
+    /// The id is minted here rather than taken from `view`, the way
+    /// [`Self::insert_vpn_connection`] mints a connection id, and the move the clock owes a
+    /// gateway written in a non-terminal state is recorded by [`owed_customer_gateway_move`]
+    /// rather than slept for. The caller-chosen bytes the record holds are charged on top of
+    /// the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs.
+    pub fn insert_customer_gateway(&mut self, mut view: CustomerGateway) -> Option<String> {
+        if !self.has_customer_gateway_capacity() {
+            return None;
+        }
+        let customer_gateway_id = self.next_id(CUSTOMER_GATEWAY_ID_PREFIX);
+        view.customer_gateway_id = Some(customer_gateway_id.clone());
+        let pending = owed_customer_gateway_move(view.state.as_deref().unwrap_or_default());
+        let record = CustomerGatewayRecord { view, pending };
+        self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES + record.payload_bytes());
+        self.customer_gateways
+            .insert(customer_gateway_id.clone(), record);
+        Some(customer_gateway_id)
     }
 }
 

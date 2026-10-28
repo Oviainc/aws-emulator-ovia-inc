@@ -36,9 +36,10 @@
 //! spelling of each request for both suites.
 //!
 //! What the delete left behind is read through the store for the reason
-//! `super::lens_shares` gives: `DeleteLensShare` answers no members and `ListLensShares` is
-//! a stub with its own issue. The REFUSALS and the re-grant that prove the same thing over
-//! HTTP are asserted beside every stored assertion.
+//! `super::lens_shares` gives: `DeleteLensShare` answers no members, and the paged read of
+//! a lens's shares is `super::lens_share_listing`'s own suite. The REFUSALS and the
+//! re-grant that prove the same thing over HTTP are asserted beside every stored
+//! assertion.
 
 use super::custom_lens_import::{export, lens_document, member, ABSENT_LENS_ARN};
 use super::lens_shares::{

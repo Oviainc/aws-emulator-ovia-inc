@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomerGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomerGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the customer gateway an id names out of service, refusing an id the
+//! account holds no gateway for and a gateway a VPN connection still uses.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomerGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomerGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomerGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomerGateway"))
+        // `ctx` carries request metadata only; this operation reads none of it — a customer
+        // gateway is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The ID of the customer gateway" (`CustomerGatewayId`) is `@required` AND
+        // `@clientOptional`, so a request that sends the field empty reaches this handler
+        // rather than the boundary's refusal. EC2 answers that with `MissingParameter`, which
+        // is a different claim from "no such gateway".
+        if input.customer_gateway_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter customerGatewayId",
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // The clock first: a gateway whose owed move has fallen due is already in the state it
+        // was owed, so what this call does is decided from the state the gateway is ACTUALLY
+        // in rather than from the one the last writer left it in.
+        store.materialize_due_transitions();
+
+        // "Deletes the specified customer gateway" (`DeleteCustomerGateway`): an id this
+        // account holds no gateway for is a refusal, not a no-op — resolved through the one
+        // place this crate resolves the customer gateway an operation acts on.
+        store.require_customer_gateway(&input.customer_gateway_id)?;
+
+        // "You must delete the VPN connection before you can delete the customer gateway"
+        // (`DeleteCustomerGateway`): a connection on its way out or already gone no longer uses
+        // the gateway, so only a connection still in service blocks the delete, and the
+        // refusal names the connection to delete first.
+        if let Some(vpn_connection_id) =
+            store.vpn_connection_using_customer_gateway(&input.customer_gateway_id)
+        {
+            let vpn_connection_id = vpn_connection_id.to_string();
+            return Err(state::dependency_violation(format!(
+                "The customerGateway '{customer_gateway_id}' is used by the VPN connection \
+                 '{vpn_connection_id}', which must be deleted first",
+                customer_gateway_id = input.customer_gateway_id,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`DryRun`). Nothing
+        // has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The write itself, through the one place a gateway's deletion is recorded: the record
+        // keeps being reported, in the terminal state of a gateway that is gone.
+        let record = store.require_customer_gateway_mut(&input.customer_gateway_id)?;
+        record.delete();
+
+        // The operation's modelled output shape is `Unit`, so a success carries nothing beyond
+        // the status.
+        Ok(DeleteCustomerGatewayOutput)
     }
 }

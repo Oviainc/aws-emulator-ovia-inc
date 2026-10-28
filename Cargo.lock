@@ -14535,6 +14535,8 @@ dependencies = [
  "serde_json",
  "serde_json_path",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
+ "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-kms-trentservice",
  "service-common",
  "sha2 0.10.9",
  "tokio",

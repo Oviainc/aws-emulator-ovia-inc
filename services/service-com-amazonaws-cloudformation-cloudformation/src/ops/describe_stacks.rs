@@ -139,7 +139,7 @@ fn stack_view(stored: &StoredStack) -> Stack {
         retain_except_on_create: stored.retain_except_on_create,
         deletion_mode: stored.deletion_mode.clone(),
         detailed_status: None,
-        last_operations: crate::state::last_operation_views(stored.last_operation.as_ref()),
+        last_operations: crate::state::last_operation_views(stored.last_operation()),
     }
 }
 

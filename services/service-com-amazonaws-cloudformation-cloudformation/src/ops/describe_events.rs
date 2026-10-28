@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers the recorded events of one stack as the events of the OPERATIONS
+//! that caused them — each event carrying the id, type, status and span of the operation it
+//! belongs to ([`crate::state::StoredOperation`]) — grouped by operation and newest first,
+//! and selected by the query criteria the request states (a stack, an operation, a change
+//! set, failures only).
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +84,114 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{StoredEvent, StoredOperation, StoredStack};
+
+/// The refusal a request that states no query criteria is answered with: "One of
+/// ChangeSetName, OperationId or StackName must be specified", which is the rule this
+/// operation's own documentation states and the only thing the caller can fix. The text
+/// carries no variable part.
+const QUERY_CRITERIA_REQUIRED: &str =
+    "One of ChangeSetName, OperationId or StackName must be specified.";
+
+/// The `EventType` values this service reports (from the model's `EventType` enum).
+///
+/// Three of the five: the stack's own status changes, the per-resource progress of an
+/// operation's walk, and a resource transition the service that owns the resource refused.
+/// `VALIDATION_ERROR` ("Failures from CloudFormation Early Validations") and
+/// `HOOK_INVOCATION_ERROR` ("Failures from CloudFormation Hook") are absent because
+/// nothing here runs an early validation or a Hook, so no event of either kind is ever
+/// recorded — rather than being reported for work nothing performed.
+mod event_type {
+    pub const STACK_EVENT: &str = "STACK_EVENT";
+    pub const PROGRESS_EVENT: &str = "PROGRESS_EVENT";
+    pub const PROVISIONING_ERROR: &str = "PROVISIONING_ERROR";
+}
+
+/// Whether this event is the STACK's own status change rather than one about a resource of
+/// it: the stack's own events name the stack itself, under its name and its id
+/// ([`StoredStack::record_event`]), which a nested-stack resource of the same type does
+/// not.
+fn is_stack_event(stored: &StoredEvent) -> bool {
+    stored.resource_type == crate::state::STACK_RESOURCE_TYPE
+        && stored.physical_resource_id.as_deref() == Some(stored.stack_id.as_str())
+}
+
+/// Whether this event reports a transition that did NOT go through — which is the set
+/// `EventFilter$FailedEvents` selects ("only returns failed events within the operation").
+fn is_failed_event(stored: &StoredEvent) -> bool {
+    stored
+        .resource_status
+        .ends_with(crate::state::FAILED_SUFFIX)
+}
+
+/// The `EventType` one recorded event carries.
+fn event_type_of(stored: &StoredEvent) -> &'static str {
+    if is_stack_event(stored) {
+        // The stack's own status changes: the operation opening, and how it ended.
+        event_type::STACK_EVENT
+    } else if is_failed_event(stored) {
+        // "Provisioning errors - Resource creation and update failures": a resource
+        // transition the service that owns the resource refused.
+        event_type::PROVISIONING_ERROR
+    } else {
+        // "Progress events - Status updates during stack operation execution."
+        event_type::PROGRESS_EVENT
+    }
+}
+
+/// One recorded event as the modelled `OperationEvent` shape: the event itself, plus the
+/// operation it belongs to where the stack still holds that operation's record.
+///
+/// The Hook and the early-validation members are absent for the reason [`event_type`]
+/// gives — nothing here invokes a Hook or runs an early validation — and `DetailedStatus`
+/// with them: this service records no event in one of those detailed states.
+fn operation_event_view(stored: &StoredEvent, operation: Option<&StoredOperation>) -> OperationEvent {
+    OperationEvent {
+        event_id: Some(stored.event_id.clone()),
+        stack_id: Some(stored.stack_id.clone()),
+        operation_id: stored.operation_id.clone(),
+        operation_type: operation.map(|operation| operation.operation_type.clone()),
+        operation_status: operation.map(|operation| operation.status.clone()),
+        event_type: Some(event_type_of(stored).to_string()),
+        logical_resource_id: Some(stored.logical_resource_id.clone()),
+        physical_resource_id: stored.physical_resource_id.clone(),
+        resource_type: Some(stored.resource_type.clone()),
+        timestamp: Some(crate::state::timestamp(stored.timestamp)),
+        // The operation's own span, not the event's: when the call that opened it was
+        // served, and when its last transition settled — absent while it is still in
+        // flight, since nothing has ended it.
+        start_time: operation.map(|operation| crate::state::timestamp(operation.started_at)),
+        end_time: operation
+            .and_then(|operation| operation.ended_at)
+            .map(crate::state::timestamp),
+        resource_status: Some(stored.resource_status.clone()),
+        resource_status_reason: stored.resource_status_reason.clone(),
+        resource_properties: stored.resource_properties.clone(),
+        client_request_token: stored.client_request_token.clone(),
+        hook_type: None,
+        hook_status: None,
+        hook_status_reason: None,
+        hook_invocation_point: None,
+        hook_failure_mode: None,
+        detailed_status: None,
+        validation_failure_mode: None,
+        validation_name: None,
+        validation_status: None,
+        validation_status_reason: None,
+        validation_path: None,
+    }
+}
+
+/// The instant the operation an event belongs to STARTED, which is what groups a stack's
+/// log by operation: an event of an operation the stack no longer holds a record for is
+/// ordered by its own instant, since there is no span to place it in.
+fn operation_started_at(stack: &StoredStack, stored: &StoredEvent) -> ::std::time::SystemTime {
+    stored
+        .operation_id
+        .as_deref()
+        .and_then(|operation_id| stack.operation(operation_id))
+        .map_or(stored.timestamp, |operation| operation.started_at)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +260,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there are no recorded events to read.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"));
+        };
+        // "One of ChangeSetName, OperationId or StackName must be specified as input": a
+        // request that states none of them selects nothing, which is a bad request rather
+        // than an empty page.
+        if input.stack_name.is_none()
+            && input.change_set_name.is_none()
+            && input.operation_id.is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                QUERY_CRITERIA_REQUIRED,
+            ));
+        }
+        // "If you specify the name of a change set, you must also specify the stack name":
+        // only an ARN names a change set on its own, exactly as it does for
+        // `DescribeChangeSet`.
+        if let Some(change_set_name) = input.change_set_name.as_deref() {
+            crate::state::require_stack_for_change_set_name(
+                change_set_name,
+                input.stack_name.as_deref(),
+            )
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        }
+
+        // A resource of a stack of this Region whose owning service had not reported it
+        // ready when the create answered holds that stack's operation open: those services
+        // are asked, before the store is locked, what they report now, which is what makes
+        // the events the walk still owes due
+        // ([`crate::state::provisioning::advance_stabilisations`]).
+        crate::state::provisioning::advance_stabilisations(ctx, &state).await;
+        // The events of a rollback the failure of an update already made due are the
+        // rollback's own: it is carried out here, before the log is read, since it was owed
+        // at the instant that update failed whether or not anybody called
+        // (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the
+        // clock had already made due — which is also what appends the terminal events this
+        // call then reports.
+        store.settle(::std::time::SystemTime::now());
+
+        // A stack, a change set and an operation are all addressable only in the Region the
+        // request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+        // The change set a request names selects the operations recorded FOR it — the
+        // creation of that change set, which is a stack operation of its own
+        // ([`crate::state::operation_type::CREATE_CHANGESET`]) — and the stack it plans
+        // changes for.
+        let change_set = match input.change_set_name.as_deref() {
+            None => None,
+            Some(change_set_name) => Some(
+                store
+                    .resolve_change_set(&region, change_set_name, input.stack_name.as_deref())
+                    .map(|change_set| {
+                        (change_set.change_set_id.clone(), change_set.stack_id.clone())
+                    })
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation_error(
+                            crate::state::change_set_does_not_exist(change_set_name),
+                        )
+                    })?,
+            ),
+        };
+
+        // WHOSE log is read: the stack the request named, the stack the named change set
+        // belongs to, or — for a request that named only an operation — the stack that
+        // recorded that operation.
+        let stack = match (&change_set, input.stack_name.as_deref()) {
+            (Some((_, stack_id)), _) => store.resolve(&region, stack_id),
+            (None, Some(stack_name)) => Some(store.resolve(&region, stack_name).ok_or_else(
+                || {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(stack_name),
+                    )
+                },
+            )?),
+            (None, None) => {
+                let operation_id = input.operation_id.as_deref().unwrap_or_default();
+                store
+                    .stacks_in(&region)
+                    .find(|stack| stack.operation(operation_id).is_some())
+            }
+        };
+        // An `OperationId` nothing in this Region recorded selects no events, the way any
+        // other query criterion that matches nothing does.
+        let Some(stack) = stack else {
+            return Ok(DescribeEventsOutput {
+                operation_events: Some(Vec::new()),
+                next_token: None,
+            });
+        };
+
+        // "When set to true, only returns failed events within the operation."
+        let failed_only = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.failed_events)
+            .unwrap_or(false);
+        let mut selected: Vec<&StoredEvent> = stack
+            .events
+            .iter()
+            .rev()
+            .filter(|stored| {
+                // Every event one operation caused carries that operation's id, so the
+                // `OperationId` criterion is read off the event itself.
+                input
+                    .operation_id
+                    .as_deref()
+                    .is_none_or(|operation_id| {
+                        stored.operation_id.as_deref() == Some(operation_id)
+                    })
+            })
+            .filter(|stored| {
+                // ...and the change set's, off the operation the event belongs to.
+                change_set.as_ref().is_none_or(|(change_set_id, _)| {
+                    stored
+                        .operation_id
+                        .as_deref()
+                        .and_then(|operation_id| stack.operation(operation_id))
+                        .and_then(|operation| operation.change_set_id.as_deref())
+                        == Some(change_set_id.as_str())
+                })
+            })
+            .filter(|stored| !failed_only || is_failed_event(stored))
+            .collect();
+        // "Groups events by operation ID": the events of one operation are reported
+        // together, newest first — the most recent operation first and, inside it, the most
+        // recent event, which is the order a client watching a deployment reads and the one
+        // `DescribeStackEvents` reports a stack's log in. Sorting by the operation's own
+        // start and then by the event's instant is what keeps the grouping when an
+        // operation whose resources took longer than its own status transition recorded a
+        // resource event after that transition had already fallen due. A stable sort over
+        // the log read backwards, so events sharing an instant keep the reverse-append
+        // order.
+        selected.sort_by_key(|stored| {
+            ::std::cmp::Reverse((operation_started_at(stack, stored), stored.timestamp))
+        });
+        let operation_events: Vec<OperationEvent> = selected
+            .into_iter()
+            .map(|stored| {
+                let operation = stored
+                    .operation_id
+                    .as_deref()
+                    .and_then(|operation_id| stack.operation(operation_id));
+                operation_event_view(stored, operation)
+            })
+            .collect();
+        // `@paginated(inputToken: NextToken, outputToken: NextToken,
+        // items: OperationEvents)`: one response carries one bounded page.
+        let (operation_events, next_token) = crate::state::paginate(
+            crate::state::PageOf::OperationEvents,
+            operation_events,
+            input.next_token.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(DescribeEventsOutput {
+            operation_events: Some(operation_events),
+            next_token,
+        })
     }
 }

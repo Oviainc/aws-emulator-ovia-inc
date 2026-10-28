@@ -495,6 +495,14 @@ pub const MAX_DELETED_STACKS_RETAINED: usize = 200;
 /// it is reading.
 pub const MAX_EVENTS_PER_STACK: usize = 4 * template::MAX_RESOURCES_PER_TEMPLATE;
 
+/// The most operations one stack remembers, oldest evicted first.
+///
+/// A client chooses how many operations it drives against one stack, so the record of
+/// them is bounded exactly as the event log above is — and generously above it in the
+/// sense that matters: the log evicts an operation's record no sooner than it evicts that
+/// operation's events, since one operation records at least two of them.
+pub const MAX_OPERATIONS_PER_STACK: usize = MAX_EVENTS_PER_STACK / 2;
+
 /// The most bytes of `StackEvent$ResourceProperties` ONE event carries.
 ///
 /// That member is the properties document of one resource, which is caller-sized: it comes
@@ -886,6 +894,19 @@ pub mod operation_type {
     /// The rollback of a stack whose last operation failed, which `RollbackStack` is the
     /// call that asks for.
     pub const ROLLBACK: &str = "ROLLBACK";
+    /// The RESUMPTION of a rollback that could not be carried through, which
+    /// `ContinueUpdateRollback` is the call that asks for.
+    pub const CONTINUE_ROLLBACK: &str = "CONTINUE_ROLLBACK";
+}
+
+/// The statuses a stack operation itself is in (the model's `BeaconStackOperationStatus`
+/// enum), as against the `StackStatus` of the stack the operation acts on: the attempt is
+/// in flight until one of its transitions settles it, and what settles it says whether it
+/// went through.
+pub mod operation_status {
+    pub const IN_PROGRESS: &str = "IN_PROGRESS";
+    pub const SUCCEEDED: &str = "SUCCEEDED";
+    pub const FAILED: &str = "FAILED";
 }
 
 /// The `OperationType` of the stack operation that moves a stack into `in_progress`, or
@@ -912,6 +933,13 @@ pub const USER_INITIATED: &str = "User Initiated";
 /// putting a stack back where it was has to test against
 /// ([`StoredStack::begin_canceled_deletion`]).
 pub const IN_PROGRESS_SUFFIX: &str = "_IN_PROGRESS";
+
+/// The suffix every status of a transition that did NOT go through carries — the
+/// `*_FAILED` statuses of [`status`] and of [`resource_status`]. What a transition in one
+/// of them says about the attempt it belongs to is that the attempt failed, which is how
+/// an operation's own status ([`operation_status`]) and a FAILED event are both read off
+/// it.
+pub const FAILED_SUFFIX: &str = "_FAILED";
 
 /// The `StatusReason` CloudFormation puts on a change set that would change nothing —
 /// the message it answers for a change set whose computed change list is empty.
@@ -1087,12 +1115,46 @@ pub struct StoredOutput {
     pub export_name: Option<String>,
 }
 
-/// One stack operation, as `Stack$LastOperations` reports it: the id the call handed back
-/// and the `OperationType` it carries.
+/// One stack operation — "a discrete change attempt on the stack": the id the call that
+/// opened it handed back, the `OperationType` it carries, the span it ran for and how it
+/// ended.
+///
+/// `Stack$LastOperations` reports the id and the type of the operation that last acted on
+/// the stack ([`StoredStack::last_operation`]); the span and the status are what an
+/// operation's own events are reported against, since every event one operation causes
+/// carries its id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOperation {
     pub operation_id: String,
     pub operation_type: String,
+    /// The change set this operation belongs to, for an operation a change set caused;
+    /// `None` for one a call made directly against the stack.
+    pub change_set_id: Option<String>,
+    /// The instant the call that opened the operation was served.
+    pub started_at: SystemTime,
+    /// The instant its last transition settled, or `None` while it is still in flight.
+    pub ended_at: Option<SystemTime>,
+    /// [`operation_status`]: how the attempt stands.
+    pub status: String,
+}
+
+impl StoredOperation {
+    /// The operation a call opens: in flight, with nothing ended yet.
+    fn opened(
+        operation_type: &str,
+        operation_id: &str,
+        change_set_id: Option<String>,
+        at: SystemTime,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.to_string(),
+            operation_type: operation_type.to_string(),
+            change_set_id,
+            started_at: at,
+            ended_at: None,
+            status: operation_status::IN_PROGRESS.to_string(),
+        }
+    }
 }
 
 /// A stack tag.
@@ -1435,10 +1497,16 @@ pub struct StoredStack {
     /// change at all. `None` for a stack with no rollback outstanding; cleared when a
     /// rollback completes.
     pub unreverted_rollback: Option<OwedRollback>,
-    /// The most recent stack operation, as `Stack$LastOperations` reports it. Recorded by
-    /// [`StoredStack::begin_transition`], so every call that opens an operation records
-    /// exactly one.
-    pub last_operation: Option<StoredOperation>,
+    /// The operations this stack has lived through, in the order they were opened and
+    /// bounded at [`MAX_OPERATIONS_PER_STACK`] (oldest evicted first): each "a discrete
+    /// change attempt on the stack", with the span it ran for and how it ended
+    /// ([`StoredOperation`]).
+    ///
+    /// Every event an operation causes carries that operation's id
+    /// ([`StoredEvent::operation_id`]), so this is what an event is reported AGAINST, and
+    /// the LAST entry is the operation that last acted on the stack —
+    /// `Stack$LastOperations` ([`Self::last_operation`]).
+    pub operations: ::std::collections::VecDeque<StoredOperation>,
     pub creation_time: SystemTime,
     pub last_updated_time: Option<SystemTime>,
     pub deletion_time: Option<SystemTime>,
@@ -1546,7 +1614,7 @@ impl StoredStack {
             rollback_plan: None,
             owed_rollback: None,
             unreverted_rollback: None,
-            last_operation: None,
+            operations: ::std::collections::VecDeque::new(),
             creation_time: now,
             last_updated_time: None,
             deletion_time: None,
@@ -2137,8 +2205,7 @@ impl StoredStack {
                 transitions,
                 dependencies,
                 &gated,
-                self.last_operation
-                    .as_ref()
+                self.last_operation()
                     .map(|operation| operation.operation_id.clone()),
                 self.client_request_token.clone(),
             )
@@ -2353,11 +2420,114 @@ impl StoredStack {
 
     /// Record the operation now acting on this stack, which is the one
     /// `Stack$LastOperations` reports until the next one starts.
-    pub fn record_operation(&mut self, operation_type: &str, operation_id: &str) {
-        self.last_operation = Some(StoredOperation {
-            operation_type: operation_type.to_string(),
-            operation_id: operation_id.to_string(),
-        });
+    ///
+    /// Keyed by the operation's id, so an operation already recorded is not opened a
+    /// second time: the calls that open one, and the rollback a failure of it owes, are
+    /// all the SAME attempt when they carry the same id.
+    pub fn record_operation(&mut self, operation_type: &str, operation_id: &str, at: SystemTime) {
+        self.record_change_set_operation(operation_type, operation_id, None, at);
+    }
+
+    /// [`Self::record_operation`] for an operation a CHANGE SET caused, which is reported
+    /// against that change set as well as against the stack.
+    pub fn record_change_set_operation(
+        &mut self,
+        operation_type: &str,
+        operation_id: &str,
+        change_set_id: Option<String>,
+        at: SystemTime,
+    ) {
+        if self
+            .operations
+            .iter()
+            .any(|recorded| recorded.operation_id == operation_id)
+        {
+            return;
+        }
+        while self.operations.len() >= MAX_OPERATIONS_PER_STACK {
+            self.operations.pop_front();
+        }
+        self.operations.push_back(StoredOperation::opened(
+            operation_type,
+            operation_id,
+            change_set_id,
+            at,
+        ));
+    }
+
+    /// The operation that last acted on this stack — what `Stack$LastOperations` reports —
+    /// or `None` for a stack nothing has opened an operation on.
+    pub fn last_operation(&self) -> Option<&StoredOperation> {
+        self.operations.back()
+    }
+
+    /// The operation this stack recorded under `operation_id`, or `None` for an id it holds
+    /// no operation for (one of another stack, and one this log has evicted).
+    pub fn operation(&self, operation_id: &str) -> Option<&StoredOperation> {
+        self.operations
+            .iter()
+            .find(|recorded| recorded.operation_id == operation_id)
+    }
+
+    /// Close the operation `operation_id` at `at`, in the status the stack-level transition
+    /// that just settled names.
+    ///
+    /// A transition that did not go through ([`FAILED_SUFFIX`]) is the attempt FAILING, and
+    /// it stays failed: the rollback its failure owed runs under the same id and settling
+    /// that rollback does not turn the attempt into one that succeeded. `ended_at` is the
+    /// instant its LAST transition settled, so an operation still unwinding has the one it
+    /// has reached.
+    fn conclude_operation(
+        &mut self,
+        operation_id: Option<&str>,
+        settled_status: &str,
+        at: SystemTime,
+    ) {
+        let Some(operation_id) = operation_id else {
+            return;
+        };
+        let Some(recorded) = self
+            .operations
+            .iter_mut()
+            .find(|recorded| recorded.operation_id == operation_id)
+        else {
+            return;
+        };
+        recorded.ended_at = Some(at);
+        if settled_status.ends_with(FAILED_SUFFIX) {
+            recorded.status = operation_status::FAILED.to_string();
+        } else if recorded.status != operation_status::FAILED {
+            recorded.status = operation_status::SUCCEEDED.to_string();
+        }
+    }
+
+    /// Close the operation that was CREATING `change_set_id`, in the state the change set's
+    /// own terminal `ChangeSetStatus` names: a creation that completed is the attempt
+    /// succeeding, and one that failed — a plan that would change nothing, a template whose
+    /// transforms could not be applied — is the attempt failing.
+    ///
+    /// A change set settles on its own clock rather than through a stack transition
+    /// ([`StoredChangeSet::settle`]), which is why its operation is concluded from here.
+    pub fn conclude_change_set_operation(
+        &mut self,
+        change_set_id: &str,
+        settled_status: &str,
+        at: SystemTime,
+    ) {
+        let Some(recorded) = self
+            .operations
+            .iter_mut()
+            .find(|recorded| recorded.change_set_id.as_deref() == Some(change_set_id))
+        else {
+            return;
+        };
+        recorded.ended_at = Some(at);
+        recorded.status = if settled_status == change_set_status::FAILED {
+            operation_status::FAILED
+        } else {
+            operation_status::SUCCEEDED
+        }
+        .to_string();
     }
 
     /// Materialise the status transition the clock has already made due, if any, and record
@@ -2489,6 +2659,10 @@ impl StoredStack {
         }
         let status = self.status.clone();
         let reason = pending.status_reason;
+        // The transition the clock made due is the operation's: it concluded at the instant
+        // that status was installed, in the state that status names
+        // ([`Self::conclude_operation`]).
+        self.conclude_operation(pending.operation_id.as_deref(), &status, due_at);
         self.record_event(
             due_at,
             &status,
@@ -2546,10 +2720,7 @@ impl StoredStack {
         if let (Some(operation_type), Some(id)) =
             (operation_type_of(in_progress), operation_id.clone())
         {
-            self.last_operation = Some(StoredOperation {
-                operation_id: id,
-                operation_type: operation_type.to_string(),
-            });
+            self.record_operation(operation_type, &id, now);
         }
         // "A unique identifier for this request": the token this operation runs under is
         // remembered against the stack, so a later operation presenting it is the
@@ -3327,11 +3498,14 @@ impl StoredStack {
         self.stabilisations.clear();
         self.status = failed_status.to_string();
         self.status_reason = Some(reason.clone());
+        let operation_id = pending.as_ref().and_then(|p| p.operation_id.clone());
+        // The attempt FAILED at this instant, whatever its failure then owes.
+        self.conclude_operation(operation_id.as_deref(), failed_status, now);
         self.record_event(
             now,
             failed_status,
             Some(reason),
-            pending.as_ref().and_then(|p| p.operation_id.clone()),
+            operation_id,
             pending.and_then(|p| p.client_request_token),
         );
     }
@@ -3356,8 +3530,7 @@ impl StoredStack {
         self.status = status::ROLLBACK_IN_PROGRESS.to_string();
         self.status_reason = Some(reason.clone());
         let operation_id = self
-            .last_operation
-            .as_ref()
+            .last_operation()
             .map(|operation| operation.operation_id.clone());
         let client_request_token = self.client_request_token.clone();
         self.record_event(
@@ -3409,8 +3582,7 @@ impl StoredStack {
         self.status = status::UPDATE_ROLLBACK_IN_PROGRESS.to_string();
         self.status_reason = Some(reason.clone());
         let operation_id = self
-            .last_operation
-            .as_ref()
+            .last_operation()
             .map(|operation| operation.operation_id.clone());
         let client_request_token = self.client_request_token.clone();
         self.record_event(
@@ -3449,10 +3621,10 @@ impl StoredStack {
         client_request_token: Option<String>,
     ) {
         let operation_id = new_operation_id();
-        self.last_operation = Some(StoredOperation {
-            operation_id: operation_id.clone(),
-            operation_type: operation_type::UPDATE_STACK.to_string(),
-        });
+        // The resumption is the stack's own operation, of the type the model names for it:
+        // "continues rolling back a stack from UPDATE_ROLLBACK_FAILED to
+        // UPDATE_ROLLBACK_COMPLETE state".
+        self.record_operation(operation_type::CONTINUE_ROLLBACK, &operation_id, now);
         self.client_request_token = client_request_token.clone();
         self.status = status::UPDATE_ROLLBACK_IN_PROGRESS.to_string();
         self.status_reason = None;
@@ -3543,7 +3715,7 @@ impl StoredStack {
         // operation's progress and events": the rollback is the stack's own operation, of
         // the type the model names for it, so that is what the stack reports as its last and
         // what the events of this rollback carry.
-        self.record_operation(operation_type::ROLLBACK, &operation_id);
+        self.record_operation(operation_type::ROLLBACK, &operation_id, now);
         // What the operation that failed worked out it would have to put back, read BEFORE
         // the transition below retires it.
         let held = self
@@ -3885,13 +4057,16 @@ impl StoredChangeSet {
             _ => change_set_hooks::hooks_status::UNAVAILABLE,
         }
     }
-    /// Materialise the change-set transition the clock has already made due, if any.
+    /// Materialise the change-set transition the clock has already made due, if any, and
+    /// answer the instant it was due at — which is when the change set reached the status
+    /// it now carries, and so when the operation that was creating it concluded
+    /// ([`StoredStack::conclude_change_set_operation`]). `None` when nothing was due.
     ///
     /// Like [`StoredStack::settle`], it only ever applies a transition whose due instant
     /// has passed: it reports what was owed at `now` even if nobody had called.
-    pub fn settle(&mut self, now: SystemTime) {
+    pub fn settle(&mut self, now: SystemTime) -> Option<SystemTime> {
         if self.pending.as_ref().is_none_or(|p| p.due_at > now) {
-            return;
+            return None;
         }
         let pending = self.pending.take().expect("checked just above");
         if let Some(status) = pending.status {
@@ -3901,6 +4076,7 @@ impl StoredChangeSet {
         if let Some(execution_status) = pending.execution_status {
             self.execution_status = execution_status;
         }
+        Some(pending.due_at)
     }
 
     /// Whether `ExecuteChangeSet` can apply this change set: CloudFormation executes a
@@ -4095,6 +4271,13 @@ pub struct ComAmazonawsCloudformationCloudformationState {
     /// [`registry`]). A registry record has nothing to do with a stack's lifecycle, so it
     /// is never reclaimed with one; the one transition the clock owes it is the conclusion
     /// of the contract tests `TestType` started, which [`Self::settle`] installs.
+    ///
+    /// A caller adds a record under a name of its own choosing — an activation's
+    /// `TypeNameAlias`, a publication's type name — so the set is bounded at
+    /// [`registry::MAX_EXTENSIONS`] records, oldest reclaimed first, at every write that
+    /// adds one ([`Self::publish_extension_version`] and `ActivateType`), with
+    /// [`registry::MAX_PUBLISHED_VERSIONS`] versions and
+    /// [`registry::MAX_TYPE_CONFIGURATIONS`] configurations inside one record.
     pub extensions: Vec<registry::StoredExtension>,
     /// This account's extension-publisher registration, once `RegisterPublisher` has
     /// written one (see [`publisher`]). The publisher id "applies to your account in all
@@ -4150,8 +4333,28 @@ impl ComAmazonawsCloudformationCloudformationState {
         for stack in &mut self.stacks {
             stack.settle(now);
         }
+        // A change set's creation is a stack operation of its own, and the change set is
+        // what carries the status that creation reached: an operation whose change set has
+        // just settled concluded at the instant that settlement was due.
+        let mut settled_change_sets: Vec<(String, String, String, SystemTime)> = Vec::new();
         for change_set in &mut self.change_sets {
-            change_set.settle(now);
+            if let Some(at) = change_set.settle(now) {
+                settled_change_sets.push((
+                    change_set.stack_id.clone(),
+                    change_set.change_set_id.clone(),
+                    change_set.status.clone(),
+                    at,
+                ));
+            }
+        }
+        for (stack_id, change_set_id, settled_status, at) in settled_change_sets {
+            if let Some(stack) = self
+                .stacks
+                .iter_mut()
+                .find(|stack| stack.stack_id == stack_id)
+            {
+                stack.conclude_change_set_operation(&change_set_id, &settled_status, at);
+            }
         }
         self.settle_drift_detections(now);
         for template in &mut self.generated_templates {
@@ -5055,8 +5258,9 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// later one adds its version to that same record and moves the record's
     /// `LatestPublicVersion` to the number just assigned, so every version a publisher has
     /// published stays addressable by the public version number it was published under.
-    /// Bounded at [`registry::MAX_PUBLISHED_VERSIONS`] versions per record, oldest reclaimed
-    /// first: a caller chooses how many publications it makes.
+    /// Bounded at [`registry::MAX_PUBLISHED_VERSIONS`] versions per record and
+    /// [`registry::MAX_EXTENSIONS`] records, oldest reclaimed first in both: a caller
+    /// chooses how many publications it makes and under how many names.
     ///
     /// The record it writes through is the one [`Self::published_extension`] reads, so a
     /// publication whose publisher the caller is not is refused by its handler before this
@@ -5088,6 +5292,15 @@ impl ComAmazonawsCloudformationCloudformationState {
                     &registry::next_public_version_id(&[]),
                     &publication,
                 );
+                // A publication adds a record under the kind and name the CALLER chose, so
+                // this is a caller-counted growth site exactly as an activation is: the
+                // oldest record is reclaimed past the registry's ceiling, so the registry
+                // cannot grow without limit.
+                let over_the_bound =
+                    (self.extensions.len() + 1).saturating_sub(registry::MAX_EXTENSIONS);
+                if over_the_bound > 0 {
+                    self.extensions.drain(..over_the_bound);
+                }
                 self.extensions
                     .push(registry::published_record(&publication, version));
             }
@@ -5831,6 +6044,8 @@ pub enum PageOf {
     StackSummaries,
     /// `DescribeStackEvents`'s `StackEvents`.
     StackEvents,
+    /// `DescribeEvents`'s `OperationEvents`.
+    OperationEvents,
     /// `ListStackResources`'s `StackResourceSummaries`.
     StackResourceSummaries,
     /// `DescribeStackResourceDrifts`'s `StackResourceDrifts`.
@@ -5876,6 +6091,7 @@ impl PageOf {
             Self::Stacks => "stacks",
             Self::StackSummaries => "summaries",
             Self::StackEvents => "events",
+            Self::OperationEvents => "operation-events",
             Self::StackResourceSummaries => "resources",
             Self::StackResourceDrifts => "resource-drifts",
             Self::Changes => "changes",
