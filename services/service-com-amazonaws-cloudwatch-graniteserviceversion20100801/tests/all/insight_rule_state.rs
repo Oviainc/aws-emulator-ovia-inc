@@ -33,8 +33,10 @@ const STATE_OPERATIONS: [(&str, &str); 2] = [
     ("DisableInsightRules", "DISABLED"),
 ];
 
-/// How this service words a request that named no rule at all.
-const MISSING_RULE_NAMES: &str = "The parameter RuleNames is required.";
+/// How this service words a request whose `RuleNames` array carries no entry: the state
+/// operations read that array as the set of rule states to write, so an empty one asks for no
+/// state at all.
+const EMPTY_RULE_STATES: &str = "EMPTY_RULE_STATES: RuleStates cannot be an empty array.";
 
 /// A rule definition in the Contributor Insights rule syntax.
 fn definition() -> String {
@@ -433,14 +435,14 @@ async fn a_request_naming_no_rule_is_refused_and_changes_nothing() {
         let (status, body) = call(&router, operation, &json!({"RuleNames": []})).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "MissingRequiredParameterException"),
-            "case {operation:?}: expected a 400 MissingRequiredParameterException, got {status} \
+            (400, "InvalidParameterValueException"),
+            "case {operation:?}: expected a 400 InvalidParameterValueException, got {status} \
              {body}"
         );
         assert_eq!(
             error_message(&body),
-            MISSING_RULE_NAMES,
-            "case {operation:?}: expected the missing-parameter wording, got {body}"
+            EMPTY_RULE_STATES,
+            "case {operation:?}: expected the empty-array wording, got {body}"
         );
         let actual = state_of(&router, "untouched").await;
         assert_eq!(

@@ -154,15 +154,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // "An array of the rule names to enable." (`EnableInsightRulesInput$RuleNames`,
-        // required) — a request carrying no entry for the list names no rule to enable, so
-        // the parameter the operation requires is missing. Each entry's modelled 1..128
-        // length and `^[\x20-\x7E]+$` pattern were enforced before this handler ran and are
-        // not re-checked here.
+        // required) — an array carrying no entry asks for no rule state to be written, which
+        // this service refuses as a bad parameter value. Each entry's modelled 1..128 length
+        // and `^[\x20-\x7E]+$` pattern were enforced before this handler ran and are not
+        // re-checked here.
         if input.rule_names.is_empty() {
             return Err(
-                EnableInsightRulesErrorModeled::MissingRequiredParameterException(
-                    MissingRequiredParameterException {
-                        message: Some(crate::state::MISSING_RULE_NAMES.to_string()),
+                EnableInsightRulesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::EMPTY_RULE_STATES.to_string()),
                     },
                 )
                 .into(),

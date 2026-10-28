@@ -21,8 +21,8 @@
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metric_streams`] — the
 //!   metric streams written by `PutMetricStream` and read back by `GetMetricStream`.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::insight_rules`] — the
-//!   Contributor Insights rules written by `PutInsightRule` and read back by
-//!   `DescribeInsightRules`.
+//!   Contributor Insights rules written by `PutInsightRule`, read back by
+//!   `DescribeInsightRules` and removed by `DeleteInsightRules`.
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::anomaly_detectors`] — the
 //!   anomaly detection models written by `PutAnomalyDetector`, read back by
 //!   `DescribeAnomalyDetectors` and removed by `DeleteAnomalyDetector`, each reported
@@ -2258,12 +2258,35 @@ fn unknown_insight_rule(rule_name: &str) -> String {
     format!("Rule {rule_name} does not exist")
 }
 
+/// The one `Failures` entry a batch Contributor Insights rule operation reports for a name
+/// this store holds no rule for: "An array listing the rules that could not be deleted."
+/// (`DeleteInsightRulesOutput$Failures`), worded and coded identically whichever of those
+/// operations was called, so the entry is built here once.
+fn unknown_insight_rule_failure(rule_name: &str) -> PartialFailure {
+    PartialFailure {
+        failure_resource: Some(rule_name.to_string()),
+        exception_type: Some(INSIGHT_RULE_FAILURE_EXCEPTION.to_string()),
+        failure_code: Some(INSIGHT_RULE_FAILURE_CODE.to_string()),
+        failure_description: Some(unknown_insight_rule(rule_name)),
+    }
+}
+
 /// How CloudWatch states that a request named no Contributor Insights rule at all.
 ///
-/// "An array of the rule names to disable." (`DisableInsightRulesInput$RuleNames`, required) —
-/// a request carrying no entry for the list names nothing to act on, which is the required
-/// parameter missing. Shared so the operations taking a `RuleNames` cannot word it two ways.
-pub const MISSING_RULE_NAMES: &str = "The parameter RuleNames is required.";
+/// "An array of the rule names to delete." (`DeleteInsightRulesInput$RuleNames`, required) — an
+/// array carrying no entry names nothing to act on, which this service refuses as a bad value
+/// for `RuleNames` rather than as a change it applied to nothing.
+pub const EMPTY_RULE_NAMES: &str = "EMPTY_RULE_NAMES: RuleNames cannot be an empty array.";
+
+/// How CloudWatch states the same thing for the operations that MOVE a rule's state
+/// (`EnableInsightRules`, `DisableInsightRules`).
+///
+/// Those operations read their `RuleNames` as the set of rule states to write — "The state of
+/// the rule. Valid values are ENABLED and DISABLED." (`PutInsightRuleInput$RuleState`) — so an
+/// empty array is refused as the empty set of states it asks for, under the same
+/// `InvalidParameterValueException`. Shared so neither of them can word it differently from
+/// the other.
+pub const EMPTY_RULE_STATES: &str = "EMPTY_RULE_STATES: RuleStates cannot be an empty array.";
 
 /// The `Schema` a managed Contributor Insights rule carries: "For managed rules, this is
 /// `{"Name": "ServiceLogRule", "Version": 1}`" (`InsightRule$Schema`) — the schema of a rule
@@ -3167,12 +3190,36 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         for rule_name in rule_names {
             match self.insight_rules.get_mut(rule_name) {
                 Some(stored) => stored.rule.state = rule_state.to_string(),
-                None => failures.push(PartialFailure {
-                    failure_resource: Some(rule_name.clone()),
-                    exception_type: Some(INSIGHT_RULE_FAILURE_EXCEPTION.to_string()),
-                    failure_code: Some(INSIGHT_RULE_FAILURE_CODE.to_string()),
-                    failure_description: Some(unknown_insight_rule(rule_name)),
-                }),
+                None => failures.push(unknown_insight_rule_failure(rule_name)),
+            }
+        }
+        failures
+    }
+
+    /// Remove every Contributor Insights rule `rule_names` names, reporting back one entry per
+    /// name this store holds no rule for.
+    ///
+    /// "Permanently deletes the specified Contributor Insights rules."
+    /// (`DeleteInsightRules`) — the rule and everything stored with it (its definition, its
+    /// state and its tags) go away, so a later read reports no such rule. "An array listing the
+    /// rules that could not be deleted." (`DeleteInsightRulesOutput$Failures`) is reported the
+    /// same way the state operations report theirs: per name, with the rest of the request
+    /// still taking effect.
+    ///
+    /// The names a request carries are the SET of rules it deletes, so a name it repeats is
+    /// deleted once and is not a failure the second time — the same way naming a rule twice
+    /// asks the state operations for one state. A rule `PutManagedInsightRules` enabled is
+    /// removed by the same walk: "The rules can be enabled, disabled, and deleted using
+    /// EnableInsightRules, DisableInsightRules, and DeleteInsightRules."
+    /// (`PutManagedInsightRules`).
+    pub fn delete_insight_rules(&mut self, rule_names: &[String]) -> Vec<PartialFailure> {
+        let mut deleted: HashSet<&String> = HashSet::new();
+        let mut failures: Vec<PartialFailure> = Vec::new();
+        for rule_name in rule_names {
+            if self.insight_rules.remove(rule_name).is_some() {
+                deleted.insert(rule_name);
+            } else if !deleted.contains(rule_name) {
+                failures.push(unknown_insight_rule_failure(rule_name));
             }
         }
         failures
