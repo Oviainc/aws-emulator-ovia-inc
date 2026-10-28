@@ -2,8 +2,8 @@
 
 //! @op DeleteInstance
 //! Removes the stored instance so no later read reports it, releases every
-//! attachment another stored resource held to it, and appends the operations
-//! that record the removal and each release.
+//! attachment and access grant another stored resource held to it, and appends
+//! the operations that record the removal and each release.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -173,13 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
-            // Removing the instance also releases every attachment another
+            // Removing the instance also releases every live reference another
             // stored resource holds to it — a block storage disk, a static IP,
-            // a load balancer's registration — because an attachment names "the
-            // resources to which" a resource "is attached" (the modelled
-            // `Disk$attachedTo`) and this instance is about to be none of them.
-            // The release is part of the same step, so no read can observe a
-            // resource attached to an instance this account no longer holds.
+            // a load balancer's registration, a bucket's access grant — because
+            // each of those names a resource this account holds: an attachment
+            // names "the resources to which" a resource "is attached" (the
+            // modelled `Disk$attachedTo`) and the grant describes "Lightsail
+            // instances that have access to the bucket" (the modelled
+            // `Bucket$resourcesReceivingAccess`), and this instance is about to
+            // be none of them. The release is part of the same step, so no read
+            // can observe an attachment to, or an access held by, an instance
+            // this account no longer holds.
             let Some(deleted) = store.remove_instance(&name) else {
                 return Err(not_found(&name));
             };
@@ -194,10 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None,
             );
             // `operations` is a list because a Lightsail call can act on
-            // several resources at once, and this one did: each attachment the
+            // several resources at once, and this one did: each reference the
             // removal released is a mutation of the record that held it, so it
-            // is logged as that record's own detachment — already done when
-            // this call returns, and so terminal too.
+            // is logged as that record's own release — a detachment for an
+            // attachment, the access-setting call for a bucket's grant —
+            // already done when this call returns, and so terminal too.
             let mut operations = vec![operation.view()];
             for released in &deleted.released_attachments {
                 let entry = store.start_operation(

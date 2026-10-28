@@ -2180,23 +2180,31 @@ impl StoredBucket {
     /// and repeating it changes nothing. Entries are kept in the order access
     /// was given, so every read reports the same sequence; the set is bounded by
     /// the resources this store holds, since a name appears in it at most once.
-    pub fn set_resource_access(&mut self, name: &str, resource_type: &str, allow: bool) {
+    ///
+    /// Answers whether the set CHANGED, so a caller that has to log what it
+    /// changed (the release a resource's removal performs — see
+    /// [`ComAmazonawsLightsailLightsail20161128State::remove_instance`]) can tell
+    /// a grant it released from one that was never held.
+    pub fn set_resource_access(&mut self, name: &str, resource_type: &str, allow: bool) -> bool {
         let held = self
             .resources_receiving_access
             .iter()
             .position(|resource| resource.name.as_deref() == Some(name));
         match (allow, held) {
-            (true, None) => self
-                .resources_receiving_access
-                .push(ResourceReceivingAccess {
-                    name: Some(name.to_string()),
-                    resource_type: Some(resource_type.to_string()),
-                }),
+            (true, None) => {
+                self.resources_receiving_access
+                    .push(ResourceReceivingAccess {
+                        name: Some(name.to_string()),
+                        resource_type: Some(resource_type.to_string()),
+                    });
+                true
+            }
             (false, Some(index)) => {
                 self.resources_receiving_access.remove(index);
+                true
             }
             // Already in the state the request asks for: nothing to change.
-            (true, Some(_)) | (false, None) => {}
+            (true, Some(_)) | (false, None) => false,
         }
     }
 }
@@ -12508,8 +12516,9 @@ pub struct RemovedInstance {
     pub instance: StoredInstance,
     /// One entry per attachment the removal released, in the store's own
     /// stable order: disks by name, then static IPs by name, then load
-    /// balancers by region and name — every one of those maps is a
-    /// `BTreeMap`, so the order is the same on every call.
+    /// balancers by region and name, then buckets by region and name — every
+    /// one of those maps is a `BTreeMap`, so the order is the same on every
+    /// call.
     pub released_attachments: Vec<ReleasedAttachment>,
 }
 
@@ -13402,14 +13411,16 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Remove the instance `name` names, answering the record and every
-    /// attachment its removal released. `None` when nothing matched.
+    /// reference its removal released. `None` when nothing matched.
     ///
-    /// Removing a resource also releases every attachment another stored
-    /// resource holds to it: an attachment names "the resources to which" one
-    /// resource "is attached" (the modelled `Disk$attachedTo` and
-    /// `StaticIp$attachedTo`), and a resource this account no longer holds is
-    /// not one of them — so the removal and the release are one step, and no
-    /// read can observe an attachment to a record that is gone.
+    /// Removing a resource also releases every live reference another stored
+    /// record holds to it — an attachment or an access grant: each of those
+    /// names a resource this account holds (the modelled `Disk$attachedTo` and
+    /// `StaticIp$attachedTo` name "the resources to which" one resource "is
+    /// attached"; `Bucket$resourcesReceivingAccess` describes "Lightsail
+    /// instances that have access to the bucket"), and a resource this account
+    /// no longer holds is not one of them — so the removal and the release are
+    /// one step, and no read can observe a reference to a record that is gone.
     pub fn remove_instance(&mut self, name: &str) -> Option<RemovedInstance> {
         let instance = self.instances.remove(name)?;
         // The instance's automatic snapshots go with it, for the reason spelled
@@ -13424,19 +13435,23 @@ impl ComAmazonawsLightsailLightsail20161128State {
         })
     }
 
-    /// Release every attachment the store holds to the instance `name`,
+    /// Release every reference the store holds to the instance `name`,
     /// answering one entry per release so the caller can log it.
     ///
-    /// Three kinds of record can hold one: a block storage disk (`attachedTo`
-    /// plus the device `path` it is mounted at), a static IP (`attachedTo`), and
-    /// a load balancer (the instance registered with it). Each returns to the
-    /// state it has while it is attached to nothing — for a disk that is
-    /// `available`, the modelled `DiskState` value for a disk that "exists and
-    /// is attached to nothing" next to `in-use`.
+    /// Four kinds of record can hold one: a block storage disk (`attachedTo`
+    /// plus the device `path` it is mounted at), a static IP (`attachedTo`), a
+    /// load balancer (the instance registered with it), and a bucket (the
+    /// instance it reports in `resourcesReceivingAccess`, which "describe
+    /// Lightsail instances that have access to the bucket"). Each returns to the
+    /// state it has while it holds nothing — for a disk that is `available`, the
+    /// modelled `DiskState` value for a disk that "exists and is attached to
+    /// nothing" next to `in-use`; for a bucket, one fewer resource receiving
+    /// access.
     ///
     /// Every walk is bounded: the disks by [`MAX_DISKS`], the static IPs by
-    /// [`MAX_STATIC_IPS`], and the load balancers by
-    /// [`MAX_LOAD_BALANCERS_PER_REGION`] per region.
+    /// [`MAX_STATIC_IPS`], the load balancers by
+    /// [`MAX_LOAD_BALANCERS_PER_REGION`] per region, and the buckets by
+    /// [`MAX_BUCKETS`].
     fn release_attachments_to_instance(&mut self, name: &str) -> Vec<ReleasedAttachment> {
         let mut released = Vec::new();
         for disk in self.disks.values_mut() {
@@ -13496,6 +13511,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 resource_type: RESOURCE_TYPE_LOAD_BALANCER,
                 resource_name: balancer.name.clone(),
                 location: balancer.location.clone(),
+            });
+        }
+        for bucket in self.buckets.values_mut() {
+            // The grant lives on the BUCKET's record and is keyed on the
+            // instance's name alone, so taking it back is the same write
+            // `SetResourceAccessForBucket` makes with `deny` — which is why the
+            // release is logged under that modelled `OperationType`, against the
+            // bucket whose record changed.
+            if !bucket.set_resource_access(name, RESOURCE_TYPE_INSTANCE, false) {
+                continue;
+            }
+            released.push(ReleasedAttachment {
+                operation_type: OPERATION_TYPE_SET_RESOURCE_ACCESS_FOR_BUCKET,
+                resource_type: RESOURCE_TYPE_BUCKET,
+                resource_name: bucket.name.clone(),
+                location: bucket.location.clone(),
             });
         }
         released

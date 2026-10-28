@@ -163,6 +163,8 @@ mod gui_session_access_details;
 mod gui_session_start;
 #[path = "all/instance_delete_attachments.rs"]
 mod instance_delete_attachments;
+#[path = "all/instance_delete_bucket_access.rs"]
+mod instance_delete_bucket_access;
 #[path = "all/instance_error_envelope.rs"]
 mod instance_error_envelope;
 #[path = "all/instance_https_setup.rs"]
