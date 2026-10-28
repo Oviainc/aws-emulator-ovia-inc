@@ -431,12 +431,15 @@ async fn create_accessor_refuses_a_request_the_model_rejects() {
 }
 
 /// Read one accessor back.
-async fn get_accessor(router: &MultiServiceRouter, accessor_id: &str) -> Answer {
+///
+/// `pub(crate)`, like the delete below, so a sibling suite in this target reads an
+/// accessor back through this one helper rather than a second copy of the request.
+pub(crate) async fn get_accessor(router: &MultiServiceRouter, accessor_id: &str) -> Answer {
     call(router, "GET", &format!("/accessors/{accessor_id}"), None).await
 }
 
 /// Delete one accessor.
-async fn delete_accessor(router: &MultiServiceRouter, accessor_id: &str) -> Answer {
+pub(crate) async fn delete_accessor(router: &MultiServiceRouter, accessor_id: &str) -> Answer {
     call(router, "DELETE", &format!("/accessors/{accessor_id}"), None).await
 }
 

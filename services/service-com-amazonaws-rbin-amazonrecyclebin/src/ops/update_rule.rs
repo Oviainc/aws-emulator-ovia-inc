@@ -263,16 +263,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(UpdateRuleErrorModeled::ValidationException(refusal).into());
             }
         }
-        if !merged_resource_tags.is_empty() && !merged_exclude_resource_tags.is_empty() {
-            // A rule the MODEL cannot express, stated in the same envelope a modelled
-            // constraint takes: the member that cannot hold, and what it must satisfy.
-            return Err(UpdateRuleErrorModeled::ValidationException(
-                crate::state::member_validation_failed(
-                    crate::state::EXCLUDE_RESOURCE_TAGS_MEMBER,
-                    crate::state::EXCLUDE_RESOURCE_TAGS_REQUIREMENT,
-                ),
-            )
-            .into());
+        // Resource tags and exclusion tags select resources in ways that cannot hold
+        // together, so a request whose MERGED selection names both is refused and the rule
+        // is left exactly as it was — the same invariant `CreateRule` holds a request to
+        // before it mints a rule, kept in one place so neither door can disagree about
+        // which selections a rule can carry.
+        if let Some(refusal) = crate::state::selection_combination_unsupported(
+            &merged_resource_tags,
+            &merged_exclude_resource_tags,
+        ) {
+            return Err(UpdateRuleErrorModeled::ValidationException(refusal).into());
         }
         // Recycle Bin holds a lock only on a Region-level rule that carries no exclusion
         // tags, so a rule that HOLDS a lock cannot be given a selection of either other

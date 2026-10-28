@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEmailTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEmailTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEmailTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +130,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEmailTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEmailTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEmailTemplate"))
+        // Request metadata is not needed: a template is keyed by its name within the
+        // one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateEmailTemplate without the shared emulator state",
+            ));
+        };
+
+        let name = input.template_name;
+        let content = input.template_content;
+
+        // The content rules are the template's, not one operation's: a template is
+        // "composed of a subject line, an HTML part, and a text-only part"
+        // (`EmailTemplateContent`), and the subject is the one part a send cannot
+        // supply for itself, so content carrying none is refused on the input rather
+        // than written over a usable template. `Subject` carries no length bound in the
+        // model, so a subject sent as an empty string reaches here, and it is the same
+        // absence.
+        if content.subject.as_deref().unwrap_or_default().is_empty() {
+            return Err(bad_request("The subject must be specified."));
+        }
+
+        // SES documents a maximum size of 500 KB for an email template, and none of the
+        // content's parts carries a length bound in the model, so the size of what the
+        // request carries is checked here.
+        let size = crate::state::email_template_size(&content);
+        if size > crate::state::MAX_EMAIL_TEMPLATE_BYTES {
+            return Err(bad_request(format!(
+                "The template is {size} bytes, which is larger than the maximum \
+                 template size of {} bytes.",
+                crate::state::MAX_EMAIL_TEMPLATE_BYTES
+            )));
+        }
+
+        let mut store = state.lock();
+        // Updating is not creating: a name the account holds no template under is the
+        // missing resource this operation models, and recording a new template is what
+        // `CreateEmailTemplate` is for. Nothing is written for the refused update.
+        let Some(record) = store.email_templates.get_mut(&name) else {
+            return Err(UpdateEmailTemplateErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::email_template_not_found(&name)),
+                },
+            )
+            .into());
+        };
+
+        // The content the request carries replaces the stored content WHOLE: a part the
+        // request omits is absent from the updated template rather than inherited from
+        // what stood there before, because `TemplateContent` is the template's content
+        // and not a patch of it. Everything the request does not carry — the name the
+        // template is keyed by, the tags attached to it and the instant it was created —
+        // is left exactly as it was.
+        record.content = content;
+
+        // `UpdateEmailTemplateResponse` carries no members: the stored template is read
+        // back with `GetEmailTemplate`.
+        Ok(UpdateEmailTemplateOutput {})
     }
+}
+
+/// Refuse the request with this operation's input error: "The input you provided is
+/// invalid."
+fn bad_request(message: impl Into<String>) -> UpdateEmailTemplateError {
+    UpdateEmailTemplateErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

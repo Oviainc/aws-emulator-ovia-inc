@@ -197,7 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(now);
 
         // "An idempotent operation completes no more than once" (`ClientRequestToken`):
-        // a token already used replays the node id its first call minted.
+        // a token already used replays the node id its first call minted, for as long as
+        // that node is one a caller can still use — `replay_idempotent` is where that
+        // liveness test lives, so a token whose node has begun being deleted (by its own
+        // delete, or by the delete of the member that owns it) mints a fresh node below.
         let token = crate::state::idempotency_key(&region, Self::NAME, &input.client_request_token);
         if let Some(created) = guard.replay_idempotent(&token) {
             return Ok(CreateNodeOutput {
@@ -425,16 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         network.nodes.insert(node_id.clone(), node);
-        guard.remember_idempotent(
-            token,
-            crate::state::CreatedIds {
-                network_id: Some(input.network_id.clone()),
-                member_id,
-                node_id: Some(node_id.clone()),
-                proposal_id: None,
-                accessor_id: None,
-            },
-        );
+        guard.remember_idempotent(token, crate::state::CreatedIds::node(&node_id));
 
         // Answer from the STORED record, so this is the id every later read of the node
         // answers to — read back through the same Region-scoped resolver every other read

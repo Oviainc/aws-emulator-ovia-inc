@@ -724,6 +724,32 @@ const TAG_LEVEL_MEMBER_REQUIREMENT: &str =
 /// select resources in ways that cannot hold together.
 pub const EXCLUDE_RESOURCE_TAGS_REQUIREMENT: &str = TAG_LEVEL_MEMBER_REQUIREMENT;
 
+/// The modelled 400 for a resource selection that names BOTH resource tags and exclusion
+/// tags, or `None` when the selection is one a retention rule can hold.
+///
+/// The model cannot express the combination: resource tags make a rule tag-level, and
+/// exclusion tags are "[Region-level retention rules only] ... You can't specify exclusion
+/// tags for tag-level retention rules" (smithy_query(query="doc", shape="CreateRuleRequest",
+/// member="ExcludeResourceTags")). The refusal is stated in the same envelope a modelled
+/// constraint takes: the member that cannot hold, and what it must satisfy.
+///
+/// Every door onto a rule's resource selection goes through this: `CreateRule`, where both
+/// lists are the ones the request names, and `UpdateRule`, where each list is the one the
+/// request names or, absent, the stored one, so no sequence of calls leaves a rule
+/// selecting resources both ways at once.
+pub fn selection_combination_unsupported(
+    resource_tags: &[ResourceTag],
+    exclude_resource_tags: &[ResourceTag],
+) -> Option<ValidationException> {
+    if resource_tags.is_empty() || exclude_resource_tags.is_empty() {
+        return None;
+    }
+    Some(member_validation_failed(
+        EXCLUDE_RESOURCE_TAGS_MEMBER,
+        EXCLUDE_RESOURCE_TAGS_REQUIREMENT,
+    ))
+}
+
 /// The modelled 400 for a request asking to lock a rule Recycle Bin cannot lock.
 ///
 /// The lock configuration is the member that cannot hold: the rule itself is one the

@@ -1400,9 +1400,9 @@ pub fn page_bound(member_path: &str, max_results: i32, maximum: i32) -> Result<u
 /// resolved against the projection that issued it; `Err` carries the refusal message for a
 /// token that is not one this service issued under that tag — the service's ONE wording for
 /// that failure ([`UNISSUED_NEXT_TOKEN`]), so a cursor refused here reads exactly like the
-/// same cursor refused by a read whose cursor is a stored key. A read whose projection is ONE
-/// subject's set passes that tag with the subject bound into it ([`subject_token_tag`]),
-/// since the operation alone does not name the projection there.
+/// same cursor refused by a read whose cursor is a stored key. A read whose projection the
+/// REQUEST selects passes that tag with the whole selection bound into it
+/// ([`subject_token_tag`]), since the operation alone does not name the projection there.
 pub fn page_of<T>(
     items: Vec<T>,
     tag: &str,
@@ -1432,43 +1432,132 @@ pub fn page_of<T>(
     Ok((page, next_token))
 }
 
-/// The `NextToken` tag a read whose projection is ONE subject's set issues its page tokens
+/// The `NextToken` tag a read whose projection the REQUEST selects issues its page tokens
 /// under: the read's own [`SERVICE_OPERATIONS_TOKEN_TAG`]-style tag, plus a fingerprint of the
-/// subject the page was taken over.
+/// selection the page was taken over.
 ///
-/// A [`page_of`] cursor is an offset within one subject's ordered set, so a token issued for
-/// another subject would silently skip that subject's first entries if it were honoured.
-/// Binding the subject into the tag makes such a token fail to decode, so it is refused like
-/// any other token this service did not issue — the rule the scoped instrumentation reads
-/// already hold ([`instrumentation_token_tag`]), stated once here for every read whose set
-/// belongs to a subject the request names.
+/// A [`page_of`] cursor is an offset within ONE ordered set, so a token issued over another
+/// selection would silently skip that selection's first entries if it were honoured. Binding
+/// the selection into the tag makes such a token fail to decode, so it is refused like any
+/// other token this service did not issue — the rule the scoped instrumentation reads already
+/// hold ([`instrumentation_token_tag`]), stated once here for every read whose set the request
+/// picks out. Every request member the projection is a function of belongs in `subject`: the
+/// subject the request names, the filters that narrow it ([`filtered_window_token_tag`]) and
+/// the period it covers ([`window_fields`]) — and nothing else, so a member that changes only
+/// how a reported entry is rendered leaves a token honoured.
 ///
-/// `subject` is the subject's RESOLVED identity — what the store holds it under, not how the
+/// `subject` is the selection's RESOLVED identity — what the store holds it under, not how the
 /// request spelled it — so a token handed back for a read that named the subject one way
 /// still resumes a read naming the SAME subject another way. A field list is injectively
-/// rendered ([`stable_hash`]), so no two different subjects share a tag.
+/// rendered ([`stable_hash`]), so no two different selections share a tag; a list of variable
+/// length is preceded by its length, so where one list ends and the next begins is readable
+/// off the fields themselves rather than being a property of the values in them.
 pub fn subject_token_tag(tag: &str, subject: &[Option<&str>]) -> String {
     format!("{tag}{}/", stable_hash(subject))
 }
 
-/// [`subject_token_tag`] for a read whose subject is the entity a key-attribute map selects.
+/// `fields` as the borrowed field list [`subject_token_tag`] fingerprints, for a selection
+/// whose fields are assembled as owned values.
+fn borrowed_fields(fields: &[Option<String>]) -> Vec<Option<&str>> {
+    fields.iter().map(|field| field.as_deref()).collect()
+}
+
+/// The fields one time period contributes to the tag of a cursor paged over it: the period's
+/// start and its end, each on the one key instants are compared on ([`instant_nanos`]).
+///
+/// A read whose projection is what the store holds OVER A PERIOD derives a different ordered
+/// set for a different period, so the period is part of what picks that set out: an offset
+/// counted in one period's set would skip or repeat entries if it were honoured in another's,
+/// which is the rule [`subject_token_tag`] states. The chronological read binds its own window
+/// for the same reason, inside the cursor rather than in the tag ([`StatusEventCursor`]),
+/// because a window it was never given is one it derived.
+fn window_fields(window_start: &DateTime, window_end: &DateTime) -> [String; 2] {
+    [window_start, window_end].map(|instant| instant_nanos(instant).to_string())
+}
+
+/// [`subject_token_tag`] for a read whose projection is a PERIOD of what this store holds and
+/// which names no subject of its own: the period is the whole selection, so it alone is bound
+/// into the tag ([`window_fields`]).
+pub fn window_token_tag(tag: &str, window_start: &DateTime, window_end: &DateTime) -> String {
+    let window = window_fields(window_start, window_end);
+    subject_token_tag(tag, &[Some(window[0].as_str()), Some(window[1].as_str())])
+}
+
+/// [`subject_token_tag`] for a read whose subject is the entity a key-attribute map selects,
+/// over the period the request names.
 ///
 /// The whole map is the subject's identity, because the projection is a function of all of it:
 /// a stored entity is selected when it carries every entry the map states
 /// ([`attributes_contain`]), so two maps that differ in one entry select different sets. The
 /// entries are fingerprinted in key order, since a map carries no order of its own while one
-/// subject must yield the same tag on every call.
-pub fn entity_token_tag(tag: &str, attributes: &HashMap<String, String>) -> String {
+/// subject must yield the same tag on every call, and the count comes first so that the
+/// attributes cannot run into the period's fields.
+pub fn entity_token_tag(
+    tag: &str,
+    attributes: &HashMap<String, String>,
+    window_start: &DateTime,
+    window_end: &DateTime,
+) -> String {
     let mut entries: Vec<(&str, &str)> = attributes
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     entries.sort_unstable();
-    let fields: Vec<Option<&str>> = entries
-        .into_iter()
-        .flat_map(|(key, value)| [Some(key), Some(value)])
-        .collect();
+    let count = entries.len().to_string();
+    let window = window_fields(window_start, window_end);
+    let mut fields: Vec<Option<&str>> = vec![Some(count.as_str())];
+    fields.extend(
+        entries
+            .into_iter()
+            .flat_map(|(key, value)| [Some(key), Some(value)]),
+    );
+    fields.extend(window.iter().map(|field| Some(field.as_str())));
     subject_token_tag(tag, &fields)
+}
+
+/// [`subject_token_tag`] for a read whose selection is a period plus the attribute filters that
+/// narrow it.
+///
+/// The filters are part of the selection, since each one is a further condition the reported
+/// services pass ([`passes_attribute_filter`]), so an offset counted in a filtered set is not
+/// an offset into an unfiltered one. They are fingerprinted in a CANONICAL form — each
+/// filter's accepted values sorted and deduplicated, then the filters themselves — because the
+/// set they select does not depend on the order they were written in, nor on a value or a
+/// filter named twice: two requests stating ONE selection resume each other.
+pub fn filtered_window_token_tag(
+    tag: &str,
+    window_start: &DateTime,
+    window_end: &DateTime,
+    filters: &[AttributeFilter],
+) -> String {
+    let mut canonical: Vec<(&str, Vec<&str>)> = filters
+        .iter()
+        .map(|filter| {
+            let mut values: Vec<&str> = filter
+                .attribute_filter_values
+                .iter()
+                .map(String::as_str)
+                .collect();
+            values.sort_unstable();
+            values.dedup();
+            (filter.attribute_filter_name.as_str(), values)
+        })
+        .collect();
+    canonical.sort_unstable();
+    canonical.dedup();
+
+    let mut fields: Vec<Option<String>> = vec![Some(canonical.len().to_string())];
+    for (name, values) in canonical {
+        fields.push(Some(name.to_string()));
+        fields.push(Some(values.len().to_string()));
+        fields.extend(values.into_iter().map(|value| Some(value.to_string())));
+    }
+    fields.extend(
+        window_fields(window_start, window_end)
+            .into_iter()
+            .map(Some),
+    );
+    subject_token_tag(tag, &borrowed_fields(&fields))
 }
 
 /// Whether `candidate` holds every entry of `filter` with the same value.
@@ -2749,6 +2838,111 @@ fn audit_target_kind(target: &AuditTargetEntity) -> &'static str {
         AuditTargetEntity::ServiceOperation(_) => "service_operation",
         AuditTargetEntity::Canary(_) => "canary",
     }
+}
+
+/// The `NextToken` tag `ListAuditFindings` issues its page tokens under: the read's own
+/// [`AUDIT_FINDINGS_TOKEN_TAG`]-style tag plus a fingerprint of the SELECTION the page was taken
+/// over — the targets the request named, the auditors it filtered by and the period it covered.
+///
+/// The reported findings are a function of all three
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::audited_findings`]), so each is
+/// bound into the tag for the reason [`subject_token_tag`] states: the cursor is a bare offset,
+/// so a token issued over one selection would silently skip another's first findings if it were
+/// honoured. `DetailLevel` is NOT part of the selection — it chooses how much context each
+/// reported finding carries, not which findings are reported nor in what order — so a token
+/// stays honoured whatever detail level either request asked for.
+///
+/// An objective target is fingerprinted on the NAME its identity resolves to
+/// ([`slo_name_of`]), not on the spelling the request used, so a token handed back for a target
+/// naming an objective by name resumes a read naming the same objective by ARN. The targets are
+/// fingerprinted as a SET — each one rendered, then the renderings sorted and deduplicated —
+/// and the auditor names likewise, because neither the order the request listed them in nor a
+/// target or an auditor it named twice changes which findings are reported or in what order:
+/// the findings are keyed by the name of the objective each assessed
+/// ([`ComAmazonawsApplicationsignalsApplicationsignalsState::audited_findings`]).
+pub fn audit_findings_token_tag(
+    tag: &str,
+    targets: &[AuditTarget],
+    auditors: Option<&[String]>,
+    window_start: &DateTime,
+    window_end: &DateTime,
+) -> String {
+    let mut rendered: Vec<Vec<Option<String>>> = Vec::with_capacity(targets.len());
+    for target in targets {
+        // The kind of entity the target names is the modelled UNION member it carried, which
+        // is also what says how the fields after it are read. The target's own free-form
+        // `Type` is not bound: the projection is resolved off the union
+        // ([`audit_target_kind`]), so that member selects nothing.
+        let mut fields: Vec<Option<String>> =
+            vec![Some(audit_target_kind(&target.data).to_string())];
+        match &target.data {
+            AuditTargetEntity::Service(entity) => {
+                fields.extend(audited_entity_fields(Some(entity)));
+            }
+            AuditTargetEntity::Slo(entity) => {
+                let mut names: Vec<&str> = [entity.slo_name.as_deref(), entity.slo_arn.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .map(slo_name_of)
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                fields.push(Some(names.len().to_string()));
+                fields.extend(names.into_iter().map(|name| Some(name.to_string())));
+            }
+            AuditTargetEntity::ServiceOperation(entity) => {
+                fields.extend(audited_entity_fields(entity.service.as_ref()));
+                fields.push(entity.operation.clone());
+                fields.push(entity.metric_type.clone());
+            }
+            AuditTargetEntity::Canary(entity) => {
+                fields.push(Some(entity.canary_name.clone()));
+            }
+        }
+        rendered.push(fields);
+    }
+    rendered.sort_unstable();
+    rendered.dedup();
+
+    // The number of targets precedes them, so the auditor filter and the period that follow are
+    // read in their own places however many fields the targets took.
+    let mut fields: Vec<Option<String>> = vec![Some(rendered.len().to_string())];
+    fields.extend(rendered.into_iter().flatten());
+    match auditors {
+        // An absent filter is not an empty one: it names no auditor to filter by, while an
+        // empty list names none to keep ([`retaining_auditors`]).
+        None => fields.push(None),
+        Some(named) => {
+            let mut names: Vec<&str> = named.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            names.dedup();
+            fields.push(Some(names.len().to_string()));
+            fields.extend(names.into_iter().map(|name| Some(name.to_string())));
+        }
+    }
+    fields.extend(
+        window_fields(window_start, window_end)
+            .into_iter()
+            .map(Some),
+    );
+    subject_token_tag(tag, &borrowed_fields(&fields))
+}
+
+/// The fields one audited `ServiceEntity` contributes to a cursor's tag: the attributes it
+/// names, each in a place of its own.
+///
+/// An entity that leaves an attribute unnamed selects a different set from one that names it,
+/// since the identity is matched as a SUBSET of a stored one ([`attributes_contain`]) — so an
+/// absent attribute is an absent field rather than a missing one. Always four fields, whether
+/// or not the target carried an entity at all, so the fields of whatever follows are still
+/// read in their own places.
+fn audited_entity_fields(entity: Option<&ServiceEntity>) -> [Option<String>; 4] {
+    [
+        entity.and_then(|entity| entity.r#type.clone()),
+        entity.and_then(|entity| entity.name.clone()),
+        entity.and_then(|entity| entity.environment.clone()),
+        entity.and_then(|entity| entity.aws_account_id.clone()),
+    ]
 }
 
 /// The key attributes a `ServiceEntity` names, or `None` when it names no entity of this
