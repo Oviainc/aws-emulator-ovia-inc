@@ -450,8 +450,11 @@ pub fn unknown_target_region(regions: &[String]) -> Option<&str> {
 
 /// The refusal naming a Region AWS does not have, worded once for every operation that
 /// takes a `RegionList`.
+///
+/// One variable part — the offending Region, as the request spelled it — inside fixed text;
+/// nothing else of the request appears.
 pub fn region_does_not_exist(region: &str) -> String {
-    format!("Region {region} is not a supported Amazon Web Services Region")
+    format!("Region {region} is not supported")
 }
 
 /// `base` with `overrides` applied by parameter key: an overridden parameter takes the

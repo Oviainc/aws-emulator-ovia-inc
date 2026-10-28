@@ -7,8 +7,10 @@
 //! whose `OperationId` it answers, which `DescribeStackSetOperation` monitors. A pair the
 //! StackSet holds no instance in is nothing this operation may act on ("you can only update
 //! stack instances in Amazon Web Services Regions and accounts where they already exist"), so
-//! it is refused `StackInstanceNotFoundException` in the sentence this crate answers for that
-//! exception ([`crate::state::stack_instance_does_not_exist`]).
+//! it is refused `StackInstanceNotFoundException` in the sentence THIS operation answers for
+//! that exception — one naming the Region of the selection that resolved nothing
+//! ([`crate::state::no_stack_instance_in_region`]), not the sentence the reading operations
+//! answer.
 //!
 //! ## Shape of an operation
 //!
@@ -416,17 +418,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Vec::new();
             for pair in &requested {
                 let Some(instance) = held.get(pair) else {
-                    // The one sentence this crate answers for `StackInstanceNotFoundException`
-                    // ([`crate::state::stack_instance_does_not_exist`], which
-                    // `DescribeStackInstance` and `ListStackInstanceResourceDrifts` answer
-                    // too), so the exception reads the same whichever operation addressed the
-                    // instance.
+                    // This operation is addressed at a SELECTION, so its refusal names which
+                    // Region of the request's `Regions` list resolved no instance
+                    // ([`crate::state::no_stack_instance_in_region`]) — the wording belongs
+                    // to the operation that refused, not to the exception shape, so it is a
+                    // different sentence from the one the reading operations answer.
                     return Err(
                         UpdateStackInstancesErrorModeled::StackInstanceNotFoundException(
                             StackInstanceNotFoundException {
-                                message: Some(
-                                    crate::state::stack_instance_does_not_exist().to_string(),
-                                ),
+                                message: Some(crate::state::no_stack_instance_in_region(pair.1)),
                             },
                         )
                         .into(),

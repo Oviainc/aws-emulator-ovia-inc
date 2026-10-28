@@ -456,8 +456,9 @@ async fn deleting_stack_instances_takes_them_out_of_the_stack_set() {
                 "case {:?}: expected the modelled refusal for {account}/{region}, got {body}",
                 case.case
             );
-            // The one sentence this service answers for a stack instance it holds no record
-            // of, whichever operation addressed the pair.
+            // The sentence the operations that READ one stack instance answer for a pair this
+            // StackSet holds no record of; the operations that UPDATE a selection word the
+            // same exception their own way (`stack_set_refusal_wording.rs`).
             assert_eq!(
                 xml_text(&body, "Message").as_deref(),
                 Some("StackInstance not found"),

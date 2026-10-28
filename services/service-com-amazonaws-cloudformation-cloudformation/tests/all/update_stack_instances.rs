@@ -1160,11 +1160,13 @@ async fn an_update_of_an_instance_a_deletion_took_away_is_refused() {
         "case {:?}: expected the refusal to be reported as the caller's fault, got {body}",
         "an update of an instance a deletion took away"
     );
+    // The update path words the exception its own way: the Region of the selection that
+    // resolved no instance, taken from the request's `Regions` list.
     assert_eq!(
         xml_text(&body, "Message").as_deref(),
-        Some("StackInstance not found"),
-        "case {:?}: expected the one sentence this service answers for a stack instance it \
-         holds no record of, got {body}",
+        Some(format!("No Stack Instance found in region {REGION}").as_str()),
+        "case {:?}: expected the update path's not-found sentence naming the selected Region, \
+         got {body}",
         "an update of an instance a deletion took away"
     );
 

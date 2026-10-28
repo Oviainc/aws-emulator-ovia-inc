@@ -555,7 +555,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The instances this update rolls out over: the pairs the request selects, or —
             // for a request that selects none — every instance the StackSet holds. A
             // selected pair the StackSet holds no instance for is the modelled
-            // `StackInstanceNotFoundException`.
+            // `StackInstanceNotFoundException`, worded as the update path words it: naming
+            // the Region of the request's `Regions` list that resolved nothing.
             let mut selected: Vec<Selected> = Vec::new();
             match &accounts {
                 Some(accounts) => {
@@ -566,8 +567,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     UpdateStackSetErrorModeled::StackInstanceNotFoundException(
                                         StackInstanceNotFoundException {
                                             message: Some(
-                                                crate::state::stack_instance_does_not_exist()
-                                                    .to_string(),
+                                                crate::state::no_stack_instance_in_region(
+                                                    target_region,
+                                                ),
                                             ),
                                         },
                                     )

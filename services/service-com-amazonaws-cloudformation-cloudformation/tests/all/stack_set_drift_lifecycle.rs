@@ -785,7 +785,9 @@ async fn drift_detection_over_a_stack_set_reports_what_each_instance_really_is()
         "an account the StackSet has no instance in"
     );
     // The same sentence `DescribeStackInstance` answers for a pair this StackSet holds no
-    // instance for (`delete_stack_instances.rs`): one wording for the one exception.
+    // instance for (`delete_stack_instances.rs`): the operations that READ one instance share
+    // this wording, while the ones that update a selection word it their own way
+    // (`stack_set_refusal_wording.rs`).
     assert_eq!(
         xml_text(&body, "Message").as_deref(),
         Some("StackInstance not found"),

@@ -6016,15 +6016,30 @@ pub fn drift_operation_does_not_exist() -> &'static str {
     "Detect Drift Operation not found"
 }
 
-/// The `StackInstanceNotFoundException` message CloudFormation answers when a stack set
-/// holds no instance in the account and Region a request named — the pair that identifies
-/// one instance of a stack set.
+/// The `StackInstanceNotFoundException` message CloudFormation answers an operation that
+/// READS one stack instance, addressed by the account and Region a request named, and finds
+/// the stack set holds none.
 ///
 /// The text carries no variable part, the way [`drift_operation_does_not_exist`] carries
 /// none: the error names the KIND of record the request did not resolve, and the account and
-/// Region the caller asked for are the ones it already sent.
+/// Region the caller asked for are the ones it already sent. The wording belongs to the
+/// reading operations only — an operation that UPDATES the instances a `Regions` list selects
+/// words the same exception its own way, see [`no_stack_instance_in_region`].
 pub fn stack_instance_does_not_exist() -> &'static str {
     "StackInstance not found"
+}
+
+/// The `StackInstanceNotFoundException` message CloudFormation answers an operation that
+/// UPDATES the stack instances a request's `Regions` list selects when one of those Regions
+/// holds no instance of the stack set.
+///
+/// An update is addressed at a SELECTION — a `Regions` list crossed with the accounts or
+/// deployment targets — rather than at one instance, so the refusal names which Region of
+/// that list resolved nothing: fixed text plus ONE variable part, the Region as the request
+/// spelled it. A different sentence from [`stack_instance_does_not_exist`] because the
+/// message belongs to the operation that refused, not to the exception shape alone.
+pub fn no_stack_instance_in_region(region: &str) -> String {
+    format!("No Stack Instance found in region {region}")
 }
 
 /// The refusal for a request that does not name exactly ONE source for the template it

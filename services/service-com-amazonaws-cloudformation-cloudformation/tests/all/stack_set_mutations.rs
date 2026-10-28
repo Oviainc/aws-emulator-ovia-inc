@@ -68,7 +68,7 @@ const NO_MODE: &str = "You must specify at least one value for either Accounts o
 /// The refusal for a Region the partition does not have, spelled out for the same reason:
 /// the Region is the request's, the rest of the sentence is fixed.
 fn unknown_region_message(region: &str) -> String {
-    format!("Region {region} is not a supported Amazon Web Services Region")
+    format!("Region {region} is not supported")
 }
 
 /// `CreateStackSet` with a template and whatever else a case states.
