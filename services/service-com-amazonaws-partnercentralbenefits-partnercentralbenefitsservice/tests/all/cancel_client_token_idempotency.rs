@@ -247,9 +247,11 @@ async fn a_cancel_replay_holds_for_every_token_form_the_model_admits() {
     }
 }
 
-/// A `ClientToken` identifies ONE request, so the same token naming a DIFFERENT
-/// application is a different cancellation: it applies to that application, and replaying
-/// the first request still answers what it reported.
+/// A `ClientToken` identifies ONE request, and the application a cancellation names is one
+/// of that request's members: a cancellation of ANOTHER application carrying a spent token
+/// is a different request, so it is refused with the modelled `ConflictException` and that
+/// application is left exactly as it was, while the request the token was spent on is
+/// still replayable.
 #[tokio::test]
 async fn a_cancel_token_names_one_application() {
     let case = "one token, two applications";
@@ -266,25 +268,32 @@ async fn a_cancel_token_names_one_application() {
         )
         .await;
     let first_after = harness.get(case, &first_id).await;
+    let second_before = harness.get(case, &second_id).await;
 
-    // The second request names another application, so it is not a replay of the first:
-    // it must cancel that application rather than answer as a retry of one that was never
-    // cancelled.
-    harness
-        .ok(
-            case,
+    // The second request names another application, so it is not the request the token was
+    // spent on: it is refused rather than applied under another request's token.
+    let (http, out) = harness
+        .call(
             "CancelBenefitApplication",
             &cancel_body(&second_id, shared, Some("no longer needed")),
         )
         .await;
+    assert_eq!(
+        http, 409,
+        "case {case:?}: a spent token naming another application must be refused, got {http} {out:?}"
+    );
+    assert_eq!(
+        error_code(&out),
+        "ConflictException",
+        "case {case:?}: expected ConflictException, got {out:?}"
+    );
     let second_after = harness.get(case, &second_id).await;
     assert_eq!(
-        second_after["Status"],
-        json!("CANCELED"),
-        "case {case:?}: a token naming another application is another request, so the cancellation must apply, got {second_after:?}"
+        second_after, second_before,
+        "case {case:?}: a refused cancellation must change nothing, expected {second_before:?}, got {second_after:?}"
     );
 
-    // And the first request is still replayable, unaffected by the second.
+    // And the first request is still replayable, unaffected by the refusal.
     let (http, out) = harness
         .call(
             "CancelBenefitApplication",

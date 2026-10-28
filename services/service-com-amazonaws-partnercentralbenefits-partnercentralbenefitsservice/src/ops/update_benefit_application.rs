@@ -25,10 +25,14 @@
 //! update that already applied changes nothing a second time and answers with the
 //! `Id`/`Arn`/`Revision` that update reported, while an update carrying that token with
 //! any different member is a different request and is refused with the modelled
-//! `ConflictException` (HTTP 409) — see [`crate::state::replayed_write`] and
-//! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]. The token is checked BEFORE the
-//! status and the revision, because the first call's own write is what moved the revision
-//! the retry still carries.
+//! `ConflictException` (HTTP 409) — see
+//! [`crate::state::ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::replayed_application_write`]
+//! and [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]. The members compared are the
+//! records the request NAMES rather than the spellings it used, and the token is looked up
+//! wherever in the store it was spent — so a retry naming the same application by its ARN
+//! instead of its id is that same request, and an update of ANOTHER application carrying
+//! the token is not. The token is checked BEFORE the status and the revision, because the
+//! first call's own write is what moved the revision the retry still carries.
 //!
 //! ## Shape of an operation
 //!
@@ -229,8 +233,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let principal = crate::state::caller_principal(ctx);
         let now = crate::state::now_millis();
 
+        let mut store = state.lock();
+
+        // The catalog the request names is resolved FIRST: an application lives inside a
+        // catalog, so a catalog that does not exist is the missing resource and is what
+        // the answer names — see [`crate::state::catalog_refusal`].
+        if let Some(missing) = store.catalog_refusal(&input.catalog) {
+            return Err(
+                UpdateBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
+            );
+        }
+
+        // The application's own benefit governs the document this update would store, the
+        // way it governs the one the create stores. The schema is read — and cloned —
+        // BEFORE the application is borrowed for writing, and judged after the retry
+        // check below, so a replay of a write that already landed still answers with what
+        // it reported.
+        let benefit_schema =
+            store.benefit_schema_for_application(&input.catalog, &input.identifier);
+
         // The identity of this REQUEST, which is what the `ClientToken` below is judged
-        // against: every member the request carries other than the token itself.
+        // against: every member the request carries other than the token itself. The
+        // `Identifier` member is covered by the APPLICATION it names
+        // ([`crate::state::ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::application_identity`]),
+        // not by the spelling it was written with, so a retry naming the same application
+        // the other way the modelled pattern admits is the same request.
         let fingerprint = crate::state::request_fingerprint(vec![
             (
                 "Catalog",
@@ -238,7 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             (
                 "Identifier",
-                Some(crate::state::fingerprint_value(&input.identifier)),
+                Some(crate::state::fingerprint_value(
+                    &store.application_identity(&input.catalog, &input.identifier),
+                )),
             ),
             (
                 "Revision",
@@ -278,24 +307,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ]);
 
-        let mut store = state.lock();
-
-        // The catalog the request names is resolved FIRST: an application lives inside a
-        // catalog, so a catalog that does not exist is the missing resource and is what
-        // the answer names — see [`crate::state::catalog_refusal`].
-        if let Some(missing) = store.catalog_refusal(&input.catalog) {
-            return Err(
-                UpdateBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
-            );
+        // A retry of an update that already applied applies nothing a second time and
+        // answers with what that call reported: the `ClientToken` is the identity of the
+        // REQUEST, so a request repeating one is the same request rather than a new
+        // write — and a request repeating one with different members is a DIFFERENT
+        // request, refused rather than answered with that write's result. The token is
+        // looked up wherever in the store it was spent, so the application the request
+        // names is a member it can differ on. It is checked BEFORE the status and the
+        // revision, because the first call's own write moved the revision the retry still
+        // carries (and the application may since have been submitted, which the status
+        // gate below refuses an update of) — so without this a lost response turns into a
+        // refusal of a write that already succeeded.
+        match store.replayed_application_write(Self::NAME, &input.client_token, &fingerprint) {
+            Err(conflict) => {
+                return Err(UpdateBenefitApplicationErrorModeled::ConflictException(conflict).into())
+            }
+            Ok(Some(replayed)) => {
+                return Ok(UpdateBenefitApplicationOutput {
+                    id: Some(replayed.id),
+                    arn: Some(replayed.arn),
+                    revision: Some(replayed.revision.to_string()),
+                })
+            }
+            Ok(None) => {}
         }
-
-        // The application's own benefit governs the document this update would store, the
-        // way it governs the one the create stores. The schema is read — and cloned —
-        // BEFORE the application is borrowed for writing, and judged after the retry
-        // check below, so a replay of a write that already landed still answers with what
-        // it reported.
-        let benefit_schema =
-            store.benefit_schema_for_application(&input.catalog, &input.identifier);
 
         let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
             return Err(
@@ -310,32 +345,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-
-        // A retry of an update that already applied applies nothing a second time and
-        // answers with what that call reported: the `ClientToken` is the identity of the
-        // REQUEST, so a request repeating one is the same request rather than a new
-        // write — and a request repeating one with different members is a DIFFERENT
-        // request, refused rather than answered with that write's result. It is checked
-        // BEFORE the status and the revision, because the first call's own write moved
-        // the revision the retry still carries (and the application may since have been
-        // submitted, which the status gate below refuses an update of) — so without this
-        // a lost response turns into a refusal of a write that already succeeded.
-        match crate::state::replayed_write(
-            application.applied_write(Self::NAME, &input.client_token),
-            &fingerprint,
-        ) {
-            Err(conflict) => {
-                return Err(UpdateBenefitApplicationErrorModeled::ConflictException(conflict).into())
-            }
-            Ok(Some(applied)) => {
-                return Ok(UpdateBenefitApplicationOutput {
-                    id: Some(application.id.clone()),
-                    arn: Some(application.arn.clone()),
-                    revision: Some(applied.revision.to_string()),
-                })
-            }
-            Ok(None) => {}
-        }
 
         // A document this update would store has to satisfy the benefit's request schema,
         // exactly as the create's does: one rule, applied wherever the member is written.

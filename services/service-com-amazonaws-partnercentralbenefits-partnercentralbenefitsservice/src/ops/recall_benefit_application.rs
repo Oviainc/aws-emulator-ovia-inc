@@ -227,23 +227,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The identity of this REQUEST, which is what the `ClientToken` below is judged
-        // against: every member the request carries other than the token itself.
-        let fingerprint = crate::state::request_fingerprint(vec![
-            (
-                "Catalog",
-                Some(crate::state::fingerprint_value(&input.catalog)),
-            ),
-            (
-                "Identifier",
-                Some(crate::state::fingerprint_value(&input.identifier)),
-            ),
-            (
-                "Reason",
-                Some(crate::state::fingerprint_value(&input.reason)),
-            ),
-        ]);
-
         let mut store = state.lock();
         // The catalog the request names is resolved FIRST: an application lives inside a
         // catalog, so a catalog that does not exist is the missing resource and is what
@@ -252,6 +235,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RecallBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
             );
+        }
+
+        // The identity of this REQUEST, which is what the `ClientToken` below is judged
+        // against: every member the request carries other than the token itself. The
+        // `Identifier` member is covered by the APPLICATION it names, not by the spelling
+        // it was written with.
+        let fingerprint = crate::state::request_fingerprint(vec![
+            (
+                "Catalog",
+                Some(crate::state::fingerprint_value(&input.catalog)),
+            ),
+            (
+                "Identifier",
+                Some(crate::state::fingerprint_value(
+                    &store.application_identity(&input.catalog, &input.identifier),
+                )),
+            ),
+            (
+                "Reason",
+                Some(crate::state::fingerprint_value(&input.reason)),
+            ),
+        ]);
+
+        // A retry of the recall already in effect: answer success and leave the record —
+        // its status, its `StatusReason`, its revision and its `UpdatedAt` — exactly as
+        // that recall left it. A request carrying no `ClientToken` is not a retry, and a
+        // request carrying that token with a different `Reason`, or naming another
+        // application, is a DIFFERENT request and is refused rather than answered success:
+        // the token is looked up wherever in the store it was spent, which is what makes
+        // the application it names a member the comparison can differ on.
+        if let Some(token) = input.client_token.as_deref() {
+            match store.replayed_recall(token, &fingerprint) {
+                Err(conflict) => {
+                    return Err(
+                        RecallBenefitApplicationErrorModeled::ConflictException(conflict).into(),
+                    )
+                }
+                Ok(true) => return Ok(RecallBenefitApplicationOutput {}),
+                Ok(false) => {}
+            }
         }
 
         let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
@@ -267,23 +290,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-
-        // A retry of the recall already in effect: answer success and leave the record —
-        // its status, its `StatusReason`, its revision and its `UpdatedAt` — exactly as
-        // that recall left it. A request carrying no `ClientToken` is not a retry, and a
-        // request carrying that token with a different `Reason` is a DIFFERENT request,
-        // refused rather than answered success.
-        if let Some(token) = input.client_token.as_deref() {
-            match application.recall_retry(token, &fingerprint) {
-                Err(conflict) => {
-                    return Err(
-                        RecallBenefitApplicationErrorModeled::ConflictException(conflict).into(),
-                    )
-                }
-                Ok(true) => return Ok(RecallBenefitApplicationOutput {}),
-                Ok(false) => {}
-            }
-        }
 
         if !application.is_recallable() {
             return Err(RecallBenefitApplicationErrorModeled::ConflictException(

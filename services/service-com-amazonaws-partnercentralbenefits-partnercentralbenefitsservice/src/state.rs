@@ -1285,14 +1285,33 @@ impl BenefitApplication {
 /// copy of the request.
 #[derive(Debug, Clone)]
 pub struct ClientTokenRecord {
+    /// The catalog the create minted the application in. Part of the record rather than
+    /// of the key: the token identifies the request, and the catalog the request named is
+    /// one of the members its fingerprint covers.
+    pub catalog: String,
     /// The `benappl-...` id of the application the create minted.
     pub application_id: String,
     /// The fingerprint of the create request ([`request_fingerprint`]).
     pub request_fingerprint: String,
 }
 
-/// One benefit catalog: its seeded benefits and allocations, the applications created in
-/// it, and the `ClientToken`s those creates were made with.
+/// What a replayed `ClientToken` answers with: the application the write it was spent on
+/// landed on, and the revision that write reported.
+///
+/// Owned rather than borrowed, so a handler can judge a repeated token against the whole
+/// store and then take the application for writing.
+#[derive(Debug, Clone)]
+pub struct ReplayedWrite {
+    /// The `benappl-...` id of the application the write landed on.
+    pub id: String,
+    /// That application's ARN.
+    pub arn: String,
+    /// The revision the write produced — the `Revision` a replay reports.
+    pub revision: u64,
+}
+
+/// One benefit catalog: its seeded benefits and allocations, and the applications created
+/// in it.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     /// Benefits by `ben-...` id, in one stable order so `ListBenefits` can page.
@@ -1303,8 +1322,6 @@ pub struct Catalog {
     /// Allocations by `benalloc-...` id, in one stable order so
     /// `ListBenefitAllocations` can page.
     pub allocations: BTreeMap<String, BenefitAllocation>,
-    /// `ClientToken` -> what the create it completed minted, and the request it carried.
-    pub client_tokens: BTreeMap<String, ClientTokenRecord>,
 }
 
 impl Catalog {
@@ -1386,7 +1403,6 @@ impl Catalog {
             benefits,
             applications: BTreeMap::new(),
             allocations,
-            client_tokens: BTreeMap::new(),
         }
     }
 
@@ -1484,6 +1500,15 @@ pub struct ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState 
     /// Application ARN -> (catalog, application id), so an `Identifier` given as an ARN
     /// resolves to the same record as the bare id.
     pub arns: HashMap<String, (String, String)>,
+    /// The `ClientToken` of every `CreateBenefitApplication` that succeeded -> what that
+    /// create minted and the request it came on.
+    ///
+    /// ONE namespace for the whole service, not one per catalog: a `ClientToken`
+    /// identifies one REQUEST of the operation, and the `Catalog` the request named is one
+    /// of the members its fingerprint covers — so a create repeating a spent token in
+    /// another catalog is a different request, which only a store-wide index can tell. At
+    /// most one entry per stored application, so it is bounded by the application count.
+    pub client_tokens: BTreeMap<String, ClientTokenRecord>,
     /// Monotonic counter feeding [`Self::mint_application_id`]; it is what makes a minted
     /// id unique even within one clock tick.
     id_sequence: u64,
@@ -1505,6 +1530,7 @@ impl Default for ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsservice
             },
             partner_accounts: BTreeSet::new(),
             arns: HashMap::new(),
+            client_tokens: BTreeMap::new(),
             id_sequence: 0,
         }
     }
@@ -1575,6 +1601,122 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         self.catalogs.get(catalog)?.applications.get(&id)
     }
 
+    /// The identity of the application `identifier` names, as a request fingerprint covers
+    /// it ([`request_fingerprint`]).
+    ///
+    /// A fingerprint is the identity of the REQUEST, and an identifier member names the
+    /// RECORD it resolves to rather than the spelling it was written with, so what the
+    /// fingerprint carries is the stored `benappl-...` id: both forms the modelled
+    /// identifier admits name one request, so a retry spelled the other way is the SAME
+    /// request and is replayed. An identifier naming no stored application is its own
+    /// identity, so such a request is a different request from any a token was spent on —
+    /// refused as the reuse it is where the token is spent, and answered by the
+    /// operation's own `ResourceNotFoundException` where it is not.
+    pub fn application_identity(&self, catalog: &str, identifier: &str) -> String {
+        self.resolve_application_id(catalog, identifier)
+            .unwrap_or_else(|| identifier.to_string())
+    }
+
+    /// The identity of the benefit `identifier` names, as a request fingerprint covers it:
+    /// the same rule [`Self::application_identity`] states, for the member whose modelled
+    /// pattern is `^(arn:.+|ben-[0-9a-z]{14})$`.
+    pub fn benefit_identity(&self, catalog: &str, identifier: &str) -> String {
+        self.catalogs
+            .get(catalog)
+            .and_then(|stored| stored.resolve_benefit_id(catalog, identifier))
+            .unwrap_or_else(|| identifier.to_string())
+    }
+
+    /// The write `operation` already applied under `client_token`, WHEREVER in this store
+    /// it landed, or the refusal that token was spent on a different request.
+    ///
+    /// A `ClientToken` identifies ONE request of an operation, not one request per record,
+    /// so the token is looked up across every application this store holds rather than only
+    /// on the one the request names: a request repeating a spent token with any different
+    /// member — the application it names included — is a different request and is refused
+    /// ([`replayed_write`]), while the same request is answered with what the first call
+    /// reported. `Ok(None)` is a token no write of this operation holds, so the request is
+    /// a new one.
+    ///
+    /// The walk is bounded by the store's own caps: at most
+    /// [`MAX_APPLICATIONS_PER_CATALOG`] applications in each of the
+    /// [`SEEDED_CATALOGS`], each holding at most [`MAX_APPLIED_WRITE_HISTORY`] writes.
+    pub fn replayed_application_write(
+        &self,
+        operation: &str,
+        client_token: &str,
+        request_fingerprint: &str,
+    ) -> Result<Option<ReplayedWrite>, crate::ops::types::ConflictException> {
+        let Some((application, applied)) = self
+            .catalogs
+            .values()
+            .flat_map(|stored| stored.applications.values())
+            .find_map(|application| {
+                application
+                    .applied_write(operation, client_token)
+                    .map(|applied| (application, applied))
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(applied) = replayed_write(Some(applied), request_fingerprint)? else {
+            return Ok(None);
+        };
+        Ok(Some(ReplayedWrite {
+            id: application.id.clone(),
+            arn: application.arn.clone(),
+            revision: applied.revision,
+        }))
+    }
+
+    /// Whether `client_token` is the token of a recall still in effect on an application of
+    /// this store — a retry of that recall, which must change nothing — or the refusal that
+    /// token was spent on a DIFFERENT recall request.
+    ///
+    /// The store-wide lookup is the rule [`Self::replayed_application_write`] applies for
+    /// the writes an application records: the token names one request, so a recall naming
+    /// another application under a spent token is refused rather than served.
+    pub fn replayed_recall(
+        &self,
+        client_token: &str,
+        request_fingerprint: &str,
+    ) -> Result<bool, crate::ops::types::ConflictException> {
+        for application in self
+            .catalogs
+            .values()
+            .flat_map(|stored| stored.applications.values())
+        {
+            if application.recall_retry(client_token, request_fingerprint)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The application the create that spent `client_token` minted, or the refusal that
+    /// token was spent on a different create.
+    ///
+    /// `Ok(None)` is a token no create holds, so the request is a new one. The index the
+    /// token is looked up in is the whole store's ([`Self::client_tokens`]), so the
+    /// `Catalog` a create named is a member its fingerprint can differ on, exactly as the
+    /// application an application-write names is.
+    pub fn replayed_create(
+        &self,
+        client_token: &str,
+        request_fingerprint: &str,
+    ) -> Result<Option<&BenefitApplication>, crate::ops::types::ConflictException> {
+        let Some(spent) = self.client_tokens.get(client_token) else {
+            return Ok(None);
+        };
+        if spent.request_fingerprint != request_fingerprint {
+            return Err(idempotency_conflict());
+        }
+        Ok(self
+            .catalogs
+            .get(&spent.catalog)
+            .and_then(|stored| stored.applications.get(&spent.application_id)))
+    }
+
     /// The benefit `identifier` names inside `catalog`, for a reporting operation.
     ///
     /// Resolved as [`Catalog::resolve_benefit_id`] does, so both forms the modelled
@@ -1635,9 +1777,12 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     ///
     /// The token is indexed with the fingerprint of the create request it came on
     /// ([`request_fingerprint`]), so the create can tell a retry of that request from a
-    /// different request carrying the same token.
+    /// different request carrying the same token, and the index is the store's own rather
+    /// than one catalog's, because the `Catalog` the request named is one of the members
+    /// the fingerprint covers (see [`Self::replayed_create`]).
     ///
-    /// `None` when the catalog does not exist, which a handler has already refused.
+    /// Nothing is stored when the catalog does not exist, which a handler has already
+    /// refused.
     pub fn insert_application(
         &mut self,
         client_token: String,
@@ -1648,14 +1793,15 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
             application.arn.clone(),
             (application.catalog.clone(), application.id.clone()),
         );
+        self.client_tokens.insert(
+            client_token,
+            ClientTokenRecord {
+                catalog: application.catalog.clone(),
+                application_id: application.id.clone(),
+                request_fingerprint,
+            },
+        );
         if let Some(catalog) = self.catalogs.get_mut(&application.catalog) {
-            catalog.client_tokens.insert(
-                client_token,
-                ClientTokenRecord {
-                    application_id: application.id.clone(),
-                    request_fingerprint,
-                },
-            );
             catalog
                 .applications
                 .insert(application.id.clone(), application);

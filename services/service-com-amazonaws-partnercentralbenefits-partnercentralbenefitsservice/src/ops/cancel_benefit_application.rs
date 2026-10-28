@@ -11,10 +11,11 @@
 //!
 //! Idempotency: `ClientToken` identifies the REQUEST, so a retry carrying the token of a
 //! cancellation that already applied changes nothing a second time and answers success,
-//! while a cancellation carrying that token with any different member is a different
-//! request and is refused with the modelled `ConflictException` — see
-//! [`crate::state::replayed_write`] and
-//! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]. The token is checked BEFORE the
+//! while a cancellation carrying that token with any different member — the application it
+//! names included — is a different request and is refused with the modelled
+//! `ConflictException` — see
+//! [`crate::state::ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::replayed_application_write`]
+//! and [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]. The token is checked BEFORE the
 //! status, because the first call's own write is what made the application terminal.
 //!
 //! ## Shape of an operation
@@ -179,23 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
 
-        // The identity of this REQUEST, which is what the `ClientToken` below is judged
-        // against: every member the request carries other than the token itself.
-        let fingerprint = crate::state::request_fingerprint(vec![
-            (
-                "Catalog",
-                Some(crate::state::fingerprint_value(&input.catalog)),
-            ),
-            (
-                "Identifier",
-                Some(crate::state::fingerprint_value(&input.identifier)),
-            ),
-            (
-                "Reason",
-                input.reason.as_ref().map(crate::state::fingerprint_value),
-            ),
-        ]);
-
         let mut store = state.lock();
         // The catalog the request names is resolved FIRST: an application lives inside a
         // catalog, so a catalog that does not exist is the missing resource and is what
@@ -204,6 +188,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CancelBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
             );
+        }
+
+        // The identity of this REQUEST, which is what the `ClientToken` below is judged
+        // against: every member the request carries other than the token itself. The
+        // `Identifier` member is covered by the APPLICATION it names, not by the spelling
+        // it was written with.
+        let fingerprint = crate::state::request_fingerprint(vec![
+            (
+                "Catalog",
+                Some(crate::state::fingerprint_value(&input.catalog)),
+            ),
+            (
+                "Identifier",
+                Some(crate::state::fingerprint_value(
+                    &store.application_identity(&input.catalog, &input.identifier),
+                )),
+            ),
+            (
+                "Reason",
+                input.reason.as_ref().map(crate::state::fingerprint_value),
+            ),
+        ]);
+
+        // A retry of a cancellation that already applied changes nothing a second time
+        // and answers success: the `ClientToken` is the identity of the REQUEST, so a
+        // request repeating one is the same request rather than a new write — and a
+        // request repeating one with a different member is a DIFFERENT request, refused
+        // rather than answered success. The token is looked up wherever in the store it
+        // was spent, so the application the request names is a member it can differ on.
+        // It is checked BEFORE the status, because the first call's own write is what
+        // made the application terminal, and the status gate below refuses a cancellation
+        // of a terminal application.
+        match store.replayed_application_write(Self::NAME, &input.client_token, &fingerprint) {
+            Err(conflict) => {
+                return Err(CancelBenefitApplicationErrorModeled::ConflictException(conflict).into())
+            }
+            Ok(Some(_)) => return Ok(CancelBenefitApplicationOutput {}),
+            Ok(None) => {}
         }
 
         let Some(application) = store.application_mut(&input.catalog, &input.identifier) else {
@@ -219,24 +241,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-
-        // A retry of a cancellation that already applied changes nothing a second time
-        // and answers success: the `ClientToken` is the identity of the REQUEST, so a
-        // request repeating one is the same request rather than a new write — and a
-        // request repeating one with a different member is a DIFFERENT request, refused
-        // rather than answered success. It is checked BEFORE the status, because the
-        // first call's own write is what made the application terminal, and the status
-        // gate below refuses a cancellation of a terminal application.
-        match crate::state::replayed_write(
-            application.applied_write(Self::NAME, &input.client_token),
-            &fingerprint,
-        ) {
-            Err(conflict) => {
-                return Err(CancelBenefitApplicationErrorModeled::ConflictException(conflict).into())
-            }
-            Ok(Some(_)) => return Ok(CancelBenefitApplicationOutput {}),
-            Ok(None) => {}
-        }
 
         // AWS has finished with a terminal application, so there is nothing left to
         // cancel and the record is left exactly as it is.

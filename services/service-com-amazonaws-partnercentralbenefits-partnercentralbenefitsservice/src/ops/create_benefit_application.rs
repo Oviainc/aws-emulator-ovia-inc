@@ -11,7 +11,10 @@
 //! creating a second application, while a create carrying that token with any different
 //! member is a different request and is refused with the modelled `ConflictException`
 //! (HTTP 409) — see [`crate::state::request_fingerprint`] and
-//! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`].
+//! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]. The token names ONE request of this
+//! operation for the whole service, so the `Catalog` a create named is a member the
+//! comparison can differ on, and the `BenefitIdentifier` is compared as the benefit it
+//! NAMES rather than the spelling it was written with.
 //!
 //! The benefit the request names is READ from the catalog, not merely resolved: a benefit
 //! whose `BenefitStatus` is not `ACTIVE` is no longer offered, so an application for it is
@@ -261,8 +264,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let principal = crate::state::caller_principal(ctx);
         let now = crate::state::now_millis();
 
+        let mut store = state.lock();
+        // The catalog the request names is resolved FIRST: the application this create
+        // would mint lives inside a catalog, so a catalog that does not exist is the
+        // missing resource and is what the answer names — see
+        // [`crate::state::catalog_refusal`].
+        if let Some(missing) = store.catalog_refusal(&input.catalog) {
+            return Err(
+                CreateBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
+            );
+        }
+
         // The identity of this REQUEST, which is what the `ClientToken` below is judged
-        // against: every member the request carries other than the token itself.
+        // against: every member the request carries other than the token itself. The
+        // `BenefitIdentifier` member is covered by the BENEFIT it names, not by the
+        // spelling it was written with, so a retry naming the same benefit the other way
+        // the modelled pattern admits is the same request.
         let fingerprint = crate::state::request_fingerprint(vec![
             (
                 "Catalog",
@@ -270,7 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             (
                 "BenefitIdentifier",
-                Some(crate::state::fingerprint_value(&input.benefit_identifier)),
+                Some(crate::state::fingerprint_value(
+                    &store.benefit_identity(&input.catalog, &input.benefit_identifier),
+                )),
             ),
             (
                 "Name",
@@ -324,15 +343,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         ]);
 
-        let mut store = state.lock();
-        // The catalog the request names is resolved FIRST: the application this create
-        // would mint lives inside a catalog, so a catalog that does not exist is the
-        // missing resource and is what the answer names — see
-        // [`crate::state::catalog_refusal`].
-        if let Some(missing) = store.catalog_refusal(&input.catalog) {
-            return Err(
-                CreateBenefitApplicationErrorModeled::ResourceNotFoundException(missing).into(),
-            );
+        // A `ClientToken` this service has already seen: it identifies the create request
+        // it came on, so what happens next depends on whether THIS request is that one. A
+        // different request carrying a spent token is not a retry of anything — it is
+        // refused, rather than answered with a success for an application it did not
+        // create and whose members would be silently dropped — and the token is looked up
+        // across the whole store, so the `Catalog` the request named is one of the members
+        // it can differ on.
+        match store.replayed_create(&input.client_token, &fingerprint) {
+            Err(conflict) => {
+                return Err(
+                    CreateBenefitApplicationErrorModeled::ConflictException(conflict).into(),
+                )
+            }
+            // A retry of the create that already succeeded: answer with what that call
+            // minted, and create nothing. The stored `created_revision` is what the first
+            // call reported, so the retry sees the same response even if the application
+            // has been updated since.
+            Ok(Some(existing)) => {
+                return Ok(CreateBenefitApplicationOutput {
+                    id: Some(existing.id.clone()),
+                    arn: Some(existing.arn.clone()),
+                    revision: Some(existing.created_revision_text()),
+                })
+            }
+            Ok(None) => {}
         }
 
         // Everything this create reads from the catalog is resolved here, inside one
@@ -350,32 +385,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-
-            // A `ClientToken` this catalog has already seen: it identifies the create
-            // request it came on, so what happens next depends on whether THIS request is
-            // that one.
-            if let Some(spent) = catalog.client_tokens.get(&input.client_token) {
-                // A different request carrying a spent token is not a retry of anything:
-                // it is refused, rather than answered with a success for an application
-                // it did not create and whose members would be silently dropped.
-                if spent.request_fingerprint != fingerprint {
-                    return Err(CreateBenefitApplicationErrorModeled::ConflictException(
-                        crate::state::idempotency_conflict(),
-                    )
-                    .into());
-                }
-                // A retry of the create that already succeeded: answer with what that
-                // call minted, and create nothing. The stored `created_revision` is what
-                // the first call reported, so the retry sees the same response even if
-                // the application has been updated since.
-                if let Some(existing) = catalog.applications.get(&spent.application_id) {
-                    return Ok(CreateBenefitApplicationOutput {
-                        id: Some(existing.id.clone()),
-                        arn: Some(existing.arn.clone()),
-                        revision: Some(existing.created_revision_text()),
-                    });
-                }
-            }
 
             // The application requests ONE benefit of this catalog, named either by its
             // bare `ben-...` id or by its ARN; anything the catalog does not hold is a
