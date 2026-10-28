@@ -99,6 +99,8 @@ mod snapshot_access_denied;
 mod snapshot_access_revoke;
 #[path = "all/snapshot_copy_configuration.rs"]
 mod snapshot_copy_configuration;
+#[path = "all/snapshot_copy_disable.rs"]
+mod snapshot_copy_disable;
 #[path = "all/snapshot_copy_grant_kms_keys.rs"]
 mod snapshot_copy_grant_kms_keys;
 #[path = "all/snapshot_copy_grants.rs"]
