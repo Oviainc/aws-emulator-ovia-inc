@@ -450,6 +450,21 @@ async fn deleting_stack_instances_takes_them_out_of_the_stack_set() {
                  {status} {body}",
                 case.case
             );
+            assert_eq!(
+                xml_text(&body, "Code").as_deref(),
+                Some("StackInstanceNotFoundException"),
+                "case {:?}: expected the modelled refusal for {account}/{region}, got {body}",
+                case.case
+            );
+            // The one sentence this service answers for a stack instance it holds no record
+            // of, whichever operation addressed the pair.
+            assert_eq!(
+                xml_text(&body, "Message").as_deref(),
+                Some("StackInstance not found"),
+                "case {:?}: expected the stack-instance-not-found sentence for \
+                 {account}/{region}, got {body}",
+                case.case
+            );
         }
         // An instance the selection never reached is untouched: still there, and still up to
         // date with its StackSet.

@@ -2,21 +2,25 @@
 
 //! @op StartTrigger
 //!
-//! Starts the trigger its `Name` addresses in the Region the request is served in: the
-//! stored trigger moves into the one `TriggerState` of a started trigger
-//! ([`crate::state::TRIGGER_STATE_ACTIVATED`]), which a later `GetTrigger` reports, and a
-//! started trigger that fires on nothing outside the caller — an `ON_DEMAND` one — fires
-//! here, beginning a run of the workflow it belongs to.
+//! Starts the trigger its `Name` addresses in the Region the request is served in: a
+//! started trigger that waits on something outside the caller is left armed, in the one
+//! `TriggerState` of a started trigger ([`crate::state::TRIGGER_STATE_ACTIVATED`]), which a
+//! later `GetTrigger` reports, while a trigger that waits on nothing but a caller — an
+//! `ON_DEMAND` one — is FIRED here instead: it initiates the actions its definition names
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::initiate_trigger_actions`]), begins a run
+//! of the workflow it belongs to, and is left in the state it waits in
+//! ([`crate::state::TriggerEntry::start`]), ready for the next caller.
 //!
 //! A start is refused with `EntityNotFoundException` when this Region holds no trigger
 //! under that name, and with `ConcurrentRunsExceededException` when the run the firing
 //! would begin is past the concurrency ceiling its workflow named.
 //!
-//! Nothing here runs the jobs and crawlers a trigger's actions initiate, so the run this
-//! fire records comes to rest exactly as a run `StartWorkflowRun` began does: in the
-//! modelled error status carrying the reason nothing was executed
-//! ([`crate::state::WORKFLOW_RUN_NOT_EXECUTED_MESSAGE`]), rather than reporting a result
-//! nothing computed.
+//! Nothing here EXECUTES the job scripts and crawls those actions initiate, so each record
+//! the fire wrote comes to rest exactly as the one its own start operation writes does: a
+//! job run in the modelled failure state carrying
+//! [`crate::state::JOB_RUN_NOT_EXECUTED_MESSAGE`] and the workflow run in the modelled
+//! error status carrying [`crate::state::WORKFLOW_RUN_NOT_EXECUTED_MESSAGE`], rather than
+//! reporting a result nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -187,11 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // What starting this trigger initiates, read off the stored definition before
-        // anything is written: the workflow a fire begins a run of, and how many actions
-        // that run's entry point initiates ("the actions initiated by this trigger when it
-        // fires").
+        // anything is written: the workflow a fire begins a run of, the actions the fire
+        // initiates ("the actions initiated by this trigger when it fires"), and how many
+        // of them the run's entry point counts.
         let fires_on_start = trigger.trigger_type == crate::state::TRIGGER_TYPE_ON_DEMAND;
         let workflow_name = trigger.workflow_name.clone();
+        let actions = trigger.actions.clone();
         let total_actions = i32::try_from(trigger.actions.len()).unwrap_or(i32::MAX);
 
         // An on-demand trigger waits for nothing but a caller ("True is not supported for
@@ -232,19 +237,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // "Starts an existing trigger": the trigger this call started is in the modelled
-        // state of a started trigger, which is the state `CreateTrigger` leaves a trigger
-        // in when the create started it. A steady state, so the clock owes it nothing
-        // further. The lock has been held since the trigger was read, so this write lands
-        // on the record that read reported.
+        // "The actions initiated by this trigger": a trigger that FIRED initiates them,
+        // whether or not it belongs to a workflow, so each action naming a job begins a run
+        // of that job here. A trigger that fires on something outside the caller initiates
+        // nothing until that happens.
+        let begun_job_runs = if fires_on_start {
+            store.initiate_trigger_actions(&region, &input.name, &actions, now)
+        } else {
+            Vec::new()
+        };
+
+        // "Starts an existing trigger": the state the start leaves the trigger in is the
+        // state its TYPE is left in by a start ([`crate::state::TriggerEntry::start`]) —
+        // armed when it waits on something outside the caller, and the state it waits in
+        // when the start was a firing. The lock has been held since the trigger was read, so
+        // this write lands on the record that read reported.
         if let Some(trigger) = store.trigger_mut(&region, &input.name) {
-            trigger.state = crate::state::TRIGGER_STATE_ACTIVATED.to_string();
+            trigger.start();
         }
         ::tracing::info!(
             operation = "StartTrigger",
             trigger = %input.name,
             region = %region,
             workflow_run = begun_run.as_deref().unwrap_or("none"),
+            job_runs = begun_job_runs.len(),
             "started a Glue trigger"
         );
 

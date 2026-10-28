@@ -380,28 +380,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateJob<Eng> {
         // The address a device ships to is such a record as well, and it is named the
         // same way whether or not the order joins a cluster: the check belongs to the
         // member that names the address, not to one of the two branches below, so a
-        // supplied id that answers to no stored address is refused either way. A
-        // forwarding address is an address too, so the same rule holds for it. This is
-        // exactly what `CreateCluster` does for the same two members.
-        for address_id in [
-            input.address_id.as_deref(),
-            input.forwarding_address_id.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
+        // supplied id that answers to no stored address is refused either way. Both
+        // members a request names an address through, and the refusal an unstored one
+        // earns, are the one rule `crate::state::OrderAddresses` holds for every
+        // operation that names an address — `CreateCluster`, `UpdateJob` and
+        // `UpdateCluster` ask exactly this question — and this handler lifts the answer
+        // into its own error channel.
+        if let Some(error) =
+            store.first_unstored_address(crate::state::OrderAddresses::from(&input))
         {
-            if !store.addresses.contains_key(address_id) {
-                return Err(CreateJobErrorModeled::InvalidResourceException(
-                    InvalidResourceException {
-                        message: Some(format!(
-                            "The address ID {address_id} can't be found. Check the information \
-                             you provided in your last request, and try again."
-                        )),
-                        resource_type: Some("address".to_string()),
-                    },
-                )
-                .into());
-            }
+            return Err(CreateJobErrorModeled::InvalidResourceException(error).into());
         }
 
         // A job is built from a resource it names: the address its device ships to, or

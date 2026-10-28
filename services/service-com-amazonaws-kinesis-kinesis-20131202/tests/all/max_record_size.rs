@@ -34,9 +34,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    data_too_long_message, put_record_data_path, put_records_data_path, stream_not_active_message,
-    stream_not_found_message, DEFAULT_MAX_RECORD_SIZE_KI_B, STREAM_ARN_REQUIRED_MESSAGE,
-    STREAM_CREATING, STREAM_DELETING, STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED,
+    data_too_long_message, put_record_data_path, put_records_data_path, stream_not_found_message,
+    DEFAULT_MAX_RECORD_SIZE_KI_B, STREAM_ARN_REQUIRED_MESSAGE, STREAM_CREATING, STREAM_DELETING,
+    STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED,
 };
 
 use crate::stream_tags::{error_code, error_message, past_activation, stream_arn, Emulator, REGION};
@@ -537,7 +537,14 @@ async fn an_update_of_a_stream_that_is_not_active_is_refused() {
         );
         assert_eq!(
             error_message(&response),
-            stream_not_active_message(&arn, expected_status),
+            // The sentence this service states for a stream that is not `ACTIVE`, written
+            // out here rather than borrowed from the crate, so the wording is what this
+            // case pins.
+            format!(
+                "Stream {name} under account {} not ACTIVE, instead in state \
+                 {expected_status}",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
             "case {name}: expected the not-active sentence this service states, got {response}"
         );
         assert_eq!(

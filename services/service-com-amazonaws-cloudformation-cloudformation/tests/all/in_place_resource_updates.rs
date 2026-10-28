@@ -325,6 +325,82 @@ async fn a_dropped_property_goes_back_to_its_documented_absent_value() {
 }
 
 #[tokio::test]
+async fn a_resource_whose_physical_name_cloudformation_generated_is_updated_in_place() {
+    // The declaration names NO physical name, so CloudFormation generates one — and the
+    // revision names none either, so the resource keeps the generated name and the change is
+    // applied to the resource that exists. The row differs from the table above only in that
+    // one respect, which is the one the generated-name path turns on.
+    let router = router();
+    let created = r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic","Properties":{"DisplayName":"orig-display-name"}}}}"#;
+    let (code, body) = create_stack(&router, "generated-name-inplace", created, &[]).await;
+    assert_eq!(code, 200, "expected CreateStack to succeed, got {code} {body}");
+    wait_for_the_transition().await;
+    let reported = status_of(&router, "generated-name-inplace").await;
+    assert_eq!(
+        reported,
+        status::CREATE_COMPLETE,
+        "expected the create to complete, got {reported:?} (reason {:?})",
+        reason_of(&router, "generated-name-inplace").await
+    );
+    let arn = topic_arn_of("a generated name", &router, "generated-name-inplace").await;
+
+    // A REFUSED submit in between: the body is truncated, so the request is refused and
+    // nothing is written — the stack is still the one the create left, which is what the
+    // valid revision below is applied to.
+    let truncated = r#"{"Resources": {"Topic": {"Type": "AWS::SNS::Topic", "Properties": {"#;
+    let (code, body) = call(
+        &router,
+        "UpdateStack",
+        &[
+            member("StackName", "generated-name-inplace"),
+            member("TemplateBody", truncated),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 400,
+        "expected the truncated body to be refused, got {code} {body}"
+    );
+    let reported = status_of(&router, "generated-name-inplace").await;
+    assert_eq!(
+        reported,
+        status::CREATE_COMPLETE,
+        "expected the refused update to leave the stack where it was, got {reported:?}"
+    );
+
+    let revised = r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic","Properties":{"DisplayName":"updated-display-name"}}}}"#;
+    let (code, body) = call(
+        &router,
+        "UpdateStack",
+        &[
+            member("StackName", "generated-name-inplace"),
+            member("TemplateBody", revised),
+        ],
+    )
+    .await;
+    assert_eq!(code, 200, "expected UpdateStack to succeed, got {code} {body}");
+    wait_for_the_transition().await;
+    let reported = status_of(&router, "generated-name-inplace").await;
+    assert_eq!(
+        reported,
+        status::UPDATE_COMPLETE,
+        "expected the update to complete, got {reported:?} (reason {:?})",
+        reason_of(&router, "generated-name-inplace").await
+    );
+    let after = topic_arn_of("a generated name", &router, "generated-name-inplace").await;
+    assert_eq!(
+        after, arn,
+        "expected the topic to keep the generated name it was created with, got {after:?}"
+    );
+    let held = topic_attributes("a generated name", &router, &arn).await;
+    assert!(
+        held.iter()
+            .any(|(name, value)| name == "DisplayName" && value == "updated-display-name"),
+        "expected Amazon SNS to hold the revised display name, got {held:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_change_this_emulator_cannot_apply_fails_the_update_naming_the_resource() {
     // The inline `Subscription` list is not a property of the topic: each entry is a
     // subscription of Amazon SNS's own, addressed by an ARN this resource's record does not

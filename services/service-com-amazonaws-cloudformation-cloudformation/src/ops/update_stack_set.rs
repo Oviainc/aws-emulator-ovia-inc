@@ -566,10 +566,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                     UpdateStackSetErrorModeled::StackInstanceNotFoundException(
                                         StackInstanceNotFoundException {
                                             message: Some(
-                                                crate::state::stack_instance_does_not_exist(
-                                                    account,
-                                                    target_region,
-                                                ),
+                                                crate::state::stack_instance_does_not_exist()
+                                                    .to_string(),
                                             ),
                                         },
                                     )

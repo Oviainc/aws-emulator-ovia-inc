@@ -16,10 +16,15 @@
 //! Jobs are reported in `metadataTransferJobId` order, which is the order the
 //! store keys them in, and a page carries at most
 //! [`crate::state::MAX_PAGE_SIZE`] jobs ([`crate::state::DEFAULT_PAGE_SIZE`]
-//! when the request names no `maxResults`). The `nextToken` a truncated page
-//! carries is opaque and holds the id the next page resumes AT, bound to the
-//! ends the listing was taken over, exactly as `ListComponentTypes`' token is
-//! bound to its workspace.
+//! when the request names no `maxResults`). This `maxResults` member's
+//! documentation publishes neither a default nor a minimum ("The maximum number
+//! of results to return at one time"), so the only bounds that are AWS's here
+//! are its modelled `range` (0..200): a zero is a page of no rows — the maximum
+//! number of results to return, literally — and not a refusal this handler
+//! invents, exactly as the identically documented `ListScenes` serves it. The
+//! `nextToken` a truncated page carries is opaque and holds the id the next page
+//! resumes AT, bound to the ends the listing was taken over, exactly as
+//! `ListComponentTypes`' token is bound to its workspace.
 //!
 //! A reporting operation: the only thing it writes is the lifecycle transition
 //! the CLOCK had already made due — each job's outcome, owed at
@@ -31,8 +36,9 @@
 //!
 //! The refusals this handler owns: an end type outside the modelled
 //! `SourceType`/`DestinationType` values, a filter naming a state outside the
-//! modelled `MetadataTransferJobState` values, a `maxResults` below one, and a
-//! `nextToken` this listing did not mint — each the `ValidationException` this
+//! modelled `MetadataTransferJobState` values, more `filters` than one listing
+//! accepts, and a `nextToken` this listing did not mint — each the
+//! `ValidationException` this
 //! operation models. Authorization is not emulated, so the modelled
 //! `AccessDeniedException` is never returned.
 //!
@@ -289,16 +295,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The page size served, under the rule every paginated operation of this
-        // service shares (`crate::state::page_size`): a request that names none
-        // is served this service's default rather than every job, an explicit
-        // zero is refused the way every listing of this service whose
-        // `maxResults` documents a minimum of 1 refuses it, and whatever is
-        // asked for the service serves at most `crate::state::MAX_PAGE_SIZE` —
+        // service shares (`crate::state::page_size`), applied with what THIS
+        // operation's own `maxResults` member documents: it publishes no default
+        // and no minimum, so an explicit zero is served as what it says — a page
+        // of no rows — rather than refused, and a request naming no `maxResults`
+        // is served this service's own default instead of every job. Whatever is
+        // asked for, the service serves at most `crate::state::MAX_PAGE_SIZE`,
         // so the page this call BUILDS is bounded by that code and not only by
-        // the boundary validator.
+        // the boundary validator. The token a zero-row page answers names the
+        // position the call STARTED from — a page of no rows consumed none — so
+        // a generated paginator must not be driven at zero: it would ask again
+        // from the same place forever.
         let page_size = crate::state::page_size(
             input.max_results,
-            crate::state::PageSizeRule::minimum_one(crate::state::DEFAULT_PAGE_SIZE),
+            crate::state::PageSizeRule::minimum_zero(crate::state::DEFAULT_PAGE_SIZE),
         )
         .map_err(invalid)?;
 

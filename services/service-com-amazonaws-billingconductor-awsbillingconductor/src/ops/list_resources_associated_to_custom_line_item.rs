@@ -237,8 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names the same cut point on the next one however the associations grow.
         selected.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        let (associated_resources, next_token) =
-            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let (associated_resources, next_token) = crate::state::paginate(
+            &crate::state::page_scope_within(Self::NAME, &item.arn),
+            selected,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListResourcesAssociatedToCustomLineItemErrorModeled::ValidationException)?;
 
         Ok(ListResourcesAssociatedToCustomLineItemOutput {
             arn: Some(item.arn.clone()),

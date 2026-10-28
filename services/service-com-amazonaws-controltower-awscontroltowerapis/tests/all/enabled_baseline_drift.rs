@@ -11,8 +11,9 @@
 //! `driftStatusSummary.types.inheritance.status` exactly when its baseline is one AWS
 //! Control Tower assesses inheritance drift on, and that status is `IN_SYNC` while no
 //! account under the target organizational unit has diverged from the configuration the
-//! enablement applies to it; an enablement whose deployment the clock has not made due
-//! yet, and one of a baseline no inheritance drift is assessed for, carry no
+//! enablement applies to it; an enablement whose deployment — of the configuration it was
+//! enabled with, or of one a later call started applying — the clock has not made due yet,
+//! and one of a baseline no inheritance drift is assessed for, carry no
 //! `driftStatusSummary` member at all.
 //!
 //! The table is `state::BASELINE_CATALOG` itself — the catalog `ListBaselines`/`GetBaseline`
@@ -183,7 +184,8 @@ async fn a_deployed_enablement_reports_the_inheritance_drift_of_its_baseline() {
 /// reports the drift summary of the record it lists, so the listing and
 /// `GetEnabledBaseline` agree member for member — before and after an update, which
 /// changes the version and parameters applied but not which baseline is enabled and so not
-/// whether its drift is assessed.
+/// whether its drift is assessed once the new configuration is deployed; while that update
+/// is in flight no assessment is reported at all.
 #[tokio::test]
 async fn the_listing_and_an_update_report_the_same_drift_summary() {
     let router = emulator();
@@ -227,9 +229,9 @@ async fn the_listing_and_an_update_report_the_same_drift_summary() {
             baseline.name
         );
 
-        // An update re-applies the baseline at another version it offers: the enablement
-        // goes back to UNDER_CHANGE, and the drift already assessed stays reported rather
-        // than being withdrawn or re-derived as a status the model does not declare.
+        // An update applies the baseline at another version it offers: the enablement goes
+        // back to UNDER_CHANGE, and the assessment the PREVIOUS configuration earned stops
+        // being reported, because the configuration being applied is not deployed yet.
         let newest = baseline
             .versions
             .last()
@@ -260,9 +262,9 @@ async fn the_listing_and_an_update_report_the_same_drift_summary() {
         let in_flight = details(&router, baseline.name, arn).await;
         assert_eq!(
             drift_summary(&in_flight),
-            expected,
-            "case {:?}: expected the assessed drift summary {expected:?} to survive an \
-             update in flight, got {in_flight:?}",
+            None,
+            "case {:?}: expected no driftStatusSummary while the update's configuration is \
+             still being applied, got {in_flight:?}",
             baseline.name
         );
     }

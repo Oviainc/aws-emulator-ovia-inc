@@ -6078,6 +6078,53 @@ pub fn entitlement_resource_fragment(suffix: u64, name: &str) -> String {
     format!("entitlement:1-{suffix:08x}:{name}")
 }
 
+/// How many decimal digits an Amazon Web Services account ID has: an account ID is a
+/// fixed-width 12-digit decimal number, which is why the account segment of every ARN this
+/// service mints carries exactly that many (see [`has_mintable_arn_prefix`]).
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// Whether `value` can be an Amazon Web Services account ID: exactly
+/// [`ACCOUNT_ID_DIGITS`] ASCII digits and nothing else.
+///
+/// The one encoding of what an account ID looks like in this crate, read both by the
+/// members a request carries one in ([`subscribers_rejection`]) and by the ARN prefix check
+/// [`has_mintable_arn_prefix`].
+pub fn is_account_id(value: &str) -> bool {
+    value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Why `subscribers` is not a list of Amazon Web Services account IDs, as the detail the
+/// refusal carries, or `None` when every entry is one. `prefix` is the request member that
+/// nests the entitlement, if any (see [`qualified_member`]).
+///
+/// `GrantEntitlementRequest$Subscribers` and `UpdateFlowEntitlementRequest$Subscribers` are
+/// both "the Amazon Web Services account IDs that you want to share your content with. The
+/// receiving accounts (subscribers) will be allowed to create their own flows using your
+/// content as the source" — so the list holds ACCOUNTS, and an entry that cannot be an
+/// account ID ([`is_account_id`]) names no account the content could be shared with. The
+/// caller refuses it with `BadRequestException`, the error the model describes for "a
+/// semantic error" in the request. The list itself may be EMPTY: an entitlement shared with
+/// nobody is a value the service keeps, not a malformed one.
+///
+/// CreateFlow's `Entitlements`, GrantFlowEntitlements' `Entitlements` and
+/// UpdateFlowEntitlement's `Subscribers` all write this list, so all three read the rule
+/// from here: no request can leave an entitlement carrying a subscriber another of them
+/// would refuse.
+pub fn subscribers_rejection(prefix: &str, subscribers: &[String]) -> Option<String> {
+    subscribers
+        .iter()
+        .enumerate()
+        .find(|(_, subscriber)| !is_account_id(subscriber))
+        .map(|(index, subscriber)| {
+            format!(
+                "{}[{index}] is {subscriber:?}, which is not an Amazon Web Services account \
+                 ID. A subscriber is an account you share your content with, named by its \
+                 {ACCOUNT_ID_DIGITS}-digit account ID.",
+                qualified_member(prefix, "Subscribers")
+            )
+        })
+}
+
 /// The name a `GrantEntitlementRequest` takes on a flow whose entitlement names are
 /// `taken`, resolved exactly as [`resolve_output_name`] resolves an output's.
 ///
@@ -6265,8 +6312,7 @@ fn has_mintable_arn_prefix(segments: &[&str], resource_type: &str) -> bool {
             .all(|b| b.is_ascii_alphabetic() || b == b'-')
         && service == &SERVICE_NAMESPACE
         && is_region_token(region)
-        && account.len() == 12
-        && account.bytes().all(|b| b.is_ascii_digit())
+        && is_account_id(account)
         && kind == &resource_type
 }
 

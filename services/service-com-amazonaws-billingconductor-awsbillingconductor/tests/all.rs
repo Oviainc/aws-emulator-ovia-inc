@@ -73,6 +73,8 @@ mod list_custom_line_items;
 mod membership_writes_keep_superseded_generations;
 #[path = "all/ordered_billing_period_range_refusal.rs"]
 mod ordered_billing_period_range_refusal;
+#[path = "all/pagination_token_opacity.rs"]
+mod pagination_token_opacity;
 #[path = "all/payer_account_authorization.rs"]
 mod payer_account_authorization;
 #[path = "all/payer_account_gate.rs"]

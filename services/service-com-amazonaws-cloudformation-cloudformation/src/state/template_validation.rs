@@ -8,8 +8,10 @@
 //! template whose own declarations cannot be resolved is one it never deploys: the call is
 //! refused with HTTP 400 and NOTHING is written, rather than accepted with a stack id and
 //! then deployed into a stack whose resources carry nulls. [`refusal`] is that whole pass,
-//! in ONE place, so every operation that SUBMITS a body — `CreateStack`, `UpdateStack`,
-//! `CreateChangeSet` — holds it to the same rules and words the refusal the same way.
+//! in ONE place, so every operation that TAKES a body holds it to the same rules and words
+//! the refusal the same way: the three that submit one for deployment — `CreateStack`,
+//! `UpdateStack`, `CreateChangeSet` — and `ValidateTemplate`, whose whole answer IS a
+//! verdict on the body, over the values the template's own `Default`s put in force.
 //!
 //! Every rule here is decided from the template DOCUMENT alone, which is what makes it a
 //! rule about the request rather than about the deployment:
@@ -405,32 +407,55 @@ fn is_documented_function(name: &str) -> bool {
     DOCUMENTED_FUNCTIONS.contains(&name) || name.starts_with(template::FOR_EACH_PREFIX)
 }
 
-/// The functions the service names FIRST in the list its refusal reports, which no TEMPLATE
-/// may use: they are the service's own, and appear there only because the refusal reports
-/// the whole set it resolves.
-const INTERNAL_FUNCTIONS: [&str; 3] = [
+/// The roster the "unsupported function" refusal advertises, in the order the service lists
+/// it: the three functions the SERVICE resolves for itself (which no template may use, and
+/// which appear only because the refusal reports the whole set it resolves), then the value
+/// functions, the condition functions — `Condition` among them, which is how a condition
+/// names another — then the rule functions, and `Fn::Sub` and `Fn::Cidr` last.
+///
+/// FIXED text, independent of the template the refusal answers: nothing of the request
+/// reaches it but the offending function's name. That is why it is a roster of its own
+/// rather than a rendering of [`DOCUMENTED_FUNCTIONS`] — the service advertises one list,
+/// while what a template may actually USE additionally depends on the transforms it
+/// declares, so the directives `AWS::LanguageExtensions` defines ([`template::FN_LENGTH`],
+/// [`template::FN_TO_JSON_STRING`], the loop) are NOT advertised: a response refusing one
+/// of them may not list it as supported.
+const ADVERTISED_FUNCTIONS: [&str; 26] = [
     "Fn::GetStackOutput",
     "Fn::AccountIdFromAlias",
     "Fn::GetConstantAZs",
+    "Fn::Base64",
+    "Fn::GetAtt",
+    "Fn::GetAZs",
+    "Fn::ImportValue",
+    "Fn::Join",
+    "Fn::Split",
+    "Fn::FindInMap",
+    "Fn::Select",
+    "Ref",
+    "Fn::Equals",
+    "Fn::If",
+    "Fn::Not",
+    "Condition",
+    "Fn::And",
+    "Fn::Or",
+    "Fn::Contains",
+    "Fn::EachMemberEquals",
+    "Fn::EachMemberIn",
+    "Fn::ValueOf",
+    "Fn::ValueOfAll",
+    "Fn::RefAll",
+    "Fn::Sub",
+    "Fn::Cidr",
 ];
 
-/// How a function no template may use is refused, naming it and the functions that are
-/// supported — which is what a caller who misspelled one needs.
-///
-/// The list is reported in the order the service reports it, as far as that order is known:
-/// its own three first, then the value functions. The functions past those are this
-/// service's own set, since the order the service lists the rest in is not something this
-/// emulator can observe.
+/// How a function no template may use is refused, naming it and the functions the service
+/// advertises as supported — which is what a caller who misspelled one needs.
 fn unsupported_function(name: &str) -> String {
-    let listed: Vec<&str> = INTERNAL_FUNCTIONS
-        .iter()
-        .chain(DOCUMENTED_FUNCTIONS.iter())
-        .copied()
-        .collect();
     format!(
         "Template Error: Encountered unsupported function: {name} Supported functions are: \
          [{}]",
-        listed.join(", ")
+        ADVERTISED_FUNCTIONS.join(", ")
     )
 }
 
@@ -812,28 +837,55 @@ fn static_text(
 /// `Some(message)` when the declared resources depend on each other in a cycle, naming the
 /// resources that form it: no creation order satisfies such a template, so CloudFormation
 /// refuses it instead of creating a resource whose references cannot be resolved.
+///
+/// The cycle is listed as the CHAIN it is — each logical id followed by the resource it
+/// depends on — beginning at the member whose logical id comes first
+/// ([`from_its_first_member`]). Both halves of that come from the request: its logical ids
+/// and the dependency relation they spell, so one body is refused with one list, on every
+/// run and whatever order the relation was walked in. The order a body DECLARES its
+/// resources in is not available to this rule: a template is read into a document whose
+/// object members are sorted ([`super::template::document`]), so the declarations' own
+/// order is gone before any rule sees them.
 fn cycle_refusal(template: &Template) -> Option<String> {
     let dependencies = template::direct_dependencies(template);
     let cycle = cycle_through(&dependencies)?;
     Some(format!(
         "Circular dependency between resources: [{}]",
-        cycle.join(", ")
+        from_its_first_member(&cycle).join(", ")
     ))
 }
 
-/// The resources of one cycle in the dependency relation, each named BEFORE the resource
-/// that depends on it, or `None` for a relation that has none.
+/// One cycle's logical ids as the refusal lists them: the same chain, rotated to begin at
+/// the member whose logical id sorts first.
 ///
-/// Walked from each resource in logical-id order, so one template yields one answer.
+/// A cycle has no first element of its own — every member is reached from every other — so
+/// the one the list begins at is chosen by the ids the REQUEST spelled, rather than by
+/// whichever resource the walk happened to enter the cycle from (a resource outside the
+/// cycle that points into it decides that, and it is no part of the cycle being reported).
+fn from_its_first_member(cycle: &[String]) -> Vec<String> {
+    let first = cycle
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, logical_id)| logical_id.as_str())
+        .map_or(0, |(at, _)| at);
+    cycle[first..]
+        .iter()
+        .chain(&cycle[..first])
+        .cloned()
+        .collect()
+}
+
+/// The resources of one cycle in the dependency relation, each followed by the resource it
+/// depends on, or `None` for a relation that has none.
+///
+/// Walked from each resource in logical-id order, so one template yields one answer; the
+/// chain this hands back is rotated into the order the refusal reports by
+/// [`from_its_first_member`].
 fn cycle_through(dependencies: &BTreeMap<String, BTreeSet<String>>) -> Option<Vec<String>> {
     let mut settled: BTreeSet<&str> = BTreeSet::new();
     for start in dependencies.keys() {
         let mut path: Vec<&str> = Vec::new();
-        if let Some(mut cycle) = walk(start, dependencies, &mut settled, &mut path) {
-            // The walk collected the chain in the direction of the DEPENDENCY (each entry
-            // depends on the next), and the refusal names them the other way round: a
-            // resource before the one that needs it.
-            cycle.reverse();
+        if let Some(cycle) = walk(start, dependencies, &mut settled, &mut path) {
             return Some(cycle);
         }
     }

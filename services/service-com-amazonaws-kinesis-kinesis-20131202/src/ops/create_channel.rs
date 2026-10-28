@@ -428,7 +428,8 @@ fn channel_streams(
         let status = stream.status(now);
         if status != crate::state::STREAM_ACTIVE {
             return Err(resource_in_use(crate::state::stream_not_active_message(
-                stream_arn, status,
+                &stream.name,
+                status,
             )));
         }
         if stream.stream_mode != crate::state::STREAM_MODE_ON_DEMAND {

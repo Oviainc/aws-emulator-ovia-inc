@@ -208,18 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An update that names a resource is built from that resource, exactly as the
-        // create is: an id no stored address answers to names none. A forwarding address
-        // is an address too, so the same rule holds for it. The answer is taken here,
-        // before the cluster is borrowed to write, so the cluster is looked up exactly
-        // once below and the write cannot be skipped.
-        let unknown_address: Option<String> = [
-            input.address_id.as_deref(),
-            input.forwarding_address_id.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|address_id| !store.addresses.contains_key(*address_id))
-        .map(str::to_string);
+        // create is: an id no stored address answers to names none. Both members that name
+        // an address, and the refusal an unstored one earns, are the one rule
+        // `crate::state::OrderAddresses` holds for every operation that names an address.
+        // The answer is taken here, before the cluster is borrowed to write, so the
+        // cluster is looked up exactly once below and the write cannot be skipped — while
+        // the refusal itself is raised after the cluster-not-found and state refusals
+        // below, which is this operation's own ordering.
+        let unknown_address =
+            store.first_unstored_address(crate::state::OrderAddresses::from(&input));
 
         let Some(cluster) = store.clusters.get_mut(&input.cluster_id) else {
             return Err(UpdateClusterErrorModeled::InvalidResourceException(
@@ -254,17 +251,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Some(address_id) = unknown_address {
-            return Err(UpdateClusterErrorModeled::InvalidResourceException(
-                InvalidResourceException {
-                    message: Some(format!(
-                        "The address ID {address_id} can't be found. Check the information \
-                         you provided in your last request, and try again."
-                    )),
-                    resource_type: Some("address".to_string()),
-                },
-            )
-            .into());
+        if let Some(error) = unknown_address {
+            return Err(UpdateClusterErrorModeled::InvalidResourceException(error).into());
         }
 
         // A cluster's node jobs carry the cluster's attributes rather than copies of their

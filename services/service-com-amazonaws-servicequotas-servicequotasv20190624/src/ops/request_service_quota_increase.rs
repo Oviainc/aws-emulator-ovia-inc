@@ -44,7 +44,11 @@
 //!   `IllegalArgumentException` (400);
 //! * a second open request for the same quota AND the same context ->
 //!   `ResourceAlreadyExistsException` (400): one quota plane has at most one request
-//!   awaiting a decision, whether it is `PENDING` or has a support case processing it;
+//!   awaiting a decision, whether it is `PENDING` or has a support case processing it.
+//!   The plane is as wide as the value an approved increase puts in force: the whole
+//!   ACCOUNT for a quota the catalog counts account-wide (`GlobalQuota`), so a request
+//!   made at ANY regional endpoint blocks it, and the caller's Region for any other
+//!   quota;
 //! * a region already holding [`crate::state::MAX_REQUESTS_PER_REGION`] stored
 //!   requests -> `QuotaExceededException` (409): the request store is append-only, so
 //!   it has a ceiling.
@@ -246,15 +250,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let open = quotas_state
-            .requests_for_quota(&region, &input.service_code, &input.quota_code)
-            .into_iter()
-            .find(|request| {
-                crate::state::is_open_request_status(&request.status)
-                    // One PLANE of a quota has at most one open request: an open
-                    // increase for one resource does not block another resource's.
-                    && request.context_id.as_deref() == input.context_id.as_deref()
-            });
+        // At most ONE request is awaiting a decision on a quota PLANE, and a plane is
+        // as wide as the value an approved increase puts in force: the whole account
+        // for a quota the catalog counts account-wide, the caller's region otherwise,
+        // and one resource context within either — so an open increase for one
+        // resource does not block another resource's.
+        let open = quotas_state.open_request_on_plane(
+            &region,
+            &input.service_code,
+            &input.quota_code,
+            input.context_id.as_deref(),
+        );
         if let Some(open) = open {
             return Err(
                 RequestServiceQuotaIncreaseErrorModeled::ResourceAlreadyExistsException(

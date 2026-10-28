@@ -343,6 +343,29 @@ fn validate_anything_but(argument: &Value) -> Result<(), String> {
 // Matching
 // ---------------------------------------------------------------------------
 
+/// Whether any element of `values` matches, charging a step for EVERY element
+/// visited rather than one for the array as a whole.
+///
+/// Both sides of a match are caller-supplied, so an event field holding a large
+/// array must not be able to buy more work than the budget sold it. An
+/// exhausted budget stops the walk and reports no match, the direction every
+/// other walk here takes.
+fn any_element(
+    values: &[Value],
+    budget: &mut MatchBudget,
+    mut matched: impl FnMut(&Value, &mut MatchBudget) -> bool,
+) -> bool {
+    for value in values {
+        if !budget.spend(1) {
+            return false;
+        }
+        if matched(value, budget) {
+            return true;
+        }
+    }
+    false
+}
+
 /// A nested pattern against the event's value for that field. An event field
 /// holding a LIST of objects matches when any element does.
 fn matches_nested(spec: &Value, observed: &Value, budget: &mut MatchBudget) -> bool {
@@ -350,9 +373,9 @@ fn matches_nested(spec: &Value, observed: &Value, budget: &mut MatchBudget) -> b
         return false;
     }
     match observed {
-        Value::Array(values) => values
-            .iter()
-            .any(|value| matches_nested(spec, value, budget)),
+        Value::Array(values) => any_element(values, budget, |value, budget| {
+            matches_nested(spec, value, budget)
+        }),
         Value::Object(_) => matches_within(spec, observed, budget),
         _ => false,
     }
@@ -381,9 +404,9 @@ fn candidate_matches(candidate: &Value, observed: Option<&Value>, budget: &mut M
         // An event field holding a list matches when any of its values does —
         // this is what makes `{"resources": ["<arn>"]}` match an event whose
         // `resources` list carries that ARN.
-        Value::Array(values) => values
-            .iter()
-            .any(|value| value_matches(candidate, value, budget)),
+        Value::Array(values) => any_element(values, budget, |value, budget| {
+            value_matches(candidate, value, budget)
+        }),
         _ => value_matches(candidate, observed, budget),
     }
 }
@@ -393,7 +416,9 @@ fn value_matches(candidate: &Value, observed: &Value, budget: &mut MatchBudget) 
         Value::Object(filter) => filter_matches(filter, observed, budget),
         // Numbers compare by value, so 1, 1.0 and 1e0 are one number.
         Value::Number(wanted) => {
-            budget.spend(1);
+            if !budget.spend(1) {
+                return false;
+            }
             observed
                 .as_f64()
                 .zip(wanted.as_f64())
@@ -401,13 +426,20 @@ fn value_matches(candidate: &Value, observed: &Value, budget: &mut MatchBudget) 
         }
         _ => {
             // An equality compare reads both values, so it costs their length.
-            budget.spend(candidate.as_str().map_or(1, str::len));
+            if !budget.spend(candidate.as_str().map_or(1, str::len)) {
+                return false;
+            }
             candidate == observed
         }
     }
 }
 
 fn filter_matches(filter: &Map<String, Value>, observed: &Value, budget: &mut MatchBudget) -> bool {
+    // Charged on ENTRY rather than on each arm's success path, so a filter this
+    // walk visits and answers on a type mismatch pays for the visit too.
+    if !budget.spend(1) {
+        return false;
+    }
     let Some((operator, argument)) = single_entry(filter) else {
         return false;
     };
@@ -418,7 +450,9 @@ fn filter_matches(filter: &Map<String, Value>, observed: &Value, budget: &mut Ma
         IGNORE_CASE => match (argument.as_str(), observed.as_str()) {
             (Some(wanted), Some(observed)) => {
                 // Compared in place: no lowercased copy of either side.
-                budget.spend(wanted.len());
+                if !budget.spend(wanted.len()) {
+                    return false;
+                }
                 observed.eq_ignore_ascii_case(wanted)
             }
             _ => false,
@@ -429,7 +463,9 @@ fn filter_matches(filter: &Map<String, Value>, observed: &Value, budget: &mut Ma
         },
         "cidr" => match (argument.as_str(), observed.as_str()) {
             (Some(spec), Some(observed)) => {
-                budget.spend(spec.len());
+                if !budget.spend(spec.len()) {
+                    return false;
+                }
                 cidr_matches(spec, observed)
             }
             _ => false,
@@ -466,13 +502,19 @@ fn affix_matches(
     affix: Affix,
     budget: &mut MatchBudget,
 ) -> bool {
+    // Charged on ENTRY, so the type-mismatch answer below pays for its visit.
+    if !budget.spend(1) {
+        return false;
+    }
     let (Some(observed), Some((wanted, ignore_case))) =
         (observed.as_str(), affix_argument(argument))
     else {
         return false;
     };
     // Only the affix's own length is ever read, whichever end it is at.
-    budget.spend(wanted.len());
+    if !budget.spend(wanted.len()) {
+        return false;
+    }
     let wanted = wanted.as_bytes();
     let observed = observed.as_bytes();
     // Compared as bytes, so a case-insensitive affix needs no lowercased copy
@@ -540,6 +582,10 @@ fn wildcard_matches(wildcard: &str, observed: &str, budget: &mut MatchBudget) ->
 }
 
 fn numeric_matches(argument: &Value, observed: &Value, budget: &mut MatchBudget) -> bool {
+    // Charged on ENTRY, so the type-mismatch answer below pays for its visit.
+    if !budget.spend(1) {
+        return false;
+    }
     let (Some(terms), Some(observed)) = (argument.as_array(), observed.as_f64()) else {
         return false;
     };
@@ -565,9 +611,9 @@ fn numeric_matches(argument: &Value, observed: &Value, budget: &mut MatchBudget)
 /// Whether `observed` is one of the values an `anything-but` argument excludes.
 fn excluded(argument: &Value, observed: &Value, budget: &mut MatchBudget) -> bool {
     match argument {
-        Value::Array(values) => values
-            .iter()
-            .any(|value| value_matches(value, observed, budget)),
+        Value::Array(values) => any_element(values, budget, |value, budget| {
+            value_matches(value, observed, budget)
+        }),
         _ => value_matches(argument, observed, budget),
     }
 }

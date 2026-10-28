@@ -277,7 +277,7 @@ fn stop_stream_encryption(
     ) {
         return Err(StopStreamEncryptionErrorModeled::ResourceInUseException(
             ResourceInUseException {
-                message: Some(crate::state::stream_not_active_message(&named, status)),
+                message: Some(crate::state::stream_not_active_message(&stream.name, status)),
             },
         )
         .into());

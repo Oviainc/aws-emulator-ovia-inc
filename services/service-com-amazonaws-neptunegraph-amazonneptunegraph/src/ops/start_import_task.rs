@@ -6,12 +6,14 @@
 //!
 //! ## The rule this handler implements
 //!
-//! The call mints an import task against a stored graph that is `AVAILABLE`, persists
-//! it, and reports the stored record with the modelled `INITIALIZING` status; the
-//! graph loads data (`IMPORTING`) for as long as the task runs. A graph that is not
-//! stored is `ResourceNotFoundException` (404) and one that is not `AVAILABLE` is
-//! `ConflictException` (409), because an import needs a serving graph
-//! ("The graph needs to be empty and in the AVAILABLE state").
+//! The call mints an import task against a stored graph that is `AVAILABLE` and holds
+//! NO DATA, persists it, and reports the stored record with the modelled `INITIALIZING`
+//! status; the graph loads data (`IMPORTING`) for as long as the task runs. A graph that
+//! is not stored is `ResourceNotFoundException` (404), and one that breaks either
+//! documented precondition — not `AVAILABLE`, or holding nodes or edges — is
+//! `ConflictException` (409) ("The graph needs to be empty and in the AVAILABLE
+//! state"): an import needs a serving graph, and it fills that graph rather than
+//! merging into the data it already holds.
 //!
 //! ## Why an accepted task stops FAILED
 //!
@@ -277,6 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let graph_id = graph.id.clone();
         let graph_status = graph.status;
+        let graph_is_empty = graph.data.is_empty();
 
         // The store is shared and grows by one task per call, and a task is never
         // reclaimed, so it has a ceiling (`crate::state::MAX_IMPORT_TASKS`). This
@@ -296,11 +299,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The graph needs to be empty and in the AVAILABLE state": while an earlier
-        // transition is still outstanding the graph's data is in flight, which is the
-        // same precondition `UpdateGraph` and `CreateGraphSnapshot` state. Emptiness is
-        // not checked here — this emulator has no graph data plane, so a stored graph
-        // holds no data for an import to collide with.
+        // "The graph needs to be empty and in the AVAILABLE state" — the STATUS half of
+        // that sentence: while an earlier transition is still outstanding the graph's
+        // data is in flight, which is the same precondition `UpdateGraph` and
+        // `CreateGraphSnapshot` state.
         if graph_status != crate::state::GraphStatus::Available {
             return Err(StartImportTaskErrorModeled::ConflictException(
                 ConflictException {
@@ -310,6 +312,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                     reason: None,
                 },
+            )
+            .into());
+        }
+
+        // The EMPTINESS half of the same sentence, decided on the data the stored graph
+        // actually holds: a bulk load fills the graph rather than merging into what is
+        // there, so a graph holding any node or edge cannot take one. That data is the
+        // data `GetGraphSummary` reports, `ResetGraph` empties and a restore brings a
+        // graph up holding, so the refusal fires however the graph came to hold it. The
+        // wording is the service's one precondition refusal for it
+        // (`crate::state::graph_not_empty_conflict`), and nothing is persisted: no task
+        // is minted and the graph's status is left where it was.
+        if !graph_is_empty {
+            return Err(StartImportTaskErrorModeled::ConflictException(
+                crate::state::graph_not_empty_conflict(),
             )
             .into());
         }

@@ -439,6 +439,7 @@ async fn a_destination_the_account_does_not_hold_is_refused() {
     ];
 
     for (case, name) in &absent {
+        let expected = format!("Destination with name {name} does not exist");
         let (code, message) = logs
             .refusal(
                 PUT_POLICY,
@@ -446,14 +447,10 @@ async fn a_destination_the_account_does_not_hold_is_refused() {
             )
             .await;
         assert_eq!(
-            code, INVALID_PARAMETER,
+            (code.as_str(), message.as_str()),
+            (INVALID_PARAMETER, expected.as_str()),
             "case {case:?}: attaching a policy to a destination the account does not hold is \
-             refused with {INVALID_PARAMETER}, got {code} {message}"
-        );
-        assert!(
-            message.contains("destination"),
-            "case {case:?}: the refusal names the kind of resource that is missing, \
-             got {message:?}"
+             refused with ({INVALID_PARAMETER}, {expected:?}), got ({code}, {message:?})"
         );
     }
 

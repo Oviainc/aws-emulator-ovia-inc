@@ -31,6 +31,8 @@ mod cross_region_settlement;
 mod default_quota_catalog;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/open_request_plane_scope.rs"]
+mod open_request_plane_scope;
 #[path = "all/quota_utilization_usage.rs"]
 mod quota_utilization_usage;
 #[path = "all/quota_workflow.rs"]

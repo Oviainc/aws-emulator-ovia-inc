@@ -977,6 +977,104 @@ fn role_is_absent(
         .is_some_and(::aws_sdk_iam::operation::get_role::GetRoleError::is_no_such_entity_exception)
 }
 
+/// The first bucket of `bucket_arns` Amazon S3 reports it does not hold, worded as the
+/// refusal states it.
+///
+/// A `BucketARN` is not taken on trust any more than a `RoleARN` is: Firehose resolves the
+/// Amazon S3 location a destination configuration names before it writes that
+/// configuration onto a stream, so a bucket that does not exist is an ARGUMENT fault
+/// answered at the call that named it rather than a stream that silently stops delivering.
+/// Every `BucketARN` the request carries is resolved, whichever member (the destination's
+/// own, a nested S3 configuration's, a backup's) named it: they are all locations Firehose
+/// writes objects to.
+///
+/// Amazon S3 is reached the way any emulated service reaches another: through the
+/// in-process callback ([`smithy_server_runtime::OperationContext::callback`]), with
+/// `HeadBucket` — the operation S3 documents for exactly this question ("You can use this
+/// operation to determine if a bucket exists"). Nothing is refused that could not be
+/// grounded in S3's own answer: with no S3 mounted to ask, or on any other failure to ask,
+/// nothing is known about the bucket and the request proceeds (worth a warning, because
+/// that is a deployment where this gate does not run).
+pub async fn absent_destination_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket_arns: &[&str],
+) -> Option<String> {
+    let s3 = s3_client(ctx, region);
+    // The bucket NAMES already asked about: two members naming one bucket, however their
+    // ARNs are spelled, are one question for Amazon S3.
+    let mut asked: Vec<&str> = Vec::with_capacity(bucket_arns.len());
+    for bucket_arn in bucket_arns {
+        // The modelled `BucketARN` pattern (`^arn:.*:s3:::[\w\.\-]{1,255}$`) is checked at
+        // the boundary, so a value that reached a handler carries a bucket name; one that
+        // somehow carries none names no bucket for this to resolve.
+        let Some(bucket) = delivery::bucket_name(bucket_arn) else {
+            continue;
+        };
+        if asked.contains(&bucket) {
+            continue;
+        }
+        asked.push(bucket);
+        match s3.head_bucket().bucket(bucket).send().await {
+            // S3 holds the bucket, so the destination can deliver to it.
+            Ok(_) => {}
+            // S3 says this account holds no such bucket: the refusal is grounded.
+            Err(error) if bucket_is_absent(&error) => {
+                return Some(crate::service::absent_bucket_message(bucket))
+            }
+            // Any other answer is this emulator failing to ask, not S3 reporting a bad
+            // bucket, so it refuses nothing.
+            Err(error) => ::tracing::warn!(
+                %bucket_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the configuration's bucket could not be resolved against S3"
+            ),
+        }
+    }
+    None
+}
+
+/// The S3 client this service resolves a destination bucket through: the AWS SDK driven
+/// over the emulator's own in-process transport, built exactly like [`iam_client`].
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The emulator serves one endpoint for every service, so the bucket travels in the
+        // path rather than in a per-bucket host the router could not resolve.
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Whether an S3 `HeadBucket` failure is S3 reporting that the bucket does not exist
+/// (`NotFound`, the only error that operation models), as opposed to the call not reaching
+/// S3 at all.
+fn bucket_is_absent(
+    error: &::aws_sdk_s3::error::SdkError<
+        ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
+}
+
 /// `role_arns` with the empty entries dropped and each distinct ARN kept once, so one
 /// role named by two members of a configuration is resolved against IAM once.
 #[must_use]
