@@ -824,10 +824,12 @@ async fn a_user_holding_every_passkey_it_may_hold_is_refused() {
             (400, "LimitExceededException"),
             "case {case:?}: a user at the bound is refused, got {status} with {payload}"
         );
-        assert!(
-            error_message(&payload).contains(&bound.to_string())
-                && error_message(&payload).contains("ada"),
-            "case {case:?}: the refusal names the user and the bound, got {:?}",
+        // AWS words this refusal after the bound that was reached, naming no
+        // user: "The limit for registered WebAuthn credentials is: <bound>."
+        assert_eq!(
+            error_message(&payload),
+            format!("The limit for registered WebAuthn credentials is: {bound}."),
+            "case {case:?}: the refusal names the bound, got {:?}",
             error_message(&payload)
         );
         assert!(

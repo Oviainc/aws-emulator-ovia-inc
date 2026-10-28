@@ -107,6 +107,8 @@ mod list_user_pools;
 mod list_users;
 #[path = "all/list_users_in_group.rs"]
 mod list_users_in_group;
+#[path = "all/list_web_authn_credentials.rs"]
+mod list_web_authn_credentials;
 #[path = "all/managed_login_branding.rs"]
 mod managed_login_branding;
 #[path = "all/managed_login_branding_updates.rs"]
