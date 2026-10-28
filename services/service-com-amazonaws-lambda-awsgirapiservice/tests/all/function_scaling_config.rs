@@ -9,8 +9,9 @@
 //! of the unpublished configuration (`$LATEST.PUBLISHED`) — absent until a
 //! `PutFunctionScalingConfig` call sets one on THAT qualifier, from then on exactly the
 //! bounds of the most recent such call on it (replacing rather than merging), reported as
-//! the REQUESTED configuration at once and as the APPLIED one ("the actual scaling
-//! settings in effect") only once the clock has made that due. A qualifier that names no
+//! the REQUESTED configuration while that request is still outstanding and as the APPLIED
+//! one ("the actual scaling settings in effect") — and as that one alone — once the clock
+//! has made the request due. A qualifier that names no
 //! published version, and a name that names no function, are refused
 //! `ResourceNotFoundException` (HTTP 404); a configuration whose minimum exceeds its
 //! maximum is refused `InvalidParameterValueException` (HTTP 400); a bound outside the
@@ -502,8 +503,9 @@ async fn stored_bounds_round_trip_through_get() {
         );
         assert_eq!(
             applied.at("/RequestedFunctionScalingConfig"),
-            reported(last),
-            "case {:?}: the requested bounds must still be the last call's {last:?}, got {}",
+            Value::Null,
+            "case {:?}: bounds the clock has applied leave no request outstanding, so none \
+             must be reported as requested, got {}",
             case.name,
             applied.text()
         );

@@ -101,9 +101,11 @@
 //! qualifier, and `GetFunctionScalingConfig` reports exactly that record. The bounds the
 //! call asked for are the REQUESTED configuration at once, and become the APPLIED one —
 //! "the actual scaling settings in effect" — when the CLOCK makes that due (see
-//! [`FunctionScalingConfigRecord::materialize`]); nothing sleeps for it. A qualifier
-//! nobody has configured still reports what the SERVICE scales it by, because a Managed
-//! Instances function is scaled from the moment it exists (see
+//! [`FunctionScalingConfigRecord::materialize`]); nothing sleeps for it. Once they are
+//! applied there is no outstanding request left to report, so the requested configuration
+//! is reported only while one is (see [`FunctionScalingConfigRecord::reported`]). A
+//! qualifier nobody has configured still reports what the SERVICE scales it by, because a
+//! Managed Instances function is scaled from the moment it exists (see
 //! [`FunctionRecord::reported_function_scaling_config`]).
 //!
 //! `GetAccountSettings` reports on the same records at the account level:
@@ -1649,7 +1651,16 @@ impl FunctionScalingConfigRecord {
         GetFunctionScalingConfigOutput {
             function_arn: Some(function_arn),
             applied_function_scaling_config: self.applied.clone(),
-            requested_function_scaling_config: Some(self.requested.clone()),
+            // "The scaling configuration that was requested for the function" is the one
+            // still waiting to become the one in effect: a request is reported while it is
+            // outstanding, and stops being reported once it IS
+            // "the scaling configuration that is currently applied to the function", which
+            // from then on is the only configuration there is to report. Its absence is
+            // therefore what tells a caller its request landed.
+            requested_function_scaling_config: self
+                .applied_due
+                .is_some()
+                .then(|| self.requested.clone()),
         }
     }
 }
@@ -2806,6 +2817,30 @@ impl FunctionRecord {
             durable_config: config.durable_config.clone(),
             tenancy_config: config.tenancy_config.clone(),
             ..CreateFunctionOutput::default()
+        }
+    }
+
+    /// The `FunctionConfiguration` reported by a call whose SUBJECT is the FUNCTION — one
+    /// addressed by a `FunctionName` carrying no qualifier, which acted on the function
+    /// itself and published `version` only as a side effect of its own `Publish`
+    /// parameter.
+    ///
+    /// It is [`Self::configuration`] with the one member that differs: `FunctionArn` is
+    /// "The function's Amazon Resource Name (ARN)" — the unqualified ARN of the resource
+    /// the call acted on — while the version the same call published is named by `Version`
+    /// alone, so a caller that forms a version ARN qualifies what it was given once rather
+    /// than twice. A call whose subject is a QUALIFIER instead (`PublishVersion`, which
+    /// creates the version; a read or a listing entry addressed by a version or an alias)
+    /// reports that qualifier's own ARN through [`Self::configuration`].
+    #[must_use]
+    pub fn unqualified_configuration(
+        &self,
+        version: &str,
+        config: &FunctionConfig,
+    ) -> CreateFunctionOutput {
+        CreateFunctionOutput {
+            function_arn: Some(self.arn.clone()),
+            ..self.configuration(version, config)
         }
     }
 
