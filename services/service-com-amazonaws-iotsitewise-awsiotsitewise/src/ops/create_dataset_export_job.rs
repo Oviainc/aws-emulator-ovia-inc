@@ -176,12 +176,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // The job is started IN the workspace the path names, so a workspace this
+        // store holds no record of is the same absence every other workspace-scoped
+        // operation of this service reports — resolved before anything is written,
+        // so a create naming a workspace nobody opened starts no job.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(CreateDatasetExportJobError::Modeled(
+                CreateDatasetExportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_WORKSPACE,
+                            &input.workspace_name,
+                        ),
+                    },
+                ),
+            ));
+        }
+
         // "If you retry a request that completed successfully using the same client
         // token, the server returns the cached result from the original successful
         // request without performing the operation again": the retry writes nothing
-        // and reports the job the ORIGINAL call started. Answered BEFORE the request
-        // is resolved against the store, so a replay stays the answer the first call
-        // gave whatever has changed since.
+        // and reports the job the ORIGINAL call started. Answered BEFORE the input
+        // the job processes is resolved against the store, so a replay stays the
+        // answer the first call gave whatever has changed since.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(existing) = store.dataset_export_jobs.values().find(|job| {
                 job.workspace_name == input.workspace_name
@@ -217,10 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is bounded: a create is the only thing that adds a job and
         // nothing evicts one. Past either cap the request exceeds what this emulator
         // holds, which is the quota refusal this operation models. The total is
-        // checked as well as the per-workspace count, because `workspaceName` is a
-        // caller-supplied string this service has no registry to resolve, so a caller
-        // naming a fresh workspace each time would otherwise open one more
-        // per-workspace bucket every time.
+        // checked as well as the per-workspace count, so the jobs this emulator holds
+        // are bounded whatever the mix of workspaces they are spread over.
         if store.dataset_export_jobs.len() >= crate::state::MAX_DATASET_EXPORT_JOBS {
             return Err(throttled(format!(
                 "This emulator holds at most {} dataset export jobs.",

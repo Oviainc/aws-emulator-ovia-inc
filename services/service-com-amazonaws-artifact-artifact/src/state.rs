@@ -68,7 +68,10 @@
 //! report's is — from the bytes the export stored, under the endpoint the caller reached
 //! ([`document_url_host`]) and a path this service publishes
 //! ([`EXPORT_DOCUMENT_PATH_PREFIX`]) — so the URL the export announces resolves for
-//! whoever was handed it.
+//! whoever was handed it, and it is authorised the same way too: the export's own
+//! [`InquiryExport::download_token`] travels in that URL and is what the data plane
+//! requires of a fetch ([`ComAmazonawsArtifactArtifactState::export_download_authorised`]),
+//! exactly as a term grant's token authorises a report download.
 //!
 //! The CUSTOMER-AGREEMENT set is held the same way as the catalog, and for the same
 //! reason: the API has no operation that creates, accepts or terminates one — an
@@ -1335,6 +1338,27 @@ pub struct InquiryExport {
     /// document a caller follows the URL to is the one the export produced, whatever has
     /// become of the inquiry since.
     pub document: Vec<u8>,
+    /// The token the announced document URL carries, and the one thing that authorises a
+    /// fetch of this export's document
+    /// ([`ComAmazonawsArtifactArtifactState::export_download_authorised`]).
+    ///
+    /// It is what the caller this export was handed to holds and nobody else does: the
+    /// inquiry and export ids the URL's path names are minted from counters, so they are
+    /// derivable by a caller that never called the control plane, while this is not
+    /// ([`mint_inquiry_export_token`]). Carried only inside the announced URL — whose
+    /// `PresignedUrl` shape is `@sensitive` — and never logged or answered on its own.
+    pub download_token: String,
+}
+
+/// One export [`ComAmazonawsArtifactArtifactState::record_inquiry_export`] just minted:
+/// the id its document URL names, and the token that URL carries to authorise a fetch of
+/// the document.
+#[derive(Debug, Clone)]
+pub struct MintedInquiryExport {
+    /// The export's id, the path segment [`export_document_path`] names it by.
+    pub id: String,
+    /// The export's download token, which [`inquiry_export_url`] carries in the URL.
+    pub download_token: String,
 }
 
 /// What a request to a published export-document URL names: the inquiry the document was
@@ -1621,7 +1645,8 @@ impl ComAmazonawsArtifactArtifactState {
             .find(|inquiry| inquiry.arn == resource_arn)
     }
 
-    /// Mint and persist one compliance-inquiry export, returning its id.
+    /// Mint and persist one compliance-inquiry export, returning the id its URL names and
+    /// the token that URL carries to authorise a fetch of the document.
     ///
     /// Every call produces a NEW document — that is what exporting is — so the id is
     /// fresh on every call and two exports of one inquiry are two records with two URLs.
@@ -1635,13 +1660,16 @@ impl ComAmazonawsArtifactArtifactState {
         include_citations: bool,
         document: Vec<u8>,
         now: SystemTime,
-    ) -> String {
+    ) -> MintedInquiryExport {
         let id = mint_counter_id(
             &mut self.inquiry_exports,
             &mut self.inquiry_export_seq,
             EXPORT_ID_PREFIX,
             Some(INQUIRY_EXPORT_CAPACITY),
         );
+        // The receipt this export is handed out under, minted per export: two exports of
+        // one inquiry are two documents, so they are authorised by two tokens.
+        let download_token = mint_inquiry_export_token();
         self.inquiry_exports.insert(
             id.clone(),
             InquiryExport {
@@ -1651,10 +1679,39 @@ impl ComAmazonawsArtifactArtifactState {
                 include_citations,
                 exported_at: now,
                 document,
+                download_token: download_token.clone(),
             },
         );
-        id
+        MintedInquiryExport { id, download_token }
     }
+
+    /// Whether a fetch of the export document `target` names, presenting `token`, is
+    /// authorised.
+    ///
+    /// The ONE place the export-download rule is decided, as [`Self::download_authorised`]
+    /// is for a report document, so the control plane and the data plane cannot disagree
+    /// about which document downloads under which token. A document is authorised only by
+    /// the token the URL that announced it carries, and only for the export that URL
+    /// names: the export the path names must be one this store holds, taken from the
+    /// inquiry the path names, under the token it was announced with. A fetch carrying no
+    /// token carries no receipt, so the empty token is what this rule is asked about.
+    pub fn export_download_authorised(&self, token: &str, target: &ExportDocumentTarget) -> bool {
+        self.inquiry_exports
+            .get(&target.export_id)
+            .is_some_and(|export| {
+                export.inquiry_id == target.inquiry_id && export.download_token == token
+            })
+    }
+}
+
+/// Mint the token one export's document URL carries.
+///
+/// A receipt rather than a key into a store, so unlike [`mint_counter_id`] it is NOT drawn
+/// from a counter: a counter-minted token is derivable by a caller that was handed no URL,
+/// and a URL carrying only derivable values authorises nobody. It is a version-4 UUID's 32
+/// hex digits, which satisfy the one query-value encoding [`QUERY_VALUE`] admits unescaped.
+fn mint_inquiry_export_token() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Remember what one `clientToken` replays, forgetting the oldest remembered token once
@@ -1802,13 +1859,9 @@ pub fn document_path(kind: &str, report_id: &str, version: i64, object: &str) ->
 /// emulator holds the document, so a client or test that follows the URL must come back
 /// here.
 ///
-/// The token the grant was issued under is carried as a query parameter: it is the receipt
-/// that authorises the download, and it is what makes two acceptances of the same report
-/// yield two distinct URLs. It is PERCENT-ENCODED on the way in, so the announced URL is
-/// well formed for every token `TermToken`'s `^[a-zA-Z0-9_\-\s]*$` admits (a space among
-/// them) rather than only for the ones [`mint_term_grant`](
-/// ComAmazonawsArtifactArtifactState::mint_term_grant) happens to produce; the data plane
-/// reads it back through the framework's query decoder, which undoes exactly this.
+/// The token the grant was issued under is carried as a query parameter
+/// ([`tokened_document_url`]): it is the receipt that authorises the download, and it is
+/// what makes two acceptances of the same report yield two distinct URLs.
 ///
 /// NO SigV4 signature is attached — this emulator does not sign documents, and a
 /// fabricated signature would claim a computation nothing performed.
@@ -1820,9 +1873,34 @@ fn document_url(
     object: &str,
     term_token: &str,
 ) -> String {
-    let path = document_path(kind, report_id, version, object);
-    let token = ::percent_encoding::utf8_percent_encode(term_token, QUERY_VALUE);
-    format!("https://{host}{path}?termToken={token}")
+    tokened_document_url(
+        host,
+        &document_path(kind, report_id, version, object),
+        TERM_TOKEN_PARAM,
+        term_token,
+    )
+}
+
+/// The query parameter a report or term document URL carries its term grant's token in,
+/// which `crate::service`'s document plane reads the fetch's authorisation off.
+pub const TERM_TOKEN_PARAM: &str = "termToken";
+
+/// The query parameter an export document URL carries its download token in, which
+/// `crate::service`'s export plane reads the fetch's authorisation off.
+pub const INQUIRY_EXPORT_TOKEN_PARAM: &str = "exportToken";
+
+/// One document URL this service announces: the endpoint the caller reached
+/// ([`document_url_host`]), the path the document is published at, and the token that
+/// authorises a fetch of it.
+///
+/// The ONE place a document URL of this service is assembled, so both planes announce
+/// their documents under one convention. The token is PERCENT-ENCODED on the way in, so
+/// the announced URL is well formed for every token either plane mints rather than only
+/// for the ones whose characters happen to need no escaping; the data plane reads it back
+/// through the framework's query decoder, which undoes exactly this.
+fn tokened_document_url(host: &str, path: &str, parameter: &str, token: &str) -> String {
+    let token = ::percent_encoding::utf8_percent_encode(token, QUERY_VALUE);
+    format!("https://{host}{path}?{parameter}={token}")
 }
 
 /// What a query-string VALUE must escape: everything but RFC 3986's unreserved set
@@ -1911,9 +1989,23 @@ pub fn export_document_path(inquiry_id: &str, export_id: &str) -> String {
 /// record it can be traced back to. As with [`report_document_url`], NO SigV4 signature is
 /// attached: this emulator does not sign documents, and a fabricated signature would claim
 /// a computation nothing performed.
-pub fn inquiry_export_url(host: &str, inquiry_id: &str, export_id: &str) -> String {
-    let path = export_document_path(inquiry_id, export_id);
-    format!("https://{host}{path}")
+///
+/// What authorises the fetch instead is `download_token`, the receipt this export was
+/// minted with ([`InquiryExport::download_token`]), carried in the query string exactly as
+/// [`report_document_url`] carries its term grant's: the URL is handed to ONE caller, and
+/// the token is what that caller holds and a caller that was handed no URL does not.
+pub fn inquiry_export_url(
+    host: &str,
+    inquiry_id: &str,
+    export_id: &str,
+    download_token: &str,
+) -> String {
+    tokened_document_url(
+        host,
+        &export_document_path(inquiry_id, export_id),
+        INQUIRY_EXPORT_TOKEN_PARAM,
+        download_token,
+    )
 }
 
 /// The URL of the term document governing `report`, under the grant `term_token`.

@@ -47,10 +47,11 @@ const OTHER_WORKSPACE: &str = "Plant2";
 /// from an absent workspace.
 const EMPTY_WORKSPACE: &str = "Plant3";
 
-/// A workspace no `CreateWorkspace` registered, yet which holds jobs of its own:
-/// `CreateDatasetExportJob` keys a job by `(workspaceName, jobId)` without
-/// consulting the workspace registry, so the jobs it really holds are listable.
-const UNREGISTERED_WORKSPACE: &str = "Plant4";
+/// A fourth workspace, opened by the job starter below rather than by
+/// [`fixture`], and holding jobs of its own: a listing is keyed on the workspace
+/// half of a job's key, so the jobs started here belong to this workspace's
+/// listing and to no other.
+const LATE_OPENED_WORKSPACE: &str = "Plant4";
 
 /// How long after a step falls due a read is taken, so a run whose scheduler is
 /// late cannot observe the previous status.
@@ -219,12 +220,16 @@ fn job_cases() -> Vec<JobCase> {
 }
 
 /// `CreateDatasetExportJob` in `workspace`, answering the `jobId` it minted.
+///
+/// A job is started INSIDE a workspace, which the create resolves through the
+/// workspace registry, so the workspace is opened first.
 async fn start_job(
     router: &MultiServiceRouter,
     workspace: &str,
     destination: &str,
     input: Value,
 ) -> String {
+    crate::support::ensure_workspace(router, workspace).await;
     let (status, body) = call(
         router,
         "POST",
@@ -379,15 +384,15 @@ async fn a_listing_reports_the_jobs_of_the_workspace_it_names() {
         .into_iter()
         .map(|(job_id, _, _)| job_id)
         .collect();
-    // Jobs in another registered workspace, and jobs in a workspace no
-    // `CreateWorkspace` registered: a listing that keyed on nothing but the job id
-    // would report these too.
+    // Jobs in another workspace of the fixture, and jobs in a workspace opened
+    // only when its first job was started: a listing that keyed on nothing but the
+    // job id would report these too.
     let there: Vec<String> = start_job_cases(&router, OTHER_WORKSPACE, &dataset_id)
         .await
         .into_iter()
         .map(|(job_id, _, _)| job_id)
         .collect();
-    let unregistered: Vec<String> = start_job_cases(&router, UNREGISTERED_WORKSPACE, &dataset_id)
+    let late: Vec<String> = start_job_cases(&router, LATE_OPENED_WORKSPACE, &dataset_id)
         .await
         .into_iter()
         .map(|(job_id, _, _)| job_id)
@@ -401,9 +406,9 @@ async fn a_listing_reports_the_jobs_of_the_workspace_it_names() {
             &there,
         ),
         (
-            "a workspace the store holds only jobs under",
-            UNREGISTERED_WORKSPACE,
-            &unregistered,
+            "a workspace opened only by its first job",
+            LATE_OPENED_WORKSPACE,
+            &late,
         ),
     ] {
         let body = listed(&router, workspace, "maxResults=250").await;

@@ -34,6 +34,13 @@ mod client_token_replay;
 #[path = "all/computation_model_execution_summary.rs"]
 mod computation_model_execution_summary;
 
+// `workspace_scoped_creates` is declared HERE, beside the suites above, for the
+// reason their notes give: the sorted list and the END of this file are both
+// where every concurrent iotsitewise change puts a declaration of its own. Fold
+// it into the list once the churn settles.
+#[path = "all/workspace_scoped_creates.rs"]
+mod workspace_scoped_creates;
+
 // `actions` is declared HERE, at the head of the file, rather than in the sorted
 // list or appended after it: both of those are where every concurrent
 // iotsitewise change puts a declaration of its own, and each of three attempts

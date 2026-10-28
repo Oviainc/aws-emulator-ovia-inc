@@ -1,18 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Whether the CALLER may have a state machine's customer managed KMS key used on
-//! its behalf, which is what a read of data that key encrypts needs.
+//! its behalf, which is what reading data that key encrypts — and sealing data under
+//! it — needs.
 //!
 //! A state machine on `encryptionConfiguration` of
 //! [`ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY`](super::ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY)
 //! has its execution data and its definition encrypted under the key the account
-//! named. Step Functions does not hold that key: it asks KMS to decrypt the data as
-//! the CALLER, so a caller the key does not permit cannot have the data decrypted for
-//! it and the read is refused with the KMS error class the operation models
+//! named. Step Functions does not hold that key: it asks KMS to use it as the CALLER,
+//! so a caller the key does not permit cannot have the data decrypted — or encrypted
+//! — for it, and the call is refused with the KMS error class the operation models
 //! (`KmsAccessDeniedException`, HTTP 400) — which is why every one of those
-//! operations declares the `Kms*` family. The grant is `kms:Decrypt`, the permission
-//! the `includedData` member documents ("callers must have kms:Decrypt permission to
-//! decrypt the definition").
+//! operations declares the `Kms*` family.
+//!
+//! A READ asks for `kms:Decrypt`, the permission the `includedData` member documents
+//! ("callers must have kms:Decrypt permission to decrypt the definition"). A WRITE of
+//! data the caller supplied asks for the data key the payload is sealed with: "when
+//! the period expires, Step Functions will call `GenerateDataKey`"
+//! (`kmsDataKeyReusePeriodSeconds`), and a data key still inside that period is
+//! RE-USED, which means decrypting the one already minted — so a caller allowed
+//! neither cannot have its data sealed. A request that carries no such data seals
+//! nothing and so asks nothing of the key.
+//!
+//! Two approximations are deliberate here, so a later reader does not take them for
+//! the service's exact rule. Which of the two calls a given write makes depends on
+//! how long ago a data key was minted, which no caller chooses, so a write asks for
+//! both rather than for whichever one this instant would have made. And the decision
+//! is taken against the identity that signed the REQUEST: the emulator has no
+//! execution role to assume, so the caller stands in for it.
 //!
 //! The key is resolved in the KMS service's OWN store and the decision is KMS's own
 //! ([`kms_authorization::authorize`]), so this service reads exactly what KMS's
@@ -38,6 +53,19 @@ use ::service_com_amazonaws_kms_trentservice::state::authorization as kms_author
 /// The KMS operation a read of data the key encrypts performs: the data was sealed
 /// under that key, so reporting it means decrypting it.
 const DECRYPT_OPERATION: &str = "Decrypt";
+
+/// The KMS operation that MINTS the data key a payload is sealed with.
+const GENERATE_DATA_KEY_OPERATION: &str = "GenerateDataKey";
+
+/// What reporting data the key sealed asks of that key.
+const READ_OF_SEALED_DATA: &[&str] = &[DECRYPT_OPERATION];
+
+/// What sealing caller-supplied data under the key asks of it: a data key is minted
+/// for the payload, and one still inside the reuse period the configuration names is
+/// re-used instead, which decrypts it. A caller is allowed to have data sealed only
+/// when it is allowed both, since which of the two a given call makes is not the
+/// caller's to choose.
+const WRITE_OF_SEALED_DATA: &[&str] = &[GENERATE_DATA_KEY_OPERATION, DECRYPT_OPERATION];
 
 /// The service name KMS's own error metadata carries.
 const KMS_SERVICE_NAME: &str = "AWSKMS";
@@ -98,6 +126,36 @@ pub fn execution_read_denied<Eng: Send + Sync + 'static>(
     region: &str,
     execution_arn: &str,
 ) -> Option<String> {
+    execution_key_denied(engine, ctx, region, execution_arn, READ_OF_SEALED_DATA)
+}
+
+/// Why this request's caller may not have data of its own SEALED into the execution
+/// `execution_arn` identifies, or `None` when it may be.
+///
+/// The key is the one the execution's STATE MACHINE is encrypted under, which is what
+/// everything the execution retains is sealed with, so the data this call records
+/// goes under that same key.
+///
+/// `None` for an ARN that addresses no execution: that is the operation's own
+/// `ExecutionDoesNotExist`, reported out of the store it goes on to write.
+pub fn execution_write_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    execution_arn: &str,
+) -> Option<String> {
+    execution_key_denied(engine, ctx, region, execution_arn, WRITE_OF_SEALED_DATA)
+}
+
+/// The one resolution behind both of the above: the key the execution's data lives
+/// under, judged for the `operations` this call makes on it.
+fn execution_key_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    execution_arn: &str,
+    operations: &[&str],
+) -> Option<String> {
     let state = super::service_state(engine)?;
     // The lock is released before KMS is consulted: nothing of this service's state
     // is read or written while the decision is being made.
@@ -106,7 +164,35 @@ pub fn execution_read_denied<Eng: Send + Sync + 'static>(
         let machine_arn = store.executions.get(execution_arn)?.state_machine_arn.clone();
         state_machine_key(&store, &machine_arn)?
     };
-    key_read_denied(engine, ctx, region, &key)
+    key_denied(engine, ctx, region, &key, operations)
+}
+
+/// Why this request's caller may not have data of its own SEALED into the execution
+/// the activity task `token` belongs to, or `None` when it may be.
+///
+/// A task token names its task and its execution on its own, so a reply to one is
+/// judged against the key of the execution the task was scheduled by — in that
+/// execution's own Region, since a KMS key is a regional resource.
+///
+/// `None` for a token the store holds no outstanding task under: that is the
+/// operation's own refusal about a task that has been closed.
+pub fn task_reply_write_denied<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    token: &str,
+) -> Option<String> {
+    let state = super::service_state(engine)?;
+    // ONE acquisition resolves the whole chain — the task's execution, that
+    // execution's state machine, and the key it is encrypted under — so the two reads
+    // cannot disagree, and the guard is released before KMS is consulted.
+    let (execution_arn, key) = {
+        let store = state.lock();
+        let execution_arn = store.activity_tasks.get(token)?.execution_arn.clone();
+        let machine_arn = store.executions.get(&execution_arn)?.state_machine_arn.clone();
+        (execution_arn, state_machine_key(&store, &machine_arn)?)
+    };
+    let region = super::arn_region(&execution_arn);
+    key_denied(engine, ctx, &region, &key, WRITE_OF_SEALED_DATA)
 }
 
 /// Why the data of the state machine `state_machine_arn` identifies may not be read
@@ -126,7 +212,7 @@ pub fn state_machine_read_denied<Eng: Send + Sync + 'static>(
         let store = state.lock();
         state_machine_key(&store, state_machine_arn)?
     };
-    key_read_denied(engine, ctx, region, &key)
+    key_denied(engine, ctx, region, &key, READ_OF_SEALED_DATA)
 }
 
 /// The customer managed key the state machine `arn` names is encrypted under.
@@ -149,20 +235,23 @@ fn state_machine_key(
     customer_managed_key(configuration).map(str::to_string)
 }
 
-/// Why this request's caller may not have `key` used to decrypt data for it, as KMS
-/// words that refusal, or `None` when the authorities in force let the call through.
+/// Why this request's caller may not have `key` used for it, as KMS words that
+/// refusal, or `None` when the authorities in force let the call through.
 ///
 /// `key` is the state machine's `kmsKeyId` in any form KMS accepts — a key id, a key
 /// ARN, an alias or an alias ARN — and `region` the Region the request is signed for,
-/// since a KMS key is a regional resource.
-fn key_read_denied<Eng: Send + Sync + 'static>(
+/// since a KMS key is a regional resource. `operations` are the KMS operations the
+/// call makes on the key; the FIRST one the authorities refuse is what the caller is
+/// told, since one refused operation is already enough to stop the call.
+fn key_denied<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     key: &str,
+    operations: &[&str],
 ) -> Option<String> {
     let Some(kms) = kms_store::service_state(engine) else {
-        // Visible to an operator: a lookup nothing answered lets the read through, so
+        // Visible to an operator: a lookup nothing answered lets the call through, so
         // without this line it would be indistinguishable from a key KMS permitted.
         ::tracing::warn!(
             key,
@@ -182,18 +271,20 @@ fn key_read_denied<Eng: Send + Sync + 'static>(
     if found.key_manager != kms_store::KEY_MANAGER_CUSTOMER {
         return None;
     }
-    kms_authorization::authorize(
-        &caller,
-        &store,
-        region,
-        found,
-        DECRYPT_OPERATION,
-        // No encryption context is presented, so a grant constrained to one does not
-        // permit this call: the authority the grant carries is not claimed rather than
-        // assumed.
-        None,
-        None,
-    )
-    .err()
-    .map(|why| relayed(&why))
+    operations.iter().find_map(|operation| {
+        kms_authorization::authorize(
+            &caller,
+            &store,
+            region,
+            found,
+            operation,
+            // No encryption context is presented, so a grant constrained to one does
+            // not permit this call: the authority the grant carries is not claimed
+            // rather than assumed.
+            None,
+            None,
+        )
+        .err()
+        .map(|why| relayed(&why))
+    })
 }

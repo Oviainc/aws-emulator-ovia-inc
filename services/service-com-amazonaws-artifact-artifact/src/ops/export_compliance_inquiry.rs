@@ -26,9 +26,11 @@
 //! The URL this answers with is a promise the caller can FOLLOW it, so it names the
 //! endpoint the caller reached this emulator on ([`crate::state::document_url_host`]) and
 //! a path `crate::service` serves the stored export document at — the same rule `GetReport`
-//! and `GetTermForReport` announce their documents under. No SigV4 signature is attached:
-//! this emulator does not sign documents and does not fabricate a signature it did not
-//! compute.
+//! and `GetTermForReport` announce their documents under. It carries the export's own
+//! download token, which is what authorises the unsigned fetch of that document, exactly
+//! as the term grant's token authorises a report download: the URL is handed to ONE caller
+//! and the token is the receipt that caller holds. No SigV4 signature is attached: this
+//! emulator does not sign documents and does not fabricate a signature it did not compute.
 //!
 //! ## Shape of an operation
 //!
@@ -237,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Rendered HERE, from the inquiry as it stands, because an export is a snapshot:
         // the document the URL below leads to is the one this call produced.
         let document = inquiry.export_document(&covered, include_citations);
-        let export_id = store.record_inquiry_export(
+        let minted = store.record_inquiry_export(
             &input.compliance_inquiry_id,
             covered,
             include_citations,
@@ -247,11 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Attributable: the inquiry exported and the export minted for it. NEVER the
         // inquiry's name, content or queries — all `@sensitive` in the model — and never
-        // the URL, whose `PresignedUrl` shape is `@sensitive` too.
+        // the URL, whose `PresignedUrl` shape is `@sensitive` too, nor the download token
+        // that URL carries, which is what authorises the fetch.
         ::tracing::info!(
             operation = "ExportComplianceInquiry",
             compliance_inquiry_id = %input.compliance_inquiry_id,
-            export_id = %export_id,
+            export_id = %minted.id,
             include_citations,
             outcome = "exported",
             "exported a compliance inquiry"
@@ -261,7 +264,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             document_presigned_url: Some(crate::state::inquiry_export_url(
                 &host,
                 &input.compliance_inquiry_id,
-                &export_id,
+                &minted.id,
+                &minted.download_token,
             )),
             // The projection every other inquiry operation returns, computed above off
             // the stored record.

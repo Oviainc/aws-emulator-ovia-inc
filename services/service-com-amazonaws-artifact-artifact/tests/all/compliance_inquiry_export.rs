@@ -650,7 +650,7 @@ async fn following_a_document_url_is_a_read_that_changes_nothing() {
 }
 
 #[tokio::test]
-async fn a_document_url_that_names_no_export_is_404() {
+async fn a_document_url_that_names_no_export_of_this_caller_s_is_refused() {
     let router = emulator();
     let first = create(
         &router,
@@ -668,7 +668,10 @@ async fn a_document_url_that_names_no_export_is_404() {
 
     let served = export(&router, &export_body(&first_id, None, None)).await;
     let url = served.url().to_string();
-    let (host, path) = split_url(&url);
+    let (host, path_and_query) = split_url(&url);
+    let (path, query) = path_and_query.split_once('?').unwrap_or_else(|| {
+        panic!("{url:?} must carry the token that authorises the fetch")
+    });
     let export_id = path
         .rsplit('/')
         .nth(1)
@@ -676,32 +679,41 @@ async fn a_document_url_that_names_no_export_is_404() {
         .to_string();
     let object = path.rsplit('/').next().expect("the URL carries an object");
 
-    // One row per way a path can name no document this emulator holds: an export id it
-    // never minted, the right export under the wrong inquiry, the right export under the
-    // wrong object name, and a path that is not a document path at all.
-    let missing = [
+    // One row per way a path can name no document this caller was handed, each presenting
+    // the token the announced URL carried, with the refusal the plane answers under. That
+    // token authorises ONE export under the inquiry it was taken from and nothing else, so
+    // an export id this store never minted and the right export crossed with another
+    // inquiry are refused as unauthorised rather than reported absent — a 404 there would
+    // let a caller enumerate which exports exist. Only a path the token authorises is
+    // answered 404, for an object the export does not publish.
+    let refused = [
         (
             "an export id that was never minted",
             format!(
-                "{EXPORT_DOCUMENT_PATH_PREFIX}/{first_id}/export/export-dead0000beef0000/{object}"
+                "{EXPORT_DOCUMENT_PATH_PREFIX}/{first_id}/export/export-dead0000beef0000/\
+                 {object}?{query}"
             ),
+            403,
         ),
         (
             "the export under another inquiry",
-            format!("{EXPORT_DOCUMENT_PATH_PREFIX}/{second_id}/export/{export_id}/{object}"),
+            format!("{EXPORT_DOCUMENT_PATH_PREFIX}/{second_id}/export/{export_id}/{object}?{query}"),
+            403,
         ),
         (
             "the export under another object name",
             format!(
-                "{EXPORT_DOCUMENT_PATH_PREFIX}/{first_id}/export/{export_id}/other-report.json"
+                "{EXPORT_DOCUMENT_PATH_PREFIX}/{first_id}/export/{export_id}/\
+                 other-report.json?{query}"
             ),
+            404,
         ),
     ];
-    for (label, candidate) in missing {
+    for (label, candidate, expected) in refused {
         let answer = follow(&router, "GET", &format!("https://{host}{candidate}")).await;
         assert_eq!(
-            answer.status, 404,
-            "case {label:?}: a path naming no document must answer 404, got {} with {:?}",
+            answer.status, expected,
+            "case {label:?}: expected HTTP {expected}, got {} with {:?}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );

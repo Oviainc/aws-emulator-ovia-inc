@@ -7,6 +7,12 @@
 //! task is running a job of another service, so this call stops that job too,
 //! through the stopping call its integration names.
 //!
+//! An execution of a state machine on a customer managed KMS key has the `error` and
+//! `cause` this call carries SEALED under that key, so a stop that carries either is
+//! refused with `KmsAccessDeniedException` unless KMS lets this caller have the key
+//! used for it — and one that carries neither needs nothing of the key
+//! ([`crate::state::encryption`]).
+//!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
 //!
@@ -175,6 +181,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now();
+        // "For an execution with encryption enabled, Step Functions will encrypt the
+        // error and cause fields using the KMS key for the execution role", and "a
+        // caller can stop an execution without using any KMS permissions in the
+        // execution role if the caller provides a null value for both error and cause
+        // fields because no data needs to be encrypted": a stop that carries either
+        // field has that field SEALED under the execution's customer managed key, so
+        // KMS decides whether this caller may have the key used for it before the
+        // execution is stopped. The decision is made with no store of this service
+        // locked.
+        if input.error.is_some() || input.cause.is_some() {
+            if let Some(why) = crate::state::encryption::execution_write_denied(
+                &*self.engine,
+                ctx,
+                &endpoint_region,
+                &input.execution_arn,
+            ) {
+                return Err(StopExecutionErrorModeled::KmsAccessDeniedException(
+                    KmsAccessDeniedException { message: Some(why) },
+                )
+                .into());
+            }
+        }
         // The store is held for THIS block alone: the stop itself is one state-level
         // step, and the cross-service call below must not hold the store while it is
         // in flight.

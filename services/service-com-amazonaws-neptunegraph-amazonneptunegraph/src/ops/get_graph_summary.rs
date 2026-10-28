@@ -182,22 +182,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A summary is read from the graph's OWN data endpoint — the operation is
         // bound to the host prefix `{graphIdentifier}.`
         // (`smithy_query(query="operation",operation="GetGraphSummary")` -> endpoint) —
-        // and that endpoint serves only while the graph is serving. A graph that is
-        // provisioning, reconfiguring, importing, snapshotting, stopped or on its way
-        // out has no data plane to summarise, which this operation reports with the
-        // one client error it models for a request it cannot serve: it declares no
-        // `ConflictException` (`smithy_query` -> errors), so the refusal is the
-        // modelled `ValidationException` (400) naming the status that was read.
-        if graph.status != crate::state::GraphStatus::Available {
+        // and that endpoint serves only while the graph is serving. That precondition
+        // and the refusal it is reported with are the ONE rule `crate::state` states
+        // for every operation on that endpoint, so this handler only names what it
+        // had nothing to do.
+        if !graph.status.is_serving() {
             return Err(GetGraphSummaryErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "graph {} is in status {} and has no serving data plane to summarise",
-                        graph.id,
-                        graph.status.as_wire()
-                    ),
-                    reason: Some("BAD_REQUEST".to_string()),
-                },
+                crate::state::graph_data_plane_unavailable(
+                    &graph.id,
+                    graph.status,
+                    "summarise",
+                ),
             )
             .into());
         }

@@ -224,6 +224,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|sort| sort.sort_order.as_deref())
             .is_some_and(|order| order == crate::state::SORT_DESCENDING);
 
+        // The statuses the request OPTED IN to beyond finality, absent when it carried
+        // no filter; what each one admits is [`crate::state::confirmation_status_listed`].
         let wanted_statuses = input
             .confirmation_status_filter
             .as_ref()
@@ -235,14 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default()
             .into_iter()
             .filter(|transaction| window.contains(transaction.transaction_timestamp))
-            // `ConfirmationStatusFilter$include`: "Transactions that have reached
-            // finality are always part of the response", so the filter decides only
-            // whether the transactions that have NOT reached it are included too.
+            // The finality rule, shared with the other listing a finality filter
+            // narrows so the two can never disagree about what an absent filter means.
             .filter(|transaction| {
-                transaction.confirmation_status == crate::state::CONFIRMATION_FINAL
-                    || wanted_statuses
-                        .as_ref()
-                        .is_none_or(|wanted| wanted.contains(&transaction.confirmation_status))
+                crate::state::confirmation_status_listed(
+                    &transaction.confirmation_status,
+                    wanted_statuses.as_deref(),
+                )
             })
             .collect();
         if descending {
