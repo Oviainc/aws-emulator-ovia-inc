@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachStaticIp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachStaticIp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Releases the attachment one stored static IP holds: the address stays reserved for
+//! the account, and the instance it came off stops being reachable at it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachStaticIp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachStaticIp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachStaticIpErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachStaticIp"))
+        // A static IP is addressed by the name the request names — the store
+        // holds it under that name alone — and where it was reserved is the
+        // location its own record holds, so nothing here comes from the request
+        // metadata `ctx` carries, exactly as it does not in `ReleaseStaticIp`.
+        let _ = ctx;
+
+        // `staticIpName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused an absent or
+        // malformed one before this body ran. What is left is what the model
+        // cannot express: the static IP has to be one this account holds.
+        let name = input.static_ip_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // READ what the request addresses first, under one exclusive hold on
+            // the store, so a request naming a static IP this account does not
+            // hold writes nothing and is refused rather than reporting a detach
+            // that did not happen. The location the log entry is written against
+            // is the reservation's own, for the same reason every other entry in
+            // this crate is: the log says where the resource is.
+            let location = match store.static_ip(&name) {
+                Some(static_ip) => static_ip.location.clone(),
+                None => return Err(not_found(&name)),
+            };
+
+            // The detachment itself: the static IP stops naming the instance it
+            // was attached to, and that instance stops being reachable at the
+            // reserved address — an attached static IP is the ONLY thing that
+            // pins an instance's public IPv4 address, so one holding none falls
+            // back to an ordinary address the platform assigned it. Both halves
+            // are the store's own one step, the same one a release gives up the
+            // attachment through.
+            //
+            // A static IP attached to NOTHING is already in the state this
+            // request asks for, so there is nothing to release for it and
+            // nothing to refuse: this operation's modelled documentation states
+            // no precondition on the attachment, and the modelled `StaticIp`
+            // carries no lifecycle state a precondition could be about — unlike
+            // `DetachDisk`, whose modelled documentation states one ("detaches a
+            // STOPPED block storage disk") and whose `DiskState` says which
+            // disks are detachable.
+            //
+            // What comes back is the instance the address came off, when one
+            // held it; the entry below is written against the STATIC IP, which
+            // is the resource this operation acts on, so nothing more is needed
+            // from it here.
+            let _ = store.detach_static_ip(&name);
+
+            // The attachment is released as this call returns — a `StaticIp`
+            // carries no status member, so there is nothing left for the clock
+            // to settle later — which is why the operation this call logs is
+            // answered terminal, exactly as an allocation and a release are.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DETACH_STATIC_IP,
+                crate::state::RESOURCE_TYPE_STATIC_IP,
+                &name,
+                &location,
+                None,
+            );
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one detaches exactly one static IP, so it
+            // answers exactly one entry, against the static IP that is the
+            // resource this operation acts on.
+            Ok(DetachStaticIpOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No static IP of that name is stored, so this detach has no reservation to take
+/// an address off: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(name: &str) -> DetachStaticIpError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_STATIC_IP,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DetachStaticIpError {
+    DetachStaticIpErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail static IP store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
