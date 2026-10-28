@@ -58,7 +58,10 @@ const MAX_PAGE_SIZE: usize = 1000;
 ///
 /// `query` is rendered verbatim, so a value outside a modelled range can be a
 /// row of its own.
-async fn list_jobs(emulator: &Emulator, account_id: &str, query: &str) -> Reply {
+///
+/// `pub(crate)` because the sibling suites read a stored job back through the
+/// listing as well rather than standing up their own request.
+pub(crate) async fn list_jobs(emulator: &Emulator, account_id: &str, query: &str) -> Reply {
     let uri = if query.is_empty() {
         "/v20180820/jobs".to_string()
     } else {

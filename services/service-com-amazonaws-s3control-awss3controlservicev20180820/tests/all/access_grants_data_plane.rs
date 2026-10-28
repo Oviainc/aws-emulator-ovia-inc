@@ -70,7 +70,10 @@ const QUERY_UNRESERVED: &str = "-._~";
 /// Percent-encode one query value the way an SDK does: every byte outside
 /// [`QUERY_UNRESERVED`] and the ASCII alphanumerics as `%XX`, so an S3 URI's
 /// colons, slashes and wildcard reach the handler as the value the caller wrote.
-fn query_escape(value: &str) -> String {
+///
+/// `pub(crate)` because the sibling suites that put a value in a query string
+/// escape it the same way rather than each writing this again.
+pub(crate) fn query_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
         let plain = byte.is_ascii_alphanumeric() || QUERY_UNRESERVED.contains(char::from(byte));

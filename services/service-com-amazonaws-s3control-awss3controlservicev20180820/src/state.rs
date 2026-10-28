@@ -376,8 +376,7 @@ pub const STORAGE_LENS_GROUP_QUOTA: usize = 1_000;
 // `CreateJob` records a job here and every job operation reads the one record
 // it stored: `DescribeJob` reports it, `UpdateJobPriority` replaces its
 // priority, the job tagging operations read and replace its tag set, and
-// `UpdateJobStatus` moves its status (that last one is still a scaffold with
-// its own gap issue).
+// `UpdateJobStatus` moves its status.
 // ---------------------------------------------------------------------------
 
 /// `JobStatus` of a job the service has accepted and not yet prepared — the
@@ -387,6 +386,11 @@ pub const JOB_STATUS_NEW: &str = "New";
 /// `JobStatus` of a job that has been prepared and is waiting for its tasks to
 /// be run.
 pub const JOB_STATUS_READY: &str = "Ready";
+
+/// `JobStatus` of a job that will not run because its cancellation has been
+/// carried out — a terminal status, reached only through `UpdateJobStatus`, and
+/// the status whose `TerminationDate` is when the cancellation was asked for.
+pub const JOB_STATUS_CANCELLED: &str = "Cancelled";
 
 /// `JobStatus` of a job that is waiting for confirmation before it runs, which
 /// is what `JobDescriptor$SuspendedCause` documents a created job enters when
@@ -399,6 +403,30 @@ pub const JOB_STATUS_SUSPENDED: &str = "Suspended";
 /// confirmation. `SuspendedCause` is a plain string in the model (len 1..1024),
 /// so the model names no catalog of causes.
 pub const SUSPENDED_AWAITING_CONFIRMATION: &str = "AwaitingConfirmation";
+
+/// The `JobStatus` values a job can still be cancelled from: those of a job
+/// that has neither ended nor begun ending.
+///
+/// The model's `JobStatus` enum names thirteen statuses; the six left out here
+/// — `Cancelling` and `Cancelled`, `Completing` and `Complete`, `Failing` and
+/// `Failed` — are a job whose run is already ending or over, so there is
+/// nothing left for a cancellation to stop. Spelled as the model spells them,
+/// and read through [`job_cancellable`].
+pub const CANCELLABLE_JOB_STATUSES: &[&str] = &[
+    "Active",
+    "New",
+    "Paused",
+    "Pausing",
+    "Preparing",
+    "Ready",
+    "Suspended",
+];
+
+/// Whether a job in `status` can still be cancelled — see
+/// [`CANCELLABLE_JOB_STATUSES`].
+pub fn job_cancellable(status: &str) -> bool {
+    CANCELLABLE_JOB_STATUSES.contains(&status)
+}
 
 /// How long a created job takes to leave [`JOB_STATUS_NEW`].
 ///
@@ -2265,6 +2293,26 @@ pub fn job_not_found<E>(job_id: &str) -> crate::scaffolded::Scaffolded<E> {
         "InvalidRequest",
         400,
         format!("Job not found: {job_id}"),
+    )
+}
+
+/// `InvalidRequest` (HTTP 400): the job is in a status that admits no move to
+/// the one `UpdateJobStatus` asks for — a confirmation of a job that awaits
+/// none, or a cancellation of a job that has ended or begun ending.
+///
+/// The model binds `JobStatusException` to `UpdateJobStatus`, but the recorded
+/// behaviour of this service for a status it will not move is the same S3-style
+/// XML envelope the rest of the job surface answers a well-formed request it
+/// cannot carry out with (see [`job_not_found`]): code `InvalidRequest` with
+/// HTTP 400.
+pub fn job_status_not_updatable<E>(
+    current: &str,
+    requested: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "InvalidRequest",
+        400,
+        format!("Job status cannot be updated from {current} to {requested}"),
     )
 }
 

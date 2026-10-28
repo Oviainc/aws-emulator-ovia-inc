@@ -35,6 +35,8 @@ mod batch_job_lifecycle;
 mod batch_job_list;
 #[path = "all/batch_job_priority.rs"]
 mod batch_job_priority;
+#[path = "all/batch_job_status.rs"]
+mod batch_job_status;
 #[path = "all/batch_job_tagging.rs"]
 mod batch_job_tagging;
 #[path = "all/multi_region_access_point_lifecycle.rs"]

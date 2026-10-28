@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateJobStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateJobStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateJobStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the status of the job `CreateJob` recorded under this account and job
+//! id, and reports the job id with the status now stored and the reason this
+//! call gave for it, so the next `DescribeJob` of that job reports what this
+//! call left behind.
+//!
+//! Two moves, the two the operation documents — "confirm that you want to run a
+//! job or ... cancel an existing job":
+//!
+//! * `Ready` confirms a job that is waiting for confirmation, which is the only
+//!   status a confirmation has anything to do;
+//! * `Cancelled` cancels a job that has neither ended nor begun ending
+//!   ([`crate::state::job_cancellable`]), which terminates it there and then —
+//!   this emulator runs no batch tasks, so no job it holds has work in flight
+//!   for the cancellation to wait on.
+//!
+//! Any other move is refused through the one refusal the whole job surface
+//! shares for a well-formed request it cannot carry out
+//! ([`crate::state::job_status_not_updatable`]), and a job id the named account
+//! owns no job for through its sibling ([`crate::state::job_not_found`]).
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +99,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{JOB_STATUS_CANCELLED, JOB_STATUS_READY, JOB_STATUS_SUSPENDED};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,20 +171,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateJobStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateJobStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateJobStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise what the clock already owed before moving the job, so this
+        // call decides from the status the clock has the job in rather than from
+        // the one the last writer left behind.
+        store.materialize_due_jobs(now);
+
+        let Some(job) = store.job_mut(&input.account_id, &input.job_id) else {
+            return Err(crate::state::job_not_found(&input.job_id));
+        };
+
+        // `RequestedJobStatus` is a modelled enum (`Cancelled | Ready`), so the
+        // boundary validator has already refused any other value: each arm here
+        // is one of the two moves this operation performs — "confirm that you
+        // want to run a job" or "cancel an existing job".
+        match input.requested_job_status.as_str() {
+            // A job is confirmed out of the status it entered to await that
+            // confirmation; a job in any other status awaits nothing, so there
+            // is no confirmation to give it.
+            JOB_STATUS_READY => {
+                if job.status != JOB_STATUS_SUSPENDED {
+                    return Err(crate::state::job_status_not_updatable(
+                        &job.status,
+                        JOB_STATUS_READY,
+                    ));
+                }
+                job.status = crate::state::job_status(JOB_STATUS_READY);
+                // `SuspendedDate` and `SuspendedCause` are what the job WAS
+                // suspended at and for ("the timestamp when this job was
+                // suspended, if it was suspended"), so the confirmation leaves
+                // that record standing and moves the status alone. A suspended
+                // job is waiting for this call rather than for the clock, so
+                // there is no due transition to drop.
+            }
+            // A cancellation stops a job that has not ended and has not begun
+            // ending. This emulator runs no batch tasks, so no job it holds has
+            // work in flight for the cancellation to wait on: the job reaches
+            // the terminal `Cancelled`, terminated at this instant.
+            JOB_STATUS_CANCELLED => {
+                if !crate::state::job_cancellable(&job.status) {
+                    return Err(crate::state::job_status_not_updatable(
+                        &job.status,
+                        JOB_STATUS_CANCELLED,
+                    ));
+                }
+                job.status = crate::state::job_status(JOB_STATUS_CANCELLED);
+                job.termination_date = Some(::aws_smithy_types::DateTime::from(now));
+                // A job cancelled before its preparation fell due owes the
+                // clock nothing any more: the transition it was waiting for is
+                // dropped rather than left to fire against a terminal status.
+                job.status_due_at = None;
+            }
+            requested => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "RequestedJobStatus must be one of {}; the request asks for {requested}.",
+                    REQUESTED_JOB_STATUS_VALUES.join(", ")
+                )))
+            }
+        }
+
+        // `StatusUpdateReason` is "a description of the reason why you want to
+        // change the specified job's status": it describes THIS update, so the
+        // reason the job carries afterwards is the one this request carried —
+        // and none, when it carried none.
+        job.status_update_reason = input.status_update_reason.clone();
+
+        Ok(UpdateJobStatusOutput {
+            job_id: Some(job.job_id.clone()),
+            status: Some(job.status.clone()),
+            status_update_reason: job.status_update_reason.clone(),
+        })
     }
 }
