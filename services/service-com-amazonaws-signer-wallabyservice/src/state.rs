@@ -1526,6 +1526,42 @@ pub fn unsupported_override_message(
     )
 }
 
+/// The `ImageFormat` values an `overrides.signingImageFormat` may SELECT.
+///
+/// The member documents its own option set rather than taking the platform's: "when
+/// overriding the default signing platform configuration, a customer can select
+/// either of two signing formats, `JSONEmbedded` or `JSONDetached`", the third
+/// value the enum names being reserved for future use
+/// (`smithy_query(query="shape",shape="SigningPlatformOverrides")`). So the
+/// modelled `ImageFormat` enum ([`crate::ops::types::IMAGE_FORMAT_VALUES`]) is
+/// WIDER than what an override may carry — it also names the format platforms
+/// publish but customers may not select — and this is the set an override is held
+/// to, on every platform.
+pub const SELECTABLE_IMAGE_FORMATS: &[&str] = &["JSONEmbedded", "JSONDetached"];
+
+/// The `overrides.signingImageFormat` the request carries when it is not one a
+/// customer may select ([`SELECTABLE_IMAGE_FORMATS`]) — or `None` when the request
+/// selects a format a customer may select, or overrides the format not at all.
+pub fn unselectable_image_format_override(
+    overrides: Option<&SigningPlatformOverrides>,
+) -> Option<&str> {
+    let format = overrides.and_then(|overrides| overrides.signing_image_format.as_deref())?;
+    (!SELECTABLE_IMAGE_FORMATS.contains(&format)).then_some(format)
+}
+
+/// The refusal prose for an image-format override a customer may not select: the
+/// member that carried it, the value it carried, and the formats it may carry.
+///
+/// Worded like the signing-configuration refusal above — the member, the value,
+/// then the values that are supported — because it is the same kind of refusal: an
+/// override naming a value outside the option set that member is held to.
+pub fn unselectable_image_format_message(value: &str) -> String {
+    format!(
+        "signingImageFormat {value} is not supported. Supported values: [{}]",
+        SELECTABLE_IMAGE_FORMATS.join(", ")
+    )
+}
+
 /// Whether a signature produced on `platform_id` can be revoked — the platform's
 /// published `revocationSupported` ("Indicates whether revocation is supported
 /// for the platform", [`SigningPlatformEntry::revocation_supported`]), which is

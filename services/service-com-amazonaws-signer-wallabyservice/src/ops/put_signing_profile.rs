@@ -27,8 +27,10 @@
 //! no entry for names no platform, so the create is refused 404
 //! `ResourceNotFoundException` (code `PlatformNotFound`) exactly as a read of that
 //! platform is, and an `overrides.signingConfiguration` value outside the
-//! platform's published `allowedValues` is refused 400 `ValidationException`.
-//! Neither refusal stores anything.
+//! platform's published `allowedValues` is refused 400 `ValidationException` — as
+//! is an `overrides.signingImageFormat` outside the formats that member documents
+//! as selectable ([`crate::state::SELECTABLE_IMAGE_FORMATS`]). None of those
+//! refusals stores anything.
 //!
 //! ## Shape of an operation
 //!
@@ -251,6 +253,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::unsupported_override_message(
                         platform, member, value,
                     )),
+                    code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The sibling override member is held to ITS own option set: the signing
+        // image format a customer may SELECT when overriding the platform
+        // configuration is one of the two formats the member documents as
+        // selectable, the rest of the modelled enum being published by platforms
+        // but not selectable by a customer. A value outside that set is refused
+        // for the value it carried (400), before anything is written, so no
+        // profile — and no job that later snapshots one — carries an image format
+        // a customer may not ask for.
+        if let Some(format) =
+            crate::state::unselectable_image_format_override(input.overrides.as_ref())
+        {
+            return Err(PutSigningProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unselectable_image_format_message(format)),
                     code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
                 },
             )
