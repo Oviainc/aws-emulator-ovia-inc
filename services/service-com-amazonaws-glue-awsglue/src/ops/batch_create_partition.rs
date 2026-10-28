@@ -6,8 +6,11 @@
 //!
 //! Persists each submitted partition on the table it names, so a later partition read
 //! serves it, and sets the one member no `PartitionInput` carries, `CreationTime`. An
-//! absent database or table fails the whole request with `EntityNotFoundException`; a
-//! single partition that cannot be created fails only its own item, reported in
+//! absent database or table fails the whole request with `EntityNotFoundException`, and so
+//! does an item whose value count is not the addressed table's partition-key count, which
+//! is a malformed request rather than a per-item failure: that is `InvalidInputException`,
+//! refused before any item is applied. A single partition that cannot be created for a
+//! reason of its own — a duplicate, a ceiling — fails only its own item, reported in
 //! `Errors`.
 //!
 //! ## Shape of an operation
@@ -225,6 +228,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A partition is one value per partition key of its table, "ordered in the same
+        // order as the partition keys" (`PartitionInput$Values`), so an item whose value
+        // count is not the table's key count names a slice of no table. That is a
+        // malformed REQUEST rather than one item the service could not create: the whole
+        // batch is refused with `InvalidInputException` BEFORE any item is applied, so a
+        // batch carrying one such item creates nothing and reports no `Errors` list at
+        // all. The counts the request and the table disagree on travel with the refusal,
+        // in the same sentence a single-partition create is refused with.
+        let keys = table.partition_key_count();
+        if let Some(values) = input.partition_input_list.iter().find_map(|requested| {
+            let values = requested.values.as_ref().map_or(0, Vec::len);
+            (values != keys).then_some(values)
+        }) {
+            return Err(BatchCreatePartitionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::partition_values_do_not_match_keys(
+                        keys, values,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         // Each submitted partition is created on its own: `Errors` is "the errors
         // encountered when trying to create the requested partitions", which is where a

@@ -12,15 +12,22 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::{
-    mint_page_token, MAX_FILTERS, MAX_FILTER_VALUES, MAX_SECURITY_GROUP_IDS, MAX_STORED_ENDPOINTS,
-    PROVISIONING_DELAY,
+    mint_page_token, DEFAULT_PAGE_SIZE, MAX_FILTERS, MAX_FILTER_VALUES, MAX_SECURITY_GROUP_IDS,
+    MAX_STORED_ENDPOINTS, PROVISIONING_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     call, emulator, error_type, expect_error, ok, parse_time, string_member, without_status,
-    ACCOUNT, REGION,
+    Emulator, ACCOUNT, REGION,
 };
+
+/// The page size a list operation applies when the request names no
+/// `MaxResults`: "If you don't specify a value for MaxResults, Resolver returns
+/// up to 100 Resolver endpoints", which is what the response reports back.
+fn default_page_size() -> i64 {
+    i64::try_from(DEFAULT_PAGE_SIZE).expect("the default page size fits in an i64")
+}
 
 /// A create request body with `count` IP addresses in distinct subnets.
 fn create_body(creator: &str, name: Option<&str>, direction: &str, count: usize) -> Value {
@@ -45,6 +52,35 @@ fn create_body(creator: &str, name: Option<&str>, direction: &str, count: usize)
 fn endpoint(body: &Value) -> &Value {
     body.get("ResolverEndpoint")
         .expect("the response carries a ResolverEndpoint")
+}
+
+/// Register, in the account's own Amazon EC2 store, every subnet `body`'s
+/// `IpAddresses` names.
+///
+/// An endpoint's IP addresses are placed IN subnets of the caller's VPC, and
+/// `CreateResolverEndpoint` resolves every `SubnetId` against that store, so a
+/// case about anything else starts from subnets the account really holds.
+/// `tests/all/endpoint_subnet_references.rs` owns the rule itself.
+fn hold_body_subnets(router: &Emulator, body: &Value) {
+    let subnets: Vec<String> = body
+        .get("IpAddresses")
+        .and_then(Value::as_array)
+        .map(|addresses| {
+            addresses
+                .iter()
+                .filter_map(|address| address.get("SubnetId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    router.hold_subnets(subnets);
+}
+
+/// Create a Resolver endpoint from `body`, over the wire, and answer the whole
+/// response; the subnets it names are held first ([`hold_body_subnets`]).
+async fn create_endpoint(router: &Emulator, body: Value) -> Value {
+    hold_body_subnets(router, &body);
+    ok(router, "CreateResolverEndpoint", body).await
 }
 
 /// One row of the create table: the shape of the request, and what the stored
@@ -159,7 +195,7 @@ async fn a_created_endpoint_is_read_back_from_state() {
         let router = emulator();
         let requested = body.clone();
 
-        let created = ok(&router, "CreateResolverEndpoint", body).await;
+        let created = create_endpoint(&router, body).await;
         let created = endpoint(&created).clone();
 
         let id = string_member(&created, "Id");
@@ -316,8 +352,8 @@ async fn a_repeated_creator_request_id_does_not_create_a_second_endpoint() {
     let router = emulator();
     let body = create_body("req-retried", Some("once-only"), "OUTBOUND", 2);
 
-    let first = ok(&router, "CreateResolverEndpoint", body.clone()).await;
-    let second = ok(&router, "CreateResolverEndpoint", body).await;
+    let first = create_endpoint(&router, body.clone()).await;
+    let second = create_endpoint(&router, body).await;
 
     assert_eq!(
         without_status(endpoint(&first)),
@@ -343,9 +379,8 @@ async fn a_repeated_creator_request_id_does_not_create_a_second_endpoint() {
 #[tokio::test]
 async fn the_creating_status_settles_without_anyone_asking() {
     let router = emulator();
-    let created = ok(
+    let created = create_endpoint(
         &router,
-        "CreateResolverEndpoint",
         create_body("req-settles", Some("settling"), "OUTBOUND", 2),
     )
     .await;
@@ -413,12 +448,11 @@ async fn the_creating_status_settles_without_anyone_asking() {
 }
 
 /// Create `count` endpoints and return their ids in creation order.
-async fn seed_endpoints(router: &MultiServiceRouter, count: usize) -> Vec<String> {
+async fn seed_endpoints(router: &Emulator, count: usize) -> Vec<String> {
     let mut ids = Vec::with_capacity(count);
     for index in 0..count {
-        let created = ok(
+        let created = create_endpoint(
             router,
-            "CreateResolverEndpoint",
             create_body(&format!("req-seed-{index}"), None, "OUTBOUND", 2),
         )
         .await;
@@ -472,8 +506,9 @@ async fn paging_walks_every_endpoint_exactly_once() {
             }
             assert_eq!(
                 page.get("MaxResults").and_then(Value::as_i64),
-                max_results.map(i64::from),
-                "case {case:?}: MaxResults must echo the value the request specified, got {page}"
+                Some(max_results.map_or_else(default_page_size, i64::from)),
+                "case {case:?}: MaxResults must report the page size applied \
+                 (the requested value, or the default when none was named), got {page}"
             );
             walked.extend(items.iter().map(|item| string_member(item, "Id")));
 
@@ -595,9 +630,8 @@ async fn an_endpoint_list_cursor_belongs_to_the_query_that_minted_it() {
         // Two OUTBOUND and two INBOUND endpoints, so a filtered walk and an
         // unfiltered one have different lengths.
         let direction = if index % 2 == 0 { "OUTBOUND" } else { "INBOUND" };
-        ok(
+        create_endpoint(
             &router,
-            "CreateResolverEndpoint",
             create_body(&format!("req-scope-{index}"), None, direction, 2),
         )
         .await;
@@ -695,9 +729,8 @@ async fn an_endpoint_list_cursor_belongs_to_the_query_that_minted_it() {
 async fn filters_select_on_every_documented_member() {
     let router = emulator();
 
-    let alpha = ok(
+    let alpha = create_endpoint(
         &router,
-        "CreateResolverEndpoint",
         json!({
             "CreatorRequestId": "req-alpha",
             "Name": "alpha",
@@ -711,9 +744,8 @@ async fn filters_select_on_every_documented_member() {
     )
     .await;
     let alpha = endpoint(&alpha).clone();
-    let beta = ok(
+    let beta = create_endpoint(
         &router,
-        "CreateResolverEndpoint",
         json!({
             "CreatorRequestId": "req-beta",
             "Name": "beta",
@@ -727,9 +759,8 @@ async fn filters_select_on_every_documented_member() {
     )
     .await;
     let beta = endpoint(&beta).clone();
-    let gamma = ok(
+    let gamma = create_endpoint(
         &router,
-        "CreateResolverEndpoint",
         json!({
             "CreatorRequestId": "req-gamma",
             "Name": "gamma",
@@ -931,15 +962,11 @@ async fn an_update_writes_only_the_members_the_request_carries() {
     } in cases
     {
         let router = emulator();
-        let created = ok(
-            &router,
-            "CreateResolverEndpoint",
-            {
-                let mut body = create_body("req-update", Some("original"), "INBOUND", 2);
-                body["ResolverEndpointType"] = json!("IPV4");
-                body
-            },
-        )
+        let created = create_endpoint(&router, {
+            let mut body = create_body("req-update", Some("original"), "INBOUND", 2);
+            body["ResolverEndpointType"] = json!("IPV4");
+            body
+        })
         .await;
         let before = endpoint(&created).clone();
         let id = string_member(&before, "Id");
@@ -1037,9 +1064,8 @@ async fn an_update_writes_only_the_members_the_request_carries() {
 #[tokio::test]
 async fn updating_an_ip_address_writes_that_address_only() {
     let router = emulator();
-    let created = ok(
+    let created = create_endpoint(
         &router,
-        "CreateResolverEndpoint",
         create_body("req-ip-update", Some("ips"), "OUTBOUND", 3),
     )
     .await;
@@ -1147,7 +1173,7 @@ async fn the_endpoint_type_can_only_move_between_ipv4_and_dualstack() {
         let router = emulator();
         let mut body = create_body("req-type", Some("typed"), "OUTBOUND", 2);
         body["ResolverEndpointType"] = json!(from);
-        let created = ok(&router, "CreateResolverEndpoint", body).await;
+        let created = create_endpoint(&router, body).await;
         let id = string_member(endpoint(&created), "Id");
 
         let request = json!({ "ResolverEndpointId": id, "ResolverEndpointType": to });
@@ -1293,6 +1319,7 @@ async fn outpost_arn_and_preferred_instance_type_must_be_specified_together() {
         for (key, value) in extra.as_object().expect("an object of extra members") {
             body[key] = value.clone();
         }
+        hold_body_subnets(&router, &body);
         expect_error(
             &router,
             "CreateResolverEndpoint",
@@ -1307,7 +1334,7 @@ async fn outpost_arn_and_preferred_instance_type_must_be_specified_together() {
     let mut body = create_body("req-outpost-both", Some("outpost-both"), "INBOUND", 2);
     body["OutpostArn"] = json!(outpost_arn);
     body["PreferredInstanceType"] = json!("m5.large");
-    let created = ok(&router, "CreateResolverEndpoint", body).await;
+    let created = create_endpoint(&router, body).await;
     let created = endpoint(&created).clone();
     assert_eq!(
         string_member(&created, "OutpostArn"),
@@ -1393,6 +1420,7 @@ async fn the_security_group_list_one_endpoint_can_hold_is_bounded() {
         let groups: Vec<String> = (0..count).map(|index| format!("sg-{index}")).collect();
         let mut body = create_body(&format!("req-sg-{count}"), None, "OUTBOUND", 2);
         body["SecurityGroupIds"] = json!(groups);
+        hold_body_subnets(&router, &body);
 
         if stored {
             let created = ok(&router, "CreateResolverEndpoint", body).await;
@@ -1447,9 +1475,8 @@ async fn count_endpoints(router: &MultiServiceRouter) -> usize {
 async fn the_endpoint_store_is_bounded() {
     let router = emulator();
     for index in 0..MAX_STORED_ENDPOINTS {
-        ok(
+        create_endpoint(
             &router,
-            "CreateResolverEndpoint",
             create_body(&format!("req-fill-{index}"), None, "OUTBOUND", 2),
         )
         .await;
@@ -1460,10 +1487,12 @@ async fn the_endpoint_store_is_bounded() {
         "the store must hold exactly the endpoints that were created"
     );
 
+    let one_too_many = create_body("req-one-too-many", None, "OUTBOUND", 2);
+    hold_body_subnets(&router, &one_too_many);
     expect_error(
         &router,
         "CreateResolverEndpoint",
-        create_body("req-one-too-many", None, "OUTBOUND", 2),
+        one_too_many,
         "a new endpoint past the cap",
         "LimitExceededException",
     )
@@ -1476,9 +1505,8 @@ async fn the_endpoint_store_is_bounded() {
 
     // A retry of a request id the store already holds is not a new record, so the
     // bound does not refuse it.
-    let retried = ok(
+    let retried = create_endpoint(
         &router,
-        "CreateResolverEndpoint",
         create_body("req-fill-0", None, "OUTBOUND", 2),
     )
     .await;
@@ -1496,9 +1524,8 @@ async fn the_endpoint_store_is_bounded() {
         json!({ "ResolverEndpointId": doomed }),
     )
     .await;
-    ok(
+    create_endpoint(
         &router,
-        "CreateResolverEndpoint",
         create_body("req-after-delete", None, "OUTBOUND", 2),
     )
     .await;

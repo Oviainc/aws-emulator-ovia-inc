@@ -671,7 +671,8 @@ async fn reading_a_task_instance_changes_nothing_a_later_caller_sees() {
     );
 
     // The read moved no run status and consumed nothing: the run is still the
-    // `STARTING` its start left it in, and it still holds exactly the seeded instances.
+    // `STARTING` its start left it in (no transition of it is due — `seed` pinned its
+    // clock), and it still holds exactly the seeded instances.
     let (run_state, error_message, stored_ids) = {
         let state = harness
             .engine()

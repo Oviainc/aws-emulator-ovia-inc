@@ -576,8 +576,8 @@ impl WorkflowRun {
     }
 }
 
-/// One task instance of a run: the execution record of a single task in the
-/// workflow definition.
+/// One task instance of a run: the record of a single task of the workflow
+/// definition, inside one run of it.
 ///
 /// The fields are exactly what the modelled task-instance shapes report
 /// (`smithy_query(query="shape", shape="GetTaskInstanceResponse,TaskInstanceSummary")`),

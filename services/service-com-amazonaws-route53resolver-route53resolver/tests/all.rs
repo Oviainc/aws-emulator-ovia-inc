@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/endpoint_subnet_references.rs"]
+mod endpoint_subnet_references;
 #[path = "all/firewall_config_listing.rs"]
 mod firewall_config_listing;
 #[path = "all/firewall_configs.rs"]
@@ -33,6 +35,8 @@ mod firewall_rule_group_policies;
 mod firewall_rule_groups;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/list_page_size_echo.rs"]
+mod list_page_size_echo;
 #[path = "all/managed_firewall_domain_lists.rs"]
 mod managed_firewall_domain_lists;
 #[path = "all/outpost_binding.rs"]

@@ -75,6 +75,8 @@ mod hosted_zones_by_vpc;
 mod refusal_message_rules;
 #[path = "all/record_name_canonical_form.rs"]
 mod record_name_canonical_form;
+#[path = "all/record_set_health_check_references.rs"]
+mod record_set_health_check_references;
 #[path = "all/record_set_refusal_rules.rs"]
 mod record_set_refusal_rules;
 #[path = "all/record_set_validation.rs"]
