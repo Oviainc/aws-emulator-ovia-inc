@@ -177,6 +177,16 @@ pub mod operation_status {
     /// "QUEUED: [Service-managed permissions] For automatic deployments that require a
     /// sequence of operations, the operation is queued to be performed."
     pub const QUEUED: &str = "QUEUED";
+
+    /// Whether an operation in this status has NOT concluded — the ONE reading of that,
+    /// shared by the single-flight check ([`super::StoredStackSet::operation_in_flight`])
+    /// and by the operations that may act only on an operation still in flight.
+    ///
+    /// Being performed, queued to be performed, or stopping at user request; every other
+    /// `StackSetOperationStatus` is terminal.
+    pub fn is_in_flight(status: &str) -> bool {
+        status == RUNNING || status == QUEUED || status == STOPPING
+    }
 }
 
 /// The model's `StackInstanceFilterName`: the three things a request may filter stack
@@ -731,11 +741,9 @@ impl StoredStackSet {
     /// `OperationInProgressException` names ("another operation is currently in progress for
     /// this StackSet").
     pub fn operation_in_flight(&self) -> Option<&StoredStackSetOperation> {
-        self.operations.iter().find(|operation| {
-            operation.status == operation_status::RUNNING
-                || operation.status == operation_status::QUEUED
-                || operation.status == operation_status::STOPPING
-        })
+        self.operations
+            .iter()
+            .find(|operation| operation_status::is_in_flight(&operation.status))
     }
 
     /// Whether an operation on this stack set is still RUNNING — the state
@@ -901,26 +909,47 @@ impl StoredStackSet {
                         || instance.detailed_status != detailed_status::RUNNING
                 });
             }
-            if concluded.status != operation_status::SUCCEEDED {
-                continue;
+            // "STOPPED: The user has canceled the drift detection operation": a detection
+            // the caller stopped reports that rather than the status its own reads had
+            // reached, so nothing reports a completed detection for an operation the caller
+            // canceled.
+            if concluded.status == operation_status::STOPPED
+                && concluded.action == operation_action::DETECT_DRIFT
+            {
+                self.operations[index].drift_detection_status =
+                    Some(drift_detection_status::STOPPED.to_string());
             }
-            for drift in &concluded.instance_drifts {
-                if let Some(instance) = self
-                    .instances
-                    .iter_mut()
-                    .find(|held| held.is_in(&drift.account, &drift.region))
-                {
-                    instance.drift_status = drift.drift_status.clone();
-                    instance.last_drift_check = Some(drift.checked_at);
+            // What a drift detection FOUND becomes the instances' own result only when the
+            // detection itself concluded: one the caller canceled reports STOPPED rather
+            // than a finding about the stack set.
+            if concluded.status == operation_status::SUCCEEDED {
+                for drift in &concluded.instance_drifts {
+                    if let Some(instance) = self
+                        .instances
+                        .iter_mut()
+                        .find(|held| held.is_in(&drift.account, &drift.region))
+                    {
+                        instance.drift_status = drift.drift_status.clone();
+                        instance.last_drift_check = Some(drift.checked_at);
+                    }
                 }
             }
             // A deployment that completed leaves the instances it acted on up to date with
             // the stack set: "CURRENT: The stack is currently up to date with the StackSet."
-            if concluded.action == operation_action::CREATE
-                || concluded.action == operation_action::UPDATE
+            // A deployment the caller STOPPED owes them the same, for the deployments that
+            // were already under way when it was stopped: "StackSets will cancel all the
+            // unstarted stack instance deployments and wait for those are in-progress to
+            // complete." The ones it cancelled are not among them — a cancelled deployment
+            // never completed, so it keeps the CANCELLED state the stop put it in.
+            if (concluded.status == operation_status::SUCCEEDED
+                || concluded.status == operation_status::STOPPED)
+                && (concluded.action == operation_action::CREATE
+                    || concluded.action == operation_action::UPDATE)
             {
                 for instance in &mut self.instances {
-                    if instance.last_operation_id != concluded.operation_id {
+                    if instance.last_operation_id != concluded.operation_id
+                        || instance.detailed_status == detailed_status::CANCELLED
+                    {
                         continue;
                     }
                     instance.status = instance_status::CURRENT.to_string();

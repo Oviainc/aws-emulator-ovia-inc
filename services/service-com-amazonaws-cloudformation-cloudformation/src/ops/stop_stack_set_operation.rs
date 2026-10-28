@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopStackSetOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopStackSetOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopStackSetOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stops the operation a StackSet still has in flight. The operation this
+//! store holds under the requested id moves to `STOPPING` at the user's request, the stack
+//! instance deployments it had not started yet are cancelled, the ones already in progress
+//! are left to complete, and the clock concludes the operation `STOPPED` — which is also
+//! what releases the StackSet's single-flight lock. An operation that has already reached a
+//! terminal status is not stoppable and is refused on the modelled channel.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +75,18 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{detailed_status, operation_status, PendingOperationOutcome};
+
+/// The `InvalidOperationException` message CloudFormation answers a stop of an operation
+/// that has already ended with.
+///
+/// "Stops an in-progress operation on a StackSet": an operation that is no longer in
+/// progress is not one a stop can act on, and the refusal says which operation it was and
+/// the status it is in — both read off the record this store holds, never from the request
+/// or from any one run.
+fn operation_cannot_be_stopped(operation_id: &str, status: &str) -> String {
+    format!("StackSet operation {operation_id} is in {status} state and cannot be stopped")
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +158,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopStackSetOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopStackSetOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopStackSetOperation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store holding the
+            // operation to stop, so this answers 501 rather than reporting a stop nothing
+            // recorded.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StopStackSetOperation",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Every operation of this service settles the clock first, so a stop cannot act on
+        // an operation that had already concluded at this instant.
+        store.settle(now);
+
+        let stack_set = store
+            .resolve_stack_set_mut(&region, &input.stack_set_name)
+            .ok_or_else(|| {
+                StopStackSetOperationErrorModeled::StackSetNotFoundException(
+                    StackSetNotFoundException {
+                        message: Some(crate::state::stack_set_does_not_exist(
+                            &input.stack_set_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // "The specified ID refers to an operation that doesn't exist": an id this stack set
+        // holds no record for is the modelled `OperationNotFoundException`, and an operation
+        // that has already ended is the modelled `InvalidOperationException` — neither is a
+        // stop that silently did nothing.
+        {
+            let Some(operation) = stack_set
+                .operations
+                .iter_mut()
+                .find(|held| held.operation_id == input.operation_id)
+            else {
+                return Err(
+                    StopStackSetOperationErrorModeled::OperationNotFoundException(
+                        OperationNotFoundException {
+                            message: Some(crate::state::stack_set_operation_does_not_exist(
+                                &input.operation_id,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // "Stops an in-progress operation": a stop acts on exactly the operations that
+            // have not concluded — the store's own reading of that, which is also the set
+            // the StackSet's single-flight lock is held by — and every other
+            // `StackSetOperationStatus` is terminal, so there is nothing left to stop.
+            if !operation_status::is_in_flight(&operation.status) {
+                return Err(StopStackSetOperationErrorModeled::InvalidOperationException(
+                    InvalidOperationException {
+                        message: Some(operation_cannot_be_stopped(
+                            &operation.operation_id,
+                            &operation.status,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A stop of an operation already stopping is the stop that is already being
+            // carried out: while its conclusion is still owed it writes nothing, so
+            // repeating the call cannot push that conclusion further away. A STOPPING record
+            // that owes none is one nothing would ever conclude, so the stop re-owes it.
+            if operation.status == operation_status::STOPPING && operation.pending.is_some() {
+                return Ok(StopStackSetOperationOutput {});
+            }
+            // "STOPPING: The operation is in the process of stopping, at user request", and
+            // "STOPPED: The user has canceled the operation" is what it ends as — owed one
+            // transition span from THIS call, since stopping waits for the deployments
+            // already in progress, so a caller reading straight after the stop still sees
+            // the operation stopping. Whatever the conclusion already carried about what
+            // failed is kept: a stop does not unsay a failure the operation recorded.
+            match operation.pending.as_mut() {
+                Some(pending) => {
+                    pending.status = operation_status::STOPPED.to_string();
+                    pending.due_at = now + crate::state::STATUS_TRANSITION_DELAY;
+                }
+                None => {
+                    operation.pending = Some(PendingOperationOutcome {
+                        status: operation_status::STOPPED.to_string(),
+                        status_reason: operation.status_reason.clone(),
+                        failed_stack_instances_count: operation.failed_stack_instances_count,
+                        due_at: now + crate::state::STATUS_TRANSITION_DELAY,
+                    });
+                }
+            }
+            operation.status = operation_status::STOPPING.to_string();
+        }
+
+        // "StackSets will cancel all the unstarted stack instance deployments and wait for
+        // those are in-progress to complete": a deployment of this operation that had not
+        // started in its account and Region is cancelled here — "CANCELLED: The operation in
+        // the specified account and Region has been canceled" — while one already in
+        // progress is left alone and completes when the stop concludes
+        // ([`crate::state::stack_sets::StoredStackSet::settle`]).
+        for instance in &mut stack_set.instances {
+            if instance.last_operation_id == input.operation_id
+                && instance.detailed_status == detailed_status::PENDING
+            {
+                instance.detailed_status = detailed_status::CANCELLED.to_string();
+            }
+        }
+
+        // The model gives this operation no output members: the stop is reported by the
+        // status the operation now holds, which `DescribeStackSetOperation` reads back.
+        Ok(StopStackSetOperationOutput {})
     }
 }
