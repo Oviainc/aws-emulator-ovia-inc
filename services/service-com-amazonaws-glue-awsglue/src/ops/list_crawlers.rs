@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCrawlers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCrawlers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the NAMES of the crawlers this account's store holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::crawlers`]), in name order, one bounded
+//! page at a time, optionally narrowed to the crawlers carrying every tag `Tags` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCrawlers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The names come from the same records `CreateCrawler` wrote and `GetCrawler` reads back,
+//! so a client that lists before it reads sees exactly the crawlers that exist, and a name
+//! this listing reports is one `GetCrawler` resolves.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +75,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`.
+///
+/// Source: the response member's own bound — `ListCrawlersResponse$CrawlerNames` targets
+/// `CrawlerNameList`, whose `length` is 0..100 — so a page can never carry more names than
+/// that however large a `MaxResults` the request asks for. `MaxResults` itself targets
+/// `PageSize` (range 1..1000), which is why a larger value is accepted and then served as
+/// pages of this size rather than refused.
+const MAX_PAGE_SIZE: usize = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +154,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCrawlers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCrawlersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCrawlers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as its own timeout error rather than as a shape the model does not declare
+            // for it — the same way `GetCrawlers` reports it.
+            return Err(ListCrawlersErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum size of a list to return" (`MaxResults`), capped by what the
+        // response member can carry; absent, the page is that cap. The clamp also keeps
+        // the page size away from 0 even if the boundary validator ever stops enforcing
+        // the member's own 1..1000 range.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE)
+        });
+        // "Specifies to return only these tagged resources": a crawler qualifies only when
+        // it carries EVERY pair named, which is what "only resources with the tag are
+        // retrieved" asks for. An empty map narrows nothing.
+        let required_tags = input.tags.unwrap_or_default();
+
+        let store = state.lock();
+        // Name order, so one page follows another deterministically however the store
+        // happens to hash its keys. The crawler namespace is per account rather than per
+        // Region, so every crawler the store holds is in scope.
+        let mut names: Vec<&String> = store
+            .crawlers
+            .values()
+            .filter(|crawler| {
+                required_tags
+                    .iter()
+                    .all(|(key, value)| crawler.tags.get(key) == Some(value))
+            })
+            .map(|crawler| &crawler.name)
+            .collect();
+        names.sort();
+
+        // The token is the last name of the previous page, so the page resumes at the
+        // first stored name strictly after it — which stays correct across crawlers
+        // created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => names.partition_point(|name| name.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
+        // can never index outside the set.
+        let page: Vec<String> = names
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|name| (*name).clone())
+            .collect();
+        let end = start.saturating_add(page.len());
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page.
+        let next_token = if end < names.len() {
+            page.last().cloned()
+        } else {
+            None
+        };
+
+        Ok(ListCrawlersOutput {
+            // Present even when empty: an account with no crawler has an empty listing,
+            // not an absent one.
+            crawler_names: Some(page),
+            next_token,
+        })
     }
 }

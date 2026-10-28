@@ -69,6 +69,8 @@ mod connection_not_found;
 mod connection_updates;
 #[path = "all/crawler_event_queue.rs"]
 mod crawler_event_queue;
+#[path = "all/crawler_listing.rs"]
+mod crawler_listing;
 #[path = "all/crawler_schedule_suspension.rs"]
 mod crawler_schedule_suspension;
 #[path = "all/crawler_schedules.rs"]
