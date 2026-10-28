@@ -19,6 +19,8 @@ mod anonymous_credential_vend;
 mod basic_flow_gate;
 #[path = "all/control_plane_audit.rs"]
 mod control_plane_audit;
+#[path = "all/delete_identities.rs"]
+mod delete_identities;
 #[path = "all/describe_identity.rs"]
 mod describe_identity;
 #[path = "all/developer_credentials_authorization.rs"]
