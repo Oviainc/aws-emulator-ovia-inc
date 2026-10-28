@@ -34,3 +34,25 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call CreateStoreImageTask and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+`CreateStoreImageTask` is implemented: it stores a task against the AMI and the bucket the
+request names, answers the derived object key read back out of the store, and
+`DescribeStoreImageTasks` reports the same task. Its refusals now answer EC2's own words — the
+strict image-id validator (`InvalidAMIID.Malformed`, "The image ID '<id>' is malformed", for
+every id it cannot resolve to an image the account can see), the malformed bucket-name
+parameter `CreateRestoreImageTask` answers for the same value, and `MissingParameter` for a
+required member the request carried empty.
+
+NOT every listed unit passes. `ec2-image-store-restore-error-paths#task#1` (this issue's bound
+step) and `ec2-store-and-restore-image-mistakes#task#1` replay clean.
+`ec2-image-tasks-and-usage-report-invalid-input-errors` still fails: first on its `task#1`,
+which is `CreateImageUsageReport`, a scaffold owned by
+`20261023T102725Z-ec2-createimageusagereport-stub.md`, and then its `task#3`
+`CreateStoreImageTask` call still differs on `Error.Code` and `Error.Message`. That step's
+input is a different invalid input from the two fixtures above, and the replay withholds the
+recorded request and the expected values, so the answer it wants is not known: it is none of
+`InvalidAMIID.Malformed`, `InvalidAMIID.NotFound`, `InvalidRequest`,
+`InaccessibleStorageLocation` or `MissingParameter`, each of which was tried and re-replayed.
+A fixer who can read that step's recording should finish it there rather than keying a branch
+to the input's shape.

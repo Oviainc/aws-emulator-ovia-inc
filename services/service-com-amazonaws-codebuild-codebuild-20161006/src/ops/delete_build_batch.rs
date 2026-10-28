@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBuildBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBuildBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBuildBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a batch build that has finished, together with the builds that batch is
+//! made of: this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +132,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBuildBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBuildBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBuildBatch"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteBuildBatch (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let now = crate::state::now_millis();
+        let mut guard = state.lock();
+
+        // Read through `settled_build_batch`, so the record this delete decides on is
+        // the one the clock already owes: a batch whose transition out of
+        // `IN_PROGRESS` fell due before now counts as finished here, because it was
+        // owed at that instant whether or not anybody called. That is the only write a
+        // request naming a still-running batch makes.
+        let Some(build_batch) = guard
+            .settled_build_batch(&input.id, now)
+            .map(|stored| stored.build_batch.clone())
+        else {
+            // A batch build this service holds no record of leaves nothing to delete,
+            // and the operation models no not-found error at all — the same reading
+            // `crate::ops::delete_project` applies to the other deletable resource
+            // whose absence AWS models no error for. Both halves of the partition are
+            // reported empty, and `statusCode` is left out: there was no batch build
+            // for this call to report an outcome for.
+            return Ok(DeleteBuildBatchOutput {
+                status_code: None,
+                builds_deleted: Some(Vec::new()),
+                builds_not_deleted: Some(Vec::new()),
+            });
+        };
+
+        // A batch build is deletable only once it has finished: `BuildBatch$complete`
+        // "indicates if the batch build is complete", and deleting one that is still
+        // running is refused with the single error this operation models, leaving the
+        // batch — and the builds of it — exactly where they were.
+        if !build_batch.complete {
+            return Err(DeleteBuildBatchErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Build batch {} is still in progress and cannot be deleted",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The builds the batch is made of, named by the ARNs its build groups carry:
+        // deleting a batch build deletes those builds too, which is what
+        // `buildsDeleted` and `buildsNotDeleted` report on. Nothing in this emulator
+        // reads a batch specification, so a batch it started carries no build group
+        // (`crate::state::BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`) and both halves come back
+        // empty; a batch whose groups DO name builds has each of them removed from the
+        // build records here.
+        let mut deleted: Vec<String> = Vec::new();
+        let mut not_deleted: Vec<BuildNotDeleted> = Vec::new();
+        for id in batch_build_ids(&build_batch) {
+            if guard.remove_build(&id) {
+                deleted.push(id);
+            } else {
+                not_deleted.push(BuildNotDeleted {
+                    // The same text `BatchDeleteBuilds` reports for an id it holds no
+                    // record of: it names the build and says it does not exist.
+                    status_code: Some(format!("Build {id} does not exist")),
+                    id: Some(id),
+                });
+            }
+        }
+
+        // And the batch record itself, which leaves the batch map and its project's id
+        // index together, so every later read — `BatchGetBuildBatches`,
+        // `ListBuildBatches` — stops reporting it. The project's `buildBatchNumber`
+        // counter stays: AWS documents that "if a batch build is deleted, the
+        // buildBatchNumber of other batch builds does not change", so no number is
+        // ever reused.
+        guard.remove_build_batch(&input.id);
+        drop(guard);
+
+        // The lock is dropped before the audit record is written, so a log consumer can
+        // never hold this service's state. Recorded the way `crate::ops::delete_project`
+        // records the removal of the other resource kind this service deletes: a call
+        // that drops a batch build, and the builds hanging off it, leaves a local
+        // record of which operation removed what.
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::BuildBatchDeleted,
+            Some(&input.id),
+        );
+
+        Ok(DeleteBuildBatchOutput {
+            // The outcome for the batch build this call removed.
+            status_code: Some(crate::state::BATCH_DELETED_STATUS_CODE.to_string()),
+            // `BuildIds`' `@length(min: 1)` bounds what a REQUEST may carry, not
+            // whether the answer states its result, so this is reported as `[]` when
+            // the deleted batch had no build of its own — the way `BatchDeleteBuilds`
+            // reports the same partition.
+            builds_deleted: Some(deleted),
+            // `BuildsNotDeleted` carries no `@length`, so it is always reported: `[]`
+            // when nothing was left behind.
+            builds_not_deleted: Some(not_deleted),
+        })
     }
+}
+
+/// The ids of the builds `build_batch` is made of, in build-group order, each named
+/// once.
+///
+/// A batch build names its builds by ARN — `BuildGroup$currentBuildSummary` for the
+/// build of that group in this batch, and `priorBuildSummaryList` for the earlier
+/// attempts of the same group retained on it — while the build store is keyed by id,
+/// so each ARN is resolved through [`crate::state::build_id_from_arn`] and anything
+/// that is not a build ARN of this service is skipped. Two summaries naming the same
+/// build name one build, so it is reported once: a repeat would otherwise read as
+/// "not deleted" purely because the first occurrence had just deleted it.
+fn batch_build_ids(build_batch: &BuildBatch) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let summaries = build_batch.build_groups.iter().flatten().flat_map(|group| {
+        group
+            .current_build_summary
+            .iter()
+            .chain(group.prior_build_summary_list.iter().flatten())
+    });
+    for summary in summaries {
+        let Some(id) = summary
+            .arn
+            .as_deref()
+            .and_then(crate::state::build_id_from_arn)
+        else {
+            continue;
+        };
+        if !ids.iter().any(|held| held == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
