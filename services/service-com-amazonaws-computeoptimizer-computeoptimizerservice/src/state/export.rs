@@ -27,10 +27,11 @@
 //!   READER computes it, so an exported row and a `Get*Recommendations` response cannot
 //!   disagree. A field the stored analysis records no value for is an empty cell, and so is one
 //!   that names no member of the surface's recommendation at all. Where a surface's
-//!   recommendation carries members the shared findings-catalog row does not — the Aurora and
-//!   RDS database surface, whose catalog row records the database's own configuration — the row
-//!   is built from the recommendation the reader reports rather than from that catalog row, so
-//!   the one rule serves both.
+//!   recommendation carries members the shared findings-catalog row does not — the Amazon EC2
+//!   instance surface, whose options carry an instance type, and the Aurora and RDS database
+//!   surface, whose catalog row records the database's own configuration — the row is built from
+//!   the observation the reader reports the recommendation from rather than from that catalog
+//!   row, so the one rule serves both.
 //! * the metadata file — what the export job itself was: its id, the resource type and
 //!   account(s) it covers, the recommendation preferences it was asked for, the file format and
 //!   columns of the export file, how many rows it holds and where both objects were written.
@@ -64,10 +65,11 @@ use std::sync::Arc;
 use ::service_com_amazonaws_s3_amazons3 as s3;
 
 use super::{
-    architecture_admitted, look_back_period_in_days, parse_instance_arn, parse_resource_arn,
+    architecture_admitted, external_metric_status, look_back_period_in_days, parse_resource_arn,
     percentage_of, round_hundredths, stated_architectures, AnalysedResource, AnalyzedAutoScalingGroup,
     ComAmazonawsComputeoptimizerComputeoptimizerserviceState, EffectivePreferences, ExportJob,
-    GroupConfiguration, IdleResourceAnalysis, ObservedLicensedInstance, CURRENCY_USD,
+    GroupConfiguration, IdleResourceAnalysis, InstanceConfiguration, ObservedInstance,
+    ObservedLicensedInstance, CURRENCY_USD, IDLE_FALSE, IDLE_TRUE,
     RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
     RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION,
     RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE, SAVINGS_ESTIMATION_SOURCE,
@@ -75,7 +77,7 @@ use super::{
 use crate::ops::types::{
     DBStorageConfiguration, RDSDBRecommendation, RDSDBUtilizationMetric, SavingsOpportunity,
     EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES, EXPORTABLE_IDLE_FIELD_VALUES,
-    EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
+    EXPORTABLE_INSTANCE_FIELD_VALUES, EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
 };
 
 /// The one `FileFormat` the model declares: "The only export file format currently supported
@@ -779,8 +781,12 @@ fn put_preferences(row: &mut ExportRow, preferences: &EffectivePreferences) {
 /// `<prefix><MetricName><Statistic>` — as the resource type's own `Exportable*Field` enum
 /// (`fields`) declares it.
 ///
-/// The field sets spell every metric name as its own enum does, bar the CPU series: the
-/// `IdleMetricName` value is `CPU` while the field is `UtilizationMetricsCpuMaximum`.
+/// The field sets spell every metric name in UpperCamelCase, which is how the metric-name
+/// enums spell most of their own values — but not all of them: the `IdleMetricName` value is
+/// `CPU` while the field is `UtilizationMetricsCpuMaximum`, and `MetricName` names the series
+/// an instance type does not size in SCREAMING_SNAKE_CASE (`NETWORK_IN_BYTES_PER_SECOND`) while
+/// the field is `UtilizationMetricsNetworkInBytesPerSecondMaximum`. So a name is converted to
+/// that casing before the field is looked up, and a name already in it is left as it is.
 ///
 /// The STATISTIC a field's name carries is the one the export file reports that metric under,
 /// which need not be the statistic a recommendation reports it with: this API "returns
@@ -793,7 +799,22 @@ fn put_preferences(row: &mut ExportRow, preferences: &EffectivePreferences) {
 /// the statistic-named field, which no column of that resource type reads, so nothing is
 /// reported under a name the model does not give it.
 fn utilization_field(fields: &[&str], prefix: &str, name: &str, statistic: &str) -> String {
-    let name = if name == "CPU" { "Cpu" } else { name };
+    let name = if name == "CPU" {
+        "Cpu".to_string()
+    } else if name.contains('_') {
+        name.split('_')
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let mut letters = word.chars();
+                letters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>()
+                        + &letters.as_str().to_lowercase()
+                })
+            })
+            .collect()
+    } else {
+        name.to_string()
+    };
     let stem = format!("{prefix}{name}");
     let named = format!("{stem}{statistic}");
     if fields.contains(&named.as_str()) {
@@ -884,17 +905,19 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             ),
             RESOURCE_TYPE_IDLE => self.idle_export_rows(&plan.region, last_refresh),
             RESOURCE_TYPE_LICENSE => self.license_export_rows(&plan.region, last_refresh),
+            RESOURCE_TYPE_EC2_INSTANCE => self.instance_export_rows(
+                &plan.region,
+                &plan.cpu_vendor_architectures,
+                last_refresh,
+            ),
             RESOURCE_TYPE_RDS_DB_INSTANCE => self.rds_database_export_rows(
                 &plan.region,
                 &plan.cpu_vendor_architectures,
                 last_refresh,
             ),
-            resource_type => self.analysed_resource_export_rows(
-                resource_type,
-                &plan.region,
-                &plan.cpu_vendor_architectures,
-                last_refresh,
-            ),
+            resource_type => {
+                self.analysed_resource_export_rows(resource_type, &plan.region, last_refresh)
+            }
         };
         rows.retain(|row| row_matches_filters(row, &plan.resource_type, &plan.filters));
         rows
@@ -962,15 +985,85 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         rows
     }
 
+    /// The export rows of the Amazon EC2 instance analysis: one per recommendation option of
+    /// every analysed instance that the request's CPU vendor architecture preference admits,
+    /// since each `RecommendationOptions*` field names ONE option's value — and one row
+    /// carrying the instance's own columns for an instance the preference leaves no candidate
+    /// of.
+    ///
+    /// Every cell is computed from the same stored observation the recommendation READER
+    /// reports the instance from ([`ObservedInstance`]) rather than from the findings-catalog
+    /// row, which records none of an instance's own configuration or of its options, so an
+    /// exported row and a `GetEC2InstanceRecommendations` response cannot disagree about which
+    /// options the recommendation consists of.
+    fn instance_export_rows(
+        &self,
+        region: &str,
+        requested_architectures: &[String],
+        last_refresh: Option<f64>,
+    ) -> Vec<ExportRow> {
+        let account_id = ::engine::emulator_account_id();
+        let mut rows: Vec<ExportRow> = Vec::new();
+        for instance in self
+            .visible_instances()
+            .filter(|instance| instance.account_id == account_id)
+        {
+            let arn = instance.instance_arn(region);
+            let preferences =
+                self.effective_preferences_for(&arn, RESOURCE_TYPE_EC2_INSTANCE, account_id);
+            // The candidates the preference admits, and "the CPU vendor and architecture for an
+            // instance or Auto Scaling group recommendations" the exported options then consist
+            // of: the crate's one rule for both ([`architecture_admitted`]), which is what the
+            // reader of these recommendations applies — "when you specify AWS_ARM64 with an
+            // ExportEC2InstanceRecommendations request, Compute Optimizer exports
+            // recommendations that consist of Graviton instance types only".
+            let options: Vec<&InstanceConfiguration> = instance
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    architecture_admitted(requested_architectures, &candidate.architecture)
+                })
+                .collect();
+            let architectures =
+                stated_architectures(options.iter().map(|option| option.architecture.as_str()));
+            // "Describes if an Amazon EC2 instance is idle": it is exactly when this service
+            // also holds an IDLE recommendation for it, which is the record the reader of these
+            // recommendations reports it from.
+            let idle = self.idle_recommendations.get(&arn).is_some();
+            if options.is_empty() {
+                rows.push(instance_row(
+                    instance,
+                    &arn,
+                    &preferences,
+                    None,
+                    &architectures,
+                    idle,
+                    last_refresh,
+                ));
+                continue;
+            }
+            for option in options {
+                rows.push(instance_row(
+                    instance,
+                    &arn,
+                    &preferences,
+                    Some(option),
+                    &architectures,
+                    idle,
+                    last_refresh,
+                ));
+            }
+        }
+        rows
+    }
+
     /// The export rows of the findings catalog, for a resource type whose recommendation is
     /// reported from it: one row per analysed resource, carrying the columns the catalog row
-    /// records ([`analysed_resource_row`]) and the CPU vendor architectures the resource's own
-    /// admitted options consist of ([`Self::exported_architectures`]).
+    /// records ([`analysed_resource_row`]).
     fn analysed_resource_export_rows(
         &self,
         resource_type: &str,
         region: &str,
-        requested_architectures: &[String],
         last_refresh: Option<f64>,
     ) -> Vec<ExportRow> {
         let account_id = ::engine::emulator_account_id();
@@ -984,61 +1077,17 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                         let arn = resource.arn_in(region);
                         let preferences =
                             self.effective_preferences_for(&arn, resource_type, account_id);
-                        let architectures = self.exported_architectures(
-                            resource_type,
-                            &arn,
-                            requested_architectures,
-                        );
                         analysed_resource_row(
                             resource,
                             resource_type,
                             &arn,
                             &preferences,
-                            &architectures,
                             last_refresh,
                         )
                     })
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// The `cpuVendorArchitectures` the export file states for the analysed resource `arn`
-    /// names, under the architectures the export request asked for: the architectures of the
-    /// recommendation options the preference admits, by the rule that surface's READER applies
-    /// ([`architecture_admitted`]).
-    ///
-    /// An instance recommendation is the one reported from the findings catalog whose options
-    /// carry an architecture, and the analysis that records them is the observed inventory the
-    /// catalog row is projected from ([`super::ObservedInstance`]) — so the architectures are
-    /// taken from there rather than from the catalog row, which records none. Every other
-    /// resource type's recommendation reports no option of its own CPU architecture, so it
-    /// states none, and the cell is empty.
-    fn exported_architectures(
-        &self,
-        resource_type: &str,
-        arn: &str,
-        requested_architectures: &[String],
-    ) -> Vec<String> {
-        if resource_type != RESOURCE_TYPE_EC2_INSTANCE {
-            return Vec::new();
-        }
-        let instance = parse_instance_arn(arn).and_then(|parsed| {
-            self.visible_instances()
-                .find(|instance| instance.instance_id == parsed.instance_id)
-        });
-        let Some(instance) = instance else {
-            return Vec::new();
-        };
-        stated_architectures(
-            instance
-                .candidates
-                .iter()
-                .filter(|candidate| {
-                    architecture_admitted(requested_architectures, &candidate.architecture)
-                })
-                .map(|candidate| candidate.architecture.as_str()),
-        )
     }
 
     /// The export rows of the Amazon Aurora and RDS database analysis: one per analysed
@@ -1299,15 +1348,15 @@ fn put_configuration(row: &mut ExportRow, prefix: &str, configuration: &GroupCon
 ///
 /// A column whose value an effective recommendation preference switches off is left empty for
 /// as long as that preference is off, the way the recommendation readers of the same analysis
-/// leave the member unreported. `architectures` are the CPU vendor architectures the resource's
-/// exported recommendation options consist of, which is none for a resource type whose
-/// recommendation reports no option carrying one.
+/// leave the member unreported. The CPU vendor architectures of a resource's recommendation
+/// options are not among the columns a catalog row fills: no resource type reported from the
+/// catalog has an option carrying one — the instance surface, whose options do, builds its rows
+/// from the observation itself ([`ComAmazonawsComputeoptimizerComputeoptimizerserviceState::instance_export_rows`]).
 fn analysed_resource_row(
     resource: &AnalysedResource,
     resource_type: &str,
     arn: &str,
     preferences: &EffectivePreferences,
-    architectures: &[String],
     last_refresh: Option<f64>,
 ) -> ExportRow {
     let mut row = ExportRow::new();
@@ -1351,16 +1400,222 @@ fn analysed_resource_row(
         );
     }
     put_preferences(&mut row, preferences);
+    if let Some(at) = last_refresh {
+        put(&mut row, "LastRefreshTimestamp", timestamp(at));
+    }
+    row
+}
+
+/// One Amazon EC2 instance recommendation option as an export row, or the instance's own
+/// columns alone (`option` is `None`) where the request's preference admits no candidate of it.
+///
+/// Every cell is the value the recommendation READER reports for that member, computed from the
+/// stored observation the same way ([`ObservedInstance`]), so an exported row and a
+/// `GetEC2InstanceRecommendations` response cannot disagree. The fields this analysis records
+/// nothing for are left empty: the reserved-instance prices and the storage and network of a
+/// configuration (the analysis prices an instance-hour on public on-demand pricing alone), the
+/// GPU accelerator settings and the GPU utilization (no instance type in this analysis has an
+/// attached accelerator), and the utilization preferences, which are the preference RECORDS the
+/// account wrote rather than a value this recommendation reports for the instance.
+fn instance_row(
+    instance: &ObservedInstance,
+    arn: &str,
+    preferences: &EffectivePreferences,
+    option: Option<&InstanceConfiguration>,
+    architectures: &[String],
+    idle: bool,
+    last_refresh: Option<f64>,
+) -> ExportRow {
+    let mut row = ExportRow::new();
+    put(&mut row, "AccountId", instance.account_id.clone());
+    put(&mut row, "InstanceArn", arn.to_string());
+    put(
+        &mut row,
+        "InstanceName",
+        instance.instance_name().unwrap_or_default(),
+    );
+    put(&mut row, "InstanceState", instance.instance_state.clone());
+    put(&mut row, "Finding", instance.finding());
+    put_list(
+        &mut row,
+        "FindingReasonCodes",
+        &instance.finding_reason_codes,
+    );
+    put(
+        &mut row,
+        "CurrentPerformanceRisk",
+        instance.current_performance_risk.clone(),
+    );
+    put(
+        &mut row,
+        "CurrentInstanceType",
+        instance.current.instance_type.clone(),
+    );
+    put_number(&mut row, "CurrentVCpus", instance.current.vcpus);
+    put_number(&mut row, "CurrentMemory", instance.current.memory_gib);
+    put_number(
+        &mut row,
+        "CurrentOnDemandPrice",
+        instance.current.hourly_price,
+    );
+    put(&mut row, "Idle", if idle { IDLE_TRUE } else { IDLE_FALSE });
+    for metric in instance.utilization_metrics() {
+        let (Some(name), Some(statistic)) = (metric.name, metric.statistic) else {
+            continue;
+        };
+        put_number(
+            &mut row,
+            &utilization_field(
+                EXPORTABLE_INSTANCE_FIELD_VALUES,
+                "UtilizationMetrics",
+                &name,
+                &statistic,
+            ),
+            metric.value,
+        );
+    }
+    // "An array of objects that describe the source resource of the recommendation": an
+    // instance recommendation is computed from the analysis of that very instance, which is
+    // the source the reader reports for it.
+    put(
+        &mut row,
+        "RecommendationsSourcesRecommendationSourceArn",
+        arn.to_string(),
+    );
+    put(
+        &mut row,
+        "RecommendationsSourcesRecommendationSourceType",
+        RESOURCE_TYPE_EC2_INSTANCE,
+    );
+    put_preferences(&mut row, preferences);
     // "Describes the CPU vendor and architecture for an instance or Auto Scaling group
-    // recommendations": the architectures the resource's exported options consist of, which is
-    // none for a resource type whose recommendation reports no option carrying one.
+    // recommendations": the architectures the instance's exported options consist of.
     put_list(
         &mut row,
         "EffectiveRecommendationPreferencesCpuVendorArchitectures",
         architectures,
     );
+    // The external metrics provider the account prefers, and Compute Optimizer's integration
+    // status with it — the crate's one rule for that status ([`external_metric_status`]), so the
+    // file and the reader cannot report different integrations.
+    let source = preferences
+        .external_metrics_preference
+        .as_ref()
+        .and_then(|preference| preference.source.as_deref());
+    put(
+        &mut row,
+        "EffectiveRecommendationPreferencesExternalMetricsSource",
+        source.unwrap_or_default(),
+    );
+    let status = external_metric_status(source);
+    put(
+        &mut row,
+        "ExternalMetricStatusCode",
+        status.status_code.unwrap_or_default(),
+    );
+    put(
+        &mut row,
+        "ExternalMetricStatusReason",
+        status.status_reason.unwrap_or_default(),
+    );
+    // "The applications that might be running on the instance as inferred by Compute Optimizer"
+    // are reported only while the inference is active for it — the same gate the reader applies.
+    if preferences.infers_workload_types() {
+        put_list(
+            &mut row,
+            "InferredWorkloadTypes",
+            &instance.inferred_workload_types,
+        );
+    }
+    let tags: Vec<String> = instance
+        .tags
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    put_list(&mut row, "Tags", &tags);
     if let Some(at) = last_refresh {
         put(&mut row, "LastRefreshTimestamp", timestamp(at));
+    }
+
+    let Some(option) = option else {
+        return row;
+    };
+    put(
+        &mut row,
+        "RecommendationOptionsInstanceType",
+        option.instance_type.clone(),
+    );
+    put_number(&mut row, "RecommendationOptionsVcpus", option.vcpus);
+    put_number(&mut row, "RecommendationOptionsMemory", option.memory_gib);
+    put_number(
+        &mut row,
+        "RecommendationOptionsOnDemandPrice",
+        option.hourly_price,
+    );
+    put_number(
+        &mut row,
+        "RecommendationOptionsPerformanceRisk",
+        instance.option_performance_risk(option),
+    );
+    put_list(
+        &mut row,
+        "RecommendationOptionsPlatformDifferences",
+        &instance.platform_differences(option),
+    );
+    put(
+        &mut row,
+        "RecommendationOptionsMigrationEffort",
+        instance.migration_effort(option, preferences.infers_workload_types()),
+    );
+    for metric in instance.projected_utilization_metrics(option) {
+        let (Some(name), Some(statistic)) = (metric.name, metric.statistic) else {
+            continue;
+        };
+        put_number(
+            &mut row,
+            &utilization_field(
+                EXPORTABLE_INSTANCE_FIELD_VALUES,
+                "RecommendationOptionsProjectedUtilizationMetrics",
+                &name,
+                &statistic,
+            ),
+            metric.value,
+        );
+    }
+    let (saving, percentage) = instance.savings(option);
+    put_number(
+        &mut row,
+        "RecommendationOptionsSavingsOpportunityPercentage",
+        percentage,
+    );
+    put_number(
+        &mut row,
+        "RecommendationOptionsEstimatedMonthlySavingsValue",
+        saving,
+    );
+    put(
+        &mut row,
+        "RecommendationOptionsEstimatedMonthlySavingsCurrency",
+        CURRENCY_USD,
+    );
+    // The after-discount figures are reported only where the account activated the preference,
+    // which is what "activates" savings net of Savings Plans and Reserved Instances discounts.
+    if preferences.after_discounts() {
+        put_number(
+            &mut row,
+            "RecommendationOptionsSavingsOpportunityAfterDiscountsPercentage",
+            percentage,
+        );
+        put_number(
+            &mut row,
+            "RecommendationOptionsEstimatedMonthlySavingsValueAfterDiscounts",
+            saving,
+        );
+        put(
+            &mut row,
+            "RecommendationOptionsEstimatedMonthlySavingsCurrencyAfterDiscounts",
+            CURRENCY_USD,
+        );
     }
     row
 }

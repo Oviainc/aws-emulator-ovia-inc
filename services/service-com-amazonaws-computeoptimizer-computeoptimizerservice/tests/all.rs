@@ -29,6 +29,8 @@ mod ebs_volume_recommendations_export;
 mod ec2_instance_recommendations;
 #[path = "all/ec2_instance_recommendations_export.rs"]
 mod ec2_instance_recommendations_export;
+#[path = "all/ec2_instance_recommendations_export_file.rs"]
+mod ec2_instance_recommendations_export_file;
 #[path = "all/ec2_recommendation_projected_metrics.rs"]
 mod ec2_recommendation_projected_metrics;
 #[path = "all/ecs_service_recommendation_projected_metrics.rs"]
