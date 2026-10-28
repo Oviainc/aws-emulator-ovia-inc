@@ -835,3 +835,9 @@ mod network_acls;
 // holding, what the clock then decides the release ended as, and what it refuses.
 #[path = "all/ipam_byoasn_deprovisioning.rs"]
 mod ipam_byoasn_deprovisioning;
+// Appended at the END of this file, for the reason the header gives. What
+// `DescribeTransitGatewayVpcAttachments` reports out of the attachment store, how the id list,
+// the documented filters and the page size narrow it, and that an acceptance's write and the
+// move the clock owes it are both visible through it.
+#[path = "all/transit_gateway_vpc_attachments.rs"]
+mod transit_gateway_vpc_attachments;
