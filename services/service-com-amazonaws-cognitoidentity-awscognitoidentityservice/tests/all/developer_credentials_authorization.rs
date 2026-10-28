@@ -329,8 +329,9 @@ struct Principal {
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
 /// 3986's unreserved characters literal — so a policy document's braces and quotes survive
-/// the round trip.
-fn form_encode(value: &str) -> String {
+/// the round trip. `pub(crate)` so every suite in this target that drives an awsQuery setup
+/// call encodes a parameter the one way.
+pub(crate) fn form_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -342,8 +343,9 @@ fn form_encode(value: &str) -> String {
     encoded
 }
 
-/// The text of the first `<name>…</name>` element of an awsQuery response.
-fn xml_element(body: &str, name: &str) -> Option<String> {
+/// The text of the first `<name>…</name>` element of an awsQuery response. `pub(crate)` for
+/// the same reason as [`form_encode`].
+pub(crate) fn xml_element(body: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = body.find(&open)? + open.len();
