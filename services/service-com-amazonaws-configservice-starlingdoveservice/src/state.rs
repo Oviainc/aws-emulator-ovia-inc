@@ -5348,6 +5348,33 @@ pub fn epoch_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
     i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
 }
 
+/// The resolution an instant this service REPORTS is read back at, in nanoseconds.
+///
+/// A response carries an instant as an epoch-seconds number, which a client holds as a
+/// 64-bit float: around an instant of this decade such a float resolves well under a
+/// microsecond but nowhere near a nanosecond, so the instant a client sends back is the
+/// one it was given only down to the millisecond AWS reports an instant at. Every bound
+/// of a time window a request states is therefore matched at this resolution
+/// ([`window_from_nanos`], [`window_to_nanos`]).
+pub const REPORTED_INSTANT_NANOS: i128 = 1_000_000;
+
+/// The nanosecond instant a time window that STARTS at `at` opens: the beginning of the
+/// millisecond `at` names.
+///
+/// This is what makes a window bound a client took from an instant this service reported
+/// select the item it came from: the number the client read back is that instant to the
+/// millisecond, so a window opening at it opens no later than the item it names.
+pub fn window_from_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
+    let nanos = epoch_nanos(at);
+    nanos - nanos.rem_euclid(REPORTED_INSTANT_NANOS)
+}
+
+/// The nanosecond instant a time window that ENDS at `at` closes: the end of the
+/// millisecond `at` names, which is the other half of [`window_from_nanos`].
+pub fn window_to_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
+    window_from_nanos(at) + REPORTED_INSTANT_NANOS - 1
+}
+
 /// Encode the [`ResourceEvaluationPageKey`] a `ListResourceEvaluations` page should
 /// resume at as an opaque `NextToken`.
 pub fn encode_resource_evaluation_token(resume_at: &ResourceEvaluationPageKey) -> String {

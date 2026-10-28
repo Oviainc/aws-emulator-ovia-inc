@@ -220,14 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The chronologically latest time in the time range for which the history
         // requested. If not specified, current time is taken", and the earliest time
         // bounds the other end — so a range whose earlier time is not before its later
-        // time names no interval at all.
+        // time names no interval at all. The two ends are judged at the resolution the
+        // window itself is matched at (`crate::state::REPORTED_INSTANT_NANOS`), so a
+        // range the window would select items for is never refused as empty.
         let later_time = input.later_time.unwrap_or_else(|| {
             crate::state::timestamp(::std::time::SystemTime::now())
         });
-        if input
-            .earlier_time
-            .is_some_and(|earlier| crate::state::epoch_nanos(earlier) > crate::state::epoch_nanos(later_time))
-        {
+        let later = crate::state::window_to_nanos(later_time);
+        let earlier = input.earlier_time.map(crate::state::window_from_nanos);
+        if earlier.is_some_and(|earlier| earlier > later) {
             return Err(
                 GetResourceConfigHistoryErrorModeled::InvalidTimeRangeException(
                     InvalidTimeRangeException {
@@ -318,8 +319,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specified time interval": an item captured outside the requested window is
         // not a state of the resource during it. A continuation reports the items that
         // come AFTER the one its token names, in the order this request asks for.
-        let later = crate::state::epoch_nanos(later_time);
-        let earlier = input.earlier_time.map(crate::state::epoch_nanos);
         items.retain(|item| {
             item.configuration_item_capture_time.is_none_or(|at| {
                 let at = crate::state::epoch_nanos(at);
