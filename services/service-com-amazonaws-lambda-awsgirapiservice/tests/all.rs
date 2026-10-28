@@ -61,6 +61,8 @@ mod code_signing_configs;
 mod concurrency_quota_refusal_rules;
 #[path = "all/durable_execution_bound.rs"]
 mod durable_execution_bound;
+#[path = "all/durable_execution_history.rs"]
+mod durable_execution_history;
 #[path = "all/durable_execution_listing.rs"]
 mod durable_execution_listing;
 #[path = "all/durable_execution_start.rs"]

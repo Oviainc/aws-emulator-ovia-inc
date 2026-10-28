@@ -231,6 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
         };
 
         let logins = input.logins.unwrap_or_default();
+        // Which issuers the pool trusts is partly IAM's record — an `OpenIdConnectProviderARNs`
+        // entry names an IAM OpenID Connect provider — so the account's providers are read
+        // BEFORE this service's own store is locked, and only for a call that presents a
+        // login at all.
+        let registered = if logins.is_empty() {
+            crate::state::RegisteredOidcProviders::default()
+        } else {
+            crate::state::registered_oidc_providers(&*self.engine)
+        };
         let mut store = state.lock();
 
         let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
@@ -246,16 +255,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
         };
 
         // "Any provided logins will be validated against supported login providers"
-        // (`GetCredentialsForIdentity` in this service's model): a `Logins` entry that
-        // names an Amazon Cognito user pool carries its issuer in the provider name, so
-        // this pool's stored configuration decides it — a token minted by a user pool
-        // that is none of this pool's `CognitoIdentityProviders` authorizes nobody here.
-        if logins
-            .keys()
-            .any(|provider| !pool.accepts_login_provider(provider))
-        {
+        // (`GetCredentialsForIdentity` in this service's model): a `Logins` entry carries
+        // its issuer in the provider name, so this pool's stored trust for that issuer —
+        // a `CognitoIdentityProviders` entry, or an `OpenIdConnectProviderARNs` entry that
+        // still resolves to an IAM OIDC provider — decides it, together with the audience
+        // that trust accepts.
+        if let Some(refusal) = pool.login_trust(&registered).refuse(&logins) {
             return Err(GetIdErrorModeled::NotAuthorizedException(NotAuthorizedException {
-                message: Some(crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                message: Some(refusal.message().to_string()),
             })
             .into());
         }

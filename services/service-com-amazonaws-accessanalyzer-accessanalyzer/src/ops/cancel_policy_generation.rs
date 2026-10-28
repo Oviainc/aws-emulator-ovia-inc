@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelPolicyGeneration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelPolicyGeneration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelPolicyGeneration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the policy generation a `jobId` names: the job the request names stops where
+//! it is and reports `CANCELED` from then on, so the status every later
+//! `GetGeneratedPolicy` / `ListPolicyGenerations` reports for it comes from this one
+//! record.
+//!
+//! Only a generation that is still running has work to stop. A job that has already
+//! reached a terminal status the cancel did not produce is refused with the modelled
+//! `ValidationException` (HTTP 400) — the operation models no other client error — while
+//! re-cancelling a job this already cancelled answers the same success, which is what the
+//! model's `@idempotent` trait on this operation means.
 //!
 //! ## Shape of an operation
 //!
@@ -132,12 +134,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CancelPolicyGeneration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CANCEL_POLICY_GENERATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CANCEL_POLICY_GENERATION_OUTPUT_SCHEMA;
-    // `CancelPolicyGenerationResponse` is a declared structure with NO members, so the
-    // success this operation will answer once it is implemented carries no content:
-    // 204, under the same rule as the tag mutations
-    // ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]). The handler below still answers
-    // 501, so this status is what the implementer inherits rather than something a
-    // caller sees today.
+    // `CancelPolicyGenerationResponse` is a declared structure with NO members, so a
+    // successful cancel carries no content: 204, under the same rule as the tag
+    // mutations ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]).
     const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
@@ -145,18 +144,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelPolicyGeneration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelPolicyGenerationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelPolicyGeneration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::StoreUnavailable);
+            CancelPolicyGenerationErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        let now = ::std::time::SystemTime::now();
+        let job = state
+            .policy_generations
+            .get_mut(&input.job_id)
+            .ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                );
+                CancelPolicyGenerationErrorModeled::ValidationException(
+                    crate::state::policy_generation_not_found(&input.job_id),
+                )
+            })?;
+
+        if job.canceled_at.is_some() {
+            // The same cancel retried: the job is already stopped at the instant the
+            // first call stopped it, so this one changes nothing and answers the same
+            // success. Nothing about the record moves — a retry must not restate when the
+            // generation stopped.
+            drop(state);
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::NoChange);
+            return Ok(CancelPolicyGenerationOutput {});
+        }
+
+        if !job.is_in_progress(now) {
+            let (status, _) = job.status_at(now);
+            let refusal = crate::state::policy_generation_not_cancelable(&input.job_id, status);
+            drop(state);
+            crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
+            return Err(CancelPolicyGenerationErrorModeled::ValidationException(refusal).into());
+        }
+
+        job.canceled_at = Some(now);
+
+        // The store guard is released before the call is recorded, so the lock is held
+        // for the write alone.
+        drop(state);
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::PolicyGenerationCanceled,
+        );
+        Ok(CancelPolicyGenerationOutput {})
     }
 }

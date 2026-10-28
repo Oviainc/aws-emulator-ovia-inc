@@ -17,7 +17,9 @@
 //! network is resolved in that same store, and against the same VPC: the security groups
 //! that "allow traffic between the Amazon EVS control plane and your VPC"
 //! ([`security_group_failures`]) and the blocks the VLAN subnets are provisioned from
-//! ([`vlan_placement_failures`]).
+//! ([`vlan_placement_failures`]). The route server peers the environment's route server
+//! endpoints peer with are resolved there too, by id and not against a VPC, because a peer
+//! is identified account-wide ([`route_server_peer_failures`]).
 //!
 //! A host is placed on EC2 resources of the caller's account the same way: a
 //! `placementGroupId` is "the unique ID of the placement group where the host is placed"
@@ -311,6 +313,60 @@ pub fn host_placement_failures<Eng: Send + Sync + 'static>(
         }
     }
     failures
+}
+
+/// The clause stated for a route server peer id the account's own Amazon EC2 store holds
+/// no route server peer for.
+///
+/// `member` is the PATH of the entry that named it, so the clause points at the element the
+/// caller wrote. Stated in the same form as [`invalid_placement_group_clause`], because it
+/// is the same kind of failure: a member naming an Amazon EC2 resource of the caller's
+/// account that the account does not hold.
+pub fn invalid_route_server_peer_clause(member: &str, peer_id: &str) -> ValidationExceptionField {
+    super::field_failure_stated(
+        member,
+        format!(
+            "The route server peer id {peer_id} given for {member} is not valid or does not \
+             exist. Please verify the route server peer id exists and is valid."
+        ),
+    )
+}
+
+/// One route server peer a request named, and the path of the member that named it, so a
+/// refusal names the element the caller wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteServerPeerReference<'a> {
+    /// The path of the member this id came from.
+    pub member: &'a str,
+    /// The `RouteServerPeerId` the request supplied.
+    pub peer_id: &'a str,
+}
+
+/// Every failure of the precondition that each route server peer a request names is a peer
+/// the account's own Amazon EC2 store holds.
+///
+/// A route server peer is an EC2 resource of the caller's account — `RouteServerPeerId` is
+/// minted by `CreateRouteServerPeer` and Amazon EVS creates none — so an id that names no
+/// peer of the account names nothing to peer with, exactly as `vpcId` names no VPC to
+/// deploy into ([`network_failures`]) and a `placementGroupId` no group to place a host in
+/// ([`host_placement_failures`]). The question asked is the one EC2 itself answers for such
+/// an id: whether the account holds a peer record of it, whatever state that peer is in.
+///
+/// An unreadable EC2 store reports no failure at all, the "evidence of nothing" answer
+/// every function here gives for it.
+pub fn route_server_peer_failures<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    peers: &[RouteServerPeerReference<'_>],
+) -> Vec<ValidationExceptionField> {
+    let Some(state) = ec2_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    peers
+        .iter()
+        .filter(|peer| !store.route_server_peers.contains_key(peer.peer_id))
+        .map(|peer| invalid_route_server_peer_clause(peer.member, peer.peer_id))
+        .collect()
 }
 
 /// How many elastic network interfaces Amazon EVS attaches to a host.

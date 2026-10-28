@@ -23,7 +23,9 @@
 //! - `override_operation` — EDITED HERE: not a re-route. The key and the handler stay the
 //!   generated routing table's, but `PutMetricData` is served through
 //!   [`ReportingDroppedEntities`], so an accepted call whose entity this service could not
-//!   hold says so in its response header; every other key falls through to that table.
+//!   hold says so in its response header, and `GetMetricStatistics` through
+//!   [`RefusingValuesOutsideAnEnum`], so a value outside an enumerated type is refused as one
+//!   of the parameter faults ITS model declares; every other key falls through to that table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -43,7 +45,7 @@
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
-    Refused, Service,
+    Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
@@ -70,10 +72,13 @@ pub(crate) fn off_the_async_worker<T>(work: impl FnOnce() -> T) -> T {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// `PutMetricData`, the one operation whose answer carries something the response body
-    /// cannot: built from the SAME shared engine as the generated table's, and keyed by the
-    /// routing key the protocol resolves, so the operation served is the modelled one.
-    reporting_dropped_entities: OperationRoutingTable,
+    /// The operations whose ANSWER this file owns a part of — the one whose accepted response
+    /// carries something its body cannot ([`ReportingDroppedEntities`]), and the one metric
+    /// read whose model declares a parameter fault to refuse a value outside an enumerated
+    /// type with ([`RefusingValuesOutsideAnEnum`]). Each is built from the SAME shared engine
+    /// as the generated table's and keyed by the routing key the protocol resolves, so the
+    /// operation served is the modelled one.
+    overridden: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -81,16 +86,28 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut reporting_dropped_entities = OperationRoutingTable::new();
-        reporting_dropped_entities.add_operation(
+        let mut overridden = OperationRoutingTable::new();
+        overridden.add_operation(
             "PutMetricData",
             Box::new(ReportingDroppedEntities::new(
                 crate::ops::put_metric_data::PutMetricData::new(Arc::clone(&engine)),
             )) as Box<dyn ErasedOperation>,
         );
+        // `GetMetricStatistics` validates the SAME enumerated types as the retrieving read and
+        // answers a value outside one as one of the parameter faults its model declares, which
+        // the refusal seam cannot do because it cannot see which operation was called
+        // ([`RefusingValuesOutsideAnEnum`]); every other operation keeps this service's own
+        // validation code ([`scalar_enum_refusal`]).
+        overridden.add_operation(
+            "GetMetricStatistics",
+            Box::new(RefusingValuesOutsideAnEnum::new(
+                crate::ops::get_metric_statistics::GetMetricStatistics::new(Arc::clone(&engine)),
+                parameter_fault_for,
+            )) as Box<dyn ErasedOperation>,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            reporting_dropped_entities,
+            overridden,
         }
     }
 }
@@ -119,6 +136,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// Every other violation keeps the framework's code and wording: a scalar outside its own
 /// LENGTH or range bound is what this service is recorded answering `ValidationException`
 /// for, and a code a client branches on is not changed without a recording that shows it.
+///
+/// This seam cannot see WHICH operation was called, and which validator answers a value
+/// outside an enumerated type is an operation's property: the read whose model declares the
+/// parameter faults answers one of THEM rather than the code above, so it is served through
+/// [`RefusingValuesOutsideAnEnum`] and never reaches here with such a violation.
 fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -197,18 +219,33 @@ fn dimension_cap_refusal(violation: &aws_smithy_schema_server::Violation) -> Opt
 /// declares — which is what lets a client repair the request. The submitted value is NOT
 /// echoed; the set it had to come from is what locates the repair.
 fn list_element_enum_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
+    is_list_element(&violation.path)
+        .then(|| enum_value_refusal(violation))
+        .flatten()
+}
+
+/// The refusal of a value outside the enumerated type its member targets, as an operation that
+/// MODELS this service's parameter faults states it, or `None` when `violation` is not one.
+///
+/// One sentence for every such value ([`crate::state::value_in_set_message`]): the request
+/// member path it arrived on and the whole value set the type declares, and nothing of the
+/// submitted value — the set is what lets a client repair the request. The path is the one the
+/// validating walk found, spelled as this service's refusals spell a request member
+/// ([`crate::state::query_parameter_path`]), with the step into a list's own target shape added
+/// for an ELEMENT of a list, which has no member name of its own.
+fn enum_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
     let aws_smithy_schema_server::ViolationKind::EnumValue(ref allowed) = violation.kind else {
         return None;
     };
-    if !is_list_element(&violation.path) {
-        return None;
-    }
+    let member = crate::state::query_parameter_path(&violation.path);
+    let parameter = if is_list_element(&violation.path) {
+        crate::state::list_target_path(&member)
+    } else {
+        member
+    };
     Some(Refused {
         code: INVALID_PARAMETER_VALUE.to_string(),
-        message: crate::state::value_in_set_message(
-            &crate::state::list_target_path(&crate::state::query_parameter_path(&violation.path)),
-            allowed,
-        ),
+        message: crate::state::value_in_set_message(&parameter, allowed),
     })
 }
 
@@ -232,6 +269,124 @@ fn is_dimension_collection(path: &str) -> bool {
 /// validating walk ends such a path with the step from the collection into the element.
 fn is_list_element(path: &str) -> bool {
     path.split('.').next_back() == Some("member")
+}
+
+/// The status a refused request value carries: a value the model does not admit is the
+/// caller's to repair, so every class below is a client error.
+const REFUSAL_STATUS: u16 = 400;
+
+/// How an operation whose model DECLARES this service's parameter faults states a boundary
+/// refusal, or `None` when nothing in `violations` is one of the classes it words.
+///
+/// `GetMetricStatistics` declares `InvalidParameterValueException` ("The value of an input
+/// parameter is bad or out-of-range", `awsQueryError` code [`INVALID_PARAMETER_VALUE`]) beside
+/// the combination and missing-parameter faults, so a client of it branches on that code and
+/// the sentence is this service's own: the dimension cap first and then a value outside an
+/// enumerated type, in the SAME order as the service-wide seam ([`parameter_fault`]), so one
+/// operation cannot answer a request that breaks both differently from every other. An
+/// operation that declares none of those faults keeps the service's own validation code
+/// instead ([`scalar_enum_refusal`]).
+fn parameter_fault_for(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
+    violations
+        .iter()
+        .find_map(dimension_cap_refusal)
+        .or_else(|| violations.iter().find_map(enum_value_refusal))
+}
+
+/// One modelled operation, served so that a request value outside the enumerated type its
+/// member targets is refused by THIS operation's validator rather than by the framework's
+/// generic one.
+///
+/// Which code such a refusal carries is a property of the OPERATION — an operation that models
+/// this service's parameter faults answers one of them, where an operation that models none
+/// keeps this service's own validation code ([`scalar_enum_refusal`]) — and
+/// `Service::override_refusal` is handed the violations alone, with no way to tell which
+/// operation was called. So the choice is made here, where the operation is known, by the
+/// `refusal` policy this wrapper is mounted with ([`parameter_fault_for`]).
+///
+/// Nothing else is re-implemented: a request this policy does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize and every modelled error, and the violations the policy reads come from the
+/// framework's OWN deserializer and constraint walk over the same input schema, so this and
+/// the walk behind it cannot find a different refusal.
+struct RefusingValuesOutsideAnEnum<O> {
+    operation: O,
+    /// How this operation states the violations its validator found, or `None` to leave the
+    /// request to the operation itself.
+    refusal: fn(&[aws_smithy_schema_server::Violation]) -> Option<Refused>,
+}
+
+impl<O> RefusingValuesOutsideAnEnum<O> {
+    /// Wrap the operation, already constructed from the shared engine, with the policy that
+    /// words its boundary refusal.
+    fn new(
+        operation: O,
+        refusal: fn(&[aws_smithy_schema_server::Violation]) -> Option<Refused>,
+    ) -> Self {
+        Self { operation, refusal }
+    }
+}
+
+impl<O> ErasedOperation for RefusingValuesOutsideAnEnum<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this one statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = {
+                let protocol = svc.definition().protocol();
+                // The violations come from the framework's OWN deserializer and constraint
+                // walk, collected by the one shared helper every service that words its own
+                // pre-handler refusal uses, so this and the walk that follows it cannot find
+                // a different set. A request the codec cannot read at all yields none, and so
+                // falls through to the framework's own refusal.
+                let violations =
+                    service_common::validation::refusing_violations::<O>(protocol, req);
+                (self.refusal)(&violations)
+                    .and_then(|refused| refusal_response(protocol, &refused))
+            };
+            match refused {
+                Some(response) => response,
+                None => self.operation.run(svc, req, ctx).await,
+            }
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// `refused` rendered in this service's own error envelope: its code and its one `message`,
+/// with the status every refused request value carries ([`REFUSAL_STATUS`]).
+///
+/// The body is the single-`message` shape every refusal of this service that names no modelled
+/// error renders through (`crate::scaffolded`), which is also all the refusal SEAM can answer
+/// with — a code and a message and nothing else — so a refusal worded here and one the seam
+/// words read alike; `None` when the envelope cannot be built, which leaves the request to the
+/// operation and so to the framework's own refusal.
+fn refusal_response(
+    protocol: &dyn ServerHttpProtocol,
+    refused: &Refused,
+) -> Option<aws_smithy_runtime_api::http::Response> {
+    protocol
+        .serialize_error(
+            &crate::scaffolded::ValidationException::new(refused.message.clone()),
+            &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
+            &refused.code,
+            REFUSAL_STATUS,
+        )
+        .ok()
 }
 
 /// The response header an ACCEPTED `PutMetricData` reports a dropped entity in.
@@ -343,11 +498,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol resolves, and
         // the operation it names is the one served — `PutMetricData` wrapped in
-        // [`ReportingDroppedEntities`] so an accepted call reports the entity it dropped.
-        // Every other key resolves to `None` here, exactly as it would in an unedited
-        // service, and falls through to the generated table.
+        // [`ReportingDroppedEntities`] so an accepted call reports the entity it dropped, and
+        // `GetMetricStatistics` wrapped in [`RefusingValuesOutsideAnEnum`] so a value outside
+        // an enumerated type is refused as one of the parameter faults its model declares.
+        // Every other key resolves to `None` here, exactly as it would in an unedited service,
+        // and falls through to the generated table — where a refusal of such a value keeps this
+        // service's own validation code ([`scalar_enum_refusal`]).
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.reporting_dropped_entities.get(key)
+        self.overridden.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
