@@ -120,6 +120,11 @@ mod ses_v1_receipt_rule_sets_through_the_router;
 // suites add their line to.
 #[path = "all/cloudformation_provisions_ses_configuration_sets.rs"]
 mod cloudformation_provisions_ses_configuration_sets;
+// Declared beside its sibling suite, at the head, for the reason the entries above record:
+// the appended tail and the sorted `c…` span (where every cloudformation suite lands) are
+// both regions concurrently landing suites add their line to.
+#[path = "all/cloudformation_provisions_ses_receipt_rule_sets.rs"]
+mod cloudformation_provisions_ses_receipt_rule_sets;
 // At the head for the same reason, and moved here out of the `c…` span of the sorted
 // list: that span is where the cloudformation/cloudtrail suites land, so a line beside
 // them lost repeated squash merges to branches that touched it in the same window.
