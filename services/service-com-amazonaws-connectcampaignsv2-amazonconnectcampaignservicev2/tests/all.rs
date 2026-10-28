@@ -71,6 +71,8 @@ mod instance_onboarding;
 mod instance_onboarding_requires_a_connect_instance;
 #[path = "all/instance_onboarding_tags_and_outbound_requests.rs"]
 mod instance_onboarding_tags_and_outbound_requests;
+#[path = "all/instance_refusal_messages.rs"]
+mod instance_refusal_messages;
 #[path = "all/onboarding_job_deletion.rs"]
 mod onboarding_job_deletion;
 #[path = "all/outbound_request_expiration.rs"]

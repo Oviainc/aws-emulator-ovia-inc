@@ -1067,6 +1067,18 @@ pub const ONBOARDING_STATUS_FAILED: &str = "FAILED";
 pub const ONBOARDING_JOB_NOT_FAILED_MESSAGE: &str =
     "Instance onboarding job is not in failed status. Only failed job can be deleted.";
 
+/// What this service answers when a Connect instance has no onboarding job to report
+/// on or to delete: the region holds no record of one, because the instance was never
+/// onboarded there or its job has since been deleted.
+///
+/// Composed from the request, so the refusal names the instance the caller asked
+/// about. The one text the two operations whose own resource IS that job
+/// (`GetInstanceOnboardingJobStatus` and `DeleteInstanceOnboardingJob`) share, so the
+/// two cannot disagree about a request they both refuse.
+pub fn onboarding_job_not_found_message(connect_instance_id: &str) -> String {
+    format!("No onboarding job found for Connect instance {connect_instance_id}")
+}
+
 /// What this service answers when a well-formed campaign id names no campaign.
 ///
 /// A FIXED service string — it does not embed the requested id, which is what the
@@ -1101,15 +1113,22 @@ pub const CAMPAIGN_DELETION_POLICY_DELETE_ALL: &str = "DELETE_ALL";
 /// reading, since a caller that did not ask for the campaigns to go keeps them.
 pub const CAMPAIGN_DELETION_POLICY_RETAIN_ALL: &str = "RETAIN_ALL";
 
-/// What this service answers when a `connectInstanceId` names no Connect instance
-/// onboarded to Campaigns: there is no instance configuration to report, nor any to
-/// configure.
+/// What this service answers when the resource a request addresses IS the Campaigns
+/// configuration of a Connect instance the request's region holds none for: there is
+/// no instance configuration to report, nor any to configure.
 ///
 /// Composed from the request, so the refusal names the instance the caller asked
-/// about. The one text every instance-scoped operation shares, so two of them cannot
-/// disagree about an instance this service holds nothing for.
+/// about, as the recorded responses of this class do. The one text shared by every
+/// operation whose own resource is that configuration — the two on
+/// `/v2/connect-instance/{id}/config`, and the two on the instance's
+/// communication-limits, which are a member of that same stored configuration (see
+/// [`StoredInstanceOnboarding::communication_limits`]) — so two of them cannot
+/// disagree about an instance this service holds no configuration for. An operation
+/// that addresses some OTHER resource and only requires the instance to be usable by
+/// Campaigns refuses with [`INSTANCE_NOT_FOUND_MESSAGE`] instead, which is the text
+/// recorded for that class.
 pub fn instance_config_not_found_message(connect_instance_id: &str) -> String {
-    format!("ConnectInstanceConfig not found {connect_instance_id}")
+    format!("ConnectInstanceConfig not found {connect_instance_id}.")
 }
 
 /// How long after the `StartInstanceOnboardingJob` call that started it an
@@ -1268,18 +1287,21 @@ pub fn service_linked_role_arn() -> String {
     )
 }
 
-/// What this service answers when a Connect instance id names no instance onboarded
-/// to Campaigns.
+/// What this service answers when a request whose own resource is NOT the instance's
+/// configuration names a Connect instance that is not usable by Campaigns: one the
+/// account's Amazon Connect registry does not hold, or one that no finished onboarding
+/// job has enabled for Campaigns in the request's region.
 ///
-/// The one text every operation that resolves an instance id against the
-/// instance-onboarding store uses, so two of them cannot disagree about a request
-/// they both refuse. Composed from the request, which is why it names the id it was
-/// given.
-pub fn instance_not_found_message(connect_instance_id: &str) -> String {
-    format!(
-        "Connect instance {connect_instance_id} does not exist or is not enabled to use Campaigns"
-    )
-}
+/// A FIXED service string — it names no instance and carries nothing from the request,
+/// which is what the recorded responses of this class carry — so every refusal of this
+/// kind reads the same and the response is deterministic. The one text shared by the
+/// operations that merely require a usable instance (starting an onboarding job,
+/// creating a campaign, and the instance-integration operations), so two of them
+/// cannot disagree about a request they both refuse. The operations that address the
+/// instance's configuration itself answer
+/// [`instance_config_not_found_message`] instead.
+pub const INSTANCE_NOT_FOUND_MESSAGE: &str =
+    "Connect Instance does not exist or is not enabled to use Campaigns.";
 
 /// Whether the caller's Amazon Connect account holds an instance with
 /// `connect_instance_id`.
