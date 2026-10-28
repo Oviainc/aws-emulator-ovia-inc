@@ -4,7 +4,10 @@
 //!
 //! Mints a connector: derives its `Type` and its SCEP `Endpoint` from the request, stores a
 //! full record keyed by a freshly minted ARN, and answers that ARN. The connector starts
-//! `CREATING`; the clock owes it `ACTIVE` (see [`crate::state::TRANSITION_SPAN`]).
+//! `CREATING`; the clock owes it the status its creation lands in (see
+//! [`crate::state::TRANSITION_SPAN`]) — `ACTIVE`, or `FAILED` with the reason it failed for
+//! when the private CA it names is not one it could reach
+//! ([`crate::state::private_ca_failure_reason`]).
 //!
 //! ## Shape of an operation
 //!
@@ -307,6 +310,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.vpc_endpoint_id.as_deref(),
         );
 
+        // Whether the private CA this connector links is one it could reach, decided from
+        // the ARN the request named and the Region and account this connector is created in
+        // (`crate::state::private_ca_failure_reason`). The call itself is still ACCEPTED —
+        // it answers 202 and the connector starts `CREATING`, as it does for a CA that is
+        // reachable — because the outcome of linking the CA is what `Status` and
+        // `StatusReason` report: the status reason's own doc is "Information about why
+        // connector creation failed, if status is FAILED", and the values it carries for
+        // the private CA are observable only on a connector that was created and then
+        // failed.
+        let private_ca_failure =
+            crate::state::private_ca_failure_reason(&region, &input.certificate_authority_arn);
+
         // `Type` follows from the request: absent `MobileDeviceManagement` means a
         // general-purpose connector, an `IntuneConfiguration` means an Intune one — and only
         // an Intune connector publishes OIDC parameters. Those parameters are the service's
@@ -327,15 +342,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             mobile_device_management: input.mobile_device_management,
             open_id_configuration,
             vpc_endpoint_id: input.vpc_endpoint_id,
-            // A new connector is not serving yet: the clock owes it ACTIVE.
+            // A new connector is not serving yet: the clock owes it the status its creation
+            // lands in.
             status: crate::state::STATUS_CREATING.to_string(),
             // `StatusReason` says why creation FAILED, so a connector that is still being
             // created carries none.
             status_reason: None,
             pending: Some(crate::state::PendingTransition {
-                outcome: crate::state::PendingOutcome::Status(
-                    crate::state::STATUS_ACTIVE.to_string(),
-                ),
+                // A connector whose CA it could not reach never comes up: the creation
+                // lands in the failure status, carrying the reason it failed for. One whose
+                // CA is reachable lands in the ready status with no reason.
+                outcome: crate::state::PendingOutcome::Status {
+                    status: match private_ca_failure {
+                        Some(_) => crate::state::STATUS_FAILED.to_string(),
+                        None => crate::state::STATUS_ACTIVE.to_string(),
+                    },
+                    reason: private_ca_failure.map(str::to_string),
+                },
                 due_at: now + crate::state::TRANSITION_SPAN,
             }),
             endpoint,

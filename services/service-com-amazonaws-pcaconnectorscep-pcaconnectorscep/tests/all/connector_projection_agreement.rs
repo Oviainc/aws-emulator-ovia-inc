@@ -172,8 +172,9 @@ fn hold_transition(engine: &engine::InMemoryEngine, case: &str, arn: &str) {
 }
 
 /// Put `arn` in the terminal failure status, the one status that also carries a
-/// `StatusReason`. The emulator's own creates always succeed, so this record is arranged
-/// through the service's state rather than through a handler.
+/// `StatusReason`. A create whose private CA the connector cannot reach reaches this status
+/// through the handlers — which its own suite covers — so here the record is arranged through
+/// the service's state, keeping this case about the projection alone.
 fn force_failed(engine: &engine::InMemoryEngine, case: &str, arn: &str) {
     with_connector(engine, case, arn, |connector| {
         connector.pending = None;

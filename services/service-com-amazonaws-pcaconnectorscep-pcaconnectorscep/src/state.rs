@@ -40,6 +40,10 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// delete answers 202 and only accepts the work, so the connector is reported in this status
 /// until the teardown completes and the record (with its challenges) disappears.
 pub const STATUS_DELETING: &str = "DELETING";
+/// The terminal status of a connector creation that did not come up. It is the one status
+/// that carries a `StatusReason` — "Information about why connector creation failed, if
+/// status is FAILED" (the `StatusReason` member's own doc).
+pub const STATUS_FAILED: &str = "FAILED";
 
 /// `ConnectorType` value of a connector created without `MobileDeviceManagement` — the
 /// member's own doc: "If you don't supply a value, by default Connector for SCEP creates a
@@ -60,8 +64,16 @@ pub const REASON_INVALID_STATE: &str = "INVALID_STATE";
 /// `ValidationExceptionReason` for a call that does not apply to the connector's `Type`.
 pub const REASON_INVALID_CONNECTOR_TYPE: &str = "INVALID_CONNECTOR_TYPE";
 
+/// `ConnectorStatusReason` of a connector whose private CA could not be found (smithy_query:
+/// shape ConnectorStatusReason).
+pub const REASON_PRIVATECA_RESOURCE_NOT_FOUND: &str = "PRIVATECA_RESOURCE_NOT_FOUND";
+/// `ConnectorStatusReason` of a connector that was not allowed to use the private CA it
+/// names (smithy_query: shape ConnectorStatusReason).
+pub const REASON_PRIVATECA_ACCESS_DENIED: &str = "PRIVATECA_ACCESS_DENIED";
+
 /// How long a connector stays in a non-terminal status before the clock settles it:
-/// `CREATING` before it owes `ACTIVE`, and `DELETING` before the record disappears.
+/// `CREATING` before it owes the status its creation lands in (`ACTIVE`, or `FAILED` for a
+/// creation that cannot come up), and `DELETING` before the record disappears.
 ///
 /// `CreateConnector` and `DeleteConnector` both answer HTTP 202 and the connector's own
 /// `Status` enum carries `CREATING` and `DELETING`, so both are asynchronous: a resource the
@@ -159,12 +171,18 @@ pub struct PendingTransition {
 /// Where a pending transition leaves the connector.
 ///
 /// A connector in a non-terminal `ConnectorStatus` either settles into another status
-/// (`CREATING` -> `ACTIVE`) or ceases to exist (`DELETING` -> gone, taking its challenges
-/// with it), so those are the only two outcomes the clock can owe.
+/// (`CREATING` -> `ACTIVE`, or -> `FAILED` for a creation that cannot come up) or ceases to
+/// exist (`DELETING` -> gone, taking its challenges with it), so those are the only two
+/// outcomes the clock can owe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingOutcome {
-    /// The connector settles into this `ConnectorStatus` value.
-    Status(String),
+    /// The connector settles into this `ConnectorStatus` value, carrying this
+    /// `ConnectorStatusReason` — which only the failure status has one of, because the
+    /// member reports "why connector creation failed".
+    Status {
+        status: String,
+        reason: Option<String>,
+    },
     /// The teardown completes: the record, its challenges and its tags are gone.
     Removed,
 }
@@ -283,11 +301,11 @@ impl StoredConnector {
             return true;
         }
         match pending.outcome {
-            PendingOutcome::Status(status) => {
+            PendingOutcome::Status { status, reason } => {
                 self.status = status;
                 // The change happened when the clock made it due, not when someone looked.
                 self.updated_at = pending.due_at.max(self.updated_at);
-                self.status_reason = None;
+                self.status_reason = reason;
                 self.pending = None;
                 true
             }
@@ -547,6 +565,54 @@ pub fn token_key(region: &str, client_token: &str) -> (String, String) {
 /// carries no non-empty Region segment there.
 pub fn arn_region(arn: &str) -> Option<&str> {
     arn.split(':').nth(3).filter(|region| !region.is_empty())
+}
+
+/// The partition segment of an ARN: field two of
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`. `None` for a string that
+/// carries no non-empty partition segment there.
+pub fn arn_partition(arn: &str) -> Option<&str> {
+    arn.split(':').nth(1).filter(|partition| !partition.is_empty())
+}
+
+/// The account segment of an ARN: field five of
+/// `arn:<partition>:<service>:<region>:<account>:<resource>`. `None` for a string that
+/// carries no non-empty account segment there.
+pub fn arn_account(arn: &str) -> Option<&str> {
+    arn.split(':').nth(4).filter(|account| !account.is_empty())
+}
+
+/// Why the private CA an ARN names cannot be linked by a connector created in `region`, as
+/// the `ConnectorStatusReason` that says so — or `None` when the ARN names a CA this
+/// connector could reach.
+///
+/// A connector talks to its private CA as the account it is created in, from the Region it
+/// is created in: a private CA is a regional resource of one account, and neither an
+/// endpoint of another Region nor a principal of another account resolves it. So the three
+/// ARN segments that place a resource — partition, Region and account — must be the ones
+/// this connector's OWN ARN carries ([`connector_arn_prefix`], which is where this service's
+/// partition and account come from, so there is one source for both):
+///
+/// * a CA in another partition or another Region is not a CA this Region's endpoint can
+///   resolve, so it is the one that cannot be found;
+/// * a CA in another account exists, but nothing grants this connector the use of it, so
+///   that is the reason about permission rather than about existence.
+///
+/// `VpcEndpointId` gets no equivalent check: it carries neither a Region nor an account
+/// segment, so nothing in the request says whether the endpoint it names is reachable.
+pub fn private_ca_failure_reason(
+    region: &str,
+    certificate_authority_arn: &str,
+) -> Option<&'static str> {
+    let own = connector_arn_prefix(region);
+    if arn_partition(certificate_authority_arn) != arn_partition(&own)
+        || arn_region(certificate_authority_arn) != arn_region(&own)
+    {
+        return Some(REASON_PRIVATECA_RESOURCE_NOT_FOUND);
+    }
+    if arn_account(certificate_authority_arn) != arn_account(&own) {
+        return Some(REASON_PRIVATECA_ACCESS_DENIED);
+    }
+    None
 }
 
 /// Which of this service's two resource kinds an ARN names, as the `ResourceType` member of
