@@ -151,6 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The reported status must have caught up with the clock before it is
         // filtered on, or a store whose transition is already due would be
@@ -196,7 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page: Vec<DatastoreProperties> = matched[start..]
             .iter()
             .take(page_size)
-            .map(|datastore| datastore.properties())
+            // ONE instant for the whole page, so every entry's derived restore
+            // window is reported as of the same moment.
+            .map(|datastore| datastore.properties(now))
             .collect();
         // A token is emitted ONLY when entries remain after this page.
         let next_token = matched

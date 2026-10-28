@@ -204,6 +204,49 @@ async fn described_properties(service: &HealthLake, id: &str) -> Value {
     service.describe(id).await
 }
 
+/// `properties` with the one reported member that is not stored state CHECKED
+/// and then normalised, so the comparisons below can hold every other member to
+/// exact equality.
+///
+/// `BackupStatusInfo.LatestRestorePoint` is "the latest point in time the data
+/// store can be restored to", and a continuous backup covers the data store up
+/// to the present, so it advances between two reads of one unchanged record.
+/// What this suite can pin about it is its invariant — reported exactly when the
+/// rest of the restore window is, and never before that window's start — which
+/// is asserted here before the value is replaced by a marker. The window itself
+/// is pinned over a table of backup configurations by the sibling suite
+/// `datastore_backup_restore_window`.
+fn stored_members(case: &str, properties: &Value) -> Value {
+    let mut stored = properties.clone();
+    let Some(status) = stored
+        .get_mut("BackupStatusInfo")
+        .and_then(Value::as_object_mut)
+    else {
+        return stored;
+    };
+    let earliest = status.get("EarliestRestorePoint").and_then(Value::as_f64);
+    let latest = status.get("LatestRestorePoint").and_then(Value::as_f64);
+    match (earliest, latest) {
+        (Some(earliest), Some(latest)) => {
+            assert!(
+                latest >= earliest,
+                "case {case:?}: expected LatestRestorePoint at or after the EarliestRestorePoint \
+                 ({earliest}), got {latest}"
+            );
+            status.insert(
+                "LatestRestorePoint".to_string(),
+                json!("<the instant of the read>"),
+            );
+        }
+        (None, None) => {}
+        (earliest, latest) => panic!(
+            "case {case:?}: a restore window is reported whole or not at all, got an earliest of \
+             {earliest:?} and a latest of {latest:?}"
+        ),
+    }
+    stored
+}
+
 /// `UpdateFHIRDatastore`'s request for `id`, carrying `update`'s members.
 fn update_request(id: &str, update: &Value) -> Value {
     let mut request = update.clone();
@@ -244,7 +287,8 @@ async fn update_replaces_the_members_the_request_carries_and_leaves_the_rest() {
             .await;
         let properties = &answered["DatastoreProperties"];
         assert_eq!(
-            properties, &updating,
+            stored_members(case, properties),
+            stored_members(case, &updating),
             "case {case:?}: UpdateFHIRDatastore must report the requested members replaced and \
              everything else as it was, got {properties}"
         );
@@ -252,7 +296,8 @@ async fn update_replaces_the_members_the_request_carries_and_leaves_the_rest() {
         // The write is in the STORE, not just in the answer.
         let described = described_properties(&service, &id).await;
         assert_eq!(
-            described, updating,
+            stored_members(case, &described),
+            stored_members(case, &updating),
             "case {case:?}: DescribeFHIRDatastore must report what the update wrote, \
              got {described}"
         );
@@ -265,7 +310,8 @@ async fn update_replaces_the_members_the_request_carries_and_leaves_the_rest() {
     for (case, expected, id) in settled {
         let described = described_properties(&service, &id).await;
         assert_eq!(
-            described, expected,
+            stored_members(case, &described),
+            stored_members(case, &expected),
             "case {case:?}: the settled data store must still report what the update wrote, \
              got {described}"
         );
@@ -466,7 +512,8 @@ async fn an_update_outside_a_modelled_constraint_is_refused_and_writes_nothing()
         );
         let after = described_properties(&service, &id).await;
         assert_eq!(
-            after, before,
+            stored_members(case, &after),
+            stored_members(case, &before),
             "case {case:?}: a refused update must change nothing, got {after}"
         );
     }

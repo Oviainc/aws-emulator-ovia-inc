@@ -175,6 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A transition the clock already made due is materialised before the
         // status gate below reads it, so this call agrees with `Describe` about
@@ -234,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // call ran or the data store was created.
             datastore.set_backup_configuration(
                 configuration,
-                ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+                ::aws_smithy_types::DateTime::from(now),
             );
         }
 
@@ -254,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ));
 
         Ok(UpdateFHIRDatastoreOutput {
-            datastore_properties: datastore.properties(),
+            datastore_properties: datastore.properties(now),
         })
     }
 }
