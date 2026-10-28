@@ -126,7 +126,9 @@ pub(crate) async fn get_definition(
 }
 
 /// A request body with every required member set, so a row can vary one part of it.
-fn body(scope: &Scope, name: &str, treatments: Vec<Value>, control: Value) -> Value {
+/// `pub(crate)` because more than one suite needs a definition that differs from a valid
+/// one in exactly one member.
+pub(crate) fn body(scope: &Scope, name: &str, treatments: Vec<Value>, control: Value) -> Value {
     json!({
         "Name": name,
         "ConfigurationProfileIdentifier": scope.profile,

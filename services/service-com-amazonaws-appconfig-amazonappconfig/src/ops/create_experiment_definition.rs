@@ -289,18 +289,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A definition's name ADDRESSES it: every `ExperimentDefinitionIdentifier` in
         // this service resolves "ID or name", so two definitions under one application
         // cannot share a name — a second create under a name already in use conflicts
-        // with the state of the resource that holds it and writes nothing.
-        if let Some(existing) = application
+        // with the state of the resource that holds it and writes nothing. The refusal is
+        // built from the request's own `Name` and the application it was scoped to; the
+        // definition already holding the name is not disclosed.
+        if application
             .experiment_definitions
             .values()
-            .find(|definition| definition.name == input.name)
+            .any(|definition| definition.name == input.name)
         {
             return Err(CreateExperimentDefinitionErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "An experiment definition named {} already exists in application {} \
-                         with id {}.",
-                        input.name, application.id, existing.id
+                    message: Some(crate::state::experiment_definition_name_taken(
+                        &input.name,
+                        &application.id,
                     )),
                 },
             )

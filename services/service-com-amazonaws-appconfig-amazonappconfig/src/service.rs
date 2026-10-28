@@ -45,7 +45,8 @@ use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, Service,
 };
 use std::sync::Arc;
 
@@ -209,37 +210,95 @@ fn with_service_detail_member(mut resp: RtResponse) -> RtResponse {
     resp
 }
 
-/// The operation the generated routing table names for this request.
-fn modeled_operation<'s>(
-    svc: &'s dyn Service,
-    req: &'s RtRequest,
-) -> Option<&'s dyn ErasedOperation> {
-    let key = svc.definition().protocol().routing_key(req).ok()?;
-    svc.definition().routing_table().get(key)
+/// The error code this service names for a request that broke a modelled constraint.
+///
+/// AppConfig's model declares NO `ValidationException` anywhere: every operation lists
+/// `BadRequestException` (HTTP 400) for an input its constraints refuse, so that is the
+/// code a client switches on, and it is stated once here for both paths that render such a
+/// refusal ([`InServiceDialect`] and [`EmulatedService::override_refusal`]).
+const CONSTRAINT_REFUSAL_CODE: &str = "BadRequestException";
+
+/// This service's answer to the violations `req` broke, or `None` when it broke none.
+///
+/// The sentence is the framework's own `N validation error(s) detected: Value '<v>' at
+/// '<member>' failed to satisfy constraint: …` envelope — already the text AWS states for a
+/// constraint violation, and built from the request's own member path and value — with each
+/// violation restated through [`as_stated`] for the one thing AppConfig words differently,
+/// how a `@pattern` requirement is quoted. The status and the envelope stay the
+/// framework's, through the shared renderer every service that words its own pre-handler
+/// refusal answers from (`service_common::front_door::worded_rejection`): a constraint
+/// failure is a 400 in every protocol.
+///
+/// The values it quotes are the bytes the CALLER SENT. `service_common::validation`
+/// re-reads the same built input the constraint walk validated to restore each echo,
+/// because the framework stores a long value already shortened to a prefix plus a
+/// byte-count annotation — text no AWS service emits — and the echoed value is part of the
+/// request-derived rule a caller reads the rejected input back out of.
+fn constraint_refusal<O: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
+    // The protocol is read, used and dropped inside this one function, so nothing borrowed
+    // from the service definition is held across the caller's await: `&dyn
+    // ErasedServiceDefinition` is not `Sync`.
+    let violations =
+        service_common::validation::refusing_violations::<O>(svc.definition().protocol(), req);
+    let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
+    let message = envelope(&stated)?;
+    Some(service_common::front_door::worded_rejection(
+        svc,
+        violations,
+        Refused {
+            code: CONSTRAINT_REFUSAL_CODE.to_string(),
+            message,
+        },
+    ))
 }
 
-/// Serves a modelled operation through the framework exactly as the routing table would,
-/// then reports the detail text of whatever it answered in this service's `Message`
-/// member.
+/// Serves one modelled operation, with every failure of it stated in this service's own
+/// dialect: a pre-handler constraint refusal QUOTING the value the caller submitted, and
+/// the detail text of whatever is answered reported in the `Message` member this service's
+/// model declares for it.
 ///
-/// WHY a wrapper and not [`Service::override_refusal`]: that seam chooses the CODE and the
-/// WORDS of a pre-handler refusal, not the body member they are serialized into, and the
-/// framework writes a framework-rendered error's text into the synthetic shapes' own
-/// `message`. A wrapper sees the whole response, so it can report that text where this
-/// service's model says an error carries it.
+/// WHY a wrapper and not [`Service::override_refusal`]: that seam is handed the violations
+/// ALONE — no operation, no request — so it can neither recover a value the framework
+/// already shortened as it BUILT the violation, nor name the operation whose input schema
+/// the request would have to be re-read against. Nor can it choose the body member the
+/// words are serialized into: the framework writes a framework-rendered error's text into
+/// the synthetic shapes' own `message`. A per-operation wrapper has the request, the
+/// operation and the whole response, so it can do all three.
 ///
-/// The same mechanism is inlined in `service-com-amazonaws-ssoadmin-swbexternalservice`
-/// and `service-com-amazonaws-connecthealth-connecthealth`, for the same reason; it
-/// belongs in a shared home once one exists, and nothing here is specific to AppConfig
-/// beyond [`MODELLED_ERROR_SHAPES`] and [`DETAIL_MEMBER`].
+/// WHY not `service_common::front_door::FrontDoor`, which is the same wrapping for the
+/// services whose own front door refuses a body: that wrapper narrows its refusal to the
+/// violations a member BOUND TO THE BODY broke (`binds_to_body`) and words them as that
+/// layer's fixed sentence, and AppConfig does neither — it refuses a `@httpLabel`, an
+/// `@httpQuery` and an `@httpHeader` outside its constraints in the same modelled
+/// `BadRequestException` as a body member, which `pattern_refusal_quoting` pins per
+/// binding. Everything that is NOT this service's own is taken from the shared module all
+/// the same: the collecting walk ([`constraint_refusal`]), the rendering
+/// (`front_door::worded_rejection`) and the key an operation is filed under ([`served`]).
+/// What stays here is the two things that are AppConfig's: refusing over EVERY violation
+/// rather than the body's, and the `Message` member its model declares.
 ///
-/// It stores no operation of its own: the one it delegates to is the one the service's
-/// routing table names for the request, resolved from the `svc` the framework passes into
-/// [`ErasedOperation::run`]. So the framework owns the whole request walk and every status,
-/// code and text it answers with; this wrapper owns only which member that text is in.
-struct DetailMemberOperation;
+/// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error. The violations come from the framework's
+/// own machinery (the protocol's deserializer and its constraint walk over the built
+/// input), so this cannot find a different set from the walk that follows it; the cost is
+/// that a request it does not refuse is read twice, bounded by the body limits the
+/// framework already enforces.
+struct InServiceDialect<O> {
+    operation: O,
+}
 
-impl ErasedOperation for DetailMemberOperation {
+impl<O> InServiceDialect<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for InServiceDialect<O>
+where
+    O: Operation + ErasedOperation,
+{
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -247,21 +306,17 @@ impl ErasedOperation for DetailMemberOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            match modeled_operation(svc, req) {
-                Some(op) => with_service_detail_member(op.run(svc, req, ctx).await),
-                // Unreachable through `Service::override_operation`, which claims a
-                // request only when the routing table holds its key; answered as the
-                // framework answers an unroutable request rather than guessed at.
-                None => svc.definition().routing_error_response(req),
+            if let Some(refused) = constraint_refusal::<O>(svc, req) {
+                return with_service_detail_member(refused);
             }
+            with_service_detail_member(self.operation.run(svc, req, ctx).await)
         })
     }
 
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        // `None` is "defer to the modelled operation the routing key names" — which is
-        // the operation this wrapper delegates to, so its model-declared schemes decide
-        // and this wrapper cannot weaken them.
-        None
+        self.operation.auth_schemes()
     }
 }
 
@@ -304,11 +359,36 @@ fn can_handle_parts(parts: &http::request::Parts) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The wrapper every routed request is served through, so an error's detail text is
-    /// reported in the `Message` member this service's model declares for it. Held in a
-    /// field because [`Service::override_operation`] hands back a borrow; it owns no
-    /// operation of its own.
-    detail_member: DetailMemberOperation,
+    /// The same modelled operations the generated table holds, each served through
+    /// [`InServiceDialect`]: a pre-handler constraint refusal quotes the value the caller
+    /// submitted, and every error's detail text is reported in the `Message` member this
+    /// service's model declares for it. Keyed by the routing key the protocol resolves —
+    /// the key the generated table uses — and built from the SAME shared engine, so a
+    /// wrapped operation reads and writes the one store.
+    in_service_dialect: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table` through [`served`].
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            served(
+                &mut $table,
+                crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+            );
+        )+
+    };
+}
+
+/// Serve `operation` through [`InServiceDialect`], filed under its own modelled
+/// [`Operation::NAME`] — the routing key the protocol resolves and the generated table is
+/// keyed by, so the key cannot be spelled by hand. The same keying
+/// `service_common::front_door::FrontDoorTable::serve` does for the shared wrapper.
+fn served<O: Operation + ErasedOperation + 'static>(
+    table: &mut OperationRoutingTable,
+    operation: O,
+) {
+    table.add_operation(O::NAME, Box::new(InServiceDialect::new(operation)));
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -316,9 +396,75 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut in_service_dialect = OperationRoutingTable::new();
+        // EVERY modelled operation, so both rules are applied by ONE code path rather
+        // than per operation: an operation whose input declares no constraint simply
+        // never has a violation to find, which the wrapper reads off that operation's own
+        // input schema. `every_modelled_operation_is_served_in_this_services_dialect`
+        // pins the list against the model.
+        wrap_operations!(
+            in_service_dialect,
+            engine,
+            create_application::CreateApplication,
+            create_configuration_profile::CreateConfigurationProfile,
+            create_deployment_strategy::CreateDeploymentStrategy,
+            create_environment::CreateEnvironment,
+            create_experiment_definition::CreateExperimentDefinition,
+            create_extension::CreateExtension,
+            create_extension_association::CreateExtensionAssociation,
+            create_hosted_configuration_version::CreateHostedConfigurationVersion,
+            delete_application::DeleteApplication,
+            delete_configuration_profile::DeleteConfigurationProfile,
+            delete_deployment_strategy::DeleteDeploymentStrategy,
+            delete_environment::DeleteEnvironment,
+            delete_experiment_definition::DeleteExperimentDefinition,
+            delete_extension::DeleteExtension,
+            delete_extension_association::DeleteExtensionAssociation,
+            delete_hosted_configuration_version::DeleteHostedConfigurationVersion,
+            get_account_settings::GetAccountSettings,
+            get_application::GetApplication,
+            get_configuration::GetConfiguration,
+            get_configuration_profile::GetConfigurationProfile,
+            get_deployment::GetDeployment,
+            get_deployment_strategy::GetDeploymentStrategy,
+            get_environment::GetEnvironment,
+            get_experiment_definition::GetExperimentDefinition,
+            get_experiment_run::GetExperimentRun,
+            get_extension::GetExtension,
+            get_extension_association::GetExtensionAssociation,
+            get_hosted_configuration_version::GetHostedConfigurationVersion,
+            list_applications::ListApplications,
+            list_configuration_profiles::ListConfigurationProfiles,
+            list_deployment_strategies::ListDeploymentStrategies,
+            list_deployments::ListDeployments,
+            list_environments::ListEnvironments,
+            list_experiment_definitions::ListExperimentDefinitions,
+            list_experiment_run_events::ListExperimentRunEvents,
+            list_experiment_runs::ListExperimentRuns,
+            list_extension_associations::ListExtensionAssociations,
+            list_extensions::ListExtensions,
+            list_hosted_configuration_versions::ListHostedConfigurationVersions,
+            list_tags_for_resource::ListTagsForResource,
+            start_deployment::StartDeployment,
+            start_experiment_run::StartExperimentRun,
+            stop_deployment::StopDeployment,
+            stop_experiment_run::StopExperimentRun,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_account_settings::UpdateAccountSettings,
+            update_application::UpdateApplication,
+            update_configuration_profile::UpdateConfigurationProfile,
+            update_deployment_strategy::UpdateDeploymentStrategy,
+            update_environment::UpdateEnvironment,
+            update_experiment_definition::UpdateExperimentDefinition,
+            update_experiment_run::UpdateExperimentRun,
+            update_extension::UpdateExtension,
+            update_extension_association::UpdateExtensionAssociation,
+            validate_configuration::ValidateConfiguration,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            detail_member: DetailMemberOperation,
+            in_service_dialect,
         }
     }
 }
@@ -347,37 +493,37 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol
         // resolves, and the operation it names is the one served — wrapped in
-        // [`DetailMemberOperation`] so an error the FRAMEWORK renders (the pre-handler
-        // refusal of a modelled constraint, the scaffold's 501) reports its detail text
-        // in the `Message` member every error shape in this service's model declares,
-        // rather than in the synthetic shapes' own `message`. A key the model does not
-        // name resolves to `None` here exactly as it does in the generated table, so the
-        // router's routing-error path is unchanged.
+        // [`InServiceDialect`] so a request refused for breaking a modelled constraint
+        // quotes the value the caller submitted, and so an error the FRAMEWORK renders
+        // (that refusal, the scaffold's 501) reports its detail text in the `Message`
+        // member every error shape in this service's model declares, rather than in the
+        // synthetic shapes' own `message`. A key the model does not name resolves to
+        // `None` here exactly as it does in the generated table, so the router's
+        // routing-error path is unchanged.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.entry
-            .routing_table()
-            .get(key)
-            .map(|_| &self.detail_member as &dyn ErasedOperation)
+        self.in_service_dialect.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
+        // Every modelled operation is served through [`InServiceDialect`], which refuses
+        // a constraint violation itself — in this code, in these words, with the value
+        // the caller submitted quoted in full — so this seam is the FALLBACK for a
+        // refusal that reaches the framework's own walk anyway. Wording it here from the
+        // same violations keeps the two paths from disagreeing: a value outside a
+        // declared bound is this service's `BadRequestException` either way, with the
+        // same sentence.
+        //
         // AppConfig's model declares NO `ValidationException` anywhere: a request that
         // violates a declared constraint is refused with the modelled
         // `BadRequestException` (HTTP 400), which every operation in this service
         // lists, so that is the code a client switches on. The framework's default
         // names `ValidationException` — a class this service does not model, which an
-        // SDK cannot classify — so the code is replaced here, once for the whole
-        // service, rather than in each handler: the refusal happens BEFORE any handler
-        // runs.
+        // SDK cannot classify — so the code is replaced here.
         //
-        // The message is the framework's own `N validation error detected: Value <v> at
-        // '<member>' failed to satisfy constraint: …` envelope, which is already the
-        // text AWS states for a constraint violation and is built from the request's
-        // own member path and value. The ONE thing AppConfig words differently is how a
-        // `@pattern` requirement is quoted — see [`quoted_pattern`] — so each violation
-        // is restated through [`as_stated`] and nothing else about the envelope is
-        // chosen here. The echoed value is elided by the framework's bound on how much
-        // of a caller-supplied value a response repeats.
+        // The one thing this seam cannot do is quote a long value as the caller sent it:
+        // it is handed the violations alone, not the request they were collected from,
+        // and the framework shortens such a value as it BUILDS the violation. That is
+        // why the wrapper collects the refusal itself.
         //
         // `Unauthenticated` keeps the framework's wording: authentication is the
         // emulator's, not AppConfig's, and this service models no error for it.
@@ -385,7 +531,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Refusal::Invalid(violations) => {
                 let stated: Vec<Violation> = violations.iter().map(as_stated).collect();
                 Some(Refused {
-                    code: "BadRequestException".to_string(),
+                    code: CONSTRAINT_REFUSAL_CODE.to_string(),
                     message: envelope(&stated)
                         .unwrap_or_else(|| "invalid request".to_string()),
                 })
@@ -425,8 +571,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
 #[cfg(test)]
 mod tests {
-    use super::{as_stated, quoted_pattern, with_detail_member};
+    use super::{as_stated, quoted_pattern, with_detail_member, EmulatedService};
     use aws_smithy_schema_server::{Violation, ViolationKind};
+    use std::sync::Arc;
 
     /// RULE: a `@pattern` is quoted as the model's expression without its END anchor —
     /// the trailing `$` — whenever the model wrapped it as a whole-value expression, and
@@ -628,6 +775,68 @@ mod tests {
                     answered.as_deref().map(String::from_utf8_lossy)
                 ),
             }
+        }
+    }
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time
+    /// rather than embedded: it is JSON that no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-appconfig-amazonappconfig.json"
+    );
+
+    /// How many operations this service's model declares, as a second, independent
+    /// statement of its surface: a model that grows or shrinks fails here rather than
+    /// quietly leaving the new operation out of the wrapper.
+    const MODELLED_OPERATIONS: usize = 56;
+
+    /// RULE applied to the whole surface: every operation the model declares is served
+    /// through [`InServiceDialect`], under the same key the generated routing table is
+    /// keyed by — so a constraint refusal quotes the submitted value, and an error's
+    /// detail text lands in the modelled member, for EVERY operation rather than for the
+    /// ones someone remembered.
+    ///
+    /// The names come from the MODEL rather than from a second hand-written list, so an
+    /// operation added to the model and not to `wrap_operations!` fails here instead of
+    /// silently answering in the framework's wording — and a key spelled differently from
+    /// the generated table's fails here instead of silently never being reached by
+    /// `override_operation`.
+    #[test]
+    fn every_modelled_operation_is_served_in_this_services_dialect() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        let operations: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next())
+            .collect();
+        assert_eq!(
+            operations.len(),
+            MODELLED_OPERATIONS,
+            "case the model's surface: expected this service's {MODELLED_OPERATIONS} \
+             operations, got {}",
+            operations.len()
+        );
+
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        for operation in operations {
+            assert!(
+                service.entry.routing_table().get(operation).is_some(),
+                "case {operation}: the generated table keys an operation by its shape \
+                 name; this one resolved to nothing, so the wrapper's key spelling is wrong"
+            );
+            assert!(
+                service.in_service_dialect.get(operation).is_some(),
+                "case {operation}: every modelled operation is served through \
+                 InServiceDialect; this one is missing from wrap_operations!, so a \
+                 constraint refusal of it quotes a shortened value and its detail text \
+                 lands in the framework's own member"
+            );
         }
     }
 }
