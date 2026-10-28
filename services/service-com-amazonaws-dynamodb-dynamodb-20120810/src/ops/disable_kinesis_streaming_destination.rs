@@ -2,9 +2,9 @@
 
 //! @op DisableKinesisStreamingDestination
 //! The command that STOPS a table's replication to a Kinesis data stream: it resolves
-//! the table, addresses the destination still replicating to the stream its `StreamArn`
-//! names, and reports that replication as `DISABLING` until the clock settles it on
-//! `DISABLED` — this is the ONLY file to touch for this operation.
+//! the table, addresses the destination ACTIVELY replicating to the stream its
+//! `StreamArn` names, and reports that replication as `DISABLING` until the clock
+//! settles it on `DISABLED` — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,17 +196,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store.table_mut(&region, &name).map_err(lift)?;
-        // The refusal below is stated over the table's STORED name, so reading it cannot
-        // overlap the borrow of the destination it is looked up for.
+        // The answer below reports the table's STORED name, so reading it cannot overlap
+        // the borrow of the destination it is looked up for.
         let table_name = table.name.clone();
+        // Replication can only be STOPPED while it is running, so the destination this
+        // command addresses has to be ACTIVE: a registration or a configuration change
+        // still in flight, a stop already running, and a stream this table holds no
+        // destination record for at all are refused alike on that required status —
+        // which is what the refusal states, naming neither the table nor the stream.
         let destination = table
-            .replicating_kinesis_destination_mut(&input.stream_arn, now)
-            .ok_or_else(|| {
-                lift(crate::state::kinesis_destination_not_found(
-                    &table_name,
-                    &input.stream_arn,
-                ))
-            })?;
+            .active_kinesis_destination_mut(&input.stream_arn, now)
+            .ok_or_else(|| lift(crate::state::kinesis_destination_not_active_to_disable()))?;
         destination.apply_disable(now);
         let stream_arn = destination.stream_arn.clone();
         let status = destination.status(now).to_string();
