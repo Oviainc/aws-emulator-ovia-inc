@@ -32,7 +32,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 
-use crate::harness::{build_router_with_engine, now_secs, ok};
+use crate::harness::{build_router_with_engine, graded_window_stamp, now_secs, ok};
 
 /// The state an alarm's write leaves behind, which every row seeds its alarms with: "the alarm
 /// state is immediately set to INSUFFICIENT_DATA" (`PutMetricAlarm`). A pass that settles an
@@ -47,7 +47,7 @@ const METRIC: &str = "Load";
 
 /// The width of every row's window, in seconds, and the span the published datapoint is
 /// graded in.
-const PERIOD: i64 = 60;
+const PERIOD: i32 = 60;
 
 /// How the alarms of one row are configured: the two shapes a metric alarm's evaluation folds,
 /// because the one evaluation a pass is owed has to be a WHOLE one whichever of them it is.
@@ -269,7 +269,9 @@ async fn a_pass_given_a_spent_budget_settles_the_first_due_evaluation_and_defers
                     "MetricName": METRIC,
                     "Dimensions": dimensions(case),
                     "Value": row.published,
-                    "Timestamp": now_secs(),
+                    // The newest window an evaluation GRADES is the newest one that has closed,
+                    // so the datapoint a row's alarms grade is stamped inside that one.
+                    "Timestamp": graded_window_stamp(f64::from(PERIOD)),
                 }],
             }),
         )

@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::harness::{
-    element, emulator, given_queue, grant_sns_delivery_on, now_secs, received_messages, rpc, sns,
-    subscribe_queue, Emulator,
+    element, emulator, given_queue, graded_window_stamp, grant_sns_delivery_on, received_messages,
+    rpc, sns, subscribe_queue, Emulator,
 };
 
 /// The customer namespace every alarm in this suite watches.
@@ -251,7 +251,9 @@ async fn every_executed_action_is_recorded_as_the_delivery_pass_executes_it() {
                     "MetricName": METRIC,
                     "Dimensions": row.dimensions(),
                     "Value": BREACHING,
-                    "Timestamp": now_secs(),
+                    // Inside the newest window an evaluation GRADES: an alarm grades the periods
+                    // that have closed, not the one the clock is in.
+                    "Timestamp": graded_window_stamp(PERIOD_SECS),
                 }],
             }),
         )

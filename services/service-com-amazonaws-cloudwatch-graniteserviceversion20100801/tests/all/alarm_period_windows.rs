@@ -29,7 +29,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, now_secs, ok, wait_for_evaluation};
+use crate::harness::{build_router, graded_window_stamp, ok, wait_for_evaluation};
 
 /// The customer namespace every row of the table watches.
 const NAMESPACE: &str = "Custom/PeriodWindows";
@@ -38,16 +38,18 @@ const NAMESPACE: &str = "Custom/PeriodWindows";
 const METRIC: &str = "Latency";
 
 /// One datapoint a row publishes: its value and WHICH period it belongs to, counting back from
-/// the period the publish falls in.
+/// the newest period an evaluation grades.
 #[derive(Clone, Copy, Debug)]
 struct Placed {
     /// The value published.
     value: f64,
-    /// How many periods back from the current one the datapoint's time stamp falls in.
+    /// How many periods back from the newest period an evaluation grades the datapoint's time
+    /// stamp falls in.
     periods_back: u32,
 }
 
-/// A datapoint of `value` stamped inside the `periods_back`th period back from the current one.
+/// A datapoint of `value` stamped inside the `periods_back`th period back from the newest one an
+/// evaluation grades.
 const fn placed(value: f64, periods_back: u32) -> Placed {
     Placed {
         value,
@@ -105,10 +107,11 @@ fn alarm_of(row: &Row, name: &str) -> Value {
 
 /// Publish a row's datapoints, each stamped INSIDE the period it names.
 ///
-/// The time stamps are placed on the period grid, in the MIDDLE of the period they name, so the
-/// period a datapoint belongs to is the one the row asked for whatever phase of a period the
-/// publish falls in — which is what makes a row's placement a property of the datapoints rather
-/// than of the moment the test runs.
+/// The time stamps are placed on the period grid, in the MIDDLE of the period they name, counting
+/// back from the newest period an alarm's evaluation grades — the newest one that has CLOSED
+/// ([`graded_window_stamp`]) — so the period a datapoint belongs to is the one the row asked for
+/// whatever phase of a period the publish falls in, and the row's newest datapoint is one the
+/// evaluation grades rather than one still being published into.
 ///
 /// A period boundary crossed between the publish and the reading below shifts every one of a
 /// row's periods back together, and the evaluation grades the most recent periods that HOLD a
@@ -117,12 +120,11 @@ fn alarm_of(row: &Row, name: &str) -> Value {
 /// which is periods away, for anything to.
 async fn publish_placed(router: &MultiServiceRouter, name: &str, row: &Row) {
     let period = f64::from(row.period);
-    let current_period_start = (now_secs() / period).floor() * period;
+    let newest_graded = graded_window_stamp(period);
     let data: Vec<Value> = row
         .data
         .iter()
         .map(|datum| {
-            let start = current_period_start - f64::from(datum.periods_back) * period;
             json!({
                 "MetricName": METRIC,
                 "Dimensions": [{"Name": "Case", "Value": name}],
@@ -132,7 +134,7 @@ async fn publish_placed(router: &MultiServiceRouter, name: &str, row: &Row) {
                 // custom metrics defined with a StorageResolution of 1"), because regular
                 // resolution stores a datapoint at 1-minute granularity.
                 "StorageResolution": 1,
-                "Timestamp": start + period / 2.0,
+                "Timestamp": newest_graded - f64::from(datum.periods_back) * period,
             })
         })
         .collect();

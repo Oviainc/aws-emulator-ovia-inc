@@ -22,7 +22,7 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    document_instant_secs, element, emulator, grant_sns_delivery, now_secs, rpc, sns,
+    document_instant_secs, element, emulator, graded_window_stamp, grant_sns_delivery, rpc, sns,
     wait_for_evaluation, Emulator,
 };
 
@@ -124,8 +124,10 @@ fn alarm(name: &str, topic_arn: &str, actions_enabled: bool) -> Value {
     })
 }
 
-/// Publish `value` into the series `queue` names, stamped `age_secs` before now, so successive
-/// publishes land in successive evaluation periods.
+/// Publish `value` into the series `queue` names, stamped `age_secs` before the newest window an
+/// alarm's evaluation GRADES — the newest [`PERIOD_SECS`] window that has closed
+/// ([`graded_window_stamp`]) — so a datapoint meant to be graded is in a complete period and
+/// successive publishes land in successive evaluation periods.
 async fn publish(emulator: &Emulator, queue: &str, value: f64, age_secs: f64) {
     cw(
         emulator,
@@ -136,7 +138,7 @@ async fn publish(emulator: &Emulator, queue: &str, value: f64, age_secs: f64) {
                 "MetricName": METRIC,
                 "Dimensions": [{"Name": "Queue", "Value": queue}],
                 "Value": value,
-                "Timestamp": now_secs() - age_secs,
+                "Timestamp": graded_window_stamp(PERIOD_SECS) - age_secs,
             }],
         }),
     )

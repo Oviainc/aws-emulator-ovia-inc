@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     alarm_history_items, alarm_stamp, build_router, call, described_alarm, error_code,
-    error_message, now_secs, ok, wait_for_evaluation, AlarmKind,
+    error_message, graded_window_stamp, now_secs, ok, wait_for_evaluation, AlarmKind,
 };
 
 /// The namespace every series of this suite is published under.
@@ -257,10 +257,11 @@ fn numbers(document: &Value, member: &str) -> Vec<f64> {
 }
 
 /// What `GetMetricData` answers the row's OWN query array with, over the windows the alarm
-/// graded: the values of the graded query, newest first.
-async fn read_back(router: &MultiServiceRouter, row: &Row, index: usize, now: f64) -> Vec<f64> {
+/// graded: the values of the graded query, newest first. `at` is an instant inside the window
+/// the row published into, so the read covers the window the alarm graded.
+async fn read_back(router: &MultiServiceRouter, row: &Row, index: usize, at: f64) -> Vec<f64> {
     let period = f64::from(row.period);
-    let window = (now / period).floor() * period;
+    let window = (at / period).floor() * period;
     // Every query returns its data here: the read is of the same array the alarm is configured
     // with, and a reader asks for the value the alarm graded.
     let mut queries = metrics(row, index);
@@ -299,7 +300,10 @@ async fn a_metrics_array_alarm_grades_the_series_its_returning_query_computes() 
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;
         let name = format!("math-alarm-{index}");
-        let now = now_secs();
+        // The datapoint is stamped inside the newest window the alarm's evaluation GRADES — the
+        // newest one that has closed — because an evaluation grades the periods that are
+        // complete rather than the one the clock is in.
+        let stamp = graded_window_stamp(f64::from(row.period));
         ok(
             &router,
             "PutMetricData",
@@ -310,7 +314,7 @@ async fn a_metrics_array_alarm_grades_the_series_its_returning_query_computes() 
                     "Dimensions": dimensions(index),
                     "Value": row.published,
                     "Unit": "Count",
-                    "Timestamp": now,
+                    "Timestamp": stamp,
                 }],
             }),
         )
@@ -442,7 +446,7 @@ async fn a_metrics_array_alarm_grades_the_series_its_returning_query_computes() 
 
         // The same array read through `GetMetricData` computes the same value, so the alarm
         // cited what a reader of its own configuration sees.
-        let read = read_back(&router, row, index, now).await;
+        let read = read_back(&router, row, index, stamp).await;
         assert_eq!(
             read.len(),
             1,

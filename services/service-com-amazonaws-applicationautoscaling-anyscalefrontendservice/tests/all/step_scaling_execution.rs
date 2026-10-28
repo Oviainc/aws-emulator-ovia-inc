@@ -55,6 +55,25 @@ const METRIC_NAME: &str = "Load";
 /// this value.
 const THRESHOLD: f64 = 50.0;
 
+/// The `Period` the suite's alarms are evaluated on, in seconds
+/// ([`crate::emulator::Emulator::given_policy_alarm`]).
+const ALARM_PERIOD_SECS: f64 = 60.0;
+
+/// A time stamp inside the newest `period`-second window a CloudWatch alarm's evaluation grades:
+/// the middle of the newest window that has already CLOSED.
+///
+/// A metric is aggregated into periods anchored at multiples of the period and an alarm is
+/// evaluated over the periods that are complete, so a datapoint meant to decide an alarm now is
+/// stamped here rather than in the period the clock is still in. The middle of the window is what
+/// keeps the placement independent of where in a period the suite happens to run.
+fn graded_window_stamp(period: f64) -> f64 {
+    let now = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs_f64();
+    ((now / period).floor() - 1.0) * period + period / 2.0
+}
+
 /// How long a poll that waits for the scaling clock keeps looking, and how long it sleeps
 /// between looks. Generous: the clock wakes up several times inside this window, and nothing
 /// in the emulator sleeps for it.
@@ -459,14 +478,21 @@ async fn a_breach_whose_size_the_alarm_measured_picks_the_step_that_size_falls_i
         })
         .await;
 
-    // One datapoint 25 past the threshold, published the way a client publishes one. The alarm
-    // CloudWatch evaluates from it is what fires the policy.
+    // One datapoint 25 past the threshold, published the way a client publishes one, inside the
+    // newest period the alarm's evaluation GRADES: a metric is aggregated into periods anchored
+    // at multiples of the alarm's `Period` and an evaluation grades the periods that have
+    // CLOSED, so a datapoint stamped in the period the clock is still in would be graded only
+    // once that period ends. The alarm CloudWatch evaluates from it is what fires the policy.
     let (status, body) = emulator
         .call_cloudwatch(
             "PutMetricData",
             json!({
                 "Namespace": METRIC_NAMESPACE,
-                "MetricData": [{"MetricName": METRIC_NAME, "Value": THRESHOLD + 25.0}],
+                "MetricData": [{
+                    "MetricName": METRIC_NAME,
+                    "Value": THRESHOLD + 25.0,
+                    "Timestamp": graded_window_stamp(ALARM_PERIOD_SECS),
+                }],
             }),
         )
         .await;

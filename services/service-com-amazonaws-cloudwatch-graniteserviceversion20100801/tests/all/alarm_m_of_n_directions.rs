@@ -26,7 +26,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, document_instant_secs, now_secs, ok, wait_for_evaluation};
+use crate::harness::{
+    build_router, document_instant_secs, graded_window_stamp, ok, wait_for_evaluation,
+};
 
 /// The customer namespace every row of the table watches.
 const NAMESPACE: &str = "Custom/MofN";
@@ -50,11 +52,13 @@ const CLEAN: f64 = 1.0;
 struct Placed {
     /// The value published.
     value: f64,
-    /// How many periods back from the current one the datapoint's time stamp falls in.
+    /// How many periods back from the newest period an evaluation grades the datapoint's time
+    /// stamp falls in.
     periods_back: u32,
 }
 
-/// A datapoint of `value` stamped inside the `periods_back`th period back from the current one.
+/// A datapoint of `value` stamped inside the `periods_back`th period back from the newest one an
+/// evaluation grades.
 const fn placed(value: f64, periods_back: u32) -> Placed {
     Placed {
         value,
@@ -319,20 +323,20 @@ fn alarm_of(row: &Row, name: &str) -> Value {
 
 /// Publish a row's datapoints, each stamped INSIDE the period it names.
 ///
-/// The time stamps are placed on the period grid, in the MIDDLE of the period they name, so the
-/// period a datapoint belongs to is the one the row asked for whatever phase of a period the
-/// publish falls in — which is what makes a row's window a property of its datapoints rather
-/// than of the moment the test runs. A period boundary crossed between the publish and the
-/// reading shifts every one of a row's periods back together, and the evaluation grades the most
-/// recent periods that hold a datapoint, so neither the state nor the counts change under it.
+/// The time stamps are placed on the period grid, in the MIDDLE of the period they name, counting
+/// back from the newest period an evaluation grades — the newest one that has CLOSED
+/// ([`graded_window_stamp`]) — so the period a datapoint belongs to is the one the row asked for
+/// whatever phase of a period the publish falls in. A period boundary crossed between the publish
+/// and the reading shifts every one of a row's periods back together, and the evaluation grades
+/// the most recent periods that hold a datapoint, so neither the state nor the counts change
+/// under it.
 async fn publish_placed(router: &MultiServiceRouter, name: &str, row: &Row) {
     let period = f64::from(row.period);
-    let current_period_start = (now_secs() / period).floor() * period;
+    let newest_graded = graded_window_stamp(period);
     let data: Vec<Value> = row
         .data
         .iter()
         .map(|datum| {
-            let start = current_period_start - f64::from(datum.periods_back) * period;
             json!({
                 "MetricName": METRIC,
                 "Dimensions": [{"Name": "Case", "Value": name}],
@@ -341,7 +345,7 @@ async fn publish_placed(router: &MultiServiceRouter, name: &str, row: &Row) {
                 // period reads at ("Data points with a period of 10 seconds are available only
                 // for custom metrics defined with a StorageResolution of 1").
                 "StorageResolution": 1,
-                "Timestamp": start + period / 2.0,
+                "Timestamp": newest_graded - f64::from(datum.periods_back) * period,
             })
         })
         .collect();
@@ -366,7 +370,7 @@ fn without_instants(reason: &str) -> Option<String> {
 }
 
 /// Publish ONE datapoint of `value` into the series `name` watches, stamped in the middle of the
-/// `periods_back`th `period`-second period back from the one the publish falls in.
+/// `periods_back`th `period`-second period back from the newest one an evaluation grades.
 async fn publish_one(
     router: &MultiServiceRouter,
     name: &str,
@@ -374,8 +378,7 @@ async fn publish_one(
     periods_back: u32,
     value: f64,
 ) {
-    let start =
-        (now_secs() / period).floor() * period - f64::from(periods_back) * period + period / 2.0;
+    let start = graded_window_stamp(period) - f64::from(periods_back) * period;
     ok(
         router,
         "PutMetricData",

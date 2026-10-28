@@ -34,7 +34,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    build_router, document_instant_secs, now_secs, ok, wait_for_evaluation, AlarmKind,
+    build_router, document_instant_secs, graded_window_stamp, now_secs, ok, wait_for_evaluation,
+    AlarmKind,
 };
 
 /// The customer namespace every row of the table watches.
@@ -54,16 +55,18 @@ const MAX_INSTANT_AGE_SECS: f64 = 3_600.0;
 const INSTANT_TOLERANCE_SECS: f64 = 0.0015;
 
 /// One datapoint a row publishes: its value and WHICH period of the alarm it belongs to,
-/// counting back from the period the publish falls in.
+/// counting back from the newest period the evaluation grades.
 #[derive(Clone, Copy, Debug)]
 struct Placed {
     /// The value published.
     value: f64,
-    /// How many periods back from the current one the datapoint's time stamp falls in.
+    /// How many periods back from the newest period the evaluation grades the datapoint's time
+    /// stamp falls in.
     periods_back: u32,
 }
 
-/// A datapoint of `value` stamped inside the `periods_back`th period back from the current one.
+/// A datapoint of `value` stamped inside the `periods_back`th period back from the newest one the
+/// evaluation grades.
 const fn placed(value: f64, periods_back: u32) -> Placed {
     Placed { value, periods_back }
 }
@@ -230,22 +233,22 @@ fn alarm_of(row: &Row, name: &str) -> Value {
 
 /// Publish a row's datapoints, each stamped INSIDE the period it names.
 ///
-/// The time stamps are placed on the period grid, in the MIDDLE of the period they name, so the
-/// period a datapoint belongs to is the one the row asked for whatever phase of a period the
-/// publish falls in. A period boundary crossed between the publish and the reading shifts every
-/// one of a row's periods back together, which changes neither the state nor the form of the
-/// instants the document names.
+/// The time stamps are placed on the period grid, in the MIDDLE of the period they name, counting
+/// back from the newest period the evaluation grades — the newest one that has CLOSED
+/// ([`graded_window_stamp`]) — so the period a datapoint belongs to is the one the row asked for
+/// whatever phase of a period the publish falls in. A period boundary crossed between the
+/// publish and the reading shifts every one of a row's periods back together, which changes
+/// neither the state nor the form of the instants the document names.
 async fn publish_placed(router: &MultiServiceRouter, name: &str, row: &Row) {
     if row.data.is_empty() {
         return;
     }
     let period = f64::from(row.period);
-    let current_period_start = (now_secs() / period).floor() * period;
+    let newest_graded = graded_window_stamp(period);
     let data: Vec<Value> = row
         .data
         .iter()
         .map(|datum| {
-            let start = current_period_start - f64::from(datum.periods_back) * period;
             json!({
                 "MetricName": METRIC,
                 "Dimensions": [{"Name": "Case", "Value": name}],
@@ -254,7 +257,7 @@ async fn publish_placed(router: &MultiServiceRouter, name: &str, row: &Row) {
                 // stored at that resolution, because regular resolution stores a datapoint at
                 // 1-minute granularity.
                 "StorageResolution": 1,
-                "Timestamp": start + period / 2.0,
+                "Timestamp": newest_graded - f64::from(datum.periods_back) * period,
             })
         })
         .collect();

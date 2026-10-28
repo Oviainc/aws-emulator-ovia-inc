@@ -60,6 +60,23 @@ pub async fn wait_for_period_room(period: f64, room: f64) {
     }
 }
 
+/// A time stamp inside the newest `period`-second window an ALARM EVALUATION grades: the middle
+/// of the newest window that has already closed.
+///
+/// A metric is aggregated into periods anchored at multiples of the period, and an alarm is
+/// evaluated over the periods that are complete — so the newest window its evaluation grades is
+/// the one before the period the clock is in, and a suite that publishes the datapoint it wants
+/// an alarm to grade stamps it in here rather than in the period still being published into.
+///
+/// The MIDDLE of the window is what makes a row's placement independent of where in a period the
+/// suite happens to run: a datapoint stamped here, and one stamped a whole number of periods
+/// before it, stay in the windows the row meant whatever the phase — and a period boundary
+/// crossed between the publish and the reading moves every one of them back together.
+pub fn graded_window_stamp(period: f64) -> f64 {
+    let newest_graded_start = (now_secs() / period).floor() * period - period;
+    newest_graded_start + period / 2.0
+}
+
 /// Wall-clock now as epoch seconds, the clock the evaluation windows are measured against.
 pub fn now_secs() -> f64 {
     SystemTime::now()

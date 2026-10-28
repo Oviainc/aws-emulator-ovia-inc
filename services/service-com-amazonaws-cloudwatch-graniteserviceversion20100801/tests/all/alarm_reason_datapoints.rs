@@ -22,7 +22,7 @@
 
 use serde_json::{json, Value};
 
-use crate::alarm_evaluation::{datum, patched, publish, Datum};
+use crate::alarm_evaluation::{datum, patched, publish_patched, Datum};
 use crate::harness::{build_router, ok, wait_for_evaluation};
 
 /// One row of the table.
@@ -232,7 +232,7 @@ async fn an_evaluated_state_reason_names_the_datapoints_it_graded() {
     for (index, row) in rows.iter().enumerate() {
         let name = format!("graded-{index}");
         ok(&router, "PutMetricAlarm", &patched(&name, &row.patch)).await;
-        publish(&router, &name, &row.data).await;
+        publish_patched(&router, &name, &row.patch, &row.data).await;
         names.push(name);
     }
     wait_for_evaluation();

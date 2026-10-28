@@ -47,8 +47,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    element, emulator, given_queue, grant_sns_delivery_on, now_secs, received_messages, rpc, sns,
-    subscribe_queue, wait_for_period_room, Emulator, PAST_EVALUATION_DELAY,
+    element, emulator, given_queue, graded_window_stamp, grant_sns_delivery_on, received_messages,
+    rpc, sns, subscribe_queue, wait_for_period_room, Emulator, PAST_EVALUATION_DELAY,
 };
 
 /// The alarm whose actions stay on: the positive control.
@@ -170,11 +170,15 @@ impl Row {
         request
     }
 
-    /// Publish `value` into the row's series, stamped `windows_back` whole periods before now,
-    /// and answer the window it published into as a count of whole periods since the epoch.
+    /// Publish `value` into the row's series, stamped `windows_back` whole periods before the
+    /// newest window an evaluation GRADES, and answer the window it published into as a count of
+    /// whole periods since the epoch.
+    ///
+    /// An alarm grades the periods that have CLOSED, so `windows_back` of zero is the newest
+    /// closed window ([`graded_window_stamp`]) rather than the period the clock is still in.
     ///
     /// The drive waits for enough of the current window to be left for the evaluation it makes
-    /// due to be read inside that same window ([`WINDOW_ROOM_SECS`]): the windows are anchored
+    /// due to be read before the windows shift ([`WINDOW_ROOM_SECS`]): the windows are anchored
     /// at multiples of the period, so a drive made as one window ends is graded from the next
     /// one, where its datapoint is a window older than it was placed.
     ///
@@ -197,7 +201,7 @@ impl Row {
         // datapoint is not in.
         let stamp = loop {
             wait_for_period_room(period, WINDOW_ROOM_SECS).await;
-            let stamp = now_secs() - period * windows;
+            let stamp = graded_window_stamp(period) - period * windows;
             if after.is_none_or(|collides| (stamp / period).floor() > collides) {
                 break stamp;
             }

@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, merged, now_secs, ok, PAST_EVALUATION_DELAY};
+use crate::harness::{build_router, graded_window_stamp, merged, ok, PAST_EVALUATION_DELAY};
 
 /// One row of the table: the alarm shape EVERY arm of the row is configured with, and the
 /// datapoints the control arm's series is fed.
@@ -92,7 +92,15 @@ fn alarm_request(row: &Row, name: &str, arm: &str) -> Value {
     )
 }
 
+/// The `Period` every row's alarm is evaluated on unless its patch names another one, in
+/// seconds.
+const BASE_PERIOD_SECS: f64 = 60.0;
+
 /// Publish this row's datapoints into the series the control arm named `arm` watches.
+///
+/// Each datapoint's age is measured from the newest window the row's alarm GRADES — the newest
+/// one that has closed ([`graded_window_stamp`]) — because an evaluation grades the periods that
+/// are complete rather than the one the clock is in.
 ///
 /// Stored at high resolution ("Setting this to 1 specifies this metric as a high-resolution
 /// metric", `MetricDatum$StorageResolution`), so a row evaluating a sub-minute period reads the
@@ -100,7 +108,12 @@ fn alarm_request(row: &Row, name: &str, arm: &str) -> Value {
 /// windows either way.
 async fn publish(router: &MultiServiceRouter, row: &Row, arm: &str) {
     let (metric, dimensions) = series(row, arm);
-    let now = now_secs();
+    let period = row
+        .patch
+        .get("Period")
+        .and_then(Value::as_f64)
+        .unwrap_or(BASE_PERIOD_SECS);
+    let newest_graded = graded_window_stamp(period);
     let data: Vec<Value> = row
         .data
         .iter()
@@ -110,7 +123,7 @@ async fn publish(router: &MultiServiceRouter, row: &Row, arm: &str) {
                 "Dimensions": dimensions,
                 "Value": value,
                 "StorageResolution": 1,
-                "Timestamp": now - age_secs,
+                "Timestamp": newest_graded - age_secs,
             })
         })
         .collect();

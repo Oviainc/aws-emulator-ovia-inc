@@ -28,7 +28,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, described_alarm, merged, now_secs, ok, wait_for_evaluation, AlarmKind};
+use crate::harness::{
+    build_router, described_alarm, graded_window_stamp, merged, ok, wait_for_evaluation, AlarmKind,
+};
 
 /// The namespace every alarm in this suite watches.
 const NAMESPACE: &str = "Custom/ForcedReclaim";
@@ -48,11 +50,12 @@ const CLEAR: f64 = 1.0;
 /// `PutMetricAlarmInput$Period`).
 const PERIOD: i32 = 60;
 
-/// How far before now a datapoint is stamped to land OUTSIDE the range an alarm of [`PERIOD`]
-/// seconds and one evaluation period grades, while staying well inside the two weeks
-/// `PutMetricData` accepts ("You can specify time stamps that are as much as two weeks before
-/// the current date"). Such a datapoint is still an arrival in the series the alarm watches, so
-/// it is what makes the alarm's next evaluation due — with nothing for that evaluation to grade.
+/// How far before the newest window an evaluation grades a datapoint is stamped to land OUTSIDE
+/// the range an alarm of [`PERIOD`] seconds and one evaluation period grades, while staying well
+/// inside the two weeks `PutMetricData` accepts ("You can specify time stamps that are as much as
+/// two weeks before the current date"). Such a datapoint is still an arrival in the series the
+/// alarm watches, so it is what makes the alarm's next evaluation due — with nothing for that
+/// evaluation to grade.
 const STALE_AGE_SECS: f64 = 3_600.0;
 
 /// The states a caller may force: the modelled `StateValue` members
@@ -99,7 +102,10 @@ fn alarm_request(name: &str, arm: Option<&str>) -> Value {
     merged(base, &json!({"TreatMissingData": arm.map_or(Value::Null, Value::from)}))
 }
 
-/// Publish one datapoint of the series the alarm `name` watches, stamped `age_secs` before now.
+/// Publish one datapoint of the series the alarm `name` watches, stamped `age_secs` before the
+/// newest [`PERIOD`]-second window an evaluation grades: an evaluation grades the periods that
+/// have CLOSED, so a datapoint meant to be graded is stamped inside the newest closed one
+/// ([`graded_window_stamp`]).
 async fn publish(router: &MultiServiceRouter, name: &str, value: f64, age_secs: f64) {
     ok(
         router,
@@ -110,7 +116,7 @@ async fn publish(router: &MultiServiceRouter, name: &str, value: f64, age_secs: 
                 "MetricName": METRIC,
                 "Dimensions": [{"Name": "Row", "Value": name}],
                 "Value": value,
-                "Timestamp": now_secs() - age_secs,
+                "Timestamp": graded_window_stamp(f64::from(PERIOD)) - age_secs,
             }],
         }),
     )

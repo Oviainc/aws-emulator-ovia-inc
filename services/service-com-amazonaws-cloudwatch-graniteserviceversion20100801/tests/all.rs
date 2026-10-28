@@ -23,6 +23,8 @@ mod alarm_action_record_order;
 mod alarm_action_region;
 #[path = "all/alarm_actions_switch.rs"]
 mod alarm_actions_switch;
+#[path = "all/alarm_closed_period_grading.rs"]
+mod alarm_closed_period_grading;
 #[path = "all/alarm_configuration.rs"]
 mod alarm_configuration;
 #[path = "all/alarm_configuration_refusal_messages.rs"]

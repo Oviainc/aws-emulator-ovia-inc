@@ -39,8 +39,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    build_router, call, element, emulator, error_code, grant_sns_delivery, merged, now_secs, ok,
-    rpc, sns, wait_for_evaluation, wait_for_period_room,
+    build_router, call, element, emulator, error_code, graded_window_stamp, grant_sns_delivery,
+    merged, ok, rpc, sns, wait_for_evaluation, wait_for_period_room,
 };
 
 /// The customer namespace the alarm rows below watch.
@@ -76,6 +76,10 @@ async fn wait_for_period_start(period: f64) {
     wait_for_period_room(period, period - CLOSE_ENOUGH_SECS).await;
 }
 
+/// The `Period` the base alarm below is evaluated on, and so the window [`publish`] places a
+/// row's datapoints in.
+pub(crate) const BASE_PERIOD_SECS: f64 = 60.0;
+
 /// The alarm every row of the evaluation table starts from: one 60-second period, one
 /// evaluation period, a static threshold of 10 and a `GreaterThanThreshold` comparison.
 ///
@@ -95,9 +99,9 @@ pub(crate) fn base_alarm(name: &str) -> Value {
     })
 }
 
-/// One datapoint a row publishes: its value, how many seconds before the publish its time
-/// stamp lies, and the extra members that make the row what it is (another `Unit`, another
-/// dimension set).
+/// One datapoint a row publishes: its value, how many seconds before the newest window the
+/// alarm's evaluation grades its time stamp lies, and the extra members that make the row what
+/// it is (another `Unit`, another dimension set).
 #[derive(Clone, Debug)]
 pub(crate) struct Datum {
     value: f64,
@@ -105,7 +109,8 @@ pub(crate) struct Datum {
     extra: Value,
 }
 
-/// A datapoint of `value`, stamped `age_secs` before the publish.
+/// A datapoint of `value`, stamped `age_secs` before the middle of the newest window the
+/// evaluation grades ([`crate::harness::graded_window_stamp`]).
 pub(crate) fn datum(value: f64, age_secs: f64) -> Datum {
     Datum {
         value,
@@ -121,7 +126,9 @@ impl Datum {
         self
     }
 
-    /// This datapoint as a `MetricDatum` of the series `domain` names, stamped against `now`.
+    /// This datapoint as a `MetricDatum` of the series `domain` names, stamped against `base` —
+    /// the middle of the newest window an evaluation grades, because an alarm grades only the
+    /// periods that have closed.
     ///
     /// Published at high resolution: the rows that evaluate a sub-minute period need a series
     /// stored at that resolution, because regular resolution stores a datapoint at 1-minute
@@ -129,13 +136,13 @@ impl Datum {
     /// Setting this to 60 specifies this metric as regular resolution, which CloudWatch stores
     /// at 1-minute resolution", `MetricDatum$StorageResolution`). A row evaluating 60-second
     /// periods reads the same windows either way.
-    fn rendered(&self, now: f64, domain: &str) -> Value {
+    fn rendered(&self, base: f64, domain: &str) -> Value {
         let mut rendered = json!({
             "MetricName": METRIC,
             "Dimensions": [{"Name": "DomainName", "Value": domain}],
             "Value": self.value,
             "StorageResolution": 1,
-            "Timestamp": now - self.age_secs,
+            "Timestamp": base - self.age_secs,
         });
         for (member, value) in self.extra.as_object().cloned().unwrap_or_default() {
             rendered[member] = value;
@@ -144,15 +151,28 @@ impl Datum {
     }
 }
 
-/// Publish `data` as the series the `DomainName` dimension `domain` names, in one call.
+/// Publish `data` as the series the `DomainName` dimension `domain` names, in one call, for an
+/// alarm evaluated on the base alarm's [`BASE_PERIOD_SECS`] period.
 pub(crate) async fn publish(router: &MultiServiceRouter, domain: &str, data: &[Datum]) {
+    publish_in_period(router, domain, BASE_PERIOD_SECS, data).await;
+}
+
+/// The same publish for a row whose alarm is evaluated on `period` seconds: a row's datapoint
+/// ages are measured from the newest window THAT alarm's evaluation grades, so a row with
+/// another period places its datapoints in its own windows.
+pub(crate) async fn publish_in_period(
+    router: &MultiServiceRouter,
+    domain: &str,
+    period: f64,
+    data: &[Datum],
+) {
     if data.is_empty() {
         return;
     }
-    let now = now_secs();
+    let base = graded_window_stamp(period);
     let rendered: Vec<Value> = data
         .iter()
-        .map(|datum| datum.rendered(now, domain))
+        .map(|datum| datum.rendered(base, domain))
         .collect();
     ok(
         router,
@@ -167,6 +187,22 @@ pub(crate) async fn publish(router: &MultiServiceRouter, domain: &str, data: &[D
 /// `ExtendedStatistic`, never both, so a row that names one has to drop the other.
 pub(crate) fn patched(name: &str, patch: &Value) -> Value {
     merged(base_alarm(name), patch)
+}
+
+/// Publish `data` for the alarm a row's `patch` configures: the datapoint ages of a row are
+/// measured from the newest window THAT alarm's evaluation grades, so a row naming its own
+/// `Period` places its datapoints in its own windows.
+pub(crate) async fn publish_patched(
+    router: &MultiServiceRouter,
+    domain: &str,
+    patch: &Value,
+    data: &[Datum],
+) {
+    let period = patch
+        .get("Period")
+        .and_then(Value::as_f64)
+        .unwrap_or(BASE_PERIOD_SECS);
+    publish_in_period(router, domain, period, data).await;
 }
 
 #[tokio::test]
@@ -707,11 +743,19 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
             }),
         );
         ok(&router, "PutMetricAlarm", &alarm).await;
-        // The oldest period the alarm's evaluation range still searches, mid-period: the
-        // range covers `EVALUATION_RANGE_PERIODS` periods per evaluation period.
-        let age = (f64::from(EVALUATION_RANGE_PERIODS * periods) - 1.5)
+        // The OLDEST period the alarm's evaluation range still searches: the range covers
+        // `EVALUATION_RANGE_PERIODS` periods per evaluation period, counting back from the
+        // newest period that has closed, so the oldest of them is that many periods less one
+        // behind it.
+        let age = f64::from(EVALUATION_RANGE_PERIODS * periods - 1)
             * f64::from(SHORTEST_PERIOD_SECS);
-        publish(&router, &name, &[datum(42.0, age)]).await;
+        publish_in_period(
+            &router,
+            &name,
+            f64::from(SHORTEST_PERIOD_SECS),
+            &[datum(42.0, age)],
+        )
+        .await;
         names.push(name);
     }
     wait_for_evaluation();
@@ -861,7 +905,13 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
     // forced one back a span later: a datapoint under the threshold puts the alarm in OK.
     // "Metric alarms returns to their actual state quickly, often within seconds."
     // (`SetAlarmState`)
-    publish(&router, "forced", &[datum(1.0, 0.0)]).await;
+    publish_in_period(
+        &router,
+        "forced",
+        f64::from(SHORTEST_PERIOD_SECS),
+        &[datum(1.0, 0.0)],
+    )
+    .await;
     wait_for_evaluation();
     let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["forced"]})).await;
     assert_eq!(
@@ -907,7 +957,13 @@ async fn ignored_missing_data_maintains_the_state_but_a_datapoint_still_decides_
 
     // A datapoint that IS present decides the state, whatever the missing-data setting — at
     // the next evaluation, which the read above re-armed a span away.
-    publish(&router, "ignoring", &[datum(1.0, 0.0)]).await;
+    publish_in_period(
+        &router,
+        "ignoring",
+        f64::from(SHORTEST_PERIOD_SECS),
+        &[datum(1.0, 0.0)],
+    )
+    .await;
     wait_for_evaluation();
     let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["ignoring"]})).await;
     assert_eq!(
@@ -1264,7 +1320,10 @@ async fn an_alarm_that_crosses_its_threshold_notifies_its_sns_action() {
         "PutMetricData",
         &json!({
             "Namespace": NAMESPACE,
-            "MetricData": [datum(4_200.0, 0.0).rendered(now_secs(), "searchable-documents-high")],
+            "MetricData": [
+                datum(4_200.0, 0.0)
+                    .rendered(graded_window_stamp(BASE_PERIOD_SECS), "searchable-documents-high")
+            ],
         }),
     )
     .await;
