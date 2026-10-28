@@ -249,6 +249,14 @@ const INVOICE_UNIT_ARN_EXPRESSION: &str =
 /// `@length(20..2048)` beside it), and the expression a message advertises for it.
 const TAGRIS_ARN_EXPRESSION: &str = r"arn:aws[-a-z0-9]*:(invoicing)::[0-9]{12}:[-a-zA-Z0-9/:_]+";
 
+/// The ARN `@pattern` of `ProcurementPortalPreferenceArnString`
+/// (`smithy_query(query="shape", shape="ProcurementPortalPreferenceArnString")`), and the
+/// expression a message advertises for it.
+const PREFERENCE_ARN_PATTERN: &str =
+    r"^arn:aws:invoicing::[0-9]{12}:procurement-portal-preference/[-a-zA-Z0-9]+$";
+const PREFERENCE_ARN_EXPRESSION: &str =
+    r"arn:aws:invoicing::[0-9]{12}:procurement-portal-preference/[-a-zA-Z0-9]+";
+
 /// A `CreateInvoiceUnit` body with every `@required` member, which a row then spoils.
 fn create_request() -> Value {
     json!({
@@ -456,9 +464,8 @@ fn cases() -> Vec<Case> {
             json!({"ResourceArn": "arn:aws:invoicing::000000000000:invoice-unit/ffffffffffff"}),
             vec![Expected::absent("resourceTagKeys")],
         ),
-        // A SCAFFOLDED operation's refusal is worded the same way: the framework
-        // validates its modelled constraints before the 501, and this service words
-        // what it refuses once.
+        // A violation on a LIST ELEMENT at the top level of the input, on the
+        // invoice-profile plane.
         Case::new(
             "BatchGetInvoiceProfile",
             "an account id outside the account-id pattern",
@@ -469,8 +476,8 @@ fn cases() -> Vec<Case> {
             )],
         )
         .rejecting("not-an-account")
-        .anchored(ACCOUNT_ID_PATTERN)
-        .scaffolded(),
+        .anchored(ACCOUNT_ID_PATTERN),
+        // `@length`'s minimum on a LIST member.
         Case::new(
             "BatchGetInvoiceProfile",
             "an empty AccountIds list",
@@ -479,6 +486,54 @@ fn cases() -> Vec<Case> {
                 "accountIds",
                 "Member must have length greater than or equal to 1",
             )],
+        ),
+        // `@pattern` on the procurement-portal plane, whose refusals are worded and
+        // carried the same way: the modelled body belongs to the refusal, not the plane.
+        Case::new(
+            "GetProcurementPortalPreference",
+            "a preference ARN outside the preference-ARN pattern",
+            json!({"ProcurementPortalPreferenceArn": "not-an-arn"}),
+            vec![Expected::present(
+                "procurementPortalPreferenceArn",
+                pattern_requirement(PREFERENCE_ARN_EXPRESSION),
+            )],
+        )
+        .rejecting("not-an-arn")
+        .anchored(PREFERENCE_ARN_PATTERN),
+        // A `@required` member absent on a procurement-portal write.
+        Case::new(
+            "CreateProcurementPortalPreference",
+            "no Contacts at all",
+            json!({
+                "ProcurementPortalName": "COUPA",
+                "BuyerDomain": "NetworkID",
+                "BuyerIdentifier": "AN01",
+                "SupplierDomain": "NetworkID",
+                "SupplierIdentifier": "AN02",
+                "EinvoiceDeliveryEnabled": false,
+                "PurchaseOrderRetrievalEnabled": false,
+            }),
+            vec![Expected::absent("contacts")],
+        ),
+        // `@range`'s maximum on the procurement-portal plane's own `MaxResults` (1..100),
+        // a different bound from the invoice-unit plane's.
+        Case::new(
+            "ListProcurementPortalPreferences",
+            "MaxResults past the range maximum",
+            json!({"MaxResults": 101}),
+            vec![Expected::present(
+                "maxResults",
+                "Member must have value less than or equal to 100",
+            )],
+        ),
+        // A SCAFFOLDED operation's refusal is worded the same way, but carries the
+        // message alone: the framework validates its modelled constraints before the
+        // 501, and this service words what it refuses once.
+        Case::new(
+            "GetInvoicePDF",
+            "no InvoiceId at all",
+            json!({}),
+            vec![Expected::absent("invoiceId")],
         )
         .scaffolded(),
     ]

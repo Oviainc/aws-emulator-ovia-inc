@@ -68,7 +68,11 @@ const MAX_TAGS_PER_CALL: usize = 200;
 
 /// A router carrying only this service, over one shared engine — the same assembly the
 /// production router performs, minus the other services.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because the sibling suite
+/// `modelled_refusal_on_every_implemented_operation.rs` drives the same wire surface and
+/// shares this harness rather than keeping a second copy of it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signing is the router's concern, not this slice's: drive the operations unsigned.
@@ -81,15 +85,15 @@ fn emulator() -> MultiServiceRouter {
 
 /// What one call answered: the status, the media type it announced, and its body.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    media_type: Option<String>,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) media_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type` on the awsJson protocols), shape name only.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -101,13 +105,13 @@ impl Answer {
     }
 
     /// A member of the body, as a string.
-    fn member(&self, name: &str) -> Option<&str> {
+    pub(crate) fn member(&self, name: &str) -> Option<&str> {
         self.body.get(name).and_then(Value::as_str)
     }
 }
 
 /// One request, returning everything a client can see of the response.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -400,7 +404,9 @@ struct RefusedCase {
 /// The rows differ along the CONSTRAINT class the model declares (a pattern, a length
 /// bound, a numeric range, a required member absent), the member's type (string,
 /// integer, list) and the operation refusing it, so the rule is asserted over the class
-/// rather than over the one recorded request.
+/// rather than over the one recorded request. That the rule holds for EVERY operation
+/// this emulator implements — whichever plane it belongs to — is asserted over the whole
+/// implemented surface by `modelled_refusal_on_every_implemented_operation.rs`.
 #[tokio::test]
 async fn a_rejected_member_is_stated_as_a_field_validation_failure() {
     let router = emulator();
