@@ -1210,65 +1210,66 @@ impl SecurityPolicyRecord {
 ///
 /// Nothing is validated here: a document that is not in that form simply names no
 /// resources, because `CreateSecurityPolicy` accepts any JSON document a caller signs.
+/// Each of the three levels is read by [`policy_document_entries`], the one place this
+/// module decides what a document's list-valued position holds, so the resources a
+/// listing's `resource` filter matches against are exactly the ones the rules an
+/// encryption lookup covers a collection by are drawn from.
 ///
-/// At most [`MAX_POLICY_RESOURCES`] entries are collected, so the length of this list is
-/// never chosen by whoever wrote the document.
+/// At most [`MAX_POLICY_RESOURCES`] entries are collected, and each is at most
+/// [`MAX_RESOURCE_PATTERN_LENGTH`] bytes, so neither the length of this list nor the cost
+/// of one comparison is chosen by whoever wrote the document.
 pub fn policy_document_resources(document: &::aws_smithy_types::Document) -> Vec<String> {
-    let mut resources = Vec::new();
-    collect_policy_resources(document, 1, &mut resources);
+    use ::aws_smithy_types::Document;
+
+    let mut resources: Vec<String> = Vec::new();
+    for statement in policy_document_entries(Some(document)) {
+        let Document::Object(members) = statement else {
+            continue;
+        };
+        for rule in policy_document_entries(members.get("Rules")) {
+            let Document::Object(rule) = rule else {
+                continue;
+            };
+            for named in policy_document_entries(rule.get("Resource")) {
+                if resources.len() >= MAX_POLICY_RESOURCES {
+                    return resources;
+                }
+                let Document::String(named) = named else {
+                    continue;
+                };
+                // A resource entry past the pattern bound is dropped rather than matched:
+                // its length is whoever wrote the document's to choose, and it is a factor
+                // in every comparison's cost.
+                if named.len() <= MAX_RESOURCE_PATTERN_LENGTH {
+                    resources.push(named.clone());
+                }
+            }
+        }
+    }
     resources
 }
 
-/// [`policy_document_resources`] at `depth`, bounded by [`MAX_DOCUMENT_DEPTH`] for the
-/// same reason [`document_from_json`] is, by [`MAX_POLICY_RESOURCES`] in how many entries
-/// it collects and by [`MAX_RESOURCE_PATTERN_LENGTH`] in how long one may be: the document
-/// is caller-supplied.
-fn collect_policy_resources(
-    document: &::aws_smithy_types::Document,
-    depth: usize,
-    resources: &mut Vec<String>,
-) {
+/// The entries a policy document, or one of its list-valued members, holds — the list
+/// spelling and the single-value spelling read alike.
+///
+/// What the model cannot express: `PolicyDocument` is text with a character class, so a
+/// stored document's shape is whatever the caller wrote. AWS's "Encryption at rest for
+/// Amazon OpenSearch Serverless" and "Network access for Amazon OpenSearch Serverless"
+/// write a policy as one rule-carrying object or a LIST of them, a statement's `Rules` as
+/// a list of rules and a rule's `Resource` as a list of resource patterns; a document that
+/// writes a single value where such a list belongs holds the one-element list, which is
+/// what every reader of that position in this module sees.
+///
+/// An absent member holds nothing.
+fn policy_document_entries(
+    member: Option<&::aws_smithy_types::Document>,
+) -> Vec<&::aws_smithy_types::Document> {
     use ::aws_smithy_types::Document;
-    if depth > MAX_DOCUMENT_DEPTH || resources.len() >= MAX_POLICY_RESOURCES {
-        return;
-    }
-    match document {
-        // A network policy is a list of rule-carrying objects.
-        Document::Array(entries) => {
-            for entry in entries {
-                collect_policy_resources(entry, depth + 1, resources);
-            }
-        }
-        Document::Object(members) => {
-            let Some(Document::Array(rules)) = members.get("Rules") else {
-                return;
-            };
-            for rule in rules {
-                let Document::Object(rule) = rule else {
-                    continue;
-                };
-                let Some(Document::Array(named)) = rule.get("Resource") else {
-                    continue;
-                };
-                resources.extend(
-                    named
-                        .iter()
-                        .filter_map(|resource| match resource {
-                            // A resource entry past the pattern bound is dropped rather
-                            // than matched: its length is whoever wrote the document's to
-                            // choose, and it is a factor in every comparison's cost.
-                            Document::String(resource)
-                                if resource.len() <= MAX_RESOURCE_PATTERN_LENGTH =>
-                            {
-                                Some(resource.clone())
-                            }
-                            _ => None,
-                        })
-                        .take(MAX_POLICY_RESOURCES.saturating_sub(resources.len())),
-                );
-            }
-        }
-        _ => {}
+
+    match member {
+        Some(Document::Array(entries)) => entries.iter().collect(),
+        Some(single) => vec![single],
+        None => Vec::new(),
     }
 }
 
@@ -1869,19 +1870,14 @@ pub struct PolicyEncryption {
 ///
 /// A policy document is either one statement object or a list of them (a network policy is
 /// written as a list; an encryption policy as a single object), so both spellings are
-/// walked. The statement is answered rather than a bare `bool` because the key the policy
-/// assigns sits on the SAME statement as the rule that matched.
+/// walked — by [`policy_document_entries`], the same reader a listing's resource filter
+/// goes through. The statement is answered rather than a bare `bool` because the key the
+/// policy assigns sits on the SAME statement as the rule that matched.
 fn covering_statement<'a>(
     policy: &'a ::aws_smithy_types::Document,
     resource: &str,
 ) -> Option<&'a ::aws_smithy_types::Document> {
-    use ::aws_smithy_types::Document;
-
-    let statements: Vec<&Document> = match policy {
-        Document::Array(items) => items.iter().collect(),
-        single => vec![single],
-    };
-    statements
+    policy_document_entries(Some(policy))
         .into_iter()
         .find(|statement| statement_covers(statement, resource))
 }
@@ -1893,12 +1889,9 @@ fn statement_covers(statement: &::aws_smithy_types::Document, resource: &str) ->
     let Document::Object(members) = statement else {
         return false;
     };
-    let rules: Vec<&Document> = match members.get("Rules") {
-        Some(Document::Array(items)) => items.iter().collect(),
-        Some(single) => vec![single],
-        None => Vec::new(),
-    };
-    rules.into_iter().any(|rule| rule_covers(rule, resource))
+    policy_document_entries(members.get("Rules"))
+        .into_iter()
+        .any(|rule| rule_covers(rule, resource))
 }
 
 /// Whether one `Rules` entry applies to `resource`: a rule about collections, naming a
@@ -1906,8 +1899,10 @@ fn statement_covers(statement: &::aws_smithy_types::Document, resource: &str) ->
 ///
 /// AWS's security-policy documentation writes such a pattern as `collection/<name>`, with
 /// a wildcard allowed to match a prefix (`collection/log*`, `collection/*`); the match
-/// itself is [`resource_pattern_matches`], the one `*` walk this module has, so a policy's
-/// rule and a listing's filter cannot read the same pattern differently.
+/// itself is [`resource_pattern_matches`], the one `*` walk this module has, and the
+/// document positions it reads the patterns out of are [`policy_document_entries`], the
+/// one shape reader, so a policy's rule and a listing's filter can neither read the same
+/// pattern differently nor find different patterns in the same document.
 fn rule_covers(rule: &::aws_smithy_types::Document, resource: &str) -> bool {
     use ::aws_smithy_types::Document;
 
@@ -1921,15 +1916,12 @@ fn rule_covers(rule: &::aws_smithy_types::Document, resource: &str) -> bool {
     if !about_collections {
         return false;
     }
-    let patterns: Vec<&Document> = match members.get("Resource") {
-        Some(Document::Array(items)) => items.iter().collect(),
-        Some(single) => vec![single],
-        None => Vec::new(),
-    };
-    patterns.into_iter().any(|pattern| match pattern {
-        Document::String(pattern) => resource_pattern_matches(pattern, resource),
-        _ => false,
-    })
+    policy_document_entries(members.get("Resource"))
+        .into_iter()
+        .any(|pattern| match pattern {
+            Document::String(pattern) => resource_pattern_matches(pattern, resource),
+            _ => false,
+        })
 }
 
 /// A list of statuses as the sentence fragment `ConflictException`'s own documentation

@@ -39,6 +39,8 @@ mod minted_identifiers;
 mod policies_stats;
 #[path = "all/policy_and_group_writes.rs"]
 mod policy_and_group_writes;
+#[path = "all/policy_document_shape.rs"]
+mod policy_document_shape;
 #[path = "all/reported_pattern.rs"]
 mod reported_pattern;
 #[path = "all/security_config_update.rs"]
