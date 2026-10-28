@@ -196,6 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let modified = state.put_account_settings(&region, &input.settings);
+        // `vcfPortedCoreCount` is what the environments of this Region check their
+        // deployed cores against, so writing a setting changes a check input of every one
+        // of them: their checks are recomputed from the settings this call leaves behind.
+        state.recompute_environment_checks();
         // "A list of regional account-level EVS settings, and their values, that were
         // modified in this request" — the settings this call wrote, read back out of the
         // store it wrote them to.
