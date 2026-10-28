@@ -18,6 +18,13 @@
 //! [`crate::state::BenefitApplication::recall_retry`] and
 //! [`crate::state::IDEMPOTENT_PARAMETER_MISMATCH`]).
 //!
+//! Both caller strings this operation PERSISTS are bounded before anything is written:
+//! the model types `Reason` and `ClientToken` as bare `String`s here, so the centralized
+//! walk refuses neither, and the handler applies the bounds the model states for those
+//! values elsewhere — [`crate::state::MAX_STATUS_REASON_LEN`] for the reason the record
+//! reports as its `StatusReason`, [`crate::state::MAX_CLIENT_TOKEN_LEN`] for the token
+//! the record keeps — as the modelled `ValidationException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -126,6 +133,22 @@ impl From<RecallBenefitApplicationErrorModeled> for RecallBenefitApplicationErro
     }
 }
 
+/// One refusal of an input member, as this operation's modelled `ValidationException`.
+///
+/// Built by the one construction every member refusal of this crate goes through
+/// ([`crate::state::member_validation_exception`]): it names the member path and the
+/// requirement it failed, and echoes NOTHING of the rejected value.
+fn refused(member: &str, clause: &str) -> RecallBenefitApplicationError {
+    RecallBenefitApplicationErrorModeled::ValidationException(
+        crate::state::member_validation_exception(
+            member,
+            clause,
+            crate::state::VALIDATION_REASON_FIELD,
+        ),
+    )
+    .into()
+}
+
 /// The `RecallBenefitApplication` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,6 +202,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now_millis();
+
+        // The two caller-chosen strings this operation PERSISTS, checked at the door of
+        // the store whose byte accounting cites these bounds. The model types both as a
+        // bare `String` here, so the centralized walk refuses neither: the bounds are the
+        // ones the model gives these values where it states them — `@length(max: 1000)`
+        // on the member the reason is reported through
+        // (`GetBenefitApplicationOutput$StatusReason`) and on the sibling input that
+        // writes it, and `@length(min: 1, max: 64)` on every `ClientToken` of this
+        // service the model constrains. Nothing is written before both pass, so a refused
+        // recall leaves the record exactly as it was.
+        if let Some(clause) =
+            crate::state::length_clause(&input.reason, 0, crate::state::MAX_STATUS_REASON_LEN)
+        {
+            return Err(refused("reason", &clause));
+        }
+        if let Some(client_token) = input.client_token.as_deref() {
+            if let Some(clause) = crate::state::length_clause(
+                client_token,
+                crate::state::MIN_CLIENT_TOKEN_LEN,
+                crate::state::MAX_CLIENT_TOKEN_LEN,
+            ) {
+                return Err(refused("clientToken", &clause));
+            }
+        }
 
         // The identity of this REQUEST, which is what the `ClientToken` below is judged
         // against: every member the request carries other than the token itself.

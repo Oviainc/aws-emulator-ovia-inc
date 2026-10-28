@@ -824,7 +824,7 @@ fn not_authorized(message: &str) -> InitiateAuthError {
 /// This operation's `PasswordResetRequiredException` for a user in `RESET_REQUIRED`.
 fn password_reset_required() -> InitiateAuthError {
     InitiateAuthErrorModeled::PasswordResetRequiredException(PasswordResetRequiredException {
-        message: Some("Password reset required for the user.".to_string()),
+        message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
     })
     .into()
 }

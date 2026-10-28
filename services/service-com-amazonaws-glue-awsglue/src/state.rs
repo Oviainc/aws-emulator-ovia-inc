@@ -1852,6 +1852,19 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|triggers| triggers.get_mut(name))
     }
 
+    /// Every trigger the Region `region` holds, in name order — the triggers served
+    /// through this endpoint, which is every trigger reads of this Region can address.
+    ///
+    /// The order is the inner map's own key order, so a listing that walks this set pages
+    /// deterministically across calls.
+    pub fn triggers_in(&self, region: &str) -> Vec<&TriggerEntry> {
+        self.triggers
+            .get(region)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .collect()
+    }
+
     /// Store `entry` as the Region `region`'s trigger under its own name.
     pub fn insert_trigger(&mut self, region: &str, entry: TriggerEntry) {
         self.triggers
@@ -4210,6 +4223,21 @@ impl TriggerEntry {
             event_batching_condition: input.event_batching_condition.clone(),
             tags: input.tags.clone().unwrap_or_default(),
         }
+    }
+
+    /// Whether this trigger CAN START the job `job_name`, i.e. whether firing it would
+    /// begin a run of that job.
+    ///
+    /// A trigger initiates "the actions initiated by this trigger" (`Trigger$Actions`) and
+    /// an action naming a job begins a run of it ([`ComAmazonawsGlueAwsglueState::
+    /// initiate_trigger_actions`]), so the jobs a trigger can start are exactly the
+    /// `JobName`s of its actions. The job a condition WAITS ON (`Condition$JobName`) is not
+    /// one the trigger starts, so a predicate does not qualify a trigger here. Names are
+    /// compared exactly, as every other read of a job name is.
+    pub fn starts_job(&self, job_name: &str) -> bool {
+        self.actions
+            .iter()
+            .any(|action| action.job_name.as_deref() == Some(job_name))
     }
 
     /// Move this trigger into the state a start leaves it in.

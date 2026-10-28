@@ -185,6 +185,8 @@ mod table_version_listing;
 mod table_versions;
 #[path = "all/trigger_action_runs.rs"]
 mod trigger_action_runs;
+#[path = "all/trigger_listing.rs"]
+mod trigger_listing;
 #[path = "all/trigger_starts.rs"]
 mod trigger_starts;
 #[path = "all/trigger_stops.rs"]

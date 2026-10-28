@@ -215,12 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decision is made on the ARN the request addresses, while the refusal NAMES the
         // entity that ARN identifies: a managed policy, named by its type followed by the
         // ARN the request carried.
-        crate::state::authorization::authorize_named(
+        crate::state::authorization::authorize_written(
             &store,
             ctx,
             crate::state::authorization::UNTAG_POLICY,
             &input.policy_arn,
             &format!("policy {}", input.policy_arn),
+            // The keys this call REMOVES are part of the request a statement may be
+            // conditioned on (`aws:TagKeys`); an `Untag*` call writes no tag values.
+            crate::state::authorization::WrittenTags::Keys(&input.tag_keys),
         )?;
 
         // The write is addressed exactly as a read of the same ARN is, so it reaches

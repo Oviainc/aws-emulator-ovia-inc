@@ -370,10 +370,35 @@ pub const MAX_DETAILS_VALUE_LEN: usize = 1000;
 pub const MAX_AMENDMENT_REASON_LEN: usize = 1000;
 
 /// The longest `ClientToken` this service stores, which is the modelled
-/// `@length(min: 1, max: 64)` every operation's `ClientToken` carries (the patterns
+/// `@length(min: 1, max: 64)` this service's `ClientToken` carries wherever the model
+/// constrains it at all — `CreateBenefitApplication`, `UpdateBenefitApplication`,
+/// `CancelBenefitApplication` and `AmendBenefitApplication` (the patterns
 /// `^[a-zA-Z0-9-]{1,64}$` and `^[!-~]{1,64}$` say the same). The applied-write record
 /// keeps the token, so this bounds the bytes one record holds for it.
+///
+/// `RecallBenefitApplicationInput$ClientToken` is modelled as a bare `String`
+/// (`smithy_query(query="operation",operation="RecallBenefitApplication")`), so there the
+/// centralized walk refuses nothing and the handler applies this bound itself with
+/// [`length_clause`]; the token the store holds is bounded either way.
 pub const MAX_CLIENT_TOKEN_LEN: usize = 64;
+
+/// The shortest `ClientToken` this service accepts: the `min` half of the same modelled
+/// `@length(min: 1, max: 64)` [`MAX_CLIENT_TOKEN_LEN`] is the `max` half of, so both
+/// halves of one trait move together.
+pub const MIN_CLIENT_TOKEN_LEN: usize = 1;
+
+/// The longest `StatusReason` this service stores on a benefit application.
+///
+/// It is the model's own bound on the member the value is REPORTED through —
+/// `GetBenefitApplicationOutput$StatusReason` is `length {max: 1000}`
+/// (`smithy_query(query="operation",operation="GetBenefitApplication")`; the generated
+/// header of that operation prints the member's target only) — and the bound the model
+/// puts on the input that writes it where it constrains that input at all
+/// (`CancelBenefitApplicationInput$Reason` is `length {max: 1000}`, so the centralized
+/// walk refuses a longer one there). `RecallBenefitApplicationInput$Reason` is modelled as
+/// a bare `String`, so that handler applies this bound itself with [`length_clause`] and a
+/// read can never report a reason longer than the member it is reported through admits.
+pub const MAX_STATUS_REASON_LEN: usize = 1000;
 
 /// The bytes a stored request fingerprint occupies: a SHA-256 digest in hex.
 ///
@@ -1043,7 +1068,9 @@ pub struct BenefitApplication {
     pub status: String,
     /// Why the application holds the status it holds, when the transition into it carried
     /// a reason. Replaced by every transition (see [`BenefitApplication::set_status`]), so
-    /// it never explains a status the application has left.
+    /// it never explains a status the application has left. At most
+    /// [`MAX_STATUS_REASON_LEN`] characters, the bound of the member it is reported
+    /// through, so a read never answers a reason longer than that member admits.
     pub status_reason: Option<String>,
     pub status_reason_codes: Vec<String>,
     pub created_at_millis: i64,
@@ -2860,6 +2887,28 @@ pub fn validation_field(
         message: message.to_string(),
         code: Some(code.to_string()),
     }]
+}
+
+/// Whether `value` satisfies the `@length(min: min, max: max)` of the member it is
+/// written to or stored in.
+///
+/// The one length check every handler of this service makes for itself goes through, so a
+/// bound a handler enforces cannot be worded — or counted — two ways. The requirement is
+/// worded by [`crate::service::constraint_requirement`], the same words the centralized
+/// walk uses for a length, and the length is counted in CHARACTERS, as the walk counts a
+/// `@length` on a string.
+///
+/// `None` when the value satisfies the bound.
+pub fn length_clause(value: &str, min: usize, max: usize) -> Option<String> {
+    let length = value.chars().count();
+    let kind = if length < min {
+        ::smithy_server_runtime::ViolationKind::MinLength(min as i64)
+    } else if length > max {
+        ::smithy_server_runtime::ViolationKind::MaxLength(max as i64)
+    } else {
+        return None;
+    };
+    crate::service::constraint_requirement(&kind)
 }
 
 /// This service's modelled `ValidationException` refusing ONE input member: the clause

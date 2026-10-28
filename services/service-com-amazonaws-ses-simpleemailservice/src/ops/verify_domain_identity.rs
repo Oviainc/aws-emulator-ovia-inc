@@ -151,22 +151,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        if crate::state::service_state(&*self.engine).is_none() {
             // See `verify_email_identity.rs`: an engine with no store for this
             // service cannot serve the operation at all, and it models no server
             // error of its own.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "VerifyDomainIdentity",
             ));
-        };
+        }
         // Idempotent, and the token is STORED: re-verifying the same domain answers
         // with the token already on the record, so the value a caller publishes as
         // a TXT record keeps matching what the service reports for the identity.
+        // The record is written to the account's identity registry as well as to this
+        // service's own list, and the token is the registry's, so the v2 surface
+        // reports the identity and both surfaces report one TXT value for it.
         // `None` means the account is already at its identity limit.
-        let verification_token = state
-            .lock()
-            .verify_identity(&domain, crate::state::IdentityType::Domain)
-            .map(|identity| identity.verification_token.clone().unwrap_or_default());
+        let verification_token = crate::state::record_identity(
+            &*self.engine,
+            &domain,
+            crate::state::IdentityType::Domain,
+        )
+        .map(|identity| identity.verification_token.unwrap_or_default());
         let Some(verification_token) = verification_token else {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "this account already holds the maximum of {} verified identities; delete one \

@@ -176,9 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; tagging an instance profile depends on
-        // nothing in it — IAM is global, and the profile is named in the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The profile itself is
+        // named in the request — IAM is global, so no region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagInstanceProfileErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -213,6 +213,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // case", so the profile is found under the case-folded name whatever case the
         // request spelled it in — the same key `CreateInstanceProfile` wrote under.
         let key = crate::state::name_key(&input.instance_profile_name);
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is stored, and before the store is consulted for the profile, so
+        // a caller that may not change a profile's tags learns that it may not rather than
+        // whether the account holds that profile. The tags this call WRITES are handed to
+        // the gate, because they are part of the request a statement may be conditioned on
+        // (`aws:RequestTag/<key>`, `aws:TagKeys`). Nothing is written when it refuses.
+        let held = store.instance_profiles.get(&key);
+        let resource = held.map_or_else(
+            || {
+                crate::state::instance_profile_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.instance_profile_name,
+                )
+            },
+            |record| record.profile.arn.clone(),
+        );
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::TAG_INSTANCE_PROFILE,
+            &resource,
+            &format!("instance profile {}", input.instance_profile_name),
+            crate::state::authorization::WrittenTags::Pairs(&input.tags),
+        )?;
+
         let Some(record) = store.instance_profiles.get_mut(&key) else {
             return Err(TagInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

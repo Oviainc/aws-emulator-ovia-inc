@@ -3,7 +3,9 @@
 //! @op TagUser
 //!
 //! IMPLEMENTED: the tags supplied here are merged into the persisted user in this
-//! service's state (`crate::state`) and read back by `GetUser`.
+//! service's state (`crate::state`) and read back by `GetUser`, after the calling
+//! principal's identity-based policies are checked for the action — against a request
+//! context carrying the tags this call writes, so a grant conditioned on them decides it.
 //!
 //! A 501 from an operation in this service means "nobody has written it yet", never
 //! "the emulator is broken".
@@ -184,9 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; tagging a user depends on nothing in
-        // it — IAM is global, and the user is named in the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The user itself is
+        // named in the request — IAM is global, so no region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagUserErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -221,6 +223,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // by case", so the user is found under the case-folded name whatever case the
         // request spelled it in.
         let key = crate::state::name_key(&input.user_name);
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is stored, and before the STORE is consulted for the
+        // user — so a caller that may not change a user's tags learns that it may not,
+        // never whether the account holds that user. (The refusal above is about the
+        // request the caller supplied, which it already knows.) The decision is made on
+        // the ARN of the user the request addresses, with the tags this call WRITES handed
+        // to the gate, because they are part of the request a statement may be conditioned
+        // on (`aws:RequestTag/<key>`, `aws:TagKeys`); the refusal names the entity as the
+        // request named it (`user Bob`). Nothing is written when it refuses, so a refused
+        // call leaves the target's tags exactly as they were.
+        let held = store.users.get(&key);
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::TAG_USER,
+            &resource,
+            &format!("user {}", input.user_name),
+            crate::state::authorization::WrittenTags::Pairs(&input.tags),
+        )?;
+
         let Some(user) = store.users.get_mut(&key) else {
             return Err(TagUserErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

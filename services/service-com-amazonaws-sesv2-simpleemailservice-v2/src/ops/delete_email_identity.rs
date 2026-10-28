@@ -179,6 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         store.identities.remove(&key);
+        // Removed from the account's identity registry as well, so the classic SES
+        // surface stops listing and reporting the identity too. The registry lock is
+        // taken while this service's store is held, which is this service's lock
+        // order.
+        if let Some(registry) = crate::state::identity_registry(&*self.engine) {
+            registry.lock().forget(&input.email_identity);
+        }
         // The outbound-message log is deliberately left alone: deleting an identity
         // stops future sends from it and does not unsend what it already sent.
         Ok(DeleteEmailIdentityOutput {})

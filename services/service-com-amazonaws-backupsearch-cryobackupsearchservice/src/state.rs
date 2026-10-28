@@ -38,7 +38,8 @@
 //! that started it: [`scan_outcome`] turns the recovery points a scope resolved to
 //! ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::recovery_points_in_scope`])
 //! into the terminal status the scan is owed, and the `StatusMessage` that status comes
-//! with travels with it.
+//! with travels with it — including the one a scan that got through only PART of the scope
+//! it covered has to explain itself with.
 //!
 //! ## Two layers: backups, and the items inside them
 //!
@@ -52,9 +53,11 @@
 //!
 //! A covered recovery point only reaches that inner layer when its backup index was in a
 //! state a search could read ([`index_searchable`]): one that was not takes no part in the
-//! search — nothing of it is scanned, counted or matched — and is only DISPLAYED, with the
+//! search — nothing of it is scanned, counted or matched — and is DISPLAYED, with the
 //! status and status message saying why, by the listing that pages
-//! [`SearchJob::backups`].
+//! [`SearchJob::backups`]. A scan that left one of its covered recovery points out that
+//! way did not get through the scope it covered, so the terminal status it settles to
+//! carries the `StatusMessage` saying so ([`scan_outcome`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -877,7 +880,12 @@ pub struct SearchJob {
     /// (`None` for one that needs no message). A scan owes two — [`RUNNING`] and then its
     /// terminal status — so this is a queue and not a single transition; it is EMPTY for a
     /// job in a terminal status, which owes nothing.
-    pub owed_statuses: VecDeque<(SystemTime, &'static str, Option<&'static str>)>,
+    ///
+    /// The message is OWNED rather than a fixed sentence, exactly as
+    /// [`ExportJob::next_status_due`]'s is: a terminal status the service has to explain
+    /// can need text counted from the job's own record ([`scan_outcome`]), not only one of
+    /// this module's templates.
+    pub owed_statuses: VecDeque<(SystemTime, &'static str, Option<String>)>,
 }
 
 impl SearchJob {
@@ -922,7 +930,7 @@ impl SearchJob {
         &mut self,
         due: SystemTime,
         status: &'static str,
-        message: Option<&'static str>,
+        message: Option<String>,
     ) {
         self.owed_statuses.clear();
         self.owed_statuses.push_back((due, status, message));
@@ -943,16 +951,19 @@ impl SearchJob {
     /// one instant and can never disagree.
     fn settle(&mut self, now: SystemTime) {
         expire_client_token(&mut self.client_token, now);
-        while let Some(&(due, next, message)) = self.owed_statuses.front() {
+        while let Some(&(due, _, _)) = self.owed_statuses.front() {
             if now < due {
                 return;
             }
-            self.owed_statuses.pop_front();
+            let (_, next, message) = self
+                .owed_statuses
+                .pop_front()
+                .expect("the queue front was just observed");
             self.status = next.to_string();
             // The status and the message that status comes with are written together, so
             // a record can never explain a failure it has not reached, nor reach one
             // silently.
-            self.status_message = message.map(ToString::to_string);
+            self.status_message = message;
             // `CompletionTime` is when the job COMPLETED, so only a status the job never
             // leaves sets it: passing through a transient status completes nothing.
             if TERMINAL_STATES.contains(&next) {
@@ -1519,19 +1530,50 @@ fn instant_key(instant: DateTime) -> (i64, u32) {
     (instant.secs(), instant.subsec_nanos())
 }
 
-/// The terminal status the clock owes a scan over `recovery_points_in_scope` recovery
-/// points, with the `StatusMessage` that status comes with.
+/// The terminal status the clock owes a scan over the recovery points `points` a scope
+/// resolved to, with the `StatusMessage` that status comes with.
 ///
-/// A scan that had something to get through ends `COMPLETED` and explains nothing. A
-/// scope that resolved to NO recovery point is a terminal failure — there was nothing to
-/// search — and the service says so in the message, so a caller branching on a terminal
-/// status takes its failure path instead of reading results that were never produced.
-pub fn scan_outcome(recovery_points_in_scope: usize) -> (&'static str, Option<&'static str>) {
-    if recovery_points_in_scope == 0 {
-        (FAILED, Some(SCOPE_EMPTY))
-    } else {
-        (COMPLETED, None)
+/// Both the status and the message follow from the SAME two facts about that resolved
+/// scope, which is why they are decided from the resolved points themselves rather than
+/// from a count a caller passes in:
+///
+/// * a scope that resolved to NO recovery point is a terminal failure — there was nothing
+///   to search — and the service says so in the message ([`SCOPE_EMPTY`]), so a caller
+///   branching on a terminal status takes its failure path instead of reading results that
+///   were never produced;
+/// * a scope that resolved to recovery points the scan could all read ends `COMPLETED`
+///   and explains nothing, because it got through everything it covered;
+/// * a scope holding a covered recovery point the scan could NOT read
+///   ([`index_searchable`]) also ends `COMPLETED` — the scan ran — but it is a completion
+///   WITH ISSUES: part of the scope was left unscanned, so the status comes with the
+///   message that says so ([`unscanned_points_message`]). The model requires exactly that
+///   of the member: a status message is returned for a `COMPLETED` job with issues, and
+///   the example it names is a search containing recovery points unable to be scanned
+///   (`smithy_query(query="doc", shape="GetSearchJobOutput", member="StatusMessage")`).
+pub fn scan_outcome(points: &[IndexedRecoveryPoint]) -> (&'static str, Option<String>) {
+    if points.is_empty() {
+        return (FAILED, Some(SCOPE_EMPTY.to_string()));
     }
+    let unscanned = points.len() - searched_recovery_point_count(points);
+    if unscanned == 0 {
+        return (COMPLETED, None);
+    }
+    (COMPLETED, Some(unscanned_points_message(unscanned, points.len())))
+}
+
+/// The `StatusMessage` a scan that covered `covered` recovery points and could not read
+/// `unscanned` of them reports, i.e. the text of a completion WITH ISSUES.
+///
+/// The model states no wording for this outcome, so the sentence it DOES state the case in
+/// is the template: a search that "contained recovery points unable to be scanned"
+/// (`smithy_query(query="doc", shape="GetSearchJobOutput", member="StatusMessage")`). Its
+/// variable parts are counted from the job's own resolved scope — how many of the covered
+/// recovery points the search was left out of — so the message a caller reads says how
+/// much of the scope went unscanned instead of repeating one job's text. Which backups
+/// those were, and the status each one's index was in, is what the listing that pages
+/// [`SearchJob::backups`] displays.
+pub fn unscanned_points_message(unscanned: usize, covered: usize) -> String {
+    format!("Search contained {unscanned} of {covered} recovery points unable to be scanned")
 }
 
 /// Whether the backup index of `point` is in a state a search can read, and so whether
@@ -1540,9 +1582,10 @@ pub fn scan_outcome(recovery_points_in_scope: usize) -> (&'static str, Option<&'
 /// An index that is built is read, and its items are the ones a scan gets through
 /// ([`scanned_items`]); an index in any other state could not be read, so the recovery
 /// point is left OUT of the search — none of its items is scanned, counted or matched,
-/// and the backup itself is only displayed, with the status and status message that say
-/// why, by the listing that pages [`SearchJob::backups`]. A record reporting no index
-/// status at all cannot be shown to hold a readable index, so it is left out too — the
+/// and the backup itself is displayed, with the status and status message that say why, by
+/// the listing that pages [`SearchJob::backups`], while the job's own `StatusMessage`
+/// reports that part of the scope went unscanned ([`scan_outcome`]). A record reporting no
+/// index status at all cannot be shown to hold a readable index, so it is left out too — the
 /// same way the scope resolution treats a record it cannot judge ([`in_scope`]).
 pub fn index_searchable(point: &SearchJobBackupsResult) -> bool {
     point

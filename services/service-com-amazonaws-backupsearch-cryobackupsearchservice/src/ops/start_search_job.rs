@@ -19,13 +19,16 @@
 //! Both counts are over the covered recovery points the scan can READ: a backup whose
 //! index was in no state to be read ([`crate::state::index_searchable`]) takes no part in
 //! the search, so neither it nor any of its items is scanned, counted, matched or paged —
-//! it is only displayed, with the status saying why, by `ListSearchJobBackups`.
+//! it is displayed, with the status saying why, by `ListSearchJobBackups`, and the job's
+//! own `StatusMessage` says that the scope held such backups at all.
 //!
 //! The clock then owes the job `RUNNING` and after that a terminal status, and WHICH
-//! terminal one follows from the resolved scope: a scan with recovery points in scope
-//! runs to `COMPLETED`, while a scope that resolved to none ends `FAILED` with the
-//! `StatusMessage` the service explains an empty scope with
-//! ([`crate::state::scan_outcome`]).
+//! terminal one — with the `StatusMessage` it comes with — follows from the resolved scope
+//! ([`crate::state::scan_outcome`]): a scan that got through every recovery point in scope
+//! runs to `COMPLETED` and explains nothing, a scope that resolved to none ends `FAILED`
+//! with the `StatusMessage` the service explains an empty scope with, and a scan that
+//! covered recovery points it could not read runs to `COMPLETED` carrying the
+//! `StatusMessage` that says how much of the scope was left unscanned.
 //!
 //! `ClientToken` is idempotent while the token's validity window is open: the same token
 //! with the same body answers with the job the first call minted, and the same token with
@@ -320,10 +323,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             items_scanned_count: Some(0),
             items_matched_count: Some(0),
         };
-        // The terminal status the clock owes this scan follows from that resolved scope:
-        // a scope holding nothing to search is a terminal FAILURE the service explains
-        // in StatusMessage, and anything else runs to COMPLETED.
-        let (owed_status, owed_message) = crate::state::scan_outcome(points.len());
+        // The terminal status the clock owes this scan, and the message that status comes
+        // with, both follow from that resolved scope and are decided from the resolved
+        // points themselves (`crate::state::scan_outcome`): a scope holding nothing to
+        // search is a terminal FAILURE the service explains in StatusMessage, a scope the
+        // scan got all the way through runs to COMPLETED and explains nothing, and one
+        // holding a covered recovery point the scan could not read runs to COMPLETED WITH
+        // ISSUES — the status message is what carries those issues up to the job record.
+        let (owed_status, owed_message) = crate::state::scan_outcome(&points);
         // The recovery points the scan covers are exactly the ones in scope, which is
         // what `ListSearchJobBackups` reports — including one the scan could not get into,
         // which that listing displays with its status and status message.

@@ -330,7 +330,9 @@ fn resolve(
     }
     match user.status {
         crate::state::UserStatus::ResetRequired => {
-            return Err(not_authorized("Password reset required for the user."));
+            return Err(not_authorized(
+                crate::state::PASSWORD_RESET_REQUIRED_MESSAGE,
+            ));
         }
         crate::state::UserStatus::Unconfirmed => {
             return Err(not_authorized("User is not confirmed."));

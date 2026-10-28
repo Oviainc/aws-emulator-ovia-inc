@@ -140,7 +140,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        if crate::state::service_state(&*self.engine).is_none() {
             // This service has a store on the shared `InMemoryEngine` the router
             // builds; mounted on an engine that has none it cannot be served at
             // all, which is what the scaffold channel says, and this operation
@@ -148,16 +148,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "VerifyEmailIdentity",
             ));
-        };
+        }
         // Idempotent: a second call for the same address leaves the existing record
         // (and its `verified_at`, and whatever is left of the span its pending
-        // verification started) alone, so the identity list never doubles up.
-        // `None` means the account is already at its identity limit, which is a
-        // refusal, not a server fault.
-        if state
-            .lock()
-            .verify_identity(&address, crate::state::IdentityType::EmailAddress)
-            .is_none()
+        // verification started) alone, so the identity list never doubles up. The
+        // address is recorded in the account's identity registry as well as in this
+        // service's own list, so the v2 surface reports the identity this call
+        // requested. `None` means the account is already at its identity limit, which
+        // is a refusal, not a server fault.
+        if crate::state::record_identity(
+            &*self.engine,
+            &address,
+            crate::state::IdentityType::EmailAddress,
+        )
+        .is_none()
         {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "this account already holds the maximum of {} verified identities; delete one \
