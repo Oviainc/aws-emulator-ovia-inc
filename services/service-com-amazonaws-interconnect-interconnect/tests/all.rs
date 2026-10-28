@@ -19,6 +19,8 @@ mod arn_scope_refusals;
 mod arn_scope_is_relative_to_the_request;
 #[path = "all/attach_point_arn_is_scoped_to_the_request.rs"]
 mod attach_point_arn_is_scoped_to_the_request;
+#[path = "all/attach_point_judgement_is_shared.rs"]
+mod attach_point_judgement_is_shared;
 #[path = "all/attach_points.rs"]
 mod attach_points;
 #[path = "all/bandwidth_availability.rs"]

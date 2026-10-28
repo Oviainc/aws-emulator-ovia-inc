@@ -65,22 +65,47 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // Pinned off so the suites do not depend on the process-wide default; the
-        // Authorization header below is still what carries the credential scope.
-        router.set_request_authentication(false);
+        Self::on_engine(Arc::new(engine::InMemoryEngine::new()))
+    }
+
+    /// One emulator over an engine the CALLER holds, mounted the way [`Self::new`]
+    /// mounts one. A suite that needs a second front door over the same state — the
+    /// same records reached through a differently mounted router — builds both from
+    /// here.
+    pub(crate) fn on_engine(engine: Arc<engine::InMemoryEngine>) -> Self {
+        let mut router = Self::router();
+        // An attach point is a Direct Connect gateway, so the service that owns those
+        // gateways is mounted on the same engine the way the assembled router mounts it.
         router.register_service(
             service_com_amazonaws_interconnect_interconnect::EmulatedService::new(Arc::clone(
                 &engine,
             )),
         );
-        // An attach point is a Direct Connect gateway, so the service that owns those
-        // gateways is mounted on the same engine the way the assembled router mounts it.
         router.register_service(
             service_com_amazonaws_directconnect_overtureservice::EmulatedService::new(engine),
         );
         Self { router }
+    }
+
+    /// One emulator with Interconnect mounted ALONE over `engine`: nothing behind this
+    /// front door owns the account's Direct Connect gateways, so a handler that resolves
+    /// an attach point cannot read them at all — which is the UNRESOLVABLE verdict, as
+    /// distinct from an account that holds no gateway.
+    pub(crate) fn interconnect_only(engine: Arc<engine::InMemoryEngine>) -> Self {
+        let mut router = Self::router();
+        router.register_service(
+            service_com_amazonaws_interconnect_interconnect::EmulatedService::new(engine),
+        );
+        Self { router }
+    }
+
+    /// A router with nothing mounted yet, configured the way every suite's is.
+    fn router() -> MultiServiceRouter {
+        let mut router = MultiServiceRouter::new();
+        // Pinned off so the suites do not depend on the process-wide default; the
+        // Authorization header below is still what carries the credential scope.
+        router.set_request_authentication(false);
+        router
     }
 
     /// `POST /` for one operation of `signing_name`, with that service's target and

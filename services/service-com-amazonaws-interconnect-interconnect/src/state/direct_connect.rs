@@ -15,7 +15,7 @@
 //! gateway — and an emulator with no Direct Connect mounted, which knows of none — has no
 //! attach point, which is an EMPTY listing rather than a fabricated descriptor.
 
-use crate::ops::types::AttachPointDescriptor;
+use crate::ops::types::{AttachPoint, AttachPointDescriptor};
 
 /// The one `DirectConnectGatewayState` a Connection can be attached to.
 ///
@@ -133,6 +133,73 @@ pub async fn resolve_attach_point(
         AttachPointResolution::NotAnAttachPoint
     } else {
         AttachPointResolution::Unresolvable
+    }
+}
+
+/// How a request whose attach point could not be judged AT ALL is worded.
+///
+/// This is the emulator failing to resolve the account's own gateways rather than the
+/// caller naming something that does not exist, so the sentence carries no identifier:
+/// nothing is known about the one the request sent, not even that it is absent.
+const ATTACH_POINTS_UNRESOLVABLE_MESSAGE: &str =
+    "the attach points of this account could not be resolved, so the requested attach point \
+     could not be validated";
+
+/// The two refusals an attach-point resolution can call for, in the error channel of
+/// the operation that asked for it.
+///
+/// Every operation of this service carries its own modelled error enum, so the rule
+/// deciding WHICH refusal a verdict calls for and what it says lives once, in
+/// [`judge_attach_point`], and an operation that resolves an attach point supplies only
+/// this: which variant of its own channel each refusal travels in. A handler therefore
+/// cannot classify or word one of these refusals differently from its neighbour.
+pub trait AttachPointRefusal: Sized {
+    /// The account's attach points were read and the identifier is not one of them: the
+    /// modelled `ResourceNotFoundException` (HTTP 404).
+    fn not_an_attach_point(message: String) -> Self;
+
+    /// The account's attach points could not be read, so the identifier could not be
+    /// judged either way: the modelled `InterconnectServerException` (HTTP 500).
+    fn attach_points_unresolvable(message: String) -> Self;
+}
+
+/// Judge the `attach_point` a request selected for a connection on `environment_id`,
+/// answering `Ok(())` when the connection may be made onto it.
+///
+/// The ONE rule both writers of a connection's attach point (the create that allocates
+/// the first one and the acceptance that associates one) are held to, so what a
+/// Connection may be attached to does not depend on how it came to exist:
+///
+/// * [`AttachPointResolution::Valid`] — the identifier names an attach point of the
+///   account, and the request continues;
+/// * [`AttachPointResolution::NotAnAttachPoint`] — it names none, which is the
+///   not-found refusal worded by [`crate::state::attach_point_not_valid_message`] from
+///   the identifier the request carried and the Environment it was offered for;
+/// * [`AttachPointResolution::Unresolvable`] — the account's attach points could not be
+///   read, which is the server refusal carrying the sentence above, a DIFFERENT answer
+///   because nothing is known about the identifier either way.
+///
+/// Only `AttachPoint$directConnectGateway` is resolved here: that member "identifies an
+/// DirectConnect Gateway attach point by DirectConnectGatewayID", a resource of the
+/// service that OWNS those gateways, while `AttachPoint$arn` names a Connection of the
+/// account, which this service's own store resolves under its own lock.
+pub async fn judge_attach_point<E: AttachPointRefusal>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    attach_point: &AttachPoint,
+    environment_id: &str,
+) -> Result<(), E> {
+    let AttachPoint::directConnectGateway(gateway) = attach_point else {
+        return Ok(());
+    };
+    match resolve_attach_point(ctx, region, gateway).await {
+        AttachPointResolution::Valid => Ok(()),
+        AttachPointResolution::NotAnAttachPoint => Err(E::not_an_attach_point(
+            crate::state::attach_point_not_valid_message(gateway, environment_id),
+        )),
+        AttachPointResolution::Unresolvable => Err(E::attach_points_unresolvable(
+            ATTACH_POINTS_UNRESOLVABLE_MESSAGE.to_string(),
+        )),
     }
 }
 

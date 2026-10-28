@@ -117,6 +117,25 @@ impl From<CreateConnectionErrorModeled> for CreateConnectionError {
     }
 }
 
+/// Which variant of this operation's error channel each attach-point refusal travels
+/// in. WHICH refusal a resolution verdict calls for, and how it is worded, is
+/// `crate::state::direct_connect::judge_attach_point`'s to say.
+impl crate::state::direct_connect::AttachPointRefusal for CreateConnectionError {
+    fn not_an_attach_point(message: String) -> Self {
+        CreateConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: Some(message),
+        })
+        .into()
+    }
+
+    fn attach_points_unresolvable(message: String) -> Self {
+        CreateConnectionErrorModeled::InterconnectServerException(InterconnectServerException {
+            message,
+        })
+        .into()
+    }
+}
+
 /// The `CreateConnection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -350,40 +369,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `AttachPoint$directConnectGateway` "identifies an DirectConnect Gateway
-        // attach point by DirectConnectGatewayID" — a resource of the service that
-        // OWNS those gateways, so it is resolved against that service, through the
-        // same walk `ListAttachPoints` answers from. A gateway the account does not
-        // hold, or one not ready for use, is not among the attach points valid for
-        // the Environment, and a Connection is never provisioned onto one; an
-        // account whose gateways could not be read at all is a different answer
-        // again, because then nothing is known about the identifier either way.
-        if let AttachPoint::directConnectGateway(gateway) = &input.attach_point {
-            match crate::state::direct_connect::resolve_attach_point(ctx, &region, gateway).await {
-                crate::state::direct_connect::AttachPointResolution::Valid => {}
-                crate::state::direct_connect::AttachPointResolution::NotAnAttachPoint => {
-                    return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(crate::state::attach_point_not_valid_message(
-                                gateway,
-                                &environment.environment_id,
-                            )),
-                        },
-                    )
-                    .into())
-                }
-                crate::state::direct_connect::AttachPointResolution::Unresolvable => {
-                    return Err(CreateConnectionErrorModeled::InterconnectServerException(
-                        InterconnectServerException {
-                            message: "the attach points of this account could not be resolved, \
-                                      so the requested attach point could not be validated"
-                                .to_string(),
-                        },
-                    )
-                    .into())
-                }
-            }
-        }
+        // The attach point the request selected, judged by the one rule both writers of
+        // a connection's attach point are held to
+        // (`crate::state::direct_connect::judge_attach_point`): a gateway the account
+        // does not hold, or one not ready for use, is not among the attach points valid
+        // for the Environment, and a Connection is never provisioned onto one; an
+        // account whose gateways could not be read at all is a different answer again,
+        // because then nothing is known about the identifier either way.
+        crate::state::direct_connect::judge_attach_point::<CreateConnectionError>(
+            ctx,
+            &region,
+            &input.attach_point,
+            &environment.environment_id,
+        )
+        .await?;
 
         // The resource is minted under a fresh lock, and judged against the store
         // once more under THAT lock: the store may have moved while the attach point
