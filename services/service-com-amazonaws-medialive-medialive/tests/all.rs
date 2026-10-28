@@ -329,6 +329,9 @@ mod sdi_source_lifecycle;
 #[path = "all/sdi_source_tags_and_statuses.rs"]
 mod sdi_source_tags_and_statuses;
 
+#[path = "all/shared_page_size_rule.rs"]
+mod shared_page_size_rule;
+
 #[path = "all/shared_request_rules.rs"]
 mod shared_request_rules;
 

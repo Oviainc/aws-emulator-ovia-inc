@@ -161,19 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
-        // `MaxResults` is a page size, so a non-positive one asks for nothing and
-        // is a bad request. It is clamped to a finite ceiling, and an absent one
-        // uses that ceiling, so no single request can ask the service to project
-        // an unbounded number of alerts in one response.
-        let page_size = match input.max_results {
-            Some(max_results) if max_results < 1 => {
-                return Err(bad_request(&format!(
-                    "maxResults must be at least 1, got {max_results}"
-                )));
-            }
-            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
-            None => crate::state::MAX_LIST_PAGE_SIZE,
-        };
+        // The page size this listing cuts at is the service's shared page-size
+        // rule ([`crate::state::list_page_size`]), whose refusal this operation
+        // answers as its own modelled client error.
+        let page_size = crate::state::list_page_size(input.max_results)
+            .map_err(|message| bad_request(&message))?;
 
         // `StateFilter` "Specifies the set of alerts to return based on their
         // state. SET - Return only alerts with SET state. CLEARED - Return only

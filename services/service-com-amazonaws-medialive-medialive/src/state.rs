@@ -1150,6 +1150,30 @@ pub fn reserved_tag_key_message(key: &str) -> String {
 /// ask the service to project an unbounded number of resources in one response.
 pub const MAX_LIST_PAGE_SIZE: usize = 1000;
 
+/// The page size one paginated request is served at, from the `MaxResults` it
+/// carried — or the message its refusal carries when that member asks for no
+/// items at all.
+///
+/// ONE copy of this page-size rule and of its wording, for the reason
+/// [`bounded_length`] states: every paginated operation of this service cuts its
+/// page by the same rule, so none of them can drift into its own reading of the
+/// floor, of the ceiling or of what an absent member asks for. A `MaxResults`
+/// below one asks for nothing and is refused by the floor [`at_least_one`]
+/// states for a count; a larger one is the page size verbatim up to
+/// [`MAX_LIST_PAGE_SIZE`], which is also what a request naming no `MaxResults`
+/// is served at — so no single request can ask the service to project an
+/// unbounded number of resources in one response.
+///
+/// The caller maps the message onto the modelled client error its own operation
+/// declares, exactly as the operations wrapping [`bounded_length`] and
+/// [`at_least_one`] do.
+pub fn list_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    at_least_one("maxResults", max_results)?;
+    Ok(max_results.map_or(MAX_LIST_PAGE_SIZE, |asked_for| {
+        (asked_for as usize).min(MAX_LIST_PAGE_SIZE)
+    }))
+}
+
 /// The most resource ids ONE `BatchDelete` call may name, counting its
 /// `ChannelIds`, `InputIds`, `InputSecurityGroupIds` and `MultiplexIds`
 /// together.
