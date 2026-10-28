@@ -110,6 +110,9 @@ fn object(body: &[u8]) -> Object {
         checksum: None,
         // Nor is it assembled from parts: one write stored it whole.
         parts: Vec::new(),
+        // And nothing replicated it: the store settles a replication record from the
+        // bucket's own configuration.
+        replication: None,
     }
 }
 

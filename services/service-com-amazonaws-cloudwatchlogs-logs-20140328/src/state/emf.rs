@@ -50,11 +50,12 @@ const UNIT_MEMBER: &str = "Unit";
 /// See [`AWS_MEMBER`]: the resolution one metric is stored at.
 const STORAGE_RESOLUTION_MEMBER: &str = "StorageResolution";
 
-/// The resolution a metric is stored at when the directive declares none: the default
+/// The resolution a metric is stored at when nothing declares one: the default
 /// `MetricDatum$StorageResolution` documents ("This field is optional, if you do not specify
 /// it the default of 60 is used"), so an extracted metric is a regular-resolution metric
-/// unless the document says otherwise.
-const DEFAULT_STORAGE_RESOLUTION: i32 = 60;
+/// unless the document says otherwise. Shared with the metric-filter extraction in
+/// [`super::metric_filters`], whose transformations declare no resolution at all.
+pub const DEFAULT_STORAGE_RESOLUTION: i32 = 60;
 
 /// The namespace CloudWatch Logs publishes its OWN operational metrics into, rather than a
 /// client's: the service's metrics are "in the AWS/Logs namespace".
@@ -73,10 +74,11 @@ pub const LOG_GROUP_NAME_DIMENSION: &str = "LogGroupName";
 /// data is published with.
 const COUNT_UNIT: &str = "Count";
 
-/// How many datapoints one ingested event may publish, whatever its document declares: the
-/// ceiling that keeps one `PutLogEvents` batch from writing an unbounded number of series.
-/// THE EMULATOR'S OWN CEILING, not a documented limit.
-const MAX_DATAPOINTS_PER_EVENT: usize = 100;
+/// How many datapoints one ingested event may publish, whatever its document or the log
+/// group's metric filters declare: the ceiling that keeps one `PutLogEvents` batch from
+/// writing an unbounded number of series. THE EMULATOR'S OWN CEILING, not a documented
+/// limit.
+pub const MAX_DATAPOINTS_PER_EVENT: usize = 100;
 
 /// One datapoint an ingested Embedded Metric Format document publishes.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +105,25 @@ pub struct ExtractedDatapoint {
 /// `event_timestamp_ms` is the log event's own timestamp, used for a document that declares
 /// no `Timestamp` of its own: the value was observed when the event it travelled in was.
 pub fn extracted_datapoints(message: &str, event_timestamp_ms: i64) -> Vec<ExtractedDatapoint> {
+    extracted_datapoints_bounded(message, event_timestamp_ms, MAX_DATAPOINTS_PER_EVENT)
+}
+
+/// [`extracted_datapoints`], stopping once `limit` of them are extracted.
+///
+/// `limit` bounds the WORK as well as the answer: every loop over a part of the document the
+/// message chose the size of — the directives, one directive's metrics, one metric's values
+/// and the dimension sets they are published under — is left as soon as the limit is
+/// reached, so one message cannot drive iteration proportional to the product of the counts
+/// it declares. A caller that only needs to know WHETHER the message declares a metric asks
+/// for one.
+pub fn extracted_datapoints_bounded(
+    message: &str,
+    event_timestamp_ms: i64,
+    limit: usize,
+) -> Vec<ExtractedDatapoint> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(message) else {
         return Vec::new();
     };
@@ -121,7 +142,13 @@ pub fn extracted_datapoints(message: &str, event_timestamp_ms: i64) -> Vec<Extra
     };
 
     let mut datapoints: Vec<ExtractedDatapoint> = Vec::new();
+    // The numbers one document member holds, read at most once however many of the
+    // document's metrics name that same member.
+    let mut values_by_member: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     for directive in directives {
+        if datapoints.len() >= limit {
+            return datapoints;
+        }
         let Some(namespace) = directive
             .get(NAMESPACE_MEMBER)
             .and_then(::serde_json::Value::as_str)
@@ -139,7 +166,16 @@ pub fn extracted_datapoints(message: &str, event_timestamp_ms: i64) -> Vec<Extra
         // is two series. A directive declaring no set at all publishes the metrics with no
         // dimensions.
         let dimension_sets = dimension_sets(directive, &document);
+        // A directive whose every declared set names a member the document does not supply
+        // a dimension value for resolves NO set, so it publishes nothing: there is no series
+        // for its metrics to be read for.
+        if dimension_sets.is_empty() {
+            continue;
+        }
         for metric in metrics {
+            if datapoints.len() >= limit {
+                return datapoints;
+            }
             let Some(metric_name) = metric.get(NAME_MEMBER).and_then(::serde_json::Value::as_str)
             else {
                 continue;
@@ -157,9 +193,12 @@ pub fn extracted_datapoints(message: &str, event_timestamp_ms: i64) -> Vec<Extra
             // number or as an array of numbers: a member the document does not carry, or
             // that is not numeric, declares a metric with nothing observed, so it publishes
             // no datapoint rather than a zero nothing measured.
-            for value in values_of(document.get(metric_name)) {
+            let values: &[f64] = values_by_member
+                .entry(metric_name)
+                .or_insert_with(|| values_of(document.get(metric_name)));
+            for value in values {
                 for dimensions in &dimension_sets {
-                    if datapoints.len() >= MAX_DATAPOINTS_PER_EVENT {
+                    if datapoints.len() >= limit {
                         return datapoints;
                     }
                     datapoints.push(ExtractedDatapoint {
@@ -167,7 +206,7 @@ pub fn extracted_datapoints(message: &str, event_timestamp_ms: i64) -> Vec<Extra
                         metric_name: metric_name.to_string(),
                         dimensions: dimensions.clone(),
                         timestamp_ms,
-                        value,
+                        value: *value,
                         unit: unit.clone(),
                         storage_resolution,
                     });
@@ -192,7 +231,10 @@ pub fn suppressed_datapoints(
     event_timestamp_ms: i64,
     log_group_name: &str,
 ) -> Vec<ExtractedDatapoint> {
-    let skipped = extracted_datapoints(message, event_timestamp_ms);
+    // One document counts once, so only the FIRST datapoint it would have published is
+    // needed: the extraction stops there rather than paying for the whole document to
+    // answer whether it declared anything.
+    let skipped = extracted_datapoints_bounded(message, event_timestamp_ms, 1);
     let Some(first) = skipped.first() else {
         return Vec::new();
     };

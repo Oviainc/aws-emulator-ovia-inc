@@ -165,11 +165,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.custom_entity_types.get(&input.name) else {
             return Err(GetCustomEntityTypeErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal is derived from the request: it names the member that
-                    // resolved to nothing. What is pinned is the behaviour — 400 with
-                    // `EntityNotFoundException`.
-                    message: Some(format!("Custom entity type {} not found", input.name)),
+                    // The one wording this service gives a custom pattern miss
+                    // ([`crate::state::messages::custom_entity_type_not_found`]), shared
+                    // with the delete that addresses a pattern the same way: the sentence
+                    // names the pattern the request addressed and the account whose
+                    // namespace holds none under that name.
+                    message: Some(crate::state::messages::custom_entity_type_not_found(
+                        &input.name,
+                    )),
                     from_federation_source: None,
                 },
             )

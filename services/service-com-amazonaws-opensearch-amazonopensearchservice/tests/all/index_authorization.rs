@@ -38,7 +38,7 @@ const ROLE: &str = "opensearch-index-reader";
 const SESSION: &str = "index-session";
 
 /// The access key id of the assumed-role session's credentials.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
 
 /// The name of the inline policy the role carries.
 const POLICY_NAME: &str = "inline";
@@ -47,11 +47,11 @@ const POLICY_NAME: &str = "inline";
 const SESSION_SECONDS: i32 = 3_600;
 
 /// The domain every case addresses, and the index it holds.
-const DOMAIN: &str = "search-target";
-const INDEX: &str = "catalog";
+pub(crate) const DOMAIN: &str = "search-target";
+pub(crate) const INDEX: &str = "catalog";
 
 /// The schema the fixture's index is created with.
-fn created_schema() -> Value {
+pub(crate) fn created_schema() -> Value {
     json!({ "mappings": { "properties": { "title": { "type": "text" } } } })
 }
 
@@ -62,15 +62,15 @@ const INDEX_OPERATIONS: [&str; 4] = ["CreateIndex", "GetIndex", "UpdateIndex", "
 
 /// One emulator with a domain, an index on it and an assumed-role session recorded — the
 /// precondition every case below starts from.
-struct Fixture {
-    emulator: Emulator,
+pub(crate) struct Fixture {
+    pub(crate) emulator: Emulator,
     /// The domain's ARN as `DescribeDomain` reports it: what a policy scopes a statement
     /// to and what a refusal names.
-    domain_arn: String,
+    pub(crate) domain_arn: String,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let emulator = Emulator::new();
         created_domain(&emulator, DOMAIN).await;
         created_index(&emulator, DOMAIN, INDEX, &created_schema(), "fixture").await;
@@ -122,7 +122,7 @@ impl Fixture {
     }
 
     /// The principal ARN the session speaks for — what a refusal must name.
-    fn session_arn(&self) -> String {
+    pub(crate) fn session_arn(&self) -> String {
         format!(
             "arn:aws:sts::{}:assumed-role/{ROLE}/{SESSION}",
             ::engine::emulator_account_id()
@@ -135,7 +135,7 @@ impl Fixture {
     /// A `document` that is a JSON STRING is stored verbatim rather than as its JSON
     /// text, because that is how a percent-encoded document — the form IAM reports a
     /// policy in — and a document that is not a policy at all reach the store.
-    fn given_role_policy(&self, document: &Value) {
+    pub(crate) fn given_role_policy(&self, document: &Value) {
         let policy_document = match document.as_str() {
             Some(verbatim) => verbatim.to_string(),
             None => document.to_string(),
@@ -221,12 +221,12 @@ impl Fixture {
 }
 
 /// An update document adding one mapping property of `kind`.
-fn added_property(property: &str, kind: &str) -> Value {
+pub(crate) fn added_property(property: &str, kind: &str) -> Value {
     json!({ "mappings": { "properties": { property: { "type": kind } } } })
 }
 
 /// A policy allowing `actions` on `resources`.
-fn allow(actions: Value, resources: Value) -> Value {
+pub(crate) fn allow(actions: Value, resources: Value) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": resources }]

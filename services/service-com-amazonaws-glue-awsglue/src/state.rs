@@ -8328,6 +8328,23 @@ pub mod messages {
         format!("Classifier {name} is a {stored} and cannot be updated as a {requested}.")
     }
 
+    /// A custom entity type lookup for a name this account holds no custom pattern
+    /// under — the miss of every operation that addresses one by `Name`
+    /// (`GetCustomEntityType`, `DeleteCustomEntityType`).
+    ///
+    /// Recorded template: the sentence names the pattern the request addressed and the
+    /// account whose namespace was searched, because a custom pattern's name "must be
+    /// unique per Amazon Web Services account" (`CustomEntityType$Name`) and so the
+    /// account is part of the address that resolved to nothing. The name is read off the
+    /// request, exactly as sent; the account is the one this emulator serves, not a value
+    /// the request carries.
+    pub fn custom_entity_type_not_found(name: &str) -> String {
+        format!(
+            "An existing Custom Entity Type: {name} cannot be found for Account Id {}",
+            ::engine::emulator_account_id()
+        )
+    }
+
     /// Any catalog operation whose `CatalogId` names a Data Catalog of ANOTHER account
     /// that no resource-based policy grants the caller
     /// ([`super::foreign_catalog_refusal`]). Recorded template: it names the calling
