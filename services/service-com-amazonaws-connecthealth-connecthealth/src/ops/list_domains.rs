@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomains
-//! IMPLEMENTED: one `DomainSummary` per domain PERSISTED IN THE REGION the request was
-//! signed for, filtered by the `status` query parameter when present, paged by
-//! `maxResults` with an opaque `nextToken` that resumes exactly after the last domain the
-//! previous page returned.
+//! IMPLEMENTED: one `DomainSummary` per domain PERSISTED FOR THE ACCOUNT the request was
+//! signed for IN THE REGION it was signed for, filtered by the `status` query parameter
+//! when present, paged by `maxResults` with an opaque `nextToken` that resumes exactly
+//! after the last domain the previous page returned.
 //!
 //! ## Shape of an operation
 //!
@@ -136,8 +136,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // This service's endpoint is regional, so the inventory this call enumerates is
-        // the Region the request was signed for, and no other.
+        // the Region the request was signed for, and no other. The model documents the
+        // operation as an ACCOUNT's domains, so the scope is narrowed again to the account
+        // this caller's resources belong to — resolved exactly as `CreateDomain` resolves
+        // the account it files a new domain under and measures that account's cap over, so
+        // a domain this listing reports is one that account holds and no other's.
         let region = crate::state::region_of(ctx);
+        let account_id = crate::state::owning_account_id();
         let now = ::std::time::SystemTime::now();
 
         // `status` is a modelled enum, so an unknown value is refused at the boundary;
@@ -176,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.purge_due_deletions(now);
 
         let mut matching = store
-            .domains_in(&region)
+            .domains_owned_by(&region, &account_id)
             .filter(|domain| wanted.is_none_or(|status| domain.status == status))
             .filter(|domain| page.starts_after(&domain.domain_id));
 
