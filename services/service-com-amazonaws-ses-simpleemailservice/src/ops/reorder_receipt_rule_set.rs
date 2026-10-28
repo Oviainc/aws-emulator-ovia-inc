@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReorderReceiptRuleSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReorderReceiptRuleSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReorderReceiptRuleSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +132,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReorderReceiptRuleSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReorderReceiptRuleSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReorderReceiptRuleSet"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let rule_set_name = input.rule_set_name;
+        let rule_names = input.rule_names;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `update_receipt_rule.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ReorderReceiptRuleSet",
+            ));
+        };
+        let mut state = state.lock();
+
+        // `RuleSetName` IDENTIFIES a set the account already holds, so a name
+        // outside the documented form needs no refusal of its own: a name SES
+        // cannot hold is a name the store does not hold, which is the refusal
+        // below. The set is resolved FIRST — the order of a set that does not
+        // exist is nothing this account can rewrite.
+        let Some(rule_set) = state.receipt_rule_sets.get_mut(&rule_set_name) else {
+            return Err(
+                ReorderReceiptRuleSetErrorModeled::RuleSetDoesNotExistException(
+                    RuleSetDoesNotExistException {
+                        name: Some(rule_set_name.clone()),
+                        message: Some(format!("Rule set does not exist: {rule_set_name}")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The request assigns each rule ONE position, so a name it carries twice
+        // assigns that rule two of them and there is no order to apply. This
+        // operation models no error for it, so it is refused through the service's
+        // 400 `InvalidParameterValue` channel, with the set left as it was.
+        let mut named = ::std::collections::BTreeSet::new();
+        for name in &rule_names {
+            if !named.insert(name.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    format!("Multiple positions found for rule: {name}"),
+                ));
+            }
+        }
+        // The order the request asks for, read rule by rule: a name the set does
+        // not hold is a position for a rule that does not exist, which is the
+        // modelled refusal this operation declares for it. Built as a new list
+        // rather than applied in place, so a request refused below leaves the
+        // held order untouched. Its capacity comes from the SET — bounded at
+        // `MAX_RECEIPT_RULES_PER_RULE_SET` rules — rather than from the count of
+        // names the request carries: an accepted request names each held rule
+        // exactly once, so that is the length this reaches.
+        let mut reordered = Vec::with_capacity(rule_set.rules.len());
+        for name in &rule_names {
+            let Some(held) = rule_set.rules.iter().find(|held| &held.name == name) else {
+                return Err(
+                    ReorderReceiptRuleSetErrorModeled::RuleDoesNotExistException(
+                        RuleDoesNotExistException {
+                            name: Some(name.clone()),
+                            message: Some(format!("Rule does not exist: {name}")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            reordered.push(held.clone());
+        }
+        // "All of the rules in the rule set must be represented in this request.
+        // That is, it is error if the reorder request doesn't explicitly position
+        // all of the rules": a rule the request leaves out has no position in the
+        // order it asks for, so the whole request is refused — again through the
+        // 400 channel, naming every rule left unpositioned in the order the set
+        // holds them — and the set keeps the order it already had.
+        let unpositioned: Vec<&str> = rule_set
+            .rules
+            .iter()
+            .map(|held| held.name.as_str())
+            .filter(|held| !named.contains(held))
+            .collect();
+        if !unpositioned.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!("Positions for rules not found: {}", unpositioned.join(", ")),
+            ));
+        }
+
+        // Every rule of the set is named exactly once, so the order the request
+        // named IS the set's new evaluation order: each rule is taken whole, so a
+        // reorder changes positions and nothing else about any rule.
+        rule_set.rules = reordered;
+
+        Ok(ReorderReceiptRuleSetOutput {})
     }
 }

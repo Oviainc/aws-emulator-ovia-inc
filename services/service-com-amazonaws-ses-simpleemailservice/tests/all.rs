@@ -57,6 +57,8 @@ mod ses_receipt_rule_set_deletion;
 mod ses_receipt_rule_set_listing;
 #[path = "all/ses_receipt_rule_sets.rs"]
 mod ses_receipt_rule_sets;
+#[path = "all/ses_reorder_receipt_rule_set.rs"]
+mod ses_reorder_receipt_rule_set;
 #[path = "all/ses_send_raw_email.rs"]
 mod ses_send_raw_email;
 #[path = "all/ses_store_bounds.rs"]
