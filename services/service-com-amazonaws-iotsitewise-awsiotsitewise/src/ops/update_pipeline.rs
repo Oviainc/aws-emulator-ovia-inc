@@ -173,10 +173,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let key = crate::state::pipeline_key(&input.workspace_name, &input.pipeline_name);
         let mut store = state.lock();
-        let record = store
-            .pipelines
-            .get_mut(&key)
-            .ok_or_else(|| not_found(&input.pipeline_name))?;
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+        let record = store.pipelines.get_mut(&key).ok_or_else(|| {
+            not_found(crate::state::RESOURCE_PIPELINE, &input.pipeline_name)
+        })?;
 
         // "Only the fields provided in the request are updated; fields not included in
         // the request are preserved unchanged": an absent member keeps the value the
@@ -211,14 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the pipeline the request addressed.
-fn not_found(pipeline_name: &str) -> UpdatePipelineError {
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a pipeline that workspace
+/// does not hold.
+fn not_found(kind: &str, identifier: &str) -> UpdatePipelineError {
     UpdatePipelineError::Modeled(UpdatePipelineErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(
-                crate::state::RESOURCE_PIPELINE,
-                pipeline_name,
-            ),
+            message: crate::state::not_found_message(kind, identifier),
         },
     ))
 }

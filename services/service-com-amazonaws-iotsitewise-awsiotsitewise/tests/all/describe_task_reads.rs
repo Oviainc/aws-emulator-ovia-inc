@@ -435,17 +435,39 @@ async fn a_task_is_addressed_by_the_exact_names_it_was_created_under() {
         "the create"
     );
 
-    // (case, workspace, task) — each differs from the stored pair in one way the
-    // identity does not forgive: the case of a name, a name that is a prefix of
-    // the stored one, and a workspace nothing was created in.
+    // (case, workspace, task, the identifier the refusal names) — each differs
+    // from the stored pair in one way the identity does not forgive: the case of a
+    // name, a name that is a prefix of the stored one, and a workspace nothing was
+    // created in. The path nests the task inside the workspace, so a row that gets
+    // the WORKSPACE wrong is refused as that absence.
     let cases = [
-        ("the task name in another case", WORKSPACE, "exact-name"),
-        ("the task name upper-cased", WORKSPACE, "EXACT-NAME"),
-        ("a prefix of the task name", WORKSPACE, "Exact"),
-        ("the workspace name in another case", "Read-Side", name),
-        ("a workspace nothing was created in", "elsewhere", name),
+        (
+            "the task name in another case",
+            WORKSPACE,
+            "exact-name",
+            "exact-name",
+        ),
+        (
+            "the task name upper-cased",
+            WORKSPACE,
+            "EXACT-NAME",
+            "EXACT-NAME",
+        ),
+        ("a prefix of the task name", WORKSPACE, "Exact", "Exact"),
+        (
+            "the workspace name in another case",
+            "Read-Side",
+            name,
+            "Read-Side",
+        ),
+        (
+            "a workspace nothing was created in",
+            "elsewhere",
+            name,
+            "elsewhere",
+        ),
     ];
-    for (case, workspace, task) in cases {
+    for (case, workspace, task, named) in cases {
         let (status, body) = describe(&router, workspace, task, None).await;
         assert_eq!(
             (status, error_code(&body)),
@@ -454,8 +476,9 @@ async fn a_task_is_addressed_by_the_exact_names_it_was_created_under() {
              {body}"
         );
         assert!(
-            body["message"].as_str().unwrap_or("").contains(task),
-            "case {case:?}: the refusal names the task the request addressed, got {body}"
+            body["message"].as_str().unwrap_or("").contains(named),
+            "case {case:?}: the refusal names {named:?}, the resource the request got wrong, got \
+             {body}"
         );
     }
 

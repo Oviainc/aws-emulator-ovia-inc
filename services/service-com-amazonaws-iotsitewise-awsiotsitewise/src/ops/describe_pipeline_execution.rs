@@ -10,7 +10,9 @@
 //! `maxResults` / `nextToken`, as the operation's `@paginated` trait declares.
 //! Its status is DERIVED from the record: an execution a cancel was recorded on
 //! reports that cancellation in flight and then complete, as the clock makes each
-//! due. Reporting only: it writes nothing.
+//! due. The three resources the path names are resolved OUTSIDE IN, so a request
+//! naming a workspace or a pipeline this service holds no record of reports THAT
+//! absence rather than the execution's. Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -199,6 +201,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+        if !store.pipelines.contains_key(&crate::state::pipeline_key(
+            &input.workspace_name,
+            &input.pipeline_name,
+        )) {
+            return Err(not_found(
+                crate::state::RESOURCE_PIPELINE,
+                &input.pipeline_name,
+            ));
+        }
+
         // An execution is identified by its id, and the record names the pipeline it
         // belongs to: an id scoped to another workspace or pipeline names an
         // execution this request does not address, which is an absence rather than
@@ -211,15 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && execution.pipeline_name == input.pipeline_name
             })
             .ok_or_else(|| {
-                DescribePipelineExecutionError::Modeled(
-                    DescribePipelineExecutionErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: crate::state::not_found_message(
-                                crate::state::RESOURCE_PIPELINE_EXECUTION,
-                                &input.pipeline_execution_id,
-                            ),
-                        },
-                    ),
+                not_found(
+                    crate::state::RESOURCE_PIPELINE_EXECUTION,
+                    &input.pipeline_execution_id,
                 )
             })?;
 
@@ -271,6 +286,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, a pipeline that workspace does
+/// not hold, or an execution that pipeline does not hold. An execution is
+/// addressed only inside its pipeline, so the last is also what a read naming an
+/// execution of ANOTHER pipeline or workspace answers.
+fn not_found(kind: &str, identifier: &str) -> DescribePipelineExecutionError {
+    DescribePipelineExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(kind, identifier),
+    })
+    .into()
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never

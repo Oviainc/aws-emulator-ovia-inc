@@ -172,10 +172,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // query was submitted and what its run produced, which is why two readers of
         // one query cannot disagree and a read cannot move a query on.
         let store = state.lock();
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
         let record = store
             .queries
             .get(&key)
-            .ok_or_else(|| not_found(&input.query_id))?;
+            .ok_or_else(|| not_found(crate::state::RESOURCE_QUERY, &input.query_id))?;
 
         Ok(DescribeQueryOutput {
             query_id: record.query_id.clone(),
@@ -188,13 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the query the request addressed. A
-/// query is addressed within a workspace, so this is also what a query of ANOTHER
-/// workspace answers.
-fn not_found(query_id: &str) -> DescribeQueryError {
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a query that workspace does
+/// not hold. A query is addressed within a workspace, so the latter is also what
+/// a query of ANOTHER workspace answers.
+fn not_found(kind: &str, identifier: &str) -> DescribeQueryError {
     DescribeQueryError::Modeled(DescribeQueryErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_QUERY, query_id),
+            message: crate::state::not_found_message(kind, identifier),
         },
     ))
 }

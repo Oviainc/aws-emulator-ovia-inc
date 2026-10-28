@@ -230,6 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
         // A pipeline is identified by its workspace and its own name, so the lookup
         // is scoped to the workspace the request names and an absence there is the
         // modelled 404.

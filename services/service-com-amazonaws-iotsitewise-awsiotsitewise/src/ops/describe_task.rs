@@ -173,10 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read, so nothing here writes: the status is DERIVED from the instant the
         // transition the create or the update owes falls due.
         let store = state.lock();
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
         let record = store
             .tasks
             .get(&key)
-            .ok_or_else(|| not_found(&input.task_name))?;
+            .ok_or_else(|| not_found(crate::state::RESOURCE_TASK, &input.task_name))?;
 
         // "The version number of the task to retrieve. If not specified, returns the
         // latest version." A version no write ever produced names nothing this service
@@ -204,11 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the task the request addressed.
-fn not_found(task_name: &str) -> DescribeTaskError {
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a task that workspace does
+/// not hold.
+fn not_found(kind: &str, identifier: &str) -> DescribeTaskError {
     DescribeTaskError::Modeled(DescribeTaskErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: crate::state::not_found_message(crate::state::RESOURCE_TASK, task_name),
+            message: crate::state::not_found_message(kind, identifier),
         },
     ))
 }

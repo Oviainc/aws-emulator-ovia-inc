@@ -175,10 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant the create started it, which is why two readers of one job cannot
         // disagree and a read cannot move a job on.
         let store = state.lock();
-        let record = store
-            .dataset_export_jobs
-            .get(&key)
-            .ok_or_else(|| not_found(&input.job_id))?;
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+        let record = store.dataset_export_jobs.get(&key).ok_or_else(|| {
+            not_found(crate::state::RESOURCE_DATASET_EXPORT_JOB, &input.job_id)
+        })?;
 
         Ok(DescribeDatasetExportJobOutput {
             job_id: record.job_id.clone(),
@@ -193,17 +201,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 404 `ResourceNotFoundException` naming the job the request addressed. A
-/// job is addressed within a workspace, so this is also what a job of ANOTHER
-/// workspace answers.
-fn not_found(job_id: &str) -> DescribeDatasetExportJobError {
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a job that workspace does
+/// not hold. A job is addressed within a workspace, so the latter is also what a
+/// job of ANOTHER workspace answers.
+fn not_found(kind: &str, identifier: &str) -> DescribeDatasetExportJobError {
     DescribeDatasetExportJobError::Modeled(
         DescribeDatasetExportJobErrorModeled::ResourceNotFoundException(
             ResourceNotFoundException {
-                message: crate::state::not_found_message(
-                    crate::state::RESOURCE_DATASET_EXPORT_JOB,
-                    job_id,
-                ),
+                message: crate::state::not_found_message(kind, identifier),
             },
         ),
     )

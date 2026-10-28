@@ -620,9 +620,22 @@ async fn a_delete_removes_only_the_workspace_and_name_it_addresses() {
         "case \"other workspace\": plant-b's execution must survive, got {status} {execution}"
     );
 
-    // A pipeline no create ever made: an unknown name, and a known name in a
-    // workspace that holds no pipeline at all.
-    for (workspace, pipeline) in [("plant-b", "never-created"), ("plant-c", name)] {
+    // A pipeline no create ever made: an unknown name in a workspace that holds
+    // another pipeline, and a known name in a workspace nothing created at all —
+    // where the workspace is the outermost resource the request got wrong, so the
+    // refusal names it rather than the pipeline inside it.
+    for (workspace, pipeline, expected) in [
+        (
+            "plant-b",
+            "never-created",
+            "Pipeline with ID never-created not found".to_string(),
+        ),
+        (
+            "plant-c",
+            name,
+            "Workspace with ID plant-c not found".to_string(),
+        ),
+    ] {
         let (status, body) = delete(&router, workspace, pipeline).await;
         assert_eq!(
             status, 404,
@@ -635,9 +648,9 @@ async fn a_delete_removes_only_the_workspace_and_name_it_addresses() {
         );
         assert_eq!(
             body["message"].as_str().unwrap_or(""),
-            format!("Pipeline with ID {pipeline} not found"),
-            "case {workspace:?}/{pipeline:?}: the refusal must name the identifier the \
-             request sent, got {body}"
+            expected,
+            "case {workspace:?}/{pipeline:?}: the refusal must name the resource the \
+             request got wrong, expected {expected:?}, got {body}"
         );
     }
 }

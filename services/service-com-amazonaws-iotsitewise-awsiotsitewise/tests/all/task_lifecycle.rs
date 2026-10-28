@@ -865,15 +865,32 @@ async fn a_write_naming_a_task_no_workspace_holds_is_the_modelled_not_found() {
         "the create"
     );
 
-    // (case, workspace, task name) — each addresses something this store does not
-    // hold, by workspace, by name, or by both.
+    // (case, workspace, task name, the identifier the refusal names) — each
+    // addresses something this store does not hold, by workspace, by name, or by
+    // both. The path nests the task inside the workspace, so a row that gets the
+    // WORKSPACE wrong is refused as that absence.
     let cases = [
-        ("an absent task in a workspace that holds one", WORKSPACE, "no-such-task"),
-        ("a task of a workspace nothing was ever created in", "empty-workspace", held),
-        ("neither the workspace nor the task", "empty-workspace", "no-such-task"),
+        (
+            "an absent task in a workspace that holds one",
+            WORKSPACE,
+            "no-such-task",
+            "no-such-task",
+        ),
+        (
+            "a task of a workspace nothing was ever created in",
+            "empty-workspace",
+            held,
+            "empty-workspace",
+        ),
+        (
+            "neither the workspace nor the task",
+            "empty-workspace",
+            "no-such-task",
+            "empty-workspace",
+        ),
     ];
 
-    for (case, workspace, task) in cases {
+    for (case, workspace, task, named) in cases {
         let (status, body) = update(
             &router,
             workspace,
@@ -887,8 +904,9 @@ async fn a_write_naming_a_task_no_workspace_holds_is_the_modelled_not_found() {
             "case {case:?}: expected a modelled not-found, got {status} {body}"
         );
         assert!(
-            body["message"].as_str().unwrap_or("").contains(task),
-            "case {case:?}: the refusal names the task the request addressed, got {body}"
+            body["message"].as_str().unwrap_or("").contains(named),
+            "case {case:?}: the refusal names {named:?}, the resource the request got wrong, got \
+             {body}"
         );
 
         let (status, described) = describe(&router, workspace, task, None).await;
