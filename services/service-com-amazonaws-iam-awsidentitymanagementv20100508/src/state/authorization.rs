@@ -11,11 +11,12 @@
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
 //! things the decision was made about — the principal, the action and the resource —
-//! closed by why the decision went that way. A refusal that READ the documents in force
-//! and found none allowing the call reports an evaluation whose details can be read, so
-//! that sentence continues with where to read them and under which authorization id
-//! ([`not_authorized_with_details`]); a refusal that read no document, and one explained
-//! by an explicit `Deny`, end at the reason ([`not_authorized`]).
+//! closed by why the decision went that way. A refusal that WITHHELD the call — nothing
+//! in force allowed it, the implicit deny — reports an evaluation whose details can be
+//! read, so that sentence continues with where to read them and under which authorization
+//! id ([`not_authorized_with_details`]); a refusal explained by an explicit `Deny` is
+//! explained by the statement the reason already names, so it ends there
+//! ([`not_authorized`]).
 //!
 //! The four pieces, each held in exactly one place:
 //!
@@ -28,11 +29,13 @@
 //!    itself and those in force on every group it belongs to, so a policy just put grants
 //!    immediately and one just deleted stops granting immediately;
 //! 3. **the ceiling on it** — the permissions boundary in force on that principal, from
-//!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::permissions_boundary_document`],
+//!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::permissions_boundary_in_force`],
 //!    which sets the maximum permissions those documents can grant and grants nothing
 //!    itself: a call the boundary does not allow is refused even where they allow it —
-//!    and the refusal names the boundary as the document that withheld it — while a call
-//!    only the boundary allows is refused as if the boundary had allowed nothing;
+//!    and the refusal names the boundary as the document that withheld it, by the ARN of
+//!    the policy that is the boundary where a statement of it explicitly denied the call —
+//!    while a call only the boundary allows is refused as if the boundary had allowed
+//!    nothing;
 //! 4. **the decision** — [`::service_common::iam_authorization`], the tree's ONE
 //!    evaluation of IAM policy documents against `(action, resource)`, so IAM and every
 //!    other service handed the same documents decide alike.
@@ -587,12 +590,15 @@ pub fn authorize_written(
     // cannot read — is capped by nothing, which is the same position as a boundary that
     // allows the call. A call an identity-based policy explicitly DENIES is already
     // refused on that deny, so no ceiling is read for it.
-    let capped = if decided == Decision::Denied {
-        Decision::Allowed
+    let (capped, boundary) = if decided == Decision::Denied {
+        (Decision::Allowed, None)
     } else {
-        match store.permissions_boundary_document(&principal) {
-            Some(document) => iam::identity_decision(::std::slice::from_ref(&document), &request),
-            None => Decision::Allowed,
+        match store.permissions_boundary_in_force(&principal) {
+            Some((boundary, document)) => (
+                iam::identity_decision(::std::slice::from_ref(&document), &request),
+                Some(boundary),
+            ),
+            None => (Decision::Allowed, None),
         }
     };
     if granted && capped == Decision::Allowed {
@@ -605,11 +611,17 @@ pub fn authorize_written(
     // boundary where the identity-based policies did allow the call, and the
     // identity-based policies where nothing allowed it at all. They are different facts
     // about the policies in force, and AWS words each of them differently, because they
-    // need different fixes.
+    // need different fixes. The boundary's explicit deny is the one of the four that also
+    // names the policy the deciding statement came from, because in an account carrying
+    // several boundaries that ARN is the only thing in the message identifying which
+    // ceiling refused the call.
     let reason = if decided == Decision::Denied {
         "with an explicit deny in an identity-based policy".to_string()
     } else if capped == Decision::Denied {
-        "with an explicit deny in a permissions boundary".to_string()
+        match &boundary {
+            Some(arn) => format!("with an explicit deny in a permissions boundary: {arn}"),
+            None => "with an explicit deny in a permissions boundary".to_string(),
+        }
     } else if granted {
         format!("because no permissions boundary allows the {action} action")
     } else {
@@ -627,12 +639,13 @@ pub fn authorize_written(
         explicit_deny = decided == Decision::Denied || capped == Decision::Denied,
         "the policies in force on the caller do not permit this call"
     );
-    // A refusal that WITHHELD a grant — the documents in force were read and none of them
-    // allowed the call — reports an evaluation there are details to read, so it closes
-    // with the pointer at those details. A refusal that read no document at all has no
-    // evaluation to point at, and one explained by an explicit `Deny` is explained by that
-    // statement, so each of those ends at the reason.
-    if decided == Decision::Denied || capped == Decision::Denied || policies.documents.is_empty() {
+    // A refusal that WITHHELD a grant — nothing in force allowed the call, the implicit
+    // deny — reports an evaluation there are details to read, so it closes with the
+    // pointer at those details, whether or not the principal held a document for the
+    // evaluation to read: the evaluation ran either way, and it is the one the pointer
+    // names. A refusal explained by an explicit `Deny` is explained by that statement,
+    // which the reason already names, so it ends at the reason.
+    if decided == Decision::Denied || capped == Decision::Denied {
         return Err(not_authorized(&principal, action, named_as, &reason));
     }
     Err(not_authorized_with_details(

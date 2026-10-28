@@ -1290,6 +1290,35 @@ pub struct ServerCertificateRecord {
     pub tags: Option<Vec<Tag>>,
 }
 
+/// A FIDO security key the account holds as an MFA device, as `GetMFADevice` reports it.
+///
+/// `GetMFADevice` is the read that serves this kind of device and only this kind — "for
+/// this API, we only accept FIDO security key ARNs"
+/// (`smithy_query(query="doc",shape="GetMFADeviceRequest",member="SerialNumber")`) — so
+/// the record carries exactly what that response reports: the serial the device is
+/// addressed by, the user it is enabled for, when it was first enabled and the
+/// certification levels it was published with.
+#[derive(Debug, Clone)]
+pub struct FidoSecurityKey {
+    /// "Serial number that uniquely identifies the MFA device"
+    /// (`GetMFADeviceResponse$SerialNumber`) — the key this device is held under, and the
+    /// value a request addresses it by.
+    pub serial_number: String,
+    /// [`name_key`] of the IAM user the device is enabled for: the key
+    /// [`ComAmazonawsIamAwsidentitymanagementv20100508State::users`] holds that user
+    /// under, so the device is reported for the user the account still holds under that
+    /// name however the name was spelled.
+    pub user_key: String,
+    /// "The date that a specified user's MFA device was first enabled"
+    /// (`GetMFADeviceResponse$EnableDate`).
+    pub enable_date: ::aws_smithy_types::DateTime,
+    /// "The certifications of a specified user's MFA device … obtained from FIDO Alliance
+    /// Metadata Service (MDS)" (`GetMFADeviceResponse$Certifications`), keyed by
+    /// certification name. A `BTreeMap` because the modelled member is a map, so what a
+    /// read reports is the SET of pairs the device carries rather than an order.
+    pub certifications: BTreeMap<String, String>,
+}
+
 /// The organization the account belongs to, as IAM sees it: which organization it is,
 /// and which account manages it.
 ///
@@ -1482,6 +1511,17 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// chose. `UploadServerCertificate` is what fills this map and `GetServerCertificate`
     /// reads it.
     pub server_certificates: BTreeMap<String, ServerCertificateRecord>,
+    /// The FIDO security keys the account holds as MFA devices, keyed by the serial
+    /// number each is addressed by — the handle `GetMFADevice` takes
+    /// (`GetMFADeviceRequest$SerialNumber`), which for this kind of device is an ARN.
+    ///
+    /// EMPTY until something registers one, and no operation of THIS service does: a FIDO
+    /// security key is enrolled by the key itself, through the browser's WebAuthn
+    /// ceremony, and IAM's API binds no operation that registers one — the same position
+    /// [`Self::organization`] is in. A serial this map does not carry therefore names no
+    /// FIDO security key of the account, which is what `GetMFADevice` refuses a request
+    /// for.
+    pub fido_security_keys: BTreeMap<String, FidoSecurityKey>,
     /// The account's alias, when one has been created. An `Option` rather than a
     /// collection because an account holds AT MOST ONE: "Lists the account alias
     /// associated with the Amazon Web Services account (Note: you can have only
@@ -1674,6 +1714,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             open_id_connect_providers: BTreeMap::new(),
             saml_providers: BTreeMap::new(),
             server_certificates: BTreeMap::new(),
+            fido_security_keys: BTreeMap::new(),
             account_alias: None,
             account_properties: BTreeMap::new(),
             delegation_requests: BTreeMap::new(),
@@ -2284,6 +2325,19 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// question here is which ceiling that entity carries, not whether the ARN is a
     /// well-formed spelling of the entity.
     pub fn permissions_boundary_document(&self, arn: &str) -> Option<String> {
+        self.permissions_boundary_in_force(arn)
+            .map(|(_, document)| document)
+    }
+
+    /// [`Self::permissions_boundary_document`] with the POLICY it came from named: the ARN
+    /// of the managed policy that is the identity's permissions boundary, beside the
+    /// document in force on it.
+    ///
+    /// A refusal explained by an explicit `Deny` in the boundary names the boundary that
+    /// carried it, which is the ARN here — the same value the identity's own read reports
+    /// under `PermissionsBoundary.PermissionsBoundaryArn` — so the decision and the
+    /// refusal that reports it read ONE record.
+    pub fn permissions_boundary_in_force(&self, arn: &str) -> Option<(String, String)> {
         let entity = parse_entity_arn(arn)?;
         let key = name_key(&entity.name);
         let attached = match entity.kind {
@@ -2298,7 +2352,17 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             EntityKind::Group => None,
         }?
         .to_string();
-        self.default_version_document(&attached)
+        let document = self.default_version_document(&attached)?;
+        Some((attached, document))
+    }
+
+    /// The FIDO security key the account holds under the serial number `serial_number`, or
+    /// `None` when it holds none — which is every serial until a key is enrolled
+    /// ([`Self::fido_security_keys`]).
+    ///
+    /// A READ: it only consults the store.
+    pub fn fido_security_key(&self, serial_number: &str) -> Option<&FidoSecurityKey> {
+        self.fido_security_keys.get(serial_number)
     }
 
     /// The tags the IAM resource whose ARN is `arn` carries AT THIS INSTANT, or `None`

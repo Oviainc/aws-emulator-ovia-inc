@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMFADevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMFADevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMFADevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE MFA device of a user, and only a FIDO security key: "for this API, we only
+//! accept FIDO security key ARNs" (`GetMFADeviceRequest$SerialNumber`). A serial number
+//! that names no FIDO security key of this account is therefore a serial this API cannot
+//! serve, and is refused before anything about the addressed user or device is reported —
+//! HTTP 400 with the error code `ValidationError`, which is the code IAM answers a value
+//! it cannot accept with ([`crate::scaffolded::Scaffolded::validation_error`]) and the one
+//! its clients branch on. A serial that DOES name one is reported, for the user the
+//! device is enabled for; a request naming any other user is the modelled `NoSuchEntity`,
+//! because that device is not that user's.
+//!
+//! A pure read: the store is only consulted.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +151,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMFADevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMFADeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMFADevice"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMFADeviceErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A read: it reports the stored record and writes nothing.
+        let store = state.lock();
+
+        // The device the serial number names, among the FIDO security keys the account
+        // holds — the only kind this API serves. A serial naming none of them is one this
+        // API cannot serve, whatever its form and whether or not the request's user
+        // exists, so the refusal is decided here and reports nothing about either.
+        let Some(device) = store.fido_security_key(&input.serial_number) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                UNSUPPORTED_SERIAL_NUMBER,
+            ));
+        };
+
+        // Whose device it is. The request may name the user it expects to hold it, and a
+        // device is one user's: asked for under another user's name it is a device that
+        // user does not have, which is the entity that does not exist.
+        if let Some(addressed) = &input.user_name {
+            if crate::state::name_key(addressed) != device.user_key {
+                return Err(GetMFADeviceErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "MFA Device {} cannot be found for user {addressed}.",
+                            input.serial_number
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(GetMFADeviceOutput {
+            // The friendly name of the user the device is enabled for, as that user is
+            // held NOW — so renaming the user renames it here too.
+            user_name: store
+                .users
+                .get(&device.user_key)
+                .map(|user| user.user_name.clone()),
+            serial_number: device.serial_number.clone(),
+            enable_date: Some(device.enable_date),
+            certifications: Some(
+                device
+                    .certifications
+                    .iter()
+                    .map(|(name, level)| (name.clone(), level.clone()))
+                    .collect(),
+            ),
+        })
     }
 }
+
+/// The refusal IAM words for a `SerialNumber` this API cannot serve.
+///
+/// Entirely fixed text: it names neither the serial supplied nor any other part of the
+/// request, because what it reports is which devices the API serves rather than what was
+/// wrong with this one value.
+const UNSUPPORTED_SERIAL_NUMBER: &str = "The MFA device serial number sent in the request \
+     is invalid or not supported by this API. Currently, only hardware FIDO security keys \
+     are supported. Please use the compatible device or API.";

@@ -6,12 +6,13 @@
 //! the ARN of the principal that signed the request + ` is not authorized to perform: ` +
 //! the IAM action the call was decided on + ` on resource: ` + the resource it was decided
 //! against + ` ` + why the decision went that way. Where the refusal WITHHELD a grant —
-//! the documents in force were read and none of them allowed the call — that sentence
-//! continues with the pointer at the authorization details of that evaluation: the console
-//! page, at IAM's own endpoint Region whichever Region the caller addressed, and the
-//! authorization id of the refused request, named in both of the pointer's slots. Where
-//! there was no document to read, or the refusal is explained by an explicit `Deny` about
-//! the request, the message ENDS at the reason: there is no evaluation to point at.
+//! nothing in force allowed the call, the implicit deny — that sentence continues with
+//! the pointer at the authorization details of that evaluation: the console page, at
+//! IAM's own endpoint Region whichever Region the caller addressed, and the authorization
+//! id of the refused request, named in both of the pointer's slots — whether or not the
+//! caller held any document for the evaluation to read. Where the refusal is explained by
+//! an explicit `Deny` about the request, the message ENDS at the reason: that statement is
+//! the explanation, and the reason already names it.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! operation is refused, whether the resource is an ARN, a path-scoped collection, the
@@ -56,8 +57,8 @@ struct Case {
     named_as: String,
     /// The clause closing the sentence.
     reason: String,
-    /// Whether the refusal points at the authorization details of an evaluation: a
-    /// document in force was read and withheld the call.
+    /// Whether the refusal points at the authorization details of an evaluation: nothing
+    /// in force allowed the call, so the grant was withheld rather than explicitly denied.
     details: bool,
 }
 
@@ -75,7 +76,7 @@ fn cases() -> Vec<Case> {
             iam_action: "iam:ListUsers",
             named_as: format!("arn:aws:iam::{account}:user/"),
             reason: no_allow("iam:ListUsers"),
-            details: false,
+            details: true,
         },
         // The same read with a page size: a parameter that does not touch the decision
         // must not touch the wording either.
@@ -87,7 +88,7 @@ fn cases() -> Vec<Case> {
             iam_action: "iam:ListUsers",
             named_as: format!("arn:aws:iam::{account}:user/"),
             reason: no_allow("iam:ListUsers"),
-            details: false,
+            details: true,
         },
         // A path-scoped collection: the resource the refusal names is the prefix the
         // request addressed, not the root.
@@ -99,7 +100,7 @@ fn cases() -> Vec<Case> {
             iam_action: "iam:ListGroups",
             named_as: format!("arn:aws:iam::{account}:group/eng/tools/"),
             reason: no_allow("iam:ListGroups"),
-            details: false,
+            details: true,
         },
         // Another collection and another action, to show neither is special-cased.
         Case {
@@ -110,7 +111,7 @@ fn cases() -> Vec<Case> {
             iam_action: "iam:ListRoles",
             named_as: format!("arn:aws:iam::{account}:role/"),
             reason: no_allow("iam:ListRoles"),
-            details: false,
+            details: true,
         },
         // A request that addresses the account's whole configuration: the resource is
         // the account-wide one, so the message carries no ARN at all.
@@ -122,7 +123,7 @@ fn cases() -> Vec<Case> {
             iam_action: "iam:GetAccountAuthorizationDetails",
             named_as: "*".to_string(),
             reason: no_allow("iam:GetAccountAuthorizationDetails"),
-            details: false,
+            details: true,
         },
         // A request that addresses ONE entity by name: the refusal names the entity.
         Case {
@@ -133,10 +134,10 @@ fn cases() -> Vec<Case> {
             iam_action: "iam:GetGroup",
             named_as: "group payroll".to_string(),
             reason: no_allow("iam:GetGroup"),
-            details: false,
+            details: true,
         },
-        // A caller holding a document that grants something ELSE: the documents in force
-        // were read and withheld this call, so the refusal points at that evaluation.
+        // A caller holding a document that grants something ELSE: the same withholding,
+        // reached with a document in force rather than none.
         Case {
             case: "withheld collection read, the caller holding a grant for another action",
             policies: vec![(
@@ -315,14 +316,13 @@ async fn a_refusal_names_the_decision_and_points_at_the_evaluation_that_withheld
 
 /// RULE: every part of the message is a fact of the request and of the documents in
 /// force, so repeating the same refused call — and making it in another Region — answers
-/// the identical message.
+/// the identical sentence, each one closed by the pointer at that refusal's own
+/// authorization details.
 #[tokio::test]
 async fn the_same_refused_call_is_worded_identically_every_time() {
     let router = router();
     let user_name = "repeated";
-    // No identity-based policy at all, so every call below is the implicit deny — and the
-    // refusal of a caller holding no document ends at the reason, with no evaluation to
-    // point at.
+    // No identity-based policy at all, so every call below is the implicit deny.
     let access_key_id = principal(&router, "repeated refusals", user_name, &[]).await;
 
     let mut seen: Vec<String> = Vec::new();
@@ -346,10 +346,18 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
         account = account_id(),
     );
     for (attempt, message) in seen.iter().enumerate() {
-        assert_eq!(
-            message, &expected,
-            "case attempt {attempt}: expected every refusal of the same call to be worded \
-             alike, got {message:?}"
+        // The sentence is the same every time; what follows it is the pointer at the
+        // authorization details of THAT refusal, whose id names the one request.
+        let clause = message.strip_prefix(&expected).unwrap_or_else(|| {
+            panic!(
+                "case attempt {attempt}: expected every refusal of the same call to be \
+                 worded alike, got {message:?}"
+            )
+        });
+        assert!(
+            authorization_details_id(clause).is_some(),
+            "case attempt {attempt}: expected the refusal to point at the authorization \
+             details of the evaluation, got {clause:?} after the reason"
         );
     }
 }

@@ -13,7 +13,11 @@
 //! refuses whatever the other says. A refusal is HTTP 403 with the awsQuery error code
 //! `AccessDenied`, and it names the document that withheld the grant: the boundary where
 //! the identity-based policies did allow the call, and those policies where nothing
-//! allowed it at all.
+//! allowed it at all. Where a statement OF the boundary explicitly denied the call, the
+//! clause also names the boundary — by the ARN of the policy that is the boundary, the
+//! same value `GetUser` reports under `PermissionsBoundary.PermissionsBoundaryArn` —
+//! because in an account carrying several boundaries that is the only thing in the message
+//! identifying which ceiling refused the call.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! document grants and which denies, whether the boundary states the action literally,
@@ -164,6 +168,23 @@ async fn attach_boundary(
     arn
 }
 
+/// The permissions boundary the account holds on `user_name`, read back the way a caller
+/// reads it: the ARN `GetUser` reports under `PermissionsBoundary.PermissionsBoundaryArn`.
+async fn boundary_arn(router: &MultiServiceRouter, case: &str, user_name: &str) -> String {
+    let (status, fetched) = call(router, "GetUser", &[("UserName", user_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the fixture GetUser must succeed, got {status}: {fetched}"
+    );
+    let reported = elements(&fetched, "PermissionsBoundaryArn");
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: expected the user to carry one permissions boundary, got {reported:?}"
+    );
+    reported.into_iter().next().expect("one boundary ARN")
+}
+
 /// What a row requires of the signed call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expect {
@@ -184,12 +205,14 @@ enum Expect {
 
 impl Expect {
     /// The clause AWS's `AccessDenied` message carries for this outcome, for the `action`
-    /// the call named.
-    fn reason(self, action: &str) -> String {
+    /// the call named and the permissions boundary `boundary` in force on the caller.
+    fn reason(self, action: &str, boundary: &str) -> String {
         match self {
             Self::Served => String::new(),
             Self::IdentityDeny => "with an explicit deny in an identity-based policy".to_string(),
-            Self::BoundaryDeny => "with an explicit deny in a permissions boundary".to_string(),
+            Self::BoundaryDeny => {
+                format!("with an explicit deny in a permissions boundary: {boundary}")
+            }
             Self::NoAllow => {
                 format!("because no identity-based policy allows the {action} action")
             }
@@ -267,6 +290,21 @@ fn cases() -> Vec<Case> {
             ])),
             action: "ListAccessKeys",
             iam_action: "iam:ListAccessKeys",
+            names_user: true,
+            expect: Expect::BoundaryDeny,
+        },
+        Case {
+            // The same explicit boundary deny on ANOTHER operation and another ceiling,
+            // so the ARN the clause names is the boundary of the caller being refused
+            // rather than one document's.
+            case: "the boundary denies a tag read the identity-based policy allows",
+            identity: vec![statement("Allow", "iam:ListUserTags", any)],
+            boundary: Some(statements(&[
+                ("Allow", any, any),
+                ("Deny", "iam:ListUserTags", any),
+            ])),
+            action: "ListUserTags",
+            iam_action: "iam:ListUserTags",
             names_user: true,
             expect: Expect::BoundaryDeny,
         },
@@ -452,13 +490,19 @@ async fn the_boundary_caps_identity_grants_and_never_grants_one() {
         } else {
             root_collection("group")
         };
+        // The boundary the account holds on the caller: the ARN a refusal explained by an
+        // explicit deny IN it names, read back from the account rather than rebuilt here.
+        let boundary = match &case.boundary {
+            Some(_) => boundary_arn(&router, case.case, &user_name).await,
+            None => String::new(),
+        };
         assert_access_denied_message(
             case.case,
             &element(&body, "Message"),
             &user_arn(&user_name),
             case.iam_action,
             &named_as,
-            &case.expect.reason(case.iam_action),
+            &case.expect.reason(case.iam_action, &boundary),
         );
     }
 }
