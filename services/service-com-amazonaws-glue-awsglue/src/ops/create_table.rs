@@ -11,10 +11,14 @@
 //! the request speaks for (the one STS reports for it). An absent database is
 //! `EntityNotFoundException`; a duplicate (folded) table name is `AlreadyExistsException`.
 //!
-//! The `OpenTableFormatInput` create path (an Iceberg table whose metadata this
-//! emulator does not maintain) still answers 501, and so does a `TableInput` carrying a
-//! `ViewDefinition`: a Glue view's dialect representations are a layer this slice does
-//! not keep.
+//! The `OpenTableFormatInput` create path mints the table's ICEBERG metadata: the table is
+//! stored like any other, plus the three parameters that make it an open-table-format
+//! table — `table_type`, the `metadata_location` of the metadata file this create minted
+//! under the table's own location, and the `format-version` the request asked for
+//! ([`crate::state::IcebergTableMarker`]) — so a later read serves an Iceberg table a
+//! client, a table optimizer or an Iceberg-destination consumer can use. A `TableInput`
+//! carrying a `ViewDefinition` still answers 501: a Glue view's dialect representations
+//! are a layer this slice does not keep.
 //!
 //! ## Shape of an operation
 //!
@@ -180,13 +184,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // An Iceberg/open-table-format create needs a table-metadata layer this
-        // emulator does not maintain, so that path is still unimplemented.
-        if input.open_table_format_input.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateTable with OpenTableFormatInput",
-            ));
-        }
+        // An open-table-format create names exactly one format
+        // (`OpenTableFormatInput$IcebergInput`), so a value naming none asks for no table
+        // at all.
+        let iceberg_input = match input.open_table_format_input.as_ref() {
+            None => None,
+            Some(open_table_format) => match open_table_format.iceberg_input.as_ref() {
+                Some(iceberg_input) => Some(iceberg_input),
+                None => {
+                    return Err(CreateTableErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::state::messages::OPEN_TABLE_FORMAT_REQUIRES_ICEBERG
+                                    .to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
 
         // Partition indexes are a separate stored resource (GetPartitionIndexes) this
         // slice does not keep, and a transactional create needs a transaction log it
@@ -207,16 +225,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let Some(table_input) = input.table_input.as_ref() else {
-            return Err(CreateTableErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(
-                        "TableInput is required unless OpenTableFormatInput is supplied".into(),
-                    ),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+        // The table definition to store: the submitted `TableInput`, else — for an Iceberg
+        // create that carries none — the one its `CreateIcebergTableInput` describes,
+        // under the `Name` the request addressed the table by.
+        let iceberg_definition = iceberg_input.and_then(|iceberg| {
+            iceberg
+                .create_iceberg_table_input
+                .as_ref()
+                .zip(input.name.as_deref())
+                .map(|(create, name)| crate::state::iceberg_table_definition(name, create))
+        });
+        let mut definition = match input.table_input.clone().or(iceberg_definition) {
+            Some(definition) => definition,
+            None => {
+                return Err(CreateTableErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(if iceberg_input.is_some() {
+                            crate::state::messages::ICEBERG_TABLE_REQUIRES_DEFINITION.to_string()
+                        } else {
+                            "TableInput is required unless OpenTableFormatInput is supplied"
+                                .to_string()
+                        }),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
         };
 
         // A Glue view (`TableInput$ViewDefinition`) is a different kind of catalog
@@ -225,11 +259,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // definition that makes it a view would answer 200 for work nothing did — and
         // make `GetTable` report `IsMultiDialectView`/`IsMaterializedView` false for a
         // table the caller created as a view. So the view create is refused.
-        if table_input.view_definition.is_some() {
+        if definition.view_definition.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "CreateTable with ViewDefinition",
             ));
         }
+
+        // The Iceberg metadata this create mints for the table, recorded on the definition
+        // about to be stored: an Iceberg table's metadata lives under the table's own
+        // location, so a create that names no location has nowhere to mint it.
+        if let Some(iceberg) = iceberg_input {
+            let Some(location) = crate::state::iceberg_table_location(
+                &definition,
+                iceberg.create_iceberg_table_input.as_ref(),
+            ) else {
+                return Err(CreateTableErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::ICEBERG_TABLE_REQUIRES_LOCATION.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            // The table's own location is part of its definition, so a create that named
+            // it only on the Iceberg input is stored with it: the metadata location and
+            // the table location have to agree.
+            definition
+                .storage_descriptor
+                .get_or_insert_with(StorageDescriptor::default)
+                .location
+                .get_or_insert(location.clone());
+            crate::state::IcebergTableMarker::mint(&location, iceberg.version.as_deref())
+                .apply(&mut definition);
+        }
+        let table_input = &definition;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateTableErrorModeled::InternalServiceException(

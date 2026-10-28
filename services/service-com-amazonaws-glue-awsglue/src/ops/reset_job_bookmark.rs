@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetJobBookmark
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetJobBookmark`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetJobBookmark::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! "Resets a bookmark entry": drops the position a further run of the job would have
+//! resumed from, and reports the entry as the reset left it
+//! ([`crate::state::JobBookmarkState::reset`]).
+//!
+//! A bookmark is state a RUN leaves behind, so a job definition nothing has run yet has
+//! none and there is nothing to reset: that request is refused with the operation's
+//! modelled `EntityNotFoundException`, which is the same answer `GetJobBookmark` gives for
+//! the same job. `RunId` ("the unique run identifier associated with this job run")
+//! addresses the run whose bookmark is reset, so a value naming no run of the job is that
+//! miss too — the bookmark of a run the job never had is not the bookmark of its latest
+//! one.
+//!
+//! The job itself is addressed by `JobName` within the Region the request is served in,
+//! exactly as every other job operation addresses one
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::jobs`]).
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +152,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetJobBookmark` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetJobBookmarkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetJobBookmark"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResetJobBookmarkErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue job store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A job and its bookmark are addressed together, so the job is resolved first and
+        // its own miss reported for a name the Region holds no definition under.
+        let Some(job) = store.job_mut(&region, &input.job_name) else {
+            return Err(ResetJobBookmarkErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::JOB_NOT_FOUND.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The run the reset is about, when the request named one: a `RunId` the job holds
+        // no run for addresses a bookmark that does not exist, and nothing is reset.
+        let addresses_a_run = input
+            .run_id
+            .as_ref()
+            .is_none_or(|run_id| job.run(run_id).is_some());
+        let Some(bookmark) = job.bookmark.as_mut().filter(|_| addresses_a_run) else {
+            return Err(ResetJobBookmarkErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::job_bookmark_not_found(
+                        &input.job_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        bookmark.reset();
+        let entry = bookmark.to_job_bookmark_entry(&input.job_name);
+        ::tracing::info!(
+            operation = "ResetJobBookmark",
+            job = %input.job_name,
+            "reset a job bookmark"
+        );
+
+        // "The reset bookmark entry" — the entry as it now stands, which is what the
+        // `GetJobBookmark` that follows reports.
+        Ok(ResetJobBookmarkOutput {
+            job_bookmark_entry: Some(entry),
+        })
     }
 }
