@@ -17,6 +17,8 @@ mod account_configuration;
 mod account_configuration_tokens;
 #[path = "all/acme_account_listing.rs"]
 mod acme_account_listing;
+#[path = "all/acme_authorization.rs"]
+mod acme_authorization;
 #[path = "all/acme_directory_endpoint.rs"]
 mod acme_directory_endpoint;
 #[path = "all/acme_domain_validation_delete.rs"]

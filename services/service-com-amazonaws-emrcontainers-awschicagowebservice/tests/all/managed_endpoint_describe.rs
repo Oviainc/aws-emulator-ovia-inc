@@ -32,30 +32,9 @@ use service_com_amazonaws_emrcontainers_awschicagowebservice::state;
 
 use crate::managed_endpoint_listing::{
     create_endpoint, described, describe_endpoint, endpoint_body, list_endpoints, listed,
-    stored_bodies, wait_for_the_clock,
+    listed_record, stored_bodies, wait_for_the_clock, without_state,
 };
 use crate::virtual_cluster_job_run_loop::{field, text, Emr};
-
-/// The record the listing of `cluster` reports for `id`, as the describe's answer should
-/// be: both readers answer from one stored copy of the endpoint.
-async fn listed_record(emr: &Emr, cluster: &str, id: &str, case: &str) -> Value {
-    let answer = list_endpoints(emr, cluster, "").await;
-    let body = answer.ok(case).clone();
-    listed(&body, case)
-        .into_iter()
-        .find(|candidate| text(candidate, "/id", case) == id)
-        .unwrap_or_else(|| panic!("case {case:?}: the listing does not report {id}: {body}"))
-}
-
-/// The record without its `state`, so two reads taken in different phases of the
-/// `CREATING` -> `ACTIVE` step can be compared on everything else.
-fn without_state(endpoint: &Value, case: &str) -> Value {
-    let mut copy = endpoint.clone();
-    copy.as_object_mut()
-        .unwrap_or_else(|| panic!("case {case:?}: the endpoint is not an object: {endpoint}"))
-        .remove("state");
-    copy
-}
 
 /// RULES 1 and 4: every stored (cluster, id) pair describes to the record stored under
 /// that pair, and a pair the store does not hold is refused — including a stored endpoint

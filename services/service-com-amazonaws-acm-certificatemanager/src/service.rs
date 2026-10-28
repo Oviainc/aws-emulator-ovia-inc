@@ -74,6 +74,7 @@
 //! documented in [`acme_http`].
 
 pub mod acme_http;
+pub mod authorization;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -180,20 +181,17 @@ pub(crate) fn enum_value_refusal(path: &str, submitted: &str, allowed: &[&str]) 
 }
 
 /// The `ValidationException` message for an ARN input member that names a resource of
-/// ANOTHER account, where `resource_type` is the ARN resource type that member addresses
-/// (`acme-endpoint`, …).
+/// ANOTHER account.
 ///
 /// A cross-account ARN is a fact about the REQUEST rather than about the store, so ACM
-/// states it as a validation error of the resource IDENTIFIER the request carried: the
-/// resource type the member's own `@pattern` fixes, and what was wrong with the
-/// identifier — an ARN of the caller's own account was expected and one of another
-/// account arrived. The ARN itself is not echoed; the resource type is not a value the
-/// caller chose, since the member's pattern admits exactly one.
-pub(crate) fn cross_account_arn_refusal(resource_type: &str) -> String {
-    format!(
-        "Resource identifier for {resource_type} has a validation error: Same account ARN \
-         expected but got cross-account ARN"
-    )
+/// states it as a verdict on the ARN the request carried: an ARN of the caller's own
+/// account was expected and one of another account arrived. The sentence is WHOLLY FIXED
+/// text for this class — it carries nothing from the request or from the store, so a
+/// refusal cannot echo a caller's own ARN back or say whether a record with that id
+/// exists — and it is rendered here once, so every operation that holds an ARN member to
+/// the caller's account answers the same sentence.
+pub(crate) fn cross_account_arn_refusal() -> String {
+    "Invalid ARN in request: Same account ARN expected but got cross-account ARN".to_string()
 }
 
 /// The member-name suffixes whose value ACM does not reflect back into a refusal.

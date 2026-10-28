@@ -365,6 +365,10 @@ mod images;
 mod import_image_tasks;
 #[path = "all/import_snapshot_tasks.rs"]
 mod import_snapshot_tasks;
+// Cancelling an import task of either kind: what `CancelImportTask` moves and what it
+// refuses.
+#[path = "all/import_task_cancellation.rs"]
+mod import_task_cancellation;
 #[path = "all/instance_connect_endpoints.rs"]
 mod instance_connect_endpoints;
 #[path = "all/instance_event_notification_attributes.rs"]

@@ -131,9 +131,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The input is `smithy.api#Unit`, so there is nothing to read from it, and
-        // `ctx` carries only request metadata this read does not need.
-        let _ = (&input, ctx);
+        // The input is `smithy.api#Unit`, so there is nothing to read from it; `ctx`
+        // carries the credential the request presented, which is who the authorization
+        // gate judges.
+        let _ = &input;
+
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at anything, so a caller whose identity-based policies do not
+        // allow the action is refused without being told what this account configured.
+        // The configuration is account-level and names no resource, so it is judged
+        // against the resource IAM writes for such a request
+        // ([`crate::service::authorization::ANY_RESOURCE`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(GetAccountConfigurationErrorModeled::AccessDeniedException)?;
 
         // Unreachable in the assembled emulator (the engine is the shared store), and
         // this operation models no server fault, so the wrapper's refusal is the one
