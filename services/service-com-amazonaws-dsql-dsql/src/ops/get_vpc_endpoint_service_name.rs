@@ -184,8 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the ARN the cluster was minted with, so a request signed for another region
         // that reads this cluster still gets the cluster's own. Every stored cluster
         // carries a well-formed ARN, so the request's region is only a fallback.
-        let region =
-            crate::state::arn_region(&cluster.arn).unwrap_or_else(|| request_region.clone());
+        let region = crate::state::resource_region(&cluster.arn, &request_region);
 
         Ok(GetVpcEndpointServiceNameOutput {
             service_name: crate::state::vpc_endpoint_service_name(&region, &cluster.identifier),
