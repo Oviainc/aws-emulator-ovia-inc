@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCampaignSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCampaignSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Sets the schedule of the campaign `{id}` names to the `schedule` the request
+//! carries, replacing whatever that campaign held: the schedule is ONE modelled
+//! structure (its required `startTime` and `endTime` plus the optional
+//! `refreshFrequency`), so a schedule that leaves `refreshFrequency` out is a
+//! campaign that no longer refreshes its source. The schedule lives on the stored
+//! campaign record (`StoredCampaign$schedule`), which is what `DescribeCampaign` and
+//! `ListCampaigns` project and what `StoredCampaign::state_at` reads to decide
+//! whether a running campaign's window has closed, so this handler writes the store
+//! and nothing else: it keeps no copy of its own.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCampaignSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Idempotent, as the model declares: the same schedule sent twice leaves the
+//! campaign exactly as the first call left it.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +174,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCampaignSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCampaignScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCampaignSchedule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCampaignScheduleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // One guard spans the lookup and the write, so a concurrent delete of the
+        // campaign itself cannot leave this schedule on a record no longer in the
+        // store. A campaign is reachable only through the endpoint of the region it was
+        // created in, so the id is resolved in the region this request was signed for
+        // and the write never reaches another region's campaign.
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        let Some(campaign) = store.campaign_mut(&region, &input.id) else {
+            return Err(UpdateCampaignScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // A campaign in a terminal lifecycle state takes no further configuration
+        // change (see `CampaignState::accepts_configuration_change`), which is what
+        // this operation's `InvalidCampaignStateException` reports. The state is the
+        // one the campaign is at NOW: a campaign whose scheduled run window has
+        // closed has finished, so it is past being rescheduled.
+        let current = campaign.state_at(::std::time::SystemTime::now());
+        if !current.accepts_configuration_change() {
+            return Err(
+                UpdateCampaignScheduleErrorModeled::InvalidCampaignStateException(
+                    InvalidCampaignStateException {
+                        state: current.as_wire().to_string(),
+                        message: format!(
+                            "A campaign in state {} cannot be reconfigured",
+                            current.as_wire()
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The whole of the operation's effect: the campaign's schedule is now the one
+        // the request carried, replacing whatever it held. The schedule is one
+        // structure, so this is a replacement and not a merge — a schedule carrying no
+        // `refreshFrequency` leaves the campaign with none — and the run window every
+        // later read derives the campaign's state from is the new one.
+        campaign.schedule = Some(input.schedule);
+
+        Ok(UpdateCampaignScheduleOutput)
     }
 }
