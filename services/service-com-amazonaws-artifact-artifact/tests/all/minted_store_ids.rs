@@ -200,7 +200,10 @@ impl Fixture {
                     .url
                     .as_deref()
                     .unwrap_or_else(|| panic!("an export is reached through its announced URL"));
-                (follow(&self.router, url).await, 200, 404)
+                // A released export's URL is refused as UNAUTHORISED rather than reported
+                // absent: the export plane decides authorization before existence, so a
+                // caller cannot tell a released export from one it was never handed.
+                (follow(&self.router, url).await, 200, 403)
             }
         };
         if status == served {
