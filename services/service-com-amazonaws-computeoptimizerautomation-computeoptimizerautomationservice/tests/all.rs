@@ -41,6 +41,8 @@ mod automation_rule_preview_summaries;
 mod automation_rule_validation;
 #[path = "all/disassociated_member_initiation.rs"]
 mod disassociated_member_initiation;
+#[path = "all/disassociated_member_retrieval.rs"]
+mod disassociated_member_retrieval;
 #[path = "all/enrollment_gate.rs"]
 mod enrollment_gate;
 #[path = "all/enrollment_rule_mode.rs"]

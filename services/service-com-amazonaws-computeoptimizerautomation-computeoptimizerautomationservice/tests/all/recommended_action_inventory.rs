@@ -72,7 +72,14 @@ pub(crate) async fn opted_in_emulator(case: &str) -> MultiServiceRouter {
 
 /// Every recommended action `ListRecommendedActions` reports for `request`,
 /// walked page by page so the whole set is seen however it is paged.
-async fn listed_actions(router: &MultiServiceRouter, request: &Value, case: &str) -> Vec<Value> {
+///
+/// `pub(crate)` so another suite reading the whole listing walks it the same
+/// way.
+pub(crate) async fn listed_actions(
+    router: &MultiServiceRouter,
+    request: &Value,
+    case: &str,
+) -> Vec<Value> {
     let mut walked: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     loop {

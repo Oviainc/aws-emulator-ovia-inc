@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::serve_page`.
         let (page, next_token): (Vec<PreviewResult>, Option<String>) = crate::state::serve_page(
             crate::state::previewed_actions(
-                &guard.recommended_actions,
+                &guard,
                 scope.as_deref(),
                 &input.recommended_action_types,
                 &criteria,

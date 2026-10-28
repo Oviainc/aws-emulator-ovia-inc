@@ -278,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::group_by_recommended_action_type`].
         let grouped = crate::state::group_by_recommended_action_type(
             crate::state::previewed_actions(
-                &guard.recommended_actions,
+                &guard,
                 scope.as_deref(),
                 &input.recommended_action_types,
                 &criteria,

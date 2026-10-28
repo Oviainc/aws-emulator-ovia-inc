@@ -11,7 +11,10 @@
 //! that its enrollment starts, so no request carries one: this handler only
 //! reports what [`crate::state::RecommendedActionStore`] holds (the inventory
 //! recorded for every account this service holds as enrolled), and it writes
-//! nothing.
+//! nothing. The operation documents the retrieval scope — a management account
+//! or delegated administrator retrieves the actions of ASSOCIATED member
+//! accounts — so the actions it reports are the ones the caller may retrieve
+//! right now (`crate::state::…::retrievable_actions`), not every entry stored.
 //!
 //! ## Shape of an operation
 //!
@@ -231,14 +234,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = guard.opt_in_required() {
             return Err(ListRecommendedActionsErrorModeled::OptInRequiredException(refusal).into());
         }
-        // The matching actions are what gets paged, and the page walk is the one
+        // The matching actions are what gets paged, out of the actions this
+        // caller may RETRIEVE — its own account's, and each currently
+        // associated member account's, judged per call:
+        // `crate::state::…::retrievable_actions`. The page walk is the one
         // every paginated listing of this service performs:
         // `crate::state::serve_page`.
         let (page, next_token): (Vec<RecommendedAction>, Option<String>) =
             crate::state::serve_page(
                 guard
-                    .recommended_actions
-                    .iter_in_order()
+                    .retrievable_actions()
                     .filter(|action| {
                         crate::state::recommended_action_matches_filters(action, &filters)
                     })

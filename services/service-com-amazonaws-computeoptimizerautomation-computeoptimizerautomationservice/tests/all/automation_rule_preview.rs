@@ -209,18 +209,10 @@ fn emulator_with(
     actions: &[RecommendedAction],
 ) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = emulator_with_engine();
-    {
-        let state =
-            service_state(&*engine).expect("the in-memory engine carries this service's state");
-        let mut guard = state.lock();
-        for action in actions {
-            let id = action
-                .recommended_action_id
-                .clone()
-                .expect("a seeded action carries its id");
-            guard.recommended_actions.insert(id, action.clone());
-        }
-    }
+    // The one fixture that records an inventory for this crate, so a member
+    // account's analysis output is seeded with the association that put it
+    // there.
+    crate::recommended_actions::record(&engine, actions.to_vec());
     (router, engine)
 }
 

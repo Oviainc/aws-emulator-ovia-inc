@@ -1418,23 +1418,32 @@ pub fn preview_result_for(action: &RecommendedAction) -> PreviewResult {
 }
 
 /// The recommended actions ONE rule-preview request selects, in the order the
-/// store holds them: every stored action that belongs to an account `scope`
-/// covers, whose `recommendedActionType` is one of `recommended_action_types`,
-/// and that satisfies every condition of `criteria`.
+/// store holds them: every action the caller may retrieve
+/// ([`ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceState::retrievable_actions`])
+/// that belongs to an account `scope` covers, whose `recommendedActionType` is
+/// one of `recommended_action_types`, and that satisfies every condition of
+/// `criteria`.
 ///
 /// A preview request names its selection the same way whichever preview
 /// operation reads it — `ListAutomationRulePreview` reports the selected actions
 /// one by one and `ListAutomationRulePreviewSummaries` aggregates the very same
 /// set — so the selection lives here once. An action that records no
 /// `accountId` belongs to no account, so no scope covers it.
+///
+/// The scope a request NAMES is narrowed by the accounts the caller actually
+/// reaches: a preview is what the rule would act on, and a rule is only ever
+/// stored for accounts the caller may automate in
+/// ([`ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceState::may_scope_rule_to`]),
+/// so a scope naming an account whose association has gone previews nothing of
+/// that account.
 pub fn previewed_actions<'store>(
-    actions: &'store RecommendedActionStore,
+    state: &'store ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceState,
     scope: Option<&'store [String]>,
     recommended_action_types: &'store [String],
     criteria: &'store Criteria,
 ) -> impl Iterator<Item = &'store RecommendedAction> + 'store {
-    actions
-        .iter_in_order()
+    state
+        .retrievable_actions()
         .filter(move |action| {
             action
                 .account_id
@@ -2983,7 +2992,9 @@ pub struct ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationservi
     /// [`Self::ensure_recommended_action_inventory`]. No request carries an
     /// action: `StartAutomationEvent` resolves every id against this ONE store,
     /// `ListRecommendedActions` pages over it and `ListAutomationRulePreview`
-    /// previews it, so no two of them read two copies of one resource.
+    /// previews it, so no two of them read two copies of one resource. The
+    /// selections read it through [`Self::retrievable_actions`], which is what
+    /// scopes them to the accounts the caller currently reaches.
     pub recommended_actions: RecommendedActionStore,
     /// Every automation event, in creation order. Written by the operations
     /// that start and roll back an event; read by the event readers.
@@ -3139,6 +3150,45 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
             .all(|account_id| self.may_initiate_in(account_id))
     }
 
+    /// The stored recommended actions the caller may RETRIEVE right now, in the
+    /// order the store holds them.
+    ///
+    /// `ListRecommendedActions` and `ListRecommendedActionSummaries` each state
+    /// the retrieval scope: a management account or a delegated administrator
+    /// "can retrieve recommended actions that include associated member
+    /// accounts", and point at `AssociateAccounts` as the way to bring a member
+    /// account into it. So ANOTHER account's analysis output is retrieved only
+    /// while that account's association is in place — the same standing the
+    /// operations that reach into an account are judged by
+    /// ([`Self::may_initiate_in`]), read PER CALL and never inferred from the
+    /// action being stored: a disassociation leaves the member's analysed
+    /// actions exactly where they were ([`Self::disassociate_account`]), so it
+    /// is the association that decides what a caller retrieves, not the
+    /// presence of the action.
+    ///
+    /// Every SELECTION over the stored actions starts here — the two retrieval
+    /// listings and the preview selection ([`previewed_actions`]), which is what
+    /// a rule would act on — so no read path reports an action of an account the
+    /// caller no longer reaches, and none of them can drift apart from the
+    /// operations that automate those actions. Resolving ONE action by its id
+    /// still goes to the whole store ([`RecommendedActionStore::get`]), which is
+    /// what lets `StartAutomationEvent` refuse with the caller's standing
+    /// instead of claiming the resource has gone away.
+    ///
+    /// An action that records no `accountId` names no other account, so no
+    /// association gates it: the restriction is about reaching INTO another
+    /// account, and such an action is in nobody else's. It is still outside
+    /// every preview, because a preview selects by account scope and no scope
+    /// covers an account-less action ([`previewed_actions`]).
+    pub fn retrievable_actions(&self) -> impl Iterator<Item = &RecommendedAction> + '_ {
+        self.recommended_actions.iter_in_order().filter(|action| {
+            action
+                .account_id
+                .as_deref()
+                .is_none_or(|account_id| self.may_initiate_in(account_id))
+        })
+    }
+
     /// How many of `account_ids` the enrollment store does not hold an entry for
     /// yet — i.e. how much an association of exactly those accounts would GROW
     /// the store. An id already stored costs nothing, whatever its status.
@@ -3205,7 +3255,9 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
     /// enrollment status of the account" and only that account's
     /// `UpdateEnrollmentConfiguration` sets it, so a member account that enabled
     /// the Automation feature keeps it enabled (and keeps the inventory that
-    /// enrollment produced) once the organization stops reaching it.
+    /// enrollment produced) once the organization stops reaching it — the
+    /// organization's own retrieval scope is what stops covering that inventory
+    /// ([`Self::retrievable_actions`]).
     ///
     /// Only an account the enrollment store already holds an entry for is
     /// written: an account the store has never seen carries no association to

@@ -172,17 +172,12 @@ fn emulator_with(actions: &[RecommendedAction]) -> (MultiServiceRouter, Arc<engi
     (router, engine)
 }
 
-/// Record `actions` where Compute Optimizer's analysis writes them.
+/// Record `actions` where Compute Optimizer's analysis writes them, through the
+/// one fixture that records an inventory for this crate
+/// (`crate::recommended_actions::record`), so a member account's analysis output
+/// is seeded with the association that put it there.
 fn seed_inventory(engine: &Arc<engine::InMemoryEngine>, actions: &[RecommendedAction]) {
-    let state = service_state(&**engine).expect("the in-memory engine carries this service's state");
-    let mut guard = state.lock();
-    for action in actions {
-        let id = action
-            .recommended_action_id
-            .clone()
-            .expect("a seeded action carries its id");
-        guard.recommended_actions.insert(id, action.clone());
-    }
+    crate::recommended_actions::record(engine, actions.to_vec());
 }
 
 /// Every stored recommended action, rendered: a read that changed any field of

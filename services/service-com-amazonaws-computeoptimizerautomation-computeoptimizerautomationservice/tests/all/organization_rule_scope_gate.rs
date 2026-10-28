@@ -66,7 +66,10 @@ fn scope_configuration(rule_apply_order: &str, account_ids: Option<&[String]>) -
 
 /// A create request for an `OrganizationRule` whose configuration names
 /// `account_ids`, or carries no `accountIds` member at all when they are `None`.
-fn organization_rule(name: &str, account_ids: Option<&[String]>) -> Value {
+///
+/// `pub(crate)` so a suite that compares what a rule may be scoped to with what
+/// a preview of the same scope reports builds the write the same way.
+pub(crate) fn organization_rule(name: &str, account_ids: Option<&[String]>) -> Value {
     let mut request = minimal_rule(name);
     request["ruleType"] = json!("OrganizationRule");
     request["organizationConfiguration"] = scope_configuration("BeforeAccountRules", account_ids);

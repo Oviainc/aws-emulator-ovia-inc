@@ -251,11 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The matching actions, grouped by `recommendedActionType`: the matched
         // actions are what gets grouped, so a type nothing matched is no group,
         // and the groups come back in the order the store first holds an action
-        // of each type — the same order `ListRecommendedActions` walks.
+        // of each type — the same order `ListRecommendedActions` walks. The
+        // actions summarised are the ones this caller may RETRIEVE — its own
+        // account's and each currently associated member account's, judged per
+        // call (`crate::state::…::retrievable_actions`) — so a group's count and
+        // savings cover exactly the actions `ListRecommendedActions` reports.
         let grouped = crate::state::group_by_recommended_action_type(
             guard
-                .recommended_actions
-                .iter_in_order()
+                .retrievable_actions()
                 .filter(|action| crate::state::recommended_action_matches_filters(action, &filters)),
         );
 

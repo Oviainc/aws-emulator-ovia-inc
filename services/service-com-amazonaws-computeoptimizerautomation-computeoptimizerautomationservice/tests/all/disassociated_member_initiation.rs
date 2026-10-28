@@ -7,11 +7,13 @@
 //! in another account only while that account is currently associated — is about
 //! INITIATING work. This suite pins its two consequences:
 //!
-//! * a removal takes nothing away from the store: the member account's analysed
-//!   actions are still listed, by the same ids, and the automation events it
-//!   already ran are still readable, which is what makes a refused start a
-//!   statement about the caller's standing rather than about the resource having
-//!   gone away;
+//! * a removal takes nothing out of the STORE: the member account's analysed
+//!   actions are still held, by the same ids, so the association alone decides
+//!   what the organization retrieves (they come back, unchanged, the moment the
+//!   account is associated again) and a start of one of them is refused for the
+//!   caller's standing rather than answered "no such resource"; the automation
+//!   events the account already ran stay readable throughout, because an event
+//!   is a resource of its own;
 //! * a refused start consumes nothing, its `clientToken` included, so the same
 //!   request is served once the association is back and a retry of it answers
 //!   that one automation instead of starting a second.
@@ -33,10 +35,12 @@ use super::member_account_association_gate::{
 use super::recommended_action_inventory::opted_in_emulator;
 
 /// A removal of an association leaves the member account's inventory and its
-/// past automations exactly where they were: the same actions are listed, by the
-/// same ids, and an event the member account already ran is still readable — the
-/// reporting operations report, and it is the INITIATING ones the association
-/// gates.
+/// past automations exactly where they were IN THE STORE: an event the member
+/// account already ran is still readable, the action ids still resolve (a start
+/// of one is refused for the caller's standing, not answered "no such
+/// resource"), and associating the account again reports the very same actions —
+/// nothing was deleted, the organization's retrieval scope is simply no longer
+/// over them.
 #[tokio::test]
 async fn a_removed_association_takes_nothing_out_of_the_store() {
     let router = opted_in_emulator("state").await;
@@ -64,11 +68,6 @@ async fn a_removed_association_takes_nothing_out_of_the_store() {
     disassociate(&router, MEMBER_A, "disassociated").await;
 
     assert_eq!(
-        listed_action_ids(&router, MEMBER_A, "disassociated").await,
-        listed_while_associated,
-        "case \"disassociated\": the removal keeps the inventory the analysis produced"
-    );
-    assert_eq!(
         event_ids_in_account(&router, MEMBER_A, "disassociated").await,
         vec![event_id.clone()],
         "case \"disassociated\": the automation the member account ran is still listed"
@@ -86,8 +85,18 @@ async fn a_removed_association_takes_nothing_out_of_the_store() {
         "case \"disassociated\": the event still reports the account it ran in, got {event}"
     );
 
-    // And yet the action is no longer automatable, which is the gate.
+    // The action is no longer automatable, which is the gate — and the refusal
+    // is about the caller's standing, so the id still resolves.
     assert_access_denied(start(&router, &action_id, None).await, "disassociated");
+
+    // Nothing was deleted: the association alone decided what was retrieved, so
+    // the same actions come back the moment it is in place again.
+    associate(&router, MEMBER_A, "re-associated").await;
+    assert_eq!(
+        listed_action_ids(&router, MEMBER_A, "re-associated").await,
+        listed_while_associated,
+        "case \"re-associated\": the removal kept the inventory the analysis produced"
+    );
 }
 
 /// A start the gate refuses consumes nothing: the `clientToken` it carried is

@@ -20,7 +20,7 @@ use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomations
     Tag, RECOMMENDED_ACTION_FILTER_NAME_VALUES,
 };
 use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::{
-    service_state, DEFAULT_MAX_RESULTS,
+    caller_account_id, now, service_state, DEFAULT_MAX_RESULTS,
 };
 
 use crate::automation_rule_lifecycle::{
@@ -30,6 +30,13 @@ use crate::automation_rule_lifecycle::{
 /// Record `actions` into the service's store — the one store
 /// `StartAutomationEvent` resolves an id against — the way Compute Optimizer's
 /// analysis would.
+///
+/// The analysis output of an account OTHER than the caller's is in that store
+/// because the account was associated with the organization's management
+/// account, so the association is recorded with it: `AssociateAccounts` writes
+/// both, and the retrieval scope is read from the association rather than from
+/// the stored action. A fixture that recorded only the action would describe a
+/// store no call can produce.
 pub(crate) fn record(engine: &Arc<engine::InMemoryEngine>, actions: Vec<RecommendedAction>) {
     let state = service_state(&**engine).expect("the engine bears this service's state");
     let mut guard = state.lock();
@@ -38,6 +45,11 @@ pub(crate) fn record(engine: &Arc<engine::InMemoryEngine>, actions: Vec<Recommen
             .recommended_action_id
             .clone()
             .expect("a recorded action carries its id");
+        if let Some(account_id) = action.account_id.clone() {
+            if account_id != caller_account_id() {
+                guard.associate_account(&account_id, now());
+            }
+        }
         guard.recommended_actions.insert(id, action);
     }
 }
