@@ -6,8 +6,8 @@
 //! `tests/all/pipe_data_plane.rs`, reused rather than copied).
 //!
 //! `tests/all/pipe_metrics.rs` asserts WHICH STAGE fails when the role bars its call and
-//! what the pipe then publishes about itself. The two rules here are the other half of the
-//! same rule, and neither is covered there:
+//! what the pipe then publishes about itself. The three rules here are the other half of
+//! the same rule, and none is covered there:
 //!
 //! 1. The decision is about the (action, RESOURCE) pair the call is made on, not about the
 //!    action alone: a grant is read with IAM's wildcards, a grant that names another queue
@@ -16,11 +16,18 @@
 //!    source. The rows differ along what the rule generalises over — which stage's call the
 //!    policy covers (receive, delete, send), and how it names the action and the resource
 //!    (exactly, by wildcard, on another queue, by an explicit deny).
-//! 2. The role is read from the pipe's record on every cycle, so `UpdatePipe` switches the
-//!    identity a RUNNING pipe's deliveries are authorized by: delivery after the update is
-//!    authorized by the NEW role, a pipe left on a role that may not reach the target it
-//!    was just re-pointed at delivers nothing, and the record it could not move is still
-//!    delivered once a role that may reach the target is supplied.
+//! 2. The role is read from the pipe's record when each stage makes its call, so
+//!    `UpdatePipe` switches the identity a RUNNING pipe's deliveries are authorized by:
+//!    delivery after the update is authorized by the NEW role, a pipe left on a role that
+//!    may not reach the target it was just re-pointed at delivers nothing, and the record
+//!    it could not move is still delivered once a role that may reach the target is
+//!    supplied. It is read per CALL and not once per batch, so a role switched while a
+//!    batch is in flight is the one that authorizes the calls that batch has not made yet
+//!    — its delivery and the deletion of what it delivered.
+//! 3. The REST of the configuration is read from that same record, and a batch is moved
+//!    under ONE of them: records polled under a configuration `UpdatePipe` has since
+//!    replaced are not delivered under it, but stay on the source to be moved under the
+//!    configuration the pipe now carries.
 
 use std::time::{Duration, Instant};
 
@@ -28,8 +35,11 @@ use serde_json::{json, Value};
 use service_com_amazonaws_pipes_pipes::state::execution_role::SERVICE_PRINCIPAL;
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_pipes_pipes::state::pipe_state::RUNNING;
+
 use crate::pipe_data_plane::{
-    collect_at_least, counted, given_queue, receive_now, send, sqs, wait_for_counted, QUIET,
+    collect_at_least, counted, given_queue, receive_now, send, sqs, wait_for_counted, LOOK_AGAIN,
+    QUIET,
 };
 use crate::pipe_lifecycle::{call, Reply, REGION};
 use crate::pipe_metrics::{emulator, given_role_stating};
@@ -47,6 +57,25 @@ const BUDGET: Duration = Duration::from_secs(25);
 /// could not deliver comes back within this suite's budget instead of after the Amazon SQS
 /// default of 30 seconds.
 const SHORT_VISIBILITY: &str = "1";
+
+/// Give the queue at `url` a visibility timeout of `seconds`: "the length of time, in
+/// seconds, that a message received from a queue will be invisible to other receiving
+/// components" (`SetQueueAttributes$Attributes`).
+async fn set_visibility(router: &MultiServiceRouter, case: &str, url: &str, seconds: &str) {
+    let (status, body) = sqs(
+        router,
+        "SetQueueAttributes",
+        &json!({
+            "QueueUrl": url,
+            "Attributes": { "VisibilityTimeout": seconds },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: SetQueueAttributes answered {status} {body}"
+    );
+}
 
 /// A role trusting EventBridge Pipes and carrying `statements` as its one inline policy;
 /// answered with the ARN IAM persisted.
@@ -68,33 +97,16 @@ async fn given_role(
     arn
 }
 
-/// Give the queue at `url` a one-second visibility timeout: "the length of time, in
-/// seconds, that a message received from a queue will be invisible to other receiving
-/// components" (`SetQueueAttributes$Attributes`).
-async fn shorten_visibility(router: &MultiServiceRouter, case: &str, url: &str) {
-    let (status, body) = sqs(
-        router,
-        "SetQueueAttributes",
-        &json!({
-            "QueueUrl": url,
-            "Attributes": { "VisibilityTimeout": SHORT_VISIBILITY },
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: SetQueueAttributes answered {status} {body}"
-    );
-}
-
 /// The attributes that together say how many records a queue HOLDS: the ones waiting on it
 /// plus the ones a consumer has taken and not deleted ("messages that are in flight",
 /// `ApproximateNumberOfMessagesNotVisible`) — which is what a record the pipe could not
 /// move is one of.
-const HELD_ATTRIBUTES: [&str; 2] = [
-    "ApproximateNumberOfMessages",
-    "ApproximateNumberOfMessagesNotVisible",
-];
+const HELD_ATTRIBUTES: [&str; 2] = ["ApproximateNumberOfMessages", IN_FLIGHT_ATTRIBUTE];
+
+/// The attribute that says how many records a consumer has TAKEN from a queue and not
+/// deleted: "messages that are in flight" (`ApproximateNumberOfMessagesNotVisible`) —
+/// which is what the record of a batch the pipe is still working on is.
+const IN_FLIGHT_ATTRIBUTE: &str = "ApproximateNumberOfMessagesNotVisible";
 
 /// How many records the queue at `url` still holds, through this crate's ONE queue-attribute
 /// read.
@@ -116,13 +128,35 @@ async fn create_pipe(
     target_arn: &str,
     role_arn: &str,
 ) -> Reply {
-    let body = json!({
+    create_batching_pipe(router, name, source_arn, target_arn, role_arn, None).await
+}
+
+/// That same `CreatePipe`, under the source batching parameters a row names: `BatchSize`
+/// and `MaximumBatchingWindowInSeconds`, which together are how long a poll that has not
+/// filled its batch keeps collecting.
+async fn create_batching_pipe(
+    router: &MultiServiceRouter,
+    name: &str,
+    source_arn: &str,
+    target_arn: &str,
+    role_arn: &str,
+    batching: Option<(i64, Duration)>,
+) -> Reply {
+    let mut body = json!({
         "Source": source_arn,
         "Target": target_arn,
         "RoleArn": role_arn,
         "DesiredState": "RUNNING",
         "TargetParameters": { "InputTemplate": BODY_TEMPLATE },
     });
+    if let Some((batch_size, window)) = batching {
+        body["SourceParameters"] = json!({
+            "SqsQueueParameters": {
+                "BatchSize": batch_size,
+                "MaximumBatchingWindowInSeconds": window.as_secs(),
+            },
+        });
+    }
     call(
         router,
         "POST",
@@ -141,9 +175,21 @@ async fn update_pipe(
     role_arn: &str,
     target_arn: Option<&str>,
 ) -> Reply {
+    update_templated_pipe(router, name, role_arn, target_arn, BODY_TEMPLATE).await
+}
+
+/// That same `UpdatePipe`, putting the `TargetParameters.InputTemplate` the caller names
+/// in force: what the TARGET is handed instead of the event.
+async fn update_templated_pipe(
+    router: &MultiServiceRouter,
+    name: &str,
+    role_arn: &str,
+    target_arn: Option<&str>,
+    template: &str,
+) -> Reply {
     let mut body = json!({
         "RoleArn": role_arn,
-        "TargetParameters": { "InputTemplate": BODY_TEMPLATE },
+        "TargetParameters": { "InputTemplate": template },
     });
     if let Some(target_arn) = target_arn {
         body["Target"] = json!(target_arn);
@@ -196,6 +242,27 @@ fn exact_grant(arns: &Resources) -> Value {
             "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage"],
             "Resource": arns.source,
         },
+        { "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": arns.target },
+    ])
+}
+
+/// Only the calls the SOURCE poll makes: the pipe may take the source's records and
+/// delete them, and may deliver to nothing.
+fn source_only_grant(arns: &Resources) -> Value {
+    json!([
+        {
+            "Effect": "Allow",
+            "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage"],
+            "Resource": arns.source,
+        },
+    ])
+}
+
+/// Every call of [`exact_grant`] but the source DELETE: the pipe may take a record and
+/// deliver it, and may not delete what it delivered.
+fn undeletable_grant(arns: &Resources) -> Value {
+    json!([
+        { "Effect": "Allow", "Action": "sqs:ReceiveMessage", "Resource": arns.source },
         { "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": arns.target },
     ])
 }
@@ -379,7 +446,7 @@ async fn update_pipe_switches_the_role_a_running_pipe_is_authorized_by() {
     let case = "a re-roled pipe";
     let router = emulator();
     let (source_url, source_arn) = given_queue(&router, "rerole-source").await;
-    shorten_visibility(&router, case, &source_url).await;
+    set_visibility(&router, case, &source_url, SHORT_VISIBILITY).await;
     let (first_url, first_arn) = given_queue(&router, "rerole-target-a").await;
     let (second_url, second_arn) = given_queue(&router, "rerole-target-b").await;
 
@@ -497,4 +564,339 @@ async fn update_pipe_switches_the_role_a_running_pipe_is_authorized_by() {
         "case {case:?}: expected the record the old role could not move on {second_arn} \
          once the new role is in force, got {got:?}"
     );
+}
+
+/// How long a poll that has not filled its batch keeps collecting:
+/// `MaximumBatchingWindowInSeconds`, "the maximum length of a time to wait for events"
+/// (`PipeSourceSqsQueueParameters`). The rows below reconfigure the pipe DURING this span,
+/// which is what puts the change on a batch the pipe has already taken.
+const IN_FLIGHT_WINDOW: Duration = Duration::from_secs(2);
+
+/// The `BatchSize` those rows poll under: more than the one record each sends, so the
+/// poll waits its whole window out instead of returning as soon as the batch is full.
+const IN_FLIGHT_BATCH_SIZE: i64 = 10;
+
+/// Wait until the pipe `name` reports the `CurrentState` `want`, answering what it
+/// reported last: only a pipe the clock has moved into `RUNNING` polls its source at all.
+async fn wait_for_state(
+    router: &MultiServiceRouter,
+    name: &str,
+    want: &str,
+    budget: Duration,
+) -> String {
+    let deadline = Instant::now() + budget;
+    loop {
+        let reported = describe_pipe(router, name).await.string("CurrentState");
+        if reported == want || Instant::now() >= deadline {
+            return reported;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// One row of the mid-batch switch table: the role the pipe polls its record under, the
+/// role `UpdatePipe` puts in force while that record is in flight, and what the two
+/// queues hold once the batch has landed.
+struct Switch {
+    case: &'static str,
+    /// The statements of the role the pipe is CREATED with — the one its poll is made as.
+    before: fn(&Resources) -> Value,
+    /// The statements of the role put in force while the batch is in flight, which is the
+    /// one every call that batch has not made yet is authorized by.
+    after: fn(&Resources) -> Value,
+    /// How many messages the target holds once the batch has landed.
+    delivered: usize,
+    /// How many records the source still holds: one a delivery was withheld for, and one
+    /// a delete was withheld for, both stay on the queue.
+    left_on_source: i64,
+}
+
+/// RULE: a stage's call is authorized by the execution role the pipe's record carries AT
+/// THE MOMENT THAT CALL IS MADE, never by one read earlier, so a role `UpdatePipe` put in
+/// force while a batch was in flight decides every call of that batch still to come —
+/// nothing is delivered or deleted as an identity the pipe no longer carries, and a call
+/// the new role allows is made even though the role the batch began under did not.
+///
+/// The rows differ along what the rule generalises over: which stage's call the switch
+/// changes the answer for (the target delivery, the source delete) and which way it
+/// changes it (withdrawn, granted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_role_switched_mid_batch_authorizes_the_calls_that_batch_has_not_made() {
+    let rows = [
+        Switch {
+            case: "the delivery withdrawn while the batch is in flight",
+            before: exact_grant,
+            after: source_only_grant,
+            delivered: 0,
+            left_on_source: 1,
+        },
+        Switch {
+            case: "the delivery granted while the batch is in flight",
+            before: source_only_grant,
+            after: exact_grant,
+            delivered: 1,
+            left_on_source: 0,
+        },
+        Switch {
+            case: "the source delete withdrawn while the batch is in flight",
+            before: exact_grant,
+            after: undeletable_grant,
+            delivered: 1,
+            left_on_source: 1,
+        },
+    ];
+
+    let router = emulator();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (source_url, source_arn) = given_queue(&router, &format!("switch-source-{index}")).await;
+        let (target_url, target_arn) = given_queue(&router, &format!("switch-target-{index}")).await;
+        let (_, other_arn) = given_queue(&router, &format!("switch-other-{index}")).await;
+        let arns = Resources {
+            source: source_arn.clone(),
+            target: target_arn.clone(),
+            other: other_arn,
+        };
+        let before = given_role(
+            &router,
+            case,
+            &format!("switch-before-{index}"),
+            (row.before)(&arns),
+        )
+        .await;
+        let after = given_role(
+            &router,
+            case,
+            &format!("switch-after-{index}"),
+            (row.after)(&arns),
+        )
+        .await;
+
+        let name = format!("switch-pipe-{index}");
+        let created = create_batching_pipe(
+            &router,
+            &name,
+            &source_arn,
+            &target_arn,
+            &before,
+            Some((IN_FLIGHT_BATCH_SIZE, IN_FLIGHT_WINDOW)),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+        let reported = wait_for_state(&router, &name, RUNNING, BUDGET).await;
+        assert_eq!(
+            reported, RUNNING,
+            "case {case:?}: the pipe reports {reported}, so it polls nothing"
+        );
+
+        let marker = format!("in-flight-{index}");
+        send(&router, &source_url, std::slice::from_ref(&marker)).await;
+        // The batch is IN FLIGHT once the poller has taken the record and not deleted it:
+        // the pipe is inside its batching window with its delivery still to come, which
+        // is the instant the role is switched at.
+        let taken = wait_for_counted(&router, &source_url, &[IN_FLIGHT_ATTRIBUTE], 1, BUDGET).await;
+        assert_eq!(
+            taken, 1,
+            "case {case:?}: expected the poller to have taken the record of {source_arn}, \
+             in flight {taken}"
+        );
+        let switched = update_pipe(&router, &name, &after, None).await;
+        assert_eq!(
+            switched.status, 200,
+            "case {case:?}: UpdatePipe answered {} {}",
+            switched.status, switched.body
+        );
+
+        // The batching window has to close before the delivery is attempted at all, so a
+        // row that must see nothing delivered looks only once it has, and then waits the
+        // quiet window out on top.
+        let got = if row.delivered == 0 {
+            tokio::time::sleep(IN_FLIGHT_WINDOW + QUIET).await;
+            receive_now(&router, &target_url).await
+        } else {
+            collect_at_least(&router, &target_url, row.delivered, BUDGET).await
+        };
+        assert_eq!(
+            got.len(),
+            row.delivered,
+            "case {case:?}: expected {} message(s) on the target {target_arn}, got {got:?}",
+            row.delivered
+        );
+        for body in &got {
+            assert_eq!(
+                body, &marker,
+                "case {case:?}: the target {target_arn} received {body:?}, not the record \
+                 the source was sent"
+            );
+        }
+        let left = wait_for_held(&router, &source_url, row.left_on_source, BUDGET).await;
+        assert_eq!(
+            left, row.left_on_source,
+            "case {case:?}: expected the source {source_arn} to hold {} record(s), got {left}",
+            row.left_on_source
+        );
+    }
+}
+
+/// The visibility timeout the re-configured source is set to, as the seconds a
+/// `VisibilityTimeout` attribute carries. It is longer than [`IN_FLIGHT_WINDOW`] by more
+/// than a delivery takes, so a record a batch is still collecting cannot be taken twice
+/// by that batch, nor come back before the batch that delivered it has deleted it — and
+/// short enough that a record the pipe left behind comes back inside this suite's budget,
+/// instead of after the Amazon SQS default of 30 seconds.
+const REDELIVERY_VISIBILITY: &str = "4";
+
+/// A `TargetParameters.InputTemplate` that is NOT [`BODY_TEMPLATE`]: it wraps the record's
+/// body in a JSON object, so which template was in force when the delivery was made is
+/// read off the delivered message.
+const WRAPPED_TEMPLATE: &str = r#"{"moved":"<$.body>"}"#;
+
+/// What [`WRAPPED_TEMPLATE`] renders for a record whose body is `body`.
+fn wrapped(body: &str) -> String {
+    format!(r#"{{"moved":"{body}"}}"#)
+}
+
+/// One row of the reconfigured-mid-batch table: which member of the pipe's configuration
+/// `UpdatePipe` moves while a batch is in flight, and what the delivery then looks like.
+struct Reconfigured {
+    case: &'static str,
+    /// Whether the update re-points the pipe at the SECOND queue; a row that does not
+    /// leaves the first as the target.
+    retargets: bool,
+    /// The `TargetParameters.InputTemplate` the update puts in force.
+    template: &'static str,
+    /// What the delivered message must carry, given the record's body.
+    delivered: fn(&str) -> String,
+}
+
+/// RULE: a batch is moved under ONE configuration, and it is the pipe's own — the record
+/// is read when each call is made, so records polled under a configuration `UpdatePipe`
+/// has since replaced are not delivered under it: nothing reaches the target the pipe has
+/// left, nothing is delivered through a template it no longer carries, and the records
+/// stay on the source until the configuration it does carry moves them.
+///
+/// The rows differ along which member of that configuration moved: the `Target` the
+/// delivery is made to, and the `InputTemplate` it is made with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_in_flight_is_not_delivered_under_a_configuration_the_pipe_has_left() {
+    let rows = [
+        Reconfigured {
+            case: "the target re-pointed while the batch is in flight",
+            retargets: true,
+            template: BODY_TEMPLATE,
+            delivered: |body| body.to_string(),
+        },
+        Reconfigured {
+            case: "the input template replaced while the batch is in flight",
+            retargets: false,
+            template: WRAPPED_TEMPLATE,
+            delivered: wrapped,
+        },
+    ];
+
+    let router = emulator();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (source_url, source_arn) =
+            given_queue(&router, &format!("moved-source-{index}")).await;
+        let (first_url, first_arn) = given_queue(&router, &format!("moved-first-{index}")).await;
+        let (second_url, second_arn) =
+            given_queue(&router, &format!("moved-second-{index}")).await;
+        set_visibility(&router, case, &source_url, REDELIVERY_VISIBILITY).await;
+        // ONE role, which may deliver to either queue: where the record lands is then
+        // decided by the pipe's own configuration and by nothing about its permissions.
+        let role = given_role(
+            &router,
+            case,
+            &format!("moved-role-{index}"),
+            json!([
+                {
+                    "Effect": "Allow",
+                    "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage"],
+                    "Resource": source_arn,
+                },
+                { "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": first_arn },
+                { "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": second_arn },
+            ]),
+        )
+        .await;
+
+        let name = format!("moved-pipe-{index}");
+        let created = create_batching_pipe(
+            &router,
+            &name,
+            &source_arn,
+            &first_arn,
+            &role,
+            Some((IN_FLIGHT_BATCH_SIZE, IN_FLIGHT_WINDOW)),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+        let reported = wait_for_state(&router, &name, RUNNING, BUDGET).await;
+        assert_eq!(
+            reported, RUNNING,
+            "case {case:?}: the pipe reports {reported}, so it polls nothing"
+        );
+
+        let marker = format!("moved-{index}");
+        send(&router, &source_url, std::slice::from_ref(&marker)).await;
+        let taken = wait_for_counted(&router, &source_url, &[IN_FLIGHT_ATTRIBUTE], 1, BUDGET).await;
+        assert_eq!(
+            taken, 1,
+            "case {case:?}: expected the poller to have taken the record of {source_arn}, \
+             in flight {taken}"
+        );
+        let moved = update_templated_pipe(
+            &router,
+            &name,
+            &role,
+            row.retargets.then_some(second_arn.as_str()),
+            row.template,
+        )
+        .await;
+        assert_eq!(
+            moved.status, 200,
+            "case {case:?}: UpdatePipe answered {} {}",
+            moved.status, moved.body
+        );
+
+        // The record is delivered once the configuration the pipe now carries has moved
+        // it: the batch it was polled into is not served by the configuration it was
+        // polled under, so the record waits out its invisibility and is polled again.
+        let (landed_url, landed_arn) = if row.retargets {
+            (&second_url, &second_arn)
+        } else {
+            (&first_url, &first_arn)
+        };
+        let want = (row.delivered)(&marker);
+        let got = collect_at_least(&router, landed_url, 1, BUDGET).await;
+        assert_eq!(
+            got,
+            vec![want.clone()],
+            "case {case:?}: expected {want:?} on {landed_arn} under the configuration the \
+             pipe carries now, got {got:?}"
+        );
+        if row.retargets {
+            let stale = receive_now(&router, &first_url).await;
+            assert!(
+                stale.is_empty(),
+                "case {case:?}: the pipe was re-pointed away from {first_arn} before the \
+                 batch was delivered, so nothing may reach it, got {stale:?}"
+            );
+        }
+        let left = wait_for_held(&router, &source_url, 0, BUDGET).await;
+        assert_eq!(
+            left, 0,
+            "case {case:?}: expected the delivered record to leave the source {source_arn}, \
+             which held {left}"
+        );
+    }
 }

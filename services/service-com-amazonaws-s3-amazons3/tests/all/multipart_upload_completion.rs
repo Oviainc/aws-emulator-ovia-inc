@@ -784,7 +784,9 @@ struct ChecksumCase {
 /// The rows differ along the algorithm, its digest width, and the checksum type: a
 /// composition over the parts' checksums by default, a full-object checksum for the one
 /// algorithm whose checksum "is always a full object checksum" (`ChecksumCRC64NVME`), and a
-/// full-object checksum for an initiation that asks for one explicitly.
+/// full-object checksum for an initiation that asks for one explicitly under a CRC-based
+/// algorithm — the only algorithms a multipart object may carry one under (see
+/// `tests/all/multipart_checksum_type.rs`, which tables every pair).
 fn checksum_cases() -> Vec<ChecksumCase> {
     vec![
         ChecksumCase {
@@ -830,9 +832,9 @@ fn checksum_cases() -> Vec<ChecksumCase> {
             expected_type: "COMPOSITE",
         },
         ChecksumCase {
-            algorithm: "MD5",
+            algorithm: "CRC32",
             requested_type: Some("FULL_OBJECT"),
-            digest_bits: 128,
+            digest_bits: 32,
             expected_type: "FULL_OBJECT",
         },
         ChecksumCase {

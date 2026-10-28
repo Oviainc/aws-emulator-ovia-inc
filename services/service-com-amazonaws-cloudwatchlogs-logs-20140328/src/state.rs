@@ -158,6 +158,9 @@ pub mod filter_pattern;
 /// Metric extraction from an ingested Embedded Metric Format log event.
 pub mod emf;
 
+/// Metric extraction from an ingested log event through a log group's metric filters.
+pub mod metric_filters;
+
 /// The scheduled query CloudWatch manages on a log alarm's behalf.
 pub mod log_alarm_queries;
 

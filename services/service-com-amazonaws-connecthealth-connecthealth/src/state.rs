@@ -799,15 +799,35 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         }
     }
 
+    /// Every `Domain` record `account_id` OWNS in `region`, whatever its status, in
+    /// `domainId` order.
+    ///
+    /// The ONE place the ACCOUNT scope of this store is expressed, as
+    /// [`Self::domains_in`] is the one place its Region scope is: every lookup whose
+    /// contract is an account's domains — the account's cap, the repeat an `@idempotent`
+    /// create resolves, and the listing the model documents as an account's — goes through
+    /// here, so none of them can disagree about which domains an account holds. A record
+    /// carries the account that created it (`Domain::account_id`), so a domain of another
+    /// account is outside every one of those answers.
+    pub fn domains_owned_by<'a>(
+        &'a self,
+        region: &str,
+        account_id: &str,
+    ) -> impl Iterator<Item = &'a Domain> + 'a {
+        // Captured by VALUE for the same reason [`Self::domains_in`] captures its Region:
+        // the iterator borrows only the store.
+        let account_id = account_id.to_string();
+        self.domains_in(region)
+            .filter(move |domain| domain.account_id == account_id)
+    }
+
     /// How many `Domain` records `account_id` currently holds IN `region` — the LIVE
     /// count the account's per-Region cap is measured against, which a purge of a deleted
     /// domain lowers again. Every record carries its owning account and its Region, so
     /// the count is of that account's domains in that Region alone and a domain in
     /// another Region consumes nothing here.
     pub fn domains_held_by(&self, region: &str, account_id: &str) -> usize {
-        self.domains_in(region)
-            .filter(|domain| domain.account_id == account_id)
-            .count()
+        self.domains_owned_by(region, account_id).count()
     }
 
     /// The LIVE domain `account_id` already holds in `region` that was created by the
@@ -827,10 +847,8 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         account_id: &str,
         fingerprint: &str,
     ) -> Option<&Domain> {
-        self.domains_in(region).find(|domain| {
-            domain.account_id == account_id
-                && domain.status == DomainStatus::Active
-                && domain.creation_fingerprint == fingerprint
+        self.domains_owned_by(region, account_id).find(|domain| {
+            domain.status == DomainStatus::Active && domain.creation_fingerprint == fingerprint
         })
     }
 
@@ -838,7 +856,9 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     ///
     /// The ONE place the Region scope of this store is expressed: a reader that
     /// enumerates domains goes through here, so an enumeration and a point lookup
-    /// ([`Self::held_domain`]) can never disagree about which Region holds what.
+    /// ([`Self::held_domain`]) can never disagree about which Region holds what. A reader
+    /// whose contract is one ACCOUNT's domains narrows this through
+    /// [`Self::domains_owned_by`] rather than filtering the account itself.
     pub fn domains_in<'a>(&'a self, region: &str) -> impl Iterator<Item = &'a Domain> + 'a {
         // The Region is captured by VALUE, so the iterator borrows only the store: a
         // caller may hand in a Region that outlives nothing and still keep the records
@@ -1329,8 +1349,11 @@ pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
-/// The collection a `ListDomains` cursor enumerates: the domains held in ONE Region,
-/// since this endpoint is regional and a listing covers no other Region.
+/// The collection a `ListDomains` cursor enumerates: ONE account's domains in ONE
+/// Region, since this endpoint is regional and the listing reports the calling account's
+/// domains alone. Every record of this emulator belongs to the one canonical account
+/// ([`owning_account_id`]), so the Region is the only part of that scope two live
+/// collections can differ in, and so the only part the key carries.
 pub fn domains_page_scope(region: &str) -> String {
     format!("domains/{region}")
 }

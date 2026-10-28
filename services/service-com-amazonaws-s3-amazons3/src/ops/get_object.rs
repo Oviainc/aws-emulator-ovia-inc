@@ -621,14 +621,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .restore
                 .as_ref()
                 .and_then(|restore| restore.header_value(now)),
+            // "If your request involves a bucket that is either a source or a destination in
+            // a replication rule" the read reports the status of that replication
+            // (`GetObjectOutput$ReplicationStatus`): what the write that stored THIS version
+            // recorded, read through the one renderer that decides when a source version
+            // stops reporting `PENDING` ([`crate::state::ObjectReplication::status_at`]), so
+            // a GET and a HEAD of the same version cannot disagree about it. An object no
+            // replication rule covers carries no record and reports no status.
+            replication_status: object
+                .replication
+                .as_ref()
+                .map(|replication| replication.status_at(now).to_string()),
             // Everything else describes a feature no stored object here has, so none of
             // it is reported rather than being invented: `DeleteMarker` needs a delete
             // marker (a delete records none, so no read can be of one), `ArchiveStatus`
             // needs an S3 Intelligent-Tiering archive tier,
             // the SSE-C members are refused at write time, `MissingMeta`
-            // counts unreadable metadata headers (there are none), `ReplicationStatus`
-            // needs a replication configuration and `RequestCharged` a Requester Pays
-            // charge this emulator does not model.
+            // counts unreadable metadata headers (there are none), and `RequestCharged` a
+            // Requester Pays charge this emulator does not model.
             checksum_crc32: reported.crc32,
             checksum_crc32_c: reported.crc32c,
             checksum_crc64_nvme: reported.crc64nvme,

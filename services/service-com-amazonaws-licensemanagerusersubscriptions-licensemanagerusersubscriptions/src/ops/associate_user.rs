@@ -42,8 +42,10 @@
 //! `ASSOCIATED` transition is owed by the clock (see `crate::state::materialise_due`)
 //! and materialises on any later read. The operation is `@idempotent`, so associating a
 //! user that is already associated to the same instance answers the stored association
-//! rather than minting a second one. An association whose disassociation has been
-//! accepted still occupies that triple while it is `DISASSOCIATING`, and is the modelled
+//! rather than minting a second one — the user being the one `Username` and `Domain`
+//! together name, the identity `DisassociateUser` resolves an association by. An
+//! association whose disassociation has been
+//! accepted still occupies that identity while it is `DISASSOCIATING`, and is the modelled
 //! `ConflictException` instead: the user is still being torn down from that instance, so
 //! there is no association to answer with and none to mint.
 //!
@@ -225,19 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `@idempotent`: the same user on the same instance through the same directory is
-        // the association already in state, answered as it stands.
-        let index_key = (
-            key.clone(),
-            input.instance_id.clone(),
-            input.username.clone(),
-        );
+        // the association already in state, answered as it stands. Which user that is
+        // includes the Active Directory domain the user's information came from, matched the
+        // one place it is matched for both halves of this plane, so the same user name in
+        // another domain is another user and gets its own association, exactly as
+        // `DisassociateUser` resolves that user's own association.
         if let Some(existing) = state
-            .instance_user_index
-            .get(&index_key)
+            .instance_user_arn_for(
+                &key,
+                &input.instance_id,
+                &input.username,
+                input.domain.as_deref(),
+            )
             .and_then(|arn| state.instance_users.get(arn))
         {
             // Unless that association is still being torn down: a disassociation the
-            // service has not finished yet still occupies the triple, so associating the
+            // service has not finished yet still occupies that identity, so associating the
             // user with that instance again conflicts with the state the association is
             // in rather than minting a second one or resurrecting this one.
             if crate::state::disassociation_started(&existing.status) {

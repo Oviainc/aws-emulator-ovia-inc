@@ -26,7 +26,8 @@
 //!    the question arises only for a request that names an instance — one addressed by
 //!    `InstanceUserArn` alone names none and authorizes nothing;
 //! 2. then the request must address an association — by `InstanceUserArn`, or by the full
-//!    `IdentityProvider`/`InstanceId`/`Username` triple. A request naming neither is an
+//!    `IdentityProvider`/`InstanceId`/`Username` set of members, with the `Domain` that
+//!    names which user, when the association carries one. A request naming neither is an
 //!    argument error the caller must fix, refused with the modelled
 //!    `ValidationException` naming the members it requires, BEFORE anything is looked
 //!    up;
