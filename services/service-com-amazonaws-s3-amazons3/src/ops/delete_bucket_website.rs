@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketWebsite
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketWebsite`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketWebsite::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named bucket's whole website configuration and answers the modelled 204 with
+//! an empty body, so a later `GetBucketWebsite` reports it as absent again and
+//! `PutBucketWebsite` may configure the bucket as a website afresh. Idempotent: a bucket
+//! carrying no website configuration is already in the asked-for state, so the call still
+//! succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -105,14 +102,23 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteBucketWebsiteOutpu
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteBucketWebsiteError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteBucketWebsite")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="DeleteBucketWebsite")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and AWS
+// answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`): "Amazon S3 returns a 404 response if the bucket specified in the request
+// does not exist" (this operation's own documentation), the same 404 `PutBucketWebsite` and
+// `GetBucketWebsite` answer for that name, which is why the shape is widened in here rather
+// than a second rule invented.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteBucketWebsite",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum DeleteBucketWebsiteErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -166,18 +172,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketWebsite` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketWebsiteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A delete needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`DeleteBucketWebsiteRequest$ExpectedBucketOwner`): this emulator serves one
+        // account, so that account owns every bucket it holds. Decided before the lookup, so
+        // a refused request reads nothing and writes nothing.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                // The text S3 publishes for this code, kept in the one place this crate
+                // holds it rather than spelled again here.
+                crate::scaffolded::documented_error_message("AccessDenied")
+                    .unwrap_or("Access Denied"),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be removed, and answering
+            // 204 would report a configuration withdrawn that was never there to withdraw,
+            // so this goes out as the server fault S3 publishes for a request it could not
+            // carry out (`InternalError`, HTTP 500) — the channel `PutBucketWebsite` and
+            // `GetBucketWebsite` use for the same case.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The bucket is looked up FIRST, so a request naming a bucket this emulator does not
+        // hold answers that — "Amazon S3 returns a 404 response if the bucket specified in
+        // the request does not exist" (this operation's own documentation) — rather than
+        // succeeding on a record that cannot exist.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(DeleteBucketWebsiteErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // "This action removes the website configuration for a bucket" (this operation's own
+        // documentation): the whole configuration goes, which puts the bucket back in the
+        // state it was created in, so a later `GetBucketWebsite` answers
+        // `NoSuchWebsiteConfiguration` again and a later `PutBucketWebsite` configures the
+        // bucket as a website afresh.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketWebsite"))
+        // Idempotent: "You will get a 200 OK response if the website configuration you are
+        // trying to delete does not exist on the bucket" (this operation's own
+        // documentation) — nothing in the contract distinguishes a bucket that carried a
+        // website configuration from one that did not, so both end in the same state and
+        // answer this operation's modelled success status. Only this bucket's website
+        // configuration is cleared; its objects and its other subresources are left alone,
+        // as is every other bucket's record.
+        bucket.clear_website();
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(DeleteBucketWebsiteOutput)
     }
 }
+
+/// The HTTP status AWS answers a bucket-owner mismatch with: 403, as
+/// `DeleteBucketWebsiteRequest$ExpectedBucketOwner` documents.
+const ACCESS_DENIED_STATUS: u16 = 403;

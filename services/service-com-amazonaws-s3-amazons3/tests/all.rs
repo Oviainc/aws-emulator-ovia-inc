@@ -89,6 +89,8 @@ mod bucket_tagging;
 mod bucket_versioning;
 #[path = "all/bucket_website.rs"]
 mod bucket_website;
+#[path = "all/bucket_website_delete.rs"]
+mod bucket_website_delete;
 #[path = "all/directory_bucket_sessions_and_appends.rs"]
 mod directory_bucket_sessions_and_appends;
 #[path = "all/error_message_envelope.rs"]
