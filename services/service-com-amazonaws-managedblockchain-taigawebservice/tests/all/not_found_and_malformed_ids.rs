@@ -13,8 +13,10 @@
 //! 2. An id outside the SPACE its input member's values are drawn from is refused with
 //!    the modelled `InvalidRequestException` (400) naming that member and the value,
 //!    before any lookup — independently of whether the value happens to sit inside
-//!    `ResourceIdString`'s `@length(1, 32)` bound. Only `AccessorId` is validated this
-//!    way: Managed Blockchain is recorded refusing an accessor id outside the space for
+//!    `ResourceIdString`'s `@length(1, 32)` bound, and independently of WHICH operation
+//!    resolves the member, so every operation that reads it answers alike. Only
+//!    `AccessorId` is validated this way: Managed Blockchain is recorded refusing an
+//!    accessor id outside the space for
 //!    both a 36-character UUID and a bare 32-character id, while an id of any other
 //!    family that resolves to nothing is recorded as a `ResourceNotFoundException`. A
 //!    well-formed accessor id nothing holds is therefore still a 404, which is what lets
@@ -277,12 +279,39 @@ async fn a_nested_request_names_the_first_path_label_it_cannot_resolve() {
     }
 }
 
+/// One operation that resolves the `AccessorId` input member: the request that reaches
+/// it, and the status the accessor it resolved holds once it has run.
+#[derive(Debug)]
+struct AccessorIdReader {
+    operation: &'static str,
+    method: &'static str,
+    resolved_status: &'static str,
+}
+
+/// Every operation whose input declares the `AccessorId` member (smithy_query: operation
+/// "GetAccessor,DeleteAccessor" — `GetAccessorInput` and `DeleteAccessorInput` are the
+/// only input shapes that carry it). The rule is keyed on that MEMBER, so each of them
+/// answers a value outside the accessor-id space the same way.
+const ACCESSOR_ID_READERS: &[AccessorIdReader] = &[
+    AccessorIdReader {
+        operation: "GetAccessor",
+        method: "GET",
+        resolved_status: "AVAILABLE",
+    },
+    AccessorIdReader {
+        operation: "DeleteAccessor",
+        method: "DELETE",
+        resolved_status: "PENDING_DELETION",
+    },
+];
+
 /// Rule 2: an `AccessorId` outside the accessor-id space is the modelled
 /// `InvalidRequestException` (400) naming the member and the value, whether or not the
 /// value also breaks `ResourceIdString`'s `@length(1, 32)` — over a table spanning the
 /// ways a value leaves that space (a wrong prefix, no prefix, a body of the wrong length
 /// on either side, a character outside the alphabet, the wrong case, and lengths from one
-/// character to past the modelled bound).
+/// character to past the modelled bound), crossed with EVERY operation that resolves the
+/// member, because the rule is the member's and not any one operation's.
 #[tokio::test]
 async fn an_accessor_id_outside_the_accessor_id_space_is_the_modelled_invalid_request() {
     let router = new_router();
@@ -320,54 +349,68 @@ async fn an_accessor_id_outside_the_accessor_id_space_is_the_modelled_invalid_re
         ("the minted id without its prefix", minted[3..].to_string()),
     ];
 
-    for (case, id) in &malformed {
-        let answer = call(&router, "GET", &format!("/accessors/{id}"), None).await;
-        assert_eq!(
-            (answer.status, answer.error_type.as_str()),
-            (400, "InvalidRequestException"),
-            "case {case}: expected 400 InvalidRequestException for {id:?}, got {} {:?}",
-            answer.status,
-            answer.body
-        );
-        assert_eq!(
-            answer.text(&["Message"]),
-            format!("AccessorId parameter {id} is malformed"),
-            "case {case}: expected the refusal to name the member and the value, got {:?}",
-            answer.body
-        );
+    for reader in ACCESSOR_ID_READERS {
+        for (case, id) in &malformed {
+            let answer = call(&router, reader.method, &format!("/accessors/{id}"), None).await;
+            assert_eq!(
+                (answer.status, answer.error_type.as_str()),
+                (400, "InvalidRequestException"),
+                "case {}/{case}: expected 400 InvalidRequestException for {id:?}, got {} {:?}",
+                reader.operation,
+                answer.status,
+                answer.body
+            );
+            assert_eq!(
+                answer.text(&["Message"]),
+                format!("AccessorId parameter {id} is malformed"),
+                "case {}/{case}: expected the refusal to name the member and the value, got {:?}",
+                reader.operation,
+                answer.body
+            );
+        }
     }
 
     // The other half of the rule: an id INSIDE the space is looked up, so one nothing
-    // holds is the modelled 404 and the one that was minted still reads back. Rows: the
+    // holds is the modelled 404 — from every operation that resolves the member. Rows: the
     // first and the last id of the space, and one of every alphabet character in turn, so
     // the whole alphabet is accepted as well-formed.
     let mut well_formed: Vec<String> = vec![accessor_id('A'), accessor_id('7')];
     well_formed.extend(ID_ALPHABET.chars().map(accessor_id));
-    for id in &well_formed {
-        if *id == minted {
-            continue;
+    for reader in ACCESSOR_ID_READERS {
+        for id in &well_formed {
+            if *id == minted {
+                continue;
+            }
+            let answer = call(&router, reader.method, &format!("/accessors/{id}"), None).await;
+            assert_not_found(reader.operation, &answer, "Accessor", id);
         }
-        let answer = call(&router, "GET", &format!("/accessors/{id}"), None).await;
-        assert_not_found(
-            "GetAccessor/well-formed-but-unminted",
-            &answer,
-            "Accessor",
-            id,
-        );
     }
 
-    let answer = call(&router, "GET", &format!("/accessors/{minted}"), None).await;
-    assert_eq!(
-        answer.status, 200,
-        "case the minted id {minted}: expected GetAccessor 200 after the refusals, got {} {:?}",
-        answer.status, answer.body
-    );
-    assert_eq!(
-        answer.text(&["Accessor", "Id"]),
-        minted,
-        "case the minted id {minted}: expected the stored accessor, got {:?}",
-        answer.body
-    );
+    // And an id inside the space that the store DOES hold is resolved: each operation
+    // answers 200 and acts on that one record, which the read-back shows by the status
+    // the operation leaves it in.
+    for reader in ACCESSOR_ID_READERS {
+        let token = format!("malformed-held-{}", reader.operation);
+        let held = minted_accessor_id(&router, &token).await;
+        let answer = call(&router, reader.method, &format!("/accessors/{held}"), None).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {}/the minted id {held}: expected 200 after the refusals, got {} {:?}",
+            reader.operation, answer.status, answer.body
+        );
+        let read = call(&router, "GET", &format!("/accessors/{held}"), None).await;
+        assert_eq!(
+            (
+                read.text(&["Accessor", "Id"]),
+                read.text(&["Accessor", "Status"])
+            ),
+            (held.clone(), reader.resolved_status.to_string()),
+            "case {}/the minted id {held}: expected that record left {}, got {:?}",
+            reader.operation,
+            reader.resolved_status,
+            read.body
+        );
+    }
 }
 
 /// Rule 3: an `InvitationId` that resolves to nothing is the modelled 404 naming the
@@ -425,7 +468,7 @@ async fn an_invitation_id_that_resolves_to_nothing_names_the_invitation_id_membe
 /// The two id members this suite covers answer DIFFERENTLY for the same value, which is
 /// what rule 2 being scoped to the accessor-id space means: `not-an-invitation-id` is a
 /// 404 as an `InvitationId` and the same string is a malformed-id refusal as an
-/// `AccessorId`.
+/// `AccessorId` — through either operation that resolves that member.
 #[tokio::test]
 async fn only_the_accessor_id_member_is_validated_against_an_id_space() {
     let router = new_router();
@@ -440,20 +483,23 @@ async fn only_the_accessor_id_member_is_validated_against_an_id_space() {
         shared,
     );
 
-    let as_accessor = call(&router, "GET", &format!("/accessors/{shared}"), None).await;
-    assert_eq!(
-        (
+    for reader in ACCESSOR_ID_READERS {
+        let as_accessor = call(&router, reader.method, &format!("/accessors/{shared}"), None).await;
+        assert_eq!(
+            (
+                as_accessor.status,
+                as_accessor.error_type.as_str(),
+                as_accessor.text(&["Message"])
+            ),
+            (
+                400,
+                "InvalidRequestException",
+                format!("AccessorId parameter {shared} is malformed")
+            ),
+            "case the value as an AccessorId on {}: expected the malformed-id refusal, got {} {:?}",
+            reader.operation,
             as_accessor.status,
-            as_accessor.error_type.as_str(),
-            as_accessor.text(&["Message"])
-        ),
-        (
-            400,
-            "InvalidRequestException",
-            format!("AccessorId parameter {shared} is malformed")
-        ),
-        "case the value as an AccessorId: expected the malformed-id refusal, got {} {:?}",
-        as_accessor.status,
-        as_accessor.body
-    );
+            as_accessor.body
+        );
+    }
 }
