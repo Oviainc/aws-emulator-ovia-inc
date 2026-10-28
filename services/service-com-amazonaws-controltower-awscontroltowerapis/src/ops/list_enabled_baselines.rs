@@ -235,39 +235,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         enabled.sort_by(|left, right| left.arn.cmp(&right.arn));
 
-        // The token this operation hands out is the index of the next unreturned entry,
-        // so it is only meaningful against a call carrying the same filter — which is what
-        // `nextToken` is documented to require. `ListEnabledBaselinesNextToken` is
-        // modelled `pattern \S+`, so the front door has already refused an empty token and
-        // only an absent one reaches here; both mean "start at the beginning".
-        let start = match input.next_token.as_deref() {
-            None | Some("") => 0usize,
-            Some(token) => match token.parse::<usize>() {
-                Ok(index) if index <= enabled.len() => index,
-                _ => {
-                    return Err(ListEnabledBaselinesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: format!(
-                                "nextToken {token} was not returned by a previous \
-                                 ListEnabledBaselines call with these parameters"
-                            ),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
+        // The page the call asks for, cut out by this crate's one pagination rule: the
+        // token is the index of the next unreturned entry, so it is only meaningful
+        // against a call carrying the same filter — which is what `nextToken` is
+        // documented to require. `ListEnabledBaselinesNextToken` is modelled
+        // `pattern \S+`, so the front door has already refused an empty token and only an
+        // absent one reaches here; both mean "start at the beginning". `maxResults` is
+        // modelled `range 5..100`, so the front door has already refused anything outside
+        // it.
+        let (page, next_token) = crate::state::page(
+            Self::NAME,
+            crate::state::TokenScope::SameParameters,
+            input.next_token.as_deref(),
+            input.max_results,
+            &enabled,
+        )
+        .map_err(|message| {
+            ListEnabledBaselinesErrorModeled::ValidationException(ValidationException { message })
+        })?;
 
-        // `maxResults` is modelled `range 5..100`, so the front door has already refused
-        // anything outside it; absent, every remaining entry is returned. The floor of 1
-        // keeps a page from being empty-but-tokened should the model ever widen the range
-        // downwards.
-        let limit = input
-            .max_results
-            .map_or(enabled.len(), |max| max.max(1) as usize);
-        let end = start.saturating_add(limit).min(enabled.len());
-
-        let enabled_baselines: Vec<EnabledBaselineSummary> = enabled[start..end]
+        let enabled_baselines: Vec<EnabledBaselineSummary> = page
             .iter()
             .map(|enabled_baseline| EnabledBaselineSummary {
                 arn: enabled_baseline.arn.clone(),
@@ -299,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListEnabledBaselinesOutput {
             enabled_baselines,
-            next_token: (end < enabled.len()).then(|| end.to_string()),
+            next_token,
         })
     }
 }
