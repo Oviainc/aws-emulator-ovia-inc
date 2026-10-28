@@ -126,8 +126,9 @@ fn owed_detachments(engine: &engine::InMemoryEngine, volume_id: &str) -> Vec<Ins
 
 /// Hold `volume_id` inside its `creating` -> `available` span by pushing the instant the
 /// clock owes that move out, so a row about a volume still being created reads the same
-/// however long the table around it takes rather than racing the clock.
-fn hold_in_creating(engine: &engine::InMemoryEngine, volume_id: &str) {
+/// however long the table around it takes rather than racing the clock. Shared with the
+/// `AttachVolume` suite ([`super::attach_volume`]), which needs the same hold.
+pub(super) fn hold_in_creating(engine: &engine::InMemoryEngine, volume_id: &str) {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
     guard

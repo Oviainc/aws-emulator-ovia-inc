@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `AttachVolume` records on a volume, which requests it admits and refuses, and the
+// `attaching` -> `attached` move the clock owes the attachment. Declared beside
+// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
+// of this file are where every new ec2 suite inserts its lines.
+#[path = "all/attach_volume.rs"]
+mod attach_volume;
 // The ancestry chain `GetImageAncestry` walks over the parent link of the stored AMIs, and
 // what it refuses. Declared beside `prefix_lists` for the reason the note above gives: the
 // sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its

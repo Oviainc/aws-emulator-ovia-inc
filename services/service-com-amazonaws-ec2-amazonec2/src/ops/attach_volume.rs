@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: records the attachment the request asks for on the volume in
+//! [`crate::state`] and answers that attachment as it now reads. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Attaches an Amazon EBS volume to a running or stopped instance, and exposes it to the
+//! instance with the specified device name": so the request is admitted only when the
+//! instance is in one of those two states (`IncorrectInstanceState` otherwise), the volume
+//! and the instance are in the same Availability Zone ("the volume and instance must be
+//! within the same Availability Zone", `VolumeId` — `InvalidVolume.ZoneMismatch`
+//! otherwise), the volume is in a state that admits an attach, and the device name the
+//! request gives is one the instance does not already hold a volume at
+//! (`InvalidParameterValue`, the code EC2 answers for a value it will not take).
+//!
+//! A volume an instance already holds is refused with `VolumeInUse`, except for a
+//! Multi-Attach enabled one, which "can be attached to up to 16 instances" and so is
+//! refused only when the request would attach it twice to the SAME instance or take it past
+//! that published number ([`crate::state::MULTI_ATTACH_INSTANCE_LIMIT`]). "If you exceed
+//! the volume attachment limit for an instance type, the attachment request fails with the
+//! AttachmentLimitExceeded error": that limit is the instance type's own
+//! `EbsInfo$MaximumEbsAttachments`, read off the one derivation of a type's facts
+//! ([`crate::state::ebs_attachment_limit`]), counted over the attachments the instance
+//! holds across the volume store.
+//!
+//! An admitted attach is a write: the attachment is stored in the non-terminal `attaching`
+//! state and the clock owes it `attached` ([`crate::state::VolumeRecord::attaching_at`]),
+//! the same span as a volume's `creating` -> `available` move, so a caller that reads
+//! straight after the call still sees `attaching`. The volume itself holds an attachment
+//! from that moment, so it reports `in-use` — which is what `DescribeVolumes` then reports
+//! too, because both answers are the same projection of the one record.
+//!
+//! The refusals in order: a malformed volume or instance id
+//! (`InvalidVolumeID.Malformed` / `InvalidInstanceID.Malformed`), then the device name and
+//! the EBS card index the request carries, then `DryRun` (`DryRunOperation`), then an id the
+//! account holds no instance or volume for (`InvalidInstanceID.NotFound` /
+//! `InvalidVolume.NotFound`), then the instance's state, then the zone, then the volume's
+//! state and the attachments it already has, and last the instance's device names and its
+//! attachment limit.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +195,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachVolume"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            ATTACHMENT_DELETE_ON_TERMINATION, DEFAULT_EBS_CARD_INDEX, InstanceStateName,
+            MAX_DEVICE_NAME_CHARS, MULTI_ATTACH_INSTANCE_LIMIT, TRANSITION_DELAY,
+            VOLUME_ATTACHMENT_STATE_ATTACHING, VOLUME_STATE_AVAILABLE, VolumeRecord,
+            attachment_limit_exceeded, dry_run_operation, ebs_attachment_limit,
+            incorrect_state_of, instance_id_is_well_formed, invalid_volume_id_malformed,
+            invalid_volume_zone_mismatch, require_instance_record, require_service_state,
+            require_volume, require_volume_mut, system_time_to_date_time,
+            volume_id_is_well_formed, volume_in_use,
+        };
+
+        // Both resources carry their own Availability Zone, so nothing here depends on the
+        // Region the request was signed for.
+        let _ = ctx;
+
+        if !volume_id_is_well_formed(&input.volume_id) {
+            return Err(invalid_volume_id_malformed(&input.volume_id));
+        }
+        if !instance_id_is_well_formed(&input.instance_id) {
+            return Err(Scaffolded::invalid_instance_id_malformed(&input.instance_id));
+        }
+
+        // "The device name (for example, /dev/sdh or xvdh)" (`Device`): a blank name
+        // exposes the volume at no device at all, and one past the bound this service keeps
+        // for a stored caller-chosen string is refused rather than stored — both are values
+        // the service will not take, which is `InvalidParameterValue`.
+        let device = input.device.trim();
+        if device.is_empty() || device.chars().count() > MAX_DEVICE_NAME_CHARS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for unixDevice. Attachment point {} is invalid",
+                input.device, input.device
+            )));
+        }
+        // "The index of the EBS card […] The default EBS card index is 0"
+        // (`EbsCardIndex`): an index counts EBS cards from zero, so a negative one names no
+        // card.
+        if let Some(index) = input.ebs_card_index {
+            if index < DEFAULT_EBS_CARD_INDEX {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{index}' for ebsCardIndex. The EBS card index must not \
+                     be negative"
+                )));
+            }
+        }
+
+        // The permission question, answered before the resource one and before the write.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // This call writes, so the moves the clock already owed the instances are applied
+        // before their states are read: the refusal below is about the state the instance is
+        // in NOW, not the one an earlier call left it in.
+        store.materialize_due_transitions();
+        let now = ::std::time::Instant::now();
+
+        // ONE lookup each: the readers hand back the records they resolved, so no id is
+        // looked up twice and no branch is left for an id that resolved and could then not
+        // be read. The instance is resolved first, because it is the resource the volume is
+        // checked AGAINST — its zone and its state are what admit the attach.
+        let instance = require_instance_record(&store, &input.instance_id)?;
+        let instance_zone = instance.placement_az.clone();
+        let instance_type = instance.instance_type.clone();
+        let instance_state = instance.state;
+        // "Attaches an Amazon EBS volume to a running or stopped instance": an instance in
+        // any other state — one still coming up, one on its way down, one terminated — has
+        // nothing to expose the device to.
+        if !matches!(
+            instance_state,
+            InstanceStateName::Running | InstanceStateName::Stopped
+        ) {
+            return Err(Scaffolded::incorrect_instance_state(
+                &input.instance_id,
+                instance_state.as_str(),
+                "attached a volume",
+            ));
+        }
+
+        let volume = require_volume(&store, &input.volume_id)?;
+        // "The volume and instance must be within the same Availability Zone" (`VolumeId`).
+        let volume_zone = volume.view.availability_zone.clone().unwrap_or_default();
+        if volume_zone != instance_zone {
+            return Err(invalid_volume_zone_mismatch(
+                &input.volume_id,
+                &volume_zone,
+                &input.instance_id,
+                &instance_zone,
+            ));
+        }
+        // The volume's state as of this instant, and the attachments it holds: one whose
+        // detach the clock has already finished is gone, so it holds nothing back.
+        let volume_state = volume.state_at(now);
+        let held = volume.attachments_at(now);
+        // A volume that is still being created has no data to expose yet, which is a
+        // refusal SOLELY for the state of the resource the request named.
+        if volume_state != VOLUME_STATE_AVAILABLE && held.is_empty() {
+            return Err(incorrect_state_of("Volume", &input.volume_id, volume_state));
+        }
+        // "This parameter is supported with io1 and io2 volumes only"
+        // (`CreateVolumeRequest$MultiAttachEnabled`) — a volume created WITHOUT Multi-Attach
+        // is held by one instance at a time, so an attach of one an instance already holds
+        // is refused. A Multi-Attach enabled volume is refused only where the request would
+        // attach it twice to the same instance, or take it past the number of instances it
+        // may be attached to at once.
+        let multi_attach = volume.view.multi_attach_enabled == Some(true);
+        if held
+            .iter()
+            .any(|attachment| attachment.instance_id.as_deref() == Some(&*input.instance_id))
+        {
+            return Err(volume_in_use(&input.volume_id, &input.instance_id));
+        }
+        if !held.is_empty() && !multi_attach {
+            // The instance the caller has to detach the volume from first, where there is
+            // one: an attachment to an Amazon Web Services-managed resource names no
+            // instance at all ("if the volume is attached to an Amazon Web Services-managed
+            // resource, this parameter returns null"), so such a volume is refused for the
+            // state it is in instead.
+            return match held
+                .iter()
+                .find_map(|attachment| attachment.instance_id.clone())
+            {
+                Some(holder) => Err(volume_in_use(&input.volume_id, &holder)),
+                None => Err(incorrect_state_of("Volume", &input.volume_id, volume_state)),
+            };
+        }
+        if multi_attach && held.len() >= MULTI_ATTACH_INSTANCE_LIMIT {
+            return Err(attachment_limit_exceeded(format!(
+                "Volume '{}' is attached to {MULTI_ATTACH_INSTANCE_LIMIT} instances, which \
+                 is as many as a Multi-Attach enabled volume can be attached to",
+                input.volume_id
+            )));
+        }
+
+        // What the INSTANCE already holds, read off the volume store — the one place an
+        // attachment lives — which answers both of the last two questions: whether the
+        // device name is free, and whether the instance type has an attachment left.
+        let instance_attachments = store.instance_attachments_at(&input.instance_id, now);
+        if instance_attachments
+            .iter()
+            .any(|(_, attachment)| attachment.device.as_deref() == Some(device))
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{device}' for unixDevice. Attachment point {device} is \
+                 already in use"
+            )));
+        }
+        // "If you exceed the volume attachment limit for an instance type, the attachment
+        // request fails with the AttachmentLimitExceeded error. For more information, see
+        // Instance volume limits" — the limit is the instance type's own, and a type this
+        // service derives no facts for publishes none to hold the request to.
+        if let Some(limit) = ebs_attachment_limit(&instance_type) {
+            if i64::try_from(instance_attachments.len()).unwrap_or(i64::MAX) >= i64::from(limit) {
+                return Err(attachment_limit_exceeded(format!(
+                    "Instance '{}' already holds {} of the {limit} EBS volume attachments \
+                     an instance of type '{instance_type}' supports",
+                    input.instance_id,
+                    instance_attachments.len()
+                )));
+            }
+        }
+
+        // The attach is a write: the attachment is the volume's from now, in the
+        // non-terminal `attaching` state, and the clock owes it `attached`.
+        let attached_at = ::std::time::SystemTime::now();
+        let attachment = AttachVolumeOutput {
+            volume_id: Some(input.volume_id.clone()),
+            instance_id: Some(input.instance_id.clone()),
+            device: Some(device.to_string()),
+            state: Some(VOLUME_ATTACHMENT_STATE_ATTACHING.to_string()),
+            // "The time stamp when the attachment initiated" (`AttachTime`): this call's
+            // own clock reading, not a value the request carries.
+            attach_time: Some(system_time_to_date_time(attached_at)),
+            delete_on_termination: Some(ATTACHMENT_DELETE_ON_TERMINATION),
+            // An instance's own attachment, not one to an Amazon Web Services-managed
+            // resource, so neither marker is set.
+            associated_resource: None,
+            instance_owning_service: None,
+            ebs_card_index: Some(input.ebs_card_index.unwrap_or(DEFAULT_EBS_CARD_INDEX)),
+        };
+        // One reading of which attachment this is: `VolumeRecord::attachment_key`, the same
+        // key the owed instant is stored under and the same one the detach path reads, so
+        // the write and the clock cannot identify the attachment two ways.
+        let key = VolumeRecord::attachment_key(&attachment);
+        let record = require_volume_mut(&mut store, &input.volume_id)?;
+        // The moves the clock already finished for this volume, materialised before the new
+        // attachment is pushed, so the record holds only what a reader is already being
+        // shown and nothing is owed on an attachment that is gone.
+        record.materialize_due_detachments(now);
+        record.materialize_due_attachments(now);
+        record
+            .view
+            .attachments
+            .get_or_insert_with(Vec::new)
+            .push(attachment);
+        record.attaching_at.insert(key.clone(), now + TRANSITION_DELAY);
+
+        // Read the answer back OUT of the store, so the caller is told what a later
+        // `DescribeVolumes` will report rather than the request object.
+        record
+            .attachments_at(now)
+            .into_iter()
+            .find(|held| VolumeRecord::attachment_key(held) == key)
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the attachment of volume '{}' could not be read back",
+                    input.volume_id
+                ))
+            })
     }
 }

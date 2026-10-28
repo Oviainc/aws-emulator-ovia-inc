@@ -12464,10 +12464,92 @@ pub const VOLUME_STATE_IN_USE: &str = "in-use";
 /// (`crate::ops::types::VOLUME_ATTACHMENT_STATE_VALUES` is the generated catalog).
 pub const VOLUME_ATTACHMENT_STATE_ATTACHED: &str = "attached";
 
+/// An attachment `AttachVolume` has started bringing up: `VolumeAttachmentState`'s
+/// `attaching`. The move to [`VOLUME_ATTACHMENT_STATE_ATTACHED`] is owed by the clock
+/// ([`TRANSITION_DELAY`], through [`VolumeRecord::attaching_at`]), so a caller that asks
+/// straight after the attach still sees the transient state.
+pub const VOLUME_ATTACHMENT_STATE_ATTACHING: &str = "attaching";
+
 /// An attachment `DetachVolume` has started taking down: `VolumeAttachmentState`'s
 /// `detaching`. The move to `detached` is owed by the clock ([`TRANSITION_DELAY`]), at
 /// which point the attachment is gone and the volume is `available` again.
 pub const VOLUME_ATTACHMENT_STATE_DETACHING: &str = "detaching";
+
+/// The EBS card an attachment sits on when the request names none: "The default EBS card
+/// index is 0" (`AttachVolumeRequest$EbsCardIndex`).
+pub const DEFAULT_EBS_CARD_INDEX: i32 = 0;
+
+/// Whether an attachment made by `AttachVolume` is deleted with the instance.
+///
+/// "When you attach a volume to a running instance, the `DeleteOnTermination` attribute is
+/// set to `false` by default" (Amazon EBS User Guide, "Attach an Amazon EBS volume to an
+/// instance") — only a volume a LAUNCH creates for its instance defaults to `true`
+/// (`EbsBlockDevice$DeleteOnTermination`, where the launch path reads it).
+pub const ATTACHMENT_DELETE_ON_TERMINATION: bool = false;
+
+/// The longest `Device` an attachment may name.
+///
+/// CHOSEN, like [`MAX_KMS_KEY_ID_CHARS`] and for the same reason: the model declares no
+/// `@length` on the member, the string is caller-chosen and it is STORED on the volume, so
+/// without a bound one request could keep an arbitrarily long string per attachment. Every
+/// device name AWS documents ("Device names on Linux instances": `/dev/sd[a-z]`,
+/// `/dev/xvd[b-c][a-z]`, `/dev/nvme[0-26]n1`) is far inside it.
+pub const MAX_DEVICE_NAME_CHARS: usize = 32;
+
+/// How many instances one Multi-Attach enabled volume may be attached to at once:
+/// "Multi-Attach enabled volumes can be attached to up to 16 instances" (Amazon EBS User
+/// Guide, "Attach a volume to multiple instances with Amazon EBS Multi-Attach").
+pub const MULTI_ATTACH_INSTANCE_LIMIT: usize = 16;
+
+/// EC2's error code for an attach of a volume that is not in the Availability Zone of the
+/// instance it would be attached to (EC2 API error codes, "InvalidVolume.ZoneMismatch").
+pub const INVALID_VOLUME_ZONE_MISMATCH: &str = "InvalidVolume.ZoneMismatch";
+
+/// EC2's error code for an attach that would take an instance past the number of EBS
+/// volumes its instance type can hold attached: "If you exceed the volume attachment limit
+/// for an instance type, the attachment request fails with the AttachmentLimitExceeded
+/// error" (`AttachVolume`).
+pub const ATTACHMENT_LIMIT_EXCEEDED: &str = "AttachmentLimitExceeded";
+
+/// Refuse an attach whose volume and instance are in different Availability Zones: HTTP 400
+/// `InvalidVolume.ZoneMismatch`.
+///
+/// "The volume and instance must be within the same Availability Zone"
+/// (`AttachVolumeRequest$VolumeId`), so the refusal names both resources and the zone each
+/// one is in — which is what the caller has to change.
+pub fn invalid_volume_zone_mismatch<E>(
+    volume_id: &str,
+    volume_zone: &str,
+    instance_id: &str,
+    instance_zone: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VOLUME_ZONE_MISMATCH,
+        400,
+        format!(
+            "The volume '{volume_id}' is in availability zone '{volume_zone}' and the \
+             instance '{instance_id}' is in availability zone '{instance_zone}'"
+        ),
+    )
+}
+
+/// Refuse an attach that would take a resource past the attachments it can hold: HTTP 400
+/// `AttachmentLimitExceeded`.
+pub fn attachment_limit_exceeded<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(ATTACHMENT_LIMIT_EXCEEDED, 400, message)
+}
+
+/// How many EBS volumes an instance of `instance_type` can hold attached, or `None` for a
+/// type this service derives no facts for.
+///
+/// Read off the ONE derivation of an instance type's facts ([`instance_type_info`], whose
+/// `EbsInfo$MaximumEbsAttachments` is what `DescribeInstanceTypes` reports), so the limit
+/// an attach is refused by and the limit the describe publishes cannot disagree.
+pub fn ebs_attachment_limit(instance_type: &str) -> Option<i32> {
+    instance_type_info(instance_type)?
+        .ebs_info?
+        .maximum_ebs_attachments
+}
 
 /// The volume type `CreateVolume` uses when the request names none: "Default: gp2"
 /// (`CreateVolumeRequest$VolumeType`).
@@ -12634,6 +12716,19 @@ pub struct VolumeRecord {
     /// ([`VolumeRecord::materialize_due_detachments`]) so no entry outlives the attachment
     /// it was made for.
     pub detaching_at: BTreeMap<(String, String), Instant>,
+    /// For each attachment of this volume that is being brought up, the instant its
+    /// `attaching` -> `attached` move falls due, keyed by the same `(InstanceId, Device)`
+    /// pair as [`VolumeRecord::detaching_at`].
+    ///
+    /// `AttachVolume` answers an attachment in the non-terminal `attaching` state, so the
+    /// clock owes it `attached` [`TRANSITION_DELAY`] later whether or not anybody calls
+    /// again — the same span, read off the same monotonic clock, as this volume's
+    /// `creating` -> `available` move. Unlike a finished detach, a finished attach leaves
+    /// the attachment in place and only moves its state, so
+    /// [`VolumeRecord::attachments_at`] reports it `attached` once the move is due and the
+    /// next writer materialises that
+    /// ([`VolumeRecord::materialize_due_attachments`]).
+    pub attaching_at: BTreeMap<(String, String), Instant>,
 }
 
 impl VolumeRecord {
@@ -12649,6 +12744,7 @@ impl VolumeRecord {
             auto_enable_io: AUTO_ENABLE_IO_AT_CREATION,
             io_enabled: true,
             detaching_at: BTreeMap::new(),
+            attaching_at: BTreeMap::new(),
         }
     }
 
@@ -12663,14 +12759,22 @@ impl VolumeRecord {
     }
 
     /// The attachments this volume holds at `now`: every stored attachment except one
-    /// whose `detaching` -> `detached` move the clock has already made due.
+    /// whose `detaching` -> `detached` move the clock has already made due, each reporting
+    /// the state the clock has reached — an `attaching` one whose move is due reads
+    /// `attached`.
     pub fn attachments_at(&self, now: Instant) -> Vec<AttachVolumeOutput> {
         self.view
             .attachments
             .iter()
             .flatten()
             .filter(|attachment| !self.detach_is_due(attachment, now))
-            .cloned()
+            .map(|attachment| {
+                let mut attachment = attachment.clone();
+                if self.attach_is_due(&attachment, now) {
+                    attachment.state = Some(VOLUME_ATTACHMENT_STATE_ATTACHED.to_string());
+                }
+                attachment
+            })
             .collect()
     }
 
@@ -12679,6 +12783,18 @@ impl VolumeRecord {
         self.detaching_at
             .get(&Self::attachment_key(attachment))
             .is_some_and(|due_at| now >= *due_at)
+    }
+
+    /// Whether `attachment` is one being brought up whose `attached` move was owed by
+    /// `now`. An attachment stored in any other state owes no such move — a detach that has
+    /// started takes the attachment the other way, and a stored `attached` one has arrived
+    /// already.
+    fn attach_is_due(&self, attachment: &AttachVolumeOutput, now: Instant) -> bool {
+        attachment.state.as_deref() == Some(VOLUME_ATTACHMENT_STATE_ATTACHING)
+            && self
+                .attaching_at
+                .get(&Self::attachment_key(attachment))
+                .is_none_or(|due_at| now >= *due_at)
     }
 
     /// The `(InstanceId, Device)` pair that identifies `attachment` among the attachments
@@ -12732,6 +12848,52 @@ impl VolumeRecord {
                     || attachment.state.as_deref() != Some(VOLUME_ATTACHMENT_STATE_DETACHING)
             });
         }
+        // An attachment a finished detach took down owes no `attached` move either, so the
+        // instants kept for the attachments that are gone go with them: both maps converge
+        // on the attachments the volume actually holds.
+        let held: ::std::collections::BTreeSet<(String, String)> = self
+            .view
+            .attachments
+            .iter()
+            .flatten()
+            .map(Self::attachment_key)
+            .collect();
+        self.attaching_at.retain(|key, _| held.contains(key));
+    }
+
+    /// Apply the attachments the clock has already brought up: each one's state is the
+    /// `attached` a reader is already being shown, and nothing is owed on it any more.
+    ///
+    /// A WRITER calls this, which is the only thing that may materialise it — a report
+    /// observes the same state through [`VolumeRecord::attachments_at`] without writing. It
+    /// also drops any owed instant whose attachment the volume no longer holds, so no entry
+    /// outlives the attachment it was made for and a later attachment at the same device
+    /// cannot inherit a past-due one.
+    pub fn materialize_due_attachments(&mut self, now: Instant) {
+        let due: Vec<(String, String)> = self
+            .attaching_at
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if let Some(attachments) = self.view.attachments.as_mut() {
+            for attachment in attachments.iter_mut() {
+                if attachment.state.as_deref() == Some(VOLUME_ATTACHMENT_STATE_ATTACHING)
+                    && due.contains(&Self::attachment_key(attachment))
+                {
+                    attachment.state = Some(VOLUME_ATTACHMENT_STATE_ATTACHED.to_string());
+                }
+            }
+        }
+        let held: ::std::collections::BTreeSet<(String, String)> = self
+            .view
+            .attachments
+            .iter()
+            .flatten()
+            .map(Self::attachment_key)
+            .collect();
+        self.attaching_at
+            .retain(|key, due_at| now < *due_at && held.contains(key));
     }
 
     /// The volume's `VolumeState` at `now`.
@@ -12957,6 +13119,30 @@ pub fn volume_in_use<E>(volume_id: &str, instance_id: &str) -> crate::scaffolded
 }
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// The EBS attachments the instance `instance_id` holds at `now`, as
+    /// `(volume id, attachment)` in volume-id order.
+    ///
+    /// The volume store is where an attachment lives, so "which volumes does this instance
+    /// have" is answered by reading it rather than by a second index on the instance: the
+    /// attachments are read through [`VolumeRecord::attachments_at`], so one whose detach
+    /// the clock has already finished is not counted and one still `attaching` is.
+    pub fn instance_attachments_at(
+        &self,
+        instance_id: &str,
+        now: Instant,
+    ) -> Vec<(String, AttachVolumeOutput)> {
+        self.volumes
+            .iter()
+            .flat_map(|(volume_id, record)| {
+                record
+                    .attachments_at(now)
+                    .into_iter()
+                    .map(move |attachment| (volume_id.clone(), attachment))
+            })
+            .filter(|(_, attachment)| attachment.instance_id.as_deref() == Some(instance_id))
+            .collect()
+    }
+
     /// Remove the EBS volume `volume_id` and answer the record as it was stored, or `None`
     /// when the account holds no such volume.
     ///
