@@ -249,8 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(config) = destination_config {
             tunnel.destination_config = Some(config);
         }
-        tunnel.last_updated_at = now;
         let tunnel_arn = tunnel.tunnel_arn.clone();
+
+        // The members written above are members the tunnel reports, so this call
+        // is an update of the tunnel and owes the record the instant of that
+        // update. The `&mut` borrow of the record ends with the line above, so
+        // the stamp goes through the store's single writer of it — the same one
+        // every other member-level update of this service's records goes
+        // through — rather than being assigned here a second time.
+        store.stamp_tunnel_updated(&region, &input.tunnel_id, now);
         drop(store);
 
         Ok(RotateTunnelAccessTokenOutput {
