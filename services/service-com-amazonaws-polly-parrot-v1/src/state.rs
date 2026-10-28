@@ -8,7 +8,7 @@
 //!   `PutLexicon` writes and `GetLexicon`, `ListLexicons`, `DeleteLexicon` and
 //!   `SynthesizeSpeech` read. Keyed by [`LexiconKey`] — the Region the lexicon was
 //!   put in, then its name — in a `BTreeMap`, so one Region's lexicons sit
-//!   contiguously in name order and `ListLexicons` is paginable over a range scan
+//!   contiguously in name order and `ListLexicons` reads them with a range scan
 //!   without sorting on every call. Reach them through the accessors on the state
 //!   rather than through the map, so no operation can read past its own Region.
 //! * [`ComAmazonawsPollyParrotV1State::voices`] — the voice catalog `DescribeVoices`
@@ -283,20 +283,18 @@ impl ComAmazonawsPollyParrotV1State {
         self.lexicons.get(&LexiconKey::new(region, name))
     }
 
-    /// The lexicons `region` holds whose name sorts strictly after `after`, in name
-    /// order; `after` is `None` for the whole Region.
+    /// Every lexicon `region` holds, in name order.
     ///
-    /// A range scan from the cursor, bounded by the Region: the keys of one Region
-    /// are contiguous, so this reads exactly that Region's entries and stops at the
-    /// first key belonging to another.
+    /// A range scan bounded by the Region: the keys of one Region are contiguous, so
+    /// this reads exactly that Region's entries and stops at the first key belonging
+    /// to another.
     pub fn lexicons_in_region<'a>(
         &'a self,
         region: &'a str,
-        after: Option<&str>,
     ) -> impl Iterator<Item = &'a StoredLexicon> + 'a {
         // A lexicon name matches `^[0-9A-Za-z]{1,20}$`, so the empty name sorts
         // before every real one and excluding it excludes nothing.
-        let start = LexiconKey::new(region, after.unwrap_or_default());
+        let start = LexiconKey::new(region, "");
         self.lexicons
             .range((Bound::Excluded(start), Bound::Unbounded))
             .take_while(move |(key, _)| key.region == region)
@@ -305,7 +303,7 @@ impl ComAmazonawsPollyParrotV1State {
 
     /// How many lexicons `region` holds — what the per-Region count quota counts.
     pub fn lexicon_count_in_region(&self, region: &str) -> usize {
-        self.lexicons_in_region(region, None).count()
+        self.lexicons_in_region(region).count()
     }
 
     /// Store `stored` in `region` under its own name, replacing whatever that Region
@@ -472,6 +470,18 @@ pub fn encode_page_token(cursor: &str) -> String {
 /// this service did not mint.
 pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()
+}
+
+/// Whether `token` is a continuation token an UNPAGINATED read was handed.
+///
+/// A read the model declares no pagination for reports its whole result in one
+/// response and so mints no continuation token at all; every non-empty `NextToken`
+/// presented to one is therefore a token this service could not have issued, and the
+/// read refuses it with `InvalidNextTokenException` instead of answering a silently
+/// partial list. The empty token the model admits (`NextToken` is len 0..4096) names
+/// no position, so it reads as no token at all.
+pub fn is_unmintable_page_token(token: Option<&str>) -> bool {
+    token.is_some_and(|token| !token.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +937,7 @@ mod tests {
             ("ap-southeast-2", Vec::new()),
         ] {
             let names: Vec<&str> = state
-                .lexicons_in_region(region, None)
+                .lexicons_in_region(region)
                 .map(|stored| stored.name.as_str())
                 .collect();
             assert_eq!(
@@ -945,13 +955,6 @@ mod tests {
             state.lexicon("us-east-1", "Only").is_none(),
             "a name stored only in eu-west-1 must not be readable in us-east-1"
         );
-
-        // A cursor pages within the region it was taken in.
-        let after: Vec<&str> = state
-            .lexicons_in_region("eu-west-1", Some("Only"))
-            .map(|stored| stored.name.as_str())
-            .collect();
-        assert_eq!(after, vec!["Shared"], "the cursor must page one region");
 
         // Removing in one region leaves the other region's same-named lexicon.
         assert!(

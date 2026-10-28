@@ -186,11 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused before any state is read rather than answered with a partial list.
         // An empty token (the model admits length 0) names no position, so it reads as
         // no token at all.
-        if input
-            .next_token
-            .as_deref()
-            .is_some_and(|token| !token.is_empty())
-        {
+        if crate::state::is_unmintable_page_token(input.next_token.as_deref()) {
             return Err(DescribeVoicesErrorModeled::InvalidNextTokenException(
                 crate::service::errors::invalid_next_token(),
             )
