@@ -1052,13 +1052,29 @@ async fn deleting_removes_the_connector_and_its_versions() {
         "a deleted connector is absent from ListNetworkConnectors, got {:?}",
         listed.body
     );
+    // "This operation is idempotent — calling delete on a connector that is already
+    // deleting or has been deleted succeeds without error", so the repeat reports the
+    // deletion that already completed. The identity it answers from is the stored one.
     let again = delete(&router, "doomed").await;
-    assert!(
-        again.is_error(404, "ResourceNotFoundException"),
-        "a second delete of a forgotten connector answers the modelled 404 rather than \
-         panicking or inventing a record, got {} {:?}",
-        again.status,
-        again.body
+    assert_eq!(
+        again.status, 202,
+        "a second delete of a connector whose deletion completed succeeds, got {} with {:?}",
+        again.status, again.body
+    );
+    for (member, expected) in [("/Arn", json!(arn)), ("/Name", json!("doomed")), ("/Id", json!(id))]
+    {
+        assert_eq!(
+            at(&again.body, member),
+            expected,
+            "the repeated delete reports the deleted connector's {member}, got {:?}",
+            at(&again.body, member)
+        );
+    }
+    assert_eq!(
+        at(&again.body, "/State"),
+        json!("DELETING"),
+        "\"the State field is typically DELETING after this call\", got {:?}",
+        at(&again.body, "/State")
     );
 
     // And the name is free again, with a fresh identity.

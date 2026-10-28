@@ -759,6 +759,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // assembled from parts" unless `CompleteMultipartUpload` assembled it, which is
             // also what AWS reports for an object a single `PutObject` wrote.
             parts: Vec::new(),
+            // Replication is settled by the store once this version is recorded (see
+            // `crate::state::ComAmazonawsS3Amazons3State::replicate_write`), from the
+            // bucket's own replication configuration — so this write claims nothing about
+            // it.
+            replication: None,
             body,
         };
 
@@ -831,6 +836,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+
+        // The replication the bucket's own configuration owes for the version just stored:
+        // "Amazon S3 can replicate objects to one or more destination buckets"
+        // (`PutBucketReplication`), so the copy is made here — after the store accepted the
+        // write, and while it is still held — and the source version records what it did. A
+        // bucket with no replication configuration, and a key no enabled rule covers, owes
+        // nothing.
+        let _ = store.replicate_write(&input.bucket, &input.key);
 
         // The object event this write produced, and the notifications the bucket's event
         // notification configuration owes for it — rendered while the store is still

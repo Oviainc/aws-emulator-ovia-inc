@@ -3091,9 +3091,16 @@ pub fn dedicated_ip_pool_already_exists(pool_name: &str) -> String {
 ///
 /// One wording for every operation that takes a `PoolName`, so a client sees the same
 /// sentence whichever call first tells it the pool is not there — the form
-/// [`configuration_set_not_found`] states for the resource it names.
+/// [`configuration_set_not_found`] states for the resource it names: the pool SES
+/// interpolated, delimited with angle brackets, in a sentence that is otherwise fixed.
+///
+/// The fixed text, including the angle brackets around the interpolated pool name, is
+/// the sentence a recorded response of the real service answers a missing dedicated IP
+/// pool with (the behavioural trace `sesv2.dedicated-ip-pool-lifecycle`, whose report is
+/// `issues/things-that-now-work/20261027T223115Z-sesv2-deletededicatedippool-stub.md`);
+/// the only variable part, the pool name, comes from the request.
 pub fn dedicated_ip_pool_not_found(pool_name: &str) -> String {
-    format!("Dedicated IP pool <{pool_name}> does not exist.")
+    format!("The requested pool <{pool_name}> does not exist.")
 }
 
 /// The `WarmupPercentage` a dedicated IP in a MANAGED pool reports.
