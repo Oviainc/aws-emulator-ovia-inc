@@ -16,12 +16,10 @@
 //! path (which decides the `Endpoint` host), and the `ConnectorStatus` the record is in,
 //! including the one status that also reports a `StatusReason`.
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{self, label, new_router};
 use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
 
 /// A region that is NOT the emulator default, so nothing can pass by a hardcoded default.
@@ -155,92 +153,22 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// What one call answered.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
-}
-
-fn new_router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(Arc::clone(
-            &engine,
-        )),
-    );
-    (router, engine)
-}
-
-/// Percent-encode a value for one `@httpLabel` path segment, so the `:` and `/` of an ARN
-/// cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{REGION}.amazonaws.com{path}"
-        ))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer { status, body }
-}
-
 /// Make the transition the clock owes `arn` due now, so a read does not have to race the
 /// transition span.
 fn make_transition_due(engine: &engine::InMemoryEngine, case: &str, arn: &str) {
-    with_connector(engine, case, arn, |connector| {
-        let pending = connector.pending.as_mut().unwrap_or_else(|| {
-            panic!("case {case:?}: expected a transition the clock owes {arn:?}")
-        });
-        pending.due_at = SystemTime::now() - Duration::from_secs(1);
-    });
+    assert!(
+        harness::release_pending_if_owed(engine, arn),
+        "case {case:?}: expected a transition the clock owes {arn:?}"
+    );
 }
 
 /// Hold the transition the clock owes `arn` off, so the record stays in its non-terminal
 /// status for the whole case however long the test takes.
 fn hold_transition(engine: &engine::InMemoryEngine, case: &str, arn: &str) {
-    with_connector(engine, case, arn, |connector| {
-        let pending = connector.pending.as_mut().unwrap_or_else(|| {
-            panic!("case {case:?}: expected a transition the clock owes {arn:?}")
-        });
-        pending.due_at = SystemTime::now() + Duration::from_secs(3600);
-    });
+    assert!(
+        harness::hold_pending_if_owed(engine, arn),
+        "case {case:?}: expected a transition the clock owes {arn:?}"
+    );
 }
 
 /// Put `arn` in the terminal failure status, the one status that also carries a
@@ -271,7 +199,14 @@ fn with_connector(
 
 /// The `Connector` `GetConnector` reports for `arn`.
 async fn get_connector(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
-    let read = call(router, "GET", &format!("/connectors/{}", label(arn)), None).await;
+    let read = harness::call(
+        router,
+        REGION,
+        "GET",
+        &format!("/connectors/{}", label(arn)),
+        None,
+    )
+    .await;
     assert_eq!(
         read.status, 200,
         "case {case:?}: expected 200 from GetConnector, got {} / {:?}",
@@ -282,7 +217,7 @@ async fn get_connector(router: &MultiServiceRouter, case: &str, arn: &str) -> Va
 
 /// The `ConnectorSummary` `ListConnectors` reports for `arn`.
 async fn list_connector(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
-    let page = call(router, "GET", "/connectors", None).await;
+    let page = harness::call(router, REGION, "GET", "/connectors", None).await;
     assert_eq!(
         page.status, 200,
         "case {case:?}: expected 200 from ListConnectors, got {} / {:?}",
@@ -311,7 +246,7 @@ async fn arrange(router: &MultiServiceRouter, engine: &engine::InMemoryEngine, r
         request["MobileDeviceManagement"] = mdm.clone();
     }
 
-    let created = call(router, "POST", "/connectors", Some(request)).await;
+    let created = harness::call(router, REGION, "POST", "/connectors", Some(request)).await;
     assert_eq!(
         created.status, 202,
         "case {:?}: expected 202 from CreateConnector, got {} / {:?}",
@@ -332,8 +267,9 @@ async fn arrange(router: &MultiServiceRouter, engine: &engine::InMemoryEngine, r
         Status::Active => make_transition_due(engine, row.name, &arn),
         Status::Deleting => {
             make_transition_due(engine, row.name, &arn);
-            let deleted = call(
+            let deleted = harness::call(
                 router,
+                REGION,
                 "DELETE",
                 &format!("/connectors/{}", label(&arn)),
                 None,
@@ -372,7 +308,7 @@ fn expected_status(row: &Row) -> &'static str {
 #[tokio::test]
 async fn get_and_list_report_one_connector_identically() {
     for row in rows() {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let arn = arrange(&router, &engine, &row).await;
 
         let read = get_connector(&router, row.name, &arn).await;

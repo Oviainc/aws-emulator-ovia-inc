@@ -19,11 +19,10 @@
 //! words the name has, how many digits its number has, case, word emptiness, the alphabet a
 //! word uses, a leading zero, a missing number, and the length bound — at it and one past it.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{self, label, new_router, Answer};
 use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep as scep;
 
 /// The canonical emulator account id every ARN of this service carries.
@@ -45,110 +44,22 @@ const RESOURCE_ARN_PATTERN: &str = scep::state::RESOURCE_ARN_PATTERN;
 /// it, so an ARN carrying it can only be answered by how the value itself reads.
 const CONNECTOR_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
-/// What one call answered.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-impl Answer {
-    fn text(&self, name: &str) -> String {
-        self.body[name]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected a string `{name}` in {:?}", self.body))
-            .to_string()
-    }
-
-    fn message(&self) -> &str {
-        self.body["Message"].as_str().unwrap_or_default()
-    }
-}
-
-fn new_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere.
-    router.set_request_authentication(false);
-    router.register_service(scep::EmulatedService::new(engine));
-    router
-}
-
-/// Percent-encode a value for one `@httpLabel` path segment, the way an AWS SDK does, so the
-/// `:` and `/` inside an ARN cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-/// One request, carrying `scope_region` in its SigV4 credential scope — which is how a
-/// handler learns the Region the caller is addressing — and addressed at the default Region's
-/// endpoint, so the host never decides anything the scope is being tested for.
-async fn call(
+/// One request of this suite: every case addresses the default Region's endpoint, so the
+/// host never decides anything the credential scope is being tested for, and carries
+/// `scope_region` in its SigV4 credential scope — which is how a handler learns the Region
+/// the caller is addressing.
+async fn call_in_scope(
     router: &MultiServiceRouter,
     scope_region: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
 ) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{DEFAULT_REGION}.amazonaws.com{path}"
-        ))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{scope_region}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(['/', ':'])
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
+    harness::call_with_scope(router, DEFAULT_REGION, scope_region, method, path, body).await
 }
 
 async fn create_connector(router: &MultiServiceRouter, scope_region: &str, ca: &str) -> Answer {
-    call(
+    call_in_scope(
         router,
         scope_region,
         "POST",
@@ -159,7 +70,7 @@ async fn create_connector(router: &MultiServiceRouter, scope_region: &str, ca: &
 }
 
 async fn list_tags(router: &MultiServiceRouter, scope_region: &str, arn: &str) -> Answer {
-    call(
+    call_in_scope(
         router,
         scope_region,
         "GET",
@@ -175,7 +86,7 @@ async fn tag_resource(
     arn: &str,
     tags: Value,
 ) -> Answer {
-    call(
+    call_in_scope(
         router,
         scope_region,
         "POST",
@@ -279,7 +190,7 @@ fn expected_pattern_refusal(resource_arn: &str) -> String {
 /// operations that parse a `ResourceArn` against the published pattern.
 #[tokio::test]
 async fn the_region_a_record_is_filed_under_is_one_its_own_arn_can_name() {
-    let router = new_router();
+    let router = new_router().0;
     for (index, row) in rows().into_iter().enumerate() {
         let case = row.name;
         let expected_region = if row.filed_under_itself {
@@ -337,7 +248,7 @@ async fn the_region_a_record_is_filed_under_is_one_its_own_arn_can_name() {
 /// keeps it is well formed and simply names nothing, so it is a 404.
 #[tokio::test]
 async fn an_arn_is_accepted_exactly_where_its_region_segment_satisfies_the_rule() {
-    let router = new_router();
+    let router = new_router().0;
     for row in rows() {
         let case = row.name;
         let arn = connector_arn(&row.region, CONNECTOR_ID);

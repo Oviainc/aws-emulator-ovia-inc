@@ -18,12 +18,10 @@
 //! the other), the private CA the connector links, and how many challenges the connector
 //! holds.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{self, label, new_router, Answer};
 use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
 
 /// The canonical emulator account id every ARN of this service carries.
@@ -106,128 +104,12 @@ impl Row {
     }
 }
 
-/// What one call answered: the HTTP status, the modelled error code (empty on success) and
-/// the parsed body.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-impl Answer {
-    fn text(&self, name: &str) -> String {
-        self.body[name]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected a string `{name}` in {:?}", self.body))
-            .to_string()
-    }
-}
-
-fn new_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(Arc::clone(
-            &engine,
-        )),
-    );
-    (router, engine)
-}
-
-/// Percent-encode a value for one `@httpLabel` path segment, the way an AWS SDK does, so the
-/// `:` and `/` inside an ARN cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-/// One request, signed for `region`: the credential scope is how a handler learns which
-/// Region's resources the caller is addressing.
-async fn call(
-    router: &MultiServiceRouter,
-    region: &str,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> Answer {
-    call_with_scope(router, region, region, method, path, body).await
-}
-
-/// One request addressed at `host_region`'s endpoint but carrying `scope_region` in its
-/// SigV4 credential scope, so a case can send a scope Region no endpoint of this service
-/// has.
-async fn call_with_scope(
-    router: &MultiServiceRouter,
-    host_region: &str,
-    scope_region: &str,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{host_region}.amazonaws.com{path}"
-        ))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{scope_region}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(['/', ':'])
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
-
 async fn create_connector(router: &MultiServiceRouter, region: &str, body: Value) -> Answer {
-    call(router, region, "POST", "/connectors", Some(body)).await
+    harness::call(router, region, "POST", "/connectors", Some(body)).await
 }
 
 async fn get_connector(router: &MultiServiceRouter, region: &str, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "GET",
@@ -238,7 +120,7 @@ async fn get_connector(router: &MultiServiceRouter, region: &str, arn: &str) -> 
 }
 
 async fn delete_connector(router: &MultiServiceRouter, region: &str, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "DELETE",
@@ -249,11 +131,11 @@ async fn delete_connector(router: &MultiServiceRouter, region: &str, arn: &str) 
 }
 
 async fn list_connectors(router: &MultiServiceRouter, region: &str, query: &str) -> Answer {
-    call(router, region, "GET", &format!("/connectors{query}"), None).await
+    harness::call(router, region, "GET", &format!("/connectors{query}"), None).await
 }
 
 async fn create_challenge(router: &MultiServiceRouter, region: &str, connector_arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "POST",
@@ -264,7 +146,7 @@ async fn create_challenge(router: &MultiServiceRouter, region: &str, connector_a
 }
 
 async fn get_challenge_password(router: &MultiServiceRouter, region: &str, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "GET",
@@ -275,7 +157,7 @@ async fn get_challenge_password(router: &MultiServiceRouter, region: &str, arn: 
 }
 
 async fn get_challenge_metadata(router: &MultiServiceRouter, region: &str, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "GET",
@@ -286,7 +168,7 @@ async fn get_challenge_metadata(router: &MultiServiceRouter, region: &str, arn: 
 }
 
 async fn delete_challenge(router: &MultiServiceRouter, region: &str, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "DELETE",
@@ -301,7 +183,7 @@ async fn list_challenge_metadata(
     region: &str,
     connector_arn: &str,
 ) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "GET",
@@ -312,7 +194,7 @@ async fn list_challenge_metadata(
 }
 
 async fn list_tags(router: &MultiServiceRouter, region: &str, arn: &str) -> Answer {
-    call(router, region, "GET", &format!("/tags/{}", label(arn)), None).await
+    harness::call(router, region, "GET", &format!("/tags/{}", label(arn)), None).await
 }
 
 async fn tag_resource(
@@ -321,7 +203,7 @@ async fn tag_resource(
     arn: &str,
     tags: Value,
 ) -> Answer {
-    call(
+    harness::call(
         router,
         region,
         "POST",
@@ -329,21 +211,6 @@ async fn tag_resource(
         Some(json!({ "Tags": tags })),
     )
     .await
-}
-
-/// Make the `ACTIVE` the clock owes `arn` due, through the service's own state, so a case
-/// that is not about the transition neither sleeps for nor races the transition span.
-/// Strictly a clock move: nothing else on the record is touched.
-fn release_to_active(engine: &engine::InMemoryEngine, arn: &str) {
-    let shared = state::service_state(engine).expect("the service's own state");
-    let mut store = shared.lock();
-    let connector = store
-        .connectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the connector {arn:?} that was just created"));
-    if let Some(pending) = connector.pending.as_mut() {
-        pending.due_at = std::time::SystemTime::now() - Duration::from_secs(1);
-    }
 }
 
 /// Create a connector in `region` and settle it, so it can mint challenge passwords.
@@ -367,7 +234,7 @@ async fn active_connector(
         "case {case:?}: the ConnectorArn must name the Region the create was signed for \
          ({region}), got {arn:?}"
     );
-    release_to_active(engine, &arn);
+    harness::release_pending_if_owed(engine, &arn);
     arn
 }
 
@@ -734,7 +601,7 @@ async fn a_scope_naming_no_region_of_this_service_is_served_in_the_default_regio
     let mut minted = Vec::new();
     for scope in &scopes {
         let case = format!("credential scope Region {scope:?}");
-        let created = call_with_scope(
+        let created = harness::call_with_scope(
             &router,
             DEFAULT_REGION,
             scope,

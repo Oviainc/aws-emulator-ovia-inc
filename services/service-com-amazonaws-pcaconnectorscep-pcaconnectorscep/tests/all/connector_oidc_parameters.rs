@@ -23,11 +23,10 @@
 //! `Domain`, the CA, and whether the create restricted the SCEP data plane to a VPC
 //! endpoint.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{self, label, new_router};
 
 /// The audience a connector publishes: the one audience Microsoft Entra workload identity
 /// federation accepts in a token presented for token exchange, which is why it is the same
@@ -59,103 +58,6 @@ struct Row {
     vpc_endpoint_id: Option<&'static str>,
 }
 
-/// What one call answered.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
-}
-
-impl Answer {
-    fn text(&self, name: &str) -> String {
-        self.body[name]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected a string `{name}` in {:?}", self.body))
-            .to_string()
-    }
-}
-
-fn new_router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(Arc::clone(
-            &engine,
-        )),
-    );
-    (router, engine)
-}
-
-/// Make the `ACTIVE` the clock owes `arn` due, through the service's own state, so a read
-/// does not have to race the transition span.
-fn release_to_active(engine: &engine::InMemoryEngine, arn: &str) {
-    use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
-
-    let shared = state::service_state(engine).expect("the service's own state");
-    let mut store = shared.lock();
-    let connector = store
-        .connectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the connector {arn:?} that was just created"));
-    if let Some(pending) = connector.pending.as_mut() {
-        pending.due_at = std::time::SystemTime::now() - Duration::from_secs(1);
-    }
-}
-
-/// Percent-encode a value for one `@httpLabel` path segment, so the `:` and `/` of an ARN
-/// cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn call(
-    router: &MultiServiceRouter,
-    region: &str,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{region}.amazonaws.com{path}"
-        ))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer { status, body }
-}
-
 /// Create a connector, settle it and answer its ARN.
 async fn create_active(
     router: &MultiServiceRouter,
@@ -164,14 +66,14 @@ async fn create_active(
     case: &str,
     request: Value,
 ) -> String {
-    let created = call(router, region, "POST", "/connectors", Some(request)).await;
+    let created = harness::call(router, region, "POST", "/connectors", Some(request)).await;
     assert_eq!(
         created.status, 202,
         "case {case:?}: expected 202 from CreateConnector, got {} / {:?}",
         created.status, created.body
     );
     let arn = created.text("ConnectorArn");
-    release_to_active(engine, &arn);
+    harness::release_pending_if_owed(engine, &arn);
     arn
 }
 
@@ -182,7 +84,7 @@ async fn get_connector(
     case: &str,
     arn: &str,
 ) -> Value {
-    let read = call(
+    let read = harness::call(
         router,
         region,
         "GET",
@@ -205,7 +107,7 @@ async fn list_connector(
     case: &str,
     arn: &str,
 ) -> Value {
-    let page = call(router, region, "GET", "/connectors", None).await;
+    let page = harness::call(router, region, "GET", "/connectors", None).await;
     assert_eq!(
         page.status, 200,
         "case {case:?}: expected 200 from ListConnectors, got {} / {:?}",
@@ -296,7 +198,7 @@ async fn intune_connector_publishes_service_minted_oidc_parameters() {
     ];
 
     for row in &rows {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let mut request = json!({
             "CertificateAuthorityArn": row.ca_arn,
             "MobileDeviceManagement": {
@@ -405,7 +307,7 @@ async fn intune_connector_publishes_service_minted_oidc_parameters() {
 async fn two_intune_connectors_publish_distinct_identities() {
     let region = "eu-west-2";
     let case = "two connectors from one request";
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let request = json!({
         "CertificateAuthorityArn":
             "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/abcdef01-2345-6789-abcd-ef0123456789",
@@ -458,7 +360,7 @@ async fn two_intune_connectors_publish_distinct_identities() {
 async fn general_purpose_connector_publishes_no_oidc_parameters() {
     let region = "us-east-1";
     let case = "general purpose connector";
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let arn = create_active(
         &router,
         &engine,

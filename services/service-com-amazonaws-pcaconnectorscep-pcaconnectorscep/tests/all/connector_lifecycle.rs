@@ -14,11 +14,11 @@
 //! pinned to one request.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{self, label, new_router, Answer};
 
 /// A region that is NOT the emulator default, so an ARN built from the request's own SigV4
 /// credential scope is distinguishable from a hardcoded one.
@@ -55,188 +55,29 @@ const CA_ARNS: &[&str] = &[
     "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/abcdef01-2345-6789-abcd-ef0123456789",
 ];
 
-/// What one call answered: the status, the modelled error code (empty on success) and the
-/// parsed body.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-impl Answer {
-    /// One member of the response body, as a string.
-    fn text(&self, name: &str) -> String {
-        self.body[name]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected a string `{name}` in {:?}", self.body))
-            .to_string()
-    }
-
-    /// One member of the returned `Connector`.
-    fn connector(&self, name: &str) -> &Value {
-        &self.body["Connector"][name]
-    }
-
-    /// One member of the returned `Challenge`.
-    fn challenge(&self, name: &str) -> &Value {
-        &self.body["Challenge"][name]
-    }
-}
-
-fn new_router() -> MultiServiceRouter {
-    new_router_with_engine().0
-}
-
-/// The same router, with the shared engine it was built from, so a case that needs the
-/// clock-driven transition to be in a known position can put it there instead of racing it.
-fn new_router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere;
-    // these cases are about this service's behaviour.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(
-            Arc::clone(&engine),
-        ),
-    );
-    (router, engine)
-}
-
-/// Move the instant the clock owes `arn` its settled status to `due_at`, through the
-/// service's own state.
-///
-/// Strictly a clock move: it rewrites only the pending transition's due instant, never the
-/// status or the timestamps — the handlers still compute those from this same record by
-/// settling it. A case that is ABOUT the transient status would otherwise have to win a race
-/// against the service's own `TRANSITION_SPAN`; moving the due instant makes the branch under
-/// test the branch every run exercises.
-fn set_transition_due(engine: &engine::InMemoryEngine, arn: &str, due_at: std::time::SystemTime) {
-    use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
-
-    let shared = state::service_state(engine).expect("the service's own state");
-    let mut store = shared.lock();
-    let connector = store
-        .connectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the connector {arn:?} that was just created"));
-    let pending = connector
-        .pending
-        .as_mut()
-        .unwrap_or_else(|| panic!("the transition the clock owes {arn:?} right after its create"));
-    pending.due_at = due_at;
-}
-
-/// Keep the transition the clock owes `arn` undue for the rest of the case, so every call in
-/// it observes the transient `CREATING`.
-fn hold_creating(engine: &engine::InMemoryEngine, arn: &str) {
-    set_transition_due(
-        engine,
-        arn,
-        std::time::SystemTime::now() + Duration::from_secs(3600),
-    );
-}
-
-/// Make the transition the clock owes `arn` due, so the next call settles it and observes
-/// what it left behind.
-fn release_pending(engine: &engine::InMemoryEngine, arn: &str) {
-    set_transition_due(
-        engine,
-        arn,
-        std::time::SystemTime::now() - Duration::from_secs(1),
-    );
-}
-
-/// Make the `ACTIVE` the clock owes `arn` due, so the next call settles it and observes it.
-fn release_to_active(engine: &engine::InMemoryEngine, arn: &str) {
-    release_pending(engine, arn);
-}
-
-/// Percent-encode a value for use in a single `@httpLabel` path segment or a query-string
-/// value, the way an AWS SDK does: every byte outside the unreserved set is escaped, so the
-/// `:` and `/` inside an ARN cannot read as path structure and the `=` padding of a
-/// `NextToken` cannot read as a parameter separator. One rule covers both places.
-///
-/// `percent_encoding::NON_ALPHANUMERIC` would say the same thing, but this crate deliberately
-/// carries no dependency a service's own behaviour does not need, and the rule is three lines.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{REGION}.amazonaws.com{path}"
-        ))
-        // The credential scope is how a handler learns the region its ARNs name.
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(['/', ':'])
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
-
 async fn create_connector(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "POST", "/connectors", Some(request)).await
+    harness::call(router, REGION, "POST", "/connectors", Some(request)).await
 }
 
 async fn get_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(router, "GET", &format!("/connectors/{}", label(arn)), None).await
+    harness::call(
+        router,
+        REGION,
+        "GET",
+        &format!("/connectors/{}", label(arn)),
+        None,
+    )
+    .await
 }
 
 async fn list_connectors(router: &MultiServiceRouter, query: &str) -> Answer {
-    call(router, "GET", &format!("/connectors{query}"), None).await
+    harness::call(router, REGION, "GET", &format!("/connectors{query}"), None).await
 }
 
 async fn delete_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "DELETE",
         &format!("/connectors/{}", label(arn)),
         None,
@@ -245,12 +86,13 @@ async fn delete_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 async fn create_challenge(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "POST", "/challenges", Some(request)).await
+    harness::call(router, REGION, "POST", "/challenges", Some(request)).await
 }
 
 async fn get_challenge_password(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "GET",
         &format!("/challengePasswords/{}", label(arn)),
         None,
@@ -259,8 +101,9 @@ async fn get_challenge_password(router: &MultiServiceRouter, arn: &str) -> Answe
 }
 
 async fn delete_challenge(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "DELETE",
         &format!("/challenges/{}", label(arn)),
         None,
@@ -273,8 +116,9 @@ async fn list_challenge_metadata(
     connector_arn: &str,
     extra: &str,
 ) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "GET",
         &format!(
             "/challengeMetadata?ConnectorArn={}{extra}",
@@ -303,7 +147,7 @@ async fn active_connector(
         created.status, created.body
     );
     let arn = created.text("ConnectorArn");
-    release_to_active(engine, &arn);
+    harness::release_pending(engine, &arn);
     arn
 }
 
@@ -474,7 +318,7 @@ async fn created_connector_is_read_back_from_state() {
     ];
 
     for case in &cases {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let mut request = json!({ "CertificateAuthorityArn": case.ca_arn });
         if let Some(mdm) = &case.mobile_device_management {
             request["MobileDeviceManagement"] = mdm.clone();
@@ -506,7 +350,7 @@ async fn created_connector_is_read_back_from_state() {
         // that beats the span the clock owes sees the transient status. The span is held open
         // through the service's own state, so this is what the read observes every run rather
         // than a race the case has to win.
-        hold_creating(&engine, &arn);
+        harness::hold_pending(&engine, &arn);
         let creating = get_connector(&router, &arn).await;
         assert_eq!(
             creating.connector("Status"),
@@ -517,7 +361,7 @@ async fn created_connector_is_read_back_from_state() {
         );
 
         // And once the clock owes it, the same read reports the settled status.
-        release_to_active(&engine, &arn);
+        harness::release_pending(&engine, &arn);
         let read = get_connector(&router, &arn).await;
         assert_eq!(
             read.status, 200,
@@ -640,7 +484,7 @@ async fn client_token_makes_create_idempotent() {
     ];
 
     for (case, token) in tokens {
-        let router = new_router();
+        let router = new_router().0;
         let request = json!({
             "CertificateAuthorityArn": CA_ARNS[0],
             "ClientToken": token,
@@ -691,14 +535,14 @@ async fn client_token_makes_create_idempotent() {
 
     // A token whose connector has since been deleted binds nothing: the retry creates a new
     // connector, and the ARN it answers with really resolves.
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let request = json!({
         "CertificateAuthorityArn": CA_ARNS[2],
         "ClientToken": "token-for-a-deleted-connector",
     });
     let first = create_connector(&router, request.clone()).await;
     let first_arn = first.text("ConnectorArn");
-    release_to_active(&engine, &first_arn);
+    harness::release_pending(&engine, &first_arn);
     let deleted = delete_connector(&router, &first_arn).await;
     assert_eq!(
         deleted.status, 202,
@@ -720,7 +564,7 @@ async fn client_token_makes_create_idempotent() {
     );
 
     // Without a token every create is its own connector.
-    let router = new_router();
+    let router = new_router().0;
     let mut minted = BTreeSet::new();
     for ca_arn in &CA_ARNS[..3] {
         let created = create_connector(&router, json!({ "CertificateAuthorityArn": ca_arn })).await;
@@ -785,7 +629,7 @@ async fn client_token_reused_with_different_inputs_conflicts() {
     ];
 
     for (case, mismatch) in mismatches {
-        let router = new_router();
+        let router = new_router().0;
         let first = create_connector(&router, first_request.clone()).await;
         let arn = first.text("ConnectorArn");
 
@@ -808,7 +652,7 @@ async fn client_token_reused_with_different_inputs_conflicts() {
     }
 
     // The same rule on CreateChallenge, whose only resource-defining input is the connector.
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let first_connector = active_connector(&router, &engine, CA_ARNS[2]).await;
     let other_connector = active_connector(&router, &engine, CA_ARNS[3]).await;
     let created = create_challenge(
@@ -855,7 +699,7 @@ async fn challenge_passwords_round_trip_and_stay_out_of_metadata() {
     // The row's count is what the rule generalises over: one challenge, a handful, and more
     // than one page's worth at the smallest page size.
     for count in [1usize, 2, 5] {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let connector = active_connector(&router, &engine, CA_ARNS[0]).await;
         let other = active_connector(&router, &engine, CA_ARNS[1]).await;
 
@@ -940,7 +784,7 @@ async fn challenge_passwords_round_trip_and_stay_out_of_metadata() {
 #[tokio::test]
 async fn listings_page_without_repeating_or_skipping() {
     for (total, page_size) in [(1usize, 1i64), (3, 1), (3, 2), (5, 2), (4, 4), (3, 1000)] {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let mut connectors = BTreeSet::new();
         for index in 0..total {
             let created = create_connector(
@@ -971,7 +815,7 @@ async fn listings_page_without_repeating_or_skipping() {
             .next_back()
             .expect("at least one connector")
             .clone();
-        release_to_active(&engine, &connector);
+        harness::release_pending(&engine, &connector);
         let mut challenges = BTreeSet::new();
         for _ in 0..total {
             let answer =
@@ -1000,7 +844,7 @@ async fn listings_page_without_repeating_or_skipping() {
     }
 
     // The published bounds themselves, and one past each: `MaxResults` is `@range(1, 1000)`.
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let connector = active_connector(&router, &engine, CA_ARNS[0]).await;
     for (case, max_results, expect_ok) in [
         ("lower bound", MAX_RESULTS_MIN, true),
@@ -1042,7 +886,7 @@ async fn listings_page_without_repeating_or_skipping() {
 /// silently restarting the listing.
 #[tokio::test]
 async fn unminted_pagination_token_is_refused() {
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let connector = active_connector(&router, &engine, CA_ARNS[0]).await;
 
     // Each row matches `NextToken`'s own pattern (base64url with padding), so the boundary
@@ -1087,7 +931,7 @@ async fn unminted_pagination_token_is_refused() {
 /// in another connector's, so each is refused rather than silently skipping entries.
 #[tokio::test]
 async fn pagination_token_of_another_listing_is_refused() {
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     // Two connectors, each with two challenges, so both listings really do mint a cursor.
     let first = active_connector(&router, &engine, CA_ARNS[0]).await;
     let second = active_connector(&router, &engine, CA_ARNS[1]).await;
@@ -1181,7 +1025,7 @@ async fn pagination_token_of_another_listing_is_refused() {
 #[tokio::test]
 async fn deletes_are_observable_and_idempotent() {
     for challenges_per_connector in [1usize, 3] {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let connector = active_connector(&router, &engine, CA_ARNS[0]).await;
         let mut arns = Vec::new();
         for _ in 0..challenges_per_connector {
@@ -1249,7 +1093,7 @@ async fn deletes_are_observable_and_idempotent() {
         );
 
         // Let the clock make the teardown due; the record goes with it.
-        release_pending(&engine, &connector);
+        harness::release_pending(&engine, &connector);
         let read = get_connector(&router, &connector).await;
         assert_eq!(
             (read.status, read.error_type.as_str()),
@@ -1293,7 +1137,7 @@ async fn deletes_are_observable_and_idempotent() {
 /// well-formed ARN nothing was created under — never a 200 with an empty body.
 #[tokio::test]
 async fn unknown_arns_answer_resource_not_found() {
-    let router = new_router();
+    let router = new_router().0;
     // Each row is a well-formed ARN of the modelled shape that names no stored record: the
     // rule generalises over the id, not over one recorded value.
     let unknown_connectors = [
@@ -1359,17 +1203,17 @@ async fn challenge_creation_is_refused_outside_an_active_general_purpose_connect
             "INVALID_STATE",
         ),
     ] {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let created = create_connector(&router, request).await;
         let arn = created.text("ConnectorArn");
         if expected_reason == "INVALID_CONNECTOR_TYPE" {
             // An Intune connector is refused for its type, not for its status, so settle it
             // first: the refusal under test must be the type one.
-            release_to_active(&engine, &arn);
+            harness::release_pending(&engine, &arn);
         } else {
             // Hold the transition the clock owes it, so the CREATING branch is the one
             // exercised rather than one the test had to win a race for.
-            hold_creating(&engine, &arn);
+            harness::hold_pending(&engine, &arn);
         }
 
         let reported = get_connector(&router, &arn).await;
@@ -1425,7 +1269,7 @@ async fn tag_count_limit_is_enforced_on_both_creates() {
         ("one past the published limit", MAX_TAGS + 1, 400),
         ("well inside the limit", 3, 202),
     ] {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let created = create_connector(
             &router,
             json!({ "CertificateAuthorityArn": CA_ARNS[0], "Tags": tags(count) }),
@@ -1457,13 +1301,13 @@ async fn tag_count_limit_is_enforced_on_both_creates() {
 /// observable as `DELETING` before the record disappears.
 #[tokio::test]
 async fn deleting_a_connector_mid_creation_is_accepted() {
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let created = create_connector(&router, json!({ "CertificateAuthorityArn": CA_ARNS[0] })).await;
     let arn = created.text("ConnectorArn");
 
     // Hold the transition the clock owes this connector, so the CREATING branch is the one
     // exercised rather than one the test had to win a race for.
-    hold_creating(&engine, &arn);
+    harness::hold_pending(&engine, &arn);
     let reported = get_connector(&router, &arn).await;
     assert_eq!(
         reported.connector("Status"),
@@ -1489,7 +1333,7 @@ async fn deleting_a_connector_mid_creation_is_accepted() {
 
     // Once the teardown is due the record is gone, and a delete of that ARN now names no
     // connector, so it is refused with the modelled 404.
-    release_pending(&engine, &arn);
+    harness::release_pending(&engine, &arn);
     let gone = get_connector(&router, &arn).await;
     assert_eq!(
         gone.status, 404,

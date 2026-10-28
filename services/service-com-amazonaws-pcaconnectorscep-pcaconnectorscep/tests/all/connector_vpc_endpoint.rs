@@ -21,11 +21,10 @@
 //! endpoint id it names (both published `@length` bounds of `VpcEndpointId`, and several
 //! distinct ids), and the connector `Type` the same create also chooses.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{self, label, new_router};
 
 /// A region that is NOT the emulator default, so a host built from the request's own SigV4
 /// credential scope is distinguishable from a hardcoded one.
@@ -58,99 +57,6 @@ fn intune(application_id: &str, domain: &str) -> Value {
     json!({ "Intune": { "AzureApplicationId": application_id, "Domain": domain } })
 }
 
-/// What one call answered.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
-}
-
-impl Answer {
-    fn text(&self, name: &str) -> String {
-        self.body[name]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected a string `{name}` in {:?}", self.body))
-            .to_string()
-    }
-}
-
-fn new_router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(Arc::clone(
-            &engine,
-        )),
-    );
-    (router, engine)
-}
-
-/// Make the `ACTIVE` the clock owes `arn` due, through the service's own state, so a read does
-/// not have to race `TRANSITION_SPAN`.
-fn release_to_active(engine: &engine::InMemoryEngine, arn: &str) {
-    use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
-
-    let shared = state::service_state(engine).expect("the service's own state");
-    let mut store = shared.lock();
-    let connector = store
-        .connectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the connector {arn:?} that was just created"));
-    let pending = connector
-        .pending
-        .as_mut()
-        .unwrap_or_else(|| panic!("the transition the clock owes {arn:?} right after its create"));
-    pending.due_at = std::time::SystemTime::now() - Duration::from_secs(1);
-}
-
-/// Percent-encode a value for one `@httpLabel` path segment, so the `:` and `/` of an ARN
-/// cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{REGION}.amazonaws.com{path}"
-        ))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer { status, body }
-}
-
 /// Create a connector and settle it, answering its ARN.
 async fn create_active(
     router: &MultiServiceRouter,
@@ -158,20 +64,27 @@ async fn create_active(
     case: &str,
     request: Value,
 ) -> String {
-    let created = call(router, "POST", "/connectors", Some(request)).await;
+    let created = harness::call(router, REGION, "POST", "/connectors", Some(request)).await;
     assert_eq!(
         created.status, 202,
         "case {case:?}: expected 202 from CreateConnector, got {} / {:?}",
         created.status, created.body
     );
     let arn = created.text("ConnectorArn");
-    release_to_active(engine, &arn);
+    harness::release_pending(engine, &arn);
     arn
 }
 
 /// The `Endpoint` `GetConnector` reports for `arn`.
 async fn get_endpoint(router: &MultiServiceRouter, case: &str, arn: &str) -> String {
-    let read = call(router, "GET", &format!("/connectors/{}", label(arn)), None).await;
+    let read = harness::call(
+        router,
+        REGION,
+        "GET",
+        &format!("/connectors/{}", label(arn)),
+        None,
+    )
+    .await;
     assert_eq!(
         read.status, 200,
         "case {case:?}: expected 200 from GetConnector, got {} / {:?}",
@@ -185,7 +98,7 @@ async fn get_endpoint(router: &MultiServiceRouter, case: &str, arn: &str) -> Str
 
 /// The `Endpoint` `ListConnectors` reports for `arn`.
 async fn list_endpoint(router: &MultiServiceRouter, case: &str, arn: &str) -> String {
-    let page = call(router, "GET", "/connectors", None).await;
+    let page = harness::call(router, REGION, "GET", "/connectors", None).await;
     assert_eq!(
         page.status, 200,
         "case {case:?}: expected 200 from ListConnectors, got {} / {:?}",
@@ -276,7 +189,7 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn endpoint_reflects_the_access_path_the_create_chose() {
     for row in rows() {
-        let (router, engine) = new_router_with_engine();
+        let (router, engine) = new_router();
         let mut request = json!({ "CertificateAuthorityArn": row.ca_arn });
         if let Some(vpce) = row.vpc_endpoint_id {
             request["VpcEndpointId"] = json!(vpce);
@@ -350,7 +263,14 @@ async fn endpoint_reflects_the_access_path_the_create_chose() {
         // follow the access path the create chose, so restricting the data plane to one VPC
         // endpoint cannot hide the issuer behind a host only that VPC can resolve.
         if row.mobile_device_management.is_some() {
-            let read = call(&router, "GET", &format!("/connectors/{}", label(&arn)), None).await;
+            let read = harness::call(
+                &router,
+                REGION,
+                "GET",
+                &format!("/connectors/{}", label(&arn)),
+                None,
+            )
+            .await;
             let issuer = read.body["Connector"]["OpenIdConfiguration"]["Issuer"]
                 .as_str()
                 .unwrap_or_default()
@@ -376,7 +296,7 @@ async fn endpoint_reflects_the_access_path_the_create_chose() {
 /// different hosts.
 #[tokio::test]
 async fn connectors_differing_only_in_vpc_endpoint_report_different_hosts() {
-    let (router, engine) = new_router_with_engine();
+    let (router, engine) = new_router();
     let ca_arn = CA_ARNS[0];
 
     // Same CA, same (absent) MDM, same Region: the ONLY difference between these creates is

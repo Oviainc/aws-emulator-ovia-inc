@@ -23,12 +23,11 @@
 //! entries, and both sides of the per-resource ceiling.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{self, label, new_router, Answer};
 use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep as scep;
 
 /// A region that is NOT the emulator default, so an ARN built from the request's own SigV4
@@ -48,155 +47,55 @@ const MAX_TAGS_PER_RESOURCE: usize = scep::state::MAX_TAGS_PER_RESOURCE;
 const MAX_TAG_KEY_LENGTH: usize = scep::state::MAX_TAG_KEY_LENGTH;
 const MAX_TAG_VALUE_LENGTH: usize = scep::state::MAX_TAG_VALUE_LENGTH;
 
-/// What one call answered: the status, the modelled error code (empty on success), the raw
-/// body bytes and the parsed body.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    raw: Vec<u8>,
-    body: Value,
-}
-
-impl Answer {
-    /// One member of the response body, as a string.
-    fn text(&self, name: &str) -> String {
-        self.body[name]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected a string `{name}` in {:?}", self.body))
-            .to_string()
-    }
-
-    /// The returned `Tags` map, which an implemented listing always carries.
-    fn tags(&self) -> &Map<String, Value> {
-        self.body["Tags"]
-            .as_object()
-            .unwrap_or_else(|| panic!("expected a `Tags` map in {:?}", self.body))
-    }
-}
-
-/// The router, with the shared engine it was built from, so a case that needs a clock-driven
-/// transition to be in a known position can put it there instead of racing it.
-fn new_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere;
-    // these cases are about this service's behaviour.
-    router.set_request_authentication(false);
-    router.register_service(scep::EmulatedService::new(Arc::clone(&engine)));
-    (router, engine)
-}
-
-/// Make the transition the clock owes `arn` due, so the next call settles it: `CREATING` into
-/// `ACTIVE`, or a `DELETING` connector's teardown into the record being gone.
-///
-/// Strictly a clock move: it rewrites only the pending transition's due instant, never the
-/// status or the timestamps — the handlers still compute those from this same record.
-fn release_pending(engine: &engine::InMemoryEngine, arn: &str) {
-    let shared = scep::state::service_state(engine).expect("the service's own state");
-    let mut store = shared.lock();
-    if let Some(pending) = store
-        .connectors
-        .get_mut(arn)
-        .and_then(|connector| connector.pending.as_mut())
-    {
-        pending.due_at = std::time::SystemTime::now() - Duration::from_secs(1);
-    }
-}
-
-/// Percent-encode a value for use in a single `@httpLabel` path segment, the way an AWS SDK
-/// does: every byte outside the unreserved set is escaped, so the `:` and `/` inside an ARN
-/// cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{REGION}.amazonaws.com{path}"
-        ))
-        // The credential scope is how a handler learns the region its ARNs name.
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(['/', ':'])
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let raw = response.into_body().to_vec();
-    let body = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&raw).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        raw,
-        body,
-    }
-}
-
 async fn create_connector(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "POST", "/connectors", Some(request)).await
+    harness::call(router, REGION, "POST", "/connectors", Some(request)).await
 }
 
 async fn create_challenge(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "POST", "/challenges", Some(request)).await
+    harness::call(router, REGION, "POST", "/challenges", Some(request)).await
 }
 
 async fn delete_challenge(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(router, "DELETE", &format!("/challenges/{}", label(arn)), None).await
+    harness::call(
+        router,
+        REGION,
+        "DELETE",
+        &format!("/challenges/{}", label(arn)),
+        None,
+    )
+    .await
 }
 
 async fn delete_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(router, "DELETE", &format!("/connectors/{}", label(arn)), None).await
+    harness::call(
+        router,
+        REGION,
+        "DELETE",
+        &format!("/connectors/{}", label(arn)),
+        None,
+    )
+    .await
 }
 
 async fn get_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(router, "GET", &format!("/connectors/{}", label(arn)), None).await
+    harness::call(
+        router,
+        REGION,
+        "GET",
+        &format!("/connectors/{}", label(arn)),
+        None,
+    )
+    .await
 }
 
 async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(router, "GET", &format!("/tags/{}", label(arn)), None).await
+    harness::call(router, REGION, "GET", &format!("/tags/{}", label(arn)), None).await
 }
 
 async fn tag_resource(router: &MultiServiceRouter, arn: &str, tags: &Tags) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "POST",
         &format!("/tags/{}", label(arn)),
         Some(json!({ "Tags": tags_member(tags) })),
@@ -442,7 +341,7 @@ async fn active_connector(
         created.status, created.body
     );
     let arn = created.text("ConnectorArn");
-    release_pending(engine, &arn);
+    harness::release_pending_if_owed(engine, &arn);
     arn
 }
 
@@ -674,7 +573,7 @@ async fn tagging_an_arn_this_service_holds_no_record_under_is_not_found() {
         202,
         "expected 202 from DeleteConnector"
     );
-    release_pending(&engine, &connector);
+    harness::release_pending_if_owed(&engine, &connector);
 
     for (name, arn, resource_type) in [
         (

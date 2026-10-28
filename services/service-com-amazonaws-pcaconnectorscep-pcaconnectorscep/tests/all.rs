@@ -29,6 +29,12 @@ mod connector_oidc_parameters;
 mod connector_projection_agreement;
 #[path = "all/connector_vpc_endpoint.rs"]
 mod connector_vpc_endpoint;
+// The shared harness the suites drive the service through: one copy of the router, the
+// request builder, the `@httpLabel` encoding and the pending-transition clock move.
+#[path = "all/harness.rs"]
+mod harness;
+#[path = "all/harness_contract.rs"]
+mod harness_contract;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
 #[path = "all/region_segment_rule.rs"]

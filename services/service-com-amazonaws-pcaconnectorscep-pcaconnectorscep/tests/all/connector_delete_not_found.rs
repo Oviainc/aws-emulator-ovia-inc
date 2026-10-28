@@ -16,12 +16,10 @@
 //! partition and region in the ARN, and the connector id. The repeat delete the issue was
 //! filed about is ONE row.
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{self, label, new_router, Answer};
 use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
 
 /// A region that is NOT the emulator default, so an ARN built from the request's own SigV4
@@ -48,139 +46,34 @@ const CA_ARNS: &[&str] = &[
     "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/deadbeef-0000-1111-2222-333344445555",
 ];
 
-/// What one call answered: the HTTP status, the modelled error code (empty on success) and the
-/// parsed body.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-fn new_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(Arc::clone(
-            &engine,
-        )),
-    );
-    (router, engine)
-}
-
-/// Percent-encode a value for one `@httpLabel` path segment, the way an AWS SDK does, so the
-/// `:` and `/` inside an ARN cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{REGION}.amazonaws.com{path}"
-        ))
-        // The credential scope is how a handler learns the region its ARNs name.
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(['/', ':'])
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
-
 async fn create_connector(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "POST", "/connectors", Some(request)).await
+    harness::call(router, REGION, "POST", "/connectors", Some(request)).await
 }
 
 async fn get_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(router, "GET", &format!("/connectors/{}", label(arn)), None).await
-}
-
-async fn list_connectors(router: &MultiServiceRouter) -> Answer {
-    call(router, "GET", "/connectors", None).await
-}
-
-async fn delete_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
-        "DELETE",
+        REGION,
+        "GET",
         &format!("/connectors/{}", label(arn)),
         None,
     )
     .await
 }
 
-/// Move the instant the clock owes `arn` its pending transition, through the service's own
-/// state, so a case that is not about the transition neither sleeps for nor races
-/// `TRANSITION_SPAN`. Strictly a clock move: nothing else on the record is touched.
-fn set_transition_due(engine: &engine::InMemoryEngine, arn: &str, due_at: SystemTime) {
-    let shared = state::service_state(engine).expect("the service's own state");
-    let mut store = shared.lock();
-    let connector = store
-        .connectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the connector {arn:?} that was just created"));
-    let pending = connector
-        .pending
-        .as_mut()
-        .unwrap_or_else(|| panic!("the transition the clock owes {arn:?}"));
-    pending.due_at = due_at;
+async fn list_connectors(router: &MultiServiceRouter) -> Answer {
+    harness::call(router, REGION, "GET", "/connectors", None).await
 }
 
-/// Make the transition the clock owes `arn` due, so the next call materialises it.
-fn release_pending(engine: &engine::InMemoryEngine, arn: &str) {
-    set_transition_due(engine, arn, SystemTime::now() - Duration::from_secs(1));
-}
-
-/// Keep the transition the clock owes `arn` undue for the rest of the case.
-fn hold_pending(engine: &engine::InMemoryEngine, arn: &str) {
-    set_transition_due(engine, arn, SystemTime::now() + Duration::from_secs(3600));
+async fn delete_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
+    harness::call(
+        router,
+        REGION,
+        "DELETE",
+        &format!("/connectors/{}", label(arn)),
+        None,
+    )
+    .await
 }
 
 /// Create a connector from `ca_arn` and answer its ARN. It starts `CREATING`.
@@ -295,7 +188,7 @@ async fn delete_connector_refuses_an_arn_that_holds_no_connector() {
         let mut siblings = Vec::new();
         for index in 0..case.siblings {
             let arn = new_connector(&router, CA_ARNS[index % CA_ARNS.len()]).await;
-            release_pending(&engine, &arn);
+            harness::release_pending(&engine, &arn);
             siblings.push(arn);
         }
 
@@ -306,9 +199,9 @@ async fn delete_connector_refuses_an_arn_that_holds_no_connector() {
             Missing::TornDownFromActive | Missing::TornDownFromCreating => {
                 let arn = new_connector(&router, CA_ARNS[case.siblings % CA_ARNS.len()]).await;
                 if case.how == Missing::TornDownFromActive {
-                    release_pending(&engine, &arn);
+                    harness::release_pending(&engine, &arn);
                 } else {
-                    hold_pending(&engine, &arn);
+                    harness::hold_pending(&engine, &arn);
                 }
                 let accepted = delete_connector(&router, &arn).await;
                 assert_eq!(
@@ -319,7 +212,7 @@ async fn delete_connector_refuses_an_arn_that_holds_no_connector() {
                     accepted.body
                 );
                 // Let the clock make the teardown due: only then is the record gone.
-                release_pending(&engine, &arn);
+                harness::release_pending(&engine, &arn);
                 let read = get_connector(&router, &arn).await;
                 assert_eq!(
                     read.status, 404,
@@ -394,7 +287,7 @@ async fn delete_connector_is_accepted_while_the_record_is_there() {
         let mut arns = Vec::new();
         for index in 0..count {
             let arn = new_connector(&router, CA_ARNS[index % CA_ARNS.len()]).await;
-            release_pending(&engine, &arn);
+            harness::release_pending(&engine, &arn);
             arns.push(arn);
         }
 
@@ -410,7 +303,7 @@ async fn delete_connector_is_accepted_while_the_record_is_there() {
 
         // Pin the teardown window: while the record is still there the retry is accepted too,
         // and it reports the same status rather than a fresh one.
-        hold_pending(&engine, &doomed);
+        harness::hold_pending(&engine, &doomed);
         let again = delete_connector(&router, &doomed).await;
         assert_eq!(
             (again.status, again.error_type.as_str()),
@@ -429,7 +322,7 @@ async fn delete_connector_is_accepted_while_the_record_is_there() {
         );
 
         // Once the teardown is due the record is gone and the same call is refused.
-        release_pending(&engine, &doomed);
+        harness::release_pending(&engine, &doomed);
         let refused = delete_connector(&router, &doomed).await;
         assert_eq!(
             (refused.status, refused.error_type.as_str()),

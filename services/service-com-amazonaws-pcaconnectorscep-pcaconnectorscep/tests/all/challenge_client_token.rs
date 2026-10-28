@@ -17,12 +17,10 @@
 //! was created from. The connector accepted for teardown — the row the issue was filed about
 //! — is ONE row.
 
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{self, label, new_router, Answer};
 use service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::state;
 
 /// A region that is NOT the emulator default, so an ARN built from the request's own SigV4
@@ -43,110 +41,25 @@ const CA_ARNS: &[&str] = &[
     "arn:aws:acm-pca:eu-west-2:000000000000:certificate-authority/deadbeef-0000-1111-2222-333344445555",
 ];
 
-/// What one call answered: the HTTP status, the modelled error code (empty on success) and the
-/// parsed body.
-#[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
-}
-
-impl Answer {
-    /// One member of the `Challenge` this answer carries, or `None` when it carries none.
-    fn challenge(&self, member: &str) -> Option<&str> {
-        self.body["Challenge"][member].as_str()
-    }
-}
-
-fn new_router() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signature verification is the emulator's own concern and is exercised elsewhere.
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_pcaconnectorscep_pcaconnectorscep::EmulatedService::new(Arc::clone(
-            &engine,
-        )),
-    );
-    (router, engine)
-}
-
-/// Percent-encode a value for one `@httpLabel` path segment, the way an AWS SDK does, so the
-/// `:` and `/` inside an ARN cannot read as path structure.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
-    let payload = match body {
-        Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
-        None => bytes::Bytes::new(),
-    };
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!(
-            "https://pca-connector-scep.{REGION}.amazonaws.com{path}"
-        ))
-        // The credential scope is how a handler learns the region its ARNs name.
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/pca-connector-scep/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split(['/', ':'])
-                .next()
-                .unwrap_or(value)
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
-
 async fn create_connector(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "POST", "/connectors", Some(request)).await
+    harness::call(router, REGION, "POST", "/connectors", Some(request)).await
 }
 
 async fn get_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(router, "GET", &format!("/connectors/{}", label(arn)), None).await
+    harness::call(
+        router,
+        REGION,
+        "GET",
+        &format!("/connectors/{}", label(arn)),
+        None,
+    )
+    .await
 }
 
 async fn delete_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "DELETE",
         &format!("/connectors/{}", label(arn)),
         None,
@@ -155,12 +68,13 @@ async fn delete_connector(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 async fn create_challenge(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "POST", "/challenges", Some(request)).await
+    harness::call(router, REGION, "POST", "/challenges", Some(request)).await
 }
 
 async fn delete_challenge(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "DELETE",
         &format!("/challenges/{}", label(arn)),
         None,
@@ -169,40 +83,14 @@ async fn delete_challenge(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 async fn get_challenge_password(router: &MultiServiceRouter, arn: &str) -> Answer {
-    call(
+    harness::call(
         router,
+        REGION,
         "GET",
         &format!("/challengePasswords/{}", label(arn)),
         None,
     )
     .await
-}
-
-/// Move the instant the clock owes `arn` its pending transition, through the service's own
-/// state, so a case that is not about the transition neither sleeps for nor races
-/// `TRANSITION_SPAN`. Strictly a clock move: nothing else on the record is touched.
-fn set_transition_due(engine: &engine::InMemoryEngine, arn: &str, due_at: SystemTime) {
-    let shared = state::service_state(engine).expect("the service's own state");
-    let mut store = shared.lock();
-    let connector = store
-        .connectors
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the connector {arn:?} that was just created"));
-    let pending = connector
-        .pending
-        .as_mut()
-        .unwrap_or_else(|| panic!("the transition the clock owes {arn:?}"));
-    pending.due_at = due_at;
-}
-
-/// Keep the transition the clock owes `arn` undue for the rest of the case.
-fn hold_pending(engine: &engine::InMemoryEngine, arn: &str) {
-    set_transition_due(engine, arn, SystemTime::now() + Duration::from_secs(3600));
-}
-
-/// Make the transition the clock owes `arn` due, so the next call materialises it.
-fn release_pending(engine: &engine::InMemoryEngine, arn: &str) {
-    set_transition_due(engine, arn, SystemTime::now() - Duration::from_secs(1));
 }
 
 /// A connector that is serving, so it can mint challenge passwords.
@@ -221,7 +109,7 @@ async fn active_connector(
         .as_str()
         .unwrap_or_else(|| panic!("expected a ConnectorArn in {:?}", created.body))
         .to_string();
-    release_pending(engine, &arn);
+    harness::release_pending(engine, &arn);
     arn
 }
 
@@ -322,10 +210,12 @@ async fn a_client_token_answers_only_while_its_challenge_can_still_be_created() 
         );
         let challenge_arn = created
             .challenge("Arn")
+            .as_str()
             .unwrap_or_else(|| panic!("case {name:?}: expected a challenge Arn in {:?}", created.body))
             .to_string();
         let password = created
             .challenge("Password")
+            .as_str()
             .unwrap_or_else(|| {
                 panic!("case {name:?}: expected a challenge Password in {:?}", created.body)
             })
@@ -344,7 +234,7 @@ async fn a_client_token_answers_only_while_its_challenge_can_still_be_created() 
                 if case.between == Between::ConnectorDeleting {
                     // Pin the teardown window rather than race TRANSITION_SPAN, and check the
                     // row really is about a connector that is still reported.
-                    hold_pending(&engine, &connector);
+                    harness::hold_pending(&engine, &connector);
                     let reported = get_connector(&router, &connector).await;
                     assert_eq!(
                         reported.body["Connector"]["Status"],
@@ -354,7 +244,7 @@ async fn a_client_token_answers_only_while_its_challenge_can_still_be_created() 
                         reported.body
                     );
                 } else {
-                    release_pending(&engine, &connector);
+                    harness::release_pending(&engine, &connector);
                     let gone = get_connector(&router, &connector).await;
                     assert_eq!(
                         gone.status, 404,
@@ -387,13 +277,13 @@ async fn a_client_token_answers_only_while_its_challenge_can_still_be_created() 
                     retried.body
                 );
                 assert_eq!(
-                    retried.challenge("Arn"),
+                    retried.challenge("Arn").as_str(),
                     Some(challenge_arn.as_str()),
                     "case {name:?}: the token must answer with the challenge it created, got {:?}",
                     retried.body
                 );
                 assert_eq!(
-                    retried.challenge("Password"),
+                    retried.challenge("Password").as_str(),
                     Some(password.as_str()),
                     "case {name:?}: the retry must carry the password the first call returned, \
                      got {:?}",
@@ -419,6 +309,7 @@ async fn a_client_token_answers_only_while_its_challenge_can_still_be_created() 
                 );
                 let minted = retried
                     .challenge("Arn")
+                    .as_str()
                     .unwrap_or_else(|| {
                         panic!("case {name:?}: expected a challenge Arn in {:?}", retried.body)
                     })
@@ -429,7 +320,7 @@ async fn a_client_token_answers_only_while_its_challenge_can_still_be_created() 
                      {minted:?}"
                 );
                 assert_ne!(
-                    retried.challenge("Password"),
+                    retried.challenge("Password").as_str(),
                     Some(password.as_str()),
                     "case {name:?}: a newly minted challenge must carry its own password, got \
                      {:?}",
@@ -439,7 +330,7 @@ async fn a_client_token_answers_only_while_its_challenge_can_still_be_created() 
                 let read = get_challenge_password(&router, &minted).await;
                 assert_eq!(
                     (read.status, read.body["Password"].clone()),
-                    (200, json!(retried.challenge("Password"))),
+                    (200, json!(retried.challenge("Password").as_str())),
                     "case {name:?}: the challenge the retry answered with must read back, got {} \
                      / {:?}",
                     read.status,
