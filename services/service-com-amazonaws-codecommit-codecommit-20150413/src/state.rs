@@ -2709,10 +2709,15 @@ pub struct PullRequestRecord {
     /// the approvals the pull request HOLDS rather than by anything a request
     /// says.
     pub approvals: BTreeMap<String, String>,
-    /// Whether the approval rules of this pull request are currently overridden
+    /// The identity that set the approval rules of this pull request aside
     /// ([`OVERRIDE_STATUS_OVERRIDE`]), which is what lets it be merged while a
-    /// rule still states conditions its approvals do not meet.
-    pub approval_rules_overridden: bool,
+    /// rule still states conditions its approvals do not meet, and `None` while
+    /// its rules' requirements apply. ONE field for both facts, so the override a
+    /// merge reads and the overrider a reader reports cannot disagree: holding the
+    /// requirements again ([`OVERRIDE_STATUS_REVOKE`]) leaves none stored, which
+    /// is what the model documents for `overrideStatus` — "REVOKE status is not
+    /// stored".
+    pub approval_rules_overridden_by: Option<String>,
     /// How many times the reviewable state of this pull request has moved. It
     /// is what distinguishes one `revisionId` from the next — see
     /// [`PullRequestRecord::revision_id`] — so a caller that holds a revision id
@@ -2832,7 +2837,15 @@ impl PullRequestRecord {
     /// request have conditions that have not been met", and an override is what
     /// sets those conditions aside.
     pub fn approval_rules_satisfied(&self) -> bool {
-        self.approval_rules_overridden || self.approval_rules_not_satisfied().is_empty()
+        self.approval_rules_overridden() || self.approval_rules_not_satisfied().is_empty()
+    }
+
+    /// Are the approval rules of this pull request currently set aside?
+    ///
+    /// Asked by every reader of the override and by a merge of the pull request, so
+    /// the one stored fact ([`Self::approval_rules_overridden_by`]) answers them all.
+    pub fn approval_rules_overridden(&self) -> bool {
+        self.approval_rules_overridden_by.is_some()
     }
 
     /// The system-generated `revisionId` of this pull request's CURRENT
@@ -3365,6 +3378,24 @@ pub fn maximum_number_of_approvals_exceeded_message() -> String {
 /// rules of a pull request are set aside or held again.
 pub const OVERRIDE_STATUS_OVERRIDE: &str = "OVERRIDE";
 pub const OVERRIDE_STATUS_REVOKE: &str = "REVOKE";
+
+/// `OverrideStatusRequiredException`'s message: the sentence pair the model
+/// documents for the shape — the requirement, then the values that are accepted —
+/// worded here once for every operation that takes an `overrideStatus`.
+pub const OVERRIDE_STATUS_REQUIRED_MESSAGE: &str = "An override status is required, but no value \
+                                                    was provided. Valid values include OVERRIDE \
+                                                    and REVOKE.";
+
+/// `InvalidOverrideStatusException`'s message: the sentence pair the model documents
+/// for the shape — the failure, then the values that are accepted — echoing nothing
+/// from the request.
+pub const INVALID_OVERRIDE_STATUS_MESSAGE: &str =
+    "The override status is not valid. Valid statuses are OVERRIDE and REVOKE.";
+
+/// `OverrideAlreadySetException`'s message: a FIXED sentence, the one the model
+/// documents for the shape, echoing nothing from the request.
+pub const OVERRIDE_ALREADY_SET_MESSAGE: &str =
+    "The pull request has already had its approval rules set to override.";
 
 /// `ApprovalStateRequiredException`'s message: a FIXED sentence, the one the model
 /// documents for the shape, worded here once for every operation that takes an
