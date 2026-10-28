@@ -75,6 +75,8 @@ mod delete_attachment;
 mod delete_connection;
 #[path = "all/delete_dependency_refusal.rs"]
 mod delete_dependency_refusal;
+#[path = "all/delete_dependent_resource_refusal.rs"]
+mod delete_dependent_resource_refusal;
 #[path = "all/delete_device.rs"]
 mod delete_device;
 #[path = "all/delete_global_network_transit_gateway_precondition.rs"]

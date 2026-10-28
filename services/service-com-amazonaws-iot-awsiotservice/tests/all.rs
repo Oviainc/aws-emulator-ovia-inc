@@ -31,8 +31,12 @@ mod job_execution_read;
 mod job_targeting;
 #[path = "all/ota_update_deployment.rs"]
 mod ota_update_deployment;
+#[path = "all/ota_update_job_document.rs"]
+mod ota_update_job_document;
 #[path = "all/package_catalog.rs"]
 mod package_catalog;
+#[path = "all/package_deletion.rs"]
+mod package_deletion;
 #[path = "all/package_version_update.rs"]
 mod package_version_update;
 #[path = "all/package_versions.rs"]

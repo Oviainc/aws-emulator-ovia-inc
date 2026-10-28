@@ -4040,7 +4040,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .ok_or_else(|| resource_not_found(ATTACHMENT_KIND, attachment_id))
     }
 
-    /// How many peerings `core_network_id` holds, for the per-core-network quota.
+    /// How many peerings `core_network_id` holds, for the per-core-network quota and the
+    /// core-network delete refusal: a peering hangs off exactly one core network, so
+    /// deleting that core network while it holds one would orphan the peering.
     pub fn peering_count_of_core_network(&self, core_network_id: &str) -> usize {
         self.peerings
             .values()
@@ -4161,7 +4163,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     }
 
     /// How many Connect peers are carried over the Connect attachment `attachment_id`, for
-    /// the per-attachment quota [`MAX_CONNECT_PEERS_PER_ATTACHMENT`].
+    /// the per-attachment quota [`MAX_CONNECT_PEERS_PER_ATTACHMENT`] and the attachment
+    /// delete refusal: a peer hangs off exactly one Connect attachment, so deleting that
+    /// attachment while it carries one would orphan the peer.
     pub fn connect_peer_count_of_attachment(&self, attachment_id: &str) -> usize {
         self.connect_peers
             .values()

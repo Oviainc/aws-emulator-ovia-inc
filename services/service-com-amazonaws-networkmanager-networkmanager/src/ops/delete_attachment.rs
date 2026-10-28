@@ -13,9 +13,12 @@
 //!
 //! A Connect attachment is carried over ANOTHER attachment as its transport
 //! (`crate::state::AttachmentDetail::Connect`), so deleting that transport would orphan
-//! it. Like every other delete of this service that still holds dependents, the delete is
-//! refused until the caller removes them (`crate::state::dependents_block_delete`, HTTP
-//! 400 `ValidationException`) and the store is left untouched.
+//! it, and a Connect peer is carried over a Connect attachment
+//! (`crate::state::ConnectPeerRecord::connect_attachment_id`), so deleting that attachment
+//! would orphan the peer. Like every other delete of this service that still holds
+//! dependents, the delete is refused until the caller removes them
+//! (`crate::state::dependents_block_delete`, HTTP 400 `ValidationException`) and the store
+//! is left untouched.
 //!
 //! ## Reaching this service's state
 //!
@@ -150,14 +153,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A Connect attachment is built on the attachment named as its transport, so
-        // removing that transport would leave it pointing at nothing. The dependency
+        // removing that transport would leave it pointing at nothing. A Connect peer is
+        // likewise a resource with an id, a reader and a delete of its own that hangs off
+        // one Connect attachment, so removing that attachment would leave the peer naming an
+        // attachment no read can resolve: both block the delete, counted the way the
+        // per-attachment peer quota counts them. The dependency
         // refusal is computed only for an attachment that IS stored, so the one not-found
         // answer below stays the single path for an id that names nothing.
         if store.attachments.contains_key(&input.attachment_id) {
             let carried = store.connect_attachment_count_over_transport(&input.attachment_id);
+            let peers = store.connect_peer_count_of_attachment(&input.attachment_id);
             if let Some(refusal) = crate::state::dependents_block_delete(
                 crate::state::ATTACHMENT_KIND,
-                &[(crate::state::ATTACHMENT_KIND, carried)],
+                &[
+                    (crate::state::ATTACHMENT_KIND, carried),
+                    (crate::state::CONNECT_PEER_KIND, peers),
+                ],
             ) {
                 return Err(DeleteAttachmentErrorModeled::ValidationException(refusal).into());
             }

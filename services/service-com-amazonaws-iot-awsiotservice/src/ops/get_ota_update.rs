@@ -164,7 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.ota_update_id)
             .ok_or_else(|| -> Self::Error {
                 GetOTAUpdateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("OTA update {} does not exist", input.ota_update_id)),
+                    message: Some(crate::state::missing_ota_update_message(
+                        &input.ota_update_id,
+                    )),
                 })
                 .into()
             })?;

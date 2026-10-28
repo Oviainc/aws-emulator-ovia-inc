@@ -248,7 +248,10 @@ fn epoch_seconds() -> f64 {
 
 /// Every datapoint CloudWatch holds for one pipe's `metric`, read at the one-minute period
 /// the series is published at.
-async fn datapoints(router: &MultiServiceRouter, pipe: &str, metric: &str) -> Vec<Value> {
+///
+/// `pub(crate)` because `tests/all/pipe_metric_attribution.rs` asks the SAME question of
+/// several pipes running at once, and reads their series through this one path.
+pub(crate) async fn datapoints(router: &MultiServiceRouter, pipe: &str, metric: &str) -> Vec<Value> {
     let now = epoch_seconds();
     let (status, stats) = cloudwatch(
         router,
@@ -273,7 +276,7 @@ async fn datapoints(router: &MultiServiceRouter, pipe: &str, metric: &str) -> Ve
 
 /// The `Sum` of every datapoint of one pipe's `metric`, and how many datapoints there
 /// were: a series that EXISTS reads at least one datapoint, whatever it sums to.
-async fn series(router: &MultiServiceRouter, pipe: &str, metric: &str) -> (usize, f64) {
+pub(crate) async fn series(router: &MultiServiceRouter, pipe: &str, metric: &str) -> (usize, f64) {
     let points = datapoints(router, pipe, metric).await;
     let sum = points
         .iter()
@@ -284,7 +287,7 @@ async fn series(router: &MultiServiceRouter, pipe: &str, metric: &str) -> (usize
 
 /// Wait until one pipe's `metric` sums to at least `want`, answering what it summed to
 /// last.
-async fn wait_for_sum(router: &MultiServiceRouter, pipe: &str, metric: &str, want: f64) -> f64 {
+pub(crate) async fn wait_for_sum(router: &MultiServiceRouter, pipe: &str, metric: &str, want: f64) -> f64 {
     let deadline = Instant::now() + BUDGET;
     loop {
         let (_, sum) = series(router, pipe, metric).await;
@@ -316,7 +319,7 @@ async fn wait_for_every_counter(router: &MultiServiceRouter, pipe: &str) -> Opti
 }
 
 /// The dimension sets `ListMetrics` reports for one metric of this namespace.
-async fn listed_dimension_sets(router: &MultiServiceRouter, metric: &str) -> Vec<Value> {
+pub(crate) async fn listed_dimension_sets(router: &MultiServiceRouter, metric: &str) -> Vec<Value> {
     let (status, listed) = cloudwatch(
         router,
         "ListMetrics",
