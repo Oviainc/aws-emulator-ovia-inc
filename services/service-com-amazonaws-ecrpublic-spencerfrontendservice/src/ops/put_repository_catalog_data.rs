@@ -162,6 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // Request metadata is used for the audit record only: which repository's catalog
         // record this call replaces comes from the request body.
+        // Authorization comes first: an action the caller's identity-based policies do not
+        // allow is refused before this handler reads or writes anything, so a refused call
+        // leaves the registry exactly as it was.
+        if let Some(denied) = crate::state::authorization::denied_on_repository(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.repository_name,
+        ) {
+            return Err(denied);
+        }
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(server_error());
