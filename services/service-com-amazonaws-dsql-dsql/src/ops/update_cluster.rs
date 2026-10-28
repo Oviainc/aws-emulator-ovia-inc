@@ -8,8 +8,8 @@
 //! `PENDING_SETUP` while a multi-Region peering it asks for is not established on
 //! both sides. Unknown identifier -> `ResourceNotFoundException` (404);
 //! a cluster in a status that does not accept a mutation -> `ConflictException` (409),
-//! except that a cluster waiting in `PENDING_SETUP` takes the configuration change
-//! that completes its peering;
+//! except that a cluster waiting in `PENDING_SETUP` takes a request asking for
+//! NOTHING BUT the configuration change that completes its peering;
 //! a `multiRegionProperties.witnessRegion` naming the cluster's OWN Region, or a
 //! `multiRegionProperties.clusters` naming more peers than
 //! `state::MAX_MULTI_REGION_PEERS` ->
@@ -300,15 +300,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A cluster the clock still owes a transition, or one on its way out, cannot
-        // take a configuration change — with the one exception a request CONFIGURING
-        // the multi-Region setup gets: a cluster waiting in `PENDING_SETUP` is
-        // waiting for exactly that call.
-        let refusal = if input.multi_region_properties.is_some() {
-            stored.multi_region_configuration_conflict()
-        } else {
-            stored.mutation_conflict("be updated")
-        };
-        if let Some(conflict) = refusal {
+        // take a configuration change — with the one exception a request that asks
+        // for NOTHING BUT the multi-Region setup gets: a cluster waiting in
+        // `PENDING_SETUP` is waiting for exactly that call. The exemption is that
+        // one change's and not the request's, so a request that also carries another
+        // member asks for an ordinary mutation and is refused like any other (see
+        // `configures_multi_region_only`).
+        if let Some(conflict) = stored.update_conflict(configures_multi_region_only(&input)) {
             return Err(UpdateClusterErrorModeled::ConflictException(conflict).into());
         }
 
@@ -380,6 +378,20 @@ fn updated_cluster_output(cluster: &crate::state::Cluster) -> UpdateClusterOutpu
         status: cluster.status.clone(),
         creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
     }
+}
+
+/// Whether this request asks for NOTHING BUT the cluster's multi-Region
+/// configuration — the change a cluster waiting for its peering takes while its
+/// status refuses every other mutation.
+///
+/// Every member of `UpdateClusterInput` that changes the stored cluster is weighed:
+/// `multiRegionProperties` is the configuration itself, `deletionProtectionEnabled`
+/// and `kmsEncryptionKey` are mutations of their own, and `identifier` addresses the
+/// cluster while `clientToken` only names the request, so neither asks for a change.
+fn configures_multi_region_only(input: &UpdateClusterInput) -> bool {
+    input.multi_region_properties.is_some()
+        && input.deletion_protection_enabled.is_none()
+        && input.kms_encryption_key.is_none()
 }
 
 /// The parameters an `UpdateCluster` `clientToken` is bound to: the cluster it

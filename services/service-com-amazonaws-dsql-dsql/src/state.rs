@@ -315,16 +315,20 @@ impl Cluster {
         )
     }
 
-    /// The refusal an update that CONFIGURES this cluster's multi-Region setup
-    /// answers with, or `None` when the cluster takes it.
+    /// The refusal an update of this cluster answers with, or `None` when the
+    /// cluster takes it.
     ///
-    /// A cluster waiting in [`STATUS_PENDING_SETUP`] takes no other mutation, but
-    /// it does take this one: the peering it is waiting for is established by
-    /// configuring BOTH sides, so the configuration change is the very call the
-    /// wait is for. Every other status answers exactly as it does to any other
-    /// mutation ([`Self::mutation_conflict`]).
-    pub fn multi_region_configuration_conflict(&self) -> Option<ConflictException> {
-        if self.status == STATUS_PENDING_SETUP {
+    /// `configures_multi_region_only` says the request asks for NOTHING BUT this
+    /// cluster's multi-Region configuration. That one change is the only mutation a
+    /// cluster waiting in [`STATUS_PENDING_SETUP`] takes: the peering it is waiting
+    /// for is established by configuring BOTH sides, so the configuration change is
+    /// the very call the wait is for. The exemption belongs to that change and not
+    /// to the request carrying it — a request that asks for anything else asks for
+    /// an ordinary mutation of a cluster whose status takes none, so it is refused
+    /// however it spells the rest of itself. Every other status answers exactly as
+    /// it does to any other mutation ([`Self::mutation_conflict`]).
+    pub fn update_conflict(&self, configures_multi_region_only: bool) -> Option<ConflictException> {
+        if configures_multi_region_only && self.status == STATUS_PENDING_SETUP {
             return None;
         }
         self.mutation_conflict("be updated")
