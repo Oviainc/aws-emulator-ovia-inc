@@ -95,6 +95,8 @@ mod export_tasks;
 mod global_clusters;
 #[path = "all/lifecycle_poll_loops.rs"]
 mod lifecycle_poll_loops;
+#[path = "all/management_event_recording.rs"]
+mod management_event_recording;
 #[path = "all/modify_custom_db_engine_version.rs"]
 mod modify_custom_db_engine_version;
 #[path = "all/modify_db_shard_group.rs"]

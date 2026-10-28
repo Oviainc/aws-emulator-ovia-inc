@@ -1454,26 +1454,11 @@ impl Stream {
         }
     }
 
-    /// The stream's tags as the modelled `Tag` list, ordered by key.
-    ///
-    /// A tag list is paged through by key ("The key to use as the starting point for the
-    /// list of tags... gets all tags that occur after ExclusiveStartTagKey",
-    /// `ListTagsForStreamInput$ExclusiveStartTagKey`), so the tags a stream reports need
-    /// ONE total order that every read agrees on, and the cursor names the key: the order
-    /// is by key.
+    /// The stream's tags as the modelled `Tag` list, ordered by key, through the one
+    /// projection every tagged resource of this service is reported through
+    /// ([`tags_ordered`]).
     pub fn tags_ordered(&self) -> Vec<Tag> {
-        let mut tags: Vec<Tag> = self
-            .tags
-            .iter()
-            .map(|(key, value)| Tag {
-                key: key.clone(),
-                // `Tag$Value` is "An optional string", and a tag assigned a value carries
-                // it however short it is — `TagValue` is modelled `len 0..256`.
-                value: Some(value.clone()),
-            })
-            .collect();
-        tags.sort_by(|left, right| left.key.cmp(&right.key));
-        tags
+        tags_ordered(&self.tags)
     }
 
     /// How many tags the stream would carry once `tags` were assigned to it, which is what
@@ -1716,6 +1701,13 @@ impl Channel {
                 })
                 .collect(),
         }
+    }
+
+    /// The channel's tags as the modelled `Tag` list, ordered by key — the SAME projection
+    /// of the SAME kind of stored tag set a stream's tags are reported through
+    /// ([`Stream::tags_ordered`]), because one rule orders the tags of any Kinesis resource.
+    pub fn tags_ordered(&self) -> Vec<Tag> {
+        tags_ordered(&self.tags)
     }
 
     /// Whether one of the channel's source streams is the stream `stream_arn` names, created
@@ -2238,6 +2230,24 @@ impl ComAmazonawsKinesisKinesis20131202State {
         channels.sort_by(|left, right| left.name.cmp(&right.name));
         channels
     }
+
+    /// The tags the Kinesis resource `arn` names carries at `now`, ordered by key, or `None`
+    /// when this account and region hold no resource under that ARN.
+    ///
+    /// A `ResourceARN` addresses "the Kinesis resource" rather than one kind of it
+    /// (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), and a stream and a channel
+    /// each carry ONE stored tag set, so ONE lookup spans both kinds: whichever kind the ARN
+    /// names, the tags answered are the stored set every tag write of that resource wrote.
+    pub fn resource_tags_by_arn(
+        &self,
+        now: SystemTime,
+        region: &str,
+        arn: &str,
+    ) -> Option<Vec<Tag>> {
+        self.stream_by_arn(now, region, arn)
+            .map(Stream::tags_ordered)
+            .or_else(|| self.channel_by_arn(region, arn).map(Channel::tags_ordered))
+    }
 }
 
 /// Why a write places a record in no shard of the stream it addresses. The operation maps
@@ -2304,13 +2314,28 @@ pub const STREAM_IDENTIFIER_MISMATCH_MESSAGE: &str =
     "StreamName and StreamARN name different streams; name one stream or supply only one \
      of them";
 
-/// How a read states that this account and region hold no stream under the identifier the
-/// request named. Built FROM the request, so the identifier at fault is what names it.
+/// How an operation states that this account and region hold no stream under the identifier
+/// the request named, worded the way this service words that error class: "Stream `<name>`
+/// under account `<account>` not found."
+///
+/// Built FROM the request and the emulator's own account: the variable part is the stream
+/// NAME at fault, which an identifier that is a `StreamARN` carries in its resource segment
+/// ([`stream_name_in`]) and one that is a `StreamName` already is.
 pub fn stream_not_found_message(identifier: &str) -> String {
     format!(
-        "stream {identifier} not found under account {}",
+        "Stream {} under account {} not found.",
+        stream_name_in(identifier),
         ::engine::emulator_account_id()
     )
+}
+
+/// The stream NAME `identifier` names: a `StreamARN` names its stream by name, in the
+/// resource segment [`stream_arn`] builds as `stream/<name>`, and a `StreamName` is that
+/// name already.
+fn stream_name_in(identifier: &str) -> &str {
+    identifier
+        .rsplit_once("stream/")
+        .map_or(identifier, |(_, name)| name)
 }
 
 /// How an operation that needs a ready stream refuses one that is not ready yet: the rule
@@ -2740,6 +2765,28 @@ pub fn channel_not_found_message(identifier: &str) -> String {
     )
 }
 
+/// How a read states that this account and region hold no Kinesis resource under the ARN
+/// the request named, for an operation whose `ResourceARN` addresses a resource of EITHER
+/// kind (`^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`): the sentence this service
+/// already states for the kind that ARN names, so one ARN is refused in one wording whatever
+/// operation it reached.
+pub fn resource_not_found_message(arn: &str) -> String {
+    if arn_names_channel(arn) {
+        channel_not_found_message(arn)
+    } else {
+        stream_not_found_message(arn)
+    }
+}
+
+/// Whether `arn`'s resource segment names a CHANNEL, which is the other resource kind a
+/// `ResourceARN` may address. An ARN carries its resource kind in the segment after the last
+/// `:` ([`channel_arn`] builds it as `channel/<name>`).
+fn arn_names_channel(arn: &str) -> bool {
+    arn.rsplit(':')
+        .next()
+        .is_some_and(|resource| resource.starts_with("channel/"))
+}
+
 /// How a create states that this account and region already hold a channel under the name
 /// the request named: "The name is unique within your Amazon Web Services account and
 /// Amazon Web Services Region" (`CreateChannelInput$ChannelName`). Built FROM the request,
@@ -2904,6 +2951,28 @@ fn is_region_name(region: &str) -> bool {
         && region
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// A stored tag set as the modelled `Tag` list, ordered by key.
+///
+/// A tag list is paged through by key ("The key to use as the starting point for the list of
+/// tags... gets all tags that occur after ExclusiveStartTagKey",
+/// `ListTagsForStreamInput$ExclusiveStartTagKey`), so the tags a read reports need ONE total
+/// order that every read agrees on, and the cursor names the key: the order is by key. ONE
+/// projection for every resource kind that carries tags, so no two reads of one service
+/// order or shape them differently.
+pub fn tags_ordered(tags: &HashMap<String, String>) -> Vec<Tag> {
+    let mut tags: Vec<Tag> = tags
+        .iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            // `Tag$Value` is "An optional string", and a tag assigned a value carries it
+            // however short it is — `TagValue` is modelled `len 0..256`.
+            value: Some(value.clone()),
+        })
+        .collect();
+    tags.sort_by(|left, right| left.key.cmp(&right.key));
+    tags
 }
 
 /// The modelled timestamp for a stored instant.

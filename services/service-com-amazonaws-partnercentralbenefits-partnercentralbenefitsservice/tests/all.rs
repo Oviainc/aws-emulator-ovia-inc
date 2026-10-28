@@ -35,6 +35,8 @@ mod catalog_refusal_one_construction;
 mod cancel_client_token_idempotency;
 #[path = "all/client_token_idempotency.rs"]
 mod client_token_idempotency;
+#[path = "all/details_document_guard.rs"]
+mod details_document_guard;
 #[path = "all/disassociate_benefit_application_resource.rs"]
 mod disassociate_benefit_application_resource;
 #[path = "all/entitlement_denial.rs"]

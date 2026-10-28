@@ -756,3 +756,9 @@ mod security_group_vpc_associations;
 // the documented filters and the clock narrow it.
 #[path = "all/customer_gateways.rs"]
 mod customer_gateways;
+// Appended at the END of this file, for the reason the header gives. The enclave certificate
+// slice: which values `AssociateEnclaveCertificateIamRole` takes for the certificate and the
+// role it associates, what it stores for the pair, and what
+// `GetAssociatedEnclaveCertificateIamRoles` reports back out of that store.
+#[path = "all/enclave_certificate_iam_roles.rs"]
+mod enclave_certificate_iam_roles;

@@ -156,12 +156,507 @@ pub fn recorded_members<const N: usize>(
         .into()
 }
 
-/// The wire error code and message an outcome carries: `(None, None)` for a success.
+/// What a record carries in place of a value the serving API declares SENSITIVE.
 ///
-/// Read off the operation's own error channel, so the recorded code is exactly the one
-/// the caller was answered with. The modelled error's `Display` prefixes its shape name,
-/// which the record already carries as its `errorCode`, so the message is recorded
-/// alone.
+/// CloudTrail does not store such a value at all — it substitutes this fixed literal, so
+/// a password a caller sent appears nowhere in event history while the record still shows
+/// that the member was carried. The literal is CloudTrail's own, not this emulator's
+/// invention, so it is stated once here and used by every recorder.
+pub const HIDDEN_SENSITIVE_VALUE: &str = "HIDDEN_DUE_TO_SECURITY_REASONS";
+
+/// The member NAME a record spells a modelled member with: the modelled name with a
+/// lower-case first letter (`DBInstanceIdentifier` -> `dBInstanceIdentifier`), which is
+/// how a CloudTrail event document names the members of the call it records.
+///
+/// Only the first character changes: the rest of the name keeps the model's own casing,
+/// so a member whose name is already lower-case first is recorded unchanged.
+#[must_use]
+pub fn recorded_member_name(modelled: &str) -> String {
+    let mut chars = modelled.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// How deep into a value a record goes. A record is a report of ONE call, so the depth is
+/// bounded rather than sized by the value: a shape nested deeper than this is reported
+/// only down to this level.
+const MAX_RECORDED_DEPTH: usize = 16;
+
+/// How many values one recorded document holds. The same reason as [`MAX_RECORDED_DEPTH`]:
+/// every served call appends a record, so one record's size is bounded here rather than by
+/// what the caller sent.
+const MAX_RECORDED_VALUES: usize = 1_024;
+
+/// One built shape — a request's input or a response's output — as the JSON document a
+/// record carries it in (`requestParameters` / `responseElements`).
+///
+/// SCHEMA-DRIVEN, so it holds for every modelled shape rather than per operation: the walk
+/// is the framework's own [`SerializableStruct`] walk, each member named as
+/// [`recorded_member_name`] spells it, and a member that was ABSENT is simply never
+/// written (the generated walk writes nothing for an unset optional member), which is what
+/// keeps an absent member out of the record rather than in it as null.
+///
+/// `sensitive_members` are the members the serving model declares `@sensitive`. A value
+/// held at one of them — a leaf, or a whole subtree — is replaced by
+/// [`HIDDEN_SENSITIVE_VALUE`] and never read, so the plaintext reaches no record.
+#[must_use]
+pub fn recorded_shape(
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    schema: &::aws_smithy_schema::Schema,
+    sensitive_members: &[&str],
+) -> serde_json::Value {
+    let mut walk = RecordedShape {
+        stack: Vec::new(),
+        root: serde_json::Value::Null,
+        sensitive_members,
+        written: 0,
+    };
+    // The root of a request or a response is a structure; drive it the way a codec does.
+    // A walk that cannot finish leaves the document built so far: a record reports a call
+    // that was already served, so failing to render one is never a failure of the call.
+    let _ = ::aws_smithy_schema::serde::ShapeSerializer::write_struct(&mut walk, schema, value);
+    walk.root
+}
+
+/// An in-progress container of the document [`recorded_shape`] builds.
+enum RecordedFrame {
+    /// A structure, keyed by the names its members are recorded under.
+    Structure(serde_json::Map<String, serde_json::Value>),
+    /// A list, in the order its elements were written.
+    List(Vec<serde_json::Value>),
+    /// A map: its entries arrive as alternating keys and values on the same walk, so which
+    /// one comes next is state.
+    Map {
+        entries: serde_json::Map<String, serde_json::Value>,
+        pending_key: Option<String>,
+        expecting_key: bool,
+    },
+}
+
+/// The [`ShapeSerializer`](::aws_smithy_schema::serde::ShapeSerializer) that builds a
+/// record's JSON document; see [`recorded_shape`].
+struct RecordedShape<'a> {
+    /// The containers currently open, outermost first.
+    stack: Vec<RecordedFrame>,
+    /// The finished document, once the outermost container closes.
+    root: serde_json::Value,
+    /// The members whose values are never stored.
+    sensitive_members: &'a [&'a str],
+    /// How many values have been written, against [`MAX_RECORDED_VALUES`].
+    written: usize,
+}
+
+impl RecordedShape<'_> {
+    /// Whether `schema` names a member the serving model declares sensitive.
+    ///
+    /// Matched on the member's own MODELLED name, which is how a service states its
+    /// sensitive members — not the lower-first-letter spelling the finished record uses.
+    fn is_sensitive(&self, schema: &::aws_smithy_schema::Schema) -> bool {
+        schema
+            .member_name()
+            .is_some_and(|name| self.sensitive_members.contains(&name))
+    }
+
+    /// Whether this walk has already written everything one record holds.
+    fn full(&self) -> bool {
+        self.written >= MAX_RECORDED_VALUES || self.stack.len() > MAX_RECORDED_DEPTH
+    }
+
+    /// Account for a value this walk did NOT write.
+    ///
+    /// A map's entries arrive as alternating keys and values on one walk, so a write that
+    /// is skipped still has to advance that alternation — otherwise the next key would be
+    /// taken for a value and the recorded map would pair the wrong things. The entry whose
+    /// half was skipped is dropped whole, which leaves an unwritten value out of the
+    /// record rather than under a key it does not belong to.
+    fn skipped(&mut self) {
+        if let Some(RecordedFrame::Map {
+            pending_key,
+            expecting_key,
+            ..
+        }) = self.stack.last_mut()
+        {
+            *pending_key = None;
+            *expecting_key = !*expecting_key;
+        }
+    }
+
+    /// Put `value` where the walk currently is: under its member name inside a structure,
+    /// at the end of a list, as a map's key or its value, or as the whole document when no
+    /// container is open.
+    fn place(&mut self, schema: &::aws_smithy_schema::Schema, value: serde_json::Value) {
+        self.written += 1;
+        match self.stack.last_mut() {
+            None => self.root = value,
+            Some(RecordedFrame::Structure(members)) => {
+                let name = schema
+                    .member_name()
+                    .map_or_else(|| schema.shape_id().shape_name().to_string(), |name| {
+                        recorded_member_name(name)
+                    });
+                members.insert(name, value);
+            }
+            Some(RecordedFrame::List(elements)) => elements.push(value),
+            Some(RecordedFrame::Map {
+                entries,
+                pending_key,
+                expecting_key,
+            }) => {
+                if *expecting_key {
+                    // A map key is a string on the wire, and is recorded as the key it is.
+                    *pending_key = Some(match value {
+                        serde_json::Value::String(key) => key,
+                        other => other.to_string(),
+                    });
+                } else {
+                    let key = pending_key.take().unwrap_or_default();
+                    entries.insert(key, value);
+                }
+                *expecting_key = !*expecting_key;
+            }
+        }
+    }
+
+    /// Open `frame`, write the composite's children into it, then close it and place the
+    /// composite itself.
+    fn composite(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        frame: RecordedFrame,
+        write_children: &dyn Fn(
+            &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+        ) -> Result<(), ::aws_smithy_schema::serde::SerdeError>,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if self.is_sensitive(schema) {
+            self.place(
+                schema,
+                serde_json::Value::String(HIDDEN_SENSITIVE_VALUE.to_string()),
+            );
+            return Ok(());
+        }
+        if self.full() {
+            self.skipped();
+            return Ok(());
+        }
+        self.stack.push(frame);
+        let out = write_children(self);
+        let closed = match self.stack.pop() {
+            Some(RecordedFrame::Structure(members)) => serde_json::Value::Object(members),
+            Some(RecordedFrame::List(elements)) => serde_json::Value::Array(elements),
+            Some(RecordedFrame::Map { entries, .. }) => serde_json::Value::Object(entries),
+            // Unreachable: the frame just pushed is the one popped here.
+            None => serde_json::Value::Null,
+        };
+        self.place(schema, closed);
+        out
+    }
+
+    /// Place one leaf, or the redaction literal when the member it fills is sensitive.
+    fn leaf(&mut self, schema: &::aws_smithy_schema::Schema, value: serde_json::Value) {
+        if self.is_sensitive(schema) {
+            self.place(
+                schema,
+                serde_json::Value::String(HIDDEN_SENSITIVE_VALUE.to_string()),
+            );
+            return;
+        }
+        if self.full() {
+            self.skipped();
+            return;
+        }
+        self.place(schema, value);
+    }
+
+    /// A Smithy `document` as the JSON it already is, BOUNDED like the rest of the walk.
+    ///
+    /// A document's shape is the caller's to choose, so neither its depth nor its size is
+    /// the record's to follow: `depth` stops at [`MAX_RECORDED_DEPTH`] — which is what
+    /// keeps this recursion shallow whatever the request nested — and every value
+    /// produced counts against [`MAX_RECORDED_VALUES`], the same budget the schema walk
+    /// spends. A collection stops producing values the moment that budget is spent and
+    /// carries ONE [`TRUNCATED_BY_RECORD_LIMIT`] entry saying where the walk stopped, so
+    /// what the record holds is sized by the budget and not by how many elements the
+    /// request nested.
+    fn recorded_document(
+        &mut self,
+        value: &::aws_smithy_types::Document,
+        depth: usize,
+    ) -> serde_json::Value {
+        use ::aws_smithy_types::{Document, Number};
+
+        self.written += 1;
+        if depth >= MAX_RECORDED_DEPTH || self.written >= MAX_RECORDED_VALUES {
+            return serde_json::Value::String(TRUNCATED_BY_RECORD_LIMIT.to_string());
+        }
+        match value {
+            Document::Null => serde_json::Value::Null,
+            Document::Bool(flag) => serde_json::json!(flag),
+            Document::String(text) => serde_json::json!(text),
+            Document::Number(Number::PosInt(number)) => serde_json::json!(number),
+            Document::Number(Number::NegInt(number)) => serde_json::json!(number),
+            Document::Number(Number::Float(number)) => serde_json::json!(number),
+            Document::Array(elements) => {
+                let mut recorded = Vec::new();
+                for element in elements {
+                    if self.written >= MAX_RECORDED_VALUES {
+                        recorded.push(serde_json::Value::String(
+                            TRUNCATED_BY_RECORD_LIMIT.to_string(),
+                        ));
+                        break;
+                    }
+                    recorded.push(self.recorded_document(element, depth + 1));
+                }
+                serde_json::Value::Array(recorded)
+            }
+            Document::Object(members) => {
+                let mut recorded = serde_json::Map::new();
+                for (name, member) in members {
+                    if self.written >= MAX_RECORDED_VALUES {
+                        recorded.insert(
+                            TRUNCATED_BY_RECORD_LIMIT.to_string(),
+                            serde_json::Value::Null,
+                        );
+                        break;
+                    }
+                    recorded.insert(name.clone(), self.recorded_document(member, depth + 1));
+                }
+                serde_json::Value::Object(recorded)
+            }
+        }
+    }
+}
+
+impl ::aws_smithy_schema::serde::ShapeSerializer for RecordedShape<'_> {
+    fn write_struct(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        let write_members = |s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer| {
+            value.serialize_members(s)
+        };
+        self.composite(
+            schema,
+            RecordedFrame::Structure(serde_json::Map::new()),
+            &write_members,
+        )
+    }
+
+    fn write_list(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        write_elements: &dyn Fn(
+            &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+        ) -> Result<(), ::aws_smithy_schema::serde::SerdeError>,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.composite(schema, RecordedFrame::List(Vec::new()), write_elements)
+    }
+
+    fn write_map(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        write_entries: &dyn Fn(
+            &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+        ) -> Result<(), ::aws_smithy_schema::serde::SerdeError>,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.composite(
+            schema,
+            RecordedFrame::Map {
+                entries: serde_json::Map::new(),
+                pending_key: None,
+                expecting_key: true,
+            },
+            write_entries,
+        )
+    }
+
+    fn write_boolean(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: bool,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_byte(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: i8,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_short(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: i16,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_integer(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: i32,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_long(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: i64,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_float(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: f32,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_double(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: f64,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_big_integer(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: &::aws_smithy_types::BigInteger,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // A big integer and a big decimal travel as their digits, which is how a record
+        // reports one: a JSON number cannot hold either without losing precision.
+        self.leaf(schema, serde_json::json!(value.as_ref()));
+        Ok(())
+    }
+
+    fn write_big_decimal(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: &::aws_smithy_types::BigDecimal,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value.as_ref()));
+        Ok(())
+    }
+
+    fn write_string(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: &str,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.leaf(schema, serde_json::json!(value));
+        Ok(())
+    }
+
+    fn write_blob(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: &[u8],
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // A record reports a blob's SIZE, never its bytes: the bytes are the caller's
+        // payload, and an event document is not where a payload is stored.
+        self.leaf(schema, serde_json::json!(value.len()));
+        Ok(())
+    }
+
+    fn write_timestamp(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: &::aws_smithy_types::DateTime,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // The same ISO 8601 rendering an event's own `eventTime` carries.
+        let rendered = value
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_default();
+        self.leaf(schema, serde_json::json!(rendered));
+        Ok(())
+    }
+
+    fn write_document(
+        &mut self,
+        schema: &::aws_smithy_schema::Schema,
+        value: &::aws_smithy_types::Document,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // A position whose value is withheld, and one past what this record holds, need
+        // no walk of the document at all: `leaf` writes the redaction literal for the
+        // first and nothing for the second.
+        if self.is_sensitive(schema) || self.full() {
+            self.leaf(schema, serde_json::Value::Null);
+            return Ok(());
+        }
+        let document = self.recorded_document(value, 0);
+        self.leaf(schema, document);
+        Ok(())
+    }
+
+    fn write_null(
+        &mut self,
+        _schema: &::aws_smithy_schema::Schema,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Nothing is recorded: CloudTrail records what the call CARRIED, so a member with
+        // no value is left out of the document rather than written as null. The position
+        // is still accounted for, so a map's key/value alternation stays in step.
+        self.skipped();
+        Ok(())
+    }
+}
+
+/// What a record carries in place of a part of a `document` member that lies past the
+/// walk's ceilings ([`MAX_RECORDED_DEPTH`] / [`MAX_RECORDED_VALUES`]).
+///
+/// An EMULATOR ceiling, not anything CloudTrail does: a `document` member's shape is the
+/// caller's to choose, so the walk over one is bounded like every other part of a record
+/// and says where it stopped rather than reporting a value it did not read.
+pub const TRUNCATED_BY_RECORD_LIMIT: &str = "(truncated: past this record's limit)";
+
+/// How many bytes of JSON one record's `requestParameters` or `responseElements` may
+/// carry.
+///
+/// Another EMULATOR ceiling, for the same reason as [`MAX_RECORDED_VALUES`] and
+/// independent of how a walk terminated: the values a request carries are sized by the
+/// caller, every served call appends a record, and the log keeps up to
+/// [`MAX_RECORDED_EVENTS`] of them, so one record's footprint is capped here rather than
+/// by what was sent. A document past it is replaced WHOLE by
+/// [`TRUNCATED_BY_RECORD_LIMIT`]: a record that says it withheld the parameters is
+/// honest, while one holding half a document would not be.
+pub const MAX_RECORDED_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// `document` as a record carries it: itself when its JSON fits in
+/// [`MAX_RECORDED_DOCUMENT_BYTES`], else the truncation marker alone.
+fn within_record_limit(document: serde_json::Value) -> serde_json::Value {
+    // `to_string` renders exactly the bytes the record would carry, so the measurement is
+    // of the document itself rather than of an estimate.
+    if document.to_string().len() <= MAX_RECORDED_DOCUMENT_BYTES {
+        document
+    } else {
+        serde_json::Value::String(TRUNCATED_BY_RECORD_LIMIT.to_string())
+    }
+}
+
+/// The error code and message an outcome carries: `(None, None)` for a success.
+///
+/// Read off the operation's own error channel, so the code a record carries is the FAULT
+/// SHAPE's own name — which is what CloudTrail records, and not always the code the
+/// caller saw: a query-protocol error renders its `awsQueryError` code on the wire
+/// (`DBInstanceNotFound`) while the record names the shape (`DBInstanceNotFoundFault`).
+/// The modelled error's `Display` prefixes that same shape name, which the record already
+/// carries as its `errorCode`, so the message is recorded alone.
 pub fn recorded_failure<T, E>(outcome: &Result<T, E>) -> (Option<String>, Option<String>)
 where
     E: ::smithy_server_runtime::OperationError + std::fmt::Display,
@@ -417,8 +912,14 @@ impl ManagementEventLog {
     /// records past [`MAX_RECORDED_EVENTS`], are dropped. Both are owed at this instant
     /// whether or not anybody recorded anything, so the write path is where they are
     /// materialised.
-    pub fn record(&mut self, call: ServedApiCall, at: SystemTime) -> String {
+    ///
+    /// The parameters and the response a record carries are held to
+    /// [`MAX_RECORDED_DOCUMENT_BYTES`] here, where every recorder passes, so one record's
+    /// footprint is bounded whatever built the documents.
+    pub fn record(&mut self, mut call: ServedApiCall, at: SystemTime) -> String {
         self.prune(at);
+        call.request_parameters = within_record_limit(call.request_parameters);
+        call.response_elements = call.response_elements.map(within_record_limit);
         self.next_seq = self.next_seq.saturating_add(1);
         let event = ManagementEvent {
             seq: self.next_seq,
@@ -695,6 +1196,138 @@ mod tests {
                 "case {case:?}: expected user name {user_name:?}, got {caller:?}"
             );
         }
+    }
+
+    /// A record spells a modelled member with a lower-case first letter and keeps the
+    /// rest of the model's own casing — for every shape of name the models use.
+    #[test]
+    fn a_recorded_member_keeps_every_letter_but_the_first() {
+        // (the modelled member name, the name a record spells it with)
+        for (modelled, expected) in [
+            ("DBInstanceIdentifier", "dBInstanceIdentifier"),
+            ("Engine", "engine"),
+            ("MasterUserPassword", "masterUserPassword"),
+            ("KmsKeyId", "kmsKeyId"),
+            ("PerformanceInsightsKMSKeyId", "performanceInsightsKMSKeyId"),
+            // Already lower-case first: nothing changes.
+            ("identityPoolId", "identityPoolId"),
+            ("", ""),
+        ] {
+            let actual = recorded_member_name(modelled);
+            assert_eq!(
+                actual, expected,
+                "case {modelled:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A `document` member nested past the walk's ceiling is TRUNCATED rather than
+    /// followed: the walk's recursion is bounded by [`MAX_RECORDED_DEPTH`] whatever the
+    /// caller nested, so a deep document cannot exhaust the stack.
+    #[test]
+    fn a_deeply_nested_document_is_truncated_rather_than_followed() {
+        use ::aws_smithy_types::Document;
+
+        /// Far past the ceiling, and shallow enough that building the value here is
+        /// itself cheap.
+        const NESTED: usize = MAX_RECORDED_DEPTH * 8;
+
+        let mut document = Document::String("leaf".to_string());
+        for _ in 0..NESTED {
+            document = Document::Array(vec![document]);
+        }
+        let mut walk = RecordedShape {
+            stack: Vec::new(),
+            root: serde_json::Value::Null,
+            sensitive_members: &[],
+            written: 0,
+        };
+        let recorded = walk.recorded_document(&document, 0);
+
+        // How deep the RECORDED value goes, which is what the ceiling bounds.
+        let mut reached = 0;
+        let mut at = &recorded;
+        while let Some(inner) = at.as_array().and_then(|elements| elements.first()) {
+            reached += 1;
+            at = inner;
+        }
+        assert!(
+            reached <= MAX_RECORDED_DEPTH,
+            "case {NESTED} levels: expected at most {MAX_RECORDED_DEPTH} recorded levels, \
+             got {reached} in {recorded}"
+        );
+        assert_eq!(
+            at.as_str(),
+            Some(TRUNCATED_BY_RECORD_LIMIT),
+            "case {NESTED} levels: expected the deepest recorded value to say it was \
+             truncated, got {at}"
+        );
+    }
+
+    /// A `document` member with more elements than one record holds stops being read when
+    /// that budget is spent: what the record carries is sized by the budget, not by how
+    /// many elements the request carried.
+    #[test]
+    fn a_wide_document_stops_at_the_record_budget() {
+        use ::aws_smithy_types::Document;
+
+        /// Far more elements than [`MAX_RECORDED_VALUES`].
+        const ELEMENTS: usize = MAX_RECORDED_VALUES * 4;
+
+        let wide = Document::Array(
+            (0..ELEMENTS)
+                .map(|at| Document::String(format!("element-{at}")))
+                .collect(),
+        );
+        let mut walk = RecordedShape {
+            stack: Vec::new(),
+            root: serde_json::Value::Null,
+            sensitive_members: &[],
+            written: 0,
+        };
+        let recorded = walk.recorded_document(&wide, 0);
+        let elements = recorded
+            .as_array()
+            .unwrap_or_else(|| panic!("case {ELEMENTS} elements: expected a list, got {recorded}"));
+        assert!(
+            elements.len() <= MAX_RECORDED_VALUES,
+            "case {ELEMENTS} elements: expected at most {MAX_RECORDED_VALUES} recorded \
+             elements, got {}",
+            elements.len()
+        );
+        assert_eq!(
+            elements.last().and_then(serde_json::Value::as_str),
+            Some(TRUNCATED_BY_RECORD_LIMIT),
+            "case {ELEMENTS} elements: expected one entry saying where the walk stopped, \
+             got {:?}",
+            elements.last()
+        );
+    }
+
+    /// A record's documents are held to a byte ceiling wherever they came from, so one
+    /// record's footprint is bounded even when the walk that built it finished.
+    #[test]
+    fn a_document_past_the_byte_ceiling_is_withheld_whole() {
+        let mut log = ManagementEventLog::default();
+        let mut oversized = call("CreateTrail");
+        oversized.request_parameters =
+            serde_json::json!({"name": "x".repeat(MAX_RECORDED_DOCUMENT_BYTES + 1)});
+        oversized.response_elements = Some(serde_json::json!({"name": "kept"}));
+        log.record(oversized, SystemTime::now());
+
+        let event = log.iter().next().expect("the recorded event");
+        assert_eq!(
+            event.call.request_parameters,
+            serde_json::json!(TRUNCATED_BY_RECORD_LIMIT),
+            "case past the ceiling: expected the parameters to be withheld whole, got {}",
+            event.call.request_parameters
+        );
+        assert_eq!(
+            event.call.response_elements,
+            Some(serde_json::json!({"name": "kept"})),
+            "case inside the ceiling: expected the response as it was, got {:?}",
+            event.call.response_elements
+        );
     }
 
     /// A member the call did not carry is left OUT of the record, so a reader cannot

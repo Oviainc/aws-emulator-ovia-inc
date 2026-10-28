@@ -1603,6 +1603,35 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             .expect("the id generator is infinite")
     }
 
+    /// Remove ONE identity with everything that named it — the logins its pool indexed
+    /// against it, its place in the pool's listing order, the credentials outstanding for
+    /// it and the OpenID Connect tokens issued for it — and report the access key ids whose
+    /// credentials the caller must now forget. `None` when this service holds no such
+    /// identity, so nothing was written.
+    ///
+    /// The same teardown [`Self::delete_identity_pool`] does for every identity of a pool
+    /// and [`Self::merge_identity_into`] does for the identity a merge gave up: once the
+    /// identity is gone, a login that resolved to it resolves nothing (so presenting it
+    /// again is a NEW user), a listing of the pool no longer names it, and the credentials
+    /// and tokens that spoke for it speak for nobody.
+    pub fn delete_identity(&mut self, identity_id: &str) -> Option<Vec<String>> {
+        let identity = self.identities.remove(identity_id)?;
+        if let Some(identities) = self.identities_by_pool.get_mut(&identity.identity_pool_id) {
+            identities.retain(|listed| listed != identity_id);
+        }
+        self.login_index
+            .retain(|(pool, _, _), linked| !(*pool == identity.identity_pool_id && linked == identity_id));
+        self.open_id_tokens
+            .retain(|_, issued| issued.identity_id != identity_id);
+        Some(
+            self.credentials
+                .remove(identity_id)
+                .map(|issued| issued.access_key_id)
+                .into_iter()
+                .collect(),
+        )
+    }
+
     /// Remove a pool with everything that belongs to it — its identities, their login
     /// index entries, their outstanding credentials, the OIDC tokens it issued and the
     /// principal-tag attribute maps of its providers — and

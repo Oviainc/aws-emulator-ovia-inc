@@ -334,6 +334,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this
+        // completion owes names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
+        let output = self.store(input, ctx, &correlation)?;
+        // Recorded LAST, so the response carries the pair the notifications already named
+        // this call by.
+        correlation.answer();
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipartUpload<Eng> {
+    /// Assemble the upload this request names, answering what the caller is told and
+    /// starting the notifications the bucket's configuration owes for it.
+    ///
+    /// Everything that reads or writes the store lives here, so the guard is released
+    /// when this returns.
+    fn store(
+        &self,
+        input: CompleteMultipartUploadInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        correlation: &crate::state::request_ids::RequestCorrelation,
+    ) -> Result<CompleteMultipartUploadOutput, CompleteMultipartUploadError> {
         // A completion needs nothing from the request beyond its deserialized input: the
         // upload it assembles is named by the bucket, the key and the upload id, and the
         // parts to assemble arrive as the `@httpPayload` member `MultipartUpload`.
@@ -641,7 +665,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(object) => created.of_object(object),
             None => created,
         };
-        let pending = crate::state::notifications::pending(&store, &input.bucket, &[created]);
+        let pending =
+            crate::state::notifications::pending(&store, &input.bucket, &[created], correlation);
 
         let output = CompleteMultipartUploadOutput {
             // "The URI that identifies the newly created object"

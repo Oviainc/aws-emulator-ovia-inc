@@ -8,9 +8,9 @@
 //! becomes part of the cross-stack reference index — `ListImports(ExportName)` reports the
 //! name of every live stack of that Region whose deployed template resolved an import for
 //! it, and while that index names an importer, deleting the EXPORTING stack is ACCEPTED and
-//! then cancelled, leaving the stack where it was with a reason naming the export and the
-//! importing stack (the cancellation itself is pinned by
-//! `delete_canceled_export_in_use.rs`). Once the last importer is gone the byte-identical
+//! then FAILS, leaving the stack where it was in the terminal `DELETE_FAILED` status with a
+//! reason naming the export and the importing stack (that outcome itself is pinned by
+//! `delete_stack_export_in_use.rs`). Once the last importer is gone the byte-identical
 //! `DeleteStack` succeeds and the export disappears from `ListExports`.
 //!
 //! Every case drives the real request path (form-encoded body in, XML envelope out) through
@@ -241,7 +241,7 @@ async fn an_import_resolves_and_puts_the_importing_stack_in_the_export_index() {
 }
 
 #[tokio::test]
-async fn deleting_an_exporting_stack_is_canceled_while_an_importer_holds_its_export() {
+async fn deleting_an_exporting_stack_fails_while_an_importer_holds_its_export() {
     let router = router();
     deploy_exporter(&router, "held-exporter").await;
 
@@ -263,8 +263,8 @@ async fn deleting_an_exporting_stack_is_canceled_while_an_importer_holds_its_exp
     );
 
     // While the index names an importer, deleting the EXPORTING stack is accepted and then
-    // cancelled: the stack is left where it was, and says which export and which importer
-    // stood in the way.
+    // FAILS: the stack is left where it was, in the terminal failed delete status, and says
+    // which export and which importer stood in the way.
     let (status, body) = call(
         &router,
         "DeleteStack",
@@ -290,9 +290,8 @@ async fn deleting_an_exporting_stack_is_canceled_while_an_importer_holds_its_exp
     );
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("CREATE_COMPLETE"),
-        "case {:?}: expected the cancelled delete to leave the exporter where it was, got \
-         {body}",
+        Some("DELETE_FAILED"),
+        "case {:?}: expected the blocked delete to end in DELETE_FAILED, got {body}",
         "deleting the exporter while its export is in use"
     );
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();

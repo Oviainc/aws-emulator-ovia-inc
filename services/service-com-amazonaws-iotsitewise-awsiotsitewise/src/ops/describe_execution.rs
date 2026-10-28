@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports, from the shared engine store (`crate::state`),
+//! the ONE execution its `executionId` names — the action type it ran, the resource and
+//! resource version it ran against, what it resolves to, when it started and the run as
+//! the clock has it (still running until its run is due to end, its outcome and end time
+//! from then on) — and writes nothing; an id no execution is recorded under is a modelled
+//! refusal. This is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +169,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeExecution"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        // Nothing an execution carries is scoped to the caller's region, so this read
+        // takes no value off the request itself beyond the id it addresses.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // An execution is addressed by its own id, so an id no execution is
+        // recorded under addresses nothing: the modelled not-found refusal, in the
+        // wording every other read of this service uses.
+        let record = store.executions.get(&input.execution_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_EXECUTION,
+                &input.execution_id,
+            ))
+        })?;
+
+        // Every member read off the stored record, through the same rules the
+        // listing over that record reports it by — the state its run has reached
+        // and the instant it ended are DERIVED from when that run falls due — so a
+        // read of one execution and a listing holding it cannot disagree, and
+        // reading one writes nothing.
+        Ok(DescribeExecutionOutput {
+            execution_id: record.execution_id.clone(),
+            action_type: record.action_type.clone(),
+            target_resource: record.target_resource.clone(),
+            target_resource_version: record.target_resource_version.clone(),
+            resolve_to: record.resolve_to.clone(),
+            execution_start_time: crate::state::to_date_time(record.execution_start_time),
+            execution_end_time: record.execution_end_time(now).map(crate::state::to_date_time),
+            execution_status: record.status(now),
+            // "The result of the execution" and the detail map beside it report the
+            // metrics and timestamps of an anomaly detection model this emulator
+            // runs none of, so there is no result and no detail to report: a metric
+            // or a timestamp for work that nothing ran would be invented rather
+            // than observed.
+            execution_result: None,
+            execution_details: None,
+            execution_entity_version: record.execution_entity_version.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeExecutionError {
+    DescribeExecutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> DescribeExecutionError {
+    DescribeExecutionErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }

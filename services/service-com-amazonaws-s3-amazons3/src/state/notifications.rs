@@ -26,6 +26,11 @@
 //!   only while the bucket's configuration carries an `EventBridgeConfiguration`, which
 //!   "enables delivery of events to Amazon EventBridge".
 //!
+//! Every notification NAMES THE CALL it came of, by the request-correlation pair that
+//! call's own response carries ([`super::request_ids`]): the `Records` envelope reports
+//! both in its `responseElements` and the EventBridge detail reports the request id as
+//! its `request-id`, which is how a consumer tells which API call produced which event.
+//!
 //! Delivery is BEST EFFORT and never changes what the operation answers: S3 publishes a
 //! notification asynchronously, after the write that produced it was accepted, so a write
 //! into a bucket whose destination service is not mounted on this engine still succeeds.
@@ -38,6 +43,7 @@
 
 use ::std::time::SystemTime;
 
+use super::request_ids::RequestCorrelation;
 use super::{bucket_arn, canonical_user_id, NotificationTarget};
 
 /// The `eventSource` of every record S3 publishes.
@@ -415,7 +421,7 @@ impl Pending {
 pub const MAX_DELIVERIES_PER_REQUEST: usize = 1_000;
 
 /// The notifications `events` owe on the bucket named `bucket`, according to the
-/// configuration that bucket carries.
+/// configuration that bucket carries, each naming the call they came of by `correlation`.
 ///
 /// Computed while the caller still holds the store, because what is notified depends on
 /// the bucket's configuration and on the object the change left behind. A bucket this
@@ -426,6 +432,7 @@ pub fn pending(
     store: &super::ComAmazonawsS3Amazons3State,
     bucket: &str,
     events: &[ObjectEvent],
+    correlation: &RequestCorrelation,
 ) -> Pending {
     let Some(record) = store.bucket(bucket) else {
         return Pending::default();
@@ -450,7 +457,7 @@ pub fn pending(
                 deliveries.push(Delivery::EventBridge {
                     region: bucket_region.clone(),
                     detail_type,
-                    detail: event_bridge_detail(bucket, event).to_string(),
+                    detail: event_bridge_detail(bucket, event, correlation).to_string(),
                     resource: bucket_arn(bucket),
                 });
             }
@@ -467,7 +474,8 @@ pub fn pending(
             // destination ARN carries one (`super::validate_notification_configuration`
             // refuses one that does not) — falling back to the bucket's Region.
             let region = destination_region(&target.arn).unwrap_or(&bucket_region);
-            let body = records_envelope(bucket, &bucket_region, target, event).to_string();
+            let body =
+                records_envelope(bucket, &bucket_region, target, event, correlation).to_string();
             deliveries.push(match destination {
                 super::NotificationDestination::Queue => match queue_url(&target.arn) {
                     Some(url) => Delivery::Queue {
@@ -534,6 +542,7 @@ fn records_envelope(
     bucket_region: &str,
     target: &NotificationTarget,
     event: &ObjectEvent,
+    correlation: &RequestCorrelation,
 ) -> ::serde_json::Value {
     let mut object = ::serde_json::json!({
         "key": record_key(&event.key),
@@ -543,7 +552,7 @@ fn records_envelope(
         object["size"] = ::serde_json::json!(size);
     }
     if let Some(etag) = event.etag.as_deref() {
-        object["eTag"] = ::serde_json::json!(etag);
+        object["eTag"] = ::serde_json::json!(super::unquoted_etag(etag));
     }
     if let Some(version_id) = event.version_id.as_deref() {
         object["versionId"] = ::serde_json::json!(version_id);
@@ -555,6 +564,17 @@ fn records_envelope(
             "awsRegion": bucket_region,
             "eventTime": event_instant(event.at),
             "eventName": event.kind.record_event_name(),
+            // "The Amazon Web Services account ID or IAM user who made the request" —
+            // this emulator serves one account, named by the canonical user id every
+            // other S3 response names an owner by.
+            "userIdentity": { "principalId": canonical_user_id() },
+            // "The response elements … useful if you want to trace a request by
+            // following up with AWS Support": the pair the response of the call that
+            // produced this event carried.
+            "responseElements": {
+                "x-amz-request-id": correlation.request_id.clone(),
+                "x-amz-id-2": correlation.extended_request_id.clone(),
+            },
             "s3": {
                 "s3SchemaVersion": S3_SCHEMA_VERSION,
                 // "The ID found in the bucket notification configuration" — the id of
@@ -576,11 +596,15 @@ fn records_envelope(
 ///
 /// The members are the ones the EventBridge reference publishes for an `aws.s3` event:
 /// the detail version, the bucket's name, the object's key with the facts S3 holds about
-/// it, the account that made the change and the reason it happened. Nothing is filled in
-/// that this emulator does not know — a request id and a source IP address belong to the
-/// request that made the change, which no part of this emulator records, so they are
-/// omitted rather than invented.
-fn event_bridge_detail(bucket: &str, event: &ObjectEvent) -> ::serde_json::Value {
+/// it, the account that made the change, the request that made it and the reason it
+/// happened. Nothing is filled in that this emulator does not know — a source IP address
+/// belongs to the socket the request arrived on, which no handler of this emulator is
+/// given, so it is omitted rather than invented.
+fn event_bridge_detail(
+    bucket: &str,
+    event: &ObjectEvent,
+    correlation: &RequestCorrelation,
+) -> ::serde_json::Value {
     let mut object = ::serde_json::json!({
         "key": event.key,
         "sequencer": event.sequencer(),
@@ -589,7 +613,7 @@ fn event_bridge_detail(bucket: &str, event: &ObjectEvent) -> ::serde_json::Value
         object["size"] = ::serde_json::json!(size);
     }
     if let Some(etag) = event.etag.as_deref() {
-        object["etag"] = ::serde_json::json!(etag);
+        object["etag"] = ::serde_json::json!(super::unquoted_etag(etag));
     }
     if let Some(version_id) = event.version_id.as_deref() {
         object["version-id"] = ::serde_json::json!(version_id);
@@ -598,6 +622,7 @@ fn event_bridge_detail(bucket: &str, event: &ObjectEvent) -> ::serde_json::Value
         "version": EVENT_BRIDGE_DETAIL_VERSION,
         "bucket": { "name": bucket },
         "object": object,
+        "request-id": correlation.request_id.clone(),
         "requester": ::engine::emulator_account_id(),
         "reason": event.kind.event_bridge_reason(),
     });
@@ -1032,7 +1057,7 @@ mod tests {
             ("a prefixed key", "input/2026/report.json", "input/2026/report.json"),
             ("a key with a space", "red flower.jpg", "red+flower.jpg"),
             ("a key with parentheses", "test_file(3).png", "test_file%283%29.png"),
-            ("a non-ASCII key", "caf\u{e9}.txt", "caf%C3%A9.txt"),
+            ("a non-ASCII key", "café.txt", "caf%C3%A9.txt"),
         ];
         for (case, key, expected) in rows {
             let published = record_key(key);
@@ -1098,5 +1123,61 @@ mod tests {
                 "case {case:?}: expected {arn:?} to resolve to {expected:?}, got {url:?}"
             );
         }
+    }
+
+    /// Both documents name the CALL the event came of, by the pair that call's own
+    /// response carried — and report an ETag WITHOUT the quotes the store holds it in.
+    #[test]
+    fn both_documents_name_the_call_the_event_came_of() {
+        let correlation = RequestCorrelation {
+            request_id: "0123456789ABCDEF".to_string(),
+            extended_request_id: "a".repeat(64),
+        };
+        let event = ObjectEvent {
+            size: Some(11),
+            etag: Some("\"d41d8cd98f00b204e9800998ecf8427e\"".to_string()),
+            ..ObjectEvent::new(ObjectEventKind::CreatedByPut, "input/report.json")
+        };
+        let target = NotificationTarget {
+            id: Some("queue-configuration".to_string()),
+            arn: "arn:aws:sqs:us-east-1:000000000000:object-events".to_string(),
+            events: vec!["s3:ObjectCreated:*".to_string()],
+            filter_rules: None,
+        };
+
+        let envelope = records_envelope("bucket", "us-east-1", &target, &event, &correlation);
+        let record = &envelope["Records"][0];
+        assert_eq!(
+            record["responseElements"]["x-amz-request-id"],
+            ::serde_json::json!(correlation.request_id),
+            "case \"the records envelope\": expected the call's own request id, got {:?}",
+            record["responseElements"]["x-amz-request-id"]
+        );
+        assert_eq!(
+            record["responseElements"]["x-amz-id-2"],
+            ::serde_json::json!(correlation.extended_request_id),
+            "case \"the records envelope\": expected the call's own extended id, got {:?}",
+            record["responseElements"]["x-amz-id-2"]
+        );
+        assert_eq!(
+            record["s3"]["object"]["eTag"],
+            ::serde_json::json!("d41d8cd98f00b204e9800998ecf8427e"),
+            "case \"the records envelope\": expected an unquoted eTag, got {:?}",
+            record["s3"]["object"]["eTag"]
+        );
+
+        let detail = event_bridge_detail("bucket", &event, &correlation);
+        assert_eq!(
+            detail["request-id"],
+            ::serde_json::json!(correlation.request_id),
+            "case \"the EventBridge detail\": expected the call's own request id, got {:?}",
+            detail["request-id"]
+        );
+        assert_eq!(
+            detail["object"]["etag"],
+            ::serde_json::json!("d41d8cd98f00b204e9800998ecf8427e"),
+            "case \"the EventBridge detail\": expected an unquoted etag, got {:?}",
+            detail["object"]["etag"]
+        );
     }
 }

@@ -384,3 +384,76 @@ pub fn check_result(account_id: &str, workload_owner: &str) -> CheckResult {
         reason: CHECK_REASON_ASSUME_ROLE_ERROR,
     }
 }
+
+/// Every `CheckStatus` member in the model's own declared order
+/// (`smithy_query(query="shape", shape="CheckStatus")`), which runs from the state that
+/// reports no finding, through the findings in increasing gravity, to the two that say the
+/// check produced no result for the account at all.
+///
+/// That order is the precedence a check's ONE status over several accounts is taken at
+/// ([`check_account_summary`]): the model gives a summary a single `Status` beside the
+/// per-status account counts without saying how the two relate, so the status reported is
+/// the one furthest along this order that any related account carries — a summary cannot
+/// claim a finding describes the whole workload while an account produced no result at all.
+pub const CHECK_STATUS_BY_SEVERITY: &[&str] = &[
+    "OKAY",
+    "WARNING",
+    "ERROR",
+    CHECK_STATUS_NOT_AVAILABLE,
+    CHECK_STATUS_FETCH_FAILED,
+];
+
+/// Where `status` sits in [`CHECK_STATUS_BY_SEVERITY`]; a value that order does not name
+/// ranks past every one it does, so an unranked status is never hidden behind a ranked one.
+fn check_status_severity(status: &str) -> usize {
+    CHECK_STATUS_BY_SEVERITY
+        .iter()
+        .position(|ranked| *ranked == status)
+        .unwrap_or(CHECK_STATUS_BY_SEVERITY.len())
+}
+
+/// One check SUMMARIZED over the accounts related to a workload: how many of them carry
+/// each `CheckStatus`, and the one status the check carries for the workload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckAccountSummary {
+    /// `CheckSummary$Status` — the status furthest along [`CHECK_STATUS_BY_SEVERITY`] that
+    /// any of the accounts carries.
+    pub status: &'static str,
+    /// `CheckSummary$AccountSummary` — "account summary associated to the check"
+    /// (`smithy_query(query="shape", shape="CheckSummary")`): the number of accounts the
+    /// check carries each status in, which is why `CheckStatusCount` is bounded at 101, one
+    /// per account a workload can relate to (`WorkloadAccountIds` holds at most 100 beside
+    /// the account the workload lives in). A status no account carries has no entry, so
+    /// every count is at least the 1 that bound's minimum requires.
+    pub accounts_by_status: std::collections::HashMap<String, i32>,
+}
+
+/// Summarize ONE check over `account_ids`, the accounts related to a workload
+/// ([`super::WorkloadRecord::check_account_ids`]), from what that check reports for each of
+/// them ([`check_result`]).
+///
+/// `None` for no account at all: a summary states a status and a per-status count, and with
+/// nothing to count there is neither.
+pub fn check_account_summary(
+    account_ids: &[String],
+    workload_owner: &str,
+) -> Option<CheckAccountSummary> {
+    let mut accounts_by_status: std::collections::HashMap<String, i32> =
+        std::collections::HashMap::new();
+    let mut status: Option<&'static str> = None;
+    for account_id in account_ids {
+        let result = check_result(account_id, workload_owner);
+        *accounts_by_status
+            .entry(result.status.to_string())
+            .or_insert(0) += 1;
+        if status.is_none_or(|current| {
+            check_status_severity(result.status) > check_status_severity(current)
+        }) {
+            status = Some(result.status);
+        }
+    }
+    status.map(|status| CheckAccountSummary {
+        status,
+        accounts_by_status,
+    })
+}

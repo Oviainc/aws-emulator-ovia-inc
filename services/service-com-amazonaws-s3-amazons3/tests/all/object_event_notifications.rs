@@ -18,6 +18,9 @@
 //!   same change is published onto the account's default event bus under the `aws.s3`
 //!   source and that event class's detail-type, so a rule matching it reaches its own
 //!   targets;
+//! * every notification NAMES THE CALL it came of, by the `x-amz-request-id` /
+//!   `x-amz-id-2` pair that call's own response carried, so a consumer can tell which API
+//!   call produced which event;
 //! * and a change no configuration names is delivered nowhere.
 //!
 //! Every assertion drives real HTTP requests through a router carrying S3 beside the
@@ -80,6 +83,7 @@ struct Emulator {
 /// What a dispatched request answered.
 struct Answer {
     status: u16,
+    headers: http::HeaderMap,
     body: bytes::Bytes,
 }
 
@@ -87,6 +91,28 @@ impl Answer {
     /// The body as text, for a failure message.
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
+    }
+
+    /// A response header's value.
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// The `x-amz-request-id` / `x-amz-id-2` pair this response named its request by —
+    /// "a value created by Amazon S3 that uniquely identifies the request" and "a special
+    /// token that helps Amazon Web Services troubleshoot problems" (Amazon S3 API
+    /// Reference, *Common Response Headers*), which every S3 response carries.
+    fn correlation(&self, case: &str) -> (String, String) {
+        let request_id = self
+            .header("x-amz-request-id")
+            .unwrap_or_else(|| panic!("case {case:?}: the response carried no x-amz-request-id"));
+        let extended = self
+            .header("x-amz-id-2")
+            .unwrap_or_else(|| panic!("case {case:?}: the response carried no x-amz-id-2"));
+        (request_id, extended)
     }
 }
 
@@ -142,6 +168,7 @@ impl Emulator {
         let (parts, body) = response.into_parts();
         Answer {
             status: parts.status.as_u16(),
+            headers: parts.headers,
             body,
         }
     }
@@ -213,13 +240,7 @@ impl Emulator {
             BucketKind::Plain | BucketKind::Versioned => &[],
         };
         let answer = self
-            .send(
-                "s3",
-                "PUT",
-                &format!("/{bucket}"),
-                headers,
-                Vec::new(),
-            )
+            .send("s3", "PUT", &format!("/{bucket}"), headers, Vec::new())
             .await;
         assert_eq!(
             answer.status,
@@ -251,8 +272,9 @@ impl Emulator {
         self.create_bucket_of(bucket, BucketKind::Plain).await;
     }
 
-    /// `PUT /<bucket>/<key>` — `PutObject`, with `body` as the object's bytes.
-    async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) {
+    /// `PUT /<bucket>/<key>` — `PutObject`, with `body` as the object's bytes. Answers
+    /// what the write reported, so a row can compare the notification against the call.
+    async fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Answer {
         let answer = self
             .send(
                 "s3",
@@ -269,10 +291,11 @@ impl Emulator {
             answer.status,
             answer.text()
         );
+        answer
     }
 
     /// `DELETE /<bucket>/<key>` — `DeleteObject`.
-    async fn delete_object(&self, bucket: &str, key: &str) {
+    async fn delete_object(&self, bucket: &str, key: &str) -> Answer {
         let answer = self
             .s3_xml("DELETE", &format!("/{bucket}/{}", request_key(key)), "")
             .await;
@@ -283,16 +306,14 @@ impl Emulator {
             answer.status,
             answer.text()
         );
+        answer
     }
 
     /// `POST /<bucket>?delete` — `DeleteObjects`, naming the one key.
-    async fn delete_objects(&self, bucket: &str, key: &str) {
-        let body = format!(
-            "<Delete xmlns=\"{XMLNS}\"><Object><Key>{key}</Key></Object></Delete>"
-        );
-        let answer = self
-            .s3_xml("POST", &format!("/{bucket}?delete"), &body)
-            .await;
+    async fn delete_objects(&self, bucket: &str, key: &str) -> Answer {
+        let body =
+            format!("<Delete xmlns=\"{XMLNS}\"><Object><Key>{key}</Key></Object></Delete>");
+        let answer = self.s3_xml("POST", &format!("/{bucket}?delete"), &body).await;
         assert_eq!(
             answer.status,
             200,
@@ -300,16 +321,16 @@ impl Emulator {
             answer.status,
             answer.text()
         );
+        answer
     }
 
     /// `PUT /<bucket>/<key>?retention` — `PutObjectRetention`, placing a governance-mode
     /// period an hour out, which the bucket's Object Lock configuration admits.
-    async fn put_object_retention(&self, bucket: &str, key: &str) {
-        let retain_until = ::aws_smithy_types::DateTime::from(
-            SystemTime::now() + Duration::from_secs(3_600),
-        )
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .expect("the test's own retention date must render as an ISO8601 date-time");
+    async fn put_object_retention(&self, bucket: &str, key: &str) -> Answer {
+        let retain_until =
+            ::aws_smithy_types::DateTime::from(SystemTime::now() + Duration::from_secs(3_600))
+                .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                .expect("the test's own retention date must render as an ISO8601 date-time");
         let body = format!(
             "<Retention xmlns=\"{XMLNS}\"><Mode>GOVERNANCE</Mode>\
              <RetainUntilDate>{retain_until}</RetainUntilDate></Retention>"
@@ -328,10 +349,11 @@ impl Emulator {
             answer.status,
             answer.text()
         );
+        answer
     }
 
     /// `PUT /<bucket>/<key>?tagging` — `PutObjectTagging`.
-    async fn put_object_tagging(&self, bucket: &str, key: &str) {
+    async fn put_object_tagging(&self, bucket: &str, key: &str) -> Answer {
         let body = format!(
             "<Tagging xmlns=\"{XMLNS}\"><TagSet><Tag><Key>reviewed</Key>\
              <Value>yes</Value></Tag></TagSet></Tagging>"
@@ -350,6 +372,7 @@ impl Emulator {
             answer.status,
             answer.text()
         );
+        answer
     }
 
     /// `PUT /<bucket>?notification` — `PutBucketNotificationConfiguration` with one
@@ -770,7 +793,9 @@ async fn an_object_change_reaches_every_destination_its_configuration_names() {
             )
             .await;
 
-        match row.change {
+        // The call the row is about, and the pair ITS OWN response named the request by:
+        // every notification below has to name the same one.
+        let answer = match row.change {
             Change::Write => emulator.put_object(&bucket, row.key, OBJECT_BODY).await,
             Change::Delete | Change::DeleteVersioned => {
                 emulator.delete_object(&bucket, row.key).await
@@ -778,7 +803,8 @@ async fn an_object_change_reaches_every_destination_its_configuration_names() {
             Change::DeleteBatch => emulator.delete_objects(&bucket, row.key).await,
             Change::Tag => emulator.put_object_tagging(&bucket, row.key).await,
             Change::Retain => emulator.put_object_retention(&bucket, row.key).await,
-        }
+        };
+        let (request_id, extended_request_id) = answer.correlation(case);
 
         // The event bus first: a row that expects nothing on the queue configuration
         // still waits for the bus delivery, so "nothing arrived" is a wait that the
@@ -807,6 +833,12 @@ async fn an_object_change_reaches_every_destination_its_configuration_names() {
                 Some(row.key),
                 "case {case:?}: expected detail.object.key {:?}, got {event}",
                 row.key
+            );
+            // The detail names the CALL it came of, by that call's own request id.
+            assert_eq!(
+                event["detail"]["request-id"].as_str(),
+                Some(request_id.as_str()),
+                "case {case:?}: expected detail.request-id {request_id:?}, got {event}"
             );
         } else {
             let delivered = emulator.nothing_delivered(&bus_url).await;
@@ -867,6 +899,21 @@ async fn an_object_change_reaches_every_destination_its_configuration_names() {
                         .is_some_and(|sequencer| !sequencer.is_empty()),
                     "case {case:?}: expected a sequencer on the record, got {message}"
                 );
+                // "The response elements … useful if you want to trace a request": the
+                // record names the CALL it came of, by the two correlation headers that
+                // call's own response carried.
+                assert_eq!(
+                    record["responseElements"]["x-amz-request-id"].as_str(),
+                    Some(request_id.as_str()),
+                    "case {case:?}: expected the call's own x-amz-request-id \
+                     {request_id:?}, got {message}"
+                );
+                assert_eq!(
+                    record["responseElements"]["x-amz-id-2"].as_str(),
+                    Some(extended_request_id.as_str()),
+                    "case {case:?}: expected the call's own x-amz-id-2 \
+                     {extended_request_id:?}, got {message}"
+                );
                 // A change that left an object at the key reports that object's size and
                 // entity tag; a removal reports neither, because there is nothing there
                 // to report them from.
@@ -876,11 +923,12 @@ async fn an_object_change_reaches_every_destination_its_configuration_names() {
                         Some(OBJECT_BODY.len() as i64),
                         "case {case:?}: expected the stored size, got {message}"
                     );
+                    // "The object etag … does not include the surrounding quotes": the
+                    // digest alone, as the ETag the write itself reported without them.
+                    let reported = record["s3"]["object"]["eTag"].as_str().unwrap_or_default();
                     assert!(
-                        record["s3"]["object"]["eTag"]
-                            .as_str()
-                            .is_some_and(|etag| !etag.is_empty()),
-                        "case {case:?}: expected the stored eTag, got {message}"
+                        !reported.is_empty() && !reported.contains('"'),
+                        "case {case:?}: expected an unquoted eTag, got {message}"
                     );
                 } else {
                     assert!(
@@ -962,7 +1010,8 @@ async fn a_write_invokes_the_function_a_lambda_configuration_names() {
         )
         .await;
 
-    emulator.put_object(bucket, key, OBJECT_BODY).await;
+    let written = emulator.put_object(bucket, key, OBJECT_BODY).await;
+    let (request_id, _) = written.correlation("lambda destination");
 
     // No modelled Lambda operation reports an accepted asynchronous invocation, so the
     // round trip is through Lambda's own state, which is where S3's invocation lands.
@@ -1016,6 +1065,12 @@ async fn a_write_invokes_the_function_a_lambda_configuration_names() {
         Some(OBJECT_BODY.len() as i64),
         "case \"lambda destination\": expected the stored size, got {event}"
     );
+    assert_eq!(
+        record["responseElements"]["x-amz-request-id"].as_str(),
+        Some(request_id.as_str()),
+        "case \"lambda destination\": expected the write's own x-amz-request-id \
+         {request_id:?}, got {event}"
+    );
 }
 
 #[tokio::test]
@@ -1042,4 +1097,137 @@ async fn a_bucket_with_no_notifications_configured_delivers_nothing() {
         "case \"no configuration\": a bucket with no event notifications configured must \
          publish nothing, got {delivered:?}"
     );
+}
+
+/// One row of the request-correlation table: the case, the method, the uri, the request
+/// headers, the request body, the status the call answers, and whether the answer is an
+/// error envelope — which names its request in the BODY as well, so the two have to agree.
+type CorrelationRow<'a> = (
+    &'a str,
+    &'a str,
+    String,
+    Vec<(&'a str, &'a str)>,
+    Vec<u8>,
+    u16,
+    bool,
+);
+
+/// The text of the first `<name>` element of `body`, when it carries one.
+fn body_element(body: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(body).into_owned();
+    text.split_once(&format!("<{name}>"))
+        .and_then(|(_, rest)| rest.split_once(&format!("</{name}>")))
+        .map(|(value, _)| value.to_string())
+}
+
+#[tokio::test]
+async fn every_response_names_the_one_request_it_answers() {
+    let emulator = Emulator::new();
+    let bucket = "notify-correlated";
+    let key = "reports/one.txt";
+
+    emulator.create_bucket(bucket).await;
+
+    // The rows differ along the kind of answer: a write and a subresource write (both of
+    // which publish an object event and so record the pair their notification names), a
+    // read, a 204 with no body at all, and a REFUSAL — every one of which carries the
+    // pair, because "a value created by Amazon S3 that uniquely identifies the request" is
+    // a common RESPONSE header rather than a success-only one.
+    let rows: Vec<CorrelationRow> = vec![
+        (
+            "a write",
+            "PUT",
+            format!("/{bucket}/{key}"),
+            vec![("content-type", "text/plain")],
+            OBJECT_BODY.to_vec(),
+            200,
+            false,
+        ),
+        (
+            "a read of what it wrote",
+            "GET",
+            format!("/{bucket}/{key}"),
+            vec![],
+            Vec::new(),
+            200,
+            false,
+        ),
+        (
+            "a subresource write",
+            "PUT",
+            format!("/{bucket}/{key}?tagging"),
+            vec![("content-type", "application/xml")],
+            b"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>".to_vec(),
+            200,
+            false,
+        ),
+        (
+            "a 204 with no body",
+            "DELETE",
+            format!("/{bucket}/{key}?tagging"),
+            vec![],
+            Vec::new(),
+            204,
+            false,
+        ),
+        (
+            "a refusal, whose envelope names its own request",
+            "GET",
+            "/notify-no-such-bucket/absent.txt".to_string(),
+            vec![],
+            Vec::new(),
+            404,
+            true,
+        ),
+    ];
+
+    let mut seen: Vec<String> = Vec::new();
+    for (case, method, uri, headers, body, expected_status, names_in_body) in rows {
+        let answer = emulator.send("s3", method, &uri, &headers, body).await;
+        assert_eq!(
+            answer.status,
+            expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {} with {}",
+            answer.status,
+            answer.text()
+        );
+
+        let (request_id, extended) = answer.correlation(case);
+        if names_in_body {
+            // An error envelope carries the pair in its `<RequestId>` / `<HostId>`
+            // elements too, and a client reads the id from there while an operator reads
+            // it from the header: ONE refusal may not report two ids.
+            assert_eq!(
+                body_element(&answer.body, "RequestId").as_deref(),
+                Some(request_id.as_str()),
+                "case {case:?}: the body's RequestId must be the header's {request_id:?}, \
+                 got {}",
+                answer.text()
+            );
+            assert_eq!(
+                body_element(&answer.body, "HostId").as_deref(),
+                Some(extended.as_str()),
+                "case {case:?}: the body's HostId must be the header's {extended:?}, got {}",
+                answer.text()
+            );
+        } else {
+            // An opaque token, not a modelled value: what matters is that the response
+            // names SOMETHING and that no two responses name the same thing (asserted
+            // below), so the rendering itself is not pinned here.
+            assert!(
+                !request_id.is_empty() && !request_id.contains(char::is_whitespace),
+                "case {case:?}: expected a non-empty request id, got {request_id:?}"
+            );
+            assert!(
+                !extended.is_empty() && !extended.contains(char::is_whitespace),
+                "case {case:?}: expected a non-empty extended request id, got {extended:?}"
+            );
+        }
+        assert!(
+            !seen.contains(&request_id),
+            "case {case:?}: a request id must name ONE request, but {request_id:?} was \
+             already answered with (seen {seen:?})"
+        );
+        seen.push(request_id);
+    }
 }

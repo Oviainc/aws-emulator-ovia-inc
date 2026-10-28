@@ -51,13 +51,13 @@ const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 const PEER_CLUSTERS_MEMBER: &str = "multiRegionProperties.clusters";
 
 /// The Region the first cluster of a multi-Region configuration belongs to.
-const FIRST_REGION: &str = "us-east-1";
+pub const FIRST_REGION: &str = "us-east-1";
 /// The Region its peer belongs to — a cluster of a multi-Region configuration is
 /// peered with a cluster in ANOTHER Region.
-const SECOND_REGION: &str = "us-east-2";
+pub const SECOND_REGION: &str = "us-east-2";
 /// The witness Region both clusters name: a third Region, which the operation's
 /// own constraint requires (it can be neither cluster's own Region).
-const WITNESS_REGION: &str = "us-west-2";
+pub const WITNESS_REGION: &str = "us-west-2";
 
 /// A peer ARN naming a cluster this store does not hold, as `ClusterArn`'s pattern
 /// requires one (`^arn:aws(-[^:]+)?:dsql:[a-z0-9-]{1,20}:[0-9]{12}:cluster/[a-z0-9]{26}$`).
@@ -236,7 +236,7 @@ async fn the_clock_settles_a_created_cluster_into_the_status_its_configuration_a
 /// them: the first is created with the witness Region, the second names the first,
 /// and the first is then reconfigured to name the second. Returns a client per
 /// Region and each cluster's identifier, with both clusters `ACTIVE`.
-async fn peered_pair(engine: &Arc<engine::InMemoryEngine>) -> (Dsql, String, Dsql, String) {
+pub async fn peered_pair(engine: &Arc<engine::InMemoryEngine>) -> (Dsql, String, Dsql, String) {
     let first = Dsql::sharing(engine, FIRST_REGION);
     let second = Dsql::sharing(engine, SECOND_REGION);
 

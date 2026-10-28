@@ -10,6 +10,11 @@
 //! `@sensitive` and the `Service` shape has no member for it, so it is persisted with
 //! the finding and reported by nothing.
 //!
+//! Recording feedback changes the finding RECORD, so each finding it actually changes
+//! takes the instant of the write as its `Finding.UpdatedAt` — the same clock the
+//! archive write moves, through the same shape of state write
+//! ([`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::set_findings_feedback_in`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -153,37 +158,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BadRequestException`/400, through `crate::service`'s refusal seam — which
         // is why reaching here means the request carries one of the `Feedback` values
         // and a refused one wrote nothing.
-        let mut state = state.lock();
-        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
-            // Classified from the REQUEST: a value that cannot be a detector id at
-            // all is a parameter failure, a well-formed one this account and Region
-            // do not hold an ownership failure.
-            return Err(invalid_input(crate::state::detector_id_rejection(
-                &input.detector_id,
-            )));
-        };
-
         // The submission REPLACES whatever was recorded before, for every finding the
         // request names: the feedback is one value per finding, not a log, so the
         // latest call is what a later read reports. A `findingIds` entry the detector
         // does not hold is not written and is not an error — the same reading of an
         // unheld finding id that `GetFindings` takes, where such an id is simply
         // absent from the result.
-        for finding_id in &input.finding_ids {
-            if let Some(finding) = detector.findings.get_mut(finding_id) {
-                finding.user_feedback = Some(input.feedback.clone());
-                finding.feedback_comments = input.comments.clone();
-            }
+        //
+        // The write goes through
+        // [`crate::state::ComAmazonawsGuarddutyGuarddutyapiserviceState::set_findings_feedback_in`],
+        // which also records the instant of the write as the `UpdatedAt` of each
+        // finding it actually changes: `Finding.UpdatedAt` is "the time and date when
+        // the finding was last updated"
+        // (`smithy_query(query="doc",shape="Finding",member="UpdatedAt")`), the
+        // RECORD's own clock, so a change to the finding's metadata moves it exactly
+        // as the archive write does. The activity's clock is the separate
+        // `Service.EventLastSeen` ("the last-seen timestamp of the activity that
+        // prompted GuardDuty to generate this finding"), which this call leaves alone:
+        // a caller's opinion about a finding is no further observation of the
+        // activity, so it must not make the finding look freshly seen. A submission
+        // that changes no stored value moves no clock either.
+        let mut state = state.lock();
+        if let Err(message) = state.set_findings_feedback_in(
+            &region,
+            &input.detector_id,
+            &input.finding_ids,
+            &input.feedback,
+            input.comments.as_deref(),
+        ) {
+            // Classified from the REQUEST: a value that cannot be a detector id at
+            // all is a parameter failure, a well-formed one this account and Region
+            // do not hold an ownership failure.
+            return Err(invalid_input(message));
         }
-
-        // `Finding.UpdatedAt` is deliberately NOT moved here. In this service it is
-        // the clock of the DETECTED ACTIVITY — `CreateSampleFindings` advances it when
-        // it aggregates another occurrence of a finding type, `GetFindings` renders
-        // `Service.EventLastSeen` from it, and `findingCriteria`/`sortCriteria` order
-        // findings by it (`updatedAt`, "Timestamp in Unix Epoch millisecond format",
-        // `smithy_query(query="doc",shape="ListFindings",member="FindingCriteria")`).
-        // Feedback is a caller's opinion about a finding, not a further observation of
-        // the activity, so it must not make the finding look freshly seen.
 
         // `UpdateFindingsFeedbackResponse` declares no members
         // (`smithy_query(operation="UpdateFindingsFeedback")`).

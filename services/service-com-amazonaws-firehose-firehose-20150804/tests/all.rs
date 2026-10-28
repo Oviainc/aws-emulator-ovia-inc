@@ -17,6 +17,8 @@ mod argument_validation;
 mod cloudwatch_logs_source_gate;
 #[path = "all/constraint_refusal_precedes_state.rs"]
 mod constraint_refusal_precedes_state;
+#[path = "all/control_plane_refusal_templates.rs"]
+mod control_plane_refusal_templates;
 #[path = "all/delivery_stream_encryption.rs"]
 mod delivery_stream_encryption;
 #[path = "all/delivery_stream_lifecycle.rs"]
@@ -29,6 +31,8 @@ mod delivery_stream_tags;
 mod description_defaults;
 #[path = "all/destination_bucket_preflight.rs"]
 mod destination_bucket_preflight;
+#[path = "all/destination_configuration_echo.rs"]
+mod destination_configuration_echo;
 #[path = "all/destination_delivery.rs"]
 mod destination_delivery;
 #[path = "all/destination_update.rs"]
@@ -37,6 +41,8 @@ mod destination_update;
 mod direct_put_source_gate;
 #[path = "all/http_endpoint_delivery.rs"]
 mod http_endpoint_delivery;
+#[path = "all/kms_key_resolution.rs"]
+mod kms_key_resolution;
 #[path = "all/processor_parameters.rs"]
 mod processor_parameters;
 #[path = "all/refusal_messages.rs"]

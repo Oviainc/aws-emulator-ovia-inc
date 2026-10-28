@@ -30,11 +30,13 @@ use std::time::SystemTime;
 use md5::{Digest, Md5};
 
 pub mod aws_published;
-
 // What a bucket's stored notification configuration DOES when an object changes — which
 // configured destinations are notified, what each notification carries, and the
 // in-process delivery itself — lives in `state/notifications.rs`.
 pub mod notifications;
+// The request-correlation pair one response carries, which is also what a notification
+// names the call it came of by — see `state/request_ids.rs`.
+pub mod request_ids;
 
 /// The Region a general purpose bucket is created in when the request names no
 /// `CreateBucketConfiguration.LocationConstraint`.
@@ -2005,17 +2007,14 @@ impl ArnField {
 /// service writes them, and whose resource part starts with `resource_prefix` and carries
 /// something past it.
 ///
-/// The ARN grammar AWS publishes:
-/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`, so the first field is the
-/// literal `arn`, the third IS the service and the partition is non-empty. A Lambda
-/// function ARN carries extra `:`-separated fields in its resource part, which is why only
-/// the first six are examined. `resource_prefix` is the leading segment the resource KIND
-/// is named by where one exists (`role/` for an IAM role) and empty for a service whose
-/// resource part is the bare name (an S3 bucket, an SQS queue).
+/// The value is read through the ONE shared ARN parse (`service_common::arn`), so this
+/// crate does not split an ARN its own way. `resource_prefix` is the leading segment the
+/// resource KIND is named by where one exists (`role/` for an IAM role) and empty for a
+/// service whose resource part is the bare name (an S3 bucket, an SQS queue).
 ///
-/// This is the one ARN grammar this crate reads: every member that takes an ARN —
-/// a notification destination, a replication role, a replication destination bucket —
-/// is judged through it rather than through a parser of its own.
+/// This is the one place an ARN MEMBER is judged in this crate: every member that takes an
+/// ARN — a notification destination, a replication role, a replication destination bucket —
+/// is judged through it rather than through a rule of its own.
 pub fn is_arn_of(
     arn: &str,
     service: &str,
@@ -2023,15 +2022,15 @@ pub fn is_arn_of(
     account: ArnField,
     resource_prefix: &str,
 ) -> bool {
-    let fields: Vec<&str> = arn.splitn(6, ':').collect();
-    fields.len() == 6
-        && fields[0] == "arn"
-        && !fields[1].is_empty()
-        && fields[2] == service
-        && region.holds(fields[3])
-        && account.holds(fields[4])
-        && fields[5].len() > resource_prefix.len()
-        && fields[5].starts_with(resource_prefix)
+    let Some(parsed) = ::service_common::arn::parse(arn) else {
+        return false;
+    };
+    let resource = parsed.resource;
+    parsed.vendor == service
+        && region.holds(parsed.region)
+        && account.holds(parsed.account)
+        && resource.len() > resource_prefix.len()
+        && resource.starts_with(resource_prefix)
 }
 
 /// Whether `arn` is an ARN of `service` for a regional, account-owned resource named by its
@@ -7344,6 +7343,19 @@ pub fn mint_upload_id(bucket: &str, key: &str, sequence: u64) -> String {
 /// tag through here too, rather than deriving one of its own.
 pub fn object_etag(body: &[u8]) -> String {
     format!("\"{}\"", hex::encode(Md5::digest(body)))
+}
+
+/// `etag` WITHOUT the double quotes S3 stores and reports it in.
+///
+/// An entity tag is held and reported quoted (see [`object_etag`]) — but an event
+/// notification reports the digest alone: the `etag` of an EventBridge detail and the
+/// `eTag` of a `Records` document both carry it without the surrounding quotes. One place,
+/// so both documents report the same value and no caller has to know the difference
+/// between the stored form and the published one.
+pub fn unquoted_etag(etag: &str) -> &str {
+    etag.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(etag)
 }
 
 /// The entity tag S3 reports for an object a multipart upload was completed into, over the

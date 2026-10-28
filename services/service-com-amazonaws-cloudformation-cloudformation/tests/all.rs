@@ -35,8 +35,14 @@ mod cognito_resource_types;
 mod content_delivery_stack_outputs;
 #[path = "all/cross_stack_imports.rs"]
 mod cross_stack_imports;
+// An EMPTY, moved-out suite: its rows now live in `all/delete_stack_export_in_use.rs`.
+// Declared because the layout check refuses an undeclared file under `tests/all/`, and this
+// fixer's tool set can write a file but not remove one; the next change to touch this
+// directory should delete both lines and the file.
 #[path = "all/delete_canceled_export_in_use.rs"]
 mod delete_canceled_export_in_use;
+#[path = "all/delete_stack_export_in_use.rs"]
+mod delete_stack_export_in_use;
 #[path = "all/delete_stack_instances.rs"]
 mod delete_stack_instances;
 #[path = "all/detect_resource_drift.rs"]

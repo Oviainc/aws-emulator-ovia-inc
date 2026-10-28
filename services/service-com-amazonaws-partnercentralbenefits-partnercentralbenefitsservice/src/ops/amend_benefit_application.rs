@@ -39,7 +39,7 @@
 //! within the lengths the model gives them
 //! ([`crate::state::MAX_AMENDMENT_REASON_LEN`], [`crate::state::MAX_CLIENT_TOKEN_LEN`] —
 //! the two strings the record keeps), and an amended document still within
-//! [`crate::state::details_rejection`]'s depth, member-count and byte bounds.
+//! [`crate::state::details_requirement`]'s depth, member-count and byte bounds.
 //!
 //! The document the amendments produce is judged against the request schema the
 //! application's benefit declares, exactly as a document supplied to the create or the
@@ -599,21 +599,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An amendment can nest the details document deeper, so the bound the create and
         // the update enforce on a supplied document is enforced on the amended one too,
         // and refused exactly as they refuse it.
-        if let Some(why) =
-            crate::state::details_rejection(amended.benefit_application_details.as_ref())
-        {
-            return Err(AmendBenefitApplicationErrorModeled::ValidationException(
-                ValidationException {
-                    message: why.clone(),
-                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-                    field_list: Some(crate::state::validation_field(
-                        "BenefitApplicationDetails",
-                        &why,
-                        crate::state::VALIDATION_CODE_INVALID_VALUE,
-                    )),
-                },
-            )
-            .into());
+        if let Some(refusal) = crate::state::details_refusal(
+            crate::state::DETAILS_MEMBER,
+            amended.benefit_application_details.as_ref(),
+        ) {
+            return Err(AmendBenefitApplicationErrorModeled::ValidationException(refusal).into());
         }
 
         // The amended document has to satisfy the benefit's request schema just as a
