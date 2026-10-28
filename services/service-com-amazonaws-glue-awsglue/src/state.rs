@@ -3389,6 +3389,48 @@ impl PartitionUpdateRefusal {
     }
 }
 
+/// Why a partition of a table could not be deleted.
+///
+/// One refusal reason per way a delete can fail ON the table it addresses, so the
+/// single-partition delete and each item of a batch delete accept and refuse exactly the
+/// same value lists: the batch reports it as a per-item [`ErrorDetail`] inside
+/// `PartitionError` — "the errors encountered when trying to delete the requested
+/// partitions" — and a single-partition delete raises the matching modelled exception
+/// named by [`Self::error_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionDeleteRefusal {
+    /// The addressed table holds no partition at those values, so there is nothing to
+    /// delete. A delete addresses a partition by the values it was created under
+    /// (`PartitionValueList$Values`), matched exactly as a read matches them, so a list
+    /// this table holds no partition for names no partition of it at all.
+    NotFound,
+}
+
+impl PartitionDeleteRefusal {
+    /// The modelled error shape this refusal is reported under: the `ErrorCode` of a
+    /// batch's per-item [`ErrorDetail`], and the exception a single-partition delete
+    /// raises.
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::NotFound => "EntityNotFoundException",
+        }
+    }
+
+    /// This refusal's wording, the one this service answers a partition miss with
+    /// wherever it reports one. See [`messages`] for how this crate's refusals are
+    /// worded.
+    pub fn message(self) -> String {
+        match self {
+            Self::NotFound => messages::PARTITION_NOT_FOUND.to_string(),
+        }
+    }
+
+    /// This refusal as the per-item error shape a batch reports it in.
+    pub fn to_error_detail(self) -> ErrorDetail {
+        catalog_error_detail(self.error_code(), self.message())
+    }
+}
+
 /// A stored partition of a table: the client-settable definition plus the one member
 /// only the server sets, `CreationTime`.
 #[derive(Debug, Clone)]
@@ -3652,6 +3694,27 @@ impl TableEntry {
         };
         entry.apply_input(input, encryption);
         Ok(entry)
+    }
+
+    /// Delete ONE partition of this table, or say why it cannot be deleted.
+    ///
+    /// The whole delete decision for a single partition, in one place, so the
+    /// single-partition delete and each item of a batch delete accept and refuse exactly
+    /// the same value lists: a partition is addressed by the values it was created under,
+    /// matched exactly as a read matches them, and a list this table holds no partition
+    /// for is nothing to delete. A deleted partition leaves the record every partition
+    /// read consults ([`Self::partitions`]), so it is gone for every later reader, and the
+    /// table's other partitions are untouched.
+    ///
+    /// Nothing of the removed partition is handed back: a delete reports the removal and
+    /// no definition, and neither the single-partition `DeletePartitionResponse` nor a
+    /// batch's `PartitionError` carries one.
+    pub fn delete_partition(&mut self, values: &[String]) -> Result<(), PartitionDeleteRefusal> {
+        if self.partitions.remove(values).is_some() {
+            Ok(())
+        } else {
+            Err(PartitionDeleteRefusal::NotFound)
+        }
     }
 
     /// This table's client-settable definition, in the `TableInput` shape a client
@@ -9453,10 +9516,11 @@ pub mod messages {
          property can't be changed.";
 
     /// A partition read (`GetPartition`) for a value list the addressed table holds no
-    /// partition for, and an update (`UpdatePartition`, one entry of
-    /// `BatchUpdatePartition`) of such a value list, which has no partition to write to
-    /// either. RECORDED constant: the whole sentence is fixed — it names neither
-    /// the values the request addressed nor the table they were looked for in.
+    /// partition for, an update (`UpdatePartition`, one entry of `BatchUpdatePartition`)
+    /// of such a value list, which has no partition to write to either, and a delete (one
+    /// item of `BatchDeletePartition`) of one, which has none to remove. RECORDED
+    /// constant: the whole sentence is fixed — it names neither the values the request
+    /// addressed nor the table they were looked for in.
     pub const PARTITION_NOT_FOUND: &str = "Cannot find partition.";
 
     /// A partition-metadata read of the Lake Formation application-integration surface

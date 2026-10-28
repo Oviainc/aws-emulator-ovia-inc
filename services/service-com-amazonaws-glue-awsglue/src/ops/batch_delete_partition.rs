@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeletePartition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeletePartition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeletePartition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Removes each addressed partition from the table the request names, so a later
+//! partition read no longer serves it. An absent database or table fails the whole
+//! request with `EntityNotFoundException`; a value list the table holds no partition for
+//! fails only its own item, reported in `Errors`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +151,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeletePartition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeletePartitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeletePartition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchDeletePartitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // A delete removes a stored definition rather than writing one, so there is no key
+        // for it to be encrypted under and nothing of the catalog's encryption settings to
+        // read: this operation models no encryption failure at all, unlike the partition
+        // create and update that store a definition.
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(BatchDeletePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let database_name = database.name.clone();
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(BatchDeletePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Each addressed partition is removed on its own from the record every partition
+        // read consults, so a deleted partition is gone for every later reader. A value
+        // list the table holds no partition for fails only that one item: `Errors` is "the
+        // errors encountered when trying to delete the requested partitions", which is
+        // where a partial failure belongs, rather than failing the whole batch or claiming
+        // a clean delete. The items are walked in the order they were sent, so a batch
+        // that addresses the same partition twice deletes it once and reports the second
+        // item as the miss it has become.
+        let mut errors: Vec<PartitionError> = Vec::new();
+        let mut deleted = 0usize;
+        for requested in &input.partitions_to_delete {
+            match table.delete_partition(&requested.values) {
+                Ok(()) => deleted += 1,
+                Err(refusal) => errors.push(PartitionError {
+                    // `PartitionError$PartitionValues` is "the values that define the
+                    // partition": the ones this item addressed, so a client can tell which
+                    // of its items failed. Reported exactly as sent.
+                    partition_values: Some(requested.values.clone()),
+                    error_detail: Some(refusal.to_error_detail()),
+                }),
+            }
+        }
+        ::tracing::info!(
+            operation = "BatchDeletePartition",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %table.name,
+            deleted,
+            failed = errors.len(),
+            "deleted Data Catalog partitions in a batch"
+        );
+
+        // The list is reported whether or not anything failed, the way the sibling batch
+        // writes `BatchCreatePartition` and `BatchDeleteTable` report their own: an empty
+        // `Errors` is the positive statement that every addressed partition was deleted,
+        // which is what a client checks before treating the batch as done.
+        Ok(BatchDeletePartitionOutput {
+            errors: Some(errors),
+        })
     }
 }
+
