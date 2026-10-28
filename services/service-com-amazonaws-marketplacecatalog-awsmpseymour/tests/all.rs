@@ -33,6 +33,8 @@ mod entity_reads;
 mod entity_type_projections;
 #[path = "all/filter_validation.rs"]
 mod filter_validation;
+#[path = "all/page_size_rule.rs"]
+mod page_size_rule;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/reserved_tag_keys.rs"]
