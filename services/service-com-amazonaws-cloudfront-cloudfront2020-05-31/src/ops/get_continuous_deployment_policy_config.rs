@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContinuousDeploymentPolicyConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContinuousDeploymentPolicyConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContinuousDeploymentPolicyConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +132,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContinuousDeploymentPolicyConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContinuousDeploymentPolicyConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContinuousDeploymentPolicyConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        // "Gets configuration information" — a report, so the store is only read.
+        let store = state.lock();
+
+        // An id the store does not hold names no policy, whatever shape it takes: "The
+        // continuous deployment policy doesn't exist."
+        let Some(stored) = store.continuous_deployment_policy(&input.id) else {
+            return Err(
+                GetContinuousDeploymentPolicyConfigErrorModeled::NoSuchContinuousDeploymentPolicy(
+                    crate::state::no_such_continuous_deployment_policy(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetContinuousDeploymentPolicyConfigOutput {
+            // "Contains the configuration for a continuous deployment policy" — the
+            // configuration as the last mutation stored it, not as any request spells it.
+            continuous_deployment_policy_config: Some(stored.config.clone()),
+            // "The version identifier for the current version of the continuous
+            // deployment policy": the token the last mutation handed back, the same one
+            // `GetContinuousDeploymentPolicy` reports.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

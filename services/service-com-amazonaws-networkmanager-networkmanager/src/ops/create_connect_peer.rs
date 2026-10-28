@@ -256,18 +256,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
         // same request answers the record the first call minted instead of minting a second
-        // peer; the same token asking for something else is a conflict.
-        if let Some(token) = input
-            .client_token
-            .as_deref()
-            .filter(|token| !token.is_empty())
-        {
-            if let Some(existing) = store
-                .connect_peers
-                .values()
-                .find(|record| record.client_token.as_deref() == Some(token))
-            {
-                let same_request = existing.connect_attachment_id == input.connect_attachment_id
+        // peer; the same token asking for something else is a conflict. The walk itself —
+        // the token normalisation, the store lookup and the replay-or-refuse branch — is
+        // [`crate::state::replay_or_conflict`], the one every tokened operation of this
+        // service goes through, so what is left here is only what makes a stored peer THIS
+        // request.
+        let client_token = crate::state::normalized_client_token(input.client_token);
+        if let Some(existing) = crate::state::replay_or_conflict(
+            client_token.as_deref(),
+            store.connect_peers.values(),
+            |existing| {
+                existing.connect_attachment_id == input.connect_attachment_id
                     && existing.peer_address == input.peer_address
                     && existing.core_network_address == input.core_network_address
                     && existing.inside_cidr_blocks == inside_cidr_blocks
@@ -276,24 +275,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && crate::state::same_tags(
                         &existing.tags,
                         input.tags.as_deref().unwrap_or_default(),
-                    );
-                if same_request {
-                    return Ok(CreateConnectPeerOutput {
-                        connect_peer: Some(existing.to_shape(now)),
-                    });
-                }
-                return Err(CreateConnectPeerErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "client token {token:?} already created Connect peer {}, with a different request",
-                            existing.id
-                        ),
-                        resource_id: existing.id.clone(),
-                        resource_type: crate::state::CONNECT_PEER_KIND.to_string(),
-                    },
-                )
-                .into());
-            }
+                    )
+            },
+            |existing| crate::state::ClientTokenConflict {
+                effect: format!("created Connect peer {}", existing.id),
+                resource_id: existing.id.clone(),
+                resource_type: crate::state::CONNECT_PEER_KIND.to_string(),
+            },
+        )
+        .map_err(CreateConnectPeerErrorModeled::ConflictException)?
+        {
+            return Ok(CreateConnectPeerOutput {
+                connect_peer: Some(existing.to_shape(now)),
+            });
         }
 
         // A quota bounds how many peers one Connect attachment can be made to carry: at the
@@ -343,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             subnet_arn,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
-            client_token: input.client_token.filter(|token| !token.is_empty()),
+            client_token,
             tags: input.tags.unwrap_or_default(),
         };
         // The peer is `CREATING` until the settle span the clock owes elapses, so the

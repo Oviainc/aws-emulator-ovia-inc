@@ -3272,6 +3272,31 @@ impl StoredStack {
         }
     }
 
+    /// The logical ids of the resources the stack HOLDS a record of right now — the ones a
+    /// teardown of it is RESPONSIBLE for, whether or not any owning service has something to
+    /// delete for them.
+    ///
+    /// The same set [`disposed_resources`] keeps records for: every resource the stack has
+    /// installed and has not already disposed of, plus every resource the operation in
+    /// flight has ACTED ON ([`PendingDeployment::attempted`]). So what a teardown reports
+    /// per resource ([`provisioning::delete`]) and what the stack goes on reporting
+    /// afterwards are one set — a declaration an operation never reached is in neither,
+    /// because nothing was brought into being under it, and a record already at
+    /// `DELETE_COMPLETE` is in neither either, because the operation that disposed of it
+    /// already reported that.
+    pub fn held_resource_ids(&self) -> BTreeSet<String> {
+        let mut held: BTreeSet<String> = self
+            .resources
+            .iter()
+            .filter(|deployed| deployed.status != resource_status::DELETE_COMPLETE)
+            .map(|deployed| deployed.resource.logical_id.clone())
+            .collect();
+        if let Some(deployment) = &self.pending_deployment {
+            held.extend(deployment.attempted.iter().cloned());
+        }
+        held
+    }
+
     /// How many resources the stack OCCUPIES right now, for the account-wide resource
     /// ceiling ([`ComAmazonawsCloudformationCloudformationState::current_resource_count`]).
     ///

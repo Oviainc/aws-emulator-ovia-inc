@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the account's `VpcLink` record under `vpcLinkId`, so a later
+//! `GetVpcLink` answers `NotFoundException` — unless an `Integration` of some API still
+//! reaches the link, which the delete is refused for. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcLink"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // The identifier is resolved against stored state before anything is removed. A
+        // VPC link belongs to the ACCOUNT rather than to one API, so the id is resolved
+        // account-wide; one that names no link is the modelled not-found, including a
+        // second delete of the same id, which names no link once the first one has taken
+        // it away.
+        let Some(link) = store.vpc_links.get(&input.vpc_link_id) else {
+            return Err(DeleteVpcLinkErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_VPC_LINK.to_string()),
+            })
+            .into());
+        };
+        // The refusal below NAMES the blocked link, and the name comes from the record
+        // resolved here rather than from the request, which carries only its id.
+        let name = link.name.clone();
+
+        // An `Integration` that still names this link in its `connectionId` DEPENDS on
+        // it: deleting the link would leave that integration unable to reach the VPC it
+        // was configured for, so the delete is refused while the reference stands — the
+        // way this service refuses every delete a stored record still depends on. The
+        // integrations are left exactly as the caller wrote them; clearing the reference
+        // is the caller's own `UpdateIntegration` or `DeleteIntegration`.
+        if let Some((_, referencing)) = store.integration_referencing_vpc_link(&input.vpc_link_id) {
+            return Err(DeleteVpcLinkErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::vpc_link_in_use(&name, &referencing)),
+            })
+            .into());
+        }
+
+        store.vpc_links.remove(&input.vpc_link_id);
+        // The store lock is released before the record is formatted: the critical
+        // section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome,
+        // as `crate::state::AUDIT_TARGET` documents it. Metadata only — the identifier
+        // the request carried, never the deleted link's targets or tags.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            vpc_link_id = ?input.vpc_link_id,
+            outcome = "deleted",
+            "vpc link deleted",
+        );
+        Ok(DeleteVpcLinkOutput)
     }
 }

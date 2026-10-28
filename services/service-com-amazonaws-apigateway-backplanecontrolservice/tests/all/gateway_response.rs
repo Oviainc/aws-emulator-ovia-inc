@@ -497,6 +497,8 @@ async fn a_request_outside_a_modelled_constraint_is_refused_and_stores_nothing()
     // A response type outside the modelled `GatewayResponseType` enum, in the ways a
     // label can miss it: a value shaped like the enum's but not in it, the right value in
     // the wrong case, an unknown word, and a declared value with a trailing character.
+    // Each is refused by the CONSTRAINT layer in front of the handler, whose error class
+    // is `ValidationException` and not the operation's own `BadRequestException`.
     let refused_types = [
         "DEFAULT_3XX",
         "integration_timeout",
@@ -507,13 +509,13 @@ async fn a_request_outside_a_modelled_constraint_is_refused_and_stores_nothing()
         assert_failure(
             &put_gateway_response(&gateway, &api, response_type, json!({})).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("PutGatewayResponse({response_type})"),
         );
         assert_failure(
             &get_gateway_response(&gateway, &api, response_type).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("GetGatewayResponse({response_type})"),
         );
     }
@@ -531,7 +533,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused_and_stores_nothing()
             )
             .await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("PutGatewayResponse(statusCode {status})"),
         );
     }

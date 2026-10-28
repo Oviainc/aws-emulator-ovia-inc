@@ -148,6 +148,8 @@ async fn tagged_resources_of_every_kind(
     );
     let api = string_member(&created.body, "id", label);
 
+    // A deployment is the snapshot of the API's methods, so the API must carry one.
+    crate::rest_api_lifecycle::make_deployable(gateway, &api).await;
     let deployment = gateway
         .call(
             "POST",

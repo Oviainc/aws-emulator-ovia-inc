@@ -302,6 +302,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
                 })
             })?;
+            // A deployment is the snapshot of the API's methods that a stage SERVES, so
+            // an API with no method on any resource has nothing to deploy and the call is
+            // refused rather than minting an identifier for an empty snapshot.
+            if api.resources.values().all(|resource| resource.methods.is_empty()) {
+                return Err(bad_request(crate::state::NO_METHODS_TO_DEPLOY.to_string()));
+            }
             // Bound the growth a caller drives. A deployment is kept until it is
             // deleted, and API Gateway publishes no quota for them, so the cap is this
             // emulator's.

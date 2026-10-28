@@ -217,6 +217,25 @@ const IMPORTED_AUTHORIZATION_TYPE: &str = "NONE";
 /// carries its binary media types either way.
 pub const BINARY_MEDIA_TYPES_EXTENSION: &str = "x-amazon-apigateway-binary-media-types";
 
+/// The document key API Gateway's OpenAPI extensions use for an API's gateway responses,
+/// a mapping keyed by `responseType` whose entries carry the customization
+/// `PutGatewayResponse` stores.
+///
+/// `pub` for the same reason as [`BINARY_MEDIA_TYPES_EXTENSION`]: the EXPORT side
+/// (`super::get_export`) renders the same collection under the same key, so a definition
+/// exported from an API and imported again carries its gateway responses either way.
+pub const GATEWAY_RESPONSES_EXTENSION: &str = "x-amazon-apigateway-gateway-responses";
+
+/// The members one entry of [`GATEWAY_RESPONSES_EXTENSION`] carries: the same three
+/// members `PutGatewayResponse` takes beside the response type.
+const GATEWAY_RESPONSE_STATUS_CODE: &str = "statusCode";
+
+/// See [`GATEWAY_RESPONSE_STATUS_CODE`].
+const GATEWAY_RESPONSE_PARAMETERS: &str = "responseParameters";
+
+/// See [`GATEWAY_RESPONSE_STATUS_CODE`].
+const GATEWAY_RESPONSE_TEMPLATES: &str = "responseTemplates";
+
 /// The keys of an OpenAPI Path Item Object that name an operation API Gateway imports as
 /// a `Method`, mapped to the HTTP verb the method is stored under.
 ///
@@ -364,6 +383,10 @@ pub struct ImportedDefinition {
     pub base_path: Option<String>,
     /// [`BINARY_MEDIA_TYPES_EXTENSION`], absent when the document declares none.
     pub binary_media_types: Option<Vec<String>>,
+    /// The gateway responses [`GATEWAY_RESPONSES_EXTENSION`] declares, keyed by
+    /// `responseType` exactly as `RestApiEntry::gateway_responses` is, with every pseudo
+    /// parameter already resolved; empty when the document declares none.
+    pub gateway_responses: BTreeMap<String, GetGatewayResponseOutput>,
     /// The document's paths, in document order.
     pub paths: Vec<ImportedPath>,
     /// What the import could not carry over — reported in the response's `warnings`, and
@@ -850,8 +873,14 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
                     .collect()
             }),
         paths: Vec::new(),
+        gateway_responses: BTreeMap::new(),
         warnings: Vec::new(),
     };
+
+    // The gateway responses the document customizes, which describe the API ITSELF
+    // rather than one of its paths.
+    definition.gateway_responses =
+        imported_gateway_responses(document, scope, &mut definition.warnings);
 
     // The references the document does not resolve. A `$ref` names the schema a part of
     // the document stands for, and one whose target the document does not declare — or
@@ -935,6 +964,65 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
         });
     }
     Ok(definition)
+}
+
+/// The gateway responses [`GATEWAY_RESPONSES_EXTENSION`] declares, as the records
+/// `PutGatewayResponse` stores: keyed by `responseType`, each carrying the status code
+/// the customization answers with and the two caller-supplied maps, with every pseudo
+/// parameter resolved against `scope`.
+///
+/// A stored record is a CUSTOMIZATION, so `defaultResponse` is false, and a `statusCode`
+/// the entry leaves out keeps the one the type's generated response carries
+/// (`crate::state::default_gateway_status_code`) — the same resolution
+/// `PutGatewayResponse` makes at write time, so a read of an imported record agrees with
+/// a read of a put one.
+///
+/// An entry keyed by a value outside the modelled `GatewayResponseType` enum names no
+/// gateway response of an API, so it customizes nothing and is reported rather than
+/// stored.
+fn imported_gateway_responses(
+    document: &Node,
+    scope: &ImportScope,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, GetGatewayResponseOutput> {
+    let mut responses = BTreeMap::new();
+    for (response_type, declared) in document
+        .member(GATEWAY_RESPONSES_EXTENSION)
+        .and_then(Node::entries)
+        .unwrap_or_default()
+    {
+        if !GATEWAY_RESPONSE_TYPE_VALUES.contains(&response_type.as_str()) {
+            warn(
+                warnings,
+                format!("Unsupported gateway response type '{response_type}'. Ignoring."),
+            );
+            continue;
+        }
+        responses.insert(
+            response_type.clone(),
+            GetGatewayResponseOutput {
+                response_type: Some(response_type.clone()),
+                status_code: declared
+                    .string_member(GATEWAY_RESPONSE_STATUS_CODE)
+                    .or_else(|| {
+                        crate::state::default_gateway_status_code(response_type)
+                            .map(str::to_string)
+                    }),
+                response_parameters: crate::state::non_empty_map(Some(string_map(
+                    declared,
+                    GATEWAY_RESPONSE_PARAMETERS,
+                    scope,
+                ))),
+                response_templates: crate::state::non_empty_map(Some(string_map(
+                    declared,
+                    GATEWAY_RESPONSE_TEMPLATES,
+                    scope,
+                ))),
+                default_response: false,
+            },
+        );
+    }
+    responses
 }
 
 /// The refusal a definition import answers when the caller asked it to roll back on a
@@ -1563,6 +1651,15 @@ pub fn materialise_definition(
             resource.methods.insert(method.http_method.clone(), method);
         }
     }
+    // The gateway responses the definition customizes, which describe the API itself.
+    // The imported definition wins over what the API already carried for that response
+    // type, the same way an imported path wins over what the path carried — which is
+    // also what RE-RESOLVES a template's pseudo parameters on a later import, since the
+    // record is written from the document as read in THIS request's scope.
+    for (response_type, response) in &definition.gateway_responses {
+        api.gateway_responses
+            .insert(response_type.clone(), response.clone());
+    }
     Ok(())
 }
 
@@ -1599,6 +1696,21 @@ pub fn bound_definition(definition: &ImportedDefinition) -> Result<(), String> {
         definition.paths.len(),
         crate::state::MAX_RESOURCES_PER_API,
     )?;
+    // A gateway response is keyed by a `responseType` the model declares as an enum, so
+    // their COUNT needs no cap of its own; what a caller sizes is each one's two maps.
+    for response in definition.gateway_responses.values() {
+        for (member, map) in [
+            (GATEWAY_RESPONSE_PARAMETERS, &response.response_parameters),
+            (GATEWAY_RESPONSE_TEMPLATES, &response.response_templates),
+        ] {
+            let Some(entries) = map else { continue };
+            bound_entries(member, entries.len(), MAX_COLLECTION_ENTRIES)?;
+            for (key, value) in entries {
+                bound_chars(&format!("a {member} key"), key, MAX_STRING_CHARS)?;
+                bound_chars(&format!("a {member} value"), value, MAX_STRING_CHARS)?;
+            }
+        }
+    }
     for imported in &definition.paths {
         bound_chars("a path of the API definition", &imported.path, MAX_PATH_CHARS)?;
         for segment in imported.path.split('/').filter(|part| !part.is_empty()) {
@@ -1809,6 +1921,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(root) = api.resources.get_mut(&root_resource_id) {
                 root.methods.clear();
             }
+            // Nor do the gateway responses the previous definition customized: in
+            // `overwrite` mode the imported definition REPLACES the API's own, so a
+            // response type this document says nothing about goes back to the response
+            // API Gateway generates for it.
+            api.gateway_responses.clear();
         }
 
         // The planned resources, and then every operation the definition puts on a path

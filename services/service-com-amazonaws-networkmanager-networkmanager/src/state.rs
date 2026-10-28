@@ -69,6 +69,7 @@ use crate::ops::types::{
     ConnectAttachment, ConnectAttachmentOptions,
     ConnectPeer, ConnectPeerAssociation, ConnectPeerBgpConfiguration, ConnectPeerConfiguration,
     ConnectPeerSummary,
+    ConflictException,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CustomerGatewayAssociation,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkPolicyVersion,
@@ -7943,6 +7944,100 @@ fn parse_asn_range(value: &::serde_json::Value) -> Option<(i64, i64)> {
         }
     };
     (low <= high && low >= ASN_MIN && high <= ASN_MAX).then_some((low, high))
+}
+
+/// A stored record that remembers the idempotency token the request which produced it
+/// carried, which is what lets [`replay_or_conflict`] recognise a retry of that request.
+pub trait HasClientToken {
+    /// The normalised token of the request that produced this record, or `None` where it
+    /// carried none.
+    fn client_token(&self) -> Option<&str>;
+}
+
+/// Every record of this service whose producing operation models an idempotency token:
+/// each keeps it in a `client_token` field, so one implementation serves them all.
+macro_rules! client_token_records {
+    ($($record:ty),+ $(,)?) => {
+        $(
+            impl HasClientToken for $record {
+                fn client_token(&self) -> Option<&str> {
+                    self.client_token.as_deref()
+                }
+            }
+        )+
+    };
+}
+
+client_token_records!(
+    AttachmentRecord,
+    ConnectPeerRecord,
+    CoreNetworkPolicyRecord,
+    CoreNetworkRecord,
+    PeeringRecord,
+    PrefixListAssociationRecord,
+);
+
+/// The normalisation every idempotency token of this service goes through: an EMPTY token
+/// is no token at all — the modelled member starts at length zero (`smithy_query
+/// shape=ClientToken`) — so a request carrying one is idempotent against nothing and the
+/// record it produces is stored under no token.
+pub fn normalized_client_token<Token: AsRef<str>>(token: Option<Token>) -> Option<Token> {
+    token.filter(|token| !token.as_ref().is_empty())
+}
+
+/// What the refusal of a reused idempotency token says about the record the token's first
+/// request already produced: how that request is named, and the resource the refusal points
+/// at.
+#[derive(Debug)]
+pub struct ClientTokenConflict {
+    /// What the first request under the token DID, as the refusal names it ("created
+    /// attachment attachment-0123…"): the only part of the message that varies by kind.
+    pub effect: String,
+    /// The id of the resource that request produced, for `ConflictException$ResourceId`.
+    pub resource_id: String,
+    /// That resource's type, for `ConflictException$ResourceType`.
+    pub resource_type: String,
+}
+
+/// Resolve the idempotency token of a create against the records a store already holds.
+///
+/// `Ok(Some(record))` is a retry of the request that produced `record`, which the caller
+/// answers from that record instead of producing a second one; `Ok(None)` is a request that
+/// nothing has been stored under yet, which the caller goes on to produce; `Err` is the same
+/// token asking for something else, which is refused and stores nothing. `same_request` is
+/// the per-kind comparison of a stored record against the request, and `conflict` names what
+/// the stored record's own creation was.
+pub fn replay_or_conflict<'store, Record>(
+    token: Option<&str>,
+    stored: impl IntoIterator<Item = &'store Record>,
+    same_request: impl Fn(&Record) -> bool,
+    conflict: impl FnOnce(&Record) -> ClientTokenConflict,
+) -> Result<Option<&'store Record>, ConflictException>
+where
+    Record: HasClientToken + 'store,
+{
+    let Some(token) = normalized_client_token(token) else {
+        return Ok(None);
+    };
+    let Some(existing) = stored
+        .into_iter()
+        .find(|record| record.client_token() == Some(token))
+    else {
+        return Ok(None);
+    };
+    if same_request(existing) {
+        return Ok(Some(existing));
+    }
+    let ClientTokenConflict {
+        effect,
+        resource_id,
+        resource_type,
+    } = conflict(existing);
+    Err(ConflictException {
+        message: format!("client token {token:?} already {effect}, with a different request"),
+        resource_id,
+        resource_type,
+    })
 }
 
 /// Whether two tag sets hold the same keys with the same values, whatever order they

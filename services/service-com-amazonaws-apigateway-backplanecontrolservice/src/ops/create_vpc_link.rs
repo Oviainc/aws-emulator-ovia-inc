@@ -94,11 +94,9 @@ use crate::state::VpcLinkEntry;
 /// The `VpcLink` body for a stored link — the one place this crate renders that shape, so
 /// `CreateVpcLink` and `GetVpcLink` cannot report a record differently.
 ///
-/// `status` is computed from the stored record (see [`VpcLinkEntry::status`]).
-/// `statusMessage` is "a description about the VPC link status" (`VpcLink$statusMessage`)
-/// and AWS publishes no sentence it carries for a link that is provisioning or
-/// provisioned, so nothing is reported for it rather than a message this emulator made
-/// up.
+/// `status` and `statusMessage` are computed from the stored record (see
+/// [`VpcLinkEntry::status`] and [`VpcLinkEntry::status_message`]): a link reports the
+/// provisioning state the clock owes it, and a description only where it has one.
 pub fn vpc_link_body(entry: &VpcLinkEntry) -> CreateVpcLinkOutput {
     CreateVpcLinkOutput {
         id: Some(entry.id.clone()),
@@ -106,7 +104,7 @@ pub fn vpc_link_body(entry: &VpcLinkEntry) -> CreateVpcLinkOutput {
         description: entry.description.clone(),
         target_arns: Some(entry.target_arns.clone()),
         status: Some(entry.status().to_string()),
-        status_message: None,
+        status_message: entry.status_message(),
         tags: (!entry.tags.is_empty()).then(|| {
             entry
                 .tags
@@ -123,9 +121,13 @@ pub fn vpc_link_body(entry: &VpcLinkEntry) -> CreateVpcLinkOutput {
 /// the records at all. Every caller-sized member is bounded by the rule the sibling
 /// creates apply, and `targetArns` by what the member itself documents: "The ARN of the
 /// network load balancer of the VPC targeted by the VPC link" — a link targets at least
-/// one load balancer, and each entry is an ARN. WHICH resource that ARN names is not
-/// checked: a load balancer belongs to another service, which this emulator cannot
-/// resolve, so requiring the ARN FORM is the part of the rule it can hold the caller to.
+/// one load balancer, and each entry is an ARN.
+///
+/// Only the ARN FORM is held against the REQUEST: a value that is not an ARN names
+/// nothing at all, which is a malformed request. WHICH resource a well-formed ARN names is
+/// decided while the link is being PROVISIONED, because creating a link is "an
+/// asynchronous operation" — so an ARN that names no network load balancer settles the
+/// link in `FAILED` ([`provisioning_failure`]) instead of refusing the call.
 fn bound_input(input: &CreateVpcLinkInput) -> Result<(), String> {
     use crate::state::{
         bound_chars, bound_entries, bound_tag, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS, MAX_TAGS,
@@ -166,6 +168,45 @@ fn bound_input(input: &CreateVpcLinkInput) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The AWS service a VPC link's target ARN names: a VPC link reaches a VPC through a
+/// network load balancer, which is an Elastic Load Balancing resource.
+const LOAD_BALANCER_VENDOR: &str = "elasticloadbalancing";
+
+/// The resource portion a NETWORK load balancer's ARN starts with. Elastic Load Balancing
+/// writes a load balancer's ARN as `loadbalancer/<kind>/<name>/<id>`, where the kind is
+/// `net` for a network load balancer and `app` for an application one — so the prefix is
+/// what tells the two apart.
+const NETWORK_LOAD_BALANCER_RESOURCE_PREFIX: &str = "loadbalancer/net/";
+
+/// Whether `target_arn` names a network load balancer, which is what a VPC link can be
+/// provisioned against: `targetArns` is "The ARN of the network load balancer of the VPC
+/// targeted by the VPC link" (`VpcLink$targetArns`), so an ARN naming any other resource
+/// names nothing this link could carry traffic through.
+fn names_a_network_load_balancer(target_arn: &str) -> bool {
+    ::service_common::arn::parse(target_arn).is_some_and(|arn| {
+        arn.vendor == LOAD_BALANCER_VENDOR
+            && arn
+                .resource
+                .strip_prefix(NETWORK_LOAD_BALANCER_RESOURCE_PREFIX)
+                .is_some_and(|rest| !rest.is_empty())
+    })
+}
+
+/// Why the link `input` asks for cannot be provisioned, or `None` when it can.
+///
+/// A create is "an asynchronous operation": whether the targets can carry traffic is
+/// decided while the link is provisioning rather than when the request is read, so this
+/// is the outcome the link SETTLES in ([`VpcLinkEntry::failure`]) and not a refusal of
+/// the call. The first target that names no network load balancer is the one reported,
+/// which is the one the caller has to change.
+fn provisioning_failure(input: &CreateVpcLinkInput) -> Option<String> {
+    input
+        .target_arns
+        .iter()
+        .find(|target| !names_a_network_load_balancer(target))
+        .map(|target| crate::state::vpc_link_target_is_not_a_load_balancer(target))
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -251,6 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Whether the link can be provisioned at all, decided from the targets before
+        // the record is built (the entry below takes ownership of them).
+        let failure = provisioning_failure(&input);
+
         let mut store = state.lock();
         // Bound the growth a caller drives, at API Gateway's published quota.
         if store.vpc_links.len() >= crate::state::MAX_VPC_LINKS {
@@ -275,6 +320,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_at: Some(
                 ::std::time::Instant::now() + crate::state::VPC_LINK_PROVISION_SPAN,
             ),
+            // Which state it settles in: a link whose targets do not name network load
+            // balancers cannot be provisioned, so it settles `FAILED` with the reason as
+            // its `statusMessage` instead of reaching `AVAILABLE`.
+            failure,
             tags: input
                 .tags
                 .unwrap_or_default()

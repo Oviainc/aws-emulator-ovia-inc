@@ -423,11 +423,12 @@ async fn every_resource_a_stack_operation_acts_on_records_its_own_events() {
 }
 
 #[tokio::test]
-async fn deleting_a_stack_records_an_event_per_resource_it_really_deletes() {
+async fn deleting_a_stack_records_an_event_per_resource_it_owns() {
     let router = router();
     // Two topics Amazon SNS really holds, a VPC Amazon EC2 really holds, and a resource
     // this emulator provisions nowhere: the deletion asks SNS for the topics and EC2 for
-    // the VPC, and nothing for the internet gateway.
+    // the VPC, and nothing for the internet gateway — and records the teardown of all four,
+    // because which of them an owning service held is not something the event stream says.
     let template = r#"{"Resources":{
         "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.0.0.0/16"}},
         "Igw":{"Type":"AWS::EC2::InternetGateway"},
@@ -481,19 +482,17 @@ async fn deleting_a_stack_records_an_event_per_resource_it_really_deletes() {
              and once through its delete, got {events:?}"
         );
     }
-    // The VPC is one the deletion really asks Amazon EC2 for, so it records the same pair
+    // The VPC is one the deletion really asks Amazon EC2 for, and the internet gateway one
+    // it asks nobody for: both are resources the stack owned, so both record the same pair
     // of transitions a topic does.
-    assert!(
-        position(&events, "Vpc", "DELETE_IN_PROGRESS").is_some()
-            && position(&events, "Vpc", "DELETE_COMPLETE").is_some(),
-        "case \"deleting the stack\": Amazon EC2 holds Vpc, so its deletion records both \
-         events, got {events:?}"
-    );
-    assert!(
-        position(&events, "Igw", "DELETE_IN_PROGRESS").is_none(),
-        "case \"deleting the stack\": no service holds Igw, so its deletion asks nothing \
-         and records nothing, got {events:?}"
-    );
+    for logical_id in ["Vpc", "Igw"] {
+        assert!(
+            position(&events, logical_id, "DELETE_IN_PROGRESS").is_some()
+                && position(&events, logical_id, "DELETE_COMPLETE").is_some(),
+            "case \"deleting the stack\": the stack owned {logical_id}, so its teardown \
+             records both events, got {events:?}"
+        );
+    }
     let newest = events.first().expect("a deleted stack has events");
     assert_eq!(
         (newest.logical_id.as_deref(), newest.status.as_deref()),

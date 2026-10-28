@@ -9,11 +9,14 @@
 //! crate's existing harness, reused from `rest_api_lifecycle`.
 //!
 //! The RULE under test, which is this service's and not one operation's: a refused
-//! request is answered HTTP 400 `BadRequestException` whose message names the offending
-//! value, the member's path ROOTED AT THE OPERATION'S INPUT SHAPE (`<operation>Input` in
-//! lowerCamel), and the constraint it failed — with a `@pattern` emitted without the
-//! whole-value anchors the public model adds, and an enum value set listed in the order
-//! the service declares the enum in.
+//! request is answered HTTP 400 `ValidationException` — the CONSTRAINT layer's own error
+//! class, not the operation's modelled `BadRequestException` — whose message names the
+//! offending value, the member's path ROOTED AT THE OPERATION'S INPUT SHAPE
+//! (`<operation>Input` in lowerCamel), and the constraint it failed — with a `@pattern`
+//! emitted without the whole-value anchors the public model adds, and an enum value set
+//! listed in the order the service declares the enum in. The ONE member this service
+//! checks itself ahead of that layer (`CreateAuthorizer$type`) carries the operation's own
+//! `BadRequestException` instead, which is the exception the last table below pins.
 //!
 //! The rows span what the rule generalises over rather than repeating one recorded call:
 //! seven different operations (so the root is shown to be derived per operation, not a
@@ -26,17 +29,22 @@ use serde_json::{json, Value};
 
 use crate::rest_api_lifecycle::{Answer, Gateway};
 
-/// The error code a constraint failure carries on this surface: API Gateway classifies a
-/// request that breaks a modelled input constraint as a BAD REQUEST, which is the code a
-/// client branches on. Source: the recorded refusal of an out-of-enum
-/// `CreateAuthorizer$type`, which AWS answers `BadRequestException` (HTTP 400), and
-/// `BadRequestException` is the client-input error this service's model declares.
-const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
-
-/// The code this surface must NOT answer a constraint failure with: the framework's
-/// generic default for a `restJson1` service, which a client of API Gateway does not
-/// branch on.
+/// The error code a constraint failure carries on this surface: a value outside a
+/// member's modelled constraint is refused by the layer in FRONT of the operation, whose
+/// error class is its own. Source: the recorded refusals of an out-of-enum
+/// `CreateRestApi$endpointConfiguration$types`, an out-of-pattern
+/// `PutGatewayResponse$statusCode`, an out-of-enum
+/// `PutIntegrationResponse$contentHandling` and an out-of-enum
+/// `UpdateVpcLink$patchOperations[]$op`, all of which AWS answers `ValidationException`
+/// (HTTP 400).
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The code the operation's OWN refusals carry — including a violated member this service
+/// checks itself ahead of the constraint layer. Source: the recorded refusal of an
+/// out-of-enum `CreateAuthorizer$type`, which AWS answers `BadRequestException`
+/// (HTTP 400), and `BadRequestException` is the client-input error this service's model
+/// declares.
+const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
 /// The code a HANDLER answers for identifiers that name no stored record, as every
 /// operation of this service models it: `NotFoundException` (HTTP 404). A row that
@@ -122,8 +130,8 @@ fn patch_operations(count: usize, position: usize, bad: &str) -> Value {
     )
 }
 
-/// Assert `answer` is the 400 `BadRequestException` stating exactly `message`.
-fn assert_stated(answer: &Answer, case: &str, message: &str) {
+/// Assert `answer` is the 400 refusal under `code` stating exactly `message`.
+fn assert_stated_as(answer: &Answer, case: &str, code: &str, message: &str) {
     assert_eq!(
         answer.status, 400,
         "case {case}: expected 400, got {} with {:?}",
@@ -131,8 +139,8 @@ fn assert_stated(answer: &Answer, case: &str, message: &str) {
     );
     assert_eq!(
         answer.error.as_deref(),
-        Some(BAD_REQUEST_EXCEPTION),
-        "case {case}: expected {BAD_REQUEST_EXCEPTION}, got {:?}",
+        Some(code),
+        "case {case}: expected {code}, got {:?}",
         answer.error
     );
     assert_eq!(
@@ -141,6 +149,11 @@ fn assert_stated(answer: &Answer, case: &str, message: &str) {
         "case {case}: expected the message {message:?}, got {:?}",
         answer.body["message"]
     );
+}
+
+/// Assert `answer` is the 400 constraint refusal stating exactly `message`.
+fn assert_stated(answer: &Answer, case: &str, message: &str) {
+    assert_stated_as(answer, case, VALIDATION_EXCEPTION, message);
 }
 
 #[tokio::test]
@@ -256,23 +269,6 @@ async fn a_refused_request_names_the_member_by_its_path_from_the_operations_inpu
             )),
         ),
         (
-            // The recorded case of this refusal's CODE: an authorizer type outside the
-            // modelled enum, which AWS answers `BadRequestException` for.
-            "CreateAuthorizer, a type outside its enum".to_string(),
-            "POST",
-            "/restapis/abcde12345/authorizers".to_string(),
-            Some(json!({
-                "name": "auth",
-                "type": "NOT_A_REAL_TYPE",
-                "identitySource": "method.request.header.Auth",
-            })),
-            one(&clause(
-                "NOT_A_REAL_TYPE",
-                "createAuthorizerInput.type",
-                &enum_value_set(&AUTHORIZER_TYPE_VALUES),
-            )),
-        ),
-        (
             // An absent required member is found while READING the request rather than
             // while walking it, and is stated with the same rooted path.
             "CreateRestApi, no name at all".to_string(),
@@ -291,6 +287,66 @@ async fn a_refused_request_names_the_member_by_its_path_from_the_operations_inpu
         let answer = gateway.call(method, &uri, body).await;
         assert_stated(&answer, &case, &expected);
     }
+}
+
+#[tokio::test]
+async fn a_member_this_service_checks_itself_is_refused_as_the_operations_own_bad_request() {
+    // The ONE violated member of this service whose refusal is the OPERATION's rather
+    // than the constraint layer's: `CreateAuthorizer$type`, whose recorded refusal carries
+    // `BadRequestException`. The rows span the ways a value can miss that enum — an
+    // unknown word, a declared value in the wrong case, the empty string — so the code
+    // follows the MEMBER and not one recorded value.
+    let rows: [(&str, &str); 3] = [
+        ("an unknown word", "NOT_A_REAL_TYPE"),
+        ("a declared value in the wrong case", "token"),
+        ("the empty string", ""),
+    ];
+
+    let gateway = Gateway::new();
+    for (case, authorizer_type) in rows {
+        let answer = gateway
+            .call(
+                "POST",
+                "/restapis/abcde12345/authorizers",
+                Some(json!({
+                    "name": "auth",
+                    "type": authorizer_type,
+                    "identitySource": "method.request.header.Auth",
+                })),
+            )
+            .await;
+        assert_stated_as(
+            &answer,
+            case,
+            BAD_REQUEST_EXCEPTION,
+            &one(&clause(
+                authorizer_type,
+                "createAuthorizerInput.type",
+                &enum_value_set(&AUTHORIZER_TYPE_VALUES),
+            )),
+        );
+    }
+
+    // Another member of the SAME operation stays on the constraint layer's class, which
+    // is what says the code follows the member rather than the operation.
+    let answer = gateway
+        .call(
+            "POST",
+            "/restapis/abcde12345/authorizers",
+            Some(json!({
+                "type": "TOKEN",
+                "identitySource": "method.request.header.Auth",
+            })),
+        )
+        .await;
+    assert_stated(
+        &answer,
+        "CreateAuthorizer, no name at all",
+        &one(
+            "Value null at 'createAuthorizerInput.name' failed to satisfy constraint: \
+             Member must not be null",
+        ),
+    );
 }
 
 #[tokio::test]

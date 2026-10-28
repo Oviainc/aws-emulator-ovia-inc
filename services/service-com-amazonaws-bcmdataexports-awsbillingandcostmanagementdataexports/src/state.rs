@@ -422,15 +422,17 @@ impl ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState {
     /// An execution is addressed by `(ExportArn, ExecutionId)`, so an execution of an
     /// export that no longer exists can be addressed by nobody: `DeleteExport` calls this
     /// so no reader reports the history of an export the store no longer holds.
+    /// Which keys belong to one export is decided in ONE place — [`Self::executions_of`] —
+    /// so the set this removes is exactly the set a listing reports: the borrow of the
+    /// store ends at the `collect`, which is what lets the removals below take it mutably.
     pub fn remove_executions_of(&mut self, export_arn: &str) {
-        let doomed: Vec<(String, String)> = self
-            .executions
-            .range((export_arn.to_string(), String::new())..)
-            .take_while(|((arn, _), _)| arn == export_arn)
-            .map(|(key, _)| key.clone())
+        let doomed: Vec<String> = self
+            .executions_of(export_arn)
+            .map(|execution| execution.execution_id.clone())
             .collect();
-        for key in doomed {
-            self.executions.remove(&key);
+        for execution_id in doomed {
+            self.executions
+                .remove(&(export_arn.to_string(), execution_id));
         }
     }
 }

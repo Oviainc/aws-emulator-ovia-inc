@@ -475,6 +475,8 @@ async fn an_unresolvable_identifier_is_refused_on_the_identifier_it_names() {
     // A response type outside the modelled `GatewayResponseType` enum, in the ways a
     // label can miss it: a value shaped like the enum's but not in it, the right value in
     // the wrong case, an unknown word, and a declared value with a trailing character.
+    // Each is refused by the CONSTRAINT layer in front of the handler, under its own
+    // error class rather than the operation's `BadRequestException`.
     for response_type in [
         "DEFAULT_3XX",
         "integration_timeout",
@@ -484,7 +486,7 @@ async fn an_unresolvable_identifier_is_refused_on_the_identifier_it_names() {
         assert_failure(
             &patch(&gateway, &uri(&api, response_type), operations.clone()).await,
             400,
-            "BadRequestException",
+            "ValidationException",
             &format!("UpdateGatewayResponse(responseType {response_type})"),
         );
     }

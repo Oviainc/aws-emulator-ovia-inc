@@ -155,7 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation is served from every Region ECR Public publishes an endpoint in,
         // so nothing here reads the Region the request was signed for — see
         // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
-        let _ = ctx;
+        // Authorization comes first: this action takes no resource type, so it is decided
+        // against every resource of this account, and a caller whose identity-based
+        // policies do not allow it is refused before anything is read.
+        if let Some(denied) =
+            crate::state::authorization::denied_on_registry(&*self.engine, ctx, Self::NAME)
+        {
+            return Err(denied);
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeRegistriesErrorModeled::ServerException(ServerException {
                 message: Some(

@@ -8,9 +8,12 @@
 //! states the same facts differently in four ways, all of them properties of the service
 //! or of the shape that was violated rather than of one request:
 //!
-//! 0. **The refusal is named `BadRequestException`**, the client-input error this
-//!    service's model declares, rather than the framework's generic
-//!    `ValidationException`; see [`BAD_REQUEST_EXCEPTION`].
+//! 0. **The refusal carries the error code of the layer that made it.** A value outside a
+//!    modelled constraint is refused by the layer in FRONT of the operation, under that
+//!    layer's own class (`ValidationException`) rather than the operation's modelled
+//!    `BadRequestException` — except for the few members this service checks in its own
+//!    request handling ahead of that layer; see [`VALIDATION_EXCEPTION`] and
+//!    [`BAD_REQUEST_EXCEPTION`].
 //! 1. **The member path is rooted at the operation's input shape.** AWS's own model
 //!    names an operation's input `<Operation>Input`, and the clause names the member by
 //!    its path from that root in lowerCamel — `updateDocumentationVersionInput.
@@ -34,21 +37,38 @@
 use aws_smithy_schema_server::constraints::{path, ViolationKind};
 use smithy_server_runtime::{Refused, Violation};
 
-/// The error code a constraint failure is named by.
+/// The error code a value outside a member's modelled constraint is refused under.
 ///
-/// NOT the framework's default for a `restJson1` service (`ValidationException`): API
-/// Gateway classifies a request that breaks a modelled input constraint as a BAD REQUEST
-/// and answers `BadRequestException` (HTTP 400) — the recorded refusal of an
-/// out-of-enum `CreateAuthorizer$type` carries that code, and `BadRequestException` is
-/// the client-input error this service's model declares on the operation ( "The
-/// submitted request is not valid, for example, the input is incomplete or incorrect").
-/// A client branching on `BadRequestException` must therefore recognise the refusal the
-/// boundary validator answers with, and the code is a REQUIREMENT of the wire contract
-/// in a way the constructed sentence is not.
+/// A constraint trait is enforced by the layer in FRONT of the operation, and that layer
+/// has one error class of its own: a caller bug, reported at HTTP 400 as
+/// `ValidationException`. It is deliberately NOT the operation's modelled
+/// `BadRequestException` — also a 400 — which reports a SEMANTIC refusal a handler makes
+/// about a well-formed request, so a client branching on the code can tell "this value
+/// cannot be sent at all" from "this value cannot be used here".
 ///
 /// A chosen [`Refused`] replaces the code and the message TOGETHER, which is what lets
 /// this one seam state both.
+pub(super) const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The error code a refusal of a member this service checks ITSELF carries: the
+/// client-input error its model declares ("The submitted request is not valid, for
+/// example, the input is incomplete or incorrect").
 pub(super) const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// The input members this service is RECORDED checking in its own request handling,
+/// ahead of the generic constraint layer — so a value outside the member's modelled
+/// constraint is the OPERATION's semantic refusal ([`BAD_REQUEST_EXCEPTION`]) and not the
+/// layer's ([`VALIDATION_EXCEPTION`]).
+///
+/// Each entry is `(operation, the violated member's path from the operation's input
+/// shape)`. `CreateAuthorizer`'s `type` is the one such member of this service: its
+/// recorded refusal of a value outside `AuthorizerType` carries `BadRequestException`,
+/// while the recorded refusals of `CreateRestApi.endpointConfiguration.types`,
+/// `PutGatewayResponse.statusCode`, `PutIntegrationResponse.contentHandling` and
+/// `UpdateVpcLink.patchOperations[].op` — four members of four other operations — carry
+/// `ValidationException`. The set is therefore a property of the MEMBER and is listed,
+/// not derived.
+const SELF_VALIDATED_MEMBERS: [(&str, &str); 1] = [("CreateAuthorizer", "type")];
 
 /// The one enum of this service whose value set the recordings show in an order the
 /// public Smithy model does not list it in.
@@ -78,9 +98,25 @@ pub(super) fn refusal(operation: &str, violations: &[Violation]) -> Option<Refus
     // cannot arrive here with wording of its own.
     let message = aws_smithy_schema_server::envelope(&stated)?;
     Some(Refused {
-        code: BAD_REQUEST_EXCEPTION.to_string(),
+        code: code_for(operation, violations).to_string(),
         message,
     })
+}
+
+/// Which error class `operation`'s refusal belongs to: the operation's own semantic
+/// refusal when ANY violated member is one this service checks itself
+/// ([`SELF_VALIDATED_MEMBERS`]), and the constraint layer's otherwise.
+fn code_for(operation: &str, violations: &[Violation]) -> &'static str {
+    let self_validated = violations.iter().any(|violation| {
+        SELF_VALIDATED_MEMBERS
+            .iter()
+            .any(|(owner, member)| *owner == operation && *member == violation.path)
+    });
+    if self_validated {
+        BAD_REQUEST_EXCEPTION
+    } else {
+        VALIDATION_EXCEPTION
+    }
 }
 
 /// The root segment of every validation path of `operation`: its input shape, named as
@@ -374,14 +410,69 @@ mod tests {
             let stated = refusal("UpdateRestApi", std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
             assert_eq!(
-                stated.code, BAD_REQUEST_EXCEPTION,
-                "case {case:?}: expected the code {BAD_REQUEST_EXCEPTION}, got {:?}",
+                stated.code, VALIDATION_EXCEPTION,
+                "case {case:?}: expected the code {VALIDATION_EXCEPTION}, got {:?}",
                 stated.code
             );
             assert_eq!(
                 stated.message, expected,
                 "case {case:?}: expected {expected:?}, got {:?}",
                 stated.message
+            );
+        }
+    }
+
+    /// A violated member this service checks ITSELF is the operation's own semantic
+    /// refusal; every other member of the same operation, and the same member on another
+    /// operation, stay on the constraint layer's class.
+    #[test]
+    fn only_a_self_validated_member_is_refused_as_the_operations_own_bad_request() {
+        // (case, operation, the violated member's path, the expected code)
+        let rows: [(&str, &str, &str, &str); 5] = [
+            (
+                "the one member this service checks itself",
+                "CreateAuthorizer",
+                "type",
+                BAD_REQUEST_EXCEPTION,
+            ),
+            (
+                "another member of the same operation",
+                "CreateAuthorizer",
+                "name",
+                VALIDATION_EXCEPTION,
+            ),
+            (
+                "the same member name on another operation",
+                "CreateDocumentationPart",
+                "type",
+                VALIDATION_EXCEPTION,
+            ),
+            (
+                "a pattern on a URI label",
+                "PutIntegrationResponse",
+                "statusCode",
+                VALIDATION_EXCEPTION,
+            ),
+            (
+                "a nested enum member",
+                "CreateRestApi",
+                "endpointConfiguration.types.0.member",
+                VALIDATION_EXCEPTION,
+            ),
+        ];
+
+        for (case, operation, path, expected) in rows {
+            let found = Violation {
+                path: path.to_string(),
+                kind: ViolationKind::EnumValue(vec!["ONE".to_string(), "TWO".to_string()]),
+                value: Some("THREE".to_string()),
+            };
+            let stated = refusal(operation, std::slice::from_ref(&found))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            assert_eq!(
+                stated.code, expected,
+                "case {case:?}: expected the code {expected}, got {:?}",
+                stated.code
             );
         }
     }

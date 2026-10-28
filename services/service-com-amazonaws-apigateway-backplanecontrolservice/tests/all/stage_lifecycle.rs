@@ -36,6 +36,9 @@ pub(crate) async fn create_deployment(
     case: &str,
     request: Value,
 ) -> String {
+    // A deployment is the snapshot of the API's methods, so the API must carry one;
+    // `make_deployable` is idempotent, so a suite that put its own method is unaffected.
+    crate::rest_api_lifecycle::make_deployable(gateway, api).await;
     let answer = gateway
         .call(
             "POST",

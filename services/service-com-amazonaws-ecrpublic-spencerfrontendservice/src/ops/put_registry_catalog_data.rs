@@ -140,6 +140,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes first: this action takes no resource type, so it is decided
+        // against every resource of this account, and a caller whose identity-based
+        // policies do not allow it is refused before the record is touched — ahead of the
+        // Region gate below, because the decision is taken before the operation runs at
+        // all.
+        if let Some(denied) =
+            crate::state::authorization::denied_on_registry(&*self.engine, ctx, Self::NAME)
+        {
+            return Err(denied);
+        }
         // The account-global registry catalog record is the ONE Region-scoped ECR Public
         // write: AWS performs it in one Region (`crate::state::API_REGION`) and refuses it
         // for the others. WHICH endpoint of the service a caller addressed is a property of

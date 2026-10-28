@@ -532,7 +532,7 @@ pub fn already_exists_message(name: &str) -> String {
 /// account the lookup was scoped to, and not the name it was given.
 pub fn not_found_message() -> String {
     format!(
-        "Firehose under accountId {} not found",
+        "Firehose under account {} not found.",
         ::engine::emulator_account_id()
     )
 }
