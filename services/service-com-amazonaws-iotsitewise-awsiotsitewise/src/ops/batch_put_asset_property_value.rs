@@ -4,7 +4,9 @@
 //! IMPLEMENTED: this operation appends property values to the per-(asset, property)
 //! time series in the shared engine store (`crate::state`), and to the DISASSOCIATED
 //! time series an entry's `propertyAlias` owns — creating that series when the alias
-//! names none yet; this is the ONLY file to touch for it.
+//! names none yet, and only while the account's storage configuration accepts time
+//! series no asset property is associated with and the NULL/NaN data a value carries;
+//! this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -220,6 +222,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let partial = input.enable_partial_entry_processing.unwrap_or(false);
 
         let mut store = state.lock();
+
+        // Every entry is judged against the account-wide storage configuration in
+        // force, read through the same helper the bulk-import handler reads it
+        // through, so one account-wide setting is understood one way across the
+        // service and nothing this call stores can change what it admits.
+        let configuration = store.storage_configuration(now);
+        // "DISABLED – IoT SiteWise doesn't accept time series (data streams) that
+        // aren't associated with asset properties": while the account names that
+        // state, an entry landing on a stream no asset property is associated
+        // with is refused, so none is created or written to.
+        let disassociated_disabled = configuration
+            .selection
+            .disassociated_data_storage
+            .as_deref()
+            == Some(crate::state::STORAGE_STATE_DISABLED);
+        // "Describes the configuration for ingesting NULL and NaN data. By default
+        // the feature is allowed. The feature is disallowed if the value is true."
+        let disallow_null_nan = configuration
+            .selection
+            .disallow_ingest_null_na_n
+            .unwrap_or(crate::state::DEFAULT_DISALLOW_INGEST_NULL_NAN);
+
         let mut error_entries = Vec::new();
 
         for entry in &input.entries {
@@ -252,6 +276,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
+            // The account's rule over data streams no asset property is
+            // associated with, applied to the stream the entry RESOLVED to: while
+            // the configuration does not accept such streams, an entry landing on
+            // one is refused whether the store already holds it or this write
+            // would create it. An entry addressed by `assetId` and `propertyId`,
+            // or by the alias an asset property carries, resolves to that
+            // property's own stream and is unaffected.
+            if disassociated_disabled {
+                if let crate::state::SeriesKey::Disassociated(alias) = &stream {
+                    error_entries.push(error_entry(
+                        entry,
+                        "InvalidRequestException",
+                        format!(
+                            "The disassociatedDataStorage is {}, so IoT SiteWise doesn't \
+                             accept the time series (data stream) {alias}, which isn't \
+                             associated with an asset property.",
+                            crate::state::STORAGE_STATE_DISABLED
+                        ),
+                    ));
+                    continue;
+                }
+            }
+
             // Per-TQV refusals. Each value of the entry must carry a variant of the
             // property's own data type AND a timestamp inside the window IoT
             // SiteWise accepts; a value that fails either is reported against the
@@ -259,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut refused: Vec<(&'static str, String, TimeInNanos)> = Vec::new();
             let mut accepted: Vec<&AssetPropertyValue> = Vec::new();
             for value in &entry.property_values {
-                match reject_value(&data_type, value)
+                match reject_value(&data_type, value, disallow_null_nan)
                     .or_else(|| reject_timestamp(now, &value.timestamp))
                 {
                     Some((code, message)) => {
@@ -574,15 +621,38 @@ fn data_type_of(entry: &PutAssetPropertyValueEntry) -> Result<String, (&'static 
     Ok(data_type.to_string())
 }
 
+/// Which part of `variant` is the NULL or NaN data an account that disallows
+/// ingesting it turns away, named as the request spells it; `None` for a reading
+/// that is neither.
+///
+/// `disallowIngestNullNaN` covers BOTH kinds the member documents — "the
+/// configuration for ingesting NULL and NaN data" — so the absent reading a
+/// `nullValue` reports and the not-a-number the model allows a `doubleValue` to
+/// carry ("Double.NaN is allowed",
+/// `smithy_query(query="shape", shape="Variant")`) are judged together.
+fn null_or_nan_member(variant: &Variant) -> Option<&'static str> {
+    if variant.null_value.is_some() {
+        return Some("nullValue");
+    }
+    variant
+        .double_value
+        .is_some_and(f64::is_nan)
+        .then_some("NaN doubleValue")
+}
+
 /// The reason to refuse `value`, or `None` when it is acceptable.
 ///
 /// A `Variant` holds "an asset property value (of a single type only)", and the one
 /// member it sets must be the one the property's `PropertyDataType` names. A
-/// `nullValue` is the modelled way to report an absent reading, so it is accepted
-/// whatever the data type is.
+/// `nullValue` is the modelled way to report an absent reading, so the data type
+/// does not decide it — but the account's own configuration does:
+/// `disallow_null_nan` is the `disallowIngestNullNaN` in force, and while it is
+/// set, NULL and NaN readings are not ingested at all, whatever the data type and
+/// whichever way the entry addressed its stream.
 fn reject_value(
     data_type: &str,
     value: &AssetPropertyValue,
+    disallow_null_nan: bool,
 ) -> Option<(&'static str, String)> {
     let set: Vec<&'static str> = [
         value.value.string_value.is_some().then_some("stringValue"),
@@ -602,6 +672,17 @@ fn reject_value(
                 set.len()
             ),
         ));
+    }
+    if disallow_null_nan {
+        if let Some(member) = null_or_nan_member(&value.value) {
+            return Some((
+                "InvalidRequestException",
+                format!(
+                    "The disallowIngestNullNaN is true, so IoT SiteWise doesn't accept NULL \
+                     and NaN data; this value carries a {member}."
+                ),
+            ));
+        }
     }
     let expected = match data_type {
         "STRING" => "stringValue",
