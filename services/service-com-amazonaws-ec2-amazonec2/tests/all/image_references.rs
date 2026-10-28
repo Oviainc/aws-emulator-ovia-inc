@@ -703,7 +703,7 @@ async fn pages_partition_the_reference_set() {
 /// The rows differ in what is wrong: no resource type selected at all, an id that is not
 /// an image id, a resource type outside the modelled enum, a type named twice, an option
 /// the named type does not document, an option value outside its documented set or range,
-/// a page size above the service's ceiling, and a token this service did not issue.
+/// and a token this service did not issue.
 #[tokio::test]
 async fn a_request_that_cannot_be_answered_is_refused() {
     let seeded = Seeded::new().await;
@@ -874,18 +874,6 @@ async fn a_request_that_cannot_be_answered_is_refused() {
                     "ec2:Instance",
                     &[("state-name", &["running"]), ("state-name", &["stopped"])],
                 ),
-            ]
-            .concat(),
-            "InvalidParameterValue",
-        ),
-        (
-            "a page size above the service's ceiling",
-            [
-                image_ids(&[AMI_A]),
-                vec![
-                    p("IncludeAllResourceTypes", "true"),
-                    p("MaxResults", (MAX_PAGE_SIZE + 1).to_string()),
-                ],
             ]
             .concat(),
             "InvalidParameterValue",

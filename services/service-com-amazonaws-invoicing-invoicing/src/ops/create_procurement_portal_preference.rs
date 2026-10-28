@@ -305,14 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let arn = store.mint_procurement_portal_preference_arn();
         let created_at = crate::state::now();
-        // Each plane starts PENDING_VERIFICATION, and only a plane this request ENABLES
-        // has a verification status at all: the portal connection for an enabled plane
-        // has not been verified yet, and the service models
-        // `SendProcurementPortalValidation`/`VerifyProcurementPortalValidation` as the
-        // calls that carry it past that status.
-        let pending =
-            |enabled: bool| enabled.then(|| crate::state::STATUS_PENDING_VERIFICATION.to_string());
-        let preference = ProcurementPortalPreference {
+        let mut preference = ProcurementPortalPreference {
             aws_account_id: ::engine::emulator_account_id().to_string(),
             procurement_portal_preference_arn: arn.clone(),
             procurement_portal_name: input.procurement_portal_name,
@@ -344,11 +337,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             marketplace_punch_out_enabled: Some(marketplace_punch_out_enabled),
             marketplace_punch_out_preference: input.marketplace_punch_out_preference,
             contacts: Some(input.contacts),
-            einvoice_delivery_preference_status: pending(input.einvoice_delivery_enabled),
+            // The verification state of each plane is what
+            // `crate::state::apply_plane_verification_statuses` applies below, from the
+            // configuration this create states — the same rule the configuration update
+            // applies — so nothing starts out with a status here.
+            einvoice_delivery_preference_status: None,
             einvoice_delivery_preference_status_reason: None,
-            purchase_order_retrieval_preference_status: pending(
-                input.purchase_order_retrieval_enabled,
-            ),
+            purchase_order_retrieval_preference_status: None,
             purchase_order_retrieval_preference_status_reason: None,
             // The first version of this configuration; a later configuration write
             // reports the next one.
@@ -356,6 +351,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_date: created_at,
             last_update_date: created_at,
         };
+        // Each plane this request ENABLES starts at PENDING_VERIFICATION, and a plane it
+        // leaves disabled carries no status at all.
+        crate::state::apply_plane_verification_statuses(&mut preference);
         store.procurement_portal_preferences.insert(
             arn.clone(),
             crate::state::StoredProcurementPortalPreference {

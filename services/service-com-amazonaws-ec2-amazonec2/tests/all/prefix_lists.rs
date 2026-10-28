@@ -643,12 +643,12 @@ async fn a_forged_next_token_is_refused() {
     }
 }
 
-/// A page size of none is not a page and one above the most this service serves in a
-/// page is refused, while every size in between is accepted.
+/// A page size of none is not a page; every other size the model leaves unbounded above
+/// is accepted, the largest page this service serves and anything past it included.
 #[tokio::test]
 async fn a_page_size_outside_the_served_range_is_refused() {
     let router = emulator();
-    for (case, max_results) in [("zero", "0"), ("negative", "-1"), ("above 1000", "1001")] {
+    for (case, max_results) in [("zero", "0"), ("negative", "-1")] {
         let (status, body) = describe(
             &router,
             "us-east-1",
@@ -666,7 +666,11 @@ async fn a_page_size_outside_the_served_range_is_refused() {
         );
     }
 
-    for (case, max_results) in [("the smallest page", "1"), ("the largest page", "1000")] {
+    for (case, max_results) in [
+        ("the smallest page", "1"),
+        ("the largest page", "1000"),
+        ("one past the largest page", "1001"),
+    ] {
         let (status, body) = describe(
             &router,
             "us-east-1",

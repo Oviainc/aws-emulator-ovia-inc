@@ -786,8 +786,8 @@ async fn the_report_pages_by_max_results_and_next_token() {
     }
 }
 
-/// A page size outside what this service serves is refused, and each published bound is
-/// served: 1 and [`MAX_PAGE_SIZE`] are pages, 0 and `MAX_PAGE_SIZE + 1` are not.
+/// A page of none is refused and each page size the model leaves unbounded above is
+/// served: 1 and [`MAX_PAGE_SIZE`] are pages, so is one past the ceiling, and 0 is not.
 #[tokio::test]
 async fn a_page_size_outside_the_bounds_is_refused() {
     let (router, engine) = emulator();
@@ -796,6 +796,9 @@ async fn a_page_size_outside_the_bounds_is_refused() {
     for (case, max_results) in [
         ("the lower bound", 1usize),
         ("the upper bound", MAX_PAGE_SIZE),
+        // The model declares no `@range` on this operation's `MaxResults`, so a size
+        // above the largest page asks for that page rather than for a refusal.
+        ("above the upper bound", MAX_PAGE_SIZE + 1),
     ] {
         let body = described(
             &router,
@@ -816,7 +819,6 @@ async fn a_page_size_outside_the_bounds_is_refused() {
     for (case, max_results) in [
         ("below the lower bound", "0".to_string()),
         ("negative", "-1".to_string()),
-        ("above the upper bound", (MAX_PAGE_SIZE + 1).to_string()),
     ] {
         let (status, body) = describe(
             &router,

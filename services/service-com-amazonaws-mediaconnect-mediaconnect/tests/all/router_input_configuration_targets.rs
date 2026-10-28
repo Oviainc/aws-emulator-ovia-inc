@@ -438,10 +438,10 @@ async fn a_create_resolves_every_reference_its_configuration_names() {
         // request named it.
         let stored = stored_references(&emulator, &case, &arn).await;
         let expected: Vec<String> = [
-            Some(targets.interface_arn.as_str())
-                .filter(|_| configuration.get("Standard").is_some()
-                    || configuration.get("Failover").is_some()
-                    || configuration.get("Merge").is_some()),
+            (configuration.get("Standard").is_some()
+                || configuration.get("Failover").is_some()
+                || configuration.get("Merge").is_some())
+            .then_some(targets.interface_arn.as_str()),
             configuration["MediaConnectFlow"]
                 .get("flowArn")
                 .and_then(Value::as_str),

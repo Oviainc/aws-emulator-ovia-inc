@@ -13081,10 +13081,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ) -> Option<AutoSnapshotDeletion> {
         let (resource_type, location) = if let Some(instance) = self.instances.get(name) {
             (RESOURCE_TYPE_INSTANCE, instance.location.clone())
-        } else if let Some(disk) = self.disks.get(name) {
-            (RESOURCE_TYPE_DISK, disk.location.clone())
         } else {
-            return None;
+            let disk = self.disks.get(name)?;
+            (RESOURCE_TYPE_DISK, disk.location.clone())
         };
         let key = (resource_type, name.to_string());
         let found = self
@@ -15214,12 +15213,11 @@ impl ComAmazonawsLightsailLightsail20161128State {
             let outcome = body(record, RESOURCE_TYPE_INSTANCE);
             let hour = enabled_auto_snapshot_hour(&record.add_ons);
             (outcome, RESOURCE_TYPE_INSTANCE, hour)
-        } else if let Some(record) = self.disks.get_mut(name) {
+        } else {
+            let record = self.disks.get_mut(name)?;
             let outcome = body(record, RESOURCE_TYPE_DISK);
             let hour = enabled_auto_snapshot_hour(&record.add_ons);
             (outcome, RESOURCE_TYPE_DISK, hour)
-        } else {
-            return None;
         };
         self.reconcile_auto_snapshots(now_ms, resource_type, name, hour.as_deref());
         Some(outcome)

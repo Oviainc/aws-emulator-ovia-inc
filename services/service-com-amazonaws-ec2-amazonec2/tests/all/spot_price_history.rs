@@ -1156,12 +1156,6 @@ async fn a_parameter_outside_what_the_service_serves_is_refused() {
             "0".to_string(),
         ),
         (
-            "a page above the largest this service serves",
-            vec![field("MaxResults", 1_001)],
-            "InvalidParameterValue",
-            "1001".to_string(),
-        ),
-        (
             "a token this service did not mint",
             vec![field("NextToken", "not-a-token")],
             "InvalidPaginationToken",

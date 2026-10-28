@@ -188,13 +188,12 @@ pub fn route(method: &str, path: &str, query: Option<&str>) -> Option<Request> {
             return None;
         }
         (prefix, Endpoint::UploadPack)
-    } else if let Some(prefix) = path.strip_suffix("/git-receive-pack") {
+    } else {
+        let prefix = path.strip_suffix("/git-receive-pack")?;
         if method != "POST" {
             return None;
         }
         (prefix, Endpoint::ReceivePack)
-    } else {
-        return None;
     };
     let name = prefix.strip_prefix(REPOS_PREFIX)?;
     // A URL written with a trailing slash leaves one here, and a client may

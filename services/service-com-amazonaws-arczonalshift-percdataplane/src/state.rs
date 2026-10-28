@@ -538,10 +538,9 @@ pub fn as_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
 pub fn parse_expires_in(expires_in: &str) -> Option<Duration> {
     let (digits, unit_secs) = if let Some(digits) = expires_in.strip_suffix('m') {
         (digits, 60_u64)
-    } else if let Some(digits) = expires_in.strip_suffix('h') {
-        (digits, 60 * 60)
     } else {
-        return None;
+        let digits = expires_in.strip_suffix('h')?;
+        (digits, 60 * 60)
     };
     let count: u64 = digits.parse().ok()?;
     if count == 0 {

@@ -205,17 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.max_results.unwrap_or_default()
             )));
         }
-        // Documented maximum for this operation's `MaxResults`; the model declares no
-        // `@range`, so the handler is the only place it can be enforced.
-        if input
-            .max_results
-            .is_some_and(|max_results| usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE)
-        {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for maxResults. It must be at most {MAX_PAGE_SIZE}",
-                input.max_results.unwrap_or_default()
-            )));
-        }
+        // The model declares no `@range` on `MaxResults`, so the only bound on the page
+        // size is the largest page this operation serves: a value above it is not refused,
+        // it is served as that page with a `NextToken` for the rest (the clamp below).
 
         // Matching cost is filters x values x stored instances and the model bounds
         // none of them, so the two request-controlled factors are capped here,

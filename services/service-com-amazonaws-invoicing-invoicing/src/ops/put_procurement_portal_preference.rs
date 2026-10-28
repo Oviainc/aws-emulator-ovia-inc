@@ -16,6 +16,11 @@
 //! the create left. An ARN this service does not hold is the modelled
 //! `ResourceNotFoundException`.
 //!
+//! The verification state of each plane follows the configuration this write states, by
+//! the one rule [`crate::state::apply_plane_verification_statuses`] holds for every
+//! configuration write of a preference: a plane this write enables reports a status, and a
+//! plane it disables reports none.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -287,23 +292,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
 
-            // A plane this update ENABLES that carries no verification status yet starts
-            // at `PENDING_VERIFICATION`, the status a create gives an enabled plane. A
-            // status that already exists is left alone: the service models the validation
-            // calls (and `UpdateProcurementPortalPreferenceStatus`) as what moves a
-            // plane's status, so a configuration write is not one of them.
-            if preference.einvoice_delivery_enabled
-                && preference.einvoice_delivery_preference_status.is_none()
-            {
-                preference.einvoice_delivery_preference_status =
-                    Some(crate::state::STATUS_PENDING_VERIFICATION.to_string());
-            }
-            if preference.purchase_order_retrieval_enabled
-                && preference.purchase_order_retrieval_preference_status.is_none()
-            {
-                preference.purchase_order_retrieval_preference_status =
-                    Some(crate::state::STATUS_PENDING_VERIFICATION.to_string());
-            }
+            // The verification state each plane reports after a configuration write, the
+            // same rule the create applies: a plane this update ENABLES that carries no
+            // status yet starts at `PENDING_VERIFICATION`, a plane it DISABLES carries no
+            // status or reason at all, and a status an enabled plane already holds is left
+            // alone — the service models the validation calls (and
+            // `UpdateProcurementPortalPreferenceStatus`) as what moves a plane's status,
+            // so a configuration write is not one of them.
+            crate::state::apply_plane_verification_statuses(preference);
 
             // `Version` is "the version number of the procurement portal preference
             // configuration" (`smithy_query(query="doc",
