@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use crate::app_bundle_ingestion_lifecycle::{arn_of, encode, Answer, Emulator};
 
 /// A tag set as a table row writes it: key-value pairs in the order given.
-type Tags<'a> = Vec<(&'a str, &'a str)>;
+pub(crate) type Tags<'a> = Vec<(&'a str, &'a str)>;
 
 /// One row of the merge table: the case, the tags the resource was created with,
 /// the tags the call assigns, and the set that must result.
@@ -32,7 +32,7 @@ type MergeCase<'a> = (&'a str, Tags<'a>, Tags<'a>, Tags<'a>);
 type UntagCase<'a> = (&'a str, Tags<'a>, Vec<&'a str>, Tags<'a>);
 
 /// `POST /tags/{resourceArn}` — `tags` is the request body's only member.
-async fn tag_resource(emulator: &Emulator, arn: &str, tags: Value) -> Answer {
+pub(crate) async fn tag_resource(emulator: &Emulator, arn: &str, tags: Value) -> Answer {
     emulator
         .call(
             "POST",
@@ -43,7 +43,7 @@ async fn tag_resource(emulator: &Emulator, arn: &str, tags: Value) -> Answer {
 }
 
 /// `GET /tags/{resourceArn}`.
-async fn list_tags(emulator: &Emulator, arn: &str) -> Answer {
+pub(crate) async fn list_tags(emulator: &Emulator, arn: &str) -> Answer {
     emulator
         .call("GET", &format!("/tags/{}", encode(arn)), None)
         .await
@@ -69,7 +69,7 @@ async fn untag_resource(emulator: &Emulator, arn: &str, keys: &[&str]) -> Answer
 /// The tag set a `ListTagsForResource` answer reports, as a map: a tag list is a
 /// map of key-value pairs, so these tests compare it as one rather than pinning
 /// an order the service does not document.
-fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
+pub(crate) fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected HTTP 200 from ListTagsForResource, got {} with body {}",
@@ -102,7 +102,7 @@ fn reported_tags(answer: &Answer, case: &str) -> BTreeMap<String, String> {
 }
 
 /// A tag list as the wire carries it, from a map.
-fn tag_list(pairs: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
     Value::Array(
         pairs
             .iter()
@@ -112,7 +112,7 @@ fn tag_list(pairs: &[(&str, &str)]) -> Value {
 }
 
 /// The expected map for the same pairs.
-fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))

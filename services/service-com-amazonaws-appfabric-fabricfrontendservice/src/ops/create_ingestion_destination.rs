@@ -8,6 +8,10 @@
 //! this call wrote. A destination this emulator accepted is usable straight away, so it
 //! is stored in the terminal `Active` state and the clock owes no transition.
 //!
+//! The `tags` the request carries are stored as the MAP they are (see
+//! [`crate::state::tag_set`]), so a key the list repeats is held once with the
+//! last value the list gave it — exactly what `TagResource` would have stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -239,6 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // they belong in the fingerprint: the same token under a different
         // ingestion, or with a different configuration, is a different request
         // rather than a retry of this one.
+        //
+        // A tag list is a map of key-value pairs, so the list this request
+        // carried is collapsed onto one entry per key BEFORE it is stored or
+        // fingerprinted (see [`crate::state::tag_set`]).
+        let tags = crate::state::tag_set(input.tags.as_deref());
         let fingerprint = crate::state::request_fingerprint(
             &[
                 ("ingestionArn", ingestion_arn.as_str()),
@@ -253,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ),
             ],
-            input.tags.as_deref(),
+            Some(&tags),
         );
 
         // @idempotencyToken: the same token replays the destination the first call
@@ -344,7 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: None,
             created_at,
             updated_at: created_at,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             sequence,
         };
         // A destination this emulator accepted is usable straight away, so it
