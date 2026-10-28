@@ -41,6 +41,10 @@ aws-credential-types = "1"
 # hand-written subset.
 serde_json_path = "0.7"
 tracing = { workspace = true }
+# The key policy of a state machine's customer managed KMS key, and the ONE decision
+# KMS makes about it: read out of the KMS service's own store, so this service and KMS
+# cannot disagree about what a key permits the caller of a read.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -52,6 +56,10 @@ hex = { workspace = true }
 # mounted beside Step Functions on the one engine the test router builds, the same shape
 # `core/router/src/lib.rs` mounts them in, so the call a task makes is served for real.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# The principals `tests/all/execution_data_encryption.rs` judges a KMS key policy
+# against are made with IAM's own operations over that same engine, so the identity
+# policy the decision reads is the document IAM's handlers wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

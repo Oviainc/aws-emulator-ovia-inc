@@ -119,6 +119,8 @@ mod list_types;
 mod nested_resource_outputs;
 #[path = "all/no_echo_parameters.rs"]
 mod no_echo_parameters;
+#[path = "all/operation_events.rs"]
+mod operation_events;
 #[path = "all/provisioned_resources.rs"]
 mod provisioned_resources;
 #[path = "all/publish_type.rs"]

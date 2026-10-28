@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomerGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomerGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stores the customer gateway device the request describes — its type, outside
+//! address, BGP ASN, device name, certificate and tags — under a server-minted
+//! `CustomerGatewayId`, in service, and answers it as stored. An identical request answers the
+//! gateway it already made.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomerGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomerGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomerGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomerGateway"))
+        // `ctx` carries request metadata only; this operation reads none of it — the modelled
+        // `CustomerGateway` carries no Region-dependent member (no ARN, no zone). The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "You must specify either BgpAsn or BgpAsnExtended when creating the customer
+        // gateway" with "Default: 65000" (`BgpAsn`): the ASN the gateway reports, in the member
+        // its size puts it in, held to the range that member publishes — the one place this
+        // crate reads a customer gateway's ASN out of a request.
+        let (bgp_asn, bgp_asn_extended) =
+            state::customer_gateway_bgp_asn(input.bgp_asn, input.bgp_asn_extended)?;
+
+        // "The IP address for the customer gateway device's outside interface. The address
+        // must be static" (`IpAddress`), which may be of either family: "If OutsideIpAddressType
+        // is set to Ipv6, you can use an IPv6 address". `PublicIp` is that same field under its
+        // old name — "This member has been deprecated. The Internet-routable IP address for the
+        // customer gateway's outside interface" — so a request naming both with DIFFERENT
+        // values names no one address and is refused rather than having one silently win.
+        let ip_address = match (input.ip_address.as_deref(), input.public_ip.as_deref()) {
+            (Some(ip_address), Some(public_ip)) if ip_address != public_ip => {
+                return Err(state::invalid_parameter_combination(
+                    "IpAddress and PublicIp name the same address of a customer gateway \
+                     device, so they cannot be given different values",
+                ))
+            }
+            (Some(address), _) | (None, Some(address)) => {
+                // The address itself is read by the one parser this crate reads an address of
+                // either family with, so "not an address" is one answer rather than two.
+                if state::ip_address_is_ipv6(address).is_none() {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Value ({address}) for parameter ipAddress is invalid. \
+                         Expected: an IPv4 or IPv6 address."
+                    )));
+                }
+                Some(address.to_string())
+            }
+            (None, None) => None,
+        };
+
+        // "A name for the customer gateway device. Length Constraints: Up to 255 characters"
+        // (`DeviceName`) — prose the model carries no `@length` for, so the bound is applied
+        // here, in characters as that sentence counts them.
+        if let Some(device_name) = input.device_name.as_deref() {
+            let characters = device_name.chars().count();
+            if characters > state::MAX_CUSTOMER_GATEWAY_DEVICE_NAME_CHARS {
+                return Err(state::invalid_parameter_value(format!(
+                    "DeviceName carries {characters} characters, above the maximum of {maximum}",
+                    maximum = state::MAX_CUSTOMER_GATEWAY_DEVICE_NAME_CHARS,
+                )));
+            }
+        }
+
+        // "The tags to apply to the customer gateway" (`TagSpecifications`) — "you must specify
+        // the resource type to tag, otherwise the request will fail" (`TagSpecification`), and
+        // the only type this action tags is the gateway it creates. The tag payload's own
+        // bounds (the count per resource, each key and value's length, no key twice, nothing in
+        // the reserved namespace) are applied by the one shared reader every create holds its
+        // tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_CUSTOMER_GATEWAY,
+            Self::NAME,
+        )?;
+
+        // The gateway as it will be stored and reported. The id is NOT set here: the store
+        // mints it, so no writer can choose one.
+        let view = CustomerGateway {
+            // "The type of VPN connection that this customer gateway supports (ipsec.1)"
+            // (`Type`): the modelled `GatewayType`, which the boundary validator has already
+            // held to its one member, so it is stored as the request asked for it.
+            r#type: Some(input.r#type),
+            ip_address,
+            bgp_asn,
+            bgp_asn_extended,
+            device_name: input.device_name,
+            certificate_arn: input.certificate_arn,
+            // The state a created gateway is answered in. A customer gateway is a RECORD of a
+            // device the customer already operates — nothing is provisioned for it — and the
+            // recorded wire corpus shows a create answering one already in service, so the
+            // gateway is stored ready and the clock owes it no move. The other three states
+            // `CustomerGateway$State` publishes are reached by what acts on the gateway next.
+            state: Some(state::VPN_STATE_AVAILABLE.to_string()),
+            tags: Some(tags),
+            customer_gateway_id: None,
+        };
+        // The bytes this gateway would add to the store, charged against the crate's one byte
+        // budget below so the store is bounded in bytes and not only in records.
+        let payload_bytes = state::customer_gateway_payload_bytes(&view);
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: a gateway whose owed move has fallen due is in the state it would be
+        // reported in, which is the state the identical-request check below reads.
+        store.materialize_due_transitions();
+
+        // "An identical request returns information about the existing customer gateway; it
+        // doesn't create a new customer gateway" (`CreateCustomerGateway`) — what makes two
+        // requests identical is written once, in `crate::state`.
+        let held = store.customer_gateway_like(&view).map(|record| record.view.clone());
+        if held.is_none() {
+            // A count ceiling first, then the byte budget: a record count on its own admits
+            // gigabytes, because each record holds strings the caller chose the length of.
+            if !store.has_customer_gateway_capacity() {
+                return Err(state::customer_gateway_limit_exceeded());
+            }
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                    "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                     data, so it cannot store {payload_bytes} more",
+                    held = store.stored_bytes(),
+                    max = state::MAX_STORED_BYTES,
+                )));
+            }
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`DryRun`). Nothing
+        // has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The gateway an identical request already made, answered instead of a second one.
+        if let Some(view) = held {
+            return Ok(CreateCustomerGatewayOutput {
+                customer_gateway: Some(view),
+            });
+        }
+
+        // The record itself, written the one way this crate writes a customer gateway — the id
+        // comes from the store, never from the request.
+        let Some(customer_gateway_id) = store.insert_customer_gateway(view) else {
+            return Err(state::customer_gateway_limit_exceeded());
+        };
+
+        // The answer is the record as it was stored, so `CreateCustomerGateway` and
+        // `DescribeCustomerGateways` cannot drift apart.
+        let Some(record) = store.customer_gateway(&customer_gateway_id) else {
+            return Err(state::internal_error(
+                "the customer gateway just created could not be read back",
+            ));
+        };
+        Ok(CreateCustomerGatewayOutput {
+            customer_gateway: Some(record.view.clone()),
+        })
     }
 }

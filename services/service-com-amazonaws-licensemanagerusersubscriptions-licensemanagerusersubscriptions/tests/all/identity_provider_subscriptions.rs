@@ -22,6 +22,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_licensemanagerusersubscriptions_licensemanagerusersubscriptions::{
     ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState,
     EmulatedService,
@@ -82,10 +83,26 @@ pub(crate) fn harness() -> Harness {
     // service's.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    // Amazon EC2 beside this service on the SAME engine: a registration's `Settings` name
+    // EC2's resources, and this service resolves them by asking EC2 over the in-process
+    // callback, so the owner of subnets and security groups has to be mounted for that
+    // question to have an answer — exactly as `instance_fleet_resolution` mounts it for the
+    // instance a user association names.
+    router.register_service(ec2::EmulatedService::new(Arc::clone(&engine)));
     // `RegisterIdentityProvider` resolves an AWS-managed `DirectoryId` against the
     // account's directories, so the directories these registrations name are registered
     // in that fleet first.
     create_directories(&engine, AWS_MANAGED_DIRECTORIES);
+    // And it resolves a registration's `Settings` against what the account has in Amazon
+    // EC2 — License Manager creates the activation-server VPC endpoints in those subnets
+    // with that security group — so the network every suite's registrations name is created
+    // there first, for the same reason the directories are.
+    create_network(
+        &engine,
+        ACCOUNT_VPC,
+        ACCOUNT_SUBNETS,
+        ACCOUNT_SECURITY_GROUPS,
+    );
     Harness { router, engine }
 }
 
@@ -114,6 +131,110 @@ pub(crate) fn create_directories(engine: &Arc<engine::InMemoryEngine>, directory
 /// it, spelled out here rather than read from the production constant so a change to it
 /// fails a test instead of silently changing what this suite accepts.
 pub(crate) const DIRECTORY_STAGE_ACTIVE: &str = "Active";
+
+/// The VPC of the account's own Amazon EC2 store that [`harness`] puts every subnet and
+/// security group its suites' registrations name into.
+///
+/// One VPC, because one registration's subnets and security group are the resources of
+/// the ONE VPC License Manager creates its activation-server VPC endpoints in.
+pub(crate) const ACCOUNT_VPC: &str = "vpc-0123456789abcdef0";
+
+/// The IPv4 block every VPC [`create_network`] writes carries, and the block every
+/// subnet of it is carved from. Two VPCs of one account may carry the same block (nothing
+/// routes between them here), so one constant serves every VPC the suites create.
+const ACCOUNT_VPC_CIDR: &str = "10.0.0.0/8";
+
+/// The Availability Zone the account's subnets are in — a zone of [`REGION`], which is
+/// what EC2's own zone list reports for it.
+const ACCOUNT_ZONE: &str = "us-west-2a";
+
+/// Every subnet id the suites of this target register an identity provider with, or add
+/// to one: `Subnets` names "the ID of one or more subnets in which License Manager will
+/// create a VPC endpoint", so a registration is accepted only for subnets the account
+/// really holds, exactly as it is accepted only for a directory the account really has.
+///
+/// Each matches the member's `^subnet-[a-z0-9]{8,17}` pattern. A suite that means to name
+/// a subnet the account does NOT hold names one that is not here (see
+/// `settings_network_resolution`).
+pub(crate) const ACCOUNT_SUBNETS: &[&str] = &[
+    "subnet-0123456789abcdef0",
+    "subnet-1111111111111111a",
+    "subnet-2222222222222222b",
+    "subnet-3333333333333333c",
+    "subnet-4444444444444444d",
+    "subnet-5555555555555555e",
+    "subnet-6666666666666666f",
+    "subnet-7777777777777777a",
+    "subnet-8888888888888888b",
+    "subnet-9999999999999999a",
+    "subnet-aaaaaaaaaaaaaaaab",
+];
+
+/// Every security group id those registrations name, each matching
+/// `^sg-(([0-9a-z]{8})|([0-9a-z]{17}))$` — both published lengths appear.
+pub(crate) const ACCOUNT_SECURITY_GROUPS: &[&str] = &[
+    "sg-0123abcd",
+    "sg-abcd0123",
+    "sg-ffffffff",
+    "sg-0123456789abcdef0",
+    "sg-00000000000000001",
+];
+
+/// Write one VPC, `subnets` inside it and `security_groups` of it into the account's own
+/// Amazon EC2 store, at the ids given.
+///
+/// `RegisterIdentityProvider` and `UpdateIdentityProviderSettings` check a registration's
+/// `Settings` against THAT store (the VPC endpoints are created in the caller's existing
+/// network), so every test that expects those calls to be accepted holds the network they
+/// name here first. Written through EC2's own store at chosen ids, rather than through
+/// EC2's API, for the same reason the directories are: a create mints the id it chooses,
+/// and these registrations name specific ones.
+pub(crate) fn create_network(
+    engine: &Arc<engine::InMemoryEngine>,
+    vpc_id: &str,
+    subnets: &[&str],
+    security_groups: &[&str],
+) {
+    let store = ec2::state::service_state(&**engine)
+        .expect("the in-memory engine carries the account's EC2 store");
+    let mut store = store.lock();
+    store.vpcs.insert(
+        vpc_id.to_string(),
+        ec2::ops::types::Vpc {
+            vpc_id: Some(vpc_id.to_string()),
+            state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+            cidr_block: Some(ACCOUNT_VPC_CIDR.to_string()),
+            ..Default::default()
+        },
+    );
+    for (index, subnet_id) in subnets.iter().enumerate() {
+        store.subnets.insert(
+            (*subnet_id).to_string(),
+            ec2::ops::types::Subnet {
+                subnet_id: Some((*subnet_id).to_string()),
+                vpc_id: Some(vpc_id.to_string()),
+                state: Some(ec2::state::SUBNET_STATE_AVAILABLE.to_string()),
+                // A distinct /24 of the VPC's block per subnet, because two subnets of one
+                // VPC cannot overlap — distinct for every index a `&[&str]` can hold that
+                // this store also can (65 536 of them, past EC2's own subnet ceiling).
+                cidr_block: Some(format!("10.{}.{}.0/24", index / 256, index % 256)),
+                availability_zone: Some(ACCOUNT_ZONE.to_string()),
+                availability_zone_id: ec2::state::zone_id_for_zone_name(ACCOUNT_ZONE),
+                ..Default::default()
+            },
+        );
+    }
+    for group_id in security_groups {
+        store.security_groups.insert(
+            (*group_id).to_string(),
+            ec2::ops::types::SecurityGroup {
+                group_id: Some((*group_id).to_string()),
+                vpc_id: Some(vpc_id.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+}
 
 /// What a call answered: the HTTP status, the wire error code (if any) and the body.
 #[derive(Debug)]
