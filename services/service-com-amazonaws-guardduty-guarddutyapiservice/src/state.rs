@@ -1593,6 +1593,26 @@ where
         .then(|| invalid_parameter_message(ACCOUNT_ID_MEMBER))
 }
 
+/// The DISTINCT entries of an id list a request carried, in the order the request
+/// first named each of them.
+///
+/// An id list on this service names a SET of resources, so an id named twice names
+/// the same one thing: the operations that answer such a list resolve each distinct
+/// id once, and an operation that STORES the list normalises it here so a read of
+/// the stored value reports each id once too. The request's order is kept, because
+/// it is the order the stored list is reported in.
+pub fn distinct_ids<I>(ids: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    let mut seen = ::std::collections::BTreeSet::new();
+    ids.into_iter()
+        .map(|id| id.as_ref().to_string())
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
 /// The administrator account the members of this emulator's detectors belong to:
 /// the single account this emulator serves, which is the account every request it
 /// answers is signed for.

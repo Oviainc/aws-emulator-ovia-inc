@@ -103,11 +103,15 @@ async fn published_rule_ids(router: &Router) -> Vec<String> {
     ids
 }
 
-async fn create_org_configuration(router: &Router, body: Value) -> (u16, Value) {
+pub(crate) async fn create_org_configuration(router: &Router, body: Value) -> (u16, Value) {
     call(router, "POST", ORG_CONFIGURATION_PATH, Some(body)).await
 }
 
-async fn get_org_configuration(router: &Router, rule_id: &str, mode: &str) -> (u16, Value) {
+pub(crate) async fn get_org_configuration(
+    router: &Router,
+    rule_id: &str,
+    mode: &str,
+) -> (u16, Value) {
     call_in(
         router,
         HOME_REGION,
@@ -118,7 +122,11 @@ async fn get_org_configuration(router: &Router, rule_id: &str, mode: &str) -> (u
     .await
 }
 
-async fn update_org_configuration(router: &Router, rule_id: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn update_org_configuration(
+    router: &Router,
+    rule_id: &str,
+    body: Value,
+) -> (u16, Value) {
     update_org_configuration_in(router, HOME_REGION, rule_id, body).await
 }
 

@@ -15,6 +15,8 @@
 mod account_id_well_formedness;
 #[path = "all/administrator_disassociation.rs"]
 mod administrator_disassociation;
+#[path = "all/batch_id_set_normalisation.rs"]
+mod batch_id_set_normalisation;
 #[path = "all/client_rejections.rs"]
 mod client_rejections;
 #[path = "all/client_token_store.rs"]

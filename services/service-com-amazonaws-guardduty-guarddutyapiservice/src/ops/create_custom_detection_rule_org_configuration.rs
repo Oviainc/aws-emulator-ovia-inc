@@ -163,8 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a request that scopes the configuration both ways describes two
         // different scopes at once, which the model cannot express and this
         // refuses. An EMPTY list is not a scope, so it does not conflict.
-        let include = input.include_account_ids.clone().unwrap_or_default();
-        let exclude = input.exclude_account_ids.clone().unwrap_or_default();
+        // Each list names a SET of accounts, so an account named twice is scoped
+        // once and the read reports it once ([`crate::state::distinct_ids`]).
+        let include = crate::state::distinct_ids(input.include_account_ids.iter().flatten());
+        let exclude = crate::state::distinct_ids(input.exclude_account_ids.iter().flatten());
         if !include.is_empty() && !exclude.is_empty() {
             return Err(crate::scaffolded::Scaffolded::invalid_input(
                 crate::state::ORG_CONFIGURATION_ACCOUNT_SCOPE_MESSAGE,

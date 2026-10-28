@@ -2,8 +2,9 @@
 
 //! @op GetFindings
 //! IMPLEMENTED: builds each returned `Finding` from the stored record, so the `Id`,
-//! `Type` and `Severity` are the ones `CreateSampleFindings` persisted. An id the
-//! detector does not hold is simply absent from the result; an unknown detector id is
+//! `Type` and `Severity` are the ones `CreateSampleFindings` persisted. `FindingIds`
+//! names a SET of findings, so a repeated id is reported once; an id the detector
+//! does not hold is simply absent from the result, and an unknown detector id is
 //! refused with `BadRequestException`.
 //!
 //! This is the ONLY file to touch for this operation.
@@ -160,11 +161,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An id the detector does not hold is absent from the result, not an error:
         // `Findings` is `len 0..50` and carries only what was found.
-        let mut found: Vec<&crate::state::FindingRecord> = input
-            .finding_ids
-            .iter()
-            .filter_map(|id| detector.findings.get(id))
-            .collect();
+        let mut found: Vec<&crate::state::FindingRecord> = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for id in &input.finding_ids {
+            // `FindingIds` names a SET of findings: a repeated id is reported once.
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            if let Some(record) = detector.findings.get(id) {
+                found.push(record);
+            }
+        }
         crate::state::sort_findings(&mut found, input.sort_criteria.as_ref())
             .map_err(|rejection| bad_request(rejection.message(SORT_ATTRIBUTE_MEMBER)))?;
 
