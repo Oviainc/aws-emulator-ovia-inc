@@ -34,7 +34,10 @@ const BROKER_NODES_MAX: i64 = 15;
 /// One clause of the AWS constraint-validation message: the value the caller
 /// submitted (`None` for a member it omitted), the member path the violation is
 /// reported on, and the requirement that value failed.
-fn clause(submitted: Option<&str>, path: &str, requirement: &str) -> String {
+///
+/// Shared with the other suites of this binary, so one wording serves every
+/// operation's pre-handler refusal rather than one copy per suite.
+pub(crate) fn clause(submitted: Option<&str>, path: &str, requirement: &str) -> String {
     match submitted {
         Some(value) => {
             format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
