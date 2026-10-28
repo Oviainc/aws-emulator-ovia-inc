@@ -115,7 +115,7 @@ async fn get_connection_function(
 
 /// The same read, through the shared XML-parsing call path, for the cases whose answer is
 /// the restXml error envelope rather than a blob.
-async fn get_connection_function_refusal(
+pub(crate) async fn get_connection_function_refusal(
     router: &MultiServiceRouter,
     identifier: &str,
     stage: Option<&str>,

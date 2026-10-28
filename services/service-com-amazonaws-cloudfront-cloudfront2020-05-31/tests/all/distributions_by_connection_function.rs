@@ -89,7 +89,7 @@ async fn connection_function(router: &MultiServiceRouter, name: &str) -> Functio
 
 /// The `DistributionConfig` a row submits: one origin and a default cache behaviour, plus
 /// the `ConnectionFunctionAssociation` the row attaches, when it attaches one.
-fn config_xml(caller_reference: &str, attached: Option<&str>) -> String {
+pub(crate) fn config_xml(caller_reference: &str, attached: Option<&str>) -> String {
     let association = match attached {
         Some(id) => format!(
             "<ConnectionFunctionAssociation><Id>{id}</Id></ConnectionFunctionAssociation>"
