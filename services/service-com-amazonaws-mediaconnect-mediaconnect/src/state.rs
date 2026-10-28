@@ -237,23 +237,32 @@ pub fn is_stopped_bridge_state(bridge_state: &str) -> bool {
 /// The `RouterInputState` enum the model declares for a router input
 /// (`smithy_query(query="shape",shape="RouterInputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// states a router input's create, start, restart, reconfiguration and delete reach are
-/// named here; the rest belong to the router-input operations that are still scaffolded
-/// (stop, migrate).
+/// states a router input's create, start, stop, restart, reconfiguration and delete reach
+/// are named here; the rest belong to the router-input operations that are still
+/// scaffolded (migrate).
 ///
 /// The non-terminal state a router input is answered in while it is being created; the
 /// clock settles it into [`ROUTER_INPUT_STATE_STANDBY`] one [`TRANSITION_SPAN`] later.
 pub const ROUTER_INPUT_STATE_CREATING: &str = "CREATING";
 /// See [`ROUTER_INPUT_STATE_CREATING`]. A router input that finished being created is not
 /// running yet: it waits in `STANDBY` until StartRouterInput starts it, exactly as a
-/// created bridge waits (see [`BRIDGE_STATE_STANDBY`]).
+/// created bridge waits (see [`BRIDGE_STATE_STANDBY`]) — and it is where a STOPPED input
+/// settles, because stopping an input is what returns it to not running (see
+/// [`ROUTER_INPUT_STATE_STOPPING`]).
 pub const ROUTER_INPUT_STATE_STANDBY: &str = "STANDBY";
 /// See [`ROUTER_INPUT_STATE_CREATING`]. The non-terminal state a router input is answered
 /// in while StartRouterInput's start is in flight; the clock settles it into
 /// [`ROUTER_INPUT_STATE_ACTIVE`] one [`TRANSITION_SPAN`] later.
 pub const ROUTER_INPUT_STATE_STARTING: &str = "STARTING";
-/// See [`ROUTER_INPUT_STATE_CREATING`]. The state of a router input that is running.
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The state of a router input that is running — what
+/// StartRouterInput settles an input into, and the state StopRouterInput takes it out of.
 pub const ROUTER_INPUT_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The non-terminal state a router input is answered
+/// in while a stop is in flight: StopRouterInput accepts the stop and the clock settles the
+/// input into [`ROUTER_INPUT_STATE_STANDBY`] one [`TRANSITION_SPAN`] later, so a caller
+/// reading the input straight after the stop still sees it stopping — the input-side
+/// counterpart of [`ROUTER_OUTPUT_STATE_STOPPING`].
+pub const ROUTER_INPUT_STATE_STOPPING: &str = "STOPPING";
 /// See [`ROUTER_INPUT_STATE_CREATING`]. The transient state an input is RECONFIGURED in:
 /// UpdateRouterInput answers `202 Accepted`, so the settings it accepted are not in effect
 /// the instant it answers, and the clock settles the input back into the state it was
