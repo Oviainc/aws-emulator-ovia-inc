@@ -65,3 +65,5 @@ mod tag_arn_resolution;
 mod tag_character_set;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;
+#[path = "all/transition_span_schedule.rs"]
+mod transition_span_schedule;

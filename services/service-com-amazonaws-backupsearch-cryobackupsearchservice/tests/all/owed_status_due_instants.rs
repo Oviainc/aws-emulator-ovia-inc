@@ -16,9 +16,10 @@
 //! there is) crossed with the base (the epoch, now, a far-future instant, and the LAST
 //! instant the platform can represent, found by bisection rather than hardcoded). The
 //! remaining tests drive the three operations that store a due instant end-to-end over
-//! HTTP, pinning that each one is owed at its span after the call that started it and that
-//! the clock then materialises it — so making the computation fallible leaves every answer
-//! a client sees unchanged.
+//! HTTP, pinning that each one is owed at its span after the transition before it — the
+//! first of them after the call that started the resource — and that the clock then
+//! materialises it, so making the computation fallible leaves every answer a client sees
+//! unchanged.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -238,7 +239,7 @@ fn start_rows() -> Vec<StartRow> {
 /// The statuses the store holds as owed for one search job, each with the instant it is
 /// owed from — read off the record so the assertion is about what the handler STORED and
 /// not about what a reader happened to report.
-fn owed_search_job_statuses(
+pub(crate) fn owed_search_job_statuses(
     engine: &engine::InMemoryEngine,
     identifier: &str,
 ) -> Vec<(SystemTime, String)> {
@@ -255,7 +256,7 @@ fn owed_search_job_statuses(
 }
 
 /// The status one export job is owed, with the instant it is owed from.
-fn owed_export_job_status(
+pub(crate) fn owed_export_job_status(
     engine: &engine::InMemoryEngine,
     identifier: &str,
 ) -> Option<(SystemTime, String)> {
@@ -272,7 +273,7 @@ fn owed_export_job_status(
 
 /// Assert `due` is `span` after the call that was made between `before` and `after`: the
 /// instant is measured from the handler's own clock reading, which lies in that interval.
-fn assert_due_after_the_call(
+pub(crate) fn assert_due_after_the_call(
     case: &str,
     what: &str,
     due: SystemTime,
@@ -327,13 +328,15 @@ async fn a_started_search_job_owes_each_phase_at_its_span_after_the_call() {
             after,
             state::CREATING_DELAY,
         );
+        // The terminal status is owed a span after the phase BEFORE it, so measured from
+        // the call that started the job it is the set-up span plus the transition span.
         assert_due_after_the_call(
             row.case,
             "the terminal status",
             owed[1].0,
             before,
             after,
-            state::TRANSITION_DELAY,
+            state::CREATING_DELAY.saturating_add(state::TRANSITION_DELAY),
         );
 
         // The stored instants are what the clock materialises: once both spans have

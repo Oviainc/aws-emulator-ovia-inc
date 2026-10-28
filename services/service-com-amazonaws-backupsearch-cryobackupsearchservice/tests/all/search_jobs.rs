@@ -26,14 +26,24 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::ops::types;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::EmulatedService;
 
-/// Longer than `crate::state::TRANSITION_DELAY`, so the clock has made a search job's
-/// owed status transitions due by the time the next call is made.
-pub(crate) const PAST_THE_DUE_INSTANT: Duration = Duration::from_millis(900);
+/// A margin on top of a span, so a sleep that is meant to carry the clock PAST a due
+/// instant is not racing it on a loaded machine.
+pub(crate) const PAST_THE_SPAN: Duration = Duration::from_millis(150);
 
-/// Longer than `crate::state::CREATING_DELAY` but shorter than
-/// `crate::state::TRANSITION_DELAY`, so a search job has left `CREATING` for the
-/// `RUNNING` phase of its scan and not yet reached its terminal status.
-pub(crate) const PAST_THE_CREATING_INSTANT: Duration = Duration::from_millis(350);
+/// Longer than the whole schedule a new search job is owed — its set-up span plus the
+/// transition span the scan itself takes (`state::CREATING_DELAY` then
+/// `state::TRANSITION_DELAY`, each counted from the phase before it) — so the clock has
+/// made every owed transition due by the time the next call is made. Derived from those
+/// spans rather than restated, so it cannot drift from them.
+pub(crate) const PAST_THE_DUE_INSTANT: Duration = state::CREATING_DELAY
+    .saturating_add(state::TRANSITION_DELAY)
+    .saturating_add(PAST_THE_SPAN);
+
+/// Longer than `crate::state::CREATING_DELAY` but shorter than the instant the terminal
+/// status is owed from, so a search job has left `CREATING` for the `RUNNING` phase of
+/// its scan and not yet reached its terminal status.
+pub(crate) const PAST_THE_CREATING_INSTANT: Duration =
+    state::CREATING_DELAY.saturating_add(PAST_THE_SPAN);
 
 /// Shorter than either span, to pin that neither is zero: a caller acting straight after
 /// `StartSearchJob` still observes the transient `CREATING` the job is created in.

@@ -22,7 +22,10 @@
 //! it is displayed, with the status saying why, by `ListSearchJobBackups`, and the job's
 //! own `StatusMessage` says that the scope held such backups at all.
 //!
-//! The clock then owes the job `RUNNING` and after that a terminal status, and WHICH
+//! The clock then owes the job `RUNNING` one transition span after this call and a
+//! terminal status a further span after that ([`crate::state::CREATING_DELAY`] then
+//! [`crate::state::TRANSITION_DELAY`]), so each phase lasts a whole span and a client
+//! that cancels or polls right after this call still finds the job in it. WHICH
 //! terminal one — with the `StatusMessage` it comes with — follows from the resolved scope
 //! ([`crate::state::scan_outcome`]): a scan that got through every recovery point in scope
 //! runs to `COMPLETED` and explains nothing, a scope that resolved to none ends `FAILED`
@@ -337,14 +340,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let backups: Vec<SearchJobBackupsResult> =
             points.into_iter().map(|point| point.backup).collect();
 
+        // The due instant of each phase, CHAINED: the scan starts running a span after
+        // this call and ends a span after it started running, so neither phase can be
+        // skipped past by a client that acts straight after the call before it.
+        let running_due = crate::state::due_at(now, crate::state::CREATING_DELAY);
+        let terminal_due = crate::state::due_at(running_due, crate::state::TRANSITION_DELAY);
+
         let job = SearchJob {
             identifier: identifier.clone(),
             arn,
             name: input.name.clone(),
             // A new search job is being set up, so the first status any caller can
             // observe is CREATING; the clock owes it RUNNING once the set-up span has
-            // passed (`crate::state::CREATING_DELAY`) and the terminal status above once
-            // the scan's span has (`crate::state::TRANSITION_DELAY`).
+            // passed (`crate::state::CREATING_DELAY`) and the terminal status above a
+            // further span after THAT (`crate::state::TRANSITION_DELAY`), so each phase
+            // lasts a whole span.
             status: crate::state::CREATING.to_string(),
             creation_time: crate::state::timestamp(now),
             completion_time: None,
@@ -369,16 +379,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|token| crate::state::ClientToken::minted(token, now)),
             request_fingerprint: fingerprint,
             owed_statuses: VecDeque::from([
-                (
-                    crate::state::due_at(now, crate::state::CREATING_DELAY),
-                    crate::state::RUNNING,
-                    None,
-                ),
-                (
-                    crate::state::due_at(now, crate::state::TRANSITION_DELAY),
-                    owed_status,
-                    owed_message,
-                ),
+                (running_due, crate::state::RUNNING, None),
+                (terminal_due, owed_status, owed_message),
             ]),
         };
         state.insert_job(job);

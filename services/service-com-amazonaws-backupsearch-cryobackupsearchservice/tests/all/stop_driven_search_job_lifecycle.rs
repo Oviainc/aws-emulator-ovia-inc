@@ -43,12 +43,15 @@ use crate::search_jobs::{
 const BACK_TO_BACK: Duration = Duration::ZERO;
 
 /// How long a poller waits between two `GetSearchJob` calls, and how many times it asks.
-/// The product is comfortably longer than every span this service owes a search job
-/// (`state::CREATING_DELAY` then `state::TRANSITION_DELAY`), so a loop that gives up has
-/// found a job that never converges rather than one that was merely slow.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The product is comfortably longer than the whole walk a cancelled job makes — the
+/// set-up span, the scan's span and the stop's own span (`state::CREATING_DELAY` and two
+/// `state::TRANSITION_DELAY`s), each counted from the transition before it — so a loop
+/// that gives up has found a job that never converges rather than one that was merely
+/// slow. The loop returns as soon as the status is terminal, so the budget costs nothing
+/// when the job does converge.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// See [`POLL_INTERVAL`].
-const POLL_ATTEMPTS: usize = 60;
+const POLL_ATTEMPTS: usize = 150;
 
 /// One row: when the cancel is sent, the phase the job is in by then, what this account
 /// holds, the terminal status the scan would have settled to had nothing cancelled it,

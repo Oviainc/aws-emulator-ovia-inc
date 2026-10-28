@@ -214,28 +214,30 @@ pub fn export_status_refusal_message(status: &str) -> String {
     )
 }
 
-/// How long after the call that starts a transition the clock owes the next status (the
-/// terminal status [`scan_outcome`] gives a new search job, `STOPPING` -> `STOPPED` after
-/// `StopSearchJob`, and an export job's `RUNNING` -> `COMPLETED` after
-/// `StartSearchResultExportJob`).
+/// How long after the transition that precedes it the clock owes the next status (the
+/// terminal status [`scan_outcome`] gives a new search job, counted from the instant its
+/// [`RUNNING`] phase fell due; `STOPPING` -> `STOPPED` after `StopSearchJob`; and an
+/// export job's `RUNNING` -> `COMPLETED` after `StartSearchResultExportJob`).
 ///
 /// AWS documents no duration for any of them — how long a scan or an export takes
-/// depends on the backups in scope — so this span is CHOSEN, not modelled: 500 ms,
-/// inside the project's 250-750 ms band. It is deliberately non-zero, so a caller acting
-/// straight after `StartSearchJob` still observes a transient status and `StopSearchJob`
-/// can still accept it. Nothing sleeps for it: the due instant is stored and compared
-/// against the clock.
-pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
+/// depends on the backups in scope — so this span is CHOSEN, not modelled: a few
+/// seconds, which is this emulator's span for a transition the clock owes. It replaces
+/// the sub-second span this crate used before, which a single client round trip could
+/// outrun: the span has to be long enough that a client doing what AWS supports back to
+/// back — start a job and cancel it, start a job and poll it — still finds the job in the
+/// phase the call before it put the job in, rather than past the whole scan. Nothing
+/// sleeps for it: the due instant is stored and compared against the clock.
+pub const TRANSITION_DELAY: Duration = Duration::from_secs(3);
 
 /// How long after `StartSearchJob` the clock owes the job [`RUNNING`], i.e. how long it
 /// sits in [`CREATING`] first.
 ///
 /// Also CHOSEN rather than modelled — AWS documents no duration for the set-up phase
-/// either — at 250 ms, inside the same 250-750 ms band, and deliberately SHORTER than
-/// [`TRANSITION_DELAY`], which is when the scan itself is owed its terminal status: both
-/// transient phases a scan passes through are therefore observable, the first one by a
-/// caller acting straight after the start call.
-pub const CREATING_DELAY: Duration = Duration::from_millis(250);
+/// either. The set-up phase is a transition the clock owes like any other, so it lasts
+/// one [`TRANSITION_DELAY`] and the scan's terminal status is owed a further span after
+/// it: both transient phases a scan passes through are therefore observable for a whole
+/// span each, the first one by a caller acting straight after the start call.
+pub const CREATING_DELAY: Duration = TRANSITION_DELAY;
 
 /// How long a `ClientToken` of this service takes part in idempotency, measured from
 /// the moment the request that first used it completed.
@@ -880,6 +882,11 @@ pub struct SearchJob {
     /// (`None` for one that needs no message). A scan owes two — [`RUNNING`] and then its
     /// terminal status — so this is a queue and not a single transition; it is EMPTY for a
     /// job in a terminal status, which owes nothing.
+    ///
+    /// Each entry is due one [`TRANSITION_DELAY`] after the entry BEFORE it — the first of
+    /// them after the call that started the job — so every phase the queue holds lasts a
+    /// whole span, and a client acting right after one call is never carried past the
+    /// phase that call put the job in.
     ///
     /// The message is OWNED rather than a fixed sentence, exactly as
     /// [`ExportJob::next_status_due`]'s is: a terminal status the service has to explain
