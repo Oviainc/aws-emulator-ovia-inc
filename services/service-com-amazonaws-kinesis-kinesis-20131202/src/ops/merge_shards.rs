@@ -186,9 +186,14 @@ fn invalid_argument(message: String) -> MergeShardsError {
     .into()
 }
 
-/// Refuse the request because serving it would take this emulator past a ceiling it keeps
-/// on itself: "the requested resource exceeds the maximum number allowed"
-/// (`LimitExceededException`).
+/// How many shards a merge lays down: "Merges two adjacent shards in a Kinesis data stream
+/// and combines them into a single shard" (`MergeShards`), so an accepted call adds one
+/// shard record to the store and is counted against the account's shard quota by that
+/// number.
+const MERGE_CHILDREN: i32 = 1;
+
+/// Refuse the request because serving it would take the account past its shard quota: "the
+/// requested resource exceeds the maximum number allowed" (`LimitExceededException`).
 fn limit_exceeded(message: String) -> MergeShardsError {
     MergeShardsErrorModeled::LimitExceededException(LimitExceededException {
         message: Some(message),
@@ -236,12 +241,11 @@ fn merge_shards(
     now: ::std::time::SystemTime,
     input: &MergeShardsInput,
 ) -> Result<(), MergeShardsError> {
-    // The emulator's own ceilings are counted across the whole store, so they are read
+    // The account and region's shard quota is counted across the whole store, so it is read
     // BEFORE the stream is borrowed for writing: the child this call lays down is one more
     // shard record beside the ones the store already holds, since the shards it closes keep
     // the records written to them.
-    let shards_in_region = store.shards_held_in(now, region);
-    let shards_held = store.shards_held(now);
+    let (shard_limit, open_shard_count) = store.shard_quota_in(now, region);
 
     let identifier = stream_identifier(input).to_string();
     let stream = store
@@ -336,19 +340,16 @@ fn merge_shards(
         )));
     }
 
-    // The store is bounded, so a merge past a ceiling is refused rather than grown into.
-    if shards_in_region.saturating_add(1) > crate::state::MAX_SHARDS_PER_REGION {
-        return Err(limit_exceeded(format!(
-            "this region holds {shards_in_region} shards, and one more would exceed the {} \
-             shards authorized for this account and region",
-            crate::state::MAX_SHARDS_PER_REGION
-        )));
-    }
-    if shards_held.saturating_add(1) > crate::state::MAX_SHARDS_TOTAL {
-        return Err(limit_exceeded(format!(
-            "this emulator already holds {shards_held} of the maximum of {} shards across \
-             every region; delete a stream before resharding another",
-            crate::state::MAX_SHARDS_TOTAL
+    // A merge lays down a child shard beside the two it closes, and a shard record it adds
+    // is capacity the account takes up, so it is counted against the room left under the
+    // quota `DescribeLimits` publishes for this account and region exactly as every other
+    // call that lays down a shard is: one quota, one refusal.
+    if open_shard_count.saturating_add(MERGE_CHILDREN) > shard_limit {
+        return Err(limit_exceeded(crate::state::shard_limit_exceeded_message(
+            region,
+            open_shard_count,
+            shard_limit,
+            MERGE_CHILDREN,
         )));
     }
 

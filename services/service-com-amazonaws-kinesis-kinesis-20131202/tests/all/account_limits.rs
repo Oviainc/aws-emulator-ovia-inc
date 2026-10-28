@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    DELETION_DELAY, MAX_SHARDS_PER_STREAM, ON_DEMAND_INITIAL_SHARDS, STREAM_DELETING,
-    STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED,
+    DELETION_DELAY, ON_DEMAND_INITIAL_SHARDS, STREAM_DELETING, STREAM_MODE_ON_DEMAND,
+    STREAM_MODE_PROVISIONED,
 };
 
 use crate::shard_scaling::{hash_key_range, is_open, shard_id, shard_map, summary};
@@ -388,23 +388,16 @@ async fn the_reported_shard_limit_is_the_ceiling_a_create_is_refused_past() {
         "case {case}: expected a positive ShardLimit, got {quota}"
     );
 
-    // Fill the region to EXACTLY the quota the call above reported, in streams of at most
-    // the shards one stream may hold.
-    let per_stream = i64::from(MAX_SHARDS_PER_STREAM);
-    let mut filled = 0i64;
-    let mut index = 0;
-    while filled < quota {
-        let shards = (quota - filled).min(per_stream);
-        create(
-            &emulator,
-            &format!("{case}-{index}"),
-            STREAM_MODE_PROVISIONED,
-            Some(u32::try_from(shards).unwrap_or(1)),
-        )
-        .await;
-        filled += shards;
-        index += 1;
-    }
+    // Fill the region to EXACTLY the quota the call above reported. There is no second,
+    // per-stream ceiling, so the whole quota fits in one stream — `shard_quota.rs` asserts
+    // that boundary over a table of usages.
+    create(
+        &emulator,
+        &format!("{case}-0"),
+        STREAM_MODE_PROVISIONED,
+        Some(u32::try_from(quota).unwrap_or(1)),
+    )
+    .await;
 
     let full = limits(&emulator, case).await;
     assert_eq!(

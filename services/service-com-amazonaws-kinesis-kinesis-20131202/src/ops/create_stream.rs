@@ -327,19 +327,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
             // Modelled `range 1..`, so the boundary validator has already refused a
-            // non-positive count; a value past this emulator's shard ceiling is refused
+            // non-positive count; a count past the account's shard quota is refused
             // below, BEFORE the shard map is allocated from it.
             (false, Some(requested)) => u32::try_from(requested).unwrap_or(u32::MAX),
         };
-
-        if shard_count > crate::state::MAX_SHARDS_PER_STREAM {
-            audit(&akid, &region, "refused");
-            return Err(limit_exceeded(format!(
-                "a stream of {shard_count} shards exceeds the {} shards one stream of this \
-                 emulator may hold",
-                crate::state::MAX_SHARDS_PER_STREAM
-            )));
-        }
 
         // "A set of up to 50 key-value pairs to use to create the tags"
         // (`CreateStreamInput$Tags`) — narrower than the `TagMap` `@length` of 1..200 the
@@ -395,26 +386,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The store is bounded, so a create past a ceiling is refused rather than grown
-        // into. The region's own quotas are the ones AWS publishes per account and region;
-        // and because that region is the one the CALLER's credential scope names, the two
-        // ceilings no request can partition are checked beside them — together they are what
-        // keeps a caller from making this emulator's memory grow without end.
-        let streams_in_region = store.streams_held_in(created_at, &region);
-        let shards_in_region = store.shards_held_in(created_at, &region);
-        if streams_in_region >= crate::state::MAX_STREAMS_PER_REGION
-            || shards_in_region.saturating_add(shard_count) > crate::state::MAX_SHARDS_PER_REGION
-        {
+        // "Create more shards than are authorized for your account" is what the operation's
+        // own doc answers `LimitExceededException` for, and the number authorized is the
+        // quota `DescribeLimits` publishes for this account and region: the shards this
+        // create would open are counted against the room left under it, so a request for at
+        // most `ShardLimit - OpenShardCount` shards is served and a larger one is refused
+        // before any shard map is allocated. That quota never exceeds the room the store
+        // itself has left, so this is also the bound on what one request may allocate.
+        let (shard_limit, open_shard_count) = store.shard_quota_in(created_at, &region);
+        let requested = i32::try_from(shard_count).unwrap_or(i32::MAX);
+        if open_shard_count.saturating_add(requested) > shard_limit {
             drop(store);
             audit(&akid, &region, "refused");
-            return Err(limit_exceeded(format!(
-                "this region holds {streams_in_region} streams of {shards_in_region} shards, \
-                 and {shard_count} more shards would exceed the {} streams and {} shards \
-                 authorized for this account and region",
-                crate::state::MAX_STREAMS_PER_REGION,
-                crate::state::MAX_SHARDS_PER_REGION
+            return Err(limit_exceeded(crate::state::shard_limit_exceeded_message(
+                &region,
+                open_shard_count,
+                shard_limit,
+                requested,
             )));
         }
+
         // A stream of the on-demand capacity mode is counted against the on-demand stream
         // quota of this account and region, which is the quota `DescribeLimits` reports as
         // `OnDemandStreamCountLimit`, so a create past it is refused rather than served.
@@ -427,21 +418,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::on_demand_stream_ceiling_exceeded_message(on_demand_in_region),
                 ));
             }
-        }
-        if store.streams_held(created_at) >= crate::state::MAX_STREAMS_TOTAL
-            || store
-                .shards_held(created_at)
-                .saturating_add(shard_count)
-                > crate::state::MAX_SHARDS_TOTAL
-        {
-            drop(store);
-            audit(&akid, &region, "refused");
-            return Err(limit_exceeded(format!(
-                "this emulator already holds the maximum of {} streams or {} shards across \
-                 every region; delete one before creating another",
-                crate::state::MAX_STREAMS_TOTAL,
-                crate::state::MAX_SHARDS_TOTAL
-            )));
         }
 
         // The shard map: one shard per unit of capacity, covering the hash key space in

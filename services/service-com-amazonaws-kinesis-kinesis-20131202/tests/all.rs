@@ -55,6 +55,8 @@ mod retention_period;
 mod shard_iterators;
 #[path = "all/shard_listing.rs"]
 mod shard_listing;
+#[path = "all/shard_quota.rs"]
+mod shard_quota;
 #[path = "all/shard_scaling.rs"]
 mod shard_scaling;
 #[path = "all/state_roundtrip.rs"]

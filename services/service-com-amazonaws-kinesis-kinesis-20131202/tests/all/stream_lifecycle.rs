@@ -40,9 +40,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     stream_not_found_message, ACTIVATION_DELAY, DEFAULT_RETENTION_PERIOD_HOURS,
     ENCRYPTION_TYPE_NONE, MAX_DESCRIBE_STREAM_SHARD_LIMIT, MAX_SHARDS_PER_REGION,
-    MAX_SHARDS_PER_STREAM, MAX_SHARDS_TOTAL, MAX_STREAM_TAGS, ON_DEMAND_INITIAL_SHARDS,
-    SHARD_WRITE_MI_BPS, STREAM_ACTIVE, STREAM_CREATING, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
-    STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED,
+    MAX_SHARDS_TOTAL, MAX_STREAM_TAGS, ON_DEMAND_INITIAL_SHARDS, SHARD_WRITE_MI_BPS,
+    STREAM_ACTIVE, STREAM_CREATING, STREAM_IDENTIFIER_REQUIRED_MESSAGE, STREAM_MODE_ON_DEMAND,
+    STREAM_MODE_PROVISIONED,
 };
 use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -844,10 +844,10 @@ async fn a_create_outside_the_documented_rules_is_refused_and_stores_nothing() {
             "InvalidArgumentException",
         ),
         (
-            "more-shards-than-one-stream-may-hold",
+            "more-shards-than-the-account-quota-authorizes",
             json!({
                 "StreamName": "sim2real-stream-bad-e",
-                "ShardCount": i64::from(MAX_SHARDS_PER_STREAM) + 1,
+                "ShardCount": i64::from(MAX_SHARDS_PER_REGION) + 1,
             }),
             "LimitExceededException",
         ),
@@ -904,10 +904,10 @@ async fn a_create_outside_the_documented_rules_is_refused_and_stores_nothing() {
 #[tokio::test]
 async fn the_store_is_bounded_whatever_region_a_caller_names() {
     // The ceilings a create is refused past. The per-region shard quota is reached by
-    // creating whole streams of the per-stream maximum; the ceilings that no request can
-    // partition are then reached by doing the same in region after region.
+    // creating streams of half of it; the ceiling that no request can partition is then
+    // reached by doing the same in region after region.
     let emulator = Emulator::new();
-    let shards_per_stream = MAX_SHARDS_PER_STREAM;
+    let shards_per_stream = MAX_SHARDS_PER_REGION / 2;
     let streams_per_region = (MAX_SHARDS_PER_REGION / shards_per_stream) as usize;
     assert!(
         streams_per_region >= 1,
@@ -995,13 +995,16 @@ async fn the_shard_map_pages_and_partitions_the_whole_hash_key_space() {
     let emulator = Emulator::new();
     let case = "shard-map-paging";
     let name = "sim2real-stream-paged";
-    let map_len = MAX_SHARDS_PER_STREAM as usize;
+    // A map of more shards than one `DescribeStream` page carries, so the paging the rule
+    // names is exercised; the account's shard quota admits it in one stream.
+    let map_len = MAX_DESCRIBE_STREAM_SHARD_LIMIT as usize * 5 / 2;
+    let shard_count = i64::try_from(map_len).unwrap_or(i64::MAX);
 
     emulator
         .ok(
             case,
             "CreateStream",
-            &json!({ "StreamName": name, "ShardCount": MAX_SHARDS_PER_STREAM }),
+            &json!({ "StreamName": name, "ShardCount": shard_count }),
         )
         .await;
 
