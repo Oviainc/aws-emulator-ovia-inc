@@ -16,7 +16,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     CreateRule, CrossRegionCopyTarget, Exclusions, InvalidRequestException, LifecyclePolicy,
-    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, RetainRule, Schedule, Tag,
+    LifecyclePolicySummary, PolicyDetails, ResourceNotFoundException, Schedule, Tag,
 };
 
 /// The region a request belongs to — the policies it reaches, and the region a
@@ -181,6 +181,19 @@ pub const RETAIN_INTERVAL_MAX_DAYS: i32 = 14;
 /// The member targets `Interval`, which is `@range(min: 1)` — every positive
 /// integer — so the SET is enforced here.
 pub const SUPPORTED_CREATE_RULE_INTERVALS: [i32; 8] = [1, 2, 3, 4, 6, 8, 12, 24];
+
+/// The least standard-tier retention a schedule may keep when it also carries a
+/// rule that acts on the snapshots it keeps: `RetainRule` documents "If you
+/// specify a FastRestoreRule, ShareRule, or a CrossRegionCopyRule, then you must
+/// specify a retention count of `1` or more" and, for the age-based mode, "then
+/// you must specify a retention interval of `1` day or more"
+/// (`smithy_query(query="doc", shape="RetainRule")`).
+///
+/// `StandardTierRetainRuleCount` is `@range(min: 0, max: 1000)` and
+/// `StandardTierRetainRuleInterval` is `@range(min: 0)`, so the model admits `0`
+/// — it is admissible for a schedule that carries none of those rules — and this
+/// conditional floor is enforced here.
+pub const RETENTION_FLOOR_WITH_DEPENDENT_RULE: i32 = 1;
 
 /// The error code Amazon Data Lifecycle Manager answers when the caller may not
 /// pass the `ExecutionRoleArn` it named.
@@ -1570,9 +1583,10 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 /// carries, or `None` when every one of them states its creation and retention
 /// rules in a form the documentation admits.
 ///
-/// Two documented either/or rules, neither of them expressible in the model,
-/// judged on EVERY element of `Schedules` (`@length(min: 1, max: 4)`) so a
-/// policy is refused for whichever of its schedules carries the fault:
+/// The documented cross-member rules a schedule's creation and retention rules
+/// obey, none of them expressible in the model, judged on EVERY element of
+/// `Schedules` (`@length(min: 1, max: 4)`) so a policy is refused for whichever
+/// of its schedules carries the fault:
 ///
 /// * `CreateRule` — "You must specify either CronExpression, or Interval,
 ///   IntervalUnit, and Times." A schedule states when to create in exactly one
@@ -1581,7 +1595,9 @@ fn plural(count: usize) -> (&'static str, &'static str) {
 /// * `RetainRule` — "You can retain snapshots based on either a count or a time
 ///   interval. Count-based retention: You must specify Count ... Age-based
 ///   retention: You must specify Interval and IntervalUnit." A retention rule
-///   states exactly one of the two modes.
+///   states exactly one of the two modes, and the retention that mode states
+///   meets the floor the OTHER rules of the same schedule raise — see
+///   [`retention_floor_violation`].
 pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<InvalidRequestException> {
     details?
         .schedules
@@ -1591,12 +1607,8 @@ pub fn schedule_rule_violation(details: Option<&PolicyDetails>) -> Option<Invali
         .find_map(|(position, schedule)| {
             let label = schedule_label(position, schedule);
             let path = schedule_path(position);
-            create_rule_violation(&label, &path, schedule.create_rule.as_ref()).or_else(|| {
-                schedule
-                    .retain_rule
-                    .as_ref()
-                    .and_then(|rule| retain_rule_violation(&label, &path, rule))
-            })
+            create_rule_violation(&label, &path, schedule.create_rule.as_ref())
+                .or_else(|| retain_rule_violation(&label, &path, schedule))
         })
 }
 
@@ -1653,17 +1665,25 @@ fn create_rule_violation(
 }
 
 /// Why a schedule's retention rule is refused, or `None` when it states exactly
-/// one of the two documented retention modes.
+/// one of the two documented retention modes and retains at least as much as the
+/// schedule's other rules require.
 ///
 /// A retention interval of [`UNSET_RULE_INTERVAL`] is the value this service
 /// itself materializes for a rule that stated none, so it is not a time interval
 /// the request asked for: a unit, or any other interval, is what states the
 /// age-based mode.
+///
+/// The whole `schedule` is judged, not the retention rule alone: the floor on how
+/// much a rule may retain depends on which OTHER rules the same schedule carries
+/// ([`retention_floor_violation`]). A schedule carrying no retention rule is
+/// refused nothing here — the model declares none for a schedule, and no
+/// documented sentence requires one.
 fn retain_rule_violation(
     label: &str,
     path: &str,
-    rule: &RetainRule,
+    schedule: &Schedule,
 ) -> Option<InvalidRequestException> {
+    let rule = schedule.retain_rule.as_ref()?;
     let count_based = rule.count.is_some();
     let age_based = rule.interval_unit.is_some()
         || rule.interval.is_some_and(|value| value != UNSET_RULE_INTERVAL);
@@ -1687,15 +1707,122 @@ fn retain_rule_violation(
                     ("IntervalUnit", rule.interval_unit.is_some()),
                 ],
             );
-            (!omitted.is_empty()).then(|| {
-                required_in_schedule(
+            if !omitted.is_empty() {
+                return Some(required_in_schedule(
                     label,
                     omitted,
                     "age based retention states both Interval and IntervalUnit",
-                )
-            })
+                ));
+            }
+            // The floor is stated in DAYS ("a retention interval of 1 day or
+            // more"), and every `RetentionIntervalUnitValues` member is at least
+            // a day long, so an interval of 1 or more in ANY unit meets it and
+            // only an interval of 0 falls short of it.
+            let requirement = format!(
+                "a retention interval of {RETENTION_FLOOR_WITH_DEPENDENT_RULE} day or more"
+            );
+            retention_floor_violation(
+                label,
+                schedule,
+                "Interval",
+                rule.interval.unwrap_or(UNSET_RULE_INTERVAL),
+                &requirement,
+            )
         }
-        (true, false) => None,
+        (true, false) => {
+            let requirement =
+                format!("a retention count of {RETENTION_FLOOR_WITH_DEPENDENT_RULE} or more");
+            retention_floor_violation(
+                label,
+                schedule,
+                "Count",
+                rule.count.unwrap_or_default(),
+                &requirement,
+            )
+        }
+    }
+}
+
+/// Why `retained` — the retention the schedule's `member` states, in the mode it
+/// retains by — is refused, or `None` when it meets the floor the schedule's
+/// other rules raise.
+///
+/// A schedule may retain NOTHING (`StandardTierRetainRuleCount` is
+/// `@range(min: 0, max: 1000)`, `StandardTierRetainRuleInterval` is
+/// `@range(min: 0)`, and an `ArchiveRule` is documented as archiving such
+/// snapshots "immediately after creation") only while every other rule it
+/// carries acts on creation alone. A rule that acts on the snapshots the
+/// schedule KEEPS — enabling fast restore on them, sharing them, copying them to
+/// another Region — raises the floor to
+/// [`RETENTION_FLOOR_WITH_DEPENDENT_RULE`]: a schedule retaining none of them has
+/// none for that rule to act on. The floor applies to whichever mode the rule
+/// retains by, since the documentation states it for both, and it holds whatever
+/// else the schedule carries: the `ArchiveRule` sentence grants a permission for
+/// a schedule that has no such rule, while this one states a requirement.
+fn retention_floor_violation(
+    label: &str,
+    schedule: &Schedule,
+    member: &str,
+    retained: i32,
+    requirement: &str,
+) -> Option<InvalidRequestException> {
+    if retained >= RETENTION_FLOOR_WITH_DEPENDENT_RULE {
+        return None;
+    }
+    let dependent = rules_requiring_retention(schedule);
+    if dependent.is_empty() {
+        return None;
+    }
+    Some(invalid_request(format!(
+        "The parameter RetainRule.{member} in schedule {{{label}}} was {retained}. A schedule \
+         that specifies {} must specify {requirement}.",
+        named_in_prose(&dependent)
+    )))
+}
+
+/// Which of the schedule's rules act on the snapshots it RETAINS, in the order
+/// `RetainRule` names them, and so raise its retention floor. Empty when the
+/// schedule carries none of them.
+///
+/// `Schedule$ShareRules` (`@length(min: 0, max: 1)`) and
+/// `Schedule$CrossRegionCopyRules` (`@length(min: 0, max: 3)`) carry their rules
+/// as lists, so a schedule specifies one of those rules by carrying a NON-EMPTY
+/// list; `Schedule$FastRestoreRule` is a single structure. Each is named in the
+/// refusal by the name of the rule SHAPE, which is how the documented sentence
+/// and the API reference name it.
+fn rules_requiring_retention(schedule: &Schedule) -> Vec<&'static str> {
+    [
+        ("FastRestoreRule", schedule.fast_restore_rule.is_some()),
+        (
+            "ShareRule",
+            schedule
+                .share_rules
+                .as_ref()
+                .is_some_and(|rules| !rules.is_empty()),
+        ),
+        (
+            "CrossRegionCopyRule",
+            schedule
+                .cross_region_copy_rules
+                .as_ref()
+                .is_some_and(|rules| !rules.is_empty()),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, specified)| *specified)
+    .map(|(name, _)| name)
+    .collect()
+}
+
+/// `names` as a refusal reads them: `a X`, `a X and a Y`, `a X, a Y and a Z`.
+///
+/// The empty arm is defensive: the only caller refuses nothing when the schedule
+/// carries none of the rules, so it never reaches this with an empty slice.
+fn named_in_prose(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("a {one}"),
+        [leading @ .., last] => format!("a {} and a {last}", leading.join(", a ")),
     }
 }
 

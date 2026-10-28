@@ -363,13 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.networks.insert(network_id.clone(), network);
         guard.remember_idempotent(
             token,
-            crate::state::CreatedIds {
-                network_id: Some(network_id.clone()),
-                member_id: Some(member_id.clone()),
-                node_id: None,
-                proposal_id: None,
-                accessor_id: None,
-            },
+            crate::state::CreatedIds::network(&network_id, &member_id),
         );
 
         // Answer from the STORED records, so these are the ids every later read of this

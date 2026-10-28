@@ -637,7 +637,14 @@ pub const MAX_INVITATIONS: usize = 1_000;
 /// number is the emulator's own, set well above any realistic workflow's token count.
 pub const MAX_IDEMPOTENCY_RECORDS: usize = 4_096;
 
-/// The ids a create minted, replayed when the same `ClientRequestToken` comes back.
+/// The ids a create MINTED, replayed when the same `ClientRequestToken` comes back.
+///
+/// Only ids the create minted of its own belong here. An id the REQUEST named — the
+/// network a node or a member is created in, the member a node belongs to or a proposal
+/// is proposed by — was not minted by this call, so it is neither part of what a replay
+/// hands back (each create's output reports only what it minted) nor part of what keeps
+/// the record alive. That is why a create records its result through the constructor
+/// named after it rather than filling these fields in by hand.
 #[derive(Debug, Clone, Default)]
 pub struct CreatedIds {
     pub network_id: Option<String>,
@@ -645,6 +652,53 @@ pub struct CreatedIds {
     pub node_id: Option<String>,
     pub proposal_id: Option<String>,
     pub accessor_id: Option<String>,
+}
+
+impl CreatedIds {
+    /// What `CreateNetwork` mints: the network, and the first member it creates in it —
+    /// the two ids `CreateNetworkOutput` reports.
+    pub fn network(network_id: &str, member_id: &str) -> Self {
+        Self {
+            network_id: Some(network_id.to_string()),
+            member_id: Some(member_id.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// What `CreateMember` mints: the member. The network it joins is one the request
+    /// named.
+    pub fn member(member_id: &str) -> Self {
+        Self {
+            member_id: Some(member_id.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// What `CreateNode` mints: the node. The network it runs on and the member that
+    /// owns it are ones the request named.
+    pub fn node(node_id: &str) -> Self {
+        Self {
+            node_id: Some(node_id.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// What `CreateProposal` mints: the proposal. The network it is made on and the
+    /// member that proposed it are ones the request named.
+    pub fn proposal(proposal_id: &str) -> Self {
+        Self {
+            proposal_id: Some(proposal_id.to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// What `CreateAccessor` mints: the accessor.
+    pub fn accessor(accessor_id: &str) -> Self {
+        Self {
+            accessor_id: Some(accessor_id.to_string()),
+            ..Self::default()
+        }
+    }
 }
 
 /// The idempotency key of one `@idempotencyToken` call: the token is scoped to the Region
@@ -1513,6 +1567,15 @@ impl StoredAccessor {
         );
     }
 
+    /// Whether this accessor's removal has started: `DeleteAccessor` "changes the status
+    /// of the accessor ... to `PENDING_DELETION`" and the clock owes it `DELETED`, and in
+    /// either status it is no longer an accessor a caller can use. The counterpart of
+    /// [`StoredMember::is_being_deleted`] for this record's own status enum, whose
+    /// in-progress value is `PENDING_DELETION` rather than `DELETING`.
+    pub fn is_being_deleted(&self) -> bool {
+        self.status == ACCESSOR_STATUS_PENDING_DELETION || self.status == STATUS_DELETED
+    }
+
     /// Materialise the status transition the clock already owes this accessor: a deletion
     /// that has run its course reports `DELETED`.
     ///
@@ -1779,9 +1842,8 @@ pub struct ComAmazonawsManagedblockchainTaigawebserviceState {
     ///
     /// Private, together with [`Self::idempotency_order`], because the two are one
     /// bounded store: every read and write goes through [`Self::replay_idempotent`],
-    /// [`Self::remember_idempotent`], [`Self::forget_node_token`] and
-    /// [`Self::forget_dangling_tokens`], which keep the count at or under
-    /// [`MAX_IDEMPOTENCY_RECORDS`] and keep the two in step.
+    /// [`Self::remember_idempotent`] and [`Self::forget_dangling_tokens`], which keep the
+    /// count at or under [`MAX_IDEMPOTENCY_RECORDS`] and keep the two in step.
     idempotency: BTreeMap<String, CreatedIds>,
     /// The keys of `idempotency` in insertion order, oldest first: the eviction order
     /// when the ledger is at its ceiling.
@@ -2030,10 +2092,20 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         self.tagged_record_mut(arn).map(TaggedRecordMut::tags_mut)
     }
 
-    /// What the create under this idempotency key already minted, if the ledger still
-    /// holds it.
+    /// What the create under this idempotency key already minted, while the resources it
+    /// minted are still ones a caller can use.
+    ///
+    /// "An idempotent operation completes no more than one time" (`ClientRequestToken`),
+    /// and what a replay completes is that create's own result — so a record none of whose
+    /// minted resources is still live names nothing a caller could use, whichever call
+    /// started their removal, and the token is a first call again. [`Self::holds_any`] is
+    /// that one liveness test, shared with [`Self::forget_dangling_tokens`], so a replay
+    /// never depends on which delete path happened to sweep the ledger.
     pub fn replay_idempotent(&self, key: &str) -> Option<CreatedIds> {
-        self.idempotency.get(key).cloned()
+        self.idempotency
+            .get(key)
+            .filter(|created| self.holds_any(created))
+            .cloned()
     }
 
     /// Record the ids a create minted under its idempotency key.
@@ -2062,33 +2134,15 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         self.idempotency.insert(key, created);
     }
 
-    /// Forget the record of the create that minted `node_id`.
+    /// Forget every idempotency record NONE of whose minted resources this store still
+    /// holds.
     ///
-    /// Called when the node's deletion STARTS: a node whose removal has begun "can no
-    /// longer participate on the network" (`Node$Status`), so replaying that token could
-    /// only hand back a resource no caller can still use — the same stance
-    /// [`Self::holds_any`] takes. The node is the only id a `CreateNode` mints (the network
-    /// and member its record also names are ones the request named), so this is the record
-    /// that create left behind, and a create/delete loop frees it along with the node.
-    pub fn forget_node_token(&mut self, node_id: &str) {
-        let stale: Vec<String> = self
-            .idempotency
-            .iter()
-            .filter(|(_, created)| created.node_id.as_deref() == Some(node_id))
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in stale {
-            self.idempotency.remove(&key);
-            self.idempotency_order.retain(|queued| queued != &key);
-        }
-    }
-
-    /// Forget every idempotency record that names NOTHING this store still holds.
-    ///
-    /// The ledger must not outlive the resources it describes — the same reason
-    /// [`Self::forget_node_token`] runs when a node's deletion starts — so once every id a
-    /// create minted has been deleted, its token is forgotten and replaying it creates
-    /// afresh, which is the same answer the real service gives once a token has aged out.
+    /// The ledger must not outlive the resources it describes, so once every id a create
+    /// minted has been deleted — or has had its removal begun, by its own delete or by the
+    /// delete of the resource that owns it — its token is forgotten and replaying it
+    /// creates afresh, which is the same answer the real service gives once a token has
+    /// aged out. Every call that STARTS a removal sweeps here, so no path leaves a record
+    /// behind that another would have released.
     ///
     /// A record that still names ONE live resource is KEPT: a create that minted several
     /// ids (`CreateNetwork` mints a network and its first member) must keep replaying its
@@ -2106,13 +2160,14 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
         }
     }
 
-    /// Whether any resource `created` names is still stored AND has not begun being
+    /// Whether any resource `created` MINTED is still stored AND has not begun being
     /// deleted.
     ///
     /// A record whose removal has started stays readable so a caller can watch it reach
     /// `DELETED`, but it is no longer a resource a replayed create token could hand back:
     /// the ledger must not outlive the resources it describes, so such a record does not
-    /// keep its token alive.
+    /// keep its token alive. Only ids the create minted are tested, because only those are
+    /// in a [`CreatedIds`] at all — an id the request named is not this create's to replay.
     fn holds_any(&self, created: &CreatedIds) -> bool {
         let network_held = created.network_id.as_deref().is_some_and(|id| {
             self.networks
@@ -2140,10 +2195,11 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
                 .values()
                 .any(|network| network.proposals.contains_key(id))
         });
-        let accessor_held = created
-            .accessor_id
-            .as_deref()
-            .is_some_and(|id| self.accessors.contains_key(id));
+        let accessor_held = created.accessor_id.as_deref().is_some_and(|id| {
+            self.accessors
+                .get(id)
+                .is_some_and(|accessor| !accessor.is_being_deleted())
+        });
         network_held || member_held || node_held || proposal_held || accessor_held
     }
 

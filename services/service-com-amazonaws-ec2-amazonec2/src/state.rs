@@ -1558,6 +1558,34 @@ mod launched_root_volumes;
 pub mod iam_instance_profile_associations;
 pub use iam_instance_profile_associations::*;
 
+/// The account-id segment the ARN of a resource Amazon Web Services itself owns carries.
+///
+/// The fifth segment of an ARN names the account the resource belongs to, and a resource the
+/// service PUBLISHES — rather than one an account created — belongs to Amazon Web Services:
+/// its ARN carries this literal where a caller's resource carries
+/// [`::engine::emulator_account_id`]. It is what tells a service-owned resource from a
+/// customer-owned one by ARN alone, and it is the ARN spelling of the same resource's owner
+/// member reading `AWS` (see [`AWS_MANAGED_PREFIX_LIST_OWNER`]).
+pub const AWS_OWNED_RESOURCE_ACCOUNT: &str = "aws";
+
+/// The ARN of a resource Amazon Web Services itself owns: the canonical ARN
+/// [`::engine::emulator_arn`] builds, with [`AWS_OWNED_RESOURCE_ACCOUNT`] in place of the
+/// account this emulator serves.
+///
+/// Every ARN this crate reports goes through the canonical builder, so the partition, the
+/// segment order and the separators keep one source of truth; the ONE segment that differs
+/// for a service-owned resource is the account.
+pub fn aws_owned_arn(service: &str, region: &str, resource: &str) -> String {
+    // The account segment precedes the resource, so the FIRST occurrence of the account id
+    // in the canonical ARN is that segment even where a resource name carries the same
+    // digits.
+    ::engine::emulator_arn(service, region, resource).replacen(
+        ::engine::emulator_account_id(),
+        AWS_OWNED_RESOURCE_ACCOUNT,
+        1,
+    )
+}
+
 /// The one region whose Amazon-provided private DNS suffix is `ec2.internal`
 /// rather than `<region>.compute.internal`.
 pub const EC2_INTERNAL_REGION: &str = "us-east-1";
@@ -24232,10 +24260,11 @@ impl ServicePrefixList {
     /// ("The maximum number of entries for the prefix list",
     /// `ManagedPrefixList$MaxEntries`) — nothing adds an entry to a list the account does not
     /// own. Its owner is Amazon Web Services rather than the account
-    /// ([`AWS_MANAGED_PREFIX_LIST_OWNER`]), it carries no tag, because an account tags only
-    /// its own resources, and it is settled: a list a Region publishes has no creation still
-    /// in progress, so its state is [`PREFIX_LIST_STATE_CREATE_COMPLETE`] and its version the
-    /// first.
+    /// ([`AWS_MANAGED_PREFIX_LIST_OWNER`]), so its ARN carries the service's account segment
+    /// too ([`aws_owned_arn`]) and not the account the request is signed for; it carries no
+    /// tag, because an account tags only its own resources, and it is settled: a list a
+    /// Region publishes has no creation still in progress, so its state is
+    /// [`PREFIX_LIST_STATE_CREATE_COMPLETE`] and its version the first.
     pub fn to_managed_prefix_list(&self, region: &str) -> crate::ops::types::ManagedPrefixList {
         crate::ops::types::ManagedPrefixList {
             prefix_list_id: Some(self.prefix_list_id.clone()),
@@ -24249,7 +24278,13 @@ impl ServicePrefixList {
             ),
             state: Some(PREFIX_LIST_STATE_CREATE_COMPLETE.to_string()),
             state_message: None,
-            prefix_list_arn: Some(::engine::emulator_arn(
+            // "The Amazon Resource Name (ARN) for the prefix list"
+            // (`ManagedPrefixList$PrefixListArn`) names the account the list belongs to, and
+            // this list belongs to Amazon Web Services rather than to the account the
+            // request is signed for — so its account segment is
+            // [`AWS_OWNED_RESOURCE_ACCOUNT`], the ARN spelling of the `OwnerId` below. The
+            // Region and the id are the list's own.
+            prefix_list_arn: Some(aws_owned_arn(
                 "ec2",
                 region,
                 &format!("{RESOURCE_TYPE_PREFIX_LIST}/{}", self.prefix_list_id),

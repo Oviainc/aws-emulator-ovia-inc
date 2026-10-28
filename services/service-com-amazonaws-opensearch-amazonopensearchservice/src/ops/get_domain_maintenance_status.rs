@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomainMaintenanceStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomainMaintenanceStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the [`crate::state::Maintenance`] record
+//! `StartDomainMaintenance` persisted on the domain, addressed by the
+//! `MaintenanceId` that call handed out — the action asked for, the node it runs on,
+//! the instants it was created and last moved, and how far through its run it is.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomainMaintenanceStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation. The one write it makes is materialising the status moves
+//! the clock already owed the action — owed at this instant whether or not anybody
+//! called — so an action reaches `IN_PROGRESS` and then `COMPLETED` by the clock
+//! rather than by being read.
+//!
+//! `StatusMessage` is "the status message of the maintenance action": this service's
+//! own wording for one is not published, and the status itself is reported in
+//! `Status`, so none is invented.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +161,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomainMaintenanceStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainMaintenanceStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomainMaintenanceStatus"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Reporting the action materialises only what the clock already owed at
+        // `now`: a step whose span has passed has happened whether or not anybody
+        // asked. Nothing else about the record changes on a read.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            GetDomainMaintenanceStatusErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // "The request ID of the maintenance action": an id this domain's history
+        // holds no action for names no resource.
+        let maintenance = domain.maintenance(&input.maintenance_id).ok_or_else(|| {
+            GetDomainMaintenanceStatusErrorModeled::ResourceNotFoundException(
+                crate::state::maintenance_not_found(&input.domain_name, &input.maintenance_id),
+            )
+        })?;
+
+        Ok(GetDomainMaintenanceStatusOutput {
+            status: Some(maintenance.status.clone()),
+            status_message: None,
+            node_id: Some(maintenance.node_id.clone()),
+            action: Some(maintenance.action.clone()),
+            created_at: Some(crate::state::datetime(maintenance.created_at)),
+            updated_at: Some(crate::state::datetime(maintenance.updated_at)),
+        })
     }
 }

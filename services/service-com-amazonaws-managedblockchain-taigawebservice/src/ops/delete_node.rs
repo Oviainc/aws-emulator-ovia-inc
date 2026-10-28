@@ -244,10 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // go with it, through the same `begin_deletion`.
         node.begin_deletion(now);
 
-        // The idempotency ledger must not outlive the resources it describes: the node is
-        // the only id the create that minted it named of its own, and a node whose removal
-        // has begun is not one a replayed token could hand back, so that record goes.
-        guard.forget_node_token(&input.node_id);
+        // The idempotency ledger must not outlive the resources it describes: a node whose
+        // removal has begun is not one a replayed token could hand back, so the record of
+        // the create that minted it goes. One sweep for the call, by the same liveness test
+        // every other path that starts a removal sweeps by.
+        guard.forget_dangling_tokens();
 
         Ok(DeleteNodeOutput {})
     }

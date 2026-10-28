@@ -539,6 +539,8 @@ pub fn parse_expires_in(expires_in: &str) -> Option<Duration> {
     let (digits, unit_secs) = if let Some(digits) = expires_in.strip_suffix('m') {
         (digits, 60_u64)
     } else {
+        // The other unit the documentation names; a value ending in neither is
+        // not of that form at all.
         let digits = expires_in.strip_suffix('h')?;
         (digits, 60 * 60)
     };

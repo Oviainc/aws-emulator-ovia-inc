@@ -226,19 +226,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resource_tags = input.resource_tags.unwrap_or_default();
         let exclude_resource_tags = input.exclude_resource_tags.unwrap_or_default();
-        // The model cannot express this: `ResourceTags` makes the rule tag-level, and
-        // `ExcludeResourceTags` is "[Region-level retention rules only] ... You can't
-        // specify exclusion tags for tag-level retention rules".
-        if !resource_tags.is_empty() && !exclude_resource_tags.is_empty() {
-            // A rule the MODEL cannot express, stated in the same envelope a modelled
-            // constraint takes: the member that cannot hold, and what it must satisfy.
-            return Err(CreateRuleErrorModeled::ValidationException(
-                crate::state::member_validation_failed(
-                    crate::state::EXCLUDE_RESOURCE_TAGS_MEMBER,
-                    crate::state::EXCLUDE_RESOURCE_TAGS_REQUIREMENT,
-                ),
-            )
-            .into());
+        // Resource tags and exclusion tags select resources in ways that cannot hold
+        // together, so a request naming both is refused before anything is minted — the
+        // same invariant `UpdateRule` holds a merged selection to, kept in one place so
+        // neither door can disagree about which selections a rule can carry.
+        if let Some(refusal) = crate::state::selection_combination_unsupported(
+            &resource_tags,
+            &exclude_resource_tags,
+        ) {
+            return Err(CreateRuleErrorModeled::ValidationException(refusal).into());
         }
         // Recycle Bin holds a lock only on a Region-level rule that carries no exclusion
         // tags, so a create that asks to lock any other rule cannot be served and is

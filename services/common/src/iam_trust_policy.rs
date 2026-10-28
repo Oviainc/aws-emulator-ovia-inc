@@ -21,6 +21,12 @@
 //! * an explicit `Deny` among those statements WINS, whatever any `Allow` says;
 //! * otherwise the role admits the principal exactly when one of them is an `Allow`.
 //!
+//! A service that AUTHORIZES one assume, rather than validating a trust relationship, asks
+//! [`grants_service_principal`] instead: the same rule plus the statement's `Condition`,
+//! decided against the keys that request carries. A trust policy is a resource-based policy,
+//! so that reading is [`super::iam_authorization`]'s one evaluation of a policy document
+//! against a request rather than a second one written here.
+//!
 //! The two readers this rule is built on — [`parse_policy`], which accepts a document in
 //! either of the forms a store hands one back in, and [`json_strings`], which reads an
 //! element that is one string or a list of them — are the SAME readers
@@ -71,6 +77,57 @@ pub fn admits_service_principal(document: &str, principal: &str) -> Option<bool>
         }
     }
     Some(admitted)
+}
+
+/// Whether `document` grants the service principal `principal` the assume of the role
+/// `role_arn` it is attached to FOR ONE PARTICULAR assume — the request whose condition
+/// keys `context` states, as `(key, value)` pairs.
+///
+/// [`admits_service_principal`] answers the WEAKER question: does the role trust this
+/// principal at all, whatever a statement's `Condition` narrows that trust to. That is what
+/// a service asks when it validates a trust RELATIONSHIP it is about to store. A service
+/// that AUTHORIZES one assume — a caller handing it a role to act under for a named request
+/// — asks this instead, because a statement's `Condition` is part of its grant: a grant the
+/// request cannot be shown to satisfy is no grant for THAT request. The two therefore read
+/// one document under one rule and differ only in how much of the request they are told
+/// about.
+///
+/// The evaluation is the tree's one evaluation of a policy document against a request
+/// ([`super::iam_authorization`]): a trust policy IS a resource-based policy, whose
+/// statements name the principals they grant to and whose missing `Resource` element covers
+/// the role the document is attached to. So IAM's order — an explicit `Deny` wins, an
+/// `Allow` whose conditions this cannot decide is not a grant — is that module's, not a
+/// second reading of it here.
+///
+/// `Some(true)` when the grant covers the request, `Some(false)` when the document is a
+/// policy that does not grant it, and `None` when `document` is not a policy this can be
+/// read out of — the same case [`admits_service_principal`] leaves to its caller, for the
+/// reason the module docs give.
+///
+/// Two further differences follow from going through that evaluator, both of them IAM's own
+/// reading rather than this module's: the principal is compared LITERALLY (the context-free
+/// reading folds case, which the `Principal` element's own grammar does not ask for), and it
+/// is compared against every principal KIND a statement names, so a document naming this
+/// value under `AWS` rather than under `Service` grants to it as well.
+pub fn grants_service_principal(
+    document: &str,
+    principal: &str,
+    role_arn: &str,
+    context: &[(String, String)],
+) -> Option<bool> {
+    // Whether this is a policy AT ALL is the one thing the evaluator does not report back
+    // (it holds a document it cannot read as stating nothing), so it is asked here — and the
+    // document itself is handed on AS IT STANDS, in whichever of the two forms a store
+    // returned it, because the evaluator reads it through this same parse.
+    parse_policy(document)?;
+    let principals = [principal.to_string()];
+    let request =
+        super::iam_authorization::Request::new(ASSUME_ROLE_ACTION, role_arn, &principals)
+            .with_context(context);
+    Some(
+        super::iam_authorization::resource_decision(document, &request)
+            == super::iam_authorization::Decision::Allowed,
+    )
 }
 
 /// The policy `document` carries, in either of the two forms a store hands one back in.
@@ -285,6 +342,121 @@ mod tests {
                 admitted,
                 Some(true),
                 "case {case:?}: expected the grant to be read, got {admitted:?}"
+            );
+        }
+    }
+
+    /// The ROLE a trust document is read for, as the context-aware reading is handed one.
+    const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/delivery";
+
+    /// A trust policy with one statement, written as a client would send it, carrying
+    /// `condition` as its `Condition` element (`""` for a statement with none).
+    fn conditioned(condition: &str) -> String {
+        let element = if condition.is_empty() {
+            String::new()
+        } else {
+            format!(",\"Condition\":{condition}")
+        };
+        format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+             \"Principal\":{{\"Service\":\"bedrock.amazonaws.com\"}},\
+             \"Action\":\"sts:AssumeRole\"{element}}}]}}"
+        )
+    }
+
+    /// The reading a service AUTHORIZING one assume asks: the grant has to cover the
+    /// request, so the statement's `Condition` is decided against the keys that request
+    /// carries and a clause this cannot decide is no grant.
+    #[test]
+    fn a_grant_covers_an_assume_only_where_its_conditions_are_satisfied() {
+        let context = [(
+            "aws:SourceAccount".to_string(),
+            "000000000000".to_string(),
+        )];
+        // The rows differ along what the rule generalises over: whether the grant carries a
+        // condition at all, which operator it is written under, whether the request carries
+        // a value for the key, and whether the value it carries satisfies the clause.
+        let rows: [(&str, String, Option<bool>); 7] = [
+            ("an unconditioned grant", conditioned(""), Some(true)),
+            (
+                "a clause over a key the request carries, which holds",
+                conditioned("{\"StringEquals\":{\"aws:SourceAccount\":\"000000000000\"}}"),
+                Some(true),
+            ),
+            (
+                "the same clause over another value",
+                conditioned("{\"StringEquals\":{\"aws:SourceAccount\":\"210987654321\"}}"),
+                Some(false),
+            ),
+            (
+                "a clause over a key the request carries no value for",
+                conditioned(
+                    "{\"ArnEquals\":{\"aws:SourceArn\":\
+                     \"arn:aws:bedrock:us-east-1:000000000000:model-customization-job/*\"}}",
+                ),
+                Some(false),
+            ),
+            (
+                // Every clause of a statement has to hold, so one the request cannot
+                // decide withholds the grant whatever the others say.
+                "a clause that holds beside one the request cannot decide",
+                conditioned(
+                    "{\"StringEquals\":{\"aws:SourceAccount\":\"000000000000\"},\
+                     \"ArnEquals\":{\"aws:SourceArn\":\"arn:aws:bedrock:us-east-1:*\"}}",
+                ),
+                Some(false),
+            ),
+            (
+                "a statement that grants another principal only",
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                 \"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\
+                 \"Action\":\"sts:AssumeRole\"}]}"
+                    .to_string(),
+                Some(false),
+            ),
+            ("not a policy at all", "this is not json".to_string(), None),
+        ];
+
+        for (case, document, expected) in rows {
+            let granted =
+                grants_service_principal(&document, "bedrock.amazonaws.com", ROLE_ARN, &context);
+            assert_eq!(
+                granted, expected,
+                "case {case:?}: expected {expected:?}, got {granted:?} for {document}"
+            );
+        }
+    }
+
+    /// An explicit `Deny` wins here too, and the URL-encoded form a store hands a document
+    /// back in reads as the policy it encodes — the two properties the context-free reading
+    /// has, held by the reading that decides conditions as well.
+    #[test]
+    fn the_context_aware_reading_keeps_denies_and_either_document_form() {
+        let context: [(String, String); 0] = [];
+        let denied = "{\"Version\":\"2012-10-17\",\"Statement\":[\
+                      {\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"bedrock.amazonaws.com\"},\
+                      \"Action\":\"sts:AssumeRole\"},\
+                      {\"Effect\":\"Deny\",\"Principal\":{\"Service\":\"bedrock.amazonaws.com\"},\
+                      \"Action\":\"sts:AssumeRole\"}]}";
+        let granted = grants_service_principal(denied, "bedrock.amazonaws.com", ROLE_ARN, &context);
+        assert_eq!(
+            granted,
+            Some(false),
+            "case an explicit deny beside the grant: expected no grant, got {granted:?}"
+        );
+
+        let plain = conditioned("");
+        let encoded = plain
+            .replace('{', "%7B")
+            .replace('}', "%7D")
+            .replace('"', "%22");
+        for (case, document) in [("plain", plain.clone()), ("url-encoded", encoded)] {
+            let granted =
+                grants_service_principal(&document, "bedrock.amazonaws.com", ROLE_ARN, &context);
+            assert_eq!(
+                granted,
+                Some(true),
+                "case {case:?}: expected the grant to be read, got {granted:?}"
             );
         }
     }

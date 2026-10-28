@@ -233,6 +233,8 @@ mod user_lifecycle;
 mod user_permissions_boundary;
 #[path = "all/user_policy_listing.rs"]
 mod user_policy_listing;
+#[path = "all/user_renames.rs"]
+mod user_renames;
 #[path = "all/user_tag_listing.rs"]
 mod user_tag_listing;
 #[path = "all/user_tag_removal.rs"]

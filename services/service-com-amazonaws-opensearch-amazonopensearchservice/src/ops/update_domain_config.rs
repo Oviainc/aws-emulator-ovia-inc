@@ -425,6 +425,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?
             .clone();
+        // The configuration the domain is being changed FROM, captured before the
+        // merge below moves it: what `CancelDomainConfigChange` puts back if the
+        // change this call starts is cancelled before it lands.
+        let before = crate::state::DomainOptions::capture(&merged);
 
         // The master credential of the internal user database has to meet the
         // published complexity requirement, whichever call sets it. It is checked on
@@ -512,6 +516,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `DescribeDomainChangeProgress` reports. An update that changed nothing
             // starts no change, so none is recorded for it.
             merged.begin_change(PROCESSING_STATUS_MODIFYING, &touched, now);
+            // This change can be gone back from, so the change record carries the
+            // configuration it was applied on top of.
+            merged.record_revert(before);
         }
 
         // An update that moves a domain into a VPC makes it a VPC-access domain, so it
