@@ -70,6 +70,7 @@
 //! there is no ARN for this service to read. So does an ARN of a resource type this
 //! service does not validate itself, which is what the corpus records for them.
 
+pub mod authorization;
 pub mod validation;
 
 use std::collections::HashMap;

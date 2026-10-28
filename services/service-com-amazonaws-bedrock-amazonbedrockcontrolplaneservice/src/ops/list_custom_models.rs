@@ -9,6 +9,11 @@
 //! (`smithy_query(query="operation",operation="ListCustomModels")`) rather than off one
 //! request:
 //!
+//! * the caller has to be ALLOWED to perform the action: IAM decides that ahead of this
+//!   service reading anything, so a principal whose identity-based policies do not grant
+//!   `bedrock:ListCustomModels` on the custom models of this account and Region — or that
+//!   an explicit `Deny` covers — is answered 403 `AccessDeniedException`
+//!   ([`crate::service::authorization`]) rather than a page of this account's models;
 //! * every filter the request carries must hold for a custom model to be listed —
 //!   `nameContains` on a substring of its name, `baseModelArnEquals` on the model it was
 //!   customized from, `foundationModelArnEquals` on the foundation model it descends from,
@@ -238,6 +243,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides authorization ahead of this service reading anything, so a caller
+        // its policies do not allow is told it is not authorized rather than handed a page
+        // of this account's models ([`crate::service::authorization`]). A listing names no
+        // single resource, so the action is judged against the collection it reaches.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::collection_arn(
+                ctx,
+                crate::service::authorization::CUSTOM_MODEL_RESOURCE_TYPE,
+            ),
+        )
+        .map_err(ListCustomModelsErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListCustomModelsErrorModeled::InternalServerException(
                 InternalServerException {

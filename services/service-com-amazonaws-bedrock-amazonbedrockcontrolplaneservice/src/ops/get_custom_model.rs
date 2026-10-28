@@ -10,10 +10,19 @@
 //! The rules, each read off this operation's own members
 //! (`smithy_query(query="operation",operation="GetCustomModel")`):
 //!
+//! * the caller has to be ALLOWED to perform the action: IAM decides that ahead of this
+//!   service resolving the identifier, so a principal whose identity-based policies do not
+//!   grant `bedrock:GetCustomModel` on the model the request addressed — or that an
+//!   explicit `Deny` covers — is answered 403 `AccessDeniedException`
+//!   ([`crate::service::authorization`]) rather than told whether that model exists;
 //! * `modelIdentifier` is the "Name or Amazon Resource Name (ARN) of the custom model", so
 //!   both spellings address the same model
-//!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::custom_model`]),
-//!   and one that names no model of the signing region is 404 `ResourceNotFoundException`;
+//!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::custom_model`]);
+//!   an unresolvable one is refused as the spelling it IS — `ResourceNotFoundException`
+//!   (404) names the ARN it could not find, which is what that error documents ("The
+//!   specified resource Amazon Resource Name (ARN) was not found"), while a bare NAME that
+//!   resolves to no model of the signing region is no ARN to report missing but an
+//!   identifier this service could not resolve, so it is 400 `ValidationException`;
 //! * every member reported comes out of the stored record, and the members that describe a
 //!   customization JOB are absent for a model created from artifacts — `jobArn` states it:
 //!   "For models that you create with the `CreateCustomModel` API operation, this is
@@ -106,6 +115,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The one sentence Amazon Bedrock states for a model identifier it cannot resolve to a
+/// model: RECORDED behaviour, and a FIXED sentence — it quotes no part of the request, so
+/// there is nothing of the caller's value in it.
+///
+/// Taken from the Bedrock Runtime emulator, which states the same refusal for the same
+/// class on the inference surface, rather than spelled a second time here: one wording for
+/// one sentence.
+const INVALID_MODEL_IDENTIFIER: &str =
+    ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state::INVALID_MODEL_IDENTIFIER_MESSAGE;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,6 +197,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides authorization ahead of this service resolving what the request
+        // names, so a caller its policies do not allow is told it is not authorized rather
+        // than told whether the model it asked for exists
+        // ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::resource_arn(
+                ctx,
+                crate::service::authorization::CUSTOM_MODEL_RESOURCE_TYPE,
+                &input.model_identifier,
+            ),
+        )
+        .map_err(GetCustomModelErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetCustomModelErrorModeled::InternalServerException(
                 InternalServerException {
@@ -191,12 +226,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         let Some(record) = store.custom_model(&input.model_identifier, &region, now) else {
-            return Err(GetCustomModelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no custom model {} exists in this account",
-                        input.model_identifier
-                    )),
+            // `modelIdentifier` admits the model's ARN or its bare NAME, and the two
+            // unresolvable spellings are not the same failure. `ResourceNotFoundException`
+            // is documented as being about an ARN — "The specified resource Amazon
+            // Resource Name (ARN) was not found. Check the Amazon Resource Name (ARN) and
+            // try your request again" — so an ARN that names no model of this account and
+            // Region is what it reports. A bare name is no ARN to report missing: it is an
+            // identifier this service could not resolve to a model at all, which is the
+            // modelled `ValidationException` carrying the one sentence Amazon Bedrock
+            // states for an identifier it cannot resolve
+            // ([`INVALID_MODEL_IDENTIFIER`]) — a sentence with no variable part, so
+            // nothing of the request is quoted back.
+            if crate::state::names_arn_of(
+                &input.model_identifier,
+                crate::state::CUSTOM_MODEL_RESOURCE_TYPE,
+            ) {
+                return Err(GetCustomModelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no custom model {} exists in this account",
+                            input.model_identifier
+                        )),
+                    },
+                )
+                .into());
+            }
+            return Err(GetCustomModelErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(INVALID_MODEL_IDENTIFIER.to_string()),
                 },
             )
             .into());

@@ -35,6 +35,12 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # and `Converse` handlers answer from, so a batch record and a synchronous call carrying
 # the same body are served by ONE inference rather than by two that could drift.
 service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice = { workspace = true }
+# The STS store, for the identity an access key id speaks for: the principal
+# `sts:GetCallerIdentity` answers for the credentials a request signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, for the identity-based policy documents in force on that principal, which
+# is what the authorization gate in front of this service's handlers decides on.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

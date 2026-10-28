@@ -145,23 +145,19 @@ impl<Eng> GetCustomModelDeployment<Eng> {
 }
 
 /// Whether a `CustomModelDeploymentIdentifier` is the ARN spelling rather than the NAME
-/// spelling.
+/// spelling — the ONE decision this read makes on the value's form.
 ///
 /// The identifier is `<the deployment's ARN> | <its name>`
 /// (`smithy_query(query="operation",operation="GetCustomModelDeployment")`), and the two
-/// spellings are not read alike when neither names a stored deployment — which is the ONE
-/// decision this read makes on the value's form, so it is read here rather than in
-/// `crate::state`.
-///
-/// A TOTAL read of the value: the shared six-field ARN parse
-/// (`service_common::arn::parse_of`, which answers `None` for anything that is not an ARN
-/// of this service's namespace) and a comparison of the resource type it reports. Nothing
-/// is indexed, sliced or unwrapped, so no value a caller can send reaches a panic here.
+/// spellings are not read alike when neither names a stored deployment. Asked through
+/// [`crate::state::names_arn_of`], the one reading of "is this an ARN of ours naming a
+/// resource of this type" every such member of this service shares, so two of them cannot
+/// drift.
 fn names_deployment_arn(identifier: &str) -> bool {
-    ::service_common::arn::parse_of(identifier, ::service_common::bedrock::ARN_NAMESPACE)
-        .is_some_and(|arn| {
-            arn.resource_type() == crate::state::CUSTOM_MODEL_DEPLOYMENT_RESOURCE_TYPE
-        })
+    crate::state::names_arn_of(
+        identifier,
+        crate::state::CUSTOM_MODEL_DEPLOYMENT_RESOURCE_TYPE,
+    )
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation

@@ -197,6 +197,12 @@ use crate::ops::types::{
 /// and its lifecycle live here.
 pub mod model_invocation_run;
 
+/// Whether the Amazon S3 location a model source names satisfies the Amazon-managed-bucket
+/// pre-condition the member carrying it states. Beside this module for the reason
+/// [`model_invocation_run`] is: deciding it means asking another emulated service (object
+/// storage) whose bucket a name is, while the records the decision guards live here.
+pub mod model_source;
+
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
 /// (`^DRAFT$`) spells it.
 ///
@@ -5517,6 +5523,28 @@ pub fn custom_model_deployment_summary(
     }
 }
 
+/// The ARN resource type a custom model carries: the field `CustomModelArn` spells before
+/// the base-model segment and the model's own id
+/// (`smithy_query(query="operation",operation="GetCustomModel")`).
+///
+/// Stated once because two layers read it — the ARN this service builds for one, and the
+/// test that tells an ARN from the bare NAME a `ModelIdentifier` also admits
+/// ([`names_arn_of`]).
+pub const CUSTOM_MODEL_RESOURCE_TYPE: &str = "custom-model";
+
+/// Whether `value` is an ARN of this service's own namespace naming a resource of
+/// `resource_type`, rather than one of the other spellings a member admits.
+///
+/// The question a member whose `@pattern` admits an ARN **or** a bare name has to answer
+/// before anything else: which of the two a caller sent. The parse is
+/// `service_common::arn`'s one parse, so no two readings of "is this an ARN of ours"
+/// disagree.
+#[must_use]
+pub fn names_arn_of(value: &str, resource_type: &str) -> bool {
+    ::service_common::arn::parse_of(value, ARN_NAMESPACE)
+        .is_some_and(|arn| arn.resource_type() == resource_type)
+}
+
 /// The ARN of a custom model in `region`:
 /// `arn:aws:bedrock:<region>:<account>:custom-model/<base>/<id>`, as `CustomModelArn`
 /// (`^arn:aws(|-us-gov|-cn|-iso|-iso-b):bedrock:[a-z0-9-]{1,20}:[0-9]{12}:custom-model/(imported|…)/[a-z0-9]{12}$`)
@@ -5874,7 +5902,7 @@ pub const ARN_INVALID: &str = "Provided ARN is invalid.";
 /// name and the ones they do not (`GetCustomModel.modelIdentifier`,
 /// `CreateProvisionedModelThroughput.modelId`, …) — is read the same way.
 pub const SELF_VALIDATED_RESOURCE_TYPES: &[&str] = &[
-    "custom-model",
+    CUSTOM_MODEL_RESOURCE_TYPE,
     "model-copy-job",
     "model-invocation-job",
     "provisioned-model",

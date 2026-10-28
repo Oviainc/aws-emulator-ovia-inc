@@ -35,8 +35,12 @@ mod automated_reasoning_policy_updates;
 mod automated_reasoning_policy_versions;
 #[path = "all/batch_delete_evaluation_jobs.rs"]
 mod batch_delete_evaluation_jobs;
+#[path = "all/custom_model_authorization.rs"]
+mod custom_model_authorization;
 #[path = "all/custom_model_deployments.rs"]
 mod custom_model_deployments;
+#[path = "all/custom_model_source_bucket.rs"]
+mod custom_model_source_bucket;
 #[path = "all/custom_models.rs"]
 mod custom_models;
 #[path = "all/enforced_guardrail_configuration.rs"]

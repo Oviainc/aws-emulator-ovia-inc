@@ -865,10 +865,15 @@ async fn a_create_naming_its_artifacts_wrongly_is_refused() {
             "case {case}: the create must answer ValidationException, got {:?}",
             reply.error
         );
+        // A refused create stored nothing, so the name it carried resolves to no model:
+        // the read answers the unresolvable-identifier refusal rather than a model.
+        let read_back = get(&emu, "cm-refused").await;
         assert_eq!(
-            get(&emu, "cm-refused").await.status,
-            404,
-            "case {case}: a refused create must store nothing"
+            reply_verdict(&read_back),
+            (400, Some("ValidationException".to_string())),
+            "case {case}: a refused create must store nothing, got {} {:?}",
+            read_back.status,
+            read_back.body
         );
     }
     assert!(
@@ -948,42 +953,80 @@ async fn a_model_name_is_unique_and_a_replayed_token_mints_nothing() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 5. An identifier that names no custom model of this account is not found.
+// 5. An identifier that names no custom model of this account is refused as the spelling
+//    it IS: `ResourceNotFoundException` names an ARN it could not find ("The specified
+//    resource Amazon Resource Name (ARN) was not found", that error's own documentation),
+//    while a bare NAME that resolves to nothing is no ARN to report missing but an
+//    identifier the service could not resolve — `ValidationException`, with the one
+//    sentence Amazon Bedrock states for that class.
 // ---------------------------------------------------------------------------------------
 
+/// The `(status, error code)` a reply carries, so a row pins both at once.
+fn reply_verdict(reply: &Reply) -> (u16, Option<String>) {
+    (reply.status, reply.error.clone())
+}
+
 #[tokio::test]
-async fn a_read_of_an_unknown_custom_model_is_not_found() {
+async fn a_read_of_an_unknown_custom_model_is_refused_as_the_spelling_it_is() {
     let emu = emulator();
 
     let name = "cm-present";
     mint(&emu, "the live model", s3_body(name)).await;
 
-    let unknown: Vec<(&str, String)> = vec![
-        ("a name no create ever used", "cm-absent".to_string()),
-        ("a prefix of a live name", "cm-presen".to_string()),
+    /// The sentence Amazon Bedrock states for a model identifier it cannot resolve, as the
+    /// service spells it.
+    const INVALID_IDENTIFIER: &str =
+        "The provided model identifier is invalid.";
+
+    // (case, the identifier, the status, the error code, the message)
+    let unknown: Vec<(&str, String, u16, &str, Option<&str>)> = vec![
+        (
+            "a name no create ever used",
+            "cm-absent".to_string(),
+            400,
+            "ValidationException",
+            Some(INVALID_IDENTIFIER),
+        ),
+        (
+            "a prefix of a live name",
+            "cm-presen".to_string(),
+            400,
+            "ValidationException",
+            Some(INVALID_IDENTIFIER),
+        ),
         (
             "an in-region ARN of this account that names nothing",
             format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/{IMPORTED_BASE}/aaaaaaaaaaaa"),
+            404,
+            "ResourceNotFoundException",
+            None,
         ),
         (
             "an in-region ARN of another account",
             format!(
                 "arn:aws:bedrock:{REGION}:123456789012:custom-model/{IMPORTED_BASE}/aaaaaaaaaaaa"
             ),
+            404,
+            "ResourceNotFoundException",
+            None,
         ),
     ];
-    for (case, identifier) in unknown {
+    for (case, identifier, status, code, message) in unknown {
         let reply = get(&emu, &identifier).await;
         assert_eq!(
-            reply.status, 404,
-            "case {case}: a read of {identifier} must answer 404, got {} {:?}",
-            reply.status, reply.body
+            reply_verdict(&reply),
+            (status, Some(code.to_string())),
+            "case {case}: a read of {identifier} must answer {status} {code}, got {} {:?}",
+            reply.status,
+            reply.body
         );
-        assert_eq!(
-            reply.error.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case}: a read of {identifier} must answer ResourceNotFoundException, got {:?}",
-            reply.error
-        );
+        if let Some(message) = message {
+            assert_eq!(
+                reply.get("message"),
+                json!(message),
+                "case {case}: expected {message:?}, got {:?}",
+                reply.body
+            );
+        }
     }
 }

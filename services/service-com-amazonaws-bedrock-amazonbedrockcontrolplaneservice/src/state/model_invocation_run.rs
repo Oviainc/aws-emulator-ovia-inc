@@ -106,9 +106,10 @@ const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NoSuchVersi
 /// An Amazon S3 client over the in-process callback into this same emulator.
 ///
 /// The ONE client this service reaches object storage with: the read of a job's input
-/// records ([`read_input_records`]) and the write of its result records
-/// ([`run_batch_inference`]) both go through it, so neither can reach the object store in
-/// a way the other would not.
+/// records ([`read_input_records`]), the write of its result records
+/// ([`run_batch_inference`]) and the question whose bucket a model source names
+/// ([`super::model_source`]) all go through it, so none of them can reach the object store
+/// in a way another would not.
 ///
 /// The callback is the framework's documented seam for calling another emulated service:
 /// it routes in process, so no network client is configured here and this crate names no
@@ -119,7 +120,7 @@ const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NoSuchVersi
 ///
 /// The credentials are the emulator's own: they only sign this operation's in-process
 /// calls and are never put in a response or a log.
-fn s3_client(
+pub(crate) fn s3_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
@@ -148,7 +149,7 @@ fn s3_client(
 /// Whether S3's answer is S3 ITSELF saying it holds nothing at the address a request
 /// named: HTTP 404 AND one of the codes it sends for a missing bucket, key or version
 /// ([`ABSENT_OBJECT_CODES`]).
-fn names_nothing<E>(
+pub(crate) fn names_nothing<E>(
     error: &::aws_sdk_s3::error::SdkError<
         E,
         ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,

@@ -9,12 +9,22 @@
 //! (`smithy_query(query="operation",operation="CreateCustomModel")`,
 //! `smithy_query(query="doc",shape="CreateCustomModel")`) rather than off one request:
 //!
+//! * the caller has to be ALLOWED to perform the action: IAM decides that ahead of this
+//!   service reading what the request names, so a principal whose identity-based policies
+//!   do not grant `bedrock:CreateCustomModel` on the custom models of this account and
+//!   Region — or that an explicit `Deny` covers — is answered 403 `AccessDeniedException`
+//!   ([`crate::service::authorization`]) and nothing is minted;
 //! * the artifacts are named ONE way: "You can specify either `customModelDataSource` or
 //!   `modelSourceConfig`, but not both", so a request carrying neither or both is refused
 //!   with 400 `ValidationException`;
 //! * `roleArn` "is required when you use `modelSourceConfig` with an Amazon S3 data
 //!   source. It is not required when you use `customModelDataSource` with a model package
 //!   ARN", so the role is demanded exactly where the member says it is;
+//! * "The Amazon S3 URI in the model source must be for the Amazon-managed Amazon S3
+//!   bucket containing your model artifacts", so a model source naming a bucket the
+//!   ACCOUNT holds does not satisfy the member's pre-condition and is refused with 400
+//!   `ValidationException` ([`crate::state::model_source`]) rather than registering a
+//!   model over artifacts Amazon Bedrock would not have taken;
 //! * `modelName` is "a unique name for the custom model", so a second create of a name a
 //!   live model in this account and region already holds is refused with
 //!   `ConflictException`, and `@idempotencyToken` makes a replayed `clientRequestToken`
@@ -193,6 +203,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides authorization ahead of this service looking at anything the request
+        // names, so the caller's own policies are evaluated before a member is read, a
+        // name is resolved or a model is minted — and a refusal leaves nothing behind.
+        // The action is judged against the custom models of this account and Region: the
+        // id the ARN of the model this would mint carries does not exist yet.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::collection_arn(
+                ctx,
+                crate::service::authorization::CUSTOM_MODEL_RESOURCE_TYPE,
+            ),
+        )
+        .map_err(CreateCustomModelErrorModeled::AccessDeniedException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCustomModelErrorModeled::InternalServerException(
                 InternalServerException {
@@ -203,22 +229,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
-        // `@idempotencyToken`: a replay answers with what the first request minted.
-        let replayed = input
-            .client_request_token
-            .as_ref()
-            .and_then(|token| {
-                store
-                    .custom_model_create_tokens
-                    .get(&(region.clone(), token.clone()))
-            })
-            .cloned();
+        // `@idempotencyToken`: "If this token matches a previous request, Amazon Bedrock
+        // ignores the request, but does not return an error" — so a replay answers with
+        // what the first request minted, ahead of every check that request already passed.
+        // The store is read in a scope of its own: nothing below this holds the lock, and
+        // the pre-condition further down asks another service.
+        let replayed = {
+            let store = state.lock();
+            input
+                .client_request_token
+                .as_ref()
+                .and_then(|token| {
+                    store
+                        .custom_model_create_tokens
+                        .get(&(region.clone(), token.clone()))
+                })
+                .filter(|minted| store.custom_models.contains_key(*minted))
+                .cloned()
+        };
         if let Some(minted) = replayed {
-            if store.custom_models.contains_key(&minted) {
-                return Ok(CreateCustomModelOutput { model_arn: minted });
-            }
+            return Ok(CreateCustomModelOutput { model_arn: minted });
         }
 
         // "You can specify either customModelDataSource or modelSourceConfig, but not
@@ -268,6 +299,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             _ => {}
         }
+
+        // "The Amazon S3 URI in the model source must be for the Amazon-managed Amazon S3
+        // bucket containing your model artifacts": a URI naming a bucket the account holds
+        // satisfies the member's FORM without satisfying its pre-condition, and Amazon
+        // Bedrock refuses it rather than registering a model over artifacts it would not
+        // have taken ([`crate::state::model_source`]). Asked once the request is one this
+        // service can read and before the store is touched, so the refusal leaves nothing
+        // for a read or a listing to report.
+        if let Some(source) = input.model_source_config.as_ref() {
+            if let Some(message) =
+                crate::state::model_source::unsupported_model_source(ctx, &region, source).await
+            {
+                return Err(CreateCustomModelErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
 
         let tags = input.model_tags.unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
