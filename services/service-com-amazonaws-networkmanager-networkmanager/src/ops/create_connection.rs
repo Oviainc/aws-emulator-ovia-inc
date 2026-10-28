@@ -240,16 +240,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each link member is OPTIONAL — it names the link that end of the connection is
         // reached over — so a connection that names none is a connection over no recorded
-        // link. One the request does carry is a reference like any other, resolved within
-        // the same global network.
-        for (member, link_id) in [
-            (crate::state::FIELD_LINK_ID, input.link_id.as_deref()),
+        // link, and the empty string is one of the two spellings of naming none
+        // ([`crate::state::optional_reference`], the same reading `UpdateConnection` and the
+        // associates give these members): it resolves nothing and is held as none rather
+        // than being refused as a link that cannot be found. One the request does name is a
+        // reference like any other, resolved within the same global network.
+        let link_id = crate::state::optional_reference(input.link_id);
+        let connected_link_id = crate::state::optional_reference(input.connected_link_id);
+        for (member, supplied) in [
+            (crate::state::FIELD_LINK_ID, link_id.as_deref()),
             (
                 crate::state::FIELD_CONNECTED_LINK_ID,
-                input.connected_link_id.as_deref(),
+                connected_link_id.as_deref(),
             ),
         ] {
-            let Some(link_id) = link_id else { continue };
+            let Some(link_id) = supplied else { continue };
             let resolves = store
                 .links
                 .get(link_id)
@@ -298,8 +303,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             global_network_id: input.global_network_id,
             device_id: input.device_id,
             connected_device_id: input.connected_device_id,
-            link_id: input.link_id,
-            connected_link_id: input.connected_link_id,
+            link_id,
+            connected_link_id,
             description: input.description,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
