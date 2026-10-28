@@ -1043,3 +1043,145 @@ async fn deleting_a_policy_from_a_value_that_is_not_a_policy_target_is_refused()
         "a refused delete must leave the stored grant in force"
     );
 }
+
+/// RULE: the delete path models no not-found error, so — unlike the write path, which
+/// refuses an ARN of the right shape this account holds no resource for with
+/// `ResourceNotFoundException` — every ARN of a resource a policy attaches to is
+/// accepted: the attachment keyed by it leaves the store if one is there, nothing is
+/// removed if none is, and no other ARN's attachment is touched.
+#[tokio::test]
+async fn deleting_a_policy_from_an_arn_carrying_no_attachment_is_accepted() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+
+    // One SHARED resource of each kind, named by no row below: whatever a delete of an
+    // ARN carrying no attachment removes, it must not be one of these.
+    let mut shared: Vec<(Kind, String, String)> = Vec::new();
+    for kind in KINDS {
+        let arn = create_target(&router, kind, "delete-untouched").await;
+        let document = sharing_policy(&arn, "untouched-grant");
+        put(&router, "the grant left alone", &arn, &document).await;
+        shared.push((kind, arn, document));
+    }
+    // A resource this account DOES hold that was never shared — the other way an ARN of
+    // the right shape carries no attachment.
+    let held_unshared = create_target(&router, Kind::Project, "delete-never-shared").await;
+
+    // (the case, the ARN, whether this account holds the resource it names). The rows
+    // span a name never created, a shared resource addressed in another region, another
+    // account and another partition, a name differing from a shared one only in case,
+    // both resource kinds, and a held resource carrying no grant.
+    let other_account = format!("arn:aws:codebuild:{REGION}:111122223333:project/delete-untouched");
+    let other_partition = format!(
+        "arn:aws-us-gov:codebuild:{REGION}:{}:project/delete-untouched",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    let rows: [(&str, String, bool); 8] = [
+        (
+            "a project never created",
+            state::project_arn(REGION, "no-such-project"),
+            false,
+        ),
+        (
+            "a shared project in another region",
+            state::project_arn("eu-west-1", "delete-untouched"),
+            false,
+        ),
+        ("a shared project in another account", other_account, false),
+        (
+            "a shared project in another partition",
+            other_partition,
+            false,
+        ),
+        (
+            "a shared project in another case",
+            state::project_arn(REGION, "DELETE-UNTOUCHED"),
+            false,
+        ),
+        (
+            "a report group never created",
+            state::report_group_arn(REGION, "no-such-group"),
+            false,
+        ),
+        (
+            "a shared report group in another region",
+            state::report_group_arn("eu-west-1", "delete-untouched"),
+            false,
+        ),
+        ("a held project never shared", held_unshared.clone(), true),
+    ];
+
+    for (case, arn, held) in rows {
+        if !held {
+            // The contrast that makes the rule a rule: the WRITE path refuses this very
+            // ARN as a missing resource, where the delete path below accepts it.
+            refusal(
+                &router,
+                case,
+                "PutResourcePolicy",
+                json!({"resourceArn": arn, "policy": sharing_policy(&arn, "grant")}),
+                "ResourceNotFoundException",
+            )
+            .await;
+        }
+        delete(&router, case, &arn).await;
+        let message = refusal(
+            &router,
+            case,
+            "GetResourcePolicy",
+            json!({"resourceArn": arn}),
+            "ResourceNotFoundException",
+        )
+        .await;
+        assert_eq!(
+            message, "Resource ARN resource policy does not exist",
+            "case {case:?}: the ARN still carries no policy, got {message:?}"
+        );
+        // Every accepted delete of an ARN carrying nothing left the store exactly as it
+        // was: the two grants this account holds, and no third record.
+        for (kind, shared_arn, document) in &shared {
+            assert_eq!(
+                &get(&router, case, shared_arn).await,
+                document,
+                "case {case:?}: the {kind:?} grant must survive another ARN's delete"
+            );
+        }
+        let held_keys: Vec<String> = engine
+            .state::<CodeBuildState>()
+            .lock()
+            .resource_policies
+            .keys()
+            .cloned()
+            .collect();
+        let mut expected: Vec<String> = shared.iter().map(|(_, arn, _)| arn.clone()).collect();
+        expected.sort();
+        assert_eq!(
+            held_keys, expected,
+            "case {case:?}: exactly the two shared resources may be held"
+        );
+    }
+
+    // The control, so no row above can pass against a delete that removes nothing at
+    // all: deleting one shared resource's grant DOES unshare it, and the other kind's
+    // grant stays in force.
+    let (first_kind, first_arn, _) = shared[0].clone();
+    delete(&router, "the shared resource's own grant", &first_arn).await;
+    let message = refusal(
+        &router,
+        "the shared resource's own grant",
+        "GetResourcePolicy",
+        json!({"resourceArn": first_arn}),
+        "ResourceNotFoundException",
+    )
+    .await;
+    assert_eq!(
+        message, "Resource ARN resource policy does not exist",
+        "{first_kind:?}: the deleted grant must be gone, got {message:?}"
+    );
+    let (second_kind, second_arn, second_document) = shared[1].clone();
+    assert_eq!(
+        get(&router, "the other kind's grant", &second_arn).await,
+        second_document,
+        "{second_kind:?}: the other kind's grant must still be in force"
+    );
+}
