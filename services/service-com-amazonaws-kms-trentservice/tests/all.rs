@@ -39,6 +39,8 @@ mod data_key_pair_without_plaintext;
 mod data_key_without_plaintext;
 #[path = "all/decrypt_key_origin.rs"]
 mod decrypt_key_origin;
+#[path = "all/encryption_context_conditions.rs"]
+mod encryption_context_conditions;
 #[path = "all/encryption_context_validation.rs"]
 mod encryption_context_validation;
 #[path = "all/error_semantics.rs"]
