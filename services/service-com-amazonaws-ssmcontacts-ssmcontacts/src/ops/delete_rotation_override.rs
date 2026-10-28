@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused rather than serviced — before the override is looked up, and before
         // anything is removed.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.rotation_id)
             .map_err(account_precondition_failed)?;
 
         // A `RotationOverrideId` is unique only WITHIN its rotation, so the pair is what is

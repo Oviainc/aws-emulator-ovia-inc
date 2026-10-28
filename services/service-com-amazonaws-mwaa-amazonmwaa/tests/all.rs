@@ -45,3 +45,5 @@ mod rejection_contract;
 mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tags_member_single_rule.rs"]
+mod tags_member_single_rule;

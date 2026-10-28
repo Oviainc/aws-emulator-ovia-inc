@@ -12,8 +12,8 @@
 //! owns no job for is refused through the one job-id refusal the whole job
 //! surface shares ([`crate::state::job_not_found`]).
 //!
-//! Implemented on its own; the job-status and job-tagging operations beside it
-//! are still scaffolds with their own gap issues.
+//! Moves the priority alone: the status is `UpdateJobStatus`'s to move and the
+//! tag set the job tagging operations', each over the one stored job record.
 //!
 //! ## Shape of an operation
 //!

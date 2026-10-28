@@ -17,6 +17,8 @@ mod account_limits;
 mod checker_ip_ranges;
 #[path = "all/delegation_set_deletion.rs"]
 mod delegation_set_deletion;
+#[path = "all/delegation_set_listing.rs"]
+mod delegation_set_listing;
 #[path = "all/dns_answers.rs"]
 mod dns_answers;
 #[path = "all/dnssec_status.rs"]

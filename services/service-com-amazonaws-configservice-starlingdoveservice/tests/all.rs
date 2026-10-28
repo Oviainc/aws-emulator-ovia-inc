@@ -160,3 +160,5 @@ mod conformance_pack_in_use_message;
 mod aggregate_compliance_by_conformance_packs;
 #[path = "all/get_resource_config_history.rs"]
 mod get_resource_config_history;
+#[path = "all/config_write_path_validation.rs"]
+mod config_write_path_validation;

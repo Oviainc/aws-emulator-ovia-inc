@@ -2496,6 +2496,24 @@ pub fn not_export_enabled_message(certificate_arn: &str) -> String {
     format!("Certificate ARN: {certificate_arn} is not an export enabled certificate")
 }
 
+/// The `ResourceNotFoundException` message `ExportCertificate` answers for a
+/// certificate ARN that resolves to a record which has not been ISSUED, built from the
+/// ARN the request asked for.
+///
+/// The member names "an Amazon Resource Name (ARN) of the issued certificate"
+/// (`ExportCertificateRequest$CertificateArn` doc), so what is not found under the ARN
+/// of a record in any status other than [`STATUS_ISSUED`] is an issued certificate —
+/// the resource this argument addresses — even though the ARN itself
+/// resolves, exactly as [`not_an_imported_certificate_message`] reports for the other
+/// operation whose argument addresses one kind of certificate.
+/// `ResourceNotFoundException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence comes from ACM's recorded behaviour
+/// for this error class: `Could not find an issued certificate ` followed by the
+/// requested ARN.
+pub fn issued_certificate_not_found_message(certificate_arn: &str) -> String {
+    format!("Could not find an issued certificate {certificate_arn}")
+}
+
 /// The `ValidationException` message `RevokeCertificate` answers for a certificate ACM
 /// did not issue, built from the ARN the request asked for.
 ///

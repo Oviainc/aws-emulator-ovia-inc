@@ -53,6 +53,8 @@ mod negative_paths;
 mod put_bandwidth_rate_limit_schedule;
 #[path = "all/put_hypervisor_property_mappings.rs"]
 mod put_hypervisor_property_mappings;
+#[path = "all/regional_listing_scope.rs"]
+mod regional_listing_scope;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
 #[path = "all/state_roundtrip.rs"]

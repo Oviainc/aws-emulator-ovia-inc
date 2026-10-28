@@ -281,6 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This call answers while Resolver is still creating the
             // configuration, so the move to `CREATED` is the one the clock owes.
             settled_at: Some(now + crate::state::PROVISIONING_DELAY),
+            // "To share the configuration with another account you use
+            // PutResolverQueryLogConfigPolicy": a configuration is created with
+            // no resource policy attached.
+            resolver_query_log_config_policy: None,
         };
 
         let created = record.to_query_log_config(now);

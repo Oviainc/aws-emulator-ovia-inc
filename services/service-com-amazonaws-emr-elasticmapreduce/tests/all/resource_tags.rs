@@ -15,7 +15,7 @@
 //! resource does not carry and replacing the value of one it does, changing nothing else
 //! about the resource — and refuses an id naming no resource this account holds, as well
 //! as a tag outside what a tag may be: the Unicode letters, separators and numbers plus
-//! `_ . : / = + - @` of the tag character class, a key of at most 128 characters and a
+//! `_ . : / = + \ -` of the tag character class, a key of at most 128 characters and a
 //! value of at most 256.
 
 use std::collections::BTreeMap;
@@ -27,6 +27,7 @@ use service_com_amazonaws_emr_elasticmapreduce::state::{
 
 use crate::job_flow_lifecycle::{assert_refused, at, kept_alive_request, Emr};
 use crate::refusal_messages::{message, studio_request};
+use crate::tag_character_class::tag_charset_refusal;
 
 /// The resource kinds `AddTags` names: "a cluster identifier or an Amazon EMR Studio ID"
 /// (`AddTags$ResourceId` doc), each with the read that reports its tags.
@@ -630,19 +631,24 @@ async fn an_unresolvable_resource_id_is_refused() {
 }
 
 /// Characters outside the class a tag is drawn from: a symbol (the emoji class),
-/// punctuation the class does not name, and a control character (whitespace that is no
-/// separator).
+/// punctuation the class does not name (`@` among it), and a control character
+/// (whitespace that is no separator).
 ///
 /// SOURCE: the tag character class the service states, exported as
 /// `state::TAG_CHARACTER_PATTERN` — Unicode letters, separators and numbers plus
-/// `_ . : / = + - @` — so every character outside it is refused. The rows test characters
-/// the issue did not cite beside the one it did.
-const REJECTED_TAG_CHARS: [char; 8] = ['🚀', '#', '!', '%', '*', ',', '"', '\t'];
+/// `_ . : / = + \ -` — so every character outside it is refused. The rows test characters
+/// the issue did not cite beside the one it did; the whole class is walked by the sibling
+/// suite `tests/all/tag_character_class.rs`.
+const REJECTED_TAG_CHARS: [char; 9] = ['🚀', '#', '!', '%', '*', ',', '"', '\t', '@'];
 
-/// The sentence a tag key or value Amazon EMR would not have stored is refused with:
-/// which half of the pair it was and the value the request sent, in this service's own
-/// wording for a value it rejects. Spelled out here, not read from the service.
-fn tag_not_valid(member: &str, value: &str) -> String {
+/// The sentence a tag key or value PAST ITS LENGTH BOUND is refused with: which half of
+/// the pair it was and the value the request sent, in this service's own wording for a
+/// value it will not hold. Spelled out here, not read from the service.
+///
+/// A key or value carrying a character the class leaves out is a different class of
+/// refusal, with Amazon EMR's own sentence for it
+/// ([`crate::tag_character_class::tag_charset_refusal`]).
+fn tag_too_long(member: &str, value: &str) -> String {
     format!("Tag {member} '{value}' is not valid.")
 }
 
@@ -691,17 +697,17 @@ async fn a_tag_outside_the_documented_bounds_is_refused() {
         (
             "a Key one character past the maximum".to_string(),
             tag_list(&[pair(&over_long_key, Some("x"))]),
-            tag_not_valid("key", &over_long_key),
+            tag_too_long("key", &over_long_key),
         ),
         (
             "a Value one character past the maximum".to_string(),
             tag_list(&[pair("long", Some(&over_long_value))]),
-            tag_not_valid("value", &over_long_value),
+            tag_too_long("value", &over_long_value),
         ),
         (
             "a non-ASCII Value one character past the maximum".to_string(),
             tag_list(&[pair("длина", Some(&over_long_non_ascii_value))]),
-            tag_not_valid("value", &over_long_non_ascii_value),
+            tag_too_long("value", &over_long_non_ascii_value),
         ),
     ];
 
@@ -727,12 +733,12 @@ async fn a_tag_outside_the_documented_bounds_is_refused() {
         rows.push((
             format!("the character {rejected:?} in a Value"),
             tag_list(&[pair("charset", Some(&text))]),
-            tag_not_valid("value", &text),
+            tag_charset_refusal("value", &text),
         ));
         rows.push((
             format!("the character {rejected:?} in a Key"),
             tag_list(&[pair(&text, Some("x"))]),
-            tag_not_valid("key", &text),
+            tag_charset_refusal("key", &text),
         ));
     }
     // A bad tag BEHIND a good one is refused the same way, and the good one beside it is
@@ -741,7 +747,7 @@ async fn a_tag_outside_the_documented_bounds_is_refused() {
     rows.push((
         "a character outside the class in the second entry".to_string(),
         tag_list(&[pair("team", Some("data")), pair("charset", Some(&behind))]),
-        tag_not_valid("value", &behind),
+        tag_charset_refusal("value", &behind),
     ));
 
     for (case, tags, says) in rows {

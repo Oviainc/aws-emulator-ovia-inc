@@ -23,8 +23,8 @@
 //!
 //! Unlike `ListEngagements`, which resolves no resource, this one is addressed BY an
 //! engagement ARN, so it is gated on the account's Incident Manager replication set the way
-//! `DescribeEngagement` is: without an active set the account has no entry in Incident
-//! Manager's registry and the call is refused about the ACCOUNT.
+//! `DescribeEngagement` is: without an active set no engagement ARN resolves to anything,
+//! and the call is refused reporting the `EngagementId` it named.
 //!
 //! ## Shape of an operation
 //!
@@ -192,10 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST — before the `NextToken` is read and before
         // `EngagementId` is resolved — so a non-onboarded account is refused identically
-        // whatever else the request carries, and about its own missing registry entry rather
-        // than about anything the request named.
+        // whatever else the request carries, reporting the engagement ARN it named, which
+        // without a replication set can name nothing.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.engagement_id)
             .map_err(account_precondition_failed)?;
 
         // The resume point: the scheduling sequence the previous page of results ended on.

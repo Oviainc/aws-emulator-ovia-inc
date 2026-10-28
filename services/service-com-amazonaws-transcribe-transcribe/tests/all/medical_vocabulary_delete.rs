@@ -100,9 +100,9 @@ async fn create_and_settle(transcribe: &Transcribe, row: &Row, case: &str) {
             .await,
         case,
     );
-    // The family's one clock-owed transition (`PENDING` -> `FAILED`, since nothing
-    // reads the table file) falls due a fixed span after the create; a `FAILED`
-    // record is terminal, so the delete is not refused for its state.
+    // The family's one clock-owed transition (`PENDING` -> `FAILED` here, since no
+    // object store is mounted to serve the table file) falls due a fixed span after the
+    // create; a `FAILED` record is terminal, so the delete is not refused for its state.
     std::thread::sleep(PAST_THE_TRANSITION);
 }
 

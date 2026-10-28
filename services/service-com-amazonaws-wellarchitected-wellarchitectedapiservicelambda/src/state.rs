@@ -109,8 +109,9 @@ pub use recommendation_catalog::{
 };
 
 pub use trusted_advisor_checks::{
-    check_result, checks_for_best_practice, CheckResult, TrustedAdvisorCheck,
-    CHECK_PROVIDER_TRUSTED_ADVISOR, TRUSTED_ADVISOR_CHECK_CATALOG,
+    check_account_summary, check_result, checks_for_best_practice, CheckAccountSummary,
+    CheckResult, TrustedAdvisorCheck, CHECK_PROVIDER_TRUSTED_ADVISOR, CHECK_STATUS_BY_SEVERITY,
+    TRUSTED_ADVISOR_CHECK_CATALOG,
 };
 
 pub use official_lenses::{
@@ -8326,6 +8327,22 @@ pub fn decode_check_next_token(token: &str) -> Option<(String, String)> {
     let account_id = cursor.get("ca")?.as_str()?.to_string();
     let check_id = cursor.get("ck")?.as_str()?.to_string();
     Some((account_id, check_id))
+}
+
+/// Encode a cursor over the Trusted Advisor checks of one best practice SUMMARIZED for
+/// every account at once: the `CheckId` last served, in the same opaque scheme as
+/// [`encode_next_token`]. A summary covers all the accounts the workload relates to in one
+/// entry, so the check alone names a position. Its own key, so a cursor issued by another
+/// paginated operation — including the per-account [`encode_check_next_token`] — is not a
+/// cursor here.
+pub fn encode_check_summary_next_token(check_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "cs": check_id }))
+}
+
+/// The `CheckId` a check-summaries `NextToken` points just past, or `None` when the token
+/// is not one this service issued.
+pub fn decode_check_summary_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("cs")?.as_str()?.to_string())
 }
 
 /// One page of a lens's questions: the questions to report, and the `NextToken` the next

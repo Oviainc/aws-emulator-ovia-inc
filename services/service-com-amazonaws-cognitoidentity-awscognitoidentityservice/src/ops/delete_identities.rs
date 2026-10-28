@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIdentities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIdentities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIdentities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! DELETES the named identities of this account's identity pools, one by one: every login
+//! the identity's pool indexed against it is forgotten (so presenting that login again is
+//! seen as a NEW user), the pool's listing no longer names it, and the credentials and
+//! OpenID Connect tokens issued for it speak for nobody. A named id this service holds no
+//! identity for is already deleted, so the call is idempotent and two overlapping batches
+//! leave the same final state. Being a developer-credentials operation that names no single
+//! pool, the whole call is authorized once against the account's identity pools before
+//! anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +142,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIdentities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIdentitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIdentities"))
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused delete is recorded with the error code its caller was
+        // answered with. An `IdentityId` is a NAME, not a secret, so the ids the request
+        // carried are recorded as sent.
+        let request_parameters = ::service_common::management_events::recorded_members([(
+            "identityIdsToDelete",
+            ::serde_json::json!(input.identity_ids_to_delete),
+        )]);
+        let region = crate::state::request_region(ctx.parts());
+        let outcome = self.delete(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                read_only: false,
+                // The request names no pool, and the identities it names may belong to
+                // several, so the record names no single resource rather than one pool of
+                // the batch.
+                identity_pool_id: None,
+                request_parameters,
+                response_elements: outcome.as_ref().ok().map(|output| {
+                    ::service_common::management_events::recorded_members([(
+                        "unprocessedIdentityIds",
+                        ::serde_json::json!(recorded_unprocessed(
+                            output.unprocessed_identity_ids.as_deref()
+                        )),
+                    )])
+                }),
+            },
+            &outcome,
+        );
+        outcome
     }
 }
+
+/// The `UnprocessedIdentityIds` of a served call, as the audit record names them: the id
+/// and the error code of each, which is every member the modelled shape carries.
+fn recorded_unprocessed(
+    unprocessed: Option<&[UnprocessedIdentityId]>,
+) -> Vec<::serde_json::Value> {
+    unprocessed
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            ::service_common::management_events::recorded_members([
+                ("identityId", ::serde_json::json!(entry.identity_id)),
+                ("errorCode", ::serde_json::json!(entry.error_code)),
+            ])
+        })
+        .collect()
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteIdentities<Eng> {
+    /// The delete itself: authorize the call, then give up each named identity and
+    /// everything that named it.
+    async fn delete(
+        &self,
+        input: DeleteIdentitiesInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<DeleteIdentitiesOutput, DeleteIdentitiesError> {
+        // Authorization comes FIRST, before any identity is read or removed: this is a
+        // developer-credentials operation ("You must use Amazon Web Services developer
+        // credentials to call this operation"), and it names no single identity pool — an
+        // `IdentityId` carries none — so the decision is made against the account's
+        // identity pools, exactly as it is for this service's other calls that address no
+        // one pool. A caller holding no grant is told it is not authorized, and every
+        // identity of the batch survives the refusal.
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            <Self as smithy_server_runtime::Operation>::NAME,
+            None,
+        ) {
+            return Err(denied);
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteIdentitiesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Each named identity is given up with everything that named it. An id this
+        // service holds no identity for has nothing left to delete — a batch repeating an
+        // id, and a second call over an overlapping batch, ask for a deletion that has
+        // already happened — so it is processed and leaves nothing to report.
+        let mut deleted: Vec<String> = Vec::new();
+        let mut revoked: Vec<String> = Vec::new();
+        {
+            let mut store = state.lock();
+            for identity_id in &input.identity_ids_to_delete {
+                if let Some(access_key_ids) = store.delete_identity(identity_id) {
+                    revoked.extend(access_key_ids);
+                    deleted.push(identity_id.clone());
+                }
+            }
+        }
+
+        // The stores those identities were known in OUTSIDE this service's own are written
+        // with this lock released, so two of them are never held at once: a session issued
+        // to a deleted identity is no longer a credential this emulator accepts, and a
+        // token issued for one names nobody its redeemer can resolve.
+        for access_key_id in revoked {
+            crate::state::discard_vended_role_session(
+                &*self.engine,
+                ctx.credential_store(),
+                &access_key_id,
+            );
+        }
+        for identity_id in &deleted {
+            crate::state::forget_issued_web_identities_of_identity(&*self.engine, identity_id);
+        }
+
+        // `UnprocessedIdentityIds` reports the ids the call could NOT carry out, each with
+        // the code of what stopped it — the modelled `ErrorCode` admits exactly
+        // `AccessDenied` and `InternalServerError`
+        // (`smithy_query(query="shape",shape="ErrorCode")`). Neither can befall one id of a
+        // batch this emulator served: the grant is decided for the whole call above, so a
+        // caller without it is refused outright rather than per id, and each id names
+        // either an identity just deleted or one already gone. The list is therefore empty
+        // for a served call — present and empty, because the member is what a caller reads
+        // to learn there was nothing left over.
+        Ok(DeleteIdentitiesOutput {
+            unprocessed_identity_ids: Some(Vec::new()),
+        })
+    }
+}
+

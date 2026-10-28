@@ -71,25 +71,27 @@
 //! in-process callback into this same emulator, so a client that fetches the reported
 //! location reads back the terms it stored and a later update replaces them (see
 //! [`store_vocabulary_content`] and [`vocabulary_download_uri`]). A vocabulary whose
-//! terms would have to be READ from a file URI is RECORDED like any other — the
-//! control plane is real, so the create succeeds and every later operation finds the
-//! resource — and the build this emulator cannot run ends in the service's own
-//! modelled `FAILED` state, with a `FailureReason` naming the file nothing read (see
-//! [`VocabularyRecord::advance_clock`] and [`file_not_read_failure_reason`]); the
-//! custom MEDICAL vocabulary family, whose terms can ONLY come from such a file, does
-//! exactly the same (see [`MedicalVocabularyRecord`]). Either way this emulator reads
-//! no object store and makes no outbound request, so it has nothing to build a
-//! vocabulary's terms from and never reports a vocabulary built from a file as
-//! `READY`. The `DownloadUri` is where the BUILT vocabulary is stored, so only a
-//! vocabulary whose build has FINISHED reports one: it is absent while the service is
-//! still processing the terms (`PENDING`) and absent after a build that failed, in
-//! both families alike ([`VocabularyRecord::download_uri`],
-//! [`MedicalVocabularyRecord::download_uri`]). A vocabulary FILTER whose words would
-//! have come from such a file is
-//! RECORDED the same way ([`VocabularyFilterRecord`]), and that is all there is to
-//! report for it: the filter family models no processing state and no operation of it
-//! reports a filter's words, so the only thing a filter nothing read a file for does
-//! not report is its own `DownloadUri`, the file this service would have built.
+//! terms come from a FILE instead of from the request is built from the very same
+//! seam, in the other direction: the caller uploaded that file to Amazon S3 before
+//! calling, this emulator holds an Amazon S3 of its own, so the file is READ from it in
+//! process ([`resolve_vocabulary_file`]) and its lines are the terms the build
+//! produces. The build therefore ends the way the object store's answer decides: a file
+//! the store serves settles the record `READY`, with those terms stored at the
+//! `DownloadUri` the reader reports, and only a file the store does not serve — nothing
+//! at that address, a read it refuses, no Amazon S3 to ask at all — ends the build in
+//! the service's own modelled `FAILED` state, with a `FailureReason` grounded in that
+//! answer (see [`VocabularyRecord::advance_clock`] and
+//! [`vocabulary_file_not_read_reason`]); the custom MEDICAL vocabulary family, whose
+//! terms can ONLY come from such a file, is built exactly the same way (see
+//! [`MedicalVocabularyRecord`]). The `DownloadUri` is where the BUILT vocabulary is
+//! stored, so only a vocabulary whose build has FINISHED reports one: it is absent
+//! while the service is still processing the terms (`PENDING`) and absent after a build
+//! that failed, in both families alike ([`VocabularyRecord::download_uri`],
+//! [`MedicalVocabularyRecord::download_uri`]). A vocabulary FILTER whose words come
+//! from such a file is built from it the same way ([`VocabularyFilterRecord`]), and
+//! that family models no processing state at all, so the only thing a filter whose
+//! words the store did not serve does not report is its own `DownloadUri`, the file
+//! this service would have built.
 //! A Call Analytics category is the same kind of record: its
 //! rules are held here, where a Call Analytics job that applies the category would
 //! read them from, and nothing evaluates a rule against a call, because no audio is
@@ -653,16 +655,15 @@ pub const MAX_QUEUED_CALL_ANALYTICS_JOBS: usize = MAX_CONCURRENT_CALL_ANALYTICS_
 pub const VOCABULARY_STATE_PENDING: &str = "PENDING";
 /// See [`VOCABULARY_STATE_PENDING`].
 pub const VOCABULARY_STATE_READY: &str = "READY";
-/// See [`VOCABULARY_STATE_PENDING`]. Where a vocabulary whose terms would have had to
-/// be READ from a file ends up, in EITHER family: the record is kept and the build
-/// this emulator cannot perform fails, carrying a `FailureReason` that says the file
-/// was not read ([`file_not_read_failure_reason`]).
+/// See [`VOCABULARY_STATE_PENDING`]. Where a vocabulary whose terms were to be read
+/// from a file the object store did not serve ends up, in EITHER family: the record is
+/// kept and the build carries a `FailureReason` grounded in what the store answered
+/// ([`vocabulary_file_not_read_reason`]).
 pub const VOCABULARY_STATE_FAILED: &str = "FAILED";
 
 /// How long after the call that starts it a custom vocabulary's next state
-/// transition is owed (`PENDING` -> `READY` for one built from the terms the request
-/// listed, `PENDING` -> `FAILED` for one whose terms would have come from a file this
-/// emulator does not read).
+/// transition is owed (`PENDING` -> `READY` for a build that loaded its terms,
+/// `PENDING` -> `FAILED` for one whose file the object store did not serve).
 ///
 /// A chosen span, not a documented one: Amazon Transcribe gives no processing-time
 /// guarantee for building a custom vocabulary. It is deliberately non-zero, so a
@@ -2011,10 +2012,10 @@ pub fn resource_arn(resource_type: &str, name: &str, region: &str) -> String {
 /// when it was last modified).
 ///
 /// The two content members `CreateVocabulary` publishes are alternatives — the terms
-/// in `Phrases`, or the file at `VocabularyFileUri` — and BOTH are recorded here: the
-/// resource is the same control-plane record either way, and which alternative the
-/// request chose is what decides the one transition the clock owes it (see
-/// [`Self::advance_clock`]).
+/// in `Phrases`, or the file at `VocabularyFileUri` — and EITHER produces the same
+/// record: the terms of a request that listed them inline, or the terms read from the
+/// file the object store served ([`resolve_vocabulary_file`]). What the build loaded is
+/// what decides the one transition the clock owes it (see [`Self::advance_clock`]).
 #[derive(Debug, Clone)]
 pub struct VocabularyRecord {
     /// `VocabularyName`, the second half of this record's key in the store (the Region
@@ -2025,21 +2026,29 @@ pub struct VocabularyRecord {
     pub sequence: u64,
     /// `LanguageCode`: the one language this vocabulary's terms are in.
     pub language_code: String,
-    /// The terms this vocabulary holds, as the request listed them in `Phrases` —
-    /// EMPTY for one whose terms would have come from a file, which nothing loaded.
+    /// The terms this vocabulary holds: the list the request carried in `Phrases`, or
+    /// the lines of the file at `VocabularyFileUri` the object store served — EMPTY
+    /// only for a build whose file it did not serve, which loaded none.
     pub phrases: Vec<String>,
     /// `VocabularyFileUri` when the request named a file as the source of its terms,
     /// and `None` when it listed them inline. Held so the failure reason can name it
-    /// and an update can replace it; never fetched.
+    /// and an update can replace it.
     pub file_uri: Option<String>,
     /// `VocabularyState`: [`VOCABULARY_STATE_PENDING`], [`VOCABULARY_STATE_READY`]
     /// or [`VOCABULARY_STATE_FAILED`].
     pub state: String,
     /// `FailureReason`, set only on a `FAILED` vocabulary.
     pub failure_reason: Option<String>,
-    /// When the build's own transition falls due — `PENDING` -> `READY` for inline
-    /// terms, `PENDING` -> `FAILED` for a file this emulator does not read; `None`
-    /// once it has been materialised. A `PENDING` record always carries it.
+    /// The `FailureReason` the clock owes this vocabulary INSTEAD of a `READY` state,
+    /// established when the create or update resolved the file its terms were to come
+    /// from ([`resolve_vocabulary_file`]); `None` for a build that loaded its terms.
+    /// Processing is what fails, so the record is accepted and reports this only once
+    /// the clock has finished with it ([`Self::advance_clock`]).
+    pub failure_due: Option<String>,
+    /// When the build's own transition falls due — `PENDING` -> `READY` for a build
+    /// that loaded its terms, `PENDING` -> `FAILED` for one whose file the object store
+    /// did not serve; `None` once it has been materialised. A `PENDING` record always
+    /// carries it.
     pub transition_due: Option<SystemTime>,
     pub last_modified_time: SystemTime,
     /// The region the request that created or last updated it was signed for; the
@@ -2050,36 +2059,43 @@ pub struct VocabularyRecord {
     pub tags: Vec<Tag>,
 }
 
+/// The `VocabularyState` a custom vocabulary's clock-owed build settles in, with the
+/// `FailureReason` a failed one carries ("If `VocabularyState` is `FAILED`,
+/// `FailureReason` contains information about why the custom vocabulary request
+/// failed").
+///
+/// THE RULE both vocabulary families settle by, single-homed so the two cannot
+/// disagree: a build that loaded its terms — from the list the request carried or from
+/// the file the object store served — has produced the vocabulary and is `READY`, which
+/// is the state that makes it usable ("If the state is READY, you can use the custom
+/// vocabulary in a StartTranscriptionJob request"), while a build that loaded none ends
+/// in the service's own modelled failure state carrying the reason the store's answer
+/// grounded ([`vocabulary_file_not_read_reason`]).
+fn settled_build(failure_due: Option<&str>) -> (&'static str, Option<String>) {
+    match failure_due {
+        None => (VOCABULARY_STATE_READY, None),
+        Some(reason) => (VOCABULARY_STATE_FAILED, Some(reason.to_string())),
+    }
+}
+
 impl VocabularyRecord {
     /// Materialise the state transition the CLOCK already owes this vocabulary: it
     /// was due at its stored instant whether or not anybody called. A reporting
     /// operation (`Get`, `List`) runs this before projecting the record, and that is
     /// the only write it performs.
     ///
-    /// WHICH state it lands in is decided by where the terms were to come from: a
-    /// vocabulary built from the terms the request listed is `READY`, while one whose
-    /// terms would have had to be READ from a file is `FAILED` — that read is work
-    /// this emulator cannot perform, so nothing built the vocabulary and nothing may
-    /// report it as usable. The medical family's single transition is the same one
+    /// WHICH state it lands in was decided when the create or update built the
+    /// vocabulary ([`settled_build`]), so a read neither reads a file nor changes what
+    /// the next read sees. The medical family's single transition settles the same way
     /// ([`MedicalVocabularyRecord::advance_clock`]).
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.state != VOCABULARY_STATE_PENDING {
             return;
         }
         if let Some(due) = self.transition_due.filter(|due| now >= *due) {
-            match &self.file_uri {
-                Some(file_uri) => {
-                    self.state = VOCABULARY_STATE_FAILED.to_string();
-                    self.failure_reason = Some(file_not_read_failure_reason(
-                        KIND_VOCABULARY,
-                        file_uri,
-                    ));
-                }
-                None => {
-                    self.state = VOCABULARY_STATE_READY.to_string();
-                    self.failure_reason = None;
-                }
-            }
+            let (state, failure_reason) = settled_build(self.failure_due.as_deref());
+            self.state = state.to_string();
+            self.failure_reason = failure_reason;
             // The resource changed when the build finished, so the modification
             // instant is that of the transition, not of the request that started it.
             self.last_modified_time = due;
@@ -2105,9 +2121,9 @@ impl VocabularyRecord {
     /// is the state the model gives that outcome, and while a build is still
     /// [`VOCABULARY_STATE_PENDING`] — or after it ended
     /// [`VOCABULARY_STATE_FAILED`] — there is nothing built to download and the member
-    /// is absent. That one condition also covers where the terms were to come from:
-    /// a vocabulary whose terms would have had to be READ from a file never reaches
-    /// `READY` ([`Self::advance_clock`]), because nothing loaded them. The medical
+    /// is absent. That one condition also covers where the terms came from: a
+    /// vocabulary whose file the object store did not serve loaded no terms and never
+    /// reaches `READY` ([`Self::advance_clock`]). The medical
     /// family gates the same member on the same state
     /// ([`MedicalVocabularyRecord::download_uri`]). See [`vocabulary_download_uri`].
     pub fn download_uri(&self) -> Option<String> {
@@ -2117,24 +2133,26 @@ impl VocabularyRecord {
 }
 
 /// One stored custom MEDICAL vocabulary: the file the request named as the source of
-/// its terms, plus the lifecycle facts the service itself owns (its processing state,
-/// why that state is what it is, and when it was last modified).
+/// its terms, the terms that file holds, plus the lifecycle facts the service itself
+/// owns (its processing state, why that state is what it is, and when it was last
+/// modified).
 ///
-/// WHY THIS FAMILY NEVER REACHES `READY`: a custom medical vocabulary can only be
-/// built by READING the table file at `VocabularyFileUri`, which
-/// `CreateMedicalVocabulary` and `UpdateMedicalVocabulary` both model `@required`
-/// with no inline alternative (`smithy_query(query="operation",
-/// operation="CreateMedicalVocabulary")`) — unlike `CreateVocabulary`, which also
-/// takes the terms in `Phrases`. This emulator reads no object store and makes no
-/// outbound request, so that build is work it cannot perform. The RECORD is still
-/// real and is kept — the name, the language, the state, the timestamps and the tag
-/// set are the control plane every operation of this family reports — and the build
-/// it cannot run ends in the service's own modelled failure state: `PENDING` at the
-/// create, then `FAILED` with a `FailureReason` that says the file was not read
-/// ([`file_not_read_failure_reason`]). Nothing here reports a `READY` medical
-/// vocabulary, because nothing ever read its terms; a NON-medical vocabulary whose
-/// request named a file instead of listing its terms is recorded the same way and
-/// ends the same way ([`VocabularyRecord::advance_clock`]).
+/// HOW THIS FAMILY IS BUILT: a custom medical vocabulary's terms can only come from the
+/// table file at `VocabularyFileUri`, which `CreateMedicalVocabulary` and
+/// `UpdateMedicalVocabulary` both model `@required` with no inline alternative
+/// (`smithy_query(query="operation", operation="CreateMedicalVocabulary")`) — unlike
+/// `CreateVocabulary`, which also takes the terms in `Phrases`. That file is an Amazon
+/// S3 object the caller uploaded before calling ("you must first upload a text file
+/// that contains your vocabulary table into an Amazon S3 bucket"), and this emulator
+/// holds an Amazon S3 of its own, so the file is READ from it in process
+/// ([`resolve_vocabulary_file`]) and the table's lines are the terms the build
+/// produces. The build therefore ends the way the object store's answer decides:
+/// `PENDING` at the create, then [`VOCABULARY_STATE_READY`] — with those terms stored
+/// at the `DownloadUri` the reader reports ([`store_vocabulary_content`]) — for a file
+/// the store served, and [`VOCABULARY_STATE_FAILED`] with a grounded `FailureReason`
+/// only for one it did not ([`vocabulary_file_not_read_reason`]). A NON-medical
+/// vocabulary whose request named a file instead of listing its terms is built from
+/// exactly the same read ([`VocabularyRecord::advance_clock`]).
 #[derive(Debug, Clone)]
 pub struct MedicalVocabularyRecord {
     /// `VocabularyName`, with the Region, this record's key in the store.
@@ -2144,16 +2162,24 @@ pub struct MedicalVocabularyRecord {
     pub sequence: u64,
     /// `LanguageCode`: the one language this vocabulary's terms are in.
     pub language_code: String,
-    /// `VocabularyFileUri`: where the terms would be read from. Held so the failure
-    /// reason can name it and an update can replace it; never fetched.
+    /// `VocabularyFileUri`: where the terms are read from. Held so the failure reason
+    /// can name it and an update can replace it.
     pub file_uri: String,
+    /// The terms this medical vocabulary holds: the lines of the table file the object
+    /// store served — EMPTY for a build whose file it did not serve, which loaded none.
+    pub terms: Vec<String>,
     /// `VocabularyState`: [`VOCABULARY_STATE_PENDING`] until the clock makes the
-    /// build due, then [`VOCABULARY_STATE_FAILED`].
+    /// build due, then the state that build settles in.
     pub state: String,
     /// `FailureReason`, set only on a `FAILED` vocabulary.
     pub failure_reason: Option<String>,
-    /// When `PENDING` -> `FAILED` falls due; `None` once it has been materialised.
-    pub failed_due: Option<SystemTime>,
+    /// The `FailureReason` the clock owes this vocabulary INSTEAD of a `READY` state,
+    /// established when the create or update resolved its table file
+    /// ([`resolve_vocabulary_file`]); `None` for a build that loaded its terms.
+    pub failure_due: Option<String>,
+    /// When the build's own transition falls due; `None` once it has been materialised.
+    /// A `PENDING` record always carries it.
+    pub transition_due: Option<SystemTime>,
     pub last_modified_time: SystemTime,
     /// The region the request that created or last updated it was signed for.
     pub region: String,
@@ -2162,16 +2188,21 @@ pub struct MedicalVocabularyRecord {
 
 impl MedicalVocabularyRecord {
     /// The record a create of `name` from the file at `file_uri` stores: `PENDING`,
-    /// with its one clock-owed transition already due at a fixed span from `now`.
+    /// with its one clock-owed transition already due at a fixed span from `now`, the
+    /// `terms` the read of that file produced and the reason the build owes instead of
+    /// a `READY` state when it produced none ([`resolve_vocabulary_file`]).
     ///
     /// Single-homed so the create and any later update cannot disagree about the
     /// invariant that a `PENDING` record always carries the instant its transition
     /// falls due.
+    #[allow(clippy::too_many_arguments)]
     pub fn pending(
         name: String,
         sequence: u64,
         language_code: String,
         file_uri: String,
+        terms: Vec<String>,
+        failure_due: Option<String>,
         region: String,
         tags: Vec<Tag>,
         now: SystemTime,
@@ -2181,9 +2212,11 @@ impl MedicalVocabularyRecord {
             sequence,
             language_code,
             file_uri,
+            terms,
             state: VOCABULARY_STATE_PENDING.to_string(),
             failure_reason: None,
-            failed_due: Some(now + VOCABULARY_TRANSITION_DELAY),
+            failure_due,
+            transition_due: Some(now + VOCABULARY_TRANSITION_DELAY),
             last_modified_time: now,
             region,
             tags,
@@ -2194,20 +2227,22 @@ impl MedicalVocabularyRecord {
     /// vocabulary: it was due at its stored instant whether or not anybody called. A
     /// reporting operation (`Get`, `List`) runs this before projecting the record,
     /// and that is the only write it performs.
+    ///
+    /// WHICH state it lands in was decided when the create or update read the table
+    /// file ([`settled_build`]), the same rule the non-medical family settles by, so a
+    /// read neither reads a file nor changes what the next read sees.
     pub fn advance_clock(&mut self, now: SystemTime) {
         if self.state != VOCABULARY_STATE_PENDING {
             return;
         }
-        if let Some(due) = self.failed_due.filter(|due| now >= *due) {
-            self.state = VOCABULARY_STATE_FAILED.to_string();
-            self.failure_reason = Some(file_not_read_failure_reason(
-                KIND_MEDICAL_VOCABULARY,
-                &self.file_uri,
-            ));
+        if let Some(due) = self.transition_due.filter(|due| now >= *due) {
+            let (state, failure_reason) = settled_build(self.failure_due.as_deref());
+            self.state = state.to_string();
+            self.failure_reason = failure_reason;
             // The resource changed when the build ended, so the modification instant
             // is that of the transition, not of the request that started it.
             self.last_modified_time = due;
-            self.failed_due = None;
+            self.transition_due = None;
         }
     }
 
@@ -2224,9 +2259,11 @@ impl MedicalVocabularyRecord {
     }
 
     /// Where this medical vocabulary's own file is reported to live, for one this
-    /// service built — and `None` for one it did not, which is every record of this
-    /// family (see the type's own docs): a vocabulary whose terms were never loaded
-    /// has no file to download. See [`vocabulary_download_uri`].
+    /// service FINISHED building — and `None` for every other record: a build still
+    /// `PENDING` has produced nothing to download yet, and one that ended `FAILED`
+    /// loaded no terms at all, so the member stays absent rather than naming a location
+    /// holding nothing. The non-medical family gates the same member on the same state
+    /// ([`VocabularyRecord::download_uri`]). See [`vocabulary_download_uri`].
     pub fn download_uri(&self) -> Option<String> {
         (self.state == VOCABULARY_STATE_READY).then(|| {
             vocabulary_download_uri(RESOURCE_TYPE_MEDICAL_VOCABULARY, &self.name, &self.region)
@@ -2234,20 +2271,238 @@ impl MedicalVocabularyRecord {
     }
 }
 
-/// Why a custom vocabulary this emulator recorded ends `FAILED`: the file its terms
-/// would have come from is one this emulator does not read (see
-/// [`VocabularyRecord::advance_clock`] and [`MedicalVocabularyRecord`]).
+/// The member of a create or update that names the file a custom vocabulary's terms are
+/// read from, as a refusal or a failure reason spells it.
+pub const VOCABULARY_FILE_MEMBER: &str = "VocabularyFileUri";
+
+/// See [`VOCABULARY_FILE_MEMBER`]: the member the vocabulary FILTER family names its
+/// own file with.
+pub const VOCABULARY_FILTER_FILE_MEMBER: &str = "VocabularyFilterFileUri";
+
+/// What this emulator's own Amazon S3 answered about the file a request named as the
+/// source of a custom vocabulary's, medical vocabulary's or vocabulary filter's terms
+/// (see [`resolve_vocabulary_file`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VocabularyFileVerdict {
+    /// The store served the file: these are the terms it holds, in the order it lists
+    /// them.
+    Read(Vec<String>),
+    /// The file holds more bytes than a custom vocabulary may
+    /// ([`MAX_VOCABULARY_CONTENT_BYTES`]), so it is refused rather than built from —
+    /// the request's own modelled `LimitExceededException`, whose documentation covers
+    /// exactly this ("You've either sent too many requests or your input file is too
+    /// long ... use a smaller file and try your request again"). Nothing of it is
+    /// stored.
+    TooLarge(usize),
+    /// The terms were NOT read — nothing is stored at that address, the store refused
+    /// the read, there was no object store to ask, or the location is not one an object
+    /// store can be asked about. The text is the `FailureReason` the record carries
+    /// once its build ends ([`vocabulary_file_not_read_reason`]).
+    NotRead(String),
+}
+
+impl VocabularyFileVerdict {
+    /// What a create or update records from this verdict: the terms the build loaded
+    /// and the `FailureReason` the clock owes the record instead of a `READY` state —
+    /// or `Err(bytes)` for a file past the published ceiling, which each operation
+    /// refuses with its own modelled `LimitExceededException`
+    /// ([`vocabulary_file_too_large_message`]).
+    ///
+    /// Single-homed so the six operations that take a file (the two vocabulary
+    /// operations, the two medical ones and the two filter ones) cannot disagree about
+    /// what a verdict means for the record they store.
+    pub fn into_build(self) -> Result<(Vec<String>, Option<String>), usize> {
+        match self {
+            Self::Read(terms) => Ok((terms, None)),
+            Self::NotRead(reason) => Ok((Vec::new(), Some(reason))),
+            Self::TooLarge(bytes) => Err(bytes),
+        }
+    }
+}
+
+/// Read the file a request named as the source of a custom vocabulary's (or vocabulary
+/// filter's) terms from this emulator's own Amazon S3, and report what that read
+/// established.
 ///
-/// The wording is this emulator's own — AWS publishes no text for a custom
-/// vocabulary's `FailureReason` — and it names the URI the request gave, so a caller
-/// can see which file was not read. One text for both families, worded by the
-/// resource `kind` ([`KIND_VOCABULARY`], [`KIND_MEDICAL_VOCABULARY`]), because the
-/// reason they fail is the same one.
-pub fn file_not_read_failure_reason(kind: &str, file_uri: &str) -> String {
+/// A caller uploads that file BEFORE calling — "you must first upload a text file that
+/// contains your vocabulary table into an Amazon S3 bucket" — so the file is an object
+/// of the object store, and this emulator holds an Amazon S3 of its own: it is read the
+/// way any emulated service reaches another, through the in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`], see [`s3_client`] — no
+/// socket, no outbound request, no host resolution). The read happens when the resource
+/// is CREATED or UPDATED, which is when the service's build reads it, and what it
+/// established is stored on the record, so the clock-owed transition settles on it
+/// without any read having to resolve anything ([`settled_build`]).
+///
+/// A refusal has to be GROUNDED in what the store answered: only an answer saying the
+/// address holds nothing or that the read is not permitted
+/// ([`location_is_unreadable`]) names the store's own code in the reason, and every
+/// other outcome says what this emulator established instead. The terms a built
+/// vocabulary holds are its CONTENT, so — unlike a custom language model's training
+/// data, which only has to be there ([`resolve_training_data`]) — a file nothing read
+/// leaves the build with nothing to produce, whatever the reason.
+///
+/// HOW MUCH IS READ IS BOUNDED, and bounded TWICE, because the size of this read is the
+/// one thing a caller chooses: the published ceiling a custom vocabulary may hold
+/// ([`MAX_VOCABULARY_CONTENT_BYTES`]) is checked against the length the store's own
+/// answer declares — which an object read always carries — BEFORE a byte of the body is
+/// taken into this process, and again against the bytes themselves, so an answer that
+/// declared no length cannot get past it either. A file over the ceiling is refused
+/// ([`VocabularyFileVerdict::TooLarge`]) rather than truncated, so nothing is built from
+/// part of a file.
+pub async fn resolve_vocabulary_file(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    member: &str,
+    uri: &str,
+) -> VocabularyFileVerdict {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    // `Uri`'s own `@pattern` admits an `http(s)://` location too, which addresses a
+    // HOST rather than an object, and this emulator resolves no hosts: there is no
+    // object store to ask about it.
+    let Some((bucket, key)) = s3_object_address(uri) else {
+        return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
+            member,
+            uri,
+            NOT_AN_OBJECT_DETAIL,
+        ));
+    };
+    let client = s3_client(ctx, region);
+    let read = match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(read) => read,
+        Err(error) => {
+            let code = error.code().unwrap_or_default();
+            if location_is_unreadable(code) {
+                // The store says the file is not there, or not readable by this
+                // account: the failure is grounded in its answer.
+                return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
+                    member,
+                    uri,
+                    &format!("Amazon S3 answered {code}"),
+                ));
+            }
+            // Any other answer is this emulator failing to ask its own object store,
+            // not the store reporting an unreadable file — and it is worth a warning,
+            // because a deployment with no S3 mounted to ask is one where no file is
+            // ever read. The caller's own value is rendered with its escaped `Debug`
+            // form, so a URI carrying a newline cannot forge a log line.
+            ::tracing::warn!(
+                member = member,
+                uri = ?uri,
+                code = ?error.code(),
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "a custom vocabulary's file could not be read from the emulator's Amazon S3"
+            );
+            return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
+                member,
+                uri,
+                NO_ANSWER_DETAIL,
+            ));
+        }
+    };
+    // The published ceiling is checked against what the store SAYS the file holds,
+    // before any of it is read into this process.
+    if let Some(declared) = read
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+    {
+        if declared > MAX_VOCABULARY_CONTENT_BYTES {
+            return VocabularyFileVerdict::TooLarge(declared);
+        }
+    }
+    let Ok(body) = read.body.collect().await else {
+        return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
+            member,
+            uri,
+            NO_ANSWER_DETAIL,
+        ));
+    };
+    let body = body.into_bytes();
+    // The same ceiling again, now against the bytes themselves: a store that declared
+    // no length cannot smuggle a file past it.
+    if body.len() > MAX_VOCABULARY_CONTENT_BYTES {
+        return VocabularyFileVerdict::TooLarge(body.len());
+    }
+    let Ok(text) = std::str::from_utf8(&body) else {
+        return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
+            member,
+            uri,
+            NOT_TEXT_DETAIL,
+        ));
+    };
+    let terms = vocabulary_file_terms(text);
+    if terms.is_empty() {
+        return VocabularyFileVerdict::NotRead(vocabulary_file_not_read_reason(
+            member,
+            uri,
+            NO_TERMS_DETAIL,
+        ));
+    }
+    ::tracing::info!(
+        member = member,
+        bucket = ?bucket,
+        key = ?key,
+        terms = terms.len(),
+        "a custom vocabulary's file was read from the emulator's Amazon S3"
+    );
+    VocabularyFileVerdict::Read(terms)
+}
+
+/// The terms the text file of a custom vocabulary, medical vocabulary or vocabulary
+/// filter holds: its non-empty lines, in the order the file lists them.
+///
+/// One entry per line is the form every member that names such a file documents — a
+/// list of "entries, phrases, and terms", a vocabulary table, or the words a filter
+/// masks — and it is the same form this service WRITES the built file in
+/// ([`vocabulary_content_file`]), so a file this emulator built round-trips through a
+/// create that names it. A table file's line carries its columns, which travel with the
+/// line; blank lines separate nothing and are dropped.
+pub fn vocabulary_file_terms(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Why a build loaded no terms, when the location is not an Amazon S3 object this
+/// emulator can read: see [`vocabulary_file_not_read_reason`].
+const NOT_AN_OBJECT_DETAIL: &str = "it does not address an Amazon S3 object";
+/// Why a build loaded no terms, when no object store answered for the location at all.
+const NO_ANSWER_DETAIL: &str = "no Amazon S3 answered for that location";
+/// Why a build loaded no terms, when the object the store served is not text.
+const NOT_TEXT_DETAIL: &str = "it is not a UTF-8 text file";
+/// Why a build loaded no terms, when the text the store served holds none.
+const NO_TERMS_DETAIL: &str = "it holds no terms";
+
+/// Why a custom vocabulary this emulator recorded ends `FAILED`: the file its terms
+/// were to come from was not read, and `detail` is what this emulator established about
+/// it — the code Amazon S3 answered, or the reason there was no answer to go on (see
+/// [`resolve_vocabulary_file`]).
+///
+/// The wording is this emulator's own — AWS publishes no text for a custom vocabulary's
+/// `FailureReason` — and it names the member and the URI the request gave, so a caller
+/// can see which file was not read and why. One text for all three families, because
+/// the reason they fail is the same one.
+pub fn vocabulary_file_not_read_reason(member: &str, uri: &str, detail: &str) -> String {
     format!(
-        "The VocabularyFileUri {file_uri} was not read: this emulator reads no object \
-         store and makes no outbound request, so it cannot build a custom {kind} from \
-         a file. No terms were loaded for this vocabulary."
+        "The {member} {uri} could not be read: {detail}. No terms were loaded, so there \
+         was nothing to build from. Upload your file and try your request again."
+    )
+}
+
+/// The refusal a create or update carries when the file it names holds more than the
+/// published ceiling a custom vocabulary of `kind` may ([`MAX_VOCABULARY_CONTENT_BYTES`]).
+///
+/// The same ceiling, and the same remedy, as the refusal a request carrying its terms
+/// inline gets — "use a smaller file and try your request again"
+/// (`LimitExceededException`'s own documentation).
+pub fn vocabulary_file_too_large_message(member: &str, uri: &str, bytes: usize, kind: &str) -> String {
+    format!(
+        "The {member} {uri} is {bytes} bytes, more than the {max} bytes a custom {kind} \
+         may hold. Use a smaller file and try your request again.",
+        max = MAX_VOCABULARY_CONTENT_BYTES,
     )
 }
 
@@ -2628,22 +2883,22 @@ async fn read_training_location(
 /// however much a caller staged.
 const MAX_TRAINING_DATA_PAGES: usize = 8;
 
-/// Whether `code` is Amazon S3 saying a location a create named cannot be READ:
-/// either one of the codes in which it reports that an address holds nothing
-/// ([`ABSENT_OBJECT_CODES`], the same list the media resolution refuses on — a listing
-/// addresses no object version, so the version code among them cannot arise here) or
+/// Whether `code` is Amazon S3 saying a location a create or update named cannot be
+/// READ: either one of the codes in which it reports that an address holds nothing
+/// ([`ABSENT_OBJECT_CODES`], the same list the media resolution refuses on) or
 /// one of the codes in which it reports that the read is not permitted
 /// ([`FORBIDDEN_READ_CODES`]). Every other answer is this emulator failing to ask,
-/// which grounds no failure (see [`read_training_location`]).
+/// which names no store answer (see [`read_training_location`] and
+/// [`resolve_vocabulary_file`]).
 fn location_is_unreadable(code: &str) -> bool {
     ABSENT_OBJECT_CODES.contains(&code) || FORBIDDEN_READ_CODES.contains(&code)
 }
 
 /// The Amazon S3 error codes in which S3 reports that a read is NOT PERMITTED, as
 /// opposed to that the address holds nothing ([`ABSENT_OBJECT_CODES`]). A custom
-/// language model's training data is read with the role the request named, so "you may
-/// not read this" is as much a grounded reason for the training to fail as "there is
-/// nothing there".
+/// language model's training data, and a custom vocabulary's own file, are read with the
+/// role the request named, so "you may not read this" is as much a grounded reason for
+/// the build to fail as "there is nothing there".
 const FORBIDDEN_READ_CODES: &[&str] = &["AccessDenied", "AllAccessDisabled"];
 
 /// Why a custom language model ends `FAILED` when the object store holds nothing under
@@ -2682,12 +2937,12 @@ pub fn training_data_unreadable_reason(member: &str, uri: &str, code: &str) -> S
 ///
 /// The two content members `CreateVocabularyFilter` and `UpdateVocabularyFilter`
 /// publish are alternatives — the words in `Words`, or the file at
-/// `VocabularyFilterFileUri` — and BOTH are recorded here, exactly as in the
-/// vocabulary family ([`VocabularyRecord`]): the resource is the same control-plane
-/// record either way. Which alternative the request chose decides only what this
-/// record can report: a filter whose words would have had to be READ from a file has
-/// none loaded and no file of its own to download ([`Self::download_uri`]), because
-/// this emulator reads no object store and makes no outbound request.
+/// `VocabularyFilterFileUri` — and EITHER produces the same record, exactly as in the
+/// vocabulary family ([`VocabularyRecord`]): the words the request listed, or the words
+/// the file the object store served holds ([`resolve_vocabulary_file`]). What the build
+/// loaded decides only what this record can report: a filter whose file the store did
+/// not serve has no words loaded and so no file of its own to download
+/// ([`Self::download_uri`]).
 #[derive(Debug, Clone)]
 pub struct VocabularyFilterRecord {
     /// `VocabularyFilterName`, with the Region, this record's key in the store.
@@ -2696,13 +2951,12 @@ pub struct VocabularyFilterRecord {
     /// pages with.
     pub sequence: u64,
     pub language_code: String,
-    /// The words this filter masks, deletes or flags, as the request listed them in
-    /// `Words` — EMPTY for one whose words would have come from a file, which nothing
-    /// loaded.
+    /// The words this filter masks, deletes or flags: the list the request carried in
+    /// `Words`, or the lines of the file at `VocabularyFilterFileUri` the object store
+    /// served — EMPTY only for a filter whose file it did not serve, which loaded none.
     pub words: Vec<String>,
     /// `VocabularyFilterFileUri` when the request named a file as the source of its
-    /// words, and `None` when it listed them inline. Held so an update can replace it
-    /// and so this record knows it holds no words of its own; never fetched.
+    /// words, and `None` when it listed them inline. Held so an update can replace it.
     pub file_uri: Option<String>,
     pub last_modified_time: SystemTime,
     /// The region the request that created or last updated it was signed for.
@@ -2723,13 +2977,14 @@ impl VocabularyFilterRecord {
         }
     }
 
-    /// Where this filter's own file is reported to live, for one built from the words
-    /// the request listed — and `None` for one whose words would have come from a
-    /// file, which nothing read: a filter no words were loaded for has no file to
-    /// download, exactly as in the vocabulary family
-    /// ([`VocabularyRecord::download_uri`]). See [`vocabulary_download_uri`].
+    /// Where this filter's own file is reported to live, for one this service BUILT —
+    /// and `None` for one whose words the object store did not serve, which loaded none:
+    /// a filter no words were loaded for has no file to download, exactly as in the
+    /// vocabulary family ([`VocabularyRecord::download_uri`]). This family models no
+    /// processing state at all, so the words the record holds are what says whether
+    /// there is a built file at that location. See [`vocabulary_download_uri`].
     pub fn download_uri(&self) -> Option<String> {
-        self.file_uri.is_none().then(|| {
+        (!self.words.is_empty()).then(|| {
             vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY_FILTER, &self.name, &self.region)
         })
     }
@@ -3083,7 +3338,7 @@ where
 }
 
 /// What a request's two content members say about where a vocabulary's terms come
-/// from: a list in the request, or a file the service would have to read.
+/// from: a list in the request, or a file the service reads them from.
 ///
 /// `CreateVocabulary`/`UpdateVocabulary` (`Phrases` / `VocabularyFileUri`) and
 /// `CreateVocabularyFilter`/`UpdateVocabularyFilter` (`Words` /
@@ -3094,7 +3349,8 @@ where
 pub enum ContentSource<'a> {
     /// The terms are listed in the request.
     Inline(&'a [String]),
-    /// The terms are in the file at this URI, which the service would have to read.
+    /// The terms are in the file at this URI, which the service reads them from
+    /// ([`resolve_vocabulary_file`]).
     File(&'a str),
     /// Neither member carries content.
     Neither,
@@ -3187,7 +3443,8 @@ const UNCONSTRAINED_BUCKET_REGION: &str = "us-east-1";
 ///
 /// The ONE client this service reaches object storage with: a job start resolving the
 /// media location it was given, the listings that resolve a custom language model's
-/// training and tuning data ([`resolve_training_data`]) and the writes that store a
+/// training and tuning data ([`resolve_training_data`]), the read of the file a custom
+/// vocabulary's terms come from ([`resolve_vocabulary_file`]) and the writes that store a
 /// custom vocabulary's or filter's built text file ([`store_vocabulary_content`]) all
 /// go through it, so none of them can reach the object store in a way the others
 /// would not.
@@ -3244,7 +3501,7 @@ fn s3_client(
 /// and key the URI is built from, over the in-process callback, so the location a
 /// reader reports serves this resource's CURRENT terms and a rebuild from other terms
 /// replaces them. An EMPTY list of terms is the other direction of the same rule:
-/// nothing was built (the terms were to be read from a caller-named file, or the
+/// nothing was built (the file the terms were to be read from was not served, or the
 /// resource is being deleted), so nothing is served there and any file an earlier
 /// build left is withdrawn.
 ///
@@ -4019,8 +4276,8 @@ pub fn media_format_of(media: &Media) -> Option<String> {
 ///
 /// The ONE `s3://` parse this service makes: the training and tuning locations of a
 /// custom language model ([`read_training_location`]) are prefixes, so they may name a
-/// bucket with nothing after it, while a media URI names an object and layers the
-/// non-empty-key requirement on top of this ([`media_object_address`]) — so the two
+/// bucket with nothing after it, while a URI naming one OBJECT layers the
+/// non-empty-key requirement on top of this ([`s3_object_address`]) — so the two
 /// cannot disagree about what a URI addresses.
 ///
 /// `None` for a value that addresses no bucket, including the `http(s)://` form the
@@ -4032,20 +4289,25 @@ fn s3_bucket_and_path(uri: &str) -> Option<(&str, &str)> {
     (!bucket.is_empty()).then_some((bucket, path))
 }
 
-/// The Amazon S3 object a media URI addresses: its bucket and its key.
+/// The Amazon S3 object a URI addresses: its bucket and its key.
 ///
+/// Every member of this service that names ONE object spells it the same way —
 /// `Media$MediaFileUri` is "The Amazon S3 location of the media file you want to
 /// transcribe", spelled `s3://DOC-EXAMPLE-BUCKET/media-files/my-media-file.flac` in the
-/// member's own examples: the first path segment is the bucket and everything after it
-/// is the key. [`s3_bucket_and_path`] with the requirement this member adds — a media
-/// URI names an OBJECT, so a URI naming only a bucket addresses none.
-fn media_object_address(uri: &str) -> Option<(&str, &str)> {
+/// member's own examples, and `CreateMedicalVocabularyRequest$VocabularyFileUri` is "The
+/// Amazon S3 location (URI) of the text file that contains your custom medical
+/// vocabulary", spelled `s3://DOC-EXAMPLE-BUCKET/my-vocab-file.txt` — so the first path
+/// segment is the bucket and everything after it is the key, and one parse answers for
+/// the media a job is pointed at and the file a vocabulary is built from alike.
+/// [`s3_bucket_and_path`] with the requirement those members add: such a URI names an
+/// OBJECT, so a URI naming only a bucket addresses none.
+fn s3_object_address(uri: &str) -> Option<(&str, &str)> {
     let (bucket, key) = s3_bucket_and_path(uri)?;
     (!key.is_empty()).then_some((bucket, key))
 }
 
 /// Whether `uri` is of the Amazon S3 scheme and yet addresses NO object of it
-/// ([`media_object_address`]): `s3://` with no bucket, or a bucket with no key under it.
+/// ([`s3_object_address`]): `s3://` with no bucket, or a bucket with no key under it.
 ///
 /// Such a URI needs no object store to judge: the media member is "The Amazon S3
 /// location of the media file you want to transcribe", and every example of it names a
@@ -4054,7 +4316,7 @@ fn media_object_address(uri: &str) -> Option<(&str, &str)> {
 /// service could ever read — unlike the `http(s)://` form, which addresses a host this
 /// emulator cannot resolve and so leaves the media simply unknown.
 fn s3_uri_addresses_no_object(uri: &str) -> bool {
-    uri.trim().starts_with("s3://") && media_object_address(uri).is_none()
+    uri.trim().starts_with("s3://") && s3_object_address(uri).is_none()
 }
 
 /// What asking this emulator's own Amazon S3 about the media a start request named
@@ -4070,7 +4332,7 @@ pub enum MediaVerdict {
     /// media it is to process.
     Resolved,
     /// Nothing is known about the media: there was no object store to ask, the URI
-    /// addresses no object this emulator can resolve ([`media_object_address`]), or only
+    /// addresses no object this emulator can resolve ([`s3_object_address`]), or only
     /// SOME of the objects the request addressed resolved. Nothing is refused and no job
     /// is failed on an assumption.
     Unknown,
@@ -4155,7 +4417,7 @@ pub async fn resolve_media_objects(
     let mut asked = 0usize;
     let mut resolved = 0usize;
     for uri in uris {
-        let Some((bucket, key)) = media_object_address(uri) else {
+        let Some((bucket, key)) = s3_object_address(uri) else {
             // A URI of the S3 scheme that addresses no object of it names no media file
             // at all ([`s3_uri_addresses_no_object`]), so the start is refused without
             // asking the store: there is no object for it to answer about.
@@ -4659,7 +4921,7 @@ pub struct OutputObject {
 /// reports.
 fn output_object_address(uri: &str) -> Option<(&str, &str)> {
     let uri = uri.trim();
-    if let Some(address) = media_object_address(uri) {
+    if let Some(address) = s3_object_address(uri) {
         return Some(address);
     }
     let (host, path) = uri.split_once("://")?.1.split_once('/')?;

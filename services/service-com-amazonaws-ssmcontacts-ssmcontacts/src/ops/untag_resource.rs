@@ -177,9 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // The account gate comes FIRST: before `ResourceARN` is resolved, and before
-        // anything is removed.
+        // anything is removed. The gate is handed that member, because which resource
+        // family it names is what words the refusal.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.resource_arn)
             .map_err(account_precondition_failed)?;
 
         // Then the member itself: a value that is not an ARN of this service names no

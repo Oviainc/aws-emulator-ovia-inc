@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one there is nothing to resolve the request against — before `RotationId` is
         // resolved, and before anything is written.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.rotation_id)
             .map_err(account_precondition_failed)?;
 
         // An override is an override OF a rotation, so the rotation has to exist.

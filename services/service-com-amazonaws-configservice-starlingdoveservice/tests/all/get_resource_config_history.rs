@@ -21,10 +21,9 @@
 //! through the same `MultiServiceRouter` the production router builds — reusing the
 //! `Emulator` harness `config_setup_and_rule_loop` defines. The resource's states are
 //! seeded through the store's own write path (`record_discovered_resource`, which the
-//! recording pass uses) the way this crate's other inventory suites seed one, because a
-//! resource key's `resourceType` is the modelled `ResourceType` enum of the types an
-//! Amazon Web Services service owns, which a recording pass discovers, while
-//! `PutResourceConfig` records CUSTOM resource types only.
+//! recording pass uses) the way this crate's other inventory suites seed one, because
+//! the rows pin members of a configuration item that no write operation takes — the
+//! account, the Region and the capture instant a recording pass captures.
 
 use std::time::{Duration, SystemTime};
 

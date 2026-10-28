@@ -24,9 +24,12 @@
 //! apart.
 //!
 //! The account-level Incident Manager precondition lives here too
-//! ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]): it is the
-//! same gate for every replication-set-scoped operation, so it is written once and
-//! consulted from each handler. The emulated account does NOT satisfy it to begin with
+//! ([`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`], and
+//! [`ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`] for a
+//! call that addresses a resource by ARN): it is the same gate for every
+//! replication-set-scoped operation, so it is written once and consulted from each handler,
+//! with [`closed_gate_message`] the one place its wording is decided. The emulated account
+//! does NOT satisfy it to begin with
 //! ([`ComAmazonawsSsmcontactsSsmcontactsState::default`]): the account holds a replication
 //! set only once Incident Manager minted one for it, and Incident Manager's own registry of
 //! sets starts empty, so every gated operation is refused until something puts a set in
@@ -455,20 +458,42 @@ impl ComAmazonawsSsmcontactsSsmcontactsState {
     }
 
     /// `Ok(())` when this account may reach the contact data plane at all, else the message
-    /// the refusal carries.
+    /// the refusal carries — the ACCOUNT-worded one
+    /// ([`crate::state::ACCOUNT_NOT_FOUND_MESSAGE`]), which is what a call that names no
+    /// resource (a create, a listing of the whole account) is refused with, and also what a
+    /// call naming a contact, a contact channel or a page is refused with, since those are
+    /// not the families the refusal is worded from
+    /// ([`account_gate::closed_gate_message`]).
     ///
     /// The precondition is ACCOUNT level, so a handler evaluates it BEFORE looking the
     /// named resource up: an account with no active replication set is refused whether or
-    /// not the resource it named exists. For the same reason the refusal reports the
-    /// ACCOUNT and no member of the request — there is ONE wording for this failure, shared
-    /// by every gated operation, and nothing of the request appears in it. The caller
-    /// renders the `Err` as the modelled `ValidationException` (HTTP 400) its own operation
-    /// declares.
+    /// not the resource it named exists. The caller renders the `Err` as the modelled
+    /// `ValidationException` (HTTP 400) its own operation declares.
     pub fn require_active_replication_set(&self) -> Result<(), String> {
+        self.require_open_gate(None)
+    }
+
+    /// [`require_active_replication_set`](Self::require_active_replication_set) for a call
+    /// that may address a resource Incident Manager reaches THROUGH the replication set —
+    /// a rotation or an engagement, and any `ResourceARN` that may name one.
+    ///
+    /// `subject_arn` is the ARN the request carried, passed on untouched;
+    /// [`account_gate::closed_gate_message`] decides from its resource family which wording
+    /// the refusal carries, so the choice is made once, from the ARN itself, rather than per
+    /// operation. A handler whose subject can only be of an account-worded family calls
+    /// [`require_active_replication_set`](Self::require_active_replication_set) instead and
+    /// gets the same answer with nothing to decide.
+    pub fn require_active_replication_set_for(&self, subject_arn: &str) -> Result<(), String> {
+        self.require_open_gate(Some(subject_arn))
+    }
+
+    /// The gate itself: open only while the account holds an ACTIVE set, and worded from the
+    /// subject ARN the call named, when it named one.
+    fn require_open_gate(&self, subject_arn: Option<&str>) -> Result<(), String> {
         if self.active_replication_set().is_some() {
             return Ok(());
         }
-        Err(ACCOUNT_NOT_FOUND_MESSAGE.to_string())
+        Err(closed_gate_message(subject_arn))
     }
 
     /// The overrides of the rotation `rotation_arn` names, in creation order.
@@ -1486,26 +1511,13 @@ pub fn instant(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
 // Shared validation
 // ---------------------------------------------------------------------------
 
-/// The message the contact data plane refuses a request from an account with no active
-/// Incident Manager replication set with.
-///
-/// HTTP 400 with the error code `ValidationException` (never a 404) and this wording are
-/// all part of the refusal: AWS words this failure class as the ACCOUNT not being found for
-/// the request, so every gated operation answers it with this one text. It names the
-/// account rather than any member of the request, because no member is at fault, and it
-/// carries no value taken from the request or from one run.
-pub const ACCOUNT_NOT_FOUND_MESSAGE: &str =
-    "Invalid value provided - Account not found for the request";
+/// WHAT the closed account gate says, which is one decision for the whole gated surface and
+/// so lives in its own module rather than inline here: see [`account_gate`].
+pub mod account_gate;
 
-/// The message an operation refuses an ARN with when that ARN names no resource of this
-/// service: it cannot be parsed into a resource identity at all.
-///
-/// Built from the request, so the ARN it names is the one the caller supplied. This is the
-/// ARN-RESOLUTION refusal, a different failure from the account-level precondition
-/// ([`ACCOUNT_NOT_FOUND_MESSAGE`]), which reports the account and names no member.
-pub fn invalid_resource_arn_message(arn: &str) -> String {
-    format!("Invalid value provided - Invalid resource Arn {arn}")
-}
+pub use account_gate::{
+    closed_gate_message, invalid_resource_arn_message, ACCOUNT_NOT_FOUND_MESSAGE,
+};
 
 /// The message a plan is refused with when one of its lists is longer than the resolver
 /// walks: it names the member, the length the request carried and the ceiling.

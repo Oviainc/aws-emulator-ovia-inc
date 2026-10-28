@@ -57,3 +57,5 @@ mod state_roundtrip;
 mod studio_session_mapping_listing;
 #[path = "all/supported_instance_types.rs"]
 mod supported_instance_types;
+#[path = "all/tag_character_class.rs"]
+mod tag_character_class;

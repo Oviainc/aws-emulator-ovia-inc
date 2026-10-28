@@ -17,10 +17,11 @@
 //! replication-set-scoped resource is refused with the modelled `ValidationException`
 //! (HTTP 400) BEFORE the resource is looked up — so an un-onboarded account is never told
 //! instead that the resource it named does not exist. The gate is the service-wide one,
-//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`],
-//! which reports the ACCOUNT whose registry entry is missing and names no part of the
-//! request, so every data-plane operation applies the same precondition in the same
-//! order and words it the same way as its peers.
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`],
+//! which this operation hands its `RotationId`: a rotation is addressed THROUGH the
+//! account's replication set, so with no set that ARN resolves to nothing and the refusal
+//! reports it as unresolvable. Every data-plane operation applies the same precondition in
+//! the same order, worded from the ARN it named by that one helper.
 //!
 //! ## Shape of an operation
 //!
@@ -183,12 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // The account gate comes FIRST: it is evaluated before `RotationId` is resolved, so
-        // a non-onboarded account is refused identically whether or not its rotation exists,
-        // and with the account-level refusal every gated operation of this service answers
-        // it with — what is missing is the account's own registry entry rather than anything
-        // the request named.
+        // a non-onboarded account is refused identically whether or not its rotation exists.
+        // The gate is given the `RotationId` the request named, because a rotation is
+        // reachable only through the account's replication set: with no set there is nothing
+        // that ARN could name, which is what the caller is told.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.rotation_id)
             .map_err(account_precondition_failed)?;
 
         let Some(rotation) = state.rotations.get(&input.rotation_id) else {
@@ -227,8 +228,9 @@ const ROTATION_RESOURCE_TYPE: &str = "rotation";
 ///
 /// `reason` carries `OTHER` because the failure is not a member-level one, and `OTHER` is
 /// the modelled `ValidationExceptionReason` value for that; `fields` is present but EMPTY
-/// for the same reason — no field of the request is at fault. This is the wording and shape
-/// every gated operation in this service answers.
+/// for the same reason — nothing about the request's own shape is at fault. This is the
+/// shape every gated operation in this service answers, carrying the `message` the shared
+/// gate worded.
 fn account_precondition_failed(message: String) -> GetRotationError {
     GetRotationErrorModeled::ValidationException(ValidationException {
         message,

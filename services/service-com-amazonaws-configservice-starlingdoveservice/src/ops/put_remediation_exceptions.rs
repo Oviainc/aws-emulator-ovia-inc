@@ -7,14 +7,15 @@
 //! updates an existing exception for a specified resource with a specified Config
 //! rule").
 //!
-//! The rules this handler applies: one exception per rule and resource, so a second
-//! write for the same pair REVISES the one the rule holds (its explanation and the
-//! instant it falls due for deletion) rather than adding another; a resource the rule's
-//! own verdict places as COMPLIANT or NOT_APPLICABLE gets NO exception ("Placing an
-//! exception can only be performed on resources that are NON_COMPLIANT") and comes back
-//! in `FailedBatches`, as does every resource named under a rule this account does not
-//! hold, which has no remediation to except them from; and a key naming no resource is
-//! refused 400 `InvalidParameterValueException`.
+//! The rules this handler applies: a rule the account holds no remediation
+//! configuration for has no remediation to except a resource from, so the whole request
+//! is refused 400 `InvalidParameterValueException`; one exception per rule and resource,
+//! so a second write for the same pair REVISES the one the rule holds (its explanation
+//! and the instant it falls due for deletion) rather than adding another; a resource the
+//! rule's own verdict places as COMPLIANT or NOT_APPLICABLE gets NO exception ("Placing
+//! an exception can only be performed on resources that are NON_COMPLIANT") and comes
+//! back in `FailedBatches`; and a key naming no resource is refused 400
+//! `InvalidParameterValueException`.
 //!
 //! ## Shape of an operation
 //!
@@ -255,17 +256,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised before this request decides what the rule holds.
         store.expire_remediation_exceptions(now);
 
+        // An exception exempts a resource from the remediation ONE rule's remediation
+        // configuration would run, so a rule with no remediation configuration has no
+        // remediation to exempt a resource from: the whole request is refused, because
+        // nothing about any one key could have made it succeed. This covers a rule the
+        // account does not hold at all — it holds no remediation configuration either.
+        if !store
+            .remediation_configurations
+            .contains_key(&input.config_rule_name)
+        {
+            return Err(
+                PutRemediationExceptionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(no_remediation_configuration_message(
+                            &input.config_rule_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Which resources the rule's own verdicts already place outside auto-remediation:
         // one it evaluated as COMPLIANT, or as NOT_APPLICABLE to it, gets no exception.
         // Read before anything is written, so the decision is about the state this call
         // arrived at.
         let rule = store.config_rules.get(&input.config_rule_name);
-        // An exception exempts a resource from ONE rule's remediation, so a rule this
-        // account does not hold has nothing to exempt a resource from: every key the
-        // request named comes back as failed, as the sibling writer of a rule's
-        // remediation configuration reports the same precondition. It is also what keeps
-        // the exceptions one account holds bounded by the rules it holds.
-        let unknown_rule = rule.is_none();
         let no_exception_for: ::std::collections::BTreeSet<(String, String)> = rule
             .map(|rule| {
                 rule.evaluation_results
@@ -297,11 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let identity = (entry.resource_type.clone(), entry.resource_id.clone());
 
-            let reason = if unknown_rule {
-                Some(crate::state::no_such_config_rule_message(
-                    &input.config_rule_name,
-                ))
-            } else if no_exception_for.contains(&identity) {
+            let reason = if no_exception_for.contains(&identity) {
                 Some(not_non_compliant_message(&input.config_rule_name))
             } else if !store.put_remediation_exception(entry.clone()) {
                 Some(exceptions_per_rule_message(&input.config_rule_name))
@@ -325,6 +337,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             failed_batches: Some(failed_batches),
         })
     }
+}
+
+/// How Config words the remediation-configuration precondition of this operation for the
+/// rule `config_rule_name`.
+///
+/// An exception exempts a resource from the remediation a rule's remediation
+/// configuration runs, so the rule must HAVE one. The sentence states that precondition
+/// and is BUILT FROM THE REQUEST: the rule the request named is its one variable part.
+fn no_remediation_configuration_message(config_rule_name: &str) -> String {
+    format!("No RemediationConfiguration found for {config_rule_name}")
 }
 
 /// The `FailureMessage` for a resource the rule's own verdict places as COMPLIANT or as

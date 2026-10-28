@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDelegationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDelegationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDelegationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers on the wire
+//!
+//! A mutation: it FILES a delegation request for the account — "creates an IAM delegation
+//! request for temporary access delegation" — minting the identifier every later
+//! operation on that request takes, storing the record `GetDelegationRequest` reports and
+//! `ListDelegationRequests` pages over, and answering that identifier beside the console
+//! page a customer acts on the request through.
+//!
+//! The model names the error SHAPES but not their codes or wording:
+//!
+//! * a member whose value has the wrong FORM for what its documentation says it names —
+//!   a notification channel that is not an SNS topic's ARN, a permission that names no
+//!   policy template — is a value IAM cannot accept, and `arnType` and
+//!   `notificationChannelType` bound only the length and the alphabet, so the form is
+//!   read here. IAM answers such a value `400` `<Code>ValidationError</Code>`
+//!   ([`crate::scaffolded::Scaffolded::validation_error`]), worded by the one place this
+//!   crate states a refused ARN: [`crate::state::ARN_UNPARSEABLE`] for a value that is no
+//!   ARN, [`crate::state::ARN_WRONG_RESOURCE_TYPE`] for one naming another resource.
+//! * a `RequestorWorkflowId` the account has already filed a request under "attempted to
+//!   create a resource that already exists", so it is `409`
+//!   `<Code>EntityAlreadyExists</Code>`: the member's own documentation states that "IAM
+//!   maintains a uniqueness check on this workflow id for each request - if a workflow id
+//!   for an existing request is passed, this API call will fail". No recording of AWS's
+//!   wording for that refusal is available, so the sentence is this emulator's own, built
+//!   around the workflow id the request carried.
+//! * a filing past the account's delegation-request quota
+//!   ([`crate::state::MAX_DELEGATION_REQUESTS_PER_ACCOUNT`]) "attempted to create
+//!   resources beyond the current Amazon Web Services account limits", so it is the
+//!   modelled `LimitExceededException` (`409`), whose "error message describes the limit
+//!   exceeded" — the bound that keeps repeated filings from growing the account's store
+//!   without end.
+//! * a caller whose identity-based policies do not permit the call is refused before
+//!   anything is minted, `403` `<Code>AccessDenied</Code>`
+//!   ([`crate::state::authorization::authorize`]), so nothing is stored for a call that
+//!   was not allowed.
+//!
+//! What the account CANNOT know is the content of the delegated permission policy:
+//! `DelegationPermission$PolicyTemplateArn` "maps to a pre-registered policy content for
+//! this partner", registered through the partner onboarding this operation's
+//! documentation points at rather than through any modelled API, so no template content
+//! reaches this emulator and the stored record carries the permission the request named
+//! with no `PermissionPolicy` resolved from it. The record says what was asked for; it
+//! does not invent what the template holds.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +161,78 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The ARN vendor field an SNS topic carries, which is what `NotificationChannel` must
+/// name: "at this time, only SNS topic ARNs are accepted for notification"
+/// (`CreateDelegationRequest$NotificationChannel`), so a value naming a resource of
+/// another service is no channel IAM can publish a delegation request's updates to.
+///
+/// `notificationChannelType` bounds only the length (2..400) and the alphabet
+/// (`^[a-zA-Z0-9:_.-]+$`) — both of which a topic NAME satisfies as well as a topic's ARN
+/// — so the ARN form itself is read here, through the tree's one reader of a
+/// caller-supplied ARN ([`::service_common::arn`]).
+const SNS_VENDOR: &str = "sns";
+
+/// The ARN vendor field an IAM policy template carries, which is what
+/// `Permissions.PolicyTemplateArn` must name: the ARN "maps to a pre-registered policy
+/// content for this partner" (`DelegationPermission$PolicyTemplateArn`) held by IAM
+/// itself, so an ARN of another service names no template to delegate.
+///
+/// `arnType` bounds only the length (20..2048), so the form is read here too. No resource
+/// TYPE is required beyond the vendor: AWS publishes none for a delegation policy
+/// template, so requiring one would refuse a form AWS may well mint.
+const IAM_VENDOR: &str = "iam";
+
+/// The `stateType` value of a delegation request no account is targeted by: `UNASSIGNED`.
+///
+/// `OwnerAccountId` is "the Amazon Web Services account ID this delegation request is
+/// targeted to. If the account ID is not known, this parameter can be omitted, resulting
+/// in a request that can be associated by any account", so a request filed without one is
+/// assigned to nobody — which is what this state, one of the seven
+/// `stateType` declares ([`super::types::STATE_TYPE_VALUES`]), says.
+const STATE_UNASSIGNED: &str = "UNASSIGNED";
+
+/// The `stateType` value of a delegation request that IS targeted at an account:
+/// `ASSIGNED`.
+///
+/// "If the account ID passed, then the created delegation request can only be associated
+/// with an identity of that target account" (`CreateDelegationRequest$OwnerAccountId`) —
+/// the request is assigned to that account, and what is still missing is the identity
+/// within it that owns the request, which `GetDelegationRequest` describes as the case
+/// where "the owner account is assigned but there is no owner id". See
+/// [`STATE_UNASSIGNED`].
+const STATE_ASSIGNED: &str = "ASSIGNED";
+
+/// Why `value` is not the ARN of the SNS TOPIC `NotificationChannel` must name (see
+/// [`SNS_VENDOR`]), or `None` when it is one.
+///
+/// A topic's ARN is `arn:<partition>:sns:<region>:<account>:<topic name>`: the resource
+/// field is the topic name alone, so a value carrying a further `:` or `/` segment names
+/// something else in the SNS namespace (a subscription is `<topic name>:<id>`) rather
+/// than a topic to publish to.
+fn notification_channel_refusal(value: &str) -> Option<&'static str> {
+    if ::service_common::arn::parse(value).is_none() {
+        return Some(crate::state::ARN_UNPARSEABLE);
+    }
+    let names_a_topic = ::service_common::arn::parse_of(value, SNS_VENDOR)
+        .is_some_and(|arn| !arn.resource.contains([':', '/']));
+    (!names_a_topic).then_some(crate::state::ARN_WRONG_RESOURCE_TYPE)
+}
+
+/// Why `value` is not the ARN of the IAM policy template `Permissions.PolicyTemplateArn`
+/// must name (see [`IAM_VENDOR`]), or `None` when it is one.
+///
+/// A permission that supplies NO template ARN at all supplies no ARN to read, so it is
+/// refused exactly as a value that cannot be read as one: either way the permission names
+/// no pre-registered policy content, which is what it has to name to delegate anything.
+fn policy_template_refusal(value: Option<&str>) -> Option<&'static str> {
+    let Some(value) = value.filter(|value| ::service_common::arn::parse(value).is_some()) else {
+        return Some(crate::state::ARN_UNPARSEABLE);
+    };
+    ::service_common::arn::parse_of(value, IAM_VENDOR)
+        .is_none()
+        .then_some(crate::state::ARN_WRONG_RESOURCE_TYPE)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -198,18 +305,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDelegationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDelegationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDelegationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDelegationRequestErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every modelled constraint has already been taken against this request, so what
+        // is left to read is the FORM each value's own documentation states — which the
+        // model expresses as prose rather than as a constraint, and which is decided
+        // before the store is touched at all, so a request IAM cannot accept files
+        // nothing.
+        if let Some(refusal) = notification_channel_refusal(&input.notification_channel) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
+        // "The permissions to be delegated in this delegation request" are the
+        // pre-registered policy content the template ARN maps to, so a permission naming
+        // no template delegates nothing and is not a permission at all.
+        if let Some(refusal) =
+            policy_template_refusal(input.permissions.policy_template_arn.as_deref())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
+
+        // A mutation: the operation "creates an IAM delegation request", so the lock is
+        // held for write across the uniqueness check, the minting and the insert.
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is minted. The resource the decision is made on is
+        // the account's delegation-request collection — the request being filed has no
+        // identifier yet, because IAM mints it rather than taking it from the caller, so
+        // the ARN the decision is made against is the one every request in that
+        // collection is named under, exactly as `ListDelegationRequests` decides.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_DELEGATION_REQUEST,
+            &crate::state::delegation_request_arn(""),
+        )?;
+
+        // "IAM maintains a uniqueness check on this workflow id for each request - if a
+        // workflow id for an existing request is passed, this API call will fail"
+        // (`CreateDelegationRequest$RequestorWorkflowId`): the second request under one
+        // partner-side workflow id is a resource that already exists, and nothing is
+        // filed for it.
+        if store
+            .delegation_request_workflow_ids
+            .contains_key(&input.requestor_workflow_id)
+        {
+            return Err(
+                CreateDelegationRequestErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!(
+                            "Delegation request with requestor workflow id {} already \
+                             exists.",
+                            input.requestor_workflow_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An account holds a bounded number of delegation requests, so a caller cannot
+        // grow the account without limit by filing one request after another; past the
+        // quota IAM refuses the filing, and nothing is minted or stored for it.
+        if store.delegation_requests.len() >= crate::state::MAX_DELEGATION_REQUESTS_PER_ACCOUNT {
+            return Err(CreateDelegationRequestErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for DelegationRequestsPerAccount: {}",
+                        crate::state::MAX_DELEGATION_REQUESTS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let delegation_request_id = store.next_delegation_request_id();
+        let created = crate::state::now();
+        let filed = DelegationRequest {
+            delegation_request_id: Some(delegation_request_id.clone()),
+            // Every member the request carried, held as it carried it, so the read that
+            // follows reports what was filed.
+            owner_account_id: input.owner_account_id.clone(),
+            description: Some(input.description),
+            request_message: input.request_message,
+            permissions: Some(input.permissions),
+            // The template's content is registered through partner onboarding and reaches
+            // no API, so nothing here has resolved a document for it (see this module's
+            // header); the member a resolved one would be reported through stays empty
+            // rather than carrying a policy nobody wrote.
+            permission_policy: None,
+            // "If the PermissionPolicy includes role creation permissions, this element
+            // will include the list of permissions boundary policies associated with the
+            // role creation" — there is no resolved policy to include any, so there are
+            // no boundaries to report.
+            role_permission_restriction_arns: None,
+            // "ARN of the owner of this delegation request": a request is filed by the
+            // partner and owned by an identity that associates itself with it afterwards,
+            // which `AssociateDelegationRequest` is what does, so a request this call
+            // files is owned by nobody — the state `GetDelegationRequest` describes as a
+            // request that "has no owner or owner account".
+            owner_id: None,
+            approver_id: None,
+            state: Some(
+                if input.owner_account_id.is_some() {
+                    STATE_ASSIGNED
+                } else {
+                    STATE_UNASSIGNED
+                }
+                .to_string(),
+            ),
+            expiration_time: Some(::aws_smithy_types::DateTime::from_secs(
+                created.secs() + crate::state::DELEGATION_REQUEST_LIFETIME_SECONDS,
+            )),
+            // "Identity of the requestor of this delegation request. This will be an
+            // Amazon Web Services account ID" — the account the call was made in, which
+            // is the one account this emulator serves.
+            requestor_id: Some(::engine::emulator_account_id().to_string()),
+            // "A friendly name of the requestor": nothing in the request names one, and a
+            // partner's friendly name is not an IAM entity name this account holds, so
+            // none is reported.
+            requestor_name: None,
+            create_date: Some(created),
+            session_duration: Some(input.session_duration),
+            redirect_url: input.redirect_url,
+            // Notes and a rejection reason are what `UpdateDelegationRequest` and
+            // `RejectDelegationRequest` add to a request later; a request just filed
+            // carries neither.
+            notes: None,
+            rejection_reason: None,
+            only_send_by_owner: input.only_send_by_owner,
+            // "Last updated timestamp of the request": the instant this record was
+            // written, which for a request just filed is the instant it was created.
+            updated_time: Some(created),
+        };
+
+        store
+            .delegation_requests
+            .insert(delegation_request_id.clone(), filed);
+        store.delegation_request_workflow_ids.insert(
+            input.requestor_workflow_id.clone(),
+            delegation_request_id.clone(),
+        );
+        // Audit record for the change: the acting principal, the operation and what it
+        // created, so a state-changing call leaves a local record. The description, the
+        // message and the notification channel the request carried are not logged.
+        ::tracing::info!(
+            audit = true,
+            operation = "CreateDelegationRequest",
+            outcome = "created",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            delegation_request_id = %delegation_request_id,
+            requestor_workflow_id = %input.requestor_workflow_id,
+            "a delegation request was filed"
+        );
+
+        Ok(CreateDelegationRequestOutput {
+            // "A deep link URL to the Amazon Web Services Management Console for managing
+            // the delegation request": the console page for the request just filed, built
+            // from its identifier.
+            console_deep_link: Some(crate::state::delegation_request_console_link(
+                &delegation_request_id,
+            )),
+            // "The unique identifier for the created delegation request", which is the
+            // key the record was filed under and the handle every later read takes.
+            delegation_request_id: Some(delegation_request_id),
+        })
     }
 }

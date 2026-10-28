@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCheckSummaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCheckSummaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! This operation reports the Trusted Advisor checks of ONE best practice of ONE lens
+//! review of ONE workload SUMMARIZED over the accounts the workload relates to: one entry
+//! per check, carrying how many of those accounts carry each `CheckStatus` and the one
+//! status the check carries for the workload.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCheckSummaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `ListCheckSummaries::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! It is a REPORTING operation — it resolves the workload, the lens review and the best
+//! practice the request names, reads the checks this emulator publishes for that best
+//! practice and the accounts the workload covers, and writes nothing. The per-ACCOUNT view
+//! of the same checks is `ListCheckDetails`, which this shares its resolution, its
+//! association table and its result derivation with.
 //!
 //! ## Reaching this service's state
 //!
@@ -156,18 +150,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCheckSummaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCheckSummariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCheckSummariesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default. One helper restates that
+        // bound for every paginated operation of this service.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_check_summary_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => return Err(invalid_next_token()),
+            },
+        };
+
+        let store = state.lock();
+        let workload = store.workloads.get(&input.workload_id).ok_or_else(|| {
+            ListCheckSummariesErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+        })?;
+
+        // A check is associated to a lens (`CheckSummary$LensArn`) and that association is
+        // read through the workload's review of it, so a lens the workload does not carry
+        // has no review whose best practices could be checked.
+        if !workload.reviews_lens(&input.lens_arn) {
+            return Err(ListCheckSummariesErrorModeled::ResourceNotFoundException(
+                crate::state::lens_review_not_found(&input.workload_id, &input.lens_arn),
+            )
+            .into());
+        }
+
+        // `PillarId`, `QuestionId` and `ChoiceId` name ONE best practice OF THAT LENS, so
+        // each is judged against the lens's own content, outermost first: the pillar the
+        // lens defines, the question that pillar asks and the choice that question offers.
+        // They are values of the request rather than resources of their own — the resources
+        // this read resolves are the workload and its lens review above — so a value the
+        // lens's content does not define is refused as a field validation, the same rule
+        // every operation that takes a pillar or a question of a lens review applies.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCheckSummaries"))
+        // The content comes from the whole lens catalog, for the version this workload's
+        // review of the lens is against, so a pillar and a question of a CUSTOM lens are
+        // judged against the document that version published exactly as an official lens's
+        // are against its catalog row.
+        let pinned = workload.lens_review_version(&input.lens_arn);
+        let content = store.lens_content_at(&input.lens_arn, pinned);
+        if let Some(exception) = crate::state::undefined_pillar_refusal(
+            crate::state::PILLAR_ID_MEMBER,
+            &input.lens_arn,
+            &content,
+            std::iter::once(input.pillar_id.as_str()),
+        ) {
+            return Err(ListCheckSummariesErrorModeled::ValidationException(exception).into());
+        }
+        if let Some(exception) = crate::state::undefined_pillar_question_refusal(
+            crate::state::QUESTION_ID_MEMBER,
+            &input.lens_arn,
+            &input.pillar_id,
+            &content,
+            std::iter::once(input.question_id.as_str()),
+        ) {
+            return Err(ListCheckSummariesErrorModeled::ValidationException(exception).into());
+        }
+
+        // The question as the LENS asks it, which is where its choice catalog — the only
+        // place a client discovers the `ChoiceId`s this request names — comes from. A lens
+        // this emulator holds no content for asks nothing, so the two refusals above took
+        // the request's identifiers as given and there is no question to resolve: such a
+        // lens has no checked best practice either, so the answer is an empty page.
+        let question = store.lens_review_question(&input.lens_arn, pinned, &input.question_id);
+        if let Some(question) = question.as_ref() {
+            if let Some(exception) = crate::state::undefined_choice_member_refusal(
+                crate::state::CHOICE_ID_MEMBER,
+                question,
+                std::iter::once(input.choice_id.as_str()),
+            ) {
+                return Err(ListCheckSummariesErrorModeled::ValidationException(exception).into());
+            }
+        }
+
+        // The checks of the best practice, in the catalog's order. A summary covers every
+        // account the workload relates to in ONE entry, so — unlike the per-account detail
+        // view — the enumeration is the checks themselves.
+        //
+        // A workload whose Trusted Advisor integration is not activated has none of them
+        // fetched, so it reports no check at all until a caller activates it.
+        let checks = question
+            .as_ref()
+            .filter(|_| workload.trusted_advisor_integration_enabled())
+            .map(|question| {
+                crate::state::checks_for_best_practice(&input.lens_arn, question, &input.choice_id)
+            })
+            .unwrap_or_default();
+        let lens_arn =
+            store.lens_arn_of(&input.lens_arn, &crate::state::request_region(ctx.parts()));
+
+        // What one check reports depends only on which accounts the workload relates to and
+        // which of them owns it, so the summary is taken once for the whole page.
+        let summary =
+            crate::state::check_account_summary(&workload.check_account_ids(), &workload.owner);
+
+        // The cursor is start-EXCLUSIVE and names the check last served; a check this
+        // enumeration does not hold is not a cursor it issued, so it is as undecodable as a
+        // malformed token.
+        let start = match resume_after {
+            None => 0,
+            Some(check_id) => match checks.iter().position(|check| check.id == check_id) {
+                Some(position) => position.saturating_add(1),
+                None => return Err(invalid_next_token()),
+            },
+        };
+        let remaining = &checks[start.min(checks.len())..];
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = match page.last() {
+            Some(check) if remaining.len() > page.len() => {
+                Some(crate::state::encode_check_summary_next_token(check.id))
+            }
+            _ => None,
+        };
+
+        Ok(ListCheckSummariesOutput {
+            check_summaries: Some(
+                page.iter()
+                    .map(|check| {
+                        check_summary(
+                            check,
+                            summary.as_ref(),
+                            &lens_arn,
+                            &input.pillar_id,
+                            &input.question_id,
+                            &input.choice_id,
+                        )
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The `CheckSummary` of ONE check: the check as this emulator publishes it
+/// ([`crate::state::TrustedAdvisorCheck`]), the best practice it is associated to, and what
+/// that check reports across the accounts related to the workload
+/// ([`crate::state::check_account_summary`]).
+///
+/// `UpdatedAt` is "the date and time when the check summary was last updated", which
+/// describes a check RESULT, and the statuses this emulator can report are the two that say
+/// there is no result for an account — so it is not reported rather than being filled with
+/// an instant nothing produced.
+fn check_summary(
+    check: &crate::state::TrustedAdvisorCheck,
+    summary: Option<&crate::state::CheckAccountSummary>,
+    lens_arn: &str,
+    pillar_id: &str,
+    question_id: &str,
+    choice_id: &str,
+) -> CheckSummary {
+    CheckSummary {
+        id: Some(check.id.to_string()),
+        name: Some(check.name.to_string()),
+        description: Some(check.description.to_string()),
+        provider: Some(crate::state::CHECK_PROVIDER_TRUSTED_ADVISOR.to_string()),
+        lens_arn: Some(lens_arn.to_string()),
+        pillar_id: Some(pillar_id.to_string()),
+        question_id: Some(question_id.to_string()),
+        choice_id: Some(choice_id.to_string()),
+        status: summary.map(|summary| summary.status.to_string()),
+        account_summary: summary.map(|summary| summary.accounts_by_status.clone()),
+        updated_at: None,
+    }
+}
+
+/// What a `NextToken` this service did not issue is answered with. The token is this
+/// service's own opaque cursor, so the only thing a caller can do is start the
+/// pagination again — which is what `CANNOT_PARSE` tells it.
+fn invalid_next_token() -> ListCheckSummariesError {
+    ListCheckSummariesErrorModeled::ValidationException(crate::state::cannot_parse_exception(
+        crate::state::NEXT_TOKEN_MEMBER,
+        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+    ))
+    .into()
 }

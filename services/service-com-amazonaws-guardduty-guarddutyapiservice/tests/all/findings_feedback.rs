@@ -14,9 +14,11 @@
 //!    later submission REPLACES it, so a read reports the latest value.
 //! 2. `Comments` is accepted in any text form the member allows and is reported by no
 //!    read: the member is `@sensitive` and the `Service` shape has no member for it.
-//! 3. Recording feedback changes nothing else about the finding — not its
-//!    `UpdatedAt`/`EventLastSeen` (the activity clock), not its archived flag, not the
-//!    findings the request did not name.
+//! 3. Recording feedback changes nothing else about the finding — not its `CreatedAt`,
+//!    not `Service.EventLastSeen` (the activity's clock), not its archived flag, not
+//!    the findings the request did not name. The finding's OWN clock, `UpdatedAt`,
+//!    does move for each finding the write changes; the suite in
+//!    [`super::finding_record_update_clock`] owns that rule.
 //! 4. A `findingIds` entry the detector does not hold is not an error and writes
 //!    nothing, the same reading of an unheld finding id that `GetFindings` takes.
 //! 5. A detector id this account and Region do not hold is refused with HTTP 400 under
@@ -212,9 +214,17 @@ async fn submitted_feedback_round_trips_for_every_value_and_comment_form() {
                 }
             }
 
-            // Rule 3: feedback is not an observation of the activity, so the
-            // finding's clocks and its archived flag do not move.
-            for member in ["createdAt", "updatedAt", "severity", "type", "arn"] {
+            // Rule 3: feedback is a change to the RECORD, so the record's own clock
+            // moves (see `super::finding_record_update_clock`) while the activity's
+            // clocks and the archived flag do not. The timestamps are fixed-width
+            // ISO-8601 text, so text order is time order.
+            assert!(
+                after["updatedAt"].as_str() > before["updatedAt"].as_str(),
+                "case {case:?}: recording feedback must move updatedAt, got {:?} (was {:?})",
+                after["updatedAt"],
+                before["updatedAt"]
+            );
+            for member in ["createdAt", "severity", "type", "arn"] {
                 assert_eq!(
                     after[member], before[member],
                     "case {case:?}: {member} must not change when feedback is recorded, got {:?} (was {:?})",

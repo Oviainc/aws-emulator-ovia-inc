@@ -146,8 +146,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Request metadata only; the store is reached through `self.engine`.
-        let _ = ctx;
+        // A virtual machine is REGIONAL — its ARN carries the region of the hypervisor
+        // whose inventory discovered it — so, exactly as for every other listing of this
+        // service, the region the listing request was addressed to is what decides which
+        // records are part of it: one store serves every region a client addresses.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListVirtualMachinesErrorModeled::InternalServerException(InternalServerException {
@@ -198,6 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the machines it discovered at the instant it falls due, so the listing is a
         // function of the records and the current time and this read moves nothing.
         let page = state.lock().page_of_virtual_machines(
+            &region,
             input.hypervisor_arn.as_deref(),
             after.as_deref(),
             limit,

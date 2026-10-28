@@ -102,9 +102,9 @@ async fn summary(
 /// store, answering the ARN that names it.
 ///
 /// This is the state a `CreateDelegationRequest` ("creates an IAM delegation request
-/// for temporary access delegation") will write once that operation is implemented —
-/// it is still a scaffolded 501 with its own stub issue — so the request is written
-/// into the service's own store rather than into a second copy of it.
+/// for temporary access delegation") writes — seeded directly here so a row can fix
+/// the identifier it reads back under, so the request is written into the service's
+/// own store rather than into a second copy of it.
 fn seed_delegation_request(engine: &engine::InMemoryEngine, delegation_request_id: &str) -> String {
     let store = state::service_state(engine).expect("the IAM store");
     store.lock().delegation_requests.insert(

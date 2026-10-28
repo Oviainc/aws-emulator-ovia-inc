@@ -176,16 +176,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_MEDICAL_VOCABULARY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Record the custom medical vocabulary this request describes.
+    /// Record the custom medical vocabulary this request describes, built from the
+    /// table file it names.
     ///
     /// A medical vocabulary's terms can only come from the table file at
     /// `VocabularyFileUri`, which this operation models `@required` and for which it
     /// publishes no inline alternative ("CreateMedicalVocabulary does not support the
-    /// Phrases flag and only accepts vocabularies in table format"). Reading that
-    /// file is work this emulator cannot perform, so the resource is recorded — the
-    /// control plane is real — and the build it cannot run ends in the service's own
-    /// modelled failure state: `PENDING` here, then `FAILED` with a `FailureReason`
-    /// once the clock makes the transition due (see
+    /// Phrases flag and only accepts vocabularies in table format"). That file is an
+    /// Amazon S3 object the caller uploaded before calling, and this emulator holds an
+    /// Amazon S3 of its own, so the build READS it in process
+    /// ([`crate::state::resolve_vocabulary_file`]): a file the object store serves
+    /// settles the vocabulary `READY` once the clock makes its build due, with those
+    /// terms stored at the location `GetMedicalVocabulary` reports as the
+    /// `DownloadUri`, and only a file the store does not serve ends the build in the
+    /// service's own modelled `FAILED` state with a grounded `FailureReason` (see
     /// [`crate::state::MedicalVocabularyRecord`]).
     async fn handle(
         &self,
@@ -226,89 +230,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-
-        // "must be unique within an Amazon Web Services account. If you try to create
-        // a new custom medical vocabulary with the same name as an existing custom
-        // medical vocabulary, you get a ConflictException error." Checked and
-        // inserted under one lock, so N concurrent creates of one name have exactly
-        // one winner. The name is unique within THIS family and within ONE Region: a
-        // medical vocabulary and a custom vocabulary are two resource types, each with
-        // its own ARN, and a regional endpoint serves only its own Region's resources.
-        if store
-            .medical_vocabularies
-            .contains(&region, &input.vocabulary_name)
-        {
-            return Err(CreateMedicalVocabularyErrorModeled::ConflictException(
-                ConflictException {
-                    // As `CreateVocabulary`: the kind, not the caller's name.
-                    message: Some(crate::state::name_already_exists_message(
-                        crate::state::KIND_MEDICAL_VOCABULARY,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        if store.medical_vocabularies.len_in(&region) >= crate::state::MAX_VOCABULARIES {
-            return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "You have reached the limit of {} custom medical vocabularies \
-                         for this account. Delete a custom medical vocabulary you no \
-                         longer need and try your request again.",
-                        crate::state::MAX_VOCABULARIES
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // The Region comes from the request's own (unauthenticated) credential scope,
-        // so the per-Region quota above bounds the store only together with a cap on how
-        // many Regions it keeps medical vocabularies for (see
-        // [`crate::state::MAX_REGIONS`]).
-        if store.medical_vocabularies.region_bucket_exhausted(&region) {
-            return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(crate::state::region_capacity_message(
-                        crate::state::FAMILY_MEDICAL_VOCABULARIES,
-                        &region,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        let sequence = store.next_sequence();
-        let record = crate::state::MedicalVocabularyRecord::pending(
-            input.vocabulary_name.clone(),
-            sequence,
-            input.language_code,
-            input.vocabulary_file_uri,
-            region.clone(),
-            input.tags.unwrap_or_default(),
-            now,
-        );
-
-        // The response is the record just stored, never the request echoed back.
-        let output = CreateMedicalVocabularyOutput {
-            vocabulary_name: Some(record.name.clone()),
-            language_code: Some(record.language_code.clone()),
-            vocabulary_state: Some(record.state.clone()),
-            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
-            failure_reason: record.failure_reason.clone(),
+        // The table file is read before the record is stored, which is when the
+        // service's own build reads it; what it established decides the state the
+        // clock-owed build settles in.
+        let verdict = crate::state::resolve_vocabulary_file(
+            ctx,
+            &region,
+            crate::state::VOCABULARY_FILE_MEMBER,
+            &input.vocabulary_file_uri,
+        )
+        .await;
+        let (terms, failure_due) = match verdict.into_build() {
+            Ok(build) => build,
+            Err(bytes) => {
+                return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::vocabulary_file_too_large_message(
+                            crate::state::VOCABULARY_FILE_MEMBER,
+                            &input.vocabulary_file_uri,
+                            bytes,
+                            crate::state::KIND_MEDICAL_VOCABULARY,
+                        )),
+                    },
+                )
+                .into())
+            }
         };
-        ::tracing::info!(
-            operation = "CreateMedicalVocabulary",
-            vocabulary = %record.name,
-            state = %record.state,
-            "custom medical vocabulary recorded; its file is not read"
-        );
-        let name = record.name.clone();
-        store.medical_vocabularies.insert(&region, &name, record);
+
+        let now = ::std::time::SystemTime::now();
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the write of the file the vocabulary's `DownloadUri` names, which is a call
+        // out to another emulated service and reaches none of this state.
+        let (output, name, content) = {
+            let mut store = state.lock();
+
+            // "must be unique within an Amazon Web Services account. If you try to create
+            // a new custom medical vocabulary with the same name as an existing custom
+            // medical vocabulary, you get a ConflictException error." Checked and
+            // inserted under one lock, so N concurrent creates of one name have exactly
+            // one winner. The name is unique within THIS family and within ONE Region: a
+            // medical vocabulary and a custom vocabulary are two resource types, each with
+            // its own ARN, and a regional endpoint serves only its own Region's resources.
+            if store
+                .medical_vocabularies
+                .contains(&region, &input.vocabulary_name)
+            {
+                return Err(CreateMedicalVocabularyErrorModeled::ConflictException(
+                    ConflictException {
+                        // As `CreateVocabulary`: the kind, not the caller's name.
+                        message: Some(crate::state::name_already_exists_message(
+                            crate::state::KIND_MEDICAL_VOCABULARY,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            if store.medical_vocabularies.len_in(&region) >= crate::state::MAX_VOCABULARIES {
+                return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} custom medical vocabularies \
+                             for this account. Delete a custom medical vocabulary you no \
+                             longer need and try your request again.",
+                            crate::state::MAX_VOCABULARIES
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The Region comes from the request's own (unauthenticated) credential scope,
+            // so the per-Region quota above bounds the store only together with a cap on how
+            // many Regions it keeps medical vocabularies for (see
+            // [`crate::state::MAX_REGIONS`]).
+            if store.medical_vocabularies.region_bucket_exhausted(&region) {
+                return Err(CreateMedicalVocabularyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::region_capacity_message(
+                            crate::state::FAMILY_MEDICAL_VOCABULARIES,
+                            &region,
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            let sequence = store.next_sequence();
+            let record = crate::state::MedicalVocabularyRecord::pending(
+                input.vocabulary_name.clone(),
+                sequence,
+                input.language_code,
+                input.vocabulary_file_uri,
+                terms,
+                failure_due,
+                region.clone(),
+                input.tags.unwrap_or_default(),
+                now,
+            );
+
+            // The response is the record just stored, never the request echoed back.
+            let output = CreateMedicalVocabularyOutput {
+                vocabulary_name: Some(record.name.clone()),
+                language_code: Some(record.language_code.clone()),
+                vocabulary_state: Some(record.state.clone()),
+                last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+                failure_reason: record.failure_reason.clone(),
+            };
+            ::tracing::info!(
+                operation = "CreateMedicalVocabulary",
+                vocabulary = %record.name,
+                state = %record.state,
+                terms = record.terms.len(),
+                "custom medical vocabulary recorded"
+            );
+            let name = record.name.clone();
+            // The terms the build has to store, taken from the record rather than from
+            // the file that was read: what is served is what was persisted.
+            let content = record.terms.clone();
+            store.medical_vocabularies.insert(&region, &name, record);
+            (output, name, content)
+        };
+
+        // The terms this medical vocabulary was built from are stored as the text file
+        // its `DownloadUri` names, so a client that reads that location once the build
+        // is `READY` gets them back ("use this URI to view or download the custom
+        // medical vocabulary"). A build whose file the object store did not serve
+        // carries none, and nothing is built or served for it
+        // (`crate::state::store_vocabulary_content`).
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_MEDICAL_VOCABULARY,
+            &name,
+            &content,
+        )
+        .await;
 
         Ok(output)
     }

@@ -280,7 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // take it past the bound registers nothing.
         if registered >= crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER {
             return Err(limit_exceeded(format!(
-                "User {username} holds at most {} passkey credentials.",
+                "The limit for registered WebAuthn credentials is: {}.",
                 crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER
             )));
         }

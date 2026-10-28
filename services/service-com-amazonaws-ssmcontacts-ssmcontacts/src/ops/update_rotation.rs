@@ -173,11 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST: it is evaluated before `RotationId` is resolved and
         // before anything is written, so a non-onboarded account is refused identically
-        // whether or not its rotation exists. The refusal is the account-level one, exactly
-        // as `GetRotation` and `DeleteRotation` answer it: what is missing is the account's
-        // own registry entry, not anything the request named.
+        // whether or not its rotation exists. The gate is given the `RotationId` the request
+        // named, exactly as `GetRotation` and `DeleteRotation` give it theirs: a rotation is
+        // reachable only through the account's replication set, so with no set that ARN
+        // names nothing and the refusal reports it.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.rotation_id)
             .map_err(account_precondition_failed)?;
 
         // The request is checked whole before any of it is applied, so a refused update

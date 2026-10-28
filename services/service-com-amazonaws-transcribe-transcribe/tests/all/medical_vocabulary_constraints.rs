@@ -29,8 +29,8 @@
 //! by `crate::client_error_wire_status`), so a `LimitExceededException` whose
 //! modelled `httpError` is 429 is asserted here at 400 with its own error code.
 //!
-//! The lifecycle of an accepted medical vocabulary — `PENDING`, then the modelled
-//! `FAILED` the build this emulator cannot run ends in — is
+//! The lifecycle of an accepted medical vocabulary — `PENDING`, then the state its
+//! build settles in once the clock makes it due — is
 //! `crate::medical_vocabularies`' subject; these rows stop at "it was recorded and
 //! reads back". The quota row below fills the family (100 creates through the router,
 //! a second or so) because the refusal it asserts only exists at the boundary of a

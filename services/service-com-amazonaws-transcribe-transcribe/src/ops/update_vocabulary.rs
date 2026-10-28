@@ -209,20 +209,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
+
         // Same pair of alternatives as the create, and the same handling: "you can
         // either upload a text file … or you can include a list of terms directly in
-        // your request using the Phrases flag". Either is recorded; only the
-        // transition the rebuild owes differs (see
+        // your request using the Phrases flag". Either produces the terms the rebuild
+        // is built from; only what the read of a named file established differs (see
         // [`crate::state::VocabularyRecord::advance_clock`]).
-        let (phrases, file_uri) = match crate::state::content_source(
+        let (phrases, file_uri, failure_due) = match crate::state::content_source(
             input.phrases.as_deref(),
             input.vocabulary_file_uri.as_deref(),
         ) {
-            crate::state::ContentSource::Inline(phrases) => (phrases.to_vec(), None),
-            // Recorded, not read, exactly as on the create: this emulator reads no
-            // object store and makes no outbound request, so no terms are loaded and
-            // the rebuild ends in the modelled `FAILED` state.
-            crate::state::ContentSource::File(uri) => (Vec::new(), Some(uri.to_string())),
+            crate::state::ContentSource::Inline(phrases) => (phrases.to_vec(), None, None),
+            // READ before anything is written, exactly as on the create: the file is an
+            // object of this emulator's own Amazon S3
+            // (`crate::state::resolve_vocabulary_file`).
+            crate::state::ContentSource::File(uri) => {
+                let verdict = crate::state::resolve_vocabulary_file(
+                    ctx,
+                    &region,
+                    crate::state::VOCABULARY_FILE_MEMBER,
+                    uri,
+                )
+                .await;
+                match verdict.into_build() {
+                    Ok((terms, failure_due)) => (terms, Some(uri.to_string()), failure_due),
+                    Err(bytes) => {
+                        return Err(UpdateVocabularyErrorModeled::LimitExceededException(
+                            LimitExceededException {
+                                message: Some(crate::state::vocabulary_file_too_large_message(
+                                    crate::state::VOCABULARY_FILE_MEMBER,
+                                    uri,
+                                    bytes,
+                                    crate::state::KIND_VOCABULARY,
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
             crate::state::ContentSource::Neither => {
                 return Err(bad_request(
                     "Your request must include either Phrases or VocabularyFileUri. Add the \
@@ -250,7 +276,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         // The guard is SCOPED: the store lock is released before this handler awaits
         // the write of the file the vocabulary's `DownloadUri` names, which is a call
         // out to another emulated service and reaches none of this state.
@@ -295,6 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.file_uri = file_uri;
             record.state = crate::state::VOCABULARY_STATE_PENDING.to_string();
             record.failure_reason = None;
+            record.failure_due = failure_due;
             record.transition_due = Some(now + crate::state::VOCABULARY_TRANSITION_DELAY);
             record.last_modified_time = now;
             // The Region a resource lives in is fixed when it is created: it is part of
@@ -326,8 +352,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "This operation overwrites all existing information with your new values":
         // the file this vocabulary's `DownloadUri` names is rewritten from the terms
         // just recorded, so that location serves the vocabulary's CURRENT terms. A
-        // rebuild whose terms were to be read from a caller-named file has none, which
-        // withdraws the file the previous build left
+        // rebuild whose file the object store did not serve has none, which withdraws
+        // the file the previous build left
         // (`crate::state::store_vocabulary_content`).
         crate::state::store_vocabulary_content(
             ctx,

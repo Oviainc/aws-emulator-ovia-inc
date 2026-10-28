@@ -978,6 +978,17 @@ async fn a_user_holding_every_passkey_registers_no_more() {
         "case {case:?}: the error code, got {}",
         error_code(&payload)
     );
+    // The refusal names the bound that was reached, and nothing of the user who
+    // reached it.
+    assert_eq!(
+        error_message(&payload),
+        format!(
+            "The limit for registered WebAuthn credentials is: {}.",
+            state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER
+        ),
+        "case {case:?}: the message, got {}",
+        error_message(&payload)
+    );
     let stored = stored_credentials(&engine, &signed_in.user_pool_id, &signed_in.username);
     assert_eq!(
         stored.len(),

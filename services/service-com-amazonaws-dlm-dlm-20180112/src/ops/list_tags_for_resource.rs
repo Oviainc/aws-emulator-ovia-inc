@@ -148,14 +148,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let policy = store
-            .policy_id_for_arn(&region, &input.resource_arn)
-            .and_then(|policy_id| store.policy(&region, &policy_id));
-        let Some(policy) = policy else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::policy_not_found_by_arn(&input.resource_arn),
-            )
-            .into());
-        };
+            .policy_by_arn(&region, &input.resource_arn)
+            .map_err(ListTagsForResourceErrorModeled::ResourceNotFoundException)?;
 
         Ok(ListTagsForResourceOutput {
             tags: policy.wire_tags(),

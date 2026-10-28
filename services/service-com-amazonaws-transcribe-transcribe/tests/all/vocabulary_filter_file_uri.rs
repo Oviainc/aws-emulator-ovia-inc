@@ -16,8 +16,10 @@
 //! `smithy_query(query="operation", operation="GetVocabularyFilter")`), so the only
 //! difference the source makes is the service-managed `DownloadUri`: a filter this
 //! service built from the words a request listed has one, and a filter whose words
-//! would have had to be READ from a file does not — this emulator reads no object
-//! store and makes no outbound request, so nothing built a file for it.
+//! were to be READ from a file no object store served does not, since nothing loaded
+//! them. No Amazon S3 is mounted beside the service in this suite, so no file any row
+//! names is served; a filter built from one that IS served is
+//! `crate::vocabulary_file_objects`' subject.
 //!
 //! The refusals that remain — neither alternative, or both at once — are asserted
 //! here too, on the update as well as the create, so what changed is only the file
@@ -173,8 +175,8 @@ fn vocabulary_filter_arn(name: &str) -> String {
 
 /// A create that names a file is ACCEPTED and recorded: it answers 200 with the
 /// record it stored, that record reads back through `GetVocabularyFilter` with the
-/// same facts and no `DownloadUri` — nothing built a file for a filter whose words
-/// were never read — it is listed, it carries the create's own tags, and it deletes.
+/// same facts and no `DownloadUri` — nothing built a file for a filter whose words no
+/// object store served — it is listed, it carries the create's own tags, and it deletes.
 #[tokio::test]
 async fn a_file_backed_vocabulary_filter_is_recorded_and_reads_back() {
     let transcribe = Transcribe::new();
@@ -225,8 +227,8 @@ async fn a_file_backed_vocabulary_filter_is_recorded_and_reads_back() {
         );
         assert!(
             is_absent(&got, "DownloadUri"),
-            "case {case:?}: nothing read this filter's file, so there is no file of its \
-             own to download, got {:?}",
+            "case {case:?}: no object store served this filter's file, so there is no \
+             file of its own to download, got {:?}",
             got.body
         );
         if let Some(role) = request.get("DataAccessRoleArn").and_then(Value::as_str) {
