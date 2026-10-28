@@ -166,3 +166,5 @@ mod config_write_path_validation;
 mod recorded_inventory_drives_the_read_surface;
 #[path = "all/recorded_resource_config_history.rs"]
 mod recorded_resource_config_history;
+#[path = "all/aggregate_discovered_resources.rs"]
+mod aggregate_discovered_resources;
