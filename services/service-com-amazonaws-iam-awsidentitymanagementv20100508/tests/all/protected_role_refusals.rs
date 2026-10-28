@@ -44,7 +44,7 @@ const MANAGED_POLICY_ARN: &str = "arn:aws:iam::aws:policy/ReadOnlyAccess";
 
 /// The sentence this service states a refused change to a protected role with. The role
 /// name is the only variable part, and it is the one the REQUEST carried.
-fn protected(role_name: &str) -> String {
+pub(crate) fn protected(role_name: &str) -> String {
     format!(
         "Cannot perform the operation on the protected role '{role_name}' - this role is \
          only modifiable by AWS"
@@ -53,7 +53,7 @@ fn protected(role_name: &str) -> String {
 
 /// The role a service keeps for itself, created through `CreateServiceLinkedRole`: the
 /// name AWS minted for it.
-async fn service_linked_role(
+pub(crate) async fn service_linked_role(
     router: &MultiServiceRouter,
     principal: &str,
     custom_suffix: Option<&str>,
@@ -86,7 +86,7 @@ async fn reported_description(router: &MultiServiceRouter, role_name: &str) -> S
 
 /// The service principals (and optional custom suffixes) the rules are read over: a
 /// two-label principal, a three-label one, and one whose role carries a custom suffix.
-const LINKED_SERVICES: &[(&str, Option<&str>)] = &[
+pub(crate) const LINKED_SERVICES: &[(&str, Option<&str>)] = &[
     ("autoscaling.amazonaws.com", None),
     ("ops.apigateway.amazonaws.com", None),
     ("elasticbeanstalk.amazonaws.com", Some("ingest")),

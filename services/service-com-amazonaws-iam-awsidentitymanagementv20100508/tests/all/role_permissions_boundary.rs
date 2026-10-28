@@ -31,14 +31,14 @@ const POLICY_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":
 /// The one value the model's `PermissionsBoundaryAttachmentType` enum declares
 /// (`smithy_query(query="shape", shape="PermissionsBoundaryAttachmentType")`),
 /// which every entity carrying a boundary reports.
-const PERMISSIONS_BOUNDARY_TYPE: &str = "PermissionsBoundaryPolicy";
+pub(crate) const PERMISSIONS_BOUNDARY_TYPE: &str = "PermissionsBoundaryPolicy";
 
 /// ARNs of AWS-managed policies, spanning the paths the managed-policy ARN grammar
 /// admits: the account root, the `/service-role/` path and the `/job-function/`
 /// path. The names and paths are entries of the AWS Managed Policy Reference; what
 /// the rule generalises over is the ARN's SHAPE (path depth, name alphabet), which
 /// is why the rows differ in path rather than only in name.
-const AWS_MANAGED_POLICIES: &[&str] = &[
+pub(crate) const AWS_MANAGED_POLICIES: &[&str] = &[
     "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
     "arn:aws:iam::aws:policy/PowerUserAccess",
     "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",
@@ -52,7 +52,7 @@ fn customer_policy_arn(path: &str, policy_name: &str) -> String {
 }
 
 /// Create a role at `path`, which every boundary case needs first.
-async fn create_role(router: &MultiServiceRouter, role_name: &str, path: &str) {
+pub(crate) async fn create_role(router: &MultiServiceRouter, role_name: &str, path: &str) {
     let (status, body) = call(
         router,
         "CreateRole",
@@ -71,7 +71,11 @@ async fn create_role(router: &MultiServiceRouter, role_name: &str, path: &str) {
 
 /// Create a customer-managed policy at `path`, answering the ARN it reports — the
 /// ARN a boundary then names.
-async fn create_policy(router: &MultiServiceRouter, policy_name: &str, path: &str) -> String {
+pub(crate) async fn create_policy(
+    router: &MultiServiceRouter,
+    policy_name: &str,
+    path: &str,
+) -> String {
     let (status, body) = call(
         router,
         "CreatePolicy",
@@ -96,7 +100,7 @@ async fn create_policy(router: &MultiServiceRouter, policy_name: &str, path: &st
 }
 
 /// One `PutRolePermissionsBoundary` call.
-async fn put_boundary(
+pub(crate) async fn put_boundary(
     router: &MultiServiceRouter,
     role_name: &str,
     permissions_boundary: &str,
@@ -114,7 +118,7 @@ async fn put_boundary(
 
 /// The boundary `GetRole` reports for `role_name`: its type and ARN, or `None` when
 /// the role carries none.
-async fn reported_boundary(
+pub(crate) async fn reported_boundary(
     router: &MultiServiceRouter,
     role_name: &str,
 ) -> Option<(String, String)> {

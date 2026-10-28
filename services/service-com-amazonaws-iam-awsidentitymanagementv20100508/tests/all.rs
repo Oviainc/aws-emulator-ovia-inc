@@ -173,6 +173,8 @@ mod request_condition_context;
 mod resource_tag_condition_context;
 #[path = "all/role_attached_policies.rs"]
 mod role_attached_policies;
+#[path = "all/role_boundary_removal.rs"]
+mod role_boundary_removal;
 #[path = "all/role_deletion.rs"]
 mod role_deletion;
 #[path = "all/role_description.rs"]
