@@ -65,6 +65,8 @@ mod event_cursor_envelope;
 mod event_ingestion_time_independence;
 #[path = "all/event_window_selection.rs"]
 mod event_window_selection;
+#[path = "all/export_task_account_slot.rs"]
+mod export_task_account_slot;
 #[path = "all/export_task_cancellation.rs"]
 mod export_task_cancellation;
 #[path = "all/export_task_status_messages.rs"]

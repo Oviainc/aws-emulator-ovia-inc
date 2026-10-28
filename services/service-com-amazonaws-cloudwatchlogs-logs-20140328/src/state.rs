@@ -511,11 +511,13 @@ pub const RETENTION_IN_DAYS_VALUES: [i32; 22] = [
 /// slot for the next put.
 pub const MAX_SUBSCRIPTION_FILTERS_PER_GROUP: usize = 5;
 
-/// The refusal CloudWatch Logs answers a `PutSubscriptionFilter` that would take a log
-/// group past the subscription filters it can hold
-/// ([`MAX_SUBSCRIPTION_FILTERS_PER_GROUP`]). The text is FIXED — it names neither the
-/// quota nor anything from the request — so every such refusal reads identically.
-pub const SUBSCRIPTION_FILTER_LIMIT_EXCEEDED: &str = "Resource limit exceeded.";
+/// The refusal CloudWatch Logs answers when a request would take the account, or one log
+/// group, past the resources it may hold at one time: the subscription filters one group can
+/// have attached ([`MAX_SUBSCRIPTION_FILTERS_PER_GROUP`]), or the single export task an
+/// account can have active ([`ExportTaskRecord::is_active`]). The text is FIXED for the error
+/// class — it names neither the limit that was reached, nor anything from the request, nor the
+/// resource holding the slot — so every refusal of that class reads identically.
+pub const LIMIT_EXCEEDED_MESSAGE: &str = "Resource limit exceeded.";
 
 /// The destinations `PutSubscriptionFilter` documents as supported, as the service
 /// segment of the `destinationArn` naming each: "An Amazon Kinesis stream", "A logical
@@ -1442,12 +1444,13 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
 
     /// Whether this account already has an export task in one of the two statuses
     /// `CreateExportTask` counts as active ("Each account can only have one active (RUNNING
-    /// or PENDING) export task at a time").
+    /// or PENDING) export task at a time"). The slot is the account's, so holding it is all
+    /// there is to know about it: the refusal names nothing of the task that holds it.
     ///
     /// Read AFTER [`Self::materialize_due_export_transitions`], so a task the clock has
     /// already completed does not count as active.
-    pub fn active_export_task(&self) -> Option<&ExportTaskRecord> {
-        self.export_tasks.values().find(|task| task.is_active())
+    pub fn has_active_export_task(&self) -> bool {
+        self.export_tasks.values().any(ExportTaskRecord::is_active)
     }
 
     /// Drop the oldest export tasks the store holds beyond [`MAX_EXPORT_TASKS`], so repeated
