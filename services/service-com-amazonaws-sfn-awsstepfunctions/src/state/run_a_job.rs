@@ -101,7 +101,7 @@ async fn poll<Eng: Send + Sync + 'static>(
                 // The job is still doing its work, so the task is not finished and
                 // the execution is still running: nothing is written.
                 None => continue,
-                Some(Ok(report)) => Ok(report),
+                Some(Ok(report)) => Ok(integration::task_result(&report)),
                 // The job ended without doing its work, which is the task's own
                 // failure: the ASL error name for a failed task, carrying the reason
                 // the invoked service gave.

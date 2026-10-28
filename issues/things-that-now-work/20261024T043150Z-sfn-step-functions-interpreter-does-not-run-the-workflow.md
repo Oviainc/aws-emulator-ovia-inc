@@ -50,6 +50,8 @@ Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
 
 # Step Functions interpreter does not run the workflow language: Task states, JSONata, Distributed Map, callbacks and Retry/Catch all never execute (6 causes)
 
+> _STATUS: cause 1 is fixed for every service integration this emulator can make the call for — a `Task` state's integration names its service by the token its family uses, its request reaches the invoked operation under that model's own member spelling, its result comes back in PascalCase, the nested-execution integration carries `Input` as the JSON text `StartExecution` types, `.sync:2` reports the job's documents parsed, and a `Resource`'s pattern stays part of the action its events name. The OTHER five causes, and the integrations cause 1 still cannot call (a Lambda `Resource`, `aws-sdk:sts:*`, `glue:startJobRun.sync`, the execution role's authorization of the call, and the SDK response envelope), are re-filed with their replay keys as `issues/things-that-do-not-work/20261024T043150Z-sfn-5-of-the-6-interpreter-causes-remain-open.md`, so none of them is recorded as working._
+
 > _Note: this issue was identified against the code base at commit `3ecafc116f2b44ac9fb7ddf17b83f092c778a529`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

@@ -63,6 +63,8 @@ mod execution_history_state_lifecycle;
 mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
+#[path = "all/integration_member_names.rs"]
+mod integration_member_names;
 #[path = "all/json_parse_diagnostics.rs"]
 mod json_parse_diagnostics;
 #[path = "all/list_state_machine_aliases_pages.rs"]

@@ -143,8 +143,9 @@ async fn submitted_job(emulator: &Emulator, case: &str, parent_arn: &str) -> Str
     let reported: Value = serde_json::from_str(&output)
         .unwrap_or_else(|error| panic!("case {case:?}: expected a JSON output, got {error} in {output:?}"));
     // The submission carries "the response from a resource when a task has started",
-    // which for this integration is `StartExecution`'s own output.
-    string(&reported, "executionArn")
+    // which for this integration is `StartExecution`'s own output, reported in the
+    // integration's own convention.
+    string(&reported, "ExecutionArn")
 }
 
 /// One row of the resolution table: the case, the child's definition, the pattern
@@ -258,19 +259,19 @@ async fn a_run_a_job_task_is_resolved_by_the_job_it_started() {
         let output: Value = serde_json::from_str(&string(&settled, "output"))
             .unwrap_or_else(|error| panic!("case {case:?}: expected a JSON output, got {error}"));
         assert_eq!(
-            output.get("status").and_then(Value::as_str),
+            output.get("Status").and_then(Value::as_str),
             Some("SUCCEEDED"),
             "case {case:?}: expected the job's own report as the task's result, got {output:?}"
         );
         assert_eq!(
-            output.get("executionArn").and_then(Value::as_str),
+            output.get("ExecutionArn").and_then(Value::as_str),
             Some(job.as_str()),
             "case {case:?}: expected the report of the job that was started, got {output:?}"
         );
         // The pattern's second revision reports the job's own output as the parsed
         // document; its first reports it as the string that service carries it in.
         let job_output = output
-            .get("output")
+            .get("Output")
             .unwrap_or_else(|| panic!("case {case:?}: expected the job's output in {output:?}"));
         if suffix == ".sync:2" {
             assert_eq!(

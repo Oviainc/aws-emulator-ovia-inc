@@ -425,10 +425,105 @@ async fn a_map_state_entered_more_than_once_starts_a_map_run_each_time() {
     );
 }
 
+/// A nested `Parallel`/`Map` failure leaves the execution terminal and the Map Runs
+/// that really started reported, whatever ORDER the walk recorded them in.
+///
+/// A Map Run is recorded when its items are done, so the walk's list is built in
+/// FINISH order while it is read in ENTRY order; the failure of a nested `Parallel`
+/// or `Map` prunes that same list of the runs that had not started by the instant it
+/// failed. The definition below is where those two meet: the first branch's
+/// Distributed Map sits behind a `Wait`, so it is recorded FIRST and entered LAST,
+/// and the second branch's Distributed Map fails inside its items at an instant
+/// before it. Neither step may depend on a position in a list the other one moves.
+///
+/// What the execution then reports is the rule itself: the Map Run whose own items
+/// failed DID start, and the branch the failure stopped before it reached its `Map`
+/// started none.
+#[tokio::test]
+async fn a_nested_failure_leaves_the_execution_terminal_and_its_map_runs_reported() {
+    let emulator = Emulator::new();
+    let definition = machine_definition(
+        "Fan",
+        json!({
+            "Fan": {
+                "Type": "Parallel",
+                "Branches": [
+                    {
+                        "StartAt": "Hold",
+                        "States": {
+                            "Hold": { "Type": "Wait", "Seconds": 1, "Next": "Late" },
+                            "Late": distributed_map(Some("late"), None),
+                        },
+                    },
+                    {
+                        "StartAt": "Early",
+                        "States": {
+                            "Early": {
+                                "Type": "Map",
+                                "Items": [1, 2],
+                                "Label": "early",
+                                "ItemProcessor": {
+                                    "ProcessorConfig": { "Mode": "DISTRIBUTED" },
+                                    "StartAt": "Split",
+                                    "States": {
+                                        "Split": {
+                                            "Type": "Parallel",
+                                            "Branches": [{
+                                                "StartAt": "Broken",
+                                                "States": {
+                                                    "Broken": {
+                                                        "Type": "Fail",
+                                                        "Error": "BranchBroke",
+                                                    },
+                                                },
+                                            }],
+                                            "End": true,
+                                        },
+                                    },
+                                },
+                                "End": true,
+                            },
+                        },
+                    },
+                ],
+                "End": true,
+            },
+        }),
+    );
+    let machine = create_machine(&emulator, "maprun-nested-failure", &definition).await;
+    let execution = start_execution(&emulator, &machine, "only", TWO_ITEMS).await;
+    std::thread::sleep(PAST_THE_EXECUTION_DELAY.saturating_add(std::time::Duration::from_secs(1)));
+
+    let described = emulator
+        .ok("DescribeExecution", &json!({ "executionArn": execution }))
+        .await;
+    assert_eq!(
+        described.get("status").and_then(Value::as_str),
+        Some("FAILED"),
+        "case \"a nested failure\": the failing branch fails the execution, got {described:?}"
+    );
+    let labels: Vec<String> = list_map_runs(&emulator, &execution)
+        .await
+        .iter()
+        .map(|map_run| {
+            let arn = string(map_run, "mapRunArn");
+            let (label, _id) = arn
+                .rsplit_once(':')
+                .unwrap_or_else(|| panic!("expected a trailing id on {arn:?}"));
+            label.rsplit('/').next().unwrap_or_default().to_string()
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["early".to_string()],
+        "case \"a nested failure\": the Map Run whose own items failed started, and the branch \
+         the failure stopped before its own 'Map' started none, got {labels:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // What the clock owes
 // ---------------------------------------------------------------------------
-
 /// A Map Run is RUNNING — so it has no `stopDate` — until the instant its items were
 /// due, and the ARN it is reported under does not change when it settles.
 #[tokio::test]

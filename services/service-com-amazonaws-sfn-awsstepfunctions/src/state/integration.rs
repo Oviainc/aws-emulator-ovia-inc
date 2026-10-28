@@ -18,16 +18,31 @@
 //!
 //! ## Which integrations are made
 //!
-//! A `Resource` of the form `arn:aws:states:::<service>:<action>` (an optimized
-//! integration) or `arn:aws:states:::aws-sdk:<service>:<action>` (an AWS SDK
-//! integration) names a service by its ARN namespace and one of that service's API
-//! operations by its name in lowerCamel. The call is made when that service has an
+//! A `Resource` of the form `arn:aws:states:::<namespace>:<action>` (an optimized
+//! integration) or `arn:aws:states:::aws-sdk:<sdk name>:<action>` (an AWS SDK
+//! integration) names a service — by its ARN namespace in the first family, by the
+//! name the AWS SDKs give it in the second ([`Api::sdk_token`]) — and one of that
+//! service's API operations by its name in lowerCamel. The call is made when that
+//! service has an
 //! [`APIS`] entry — the services whose protocol carries the request as ONE JSON
 //! document, the `awsJson1_0` and `awsJson1_1` protocols, whose body IS the
 //! operation's input document, which is exactly what a payload template builds. One
 //! entry per service, and EVERY operation of a listed service is reachable through
 //! it: the operation name is derived from the action, so nothing here is written per
 //! action.
+//!
+//! The parameters of a `Task` state's integration are written in the integration's
+//! own convention, PascalCase, whatever the invoked API spells its own members in,
+//! so the document the state built is put on the wire under the spelling that
+//! service's model uses ([`MemberCase`]) — and a member the integration documents as
+//! a document while the operation types it as a string is carried as that document's
+//! JSON text ([`JSON_TEXT_MEMBERS`]). The answer is reported back to the state in
+//! that same convention ([`task_result`]). Both re-spell the TOP level only, because
+//! below it a document carries a caller's DATA beside the operation's members: a
+//! structure member nested inside a response therefore still reads as the invoked
+//! model spells it, which is a divergence this emulator carries rather than one it
+//! hides — re-spelling further needs the invoked model's own member names, which
+//! this crate cannot read.
 //!
 //! What has no entry is not faked. Each of these is reported by [`read`] and ends the
 //! execution in the service's own failure state with the ASL-documented
@@ -199,8 +214,13 @@ pub struct Api {
     /// which names the media type of the request body.
     pub json_version: &'static str,
     /// Its SDK id (`awsService.sdkId`), which names the service half of a task
-    /// error ([`Failed::error`]).
+    /// error ([`Failed::error`]) and — lower-cased — the token an AWS SDK
+    /// integration's `Resource` names this service by ([`Api::sdk_token`]).
     pub sdk_id: &'static str,
+    /// How its model spells the members of an operation's input
+    /// ([`MemberCase`]), which is what decides the spelling the document a `Task`
+    /// state built goes on the wire under.
+    pub member_case: MemberCase,
 }
 
 impl Api {
@@ -212,6 +232,51 @@ impl Api {
     /// The media type this service's protocol version names.
     fn content_type(&self) -> String {
         format!("application/x-amz-json-{}", self.json_version)
+    }
+
+    /// The token an AWS SDK integration's `Resource`
+    /// (`arn:aws:states:::aws-sdk:<token>:<action>`) names this service by: the
+    /// name the AWS SDKs give the service, which is its SDK id lower-cased with
+    /// its spaces dropped (`SFN` -> `sfn`, `EventBridge` -> `eventbridge`).
+    ///
+    /// That is a different token from the ARN namespace the OPTIMIZED family names
+    /// the same service by (`states:startExecution` beside
+    /// `aws-sdk:sfn:startExecution`), so each family is looked up under its own.
+    fn sdk_token(&self) -> String {
+        self.sdk_id
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+}
+
+/// How one service's model spells the members of an operation's input.
+///
+/// A `Task` state's integration parameters are written in PascalCase whatever the
+/// invoked API spells its own members in — `StateMachineArn` for a nested execution
+/// whose API member is `stateMachineArn` — so the document the state built is put on
+/// the wire under the spelling that service's model uses. The two conventions differ
+/// in the FIRST character and nothing else, which is the whole of this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberCase {
+    /// `stateMachineArn`, `taskDefinition`: the first character is lower case.
+    LowerCamel,
+    /// `TableName`, `QueueUrl`: the first character is upper case.
+    Pascal,
+}
+
+impl MemberCase {
+    /// `member` under this convention's spelling of it.
+    fn spell(self, member: &str) -> String {
+        let mut characters = member.chars();
+        let Some(first) = characters.next() else {
+            return String::new();
+        };
+        match self {
+            Self::LowerCamel => first.to_lowercase().chain(characters).collect(),
+            Self::Pascal => first.to_uppercase().chain(characters).collect(),
+        }
     }
 }
 
@@ -237,6 +302,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "AmazonAthena",
         json_version: "1.1",
         sdk_id: "Athena",
+        // `StartQueryExecution`'s input: `QueryString`, `WorkGroup`.
+        member_case: MemberCase::Pascal,
     },
     // `services/service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
     // com-amazonaws-dynamodb-dynamodb-20120810.json`: awsJson1_0, sigv4Name
@@ -249,6 +316,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "DynamoDB_20120810",
         json_version: "1.0",
         sdk_id: "DynamoDB",
+        // `PutItem`'s input: `TableName`, `Item`.
+        member_case: MemberCase::Pascal,
     },
     // `services/service-com-amazonaws-sqs-amazonsqs/smithy-model/
     // com-amazonaws-sqs-amazonsqs.json`: awsJson1_0, sigv4Name `sqs`,
@@ -260,6 +329,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "AmazonSQS",
         json_version: "1.0",
         sdk_id: "SQS",
+        // `SendMessage`'s input: `QueueUrl`, `MessageBody`.
+        member_case: MemberCase::Pascal,
     },
     // `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/
     // com-amazonaws-eventbridge-awsevents.json`: awsJson1_1, sigv4Name `events`,
@@ -271,6 +342,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "AWSEvents",
         json_version: "1.1",
         sdk_id: "EventBridge",
+        // `PutEvents`' input: `Entries`, `EndpointId`.
+        member_case: MemberCase::Pascal,
     },
     // This service itself, for a task that starts another execution:
     // `services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/
@@ -283,6 +356,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "AWSStepFunctions",
         json_version: "1.0",
         sdk_id: "SFN",
+        // `StartExecution`'s input: `stateMachineArn`, `name`, `input`.
+        member_case: MemberCase::LowerCamel,
     },
     // `services/service-com-amazonaws-kinesis-kinesis-20131202/smithy-model/
     // com-amazonaws-kinesis-kinesis-20131202.json`: awsJson1_1, sigv4Name
@@ -295,6 +370,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "Kinesis_20131202",
         json_version: "1.1",
         sdk_id: "Kinesis",
+        // `PutRecord`'s input: `StreamName`, `Data`, `PartitionKey`.
+        member_case: MemberCase::Pascal,
     },
     // `services/service-com-amazonaws-ssm-amazonssm/smithy-model/
     // com-amazonaws-ssm-amazonssm.json`: awsJson1_1, sigv4Name `ssm`,
@@ -306,6 +383,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "AmazonSSM",
         json_version: "1.1",
         sdk_id: "SSM",
+        // `GetParameter`'s input: `Name`, `WithDecryption`.
+        member_case: MemberCase::Pascal,
     },
     // `services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/
     // smithy-model/com-amazonaws-ecs-amazonec2containerservicev20141113.json`:
@@ -318,6 +397,8 @@ pub const APIS: &[Api] = &[
         target_prefix: "AmazonEC2ContainerServiceV20141113",
         json_version: "1.1",
         sdk_id: "ECS",
+        // `RunTask`'s input: `cluster`, `taskDefinition`, `overrides`.
+        member_case: MemberCase::LowerCamel,
     },
 ];
 
@@ -334,11 +415,33 @@ pub struct Call {
     /// `None` for a request-response integration, whose call IS the whole task.
     pub job: Option<&'static RunAJob>,
     /// Whether the `Resource` asked for the pattern's SECOND revision (`.sync:2`),
-    /// which differs in one thing: a job whose own output is carried as a
-    /// JSON-encoded string is reported as the parsed document rather than that
-    /// string ([`RunAJob::output_at`]).
+    /// which differs in one thing: a document the job carries as JSON TEXT is
+    /// reported as the parsed document rather than as that text
+    /// ([`RunAJob::json_text_at`]).
     pub parsed_output: bool,
+    /// The members of this call's request the invoked operation types as a STRING
+    /// while the integration documents them as a document, so the document the
+    /// state built is carried as that document's JSON text
+    /// ([`JSON_TEXT_MEMBERS`]). Empty for every call that converts nothing.
+    pub json_text: &'static [&'static str],
 }
+
+/// The members an OPTIMIZED integration documents as a document while the operation
+/// it calls types them as a string, named by the WIRE spelling of the member
+/// ([`MemberCase`]) under the `<namespace>:<action>` the optimized family names the
+/// integration by.
+///
+/// Only that family converts anything: an AWS SDK integration's parameters ARE the
+/// invoked operation's own members, so a document written for one goes on the wire
+/// as it stands.
+const JSON_TEXT_MEMBERS: &[(&str, &[&str])] = &[
+    // `arn:aws:states:::states:startExecution` takes the child execution's input as
+    // the JSON document the child receives, while `StartExecution`'s own `input`
+    // member is "the string that contains the JSON input data for the execution"
+    // (`smithy_query(query="operation",operation="StartExecution")` on this crate's
+    // own model).
+    ("states:startExecution", &["input"]),
+];
 
 /// The suffix a `Resource` names the run-a-job integration pattern with, and the
 /// revision of it that parses the job's own output
@@ -379,10 +482,11 @@ pub struct RunAJob {
     /// Where the reporting call's response says WHY a job that ended without
     /// finishing did so; empty where that service reports no such member.
     pub failure_cause_at: &'static [&'static str],
-    /// Where the reporting call's response carries the job's own output as a
-    /// JSON-encoded string, which the pattern's second revision reports parsed;
-    /// empty where that service carries none.
-    pub output_at: &'static [&'static str],
+    /// Where the reporting call's response carries a document of the job's own as a
+    /// JSON-encoded STRING — its input, its output — each of which the pattern's
+    /// second revision reports as the parsed document; empty where that service
+    /// carries none.
+    pub json_text_at: &'static [&'static [&'static str]],
     /// The operation that stops the job, and the member of its request the
     /// identifier goes in.
     pub stop: &'static str,
@@ -432,29 +536,15 @@ impl RunAJob {
     }
 
     /// The document the task reports as its result: the reporting call's own
-    /// response, with the job's JSON-encoded output parsed in place for the
-    /// pattern's second revision.
+    /// response, with each document the job carries as JSON TEXT parsed in place for
+    /// the pattern's second revision.
     fn reported(&self, answer: &Value, parsed_output: bool) -> Value {
         let mut reported = answer.clone();
         if !parsed_output {
             return reported;
         }
-        let Some((last, leading)) = self.output_at.split_last() else {
-            return reported;
-        };
-        let mut node = &mut reported;
-        for member in leading {
-            match node.get_mut(*member) {
-                Some(next) => node = next,
-                None => return reported,
-            }
-        }
-        let parsed = node
-            .get(*last)
-            .and_then(Value::as_str)
-            .and_then(|text| ::serde_json::from_str::<Value>(text).ok());
-        if let (Some(parsed), Some(object)) = (parsed, node.as_object_mut()) {
-            object.insert((*last).to_string(), parsed);
+        for path in self.json_text_at {
+            parse_in_place(&mut reported, path);
         }
         reported
     }
@@ -469,6 +559,29 @@ impl RunAJob {
                 self.starts
             ),
         }
+    }
+}
+
+/// Replace the JSON TEXT `path` names in `document` with the document that text
+/// holds, leaving `document` as it is where the path names nothing or names text
+/// that is not JSON.
+fn parse_in_place(document: &mut Value, path: &[&str]) {
+    let Some((last, leading)) = path.split_last() else {
+        return;
+    };
+    let mut node = document;
+    for member in leading {
+        match node.get_mut(*member) {
+            Some(next) => node = next,
+            None => return,
+        }
+    }
+    let parsed = node
+        .get(*last)
+        .and_then(Value::as_str)
+        .and_then(|text| ::serde_json::from_str::<Value>(text).ok());
+    if let (Some(parsed), Some(object)) = (parsed, node.as_object_mut()) {
+        object.insert((*last).to_string(), parsed);
     }
 }
 
@@ -497,7 +610,10 @@ pub const RUN_A_JOB: &[RunAJob] = &[
             super::EXECUTION_STATUS_ABORTED,
         ],
         failure_cause_at: &["cause"],
-        output_at: &["output"],
+        // `DescribeExecution` carries both the execution's `input` and its `output`
+        // as "the string that contains the JSON input data" and the JSON output of
+        // the execution.
+        json_text_at: &[&["input"], &["output"]],
         stop: "StopExecution",
         stop_member: "executionArn",
     },
@@ -518,7 +634,7 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         succeeded: &["SUCCEEDED"],
         failed: &["FAILED", "CANCELLED"],
         failure_cause_at: &["QueryExecution", "Status", "StateChangeReason"],
-        output_at: &[],
+        json_text_at: &[],
         stop: "StopQueryExecution",
         stop_member: "QueryExecutionId",
     },
@@ -600,11 +716,14 @@ pub fn read(resource: &str) -> Result<Call, String> {
     // `aws-sdk:<service>:<action>` for the AWS SDK family, `<service>:<action>` for
     // the optimized one: both name a service and an action, which is all the call
     // needs.
-    let (service, action) = match rest.split_once(':') {
-        Some((AWS_SDK_SEGMENT, tail)) => tail.split_once(':').ok_or_else(|| {
-            format!("'{shown}' names no action of its service, so nothing was run for it")
-        })?,
-        Some(pair) => pair,
+    let (aws_sdk, (service, action)) = match rest.split_once(':') {
+        Some((AWS_SDK_SEGMENT, tail)) => (
+            true,
+            tail.split_once(':').ok_or_else(|| {
+                format!("'{shown}' names no action of its service, so nothing was run for it")
+            })?,
+        ),
+        Some(pair) => (false, pair),
         None => {
             return Err(format!(
                 "'{shown}' names no action of its service, so nothing was run for it"
@@ -630,9 +749,15 @@ pub fn read(resource: &str) -> Result<Call, String> {
             "'{shown}' names no action of its service, so nothing was run for it"
         ));
     }
+    // Each family names the service by its OWN token: the optimized one by the
+    // service's ARN namespace, the AWS SDK one by the name the SDKs give it
+    // ([`Api::sdk_token`]).
     let api = APIS
         .iter()
-        .find(|api| api.namespace == service)
+        .find(|api| match aws_sdk {
+            true => api.sdk_token() == service,
+            false => api.namespace == service,
+        })
         .ok_or_else(|| {
             format!(
                 "'{shown}' names an integration with '{}', which is not one of the services this \
@@ -675,11 +800,25 @@ pub fn read(resource: &str) -> Result<Call, String> {
             ))
         }
     };
+    // The conversion a member of this call's request needs is the integration's,
+    // so it is read off the optimized `<namespace>:<action>` and is empty for the
+    // AWS SDK family, whose parameters are the operation's own members.
+    let json_text = match aws_sdk {
+        true => &[][..],
+        false => {
+            let integration = format!("{service}:{action}");
+            JSON_TEXT_MEMBERS
+                .iter()
+                .find(|(named, _)| *named == integration)
+                .map_or(&[][..], |(_, members)| *members)
+        }
+    };
     Ok(Call {
         api,
         operation: operation_of(action),
         job,
         parsed_output,
+        json_text,
     })
 }
 
@@ -696,6 +835,7 @@ pub fn describing(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Ca
             operation: job.describe.to_string(),
             job: None,
             parsed_output: false,
+            json_text: &[],
         },
         Value::Object(request),
     )
@@ -714,6 +854,7 @@ pub fn stopping(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Call
             operation: job.stop.to_string(),
             job: None,
             parsed_output: false,
+            json_text: &[],
         },
         Value::Object(request),
     )
@@ -737,19 +878,28 @@ fn operation_of(action: &str) -> String {
 ///
 /// A `Resource` names the integration as `<kind>:<action>`, where the kind is the
 /// service alone for the optimized family (`lambda:invoke`) and the family plus the
-/// service for the AWS SDK one (`aws-sdk:dynamodb:putItem`): the ACTION is the last
-/// field and the kind is everything before it, so one reading serves both families.
-/// A `Resource` with no action at all is its own kind, which is what a state naming
-/// work no call is made for reports.
+/// service for the AWS SDK one (`aws-sdk:dynamodb:putItem`): the KIND is read from
+/// the FRONT, so the action is everything after it — which is what a `Resource`
+/// naming an integration PATTERN carries, since a pattern's own revision is written
+/// with a colon (`startExecution.sync:2`) and belongs to the action rather than
+/// being a field of its own. A `Resource` with no action at all is its own kind,
+/// which is what a state naming work no call is made for reports.
 pub fn named_work(resource: &str) -> (String, String) {
     let rest = match resource.splitn(6, ':').collect::<Vec<&str>>().as_slice() {
         ["arn", _partition, _vendor, _region, _account, rest] => (*rest).to_string(),
         _ => resource.to_string(),
     };
-    let (kind, action) = match rest.rsplit_once(':') {
-        Some((kind, action)) if !kind.is_empty() && !action.is_empty() => {
-            (kind.to_string(), action.to_string())
-        }
+    // The AWS SDK family's kind is two fields (`aws-sdk:<service>`), every other
+    // kind is one, and the action is the rest of the text either way.
+    let split = match rest.split_once(':') {
+        Some((AWS_SDK_SEGMENT, tail)) => tail
+            .split_once(':')
+            .map(|(service, action)| (format!("{AWS_SDK_SEGMENT}:{service}"), action.to_string())),
+        Some((kind, action)) => Some((kind.to_string(), action.to_string())),
+        None => None,
+    };
+    let (kind, action) = match split {
+        Some((kind, action)) if !kind.is_empty() && !action.is_empty() => (kind, action),
         _ => (rest.clone(), rest),
     };
     (clip_name(kind), clip_name(action))
@@ -958,6 +1108,62 @@ pub fn chain_depth(ctx: &smithy_server_runtime::OperationContext<'_>) -> u8 {
         .map_or(0, |depth| depth.0)
 }
 
+/// The document a `Task` state REPORTS as the result of its integration call:
+/// `answer`'s top-level members under the spelling a service integration's result is
+/// written in, which is PascalCase.
+///
+/// The result of a service integration is the invoked operation's response document,
+/// and a `Task` state reads it in the integration's own convention whatever the
+/// invoked model spells its own members in — so a `ResultSelector`, a `ResultPath`
+/// or a later state's path reads `$.ExecutionArn` of an operation whose own member is
+/// `executionArn`. The wire spelling belongs to the call, not to the result.
+///
+/// Only the TOP level is re-spelled, for the reason [`wire_request`] gives: below it
+/// a response carries a caller's own DATA beside the operation's members — the
+/// attributes of an item, the output document of a child execution — and data is
+/// never re-spelled.
+pub fn task_result(answer: &Value) -> Value {
+    let Some(members) = answer.as_object() else {
+        return answer.clone();
+    };
+    let mut reported = Map::new();
+    for (member, value) in members {
+        reported.insert(MemberCase::Pascal.spell(member), value.clone());
+    }
+    Value::Object(reported)
+}
+
+/// The document `request` goes on the wire as: every TOP-LEVEL member under the
+/// spelling the invoked service's model uses for it ([`MemberCase`]), and every
+/// member the integration documents as a document the operation types as a string
+/// carried as that document's JSON text ([`Call::json_text`]).
+///
+/// A `Task` state's integration parameters are the invoked operation's input, and
+/// they are written in the integration's own convention — PascalCase — whatever the
+/// invoked API spells its members in, so the spelling is settled here rather than
+/// handing a service a member name its model does not carry.
+///
+/// Only the TOP level is re-spelled. Below it a document carries a caller's DATA
+/// beside the operation's members — a DynamoDB attribute name is a map key, an
+/// EventBridge detail is a caller's own document — and data is never re-spelled.
+/// A value already a string is left as it is, so a member written as the text the
+/// operation types goes through untouched.
+fn wire_request(call: &Call, request: &Value) -> Value {
+    let Some(members) = request.as_object() else {
+        return request.clone();
+    };
+    let mut wire = Map::new();
+    for (member, value) in members {
+        let member = call.api.member_case.spell(member);
+        let value = match call.json_text.contains(&member.as_str()) {
+            true if !value.is_string() => Value::String(value.to_string()),
+            _ => value.clone(),
+        };
+        wire.insert(member, value);
+    }
+    Value::Object(wire)
+}
+
 /// Make one integration call and read what the service answered.
 ///
 /// Public, because the calls a run-a-job pattern is made of besides the one the walk
@@ -970,7 +1176,7 @@ pub async fn call_api(
     request: &Value,
 ) -> Answer {
     let api = call.api;
-    let body = match ::serde_json::to_vec(request) {
+    let body = match ::serde_json::to_vec(&wire_request(call, request)) {
         Ok(body) => body,
         Err(error) => {
             return Err(Failed {
@@ -1272,7 +1478,7 @@ mod tests {
     #[test]
     fn a_resource_names_the_call_its_action_does() {
         // (case, the Resource, the signing name and operation it names, parks at a job)
-        let rows: [ResourceRow; 19] = [
+        let rows: [ResourceRow; 22] = [
             (
                 "the optimized DynamoDB integration",
                 "arn:aws:states:::dynamodb:putItem",
@@ -1289,6 +1495,24 @@ mod tests {
                 "the AWS SDK integration of the same operation",
                 "arn:aws:states:::aws-sdk:dynamodb:putItem",
                 Some(("dynamodb", "PutItem")),
+                false,
+            ),
+            (
+                "an AWS SDK integration whose service's SDK name is not its ARN namespace",
+                "arn:aws:states:::aws-sdk:sfn:listStateMachines",
+                Some(("states", "ListStateMachines")),
+                false,
+            ),
+            (
+                "an AWS SDK integration with EventBridge, whose SDK name is not 'events'",
+                "arn:aws:states:::aws-sdk:eventbridge:putEvents",
+                Some(("events", "PutEvents")),
+                false,
+            ),
+            (
+                "an ARN namespace the AWS SDK family does not name a service by",
+                "arn:aws:states:::aws-sdk:states:listStateMachines",
+                None,
                 false,
             ),
             (
@@ -1516,6 +1740,82 @@ mod tests {
                 _ => panic!("case {case:?}: expected {expected:?}, got {answer:?}"),
             }
         }
+    }
+
+    /// What one request looks like on the wire, over a TABLE spanning the two
+    /// member conventions a model spells its input in, both spellings a definition
+    /// may write a member under, the nested data that is NOT re-spelled, and the
+    /// member an integration documents as a document while the operation types it
+    /// as a string.
+    #[test]
+    fn a_request_carries_each_member_as_the_invoked_model_spells_it() {
+        // (case, the Resource, the document the state built, the document sent)
+        let rows: [(&str, &str, Value, Value); 6] = [
+            (
+                "a lowerCamel model's member, written in the integration's PascalCase",
+                "arn:aws:states:::states:startExecution",
+                ::serde_json::json!({"StateMachineArn": "arn:sm", "Name": "run"}),
+                ::serde_json::json!({"stateMachineArn": "arn:sm", "name": "run"}),
+            ),
+            (
+                "the same member already written as that model spells it",
+                "arn:aws:states:::states:startExecution",
+                ::serde_json::json!({"stateMachineArn": "arn:sm"}),
+                ::serde_json::json!({"stateMachineArn": "arn:sm"}),
+            ),
+            (
+                "a PascalCase model's members, which the convention leaves alone",
+                "arn:aws:states:::dynamodb:putItem",
+                ::serde_json::json!({"TableName": "t", "Item": {"pk": {"S": "a"}}}),
+                ::serde_json::json!({"TableName": "t", "Item": {"pk": {"S": "a"}}}),
+            ),
+            (
+                "nested data is a caller's own, so no key below the top level is re-spelled",
+                "arn:aws:states:::aws-sdk:ecs:runTask",
+                ::serde_json::json!({"TaskDefinition": "d", "Overrides": {"ContainerOverrides": []}}),
+                ::serde_json::json!({"taskDefinition": "d", "overrides": {"ContainerOverrides": []}}),
+            ),
+            (
+                "the child execution's input, which the operation types as a string",
+                "arn:aws:states:::states:startExecution",
+                ::serde_json::json!({"StateMachineArn": "arn:sm", "Input": {"a": [1, 2]}}),
+                ::serde_json::json!({"stateMachineArn": "arn:sm", "input": r#"{"a":[1,2]}"#}),
+            ),
+            (
+                "that input already written as the text the operation types",
+                "arn:aws:states:::states:startExecution",
+                ::serde_json::json!({"Input": "{\"a\":1}"}),
+                ::serde_json::json!({"input": "{\"a\":1}"}),
+            ),
+        ];
+
+        for (case, resource, built, expected) in rows {
+            let call = read(resource).expect("every row names a call");
+            let sent = wire_request(&call, &built);
+            assert_eq!(
+                sent, expected,
+                "case {case:?}: expected the request {expected}, got {sent}"
+            );
+        }
+    }
+
+    /// An AWS SDK integration converts nothing: its parameters ARE the invoked
+    /// operation's own members, so the member the optimized integration takes as a
+    /// document is the operation's string there.
+    #[test]
+    fn an_aws_sdk_integration_carries_the_operations_own_members() {
+        let call = read("arn:aws:states:::aws-sdk:sfn:startExecution").expect("this names a call");
+        let sent = wire_request(&call, &::serde_json::json!({"Input": "{\"a\":1}"}));
+        assert_eq!(
+            sent,
+            ::serde_json::json!({"input": "{\"a\":1}"}),
+            "case \"the AWS SDK family\": expected the operation's own members, got {sent}"
+        );
+        assert!(
+            call.json_text.is_empty(),
+            "case \"the AWS SDK family\": nothing is converted for one, got {:?}",
+            call.json_text
+        );
     }
 
     /// A chain of in-process calls already at [`MAX_CALL_CHAIN_DEPTH`] makes NO

@@ -928,6 +928,10 @@ struct Branch {
 struct Unit {
     /// Where this unit's own history events begin in the walk's list.
     from: usize,
+    /// Where the Map Runs this unit's work records begin in the walk's list of them,
+    /// so a failure that stops these units judges only the Map Runs THEY started and
+    /// leaves the ones recorded before they began alone.
+    map_runs_from: usize,
     /// The event this unit records when the state's failure stopped it, for a kind of
     /// unit the language records one for: a `Map` iteration is aborted in its own
     /// right, while a `Parallel` branch is reported through the states it was in.
@@ -2693,6 +2697,7 @@ fn interpret(
         waiting: None,
         parked: None,
         map_runs: Vec::new(),
+        map_runs_entered: 0,
         reply,
         job_reply,
         resumed: None,
@@ -2713,7 +2718,14 @@ fn interpret(
     let mut waiting = interpreter.waiting.take();
     let mut parked = interpreter.parked.take();
     let mut steps = interpreter.steps;
-    let mut map_runs = interpreter.map_runs;
+    // One execution's Map Runs are reported "in the order their states were entered",
+    // which is the position each one carries. A nested Distributed Map inside another's
+    // items finishes first, so the list is built in finish order and put in entry order
+    // HERE, once nothing can prune it any more.
+    let mut entered = interpreter.map_runs;
+    entered.sort_by_key(|(entered, _)| *entered);
+    let mut map_runs: Vec<StartedMapRun> =
+        entered.into_iter().map(|(_, map_run)| map_run).collect();
     let mut end = branch.end;
     // A walk that applied a reply reports only what FOLLOWS it: the steps the replying
     // state writes before the reply is placed are the ones the call that scheduled the
@@ -3052,10 +3064,19 @@ struct Interpreter<'tasks> {
     /// the execution waits at that state until the job finishes. Set at most once,
     /// because the walk stops at the state that set it.
     parked: Option<ParkedJob>,
-    /// The Map Run every Distributed Map state this walk entered started, in the
-    /// order they were entered. Bounded by [`MAX_STATE_TRANSITIONS`], which every
-    /// `Map` state spends from.
-    map_runs: Vec<StartedMapRun>,
+    /// The Map Run every Distributed Map state this walk entered started, each with
+    /// the position of its state among the Map states this walk ENTERED
+    /// ([`Interpreter::map_runs_entered`]).
+    ///
+    /// A run is recorded when its items are done, so the list is built in FINISH
+    /// order and read in entry order ([`plan_run`]) — a nested Distributed Map inside
+    /// another's items finishes first, and two of them may be entered at the same
+    /// offset, so the position is carried rather than derived from the instants.
+    /// Bounded by [`MAX_STATE_TRANSITIONS`], which every `Map` state spends from.
+    map_runs: Vec<(usize, StartedMapRun)>,
+    /// How many `Map` states this walk has ENTERED, which is what numbers the Map
+    /// Runs above in entry order.
+    map_runs_entered: usize,
     /// The reply a worker made to the activity task this walk is CONTINUING from,
     /// when it is one: the state the reply names produces that result instead of
     /// suspending. Taken when it is applied, so one reply answers one task.
@@ -4081,11 +4102,23 @@ impl Interpreter<'_> {
                 return (Err(failure), at);
             }
             let answered = me.tasks.perform(&call, &request, within);
+            // The identifier of the job a run-a-job call STARTED is read from the
+            // answer as the invoked model spells it, before that answer becomes the
+            // task's result in the integration's own convention
+            // ([`super::integration::task_result`]).
+            let started = answered.as_ref().ok().and_then(|answer| {
+                let job = call.job?;
+                answer
+                    .get(job.job_id)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
             let attempt = match answered {
                 // The result is a document a state carries, so it is measured
                 // against the same ceiling every state's document is measured
                 // against.
-                Ok(result) => {
+                Ok(answer) => {
+                    let result = super::integration::task_result(&answer);
                     match measure_payload(&result, &format!("the 'Task' state '{name}'")) {
                         Ok(_bytes) => Ok(result),
                         Err(failure) => Err(failure),
@@ -4102,7 +4135,7 @@ impl Interpreter<'_> {
                 // SUBMISSION ("the response from a resource when a task has
                 // started") and the walk parks at the job until it ends.
                 (Ok(result), Some(job)) => {
-                    let Some(job_id) = result.get(job.job_id).and_then(Value::as_str) else {
+                    let Some(job_id) = started else {
                         let failure = runtime(format!(
                             "state '{name}': the '{}' call of {} answered no '{}', so the job it \
                              started cannot be reported and nothing was run for it",
@@ -4185,10 +4218,11 @@ impl Interpreter<'_> {
         at: Duration,
     ) -> Result<StateStep, Fault> {
         self.push("MapStateEntered", name, at);
-        // Where this state's Map Run belongs in the walk's list: the state is ENTERED
-        // here, and a nested Distributed Map inside its items finishes first, so the
-        // record is placed at this slot rather than appended once the items are done.
-        let slot = self.map_runs.len();
+        // Which Map state of this walk this one is, in ENTRY order: the Map Run it may
+        // start is recorded once its items are done, and the list it goes in is read
+        // in this order rather than that one.
+        let entered = self.map_runs_entered;
+        self.map_runs_entered = self.map_runs_entered.saturating_add(1);
         let items = self
             .map_items(name, state, &effective, context)
             .map_err(|failure| failure.at(at))?;
@@ -4264,8 +4298,14 @@ impl Interpreter<'_> {
             // finished first is not always the one that started first.
             let mut finished_items = std::mem::take(&mut tally.items);
             finished_items.sort_by_key(|item| item.finished_at);
-            self.map_runs.insert(
-                slot,
+            // Where this state's Map Run belongs in the walk's list is decided by the
+            // position its state holds among the Map states ENTERED, never by a
+            // position in the list captured before the items ran: the same list is
+            // pruned WHILE they run, by the failure of a nested `Parallel` or `Map`
+            // ([`Interpreter::abort_units`]), so a position taken at entry no longer
+            // names the same place.
+            self.map_runs.push((
+                entered,
                 StartedMapRun {
                     label: label.clone(),
                     status: if outcome.is_ok() {
@@ -4287,7 +4327,7 @@ impl Interpreter<'_> {
                     // on, which is what `ListExecutions` reports for this Map Run.
                     children: std::mem::take(&mut tally.children),
                 },
-            );
+            ));
         }
         match outcome {
             Ok(results) => {
@@ -4457,6 +4497,7 @@ impl Interpreter<'_> {
                 );
                 units.push(Unit {
                     from,
+                    map_runs_from: self.map_runs.len(),
                     aborted: Some(Step {
                         event_type: super::EVENT_MAP_ITERATION_ABORTED,
                         state_name: Some(plan.name.to_string()),
@@ -4721,8 +4762,13 @@ impl Interpreter<'_> {
         let mut failed: Option<(Failure, Duration)> = None;
         for (states, start_at) in &plan.branches {
             let from = self.steps.len();
+            let map_runs_from = self.map_runs.len();
             let branch = self.nested_walk(states, start_at, input.clone(), at, &Scope::default());
-            units.push(Unit { from, aborted: None });
+            units.push(Unit {
+                from,
+                map_runs_from,
+                aborted: None,
+            });
             match branch.outcome {
                 Ok(value) => {
                     match measure_payload(&value, "a 'Parallel' branch") {
@@ -4818,9 +4864,18 @@ impl Interpreter<'_> {
             }
             self.steps.splice(cut..until, stopped);
         }
-        // A Map Run a branch only started after the state had already failed never
-        // started: the state it belongs to was not entered.
-        self.map_runs.retain(|map_run| map_run.started_at <= when);
+        // A Map Run one of THESE units only started after the state had already failed
+        // never started: the state it belongs to was not entered. The list also holds
+        // the Map Runs of work that finished before these units began — an earlier
+        // `Parallel` branch's, the walk's own — whose own instants this failure says
+        // nothing about, so only what these units recorded is judged.
+        let recorded_from = units
+            .first()
+            .map_or(self.map_runs.len(), |unit| unit.map_runs_from)
+            .min(self.map_runs.len());
+        let mut recorded = self.map_runs.split_off(recorded_from);
+        recorded.retain(|(_, map_run)| map_run.started_at <= when);
+        self.map_runs.append(&mut recorded);
     }
 
     // -----------------------------------------------------------------------
@@ -6575,6 +6630,7 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // Map Runs a Distributed Map starts — and the child executions its items run
         // as — belong to an execution.
         map_runs: Vec::new(),
+        map_runs_entered: 0,
         // `TestState` continues no execution: a state whose work is an invocation is
         // answered by the request's own `mock`, not by a worker's reply.
         reply: None,
