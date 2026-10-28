@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateEnclaveCertificateIamRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateEnclaveCertificateIamRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: associates one IAM role with one ACM certificate for ACM for Nitro
+//! Enclaves, and answers where the certificate bundle that association uploads lives — the
+//! Amazon S3 bucket, the object key `role_arn/certificate_arn`, and the KMS key the private
+//! key is encrypted with. A value that is not an ACM certificate ARN and a value that is not
+//! an IAM role ARN are each refused with the code that says which of the two the request got
+//! wrong, and write nothing; a certificate already holding the documented maximum of roles
+//! is refused as well.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateEnclaveCertificateIamRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateEnclaveCertificateIamRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateEnclaveCertificateIamRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateEnclaveCertificateIamRole"))
+        use crate::state;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`AssociateEnclaveCertificateIamRoleRequest$DryRun`). That is a PERMISSION check
+        // and nothing else: every caller of this emulator is permitted, so a dry run reports
+        // that outcome FIRST and neither reads nor writes anything.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The ARN of the ACM certificate with which to associate the IAM role" and "the ARN
+        // of the IAM role to associate with the ACM certificate"
+        // (`AssociateEnclaveCertificateIamRoleRequest`): both members are `@required` AND
+        // `@clientOptional`, so an empty value reaches this handler, and both are read by
+        // FORM before the store is touched — a request naming neither a certificate nor a
+        // role is refused without the store being locked, and each refusal says which of the
+        // two it was.
+        let certificate_arn = state::require_enclave_certificate_arn(&input.certificate_arn)?;
+        let role_arn = state::require_enclave_certificate_role_arn(&input.role_arn)?;
+
+        // The Region the request was signed for is what names the bucket the certificate
+        // bundle is uploaded to, and it is the only thing a request says about where it is
+        // asking.
+        let region = state::request_region(ctx.parts());
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock-owed moves this call must see before it decides, the way every operation
+        // of this crate that touches the store applies them: each was due at its instant
+        // whether or not anybody called.
+        store.materialize_due_transitions();
+
+        // "You can associate up to 16 IAM roles with an ACM certificate"
+        // (`…Request$RoleArn`). A role the certificate ALREADY holds is not a seventeenth
+        // one: that request names the association already in force, so it is not refused
+        // here. AWS publishes no wording for this refusal, so the message is built from the
+        // certificate the request named and the documented ceiling.
+        if !store.enclave_certificate_has_iam_role(certificate_arn, role_arn)
+            && store.enclave_certificate_iam_role_count(certificate_arn)
+                >= state::MAX_ENCLAVE_CERTIFICATE_IAM_ROLES
+        {
+            return Err(state::resource_limit_exceeded(format!(
+                "The certificate {certificate_arn} is already associated with {max} IAM \
+                 roles, which is as many as it may have",
+                max = state::MAX_ENCLAVE_CERTIFICATE_IAM_ROLES,
+            )));
+        }
+
+        // The association, with the bucket and the encryption key the certificate's bundle
+        // was stored under — minted for the certificate the first time a role is associated
+        // with it, so this call and `GetAssociatedEnclaveCertificateIamRoles` report one
+        // bundle.
+        let Some(association) =
+            store.associate_enclave_certificate_iam_role(certificate_arn, role_arn, &region)
+        else {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                "This emulator has no room left to store another enclave certificate \
+                 association",
+            ));
+        };
+
+        // Every member of the answer comes off the STORED association, so nothing this call
+        // reports can drift from what a later report of the same association reads.
+        Ok(AssociateEnclaveCertificateIamRoleOutput {
+            certificate_s3_bucket_name: association.certificate_s3_bucket_name,
+            certificate_s3_object_key: association.certificate_s3_object_key,
+            encryption_kms_key_id: association.encryption_kms_key_id,
+        })
     }
 }
