@@ -1426,6 +1426,22 @@ impl Stream {
         consumer
     }
 
+    /// Take the consumer the stream carries under `name` off it, answering the record that
+    /// was stored, or `None` when the stream carries no consumer under that name.
+    ///
+    /// The consumer stops being registered with the stream, so nothing of it is read any
+    /// more: the name it held is free for another registration, and a registration under it
+    /// mints a NEW consumer rather than reviving this one — "If you delete a consumer and
+    /// then create a new one with the same name, it won't have the same ARN"
+    /// ([`consumer_arn`]). The consumers left keep their registration order.
+    pub fn remove_consumer(&mut self, name: &str) -> Option<ConsumerRecord> {
+        let position = self
+            .consumers
+            .iter()
+            .position(|consumer| consumer.name == name)?;
+        Some(self.consumers.remove(position))
+    }
+
     /// This record as the modelled `StreamSummary`, which is what a listing reports beside
     /// the stream's name.
     pub fn to_stream_summary(&self, now: SystemTime) -> StreamSummary {
@@ -2004,6 +2020,51 @@ impl ComAmazonawsKinesisKinesis20131202State {
         }
     }
 
+    /// The key of the stream carrying the consumer a request's `ConsumerARN` / `StreamARN` /
+    /// `ConsumerName` members name, and that consumer's name, resolved by exactly the rule
+    /// [`Self::resolve_consumer`] applies.
+    fn resolve_consumer_key(
+        &self,
+        now: SystemTime,
+        region: &str,
+        stream_arn: Option<&str>,
+        consumer_name: Option<&str>,
+        consumer_arn: Option<&str>,
+    ) -> Result<(RegionalName, String), ConsumerLookupFailure> {
+        self.resolve_consumer(now, region, stream_arn, consumer_name, consumer_arn)
+            .map(|(stream, consumer)| {
+                (
+                    RegionalName::new(&stream.region, &stream.name),
+                    consumer.name.clone(),
+                )
+            })
+    }
+
+    /// Take the consumer a `DeregisterStreamConsumer`-shaped request names off the stream it
+    /// is registered with, answering the record that was stored.
+    ///
+    /// One rule, one lookup: the request's members are resolved by
+    /// [`Self::resolve_consumer_key`], so a deregistration addresses the same consumer a read
+    /// does, and the stored record is then reached by its key and removed
+    /// ([`Stream::remove_consumer`]) — the consumer is no longer registered with the stream,
+    /// which is what every read of it and the stream's consumer count then report.
+    pub fn deregister_consumer(
+        &mut self,
+        now: SystemTime,
+        region: &str,
+        stream_arn: Option<&str>,
+        consumer_name: Option<&str>,
+        consumer_arn: Option<&str>,
+    ) -> Result<ConsumerRecord, ConsumerLookupFailure> {
+        let (key, name) =
+            self.resolve_consumer_key(now, region, stream_arn, consumer_name, consumer_arn)?;
+        self.streams
+            .get_mut(&key)
+            .ok_or(ConsumerLookupFailure::StreamNotFound)?
+            .remove_consumer(&name)
+            .ok_or(ConsumerLookupFailure::ConsumerNotFound)
+    }
+
     /// Drop every stream whose removal has fallen due at `now`, freeing its shard logs.
     ///
     /// The removal a `DeleteStream` armed is what makes the stream stop naming a resource
@@ -2538,20 +2599,33 @@ pub const CONSUMER_IDENTIFIER_CONFLICT_MESSAGE: &str =
     "ConsumerARN, StreamARN and ConsumerName name different consumers; they must not \
      conflict with each other";
 
-/// How a read states that no consumer the request's members name is registered with this
-/// account. Built FROM the request, so the consumer at fault is what names it — and the
-/// stream clause is there only when the request named a stream to look under, since a
-/// request that resolves by `ConsumerARN` alone names none.
+/// How a refusal states that no consumer the request's members name is registered with the
+/// stream they name: the consumer at fault, then the stream and the account it was looked
+/// for under, then that it was not found.
+///
+/// Built FROM the request and from this emulator's account, so the consumer is named the way
+/// the request named it and the stream is the one it addressed, by the NAME the addressing
+/// ARN carries ([`stream_name_in_arn`]) — a request that resolves by `ConsumerARN` alone
+/// still names a stream, since a consumer's ARN is its stream's ARN extended.
 pub fn consumer_not_found_message(consumer_identifier: &str, stream_identifier: &str) -> String {
-    let under_stream = if stream_identifier.is_empty() {
-        String::new()
-    } else {
-        format!(" and stream {stream_identifier}")
-    };
+    let stream_name = stream_name_in_arn(stream_identifier)
+        .or_else(|| stream_name_in_arn(consumer_identifier))
+        .unwrap_or(stream_identifier);
     format!(
-        "Consumer {consumer_identifier} not found under account {}{under_stream}.",
+        "Consumer {consumer_identifier} under stream: {stream_name}, account {} not found.",
         ::engine::emulator_account_id()
     )
+}
+
+/// The stream's NAME as a `StreamARN` or a `ConsumerARN` carries it: the segment after
+/// `stream/`, up to the `/consumer/` a consumer's ARN continues with. The modelled patterns
+/// are `^arn:aws.*:kinesis:.*:\d{12}:stream/\S+$` and
+/// `^(arn):aws.*:kinesis:.*:\d{12}:.*stream\/[a-zA-Z0-9_.-]+\/consumer\/[a-zA-Z0-9_.-]+:[0-9]+$`,
+/// and a stream name carries no `/` (`^[a-zA-Z0-9_.-]+$`), so the first segment is the whole
+/// name. `None` for an identifier carrying no such segment.
+pub(crate) fn stream_name_in_arn(identifier: &str) -> Option<&str> {
+    let resource = identifier.split_once("stream/")?.1;
+    Some(resource.split('/').next().unwrap_or(resource))
 }
 
 /// How a registration refuses a name the stream already carries a consumer under: "For a

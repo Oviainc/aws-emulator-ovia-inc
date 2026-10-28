@@ -43,6 +43,8 @@ mod retention_rule_lifecycle;
 mod rule_lock_transitions;
 #[path = "all/rule_status_transitions.rs"]
 mod rule_status_transitions;
+#[path = "all/selection_combination_invariant.rs"]
+mod selection_combination_invariant;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_arn_label_encoding.rs"]

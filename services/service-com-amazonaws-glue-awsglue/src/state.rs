@@ -160,6 +160,14 @@
 //! ([`WorkflowEntry::runs`]), because every operation that addresses a run names its
 //! workflow too (`GetWorkflowRun` takes a `Name` beside the `RunId`).
 //!
+//! BLUEPRINTS — the reusable workflow templates a client registers with
+//! `CreateBlueprint` — sit beside that tree in another per-account namespace keyed by
+//! blueprint name ([`ComAmazonawsGlueAwsglueState::blueprints`]), because every operation
+//! that addresses a blueprint (`GetBlueprint`, `UpdateBlueprint`, `DeleteBlueprint`,
+//! `StartBlueprintRun`) names it by `Name` alone and carries no `CatalogId`, and
+//! `ListBlueprints` "lists all the blueprint names in an account". Ordered, so that
+//! listing has one deterministic order to page over.
+//!
 //! DATA QUALITY RULE RECOMMENDATION RUNS — the runs `StartDataQualityRuleRecommendationRun`
 //! starts over one data source (a catalog table) — sit beside the catalog tree in the same
 //! per-account list as the column statistics task runs
@@ -1002,6 +1010,16 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// [`MAX_WORKFLOWS`]. The key is the name exactly as sent — the model documents no case
     /// fold for a workflow name.
     pub workflows: BTreeMap<String, WorkflowEntry>,
+    /// Every blueprint this emulator holds, keyed by its name.
+    ///
+    /// Per account and beside the catalog tree, like crawlers and workflows:
+    /// `GetBlueprint`, `UpdateBlueprint` and `DeleteBlueprint` address a blueprint by
+    /// `Name` alone, with no `CatalogId` member, and `ListBlueprints` "lists all the
+    /// blueprint names in an account". Ordered, so that listing has one deterministic
+    /// order to page over. The key is the name exactly as sent — the model documents no
+    /// case fold for a blueprint name, whose pattern (`^[\.\-_A-Za-z0-9]+$`) admits both
+    /// cases and so distinguishes them.
+    pub blueprints: BTreeMap<String, BlueprintEntry>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -4328,6 +4346,28 @@ impl CustomEntityTypeEntry {
             context_words: self.context_words.clone(),
         }
     }
+}
+
+/// A stored blueprint: the reusable workflow template a blueprint create registers.
+///
+/// Only what every caller of this record can already observe is held: the name a
+/// blueprint is addressed by, and the `Tags` a create carried, which is what
+/// `ListBlueprints` narrows its answer by. The rest of the modelled `Blueprint` shape —
+/// the S3 location, the description, the status — belongs to the operations that write and
+/// report it, so each is added here by the operation that needs it rather than ahead of it.
+#[derive(Debug, Clone)]
+pub struct BlueprintEntry {
+    /// The blueprint's name, which is also its key in
+    /// [`ComAmazonawsGlueAwsglueState::blueprints`].
+    pub name: String,
+    /// The tags the blueprint was registered with, which the modelled `Blueprint` shape
+    /// does not carry.
+    ///
+    /// Kept because `ListBlueprints` "filters the list by an Amazon Web Services resource
+    /// tag", so they decide which blueprints a filtered listing reports. NOT yet reachable
+    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`]
+    /// gives: [`TaggedResourceKind`] carries no blueprint variant yet.
+    pub tags: HashMap<String, String>,
 }
 
 /// How many integration resource property ids this process has minted.

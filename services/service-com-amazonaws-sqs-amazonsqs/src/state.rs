@@ -69,6 +69,17 @@
 //! purge is remembered, so a further purge inside [`PURGE_QUEUE_INTERVAL`] of it is
 //! refused ([`Queue::purge_in_progress`]).
 //!
+//! # Dead-letter redrive
+//!
+//! A queue whose `RedrivePolicy` names a dead-letter target only lets a message be
+//! delivered as many times as that policy's count allows: once a message has had them
+//! all, the next receive on that queue moves it to the target queue instead of handing it
+//! over again ([`ComAmazonawsSqsAmazonsqsState::dead_letter_due`], over
+//! [`Queue::dead_letter_target`]). The message keeps its identity and its receive count —
+//! it is the same message in another queue — and is visible there at once, so the source
+//! queue's `ApproximateNumberOfMessages` falls as the target's rises and the move task
+//! below has something to drive back.
+//!
 //! # Message movement tasks
 //!
 //! `StartMessageMoveTask` takes the messages a dead-letter queue can hand out and puts
@@ -813,7 +824,18 @@ pub struct StoredMessage {
     /// passes it.
     pub invisible_until: Option<SystemTime>,
     /// How many times the message has been handed to a consumer without being deleted.
+    /// Counted across every queue that has held it — "the number of times a message has
+    /// been received across all queues but not deleted" (`ApproximateReceiveCount`) — so
+    /// a message that changes queue keeps it.
     pub receive_count: u32,
+    /// How many times the queue HOLDING this message has handed it to a consumer, which
+    /// is what its `RedrivePolicy` bounds: `maxReceiveCount` is "the number of times a
+    /// message is delivered to the source queue before being moved to the dead-letter
+    /// queue". A message that enters another queue starts that queue's count afresh,
+    /// because the deliveries it had elsewhere were not deliveries of this queue — which
+    /// is what lets a message driven back out of a dead-letter queue be processed again
+    /// rather than dead-lettered on sight.
+    pub queue_receive_count: u32,
     /// When it was first handed to a consumer.
     pub first_received_at: Option<SystemTime>,
     /// When it was LAST handed to a consumer, which is the instant the receipt handle
@@ -1046,6 +1068,26 @@ impl Queue {
     /// force for.
     pub fn policy(&self) -> Option<&str> {
         self.attributes.get(POLICY).map(String::as_str)
+    }
+
+    /// Where this queue's messages are dead-lettered and after how many deliveries: the
+    /// `QueueName` its `RedrivePolicy` names in `deadLetterTargetArn` and that policy's
+    /// `maxReceiveCount`, or `None` for a queue carrying no such policy.
+    ///
+    /// The count is "the number of times a message is delivered to the source queue
+    /// before being moved to the dead-letter queue", so a policy that names a target but
+    /// no count configures no dead-lettering: there is no number of deliveries to pass.
+    /// The policy is parsed once for both members, because a receive asks this of its
+    /// queue on every poll.
+    ///
+    /// The target ARN is read in THIS queue's own region, exactly as
+    /// [`ComAmazonawsSqsAmazonsqsState::dead_letter_source_queue_names`] reads it: a
+    /// redrive link never crosses a region, so an ARN naming another region's queue names
+    /// no dead-letter target of this one.
+    pub fn dead_letter_target(&self) -> Option<(String, u32)> {
+        let policy = parsed_redrive_policy(self.attributes.get(REDRIVE_POLICY)?)?;
+        let target = queue_name_from_arn(redrive_target_arn(&policy)?, &self.region)?.to_string();
+        Some((target, redrive_max_receive_count(&policy)?))
     }
 
     /// The customer master key this queue's messages are encrypted under, or `None` for
@@ -1900,6 +1942,131 @@ impl ComAmazonawsSqsAmazonsqsState {
             .collect()
     }
 
+    /// Move every message of the queue called `source_queue_name` that has had all the
+    /// deliveries its `RedrivePolicy` allows onto the dead-letter queue that policy
+    /// names, and answer how many moved.
+    ///
+    /// `maxReceiveCount` is "the number of times a message is delivered to the source
+    /// queue before being moved to the dead-letter queue" (the `RedrivePolicy`
+    /// attribute's own documentation), so a message the source queue has already handed
+    /// over that many times is not handed over again: it is moved to
+    /// `deadLetterTargetArn` and is visible there at once, which is what makes the source
+    /// queue's depth fall as the dead-letter queue's rises. A message currently IN FLIGHT
+    /// with a consumer is left alone — its consumer may still delete it, and its delivery
+    /// is the one being counted — as is one whose delay has not elapsed, which has never
+    /// been delivered at all.
+    ///
+    /// The message keeps its id, body, attributes and receive count: it is the same
+    /// message in another queue, and the count is of receives "across all queues". The
+    /// deliveries the queue it LEFT made are not deliveries of the queue it arrives in,
+    /// so the per-queue count its new queue's own `RedrivePolicy` bounds starts afresh.
+    /// It keeps the instant it was SENT too, because "the expiration of a message is
+    /// always based on its original enqueue timestamp" — being dead-lettered does not buy
+    /// a message a fresh retention period. The receipt handles the source queue minted
+    /// for it go with the message leaving that queue, exactly as they do when a message
+    /// movement task takes it: a handle is only ever valid for the queue that minted it.
+    ///
+    /// Putting messages into the dead-letter queue is bounded like every other path that
+    /// adds messages to a queue (see [`Queue::batch_rejection`]); a message the target
+    /// queue cannot take stays where it is rather than being dropped, so no message a
+    /// client was told had been accepted is lost. Each message is judged on its own here
+    /// rather than as the all-or-nothing batch that helper's other callers pass it,
+    /// because these messages are moved one delivery at a time and nothing ties them
+    /// together: a message the target cannot take is simply handed over again later.
+    ///
+    /// Both queues are the ones `region` holds: a redrive link never crosses a region
+    /// (see [`Queue::dead_letter_target`]).
+    pub fn dead_letter_due(
+        &mut self,
+        region: &str,
+        source_queue_name: &str,
+        now: SystemTime,
+    ) -> usize {
+        let source_key = queue_key(region, source_queue_name);
+        let Some((target_name, max_receive_count)) = self
+            .queues
+            .get(&source_key)
+            .and_then(Queue::dead_letter_target)
+        else {
+            return 0;
+        };
+        let target_key = queue_key(region, &target_name);
+        // A queue that drives its messages to itself, or to a queue this store does not
+        // hold, has nowhere to move them to.
+        if target_key == source_key || !self.queues.contains_key(&target_key) {
+            return 0;
+        }
+        let Some(source) = self.queues.get(&source_key) else {
+            return 0;
+        };
+        let exceeded: Vec<(String, usize)> = source
+            .messages
+            .iter()
+            .filter(|message| {
+                message.visibility(now) == Visibility::Visible
+                    && message.queue_receive_count >= max_receive_count
+            })
+            .map(|message| (message.message_id.clone(), message.retained_bytes()))
+            .collect();
+        if exceeded.is_empty() {
+            return 0;
+        }
+
+        // The bytes leave the source queue as they reach the dead-letter one, so the
+        // store-wide budget is judged on what the move would leave behind.
+        let store_bytes = self.retained_message_bytes();
+        let mut moving: BTreeSet<String> = BTreeSet::new();
+        if let Some(target) = self.queues.get(&target_key) {
+            let mut bytes = 0usize;
+            for (message_id, message_bytes) in &exceeded {
+                let total = bytes.saturating_add(*message_bytes);
+                if target
+                    .batch_rejection(
+                        moving.len().saturating_add(1),
+                        total,
+                        store_bytes.saturating_sub(total),
+                    )
+                    .is_none()
+                {
+                    bytes = total;
+                    moving.insert(message_id.clone());
+                }
+            }
+        }
+
+        let mut moved: Vec<StoredMessage> = Vec::with_capacity(moving.len());
+        if let Some(source) = self.queues.get_mut(&source_key) {
+            let mut staying: VecDeque<StoredMessage> = VecDeque::new();
+            for message in std::mem::take(&mut source.messages) {
+                if moving.contains(&message.message_id) {
+                    source.handles.retain(|_, id| *id != message.message_id);
+                    moved.push(message);
+                } else {
+                    staying.push_back(message);
+                }
+            }
+            source.messages = staying;
+        }
+        let count = moved.len();
+        if let Some(target) = self.queues.get_mut(&target_key) {
+            for message in moved {
+                target.messages.push_back(StoredMessage {
+                    // "SQS moves the message to the dead-letter queue", where a consumer
+                    // of that queue can take it: it is deliverable from the move, and no
+                    // movement task owes it.
+                    available_at: now,
+                    invisible_until: None,
+                    moved_by_task: None,
+                    // The deliveries it had from the queue it has left are not deliveries
+                    // of this one; its cross-queue `receive_count` is untouched.
+                    queue_receive_count: 0,
+                    ..message
+                });
+            }
+        }
+        count
+    }
+
     /// The message movement task that is still running for the queue called
     /// `source_queue_name` in `region` at `now`, if any: "Only one active message movement
     /// task is supported per queue at any given time" (`StartMessageMoveTask`) — and the
@@ -2095,12 +2262,12 @@ impl ComAmazonawsSqsAmazonsqsState {
     ///
     /// Every member is PROJECTED from the task record and `now`, the way
     /// [`Queue::reported_attributes`] projects a queue's reported attributes: the status
-    /// and both `ApproximateNumberOfMessages*` counts are functions of the record and the
-    /// clock, and each ARN is the one the queue record itself reports, so two readers
-    /// cannot disagree about a task and nothing stores a progress value it would have to
-    /// keep up to date. `FailureReason` is left unset because no task this store records
-    /// can fail: it takes its messages when it starts, and a status it never reaches owes
-    /// no reason.
+    /// and the moved count are functions of the record and the clock, the to-move count
+    /// is the size the task was started over, and each ARN is the one the queue record
+    /// itself reports, so two readers cannot disagree about a task and nothing stores a
+    /// progress value it would have to keep up to date. `FailureReason` is left unset
+    /// because no task this store records can fail: it takes its messages when it starts,
+    /// and a status it never reaches owes no reason.
     pub fn reported_message_move_tasks(
         &self,
         region: &str,
@@ -2125,7 +2292,7 @@ impl ComAmazonawsSqsAmazonsqsState {
                 max_number_of_messages_per_second: task.max_number_of_messages_per_second,
                 approximate_number_of_messages_moved: count_as_i64(task.messages_moved(now)),
                 approximate_number_of_messages_to_move: Some(count_as_i64(
-                    task.messages_to_move(now),
+                    task.messages_to_move(),
                 )),
                 failure_reason: None,
                 started_timestamp: epoch_millis_number(task.started_at),
@@ -2305,9 +2472,13 @@ impl MessageMoveTask {
         delivered.min(self.message_count)
     }
 
-    /// How many of this task's messages are still to be delivered at `now`.
-    pub fn messages_to_move(&self, now: SystemTime) -> u64 {
-        self.message_count.saturating_sub(self.messages_moved(now))
+    /// How many messages this task is moving, which is "obtained at the time of starting
+    /// the message movement task" (the `ApproximateNumberOfMessagesToMove` member's own
+    /// documentation): the number the source queue held when the task took them, so it
+    /// does not fall as the task delivers them and a finished task still reports the size
+    /// it was started over.
+    pub fn messages_to_move(&self) -> u64 {
+        self.message_count
     }
 
     /// This task's status at `now`: it runs until the last message it took is
@@ -2342,11 +2513,41 @@ impl MessageMoveTask {
 /// after the value of maxReceiveCount is exceeded" (the `RedrivePolicy` attribute's own
 /// documentation).
 pub fn dead_letter_target_arn(policy: &str) -> Option<String> {
-    ::serde_json::from_str::<::serde_json::Value>(policy)
-        .ok()?
-        .get("deadLetterTargetArn")?
-        .as_str()
-        .map(ToString::to_string)
+    let policy = parsed_redrive_policy(policy)?;
+    redrive_target_arn(&policy).map(ToString::to_string)
+}
+
+/// A `RedrivePolicy` attribute value as the JSON object it is, or `None` for a value that
+/// is not JSON at all. One parse, so a reader wanting both members pays for one.
+fn parsed_redrive_policy(policy: &str) -> Option<::serde_json::Value> {
+    ::serde_json::from_str::<::serde_json::Value>(policy).ok()
+}
+
+/// [`dead_letter_target_arn`] over a policy already parsed.
+fn redrive_target_arn(policy: &::serde_json::Value) -> Option<&str> {
+    policy.get("deadLetterTargetArn")?.as_str()
+}
+
+/// The `maxReceiveCount` a parsed `RedrivePolicy` carries, or `None` when it carries no
+/// usable count.
+///
+/// `maxReceiveCount` is "the number of times a message is delivered to the source queue
+/// before being moved to the dead-letter queue" (the `RedrivePolicy` attribute's own
+/// documentation), so a count of zero or less admits no delivery to count and configures
+/// no dead-lettering. The count is read whether the JSON carries it as a number or as a
+/// string of digits, because this store keeps the attribute value exactly as the caller
+/// supplied it and either spelling says the same thing about the queue.
+fn redrive_max_receive_count(policy: &::serde_json::Value) -> Option<u32> {
+    let count = policy.get("maxReceiveCount")?;
+    count
+        .as_i64()
+        .or_else(|| {
+            count
+                .as_str()
+                .and_then(|raw| raw.trim().parse::<i64>().ok())
+        })
+        .filter(|count| *count > 0)
+        .and_then(|count| u32::try_from(count).ok())
 }
 
 /// The reason a refusal gives for a `deadLetterTargetArn` that is not a queue of the
