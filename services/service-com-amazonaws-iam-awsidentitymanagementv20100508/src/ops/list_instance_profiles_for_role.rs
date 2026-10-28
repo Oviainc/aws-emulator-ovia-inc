@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstanceProfilesForRole
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstanceProfilesForRole`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstanceProfilesForRole::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstanceProfilesForRole` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstanceProfilesForRoleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstanceProfilesForRole"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListInstanceProfilesForRoleErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // IAM entity names "are not distinguished by case", so the request's spelling is
+        // folded to the key the role is held under — the same keying `GetRole` resolves a
+        // name through.
+        let role_key = crate::state::name_key(&input.role_name);
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the bindings the account holds and writes nothing.
+        let store = state.lock();
+
+        // The role the request addresses, if the account holds one. The LOOKUP comes first
+        // but the answer to it is withheld until the call has been authorized, because IAM
+        // decides a call against the caller's policies before it reads the resource: a
+        // caller that may not read a role's instance profiles learns that it may not, never
+        // whether that role exists.
+        let held = store.roles.get(&role_key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any profile is reported. The decision is made on the ARN of the
+        // role the request addresses — the held role's own ARN, or, for a name the account
+        // holds no role under, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that role as the
+        // request named it (`role Deployer`) rather than by ARN.
+        let resource = held.map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_INSTANCE_PROFILES_FOR_ROLE,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
+
+        // The profiles reported are those bound to an IAM role the account holds: a name
+        // the account does not hold names no role whose profiles could be reported, which
+        // is the modelled client error this operation declares. That refusal is what
+        // separates "no such role" from the empty list a held role with no binding answers
+        // with.
+        if held.is_none() {
+            return Err(
+                ListInstanceProfilesForRoleErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "The role with name {} cannot be found.",
+                            input.role_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The page resumes strictly after the POSITION the marker names in THIS role's
+        // profile order, so a token this service did not issue while paging this role's
+        // instance profiles is refused rather than read as "start from the beginning". A
+        // token that decodes but names a profile deleted since the previous page is NOT an
+        // error: pagination resumes from the position, and that profile is simply no longer
+        // in the range.
+        let scope = crate::state::role_instance_profiles_marker_scope(&role_key);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    // Neither modelled error fits a token that is not one this service
+                    // issued, so the refusal goes through the crate's generic client-input
+                    // channel (HTTP 400, `ValidationException`).
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued \
+                         for this role's instance profiles",
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        // The account's instance profiles, from the marker's position on, in the one stable
+        // key order every reader of that collection enumerates it in.
+        let tail = store.instance_profiles.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+
+        let mut instance_profiles = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for key in tail
+            // The binding `AddRoleToInstanceProfile` wrote is what makes a profile one of
+            // this role's: the profile record holds the role's KEY, so the selection is
+            // made on that key rather than on any name a request happened to spell.
+            .filter(|(_, profile)| profile.role_keys.iter().any(|bound| bound == &role_key))
+            .map(|(key, _)| key)
+        {
+            if instance_profiles.len() == page_size {
+                // There is at least one more profile holding this role, so the caller needs
+                // another page to see it.
+                is_truncated = true;
+                break;
+            }
+            // The profile as every reader reports it — `Roles` resolved from the roles the
+            // account holds now — minus the attributes a resource-listing operation
+            // withholds (`crate::state::listed_instance_profile`). The report is always
+            // present here: `key` comes from ranging that same map under the lock this read
+            // still holds, and the builder answers `None` only for a key the map does not
+            // carry.
+            if let Some(report) = store.instance_profile_report(key) {
+                instance_profiles.push(crate::state::listed_instance_profile(report));
+                last_key = Some(key.clone());
+            }
+        }
+
+        Ok(ListInstanceProfilesForRoleOutput {
+            // "If there are none, the operation returns an empty list" — the member is
+            // required, and empty is that answer.
+            instance_profiles,
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key
+                        .as_deref()
+                        .map(|key| crate::state::encode_marker(&scope, key))
+                })
+                .flatten(),
+        })
     }
 }
