@@ -45,6 +45,13 @@
 //! * Any other path — that API's own not-found answer; a path it serves called with a
 //!   method it does not — its method-not-allowed answer.
 //!
+//! A write through this API is a change applied to the environment's own metadata, so it
+//! needs an environment a change can be applied to: a record whose teardown has already
+//! started still answers a read but takes no write
+//! ([`crate::state::EnvironmentRecord::accepts_change`]), so a non-`GET` call against one
+//! is refused with `ValidationException` (HTTP 400) and nothing is written, while a `GET`
+//! is served for as long as the record is there.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -238,6 +245,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let call = Call::new(&input);
+        // A call that asks Apache Airflow to CHANGE something is a change applied to this
+        // environment's own metadata database, so it needs an environment a change can be
+        // applied to: a record whose teardown has already started still answers a read but
+        // takes no write ([`crate::state::EnvironmentRecord::accepts_change`]), and the
+        // write is refused — with the sentence that one rule words — before the API serves
+        // it, so nothing is applied to a record the clock is about to remove. A read is
+        // served for as long as the record is there, exactly as the control plane's readers
+        // are.
+        let refusal = call
+            .changes_state()
+            .then(|| environment.change_refusal())
+            .flatten();
+        if let Some(message) = refusal {
+            return Err(InvokeRestApiErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let answer = serve(environment, &call);
         drop(store);
         proxied(answer)
@@ -270,6 +298,18 @@ impl<'r> Call<'r> {
             query: input.query_parameters.as_ref(),
             body: input.body.as_ref(),
         }
+    }
+
+    /// Whether this call asks the Apache Airflow REST API to CHANGE the environment's
+    /// metadata, rather than to report it.
+    ///
+    /// Decided by the method alone, because that is what the method means in that API:
+    /// [`GET`] is its only read — every other method `RestApiMethod` admits
+    /// (`smithy_query(query="shape",shape="RestApiMethod")`: DELETE | GET | PATCH | POST |
+    /// PUT) creates, replaces or removes an entity — so a non-`GET` call is a write
+    /// whichever path it addresses, including one this API does not serve with that method.
+    fn changes_state(&self) -> bool {
+        self.method != GET
     }
 }
 

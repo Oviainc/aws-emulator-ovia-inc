@@ -5,7 +5,8 @@
 //! Besides the state struct itself this module holds the few rules the Support App
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
-//! a caller-supplied `channelRoleArn` must name, and the wording of the failures
+//! a caller-supplied `channelRoleArn` must name, the organization membership an
+//! Organizations-scoped call needs, and the wording of the failures
 //! several operations can answer with — so the operation files
 //! agree on one implementation of each instead of carrying copies that can drift apart.
 
@@ -72,15 +73,83 @@ pub fn derived_slack_workspace_name(team_id: &str) -> String {
     }
 }
 
-/// Whether the single account this emulator presents is an organization's management
-/// or member account, as `RegisterSlackWorkspaceForOrganization` reports it in
-/// `accountType`.
-///
-/// The emulator presents exactly ONE account (`engine::emulator_account_id`), so that
-/// account is the management account of its own organization: there is no second
-/// account for it to be a member of. One of
+/// The `accountType` of an account that MANAGES the organization it is in, as
+/// `RegisterSlackWorkspaceForOrganization` reports it. One of
 /// [`crate::ops::types::ACCOUNT_TYPE_VALUES`].
-pub const ACCOUNT_TYPE: &str = "management";
+pub const ACCOUNT_TYPE_MANAGEMENT: &str = "management";
+
+/// The `accountType` of an account that is a MEMBER of an organization some other
+/// account manages; the other of [`crate::ops::types::ACCOUNT_TYPE_VALUES`].
+pub const ACCOUNT_TYPE_MEMBER: &str = "member";
+
+/// That the Organizations store cannot be reached from this engine AT ALL, which is not
+/// a fact about the account and so is not the conflict a caller is told about: a handler
+/// answers its own modelled server error for it, exactly as it does for this service's
+/// own store being unreachable. Only reachable on an engine that is not the shared
+/// [`::engine::InMemoryEngine`], which the router never mounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrganizationsStoreUnavailable;
+
+/// Which `accountType` the calling account holds in its organization, or `Ok(None)` when
+/// it belongs to no organization in Organizations.
+///
+/// Registering a Slack workspace for the organization is an Organizations-scoped call —
+/// "To call this API, your account must be part of an organization in Organizations"
+/// (`smithy_query(query="doc",shape="RegisterSlackWorkspaceForOrganization")`) — and
+/// whether an account is in an organization, and which account manages that
+/// organization, is state the Organizations control plane owns. So it is READ from that
+/// store through the one shared engine rather than assumed: `Ok(None)` is exactly the
+/// condition the operation's `ConflictException` enumerates ("Call the
+/// RegisterSlackWorkspaceForOrganization API from an Amazon Web Services account that
+/// doesn't belong to an organization"), and when an organization does hold the account
+/// the role follows from that organization's own management account —
+/// [`ACCOUNT_TYPE_MANAGEMENT`] for the account that manages it, [`ACCOUNT_TYPE_MEMBER`]
+/// for one of its other member accounts. A store that cannot be reached at all is told
+/// apart from both, as [`OrganizationsStoreUnavailable`].
+///
+/// A one-directional, guard-free read of another service's store: it takes that store's
+/// lock, holds no other while it does and hands back a copied value, so it is called
+/// with NO guard of this service's own store held. Nothing is written — membership of an
+/// organization is not something the clock makes due.
+pub fn caller_account_type<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Result<Option<&'static str>, OrganizationsStoreUnavailable> {
+    let organizations =
+        ::service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(
+            engine,
+        )
+        .ok_or(OrganizationsStoreUnavailable)?;
+    let organizations = organizations.lock();
+    let Some(organization) = organizations.organization.as_ref() else {
+        return Ok(None);
+    };
+    let caller = ::engine::emulator_account_id();
+    if organization.master_account_id == caller {
+        Ok(Some(ACCOUNT_TYPE_MANAGEMENT))
+    } else if organizations.accounts.contains_key(caller) {
+        Ok(Some(ACCOUNT_TYPE_MEMBER))
+    } else {
+        Ok(None)
+    }
+}
+
+/// The `ConflictException` message for an Organizations-scoped call made by an account
+/// that belongs to no organization.
+///
+/// `ConflictException` enumerates the condition — "Call the
+/// RegisterSlackWorkspaceForOrganization API from an Amazon Web Services account that
+/// doesn't belong to an organization" — and the rule it breaks is the called
+/// operation's own: "To call this API, your account must be part of an organization in
+/// Organizations". The message states the account the emulator presents, so a caller
+/// reads which account is in no organization, and restates that rule for the operation
+/// that was called; `operation` is the caller's `Operation::NAME`.
+pub fn account_not_in_organization_message(operation: &str) -> String {
+    format!(
+        "Account {account} doesn't belong to an organization in Organizations. To call the \
+         {operation} API, your account must be part of an organization in Organizations.",
+        account = ::engine::emulator_account_id()
+    )
+}
 
 /// One stored Slack channel configuration: everything
 /// `CreateSlackChannelConfiguration` was given, after the documented defaults were
