@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The ancestry chain `GetImageAncestry` walks over the parent link of the stored AMIs, and
+// what it refuses. Declared beside `prefix_lists` for the reason the note above gives: the
+// sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its
+// lines.
+#[path = "all/image_ancestry.rs"]
+mod image_ancestry;
 // What `AssociateIpamResourceDiscovery` links, what the IPAM then counts, and what the
 // associate refuses. Declared beside `prefix_lists` for the reason the note above gives: the
 // sorted neighbourhood and the tail of this file are where every new ec2 suite inserts its

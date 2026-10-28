@@ -154,10 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             MAX_STORED_BYTES, MAX_WATERMARKS_PER_IMAGE, WATERMARK_NAME_PUNCTUATION,
-            dry_run_operation, image_id_is_well_formed, image_is_visible, image_watermark_key,
-            invalid_ami_id_malformed, invalid_ami_id_not_found, request_region,
-            require_service_state, resource_limit_exceeded, system_time_to_date_time,
-            watermark_name_is_well_formed,
+            dry_run_operation, image_creation_time, image_id_is_well_formed, image_is_visible,
+            image_watermark_key, invalid_ami_id_malformed, invalid_ami_id_not_found,
+            request_region, require_service_state, resource_limit_exceeded,
+            system_time_to_date_time, watermark_name_is_well_formed,
         };
 
         // "The Region where the watermark was originally attached"
@@ -288,18 +288,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })
     }
-}
-
-/// The `Image$CreationDate` of a stored image as a timestamp, or `None` for an image that
-/// carries none.
-///
-/// The member is an ISO 8601 UTC string on the `Image` shape and a timestamp on
-/// `ImageWatermark$SourceImageCreationTime` ("the creation date of the source AMI, in the
-/// following format: YYYY-MM-DDTHH:MM:SS.ssssss+HH:MM"), so the stored rendering is read
-/// back into the modelled type rather than re-derived from the clock.
-fn image_creation_time(creation_date: Option<&str>) -> Option<::aws_smithy_types::DateTime> {
-    creation_date.and_then(|text| {
-        ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
-            .ok()
-    })
 }

@@ -1,15 +1,43 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImageAncestry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetImageAncestry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the ancestry chain of ONE stored AMI, walked over the parent link
+//! the images in [`crate::state::ComAmazonawsEc2Amazonec2State::images`] carry — this is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetImageAncestry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What it does
+//!
+//! "Retrieves the ancestry chain of the specified AMI, tracing its lineage back to the root
+//! AMI", answering "a list of entries in the AMI ancestry chain, FROM THE SPECIFIED AMI TO
+//! THE ROOT AMI" (`GetImageAncestryResult$ImageAncestryEntries`).
+//!
+//! One entry per AMI of that chain, each "information about a single AMI in the ancestry
+//! chain and its source (parent) AMI" (`ImageAncestryEntry`), read off the stored [`Image`]:
+//! its own id and creation date, its owner alias, and the parent it was created from —
+//! "the ID of the source AMI from which the AMI was created" (`Image$SourceImageId`) with
+//! the Region that parent lives in (`Image$SourceImageRegion`), the pair `DescribeImages`
+//! already reports for the same image. The walk follows that parent link from the AMI the
+//! request names until an image that carries none, which IS the root of the chain, so the
+//! first entry is always the requested AMI and the last the furthest ancestor this account
+//! can see. An id the walk has already reported ends it, so a lineage pointing back at
+//! itself reports each AMI once.
+//!
+//! A reporting operation: it writes NOTHING, an AMI's lineage being fixed when the image is
+//! created and no transition of it being owed by the clock.
+//!
+//! The refusals, in the order they are answered: a value that is not an AMI id at all is
+//! `InvalidAMIID.Malformed`; a `DryRun` request that would have gone on is
+//! `DryRunOperation`, before the lookup, because the flag asks about PERMISSION rather than
+//! about the resource; and a well-formed id the account can see no image for is
+//! `InvalidAMIID.NotFound`.
+//!
+//! Those are the two codes of the crate's shared image-id policy
+//! ([`crate::state::require_visible_image`], malformed before not-found) rather than the
+//! one code the stricter validator a few image operations keep answers
+//! ([`crate::state::require_resolvable_image`]), because no recorded response of THIS
+//! operation shows it among the strict ones. The two checks are made side by side here
+//! instead of through that one helper only because the `DryRun` answer belongs between
+//! them, which is where `AttachImageWatermark` answers the same flag.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +95,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    ComAmazonawsEc2Amazonec2State, account_can_see_image, dry_run_operation, image_creation_time,
+    image_id_is_well_formed, image_is_visible, invalid_ami_id_malformed, invalid_ami_id_not_found,
+    require_service_state,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -135,18 +168,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetImageAncestry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetImageAncestryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetImageAncestry"))
+        // `ctx` carries request metadata only; this operation reads none of it — an AMI's
+        // lineage is a fact of the stored images, not of the Region the call was made in.
+        // The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // Something that is not an AMI id at all is refused BEFORE any lookup, the way
+        // every image-id reader of this crate refuses one.
+        if !image_id_is_well_formed(&input.image_id) {
+            return Err(invalid_ami_id_malformed(&input.image_id));
+        }
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request" (`DryRun`): a question about permission, so it is
+        // answered before the one about the resource, the way `AttachImageWatermark`
+        // answers the same flag.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        // A read, and only a read: the guard is taken to report the lineage the store
+        // holds, so two calls answer the same chain and reporting it cannot change what a
+        // later caller sees.
+        let store = state.lock();
+
+        if !account_can_see_image(&store, &input.image_id) {
+            return Err(invalid_ami_id_not_found(&input.image_id));
+        }
+
+        Ok(GetImageAncestryOutput {
+            image_ancestry_entries: Some(ancestry_entries(&store, &input.image_id)),
+        })
+    }
+}
+
+/// The ancestry chain of `image_id`: one [`ImageAncestryEntry`] per AMI "from the specified
+/// AMI to the root AMI" (`GetImageAncestryResult$ImageAncestryEntries`).
+///
+/// The chain is the parent links the stored images carry: each AMI's own
+/// `Image$SourceImageId` ("the ID of the source AMI from which the AMI was created") names
+/// the next AMI to report, and an AMI that carries none is the ROOT, which ends the chain.
+/// The walk stops at an ancestor this account cannot see ([`image_is_visible`], the crate's
+/// one definition of that question) or that the store no longer holds: the entry for its
+/// CHILD still names it as that child's source — the lineage recorded on the child, which
+/// `DescribeImages` reports for the same image — but no facts of an AMI the caller cannot
+/// read are reported for it.
+///
+/// An id already reported also ends the walk, so lineage that points back at an AMI of the
+/// chain reports each AMI once instead of walking for ever.
+fn ancestry_entries(
+    store: &ComAmazonawsEc2Amazonec2State,
+    image_id: &str,
+) -> Vec<ImageAncestryEntry> {
+    let account = ::engine::emulator_account_id();
+    let mut entries = Vec::new();
+    let mut reported = ::std::collections::BTreeSet::new();
+    let mut next = Some(image_id.to_string());
+    while let Some(current) = next {
+        if !reported.insert(current.clone()) {
+            break;
+        }
+        let Some(image) = store
+            .images
+            .get(&current)
+            .filter(|image| image_is_visible(image, account))
+        else {
+            break;
+        };
+        next = image.source_image_id.clone();
+        entries.push(ancestry_entry(image));
+    }
+    entries
+}
+
+/// One AMI of the chain as `GetImageAncestry` reports it: "information about a single AMI in
+/// the ancestry chain and its source (parent) AMI" (`ImageAncestryEntry`).
+///
+/// Every member is read off the stored [`Image`] member AWS documents it as — "the ID of
+/// this AMI", "the date and time when this AMI was created" (the ISO 8601 rendering read
+/// back into the modelled timestamp by [`image_creation_time`]), "the owner alias … of this
+/// AMI, if one is assigned. Otherwise, the value is `null`", "the ID of the parent AMI" and
+/// "the Amazon Web Services Region of the parent AMI" — so an ancestry report and an image
+/// report cannot disagree about the same AMI, and nothing here is recomputed.
+fn ancestry_entry(image: &Image) -> ImageAncestryEntry {
+    ImageAncestryEntry {
+        image_id: image.image_id.clone(),
+        creation_date: image_creation_time(image.creation_date.as_deref()),
+        image_owner_alias: image.image_owner_alias.clone(),
+        source_image_id: image.source_image_id.clone(),
+        source_image_region: image.source_image_region.clone(),
     }
 }

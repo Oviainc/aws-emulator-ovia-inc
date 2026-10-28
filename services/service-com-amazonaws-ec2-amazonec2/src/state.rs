@@ -15433,6 +15433,23 @@ pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
         .is_some_and(|at| iso8601_is_before(at, &reference))
 }
 
+/// The `Image$CreationDate` of a stored image as the modelled timestamp type, or `None` for
+/// an image that carries none, or one whose stored rendering does not read as an instant.
+///
+/// "The date and time the image was created" is an ISO 8601 UTC STRING on the `Image` shape,
+/// and a TIMESTAMP wherever a report carries the same fact — `ImageWatermark`'s
+/// `SourceImageCreationTime` ("the creation date of the source AMI, in the following format:
+/// YYYY-MM-DDTHH:MM:SS.ssssss+HH:MM") and `ImageAncestryEntry$CreationDate` ("the date and
+/// time when this AMI was created"). Both read the stored rendering back through this ONE
+/// conversion rather than re-deriving the instant from the clock, so no two reports of one
+/// image can disagree about when it was created.
+pub fn image_creation_time(creation_date: Option<&str>) -> Option<::aws_smithy_types::DateTime> {
+    creation_date.and_then(|text| {
+        ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+            .ok()
+    })
+}
+
 /// Refuse a request that named an AMI id the account can see no image for, the way EC2
 /// does: HTTP 400 `InvalidAMIID.NotFound`.
 ///
