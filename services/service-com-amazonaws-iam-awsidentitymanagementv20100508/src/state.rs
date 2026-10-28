@@ -1227,6 +1227,30 @@ pub struct ServiceLastAccessedJob {
     pub completes: ::aws_smithy_types::DateTime,
 }
 
+/// One service-linked role deletion the account has submitted, keyed in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::service_linked_role_deletions`]
+/// by the `DeletionTaskId` the submit answered with.
+///
+/// `DeleteServiceLinkedRole` "submits a service-linked role deletion request and returns
+/// a DeletionTaskId, which you can use to check the status of the deletion", so the
+/// submit records the task and `GetServiceLinkedRoleDeletionStatus` is what reports it.
+/// The record says WHICH role the deletion was submitted for and WHEN it is due, so the
+/// status a read reports is read off the clock rather than invented per read.
+#[derive(Debug, Clone)]
+pub struct ServiceLinkedRoleDeletionTask {
+    /// The key the deleted role was held under
+    /// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::roles`]), which is what
+    /// lets a repeated submit for one role find the task already in flight for it.
+    pub role_key: String,
+    /// The instant the deletion was submitted, which orders the tasks by age for the
+    /// bounded retention [`MAX_RETAINED_SERVICE_LINKED_ROLE_DELETION_TASKS`] states.
+    pub created: ::aws_smithy_types::DateTime,
+    /// The instant the deletion is DUE: until it, a read reports the task
+    /// `IN_PROGRESS`; from it, `SUCCEEDED`. Stored rather than slept for, so a caller
+    /// that polls straight after the submit still sees the deletion in flight.
+    pub completes: ::aws_smithy_types::DateTime,
+}
+
 /// One persisted server certificate: the metadata every operation reports about it,
 /// beside the PEM material a read may hand back.
 ///
@@ -1534,6 +1558,14 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// different resources, read back by different operations: a job id minted for one
     /// names no job of the other.
     pub service_last_accessed_reports: BTreeMap<String, ServiceLastAccessedJob>,
+    /// The service-linked role deletions the account has submitted, keyed by the
+    /// `DeletionTaskId` `DeleteServiceLinkedRole` answered with — the handle
+    /// `GetServiceLinkedRoleDeletionStatus` takes.
+    ///
+    /// `DeleteServiceLinkedRole` is what fills this map and
+    /// `GetServiceLinkedRoleDeletionStatus` is what reports one entry. A finished task
+    /// stays readable, up to [`MAX_RETAINED_SERVICE_LINKED_ROLE_DELETION_TASKS`] of them.
+    pub service_linked_role_deletions: BTreeMap<String, ServiceLinkedRoleDeletionTask>,
     /// Monotonic counter feeding every report job's `JobId`
     /// ([`next_access_report_job_id`](Self::next_access_report_job_id) and
     /// [`next_service_last_accessed_job_id`](Self::next_service_last_accessed_job_id)).
@@ -1541,6 +1573,10 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// ONE counter for both kinds of job, so no two jobs the account ever records can
     /// share an id whichever generate minted them.
     pub report_job_seq: u64,
+    /// Monotonic counter feeding the task-uuid of every service-linked role deletion's
+    /// `DeletionTaskId`
+    /// ([`next_service_linked_role_deletion_task_id`](Self::next_service_linked_role_deletion_task_id)).
+    pub service_linked_role_deletion_seq: u64,
     /// Monotonic counter feeding
     /// [`next_delegation_request_id`](Self::next_delegation_request_id).
     pub delegation_request_id_seq: u64,
@@ -1637,7 +1673,9 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             organization: None,
             organizations_access_reports: BTreeMap::new(),
             service_last_accessed_reports: BTreeMap::new(),
+            service_linked_role_deletions: BTreeMap::new(),
             report_job_seq: 0,
+            service_linked_role_deletion_seq: 0,
             delegation_request_id_seq: 0,
             saml_provider_uuid_seq: 0,
             saml_private_key_id_seq: 0,
@@ -1727,11 +1765,11 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
 
     /// Mint the next Organizations access-report job's `JobId`.
     ///
-    /// Spelled by [`report_job_id`] — unique for the same reason
+    /// Spelled by [`uuid_from_counter`] — unique for the same reason
     /// [`next_user_id`](Self::next_user_id) is, and minted once, then stored with the job.
     pub fn next_access_report_job_id(&mut self) -> String {
         self.report_job_seq += 1;
-        report_job_id(self.report_job_seq)
+        uuid_from_counter(self.report_job_seq)
     }
 
     /// Mint the next service-last-accessed report job's `JobId`.
@@ -1742,7 +1780,60 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// then stored with the job.
     pub fn next_service_last_accessed_job_id(&mut self) -> String {
         self.report_job_seq += 1;
-        report_job_id(self.report_job_seq)
+        uuid_from_counter(self.report_job_seq)
+    }
+
+    /// Mint the `DeletionTaskId` of a deletion submitted for the service-linked role
+    /// `role_name`, which is linked to `service_principal`.
+    ///
+    /// `DeleteServiceLinkedRole$DeletionTaskId` documents the identifier "is returned in
+    /// the format `task/aws-service-role/<service-principal-name>/<role-name>/<task-uuid>`",
+    /// so the id names the role the task was submitted for. The task-uuid is spelled by
+    /// [`uuid_from_counter`] off this account's own counter, so it is unique for the same
+    /// reason [`next_access_report_job_id`](Self::next_access_report_job_id) is and two
+    /// deletions submitted for one role name never share an id. Minted once, then stored
+    /// with the task.
+    pub fn next_service_linked_role_deletion_task_id(
+        &mut self,
+        service_principal: &str,
+        role_name: &str,
+    ) -> String {
+        self.service_linked_role_deletion_seq += 1;
+        format!(
+            "{DELETION_TASK_ID_PREFIX}{service_principal}/{role_name}/{}",
+            uuid_from_counter(self.service_linked_role_deletion_seq)
+        )
+    }
+
+    /// The `DeletionTaskId` of the deletion already in flight for the role keyed by
+    /// `role_key` at `now`, or `None` when the account has no incomplete deletion for it.
+    ///
+    /// `DeleteServiceLinkedRole`: "if you call this operation more than once for the same
+    /// service-linked role and an earlier deletion task is not complete, then the
+    /// DeletionTaskId of the earlier request is returned" — this is the lookup that
+    /// answers which task that is, so a repeated submit records no second task.
+    ///
+    /// One role has at most one deletion in flight, so there is normally one task to find.
+    /// Where a NAME has carried more than one role — a role created again after an earlier
+    /// one's deletion was submitted — the most recently submitted of the incomplete tasks
+    /// is the one the name's current deletion is.
+    pub fn in_flight_service_linked_role_deletion(
+        &self,
+        role_key: &str,
+        now: ::aws_smithy_types::DateTime,
+    ) -> Option<&str> {
+        self.service_linked_role_deletions
+            .iter()
+            .filter(|(_, task)| {
+                task.role_key == role_key
+                    && service_linked_role_deletion_status(task, now)
+                        == DELETION_TASK_STATUS_IN_PROGRESS
+            })
+            .max_by(|(left_id, left), (right_id, right)| {
+                (left.created.secs(), left_id.as_str())
+                    .cmp(&(right.created.secs(), right_id.as_str()))
+            })
+            .map(|(deletion_task_id, _)| deletion_task_id.as_str())
     }
 
     /// Mint the next delegation request's `DelegationRequestId`.
@@ -2638,6 +2729,22 @@ pub fn is_service_linked_role_path(path: &str) -> bool {
     path.starts_with(SERVICE_LINKED_ROLE_PATH_PREFIX)
 }
 
+/// The service principal a role at `path` is linked to, or `None` when `path` is not a
+/// service-linked role's path at all.
+///
+/// The inverse of [`service_linked_role_path`]: that function files the role under
+/// [`SERVICE_LINKED_ROLE_PATH_PREFIX`] followed by the principal, so the principal is
+/// what sits between the prefix and the trailing separator. A path that carries no
+/// principal there is linked to no service, which is why this answers an `Option`:
+/// [`is_service_linked_role_path`] alone says only that the path starts in the reserved
+/// prefix.
+pub fn service_linked_role_principal(path: &str) -> Option<&str> {
+    let service_principal = path
+        .strip_prefix(SERVICE_LINKED_ROLE_PATH_PREFIX)?
+        .trim_end_matches('/');
+    (!service_principal.is_empty()).then_some(service_principal)
+}
+
 /// The one sentence this service states a refused change to a PROTECTED role with — a
 /// role a service links itself to, which "only the service that depends on the
 /// service-linked role can modify or delete … on your behalf"
@@ -2896,6 +3003,113 @@ pub fn service_linked_role_trust_policy(service_principal: &str) -> String {
         }],
     })
     .to_string()
+}
+
+/// What every `DeletionTaskId` starts with: the fixed head of the format
+/// `DeleteServiceLinkedRole$DeletionTaskId` documents the identifier is returned in,
+/// `task/aws-service-role/<service-principal-name>/<role-name>/<task-uuid>`. Its second
+/// segment is the one [`SERVICE_LINKED_ROLE_PATH_PREFIX`] reserves for the roles those
+/// tasks delete.
+pub const DELETION_TASK_ID_PREFIX: &str = "task/aws-service-role/";
+
+/// How many `/`-separated segments follow [`DELETION_TASK_ID_PREFIX`] in a
+/// `DeletionTaskId`: the service principal, the role name and the task uuid. None of the
+/// three can carry a separator of its own — a service principal and a `roleNameType` name
+/// are both spelled without `/`, and the uuid is hex digits and dashes — so a well-formed
+/// id carries exactly this many.
+const DELETION_TASK_ID_SEGMENTS: usize = 3;
+
+/// The lengths of the five hex groups a uuid is spelled in, in order: the 8-4-4-4-12
+/// grouping [`uuid_from_counter`] mints and the `<task-uuid>` tail of a `DeletionTaskId`
+/// therefore carries.
+const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `value` is spelled as a uuid: [`UUID_GROUP_LENGTHS`] groups of hex digits
+/// joined by `-`.
+///
+/// The ONE spelling check, read back by `tests/all/service_linked_role_deletion.rs`
+/// against the ids the mint answers with, so the test and the refusal cannot disagree
+/// about what a uuid is.
+pub fn is_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == UUID_GROUP_LENGTHS.len()
+        && groups
+            .iter()
+            .zip(UUID_GROUP_LENGTHS)
+            .all(|(group, length)| {
+                group.len() == length && group.chars().all(|digit| digit.is_ascii_hexdigit())
+            })
+}
+
+/// Whether `deletion_task_id` is spelled like an identifier this service mints for a
+/// service-linked role deletion ([`DELETION_TASK_ID_PREFIX`]).
+///
+/// A value outside that format names no task the account could ever hold, which is an
+/// invalid input rather than a missing entity — the separation
+/// `GetServiceLinkedRoleDeletionStatus` makes by modelling both errors.
+pub fn is_service_linked_role_deletion_task_id(deletion_task_id: &str) -> bool {
+    let Some(rest) = deletion_task_id.strip_prefix(DELETION_TASK_ID_PREFIX) else {
+        return false;
+    };
+    let segments: Vec<&str> = rest.split('/').collect();
+    segments.len() == DELETION_TASK_ID_SEGMENTS
+        && segments.iter().all(|segment| !segment.is_empty())
+        && segments.last().is_some_and(|uuid| is_uuid(uuid))
+}
+
+/// The `DeletionTaskStatusType` value of a deletion that is submitted but not finished
+/// yet — one of the four values the enum declares
+/// (`smithy_query(query="shape", shape="DeletionTaskStatusType")`).
+pub const DELETION_TASK_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `DeletionTaskStatusType` value of a deletion that is done. See
+/// [`DELETION_TASK_STATUS_IN_PROGRESS`].
+pub const DELETION_TASK_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after the submit a service-linked role deletion is due.
+///
+/// AWS publishes no duration for it — `DeleteServiceLinkedRole` says only that the submit
+/// "returns a DeletionTaskId, which you can use to check the status of the deletion" — so
+/// the span is the emulator's own, the same one this service gives a report job's
+/// generation ([`ACCESS_REPORT_GENERATION_SECONDS`]): short enough for a caller to poll
+/// through, and long enough that a caller reading straight after the submit still sees
+/// the deletion `IN_PROGRESS`, which is the state AWS answers there.
+pub const SERVICE_LINKED_ROLE_DELETION_SECONDS: i64 = 3;
+
+/// How many submitted deletions the account keeps.
+///
+/// A finished task is a record a caller can read again, so it is kept — but not forever:
+/// past this many the oldest are dropped, so repeated submits cannot grow the store
+/// without end. The emulator's own bound, as [`MAX_RETAINED_ACCESS_REPORT_JOBS`] is for a
+/// report job; AWS publishes no retention for a deletion task.
+pub const MAX_RETAINED_SERVICE_LINKED_ROLE_DELETION_TASKS: usize = 100;
+
+/// The `Status` the deletion due at `task.completes` is in at `now`: `IN_PROGRESS` until
+/// that instant, `SUCCEEDED` from it on.
+///
+/// The ONE reading of that clock, shared by the submit (which asks whether an earlier
+/// task for the same role is still in flight) and the read that reports the status, so
+/// the two cannot disagree about one task.
+pub fn service_linked_role_deletion_status(
+    task: &ServiceLinkedRoleDeletionTask,
+    now: ::aws_smithy_types::DateTime,
+) -> &'static str {
+    if now.as_secs_f64() < task.completes.as_secs_f64() {
+        DELETION_TASK_STATUS_IN_PROGRESS
+    } else {
+        DELETION_TASK_STATUS_SUCCEEDED
+    }
+}
+
+/// The message a read of a deletion task the account holds nothing under is refused
+/// with — the `NoSuchEntityException` message, whose fixed text is `The deletion task
+/// with ID ` and ` cannot be found.` around the id the request supplied.
+///
+/// ONE wording, worded as this service words every other missing entity ("The role with
+/// name … cannot be found."), so two reads cannot describe the same missing task
+/// differently.
+pub fn deletion_task_not_found(deletion_task_id: &str) -> String {
+    format!("The deletion task with ID {deletion_task_id} cannot be found.")
 }
 
 /// The `CreateDate` a service-provisioned role reports: the epoch.
@@ -4356,21 +4570,20 @@ fn splitmix64(seq: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// What the LOW word of a 128-bit job id is keyed with, so the two words of one id are
-/// drawn from independent mixes of the same counter rather than repeating it
-/// ([`report_job_id`]). The HIGH word carries all 64 bits of the counter's bijective mix,
-/// which is what makes two distinct counter values yield two distinct ids.
+/// What the LOW word of a 128-bit identifier is keyed with, so the two words of one id
+/// are drawn from independent mixes of the same counter rather than repeating it
+/// ([`uuid_from_counter`]). The HIGH word carries all 64 bits of the counter's bijective
+/// mix, which is what makes two distinct counter values yield two distinct ids.
 const JOB_ID_LOW_WORD_KEY: u64 = 0xA076_1D64_78BD_642F;
 
-/// The `JobId` of the report job at counter position `seq`.
+/// The uuid at counter position `seq`: the 8-4-4-4-12 grouping of 128 bits AWS spells a
+/// uuid-shaped identifier in — `jobIDType`'s exactly 36 characters — built over two
+/// bijectively mixed words of the counter ([`splitmix64`], [`JOB_ID_LOW_WORD_KEY`]).
 ///
-/// `jobIDType` is exactly 36 characters, which is the 8-4-4-4-12 grouping of 128 bits AWS
-/// reports a job id in, so the id is built as that grouping over two bijectively mixed
-/// words of the counter ([`splitmix64`], [`JOB_ID_LOW_WORD_KEY`]).
-///
-/// ONE spelling, shared by every report job the account mints an id for, so a client
-/// cannot tell which generate produced an id from its shape.
-fn report_job_id(seq: u64) -> String {
+/// ONE spelling, shared by every identifier of that shape the account mints (a report
+/// job's `JobId`, the task-uuid inside a service-linked role deletion's
+/// `DeletionTaskId`), so a client cannot tell which call produced an id from its shape.
+fn uuid_from_counter(seq: u64) -> String {
     let high = splitmix64(seq);
     let low = splitmix64(seq ^ JOB_ID_LOW_WORD_KEY);
     format!(
