@@ -71,6 +71,8 @@ mod group_inline_policy_removal;
 mod group_listing;
 #[path = "all/group_membership.rs"]
 mod group_membership;
+#[path = "all/group_membership_removal.rs"]
+mod group_membership_removal;
 #[path = "all/group_membership_writes.rs"]
 mod group_membership_writes;
 #[path = "all/group_policy_listing.rs"]
