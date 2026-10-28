@@ -16,88 +16,16 @@
 //! and breaks a modelled constraint, computed here rather than transcribed: what
 //! the rule says is that the two classes are answered alike, so the readable
 //! refusal is the reference every unreadable one is held to.
+//!
+//! The reference answer, the primed record and the envelope helpers live in
+//! `crate::support`: they are the same for every suite asserting this service's
+//! front-door rule, so none of them is restated here.
 
+use crate::support::{answer, prime, reference_answer, BAD_REQUEST_EXCEPTION, BODY_MEMBERS};
 use crate::wire::{
     build_router, call, get_customizations, update_customizations, update_customizations_bytes,
 };
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
-
-/// The error code this service's front door names for a body it refuses. Not a
-/// shape in this service's model
-/// (`smithy_query(query="operation", operation="UpdateAccountCustomizations")`
-/// declares `AccessDeniedException`, `InternalServerException`,
-/// `ThrottlingException` and `ValidationException`): the refusal happens ahead of
-/// the application layer that owns the modelled errors.
-const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
-
-/// The body members a front-door refusal must NOT name, from
-/// `smithy_query(query="operation", operation="UpdateAccountCustomizations")`.
-const BODY_MEMBERS: &[&str] = &["accountColor", "visibleServices", "visibleRegions"];
-
-/// A body that READS cleanly into the input shape and breaks a modelled
-/// constraint: `accountColor` is an enum of ten values
-/// (`smithy_query(query="shape", shape="AccountColor")`) and this is none of them.
-fn readable_but_refused() -> Value {
-    json!({"accountColor": "chartreuse"})
-}
-
-/// A record to prime state with before a refused request, so "nothing was
-/// written" is an observable claim rather than the absence of one.
-fn primed_record() -> Value {
-    json!({
-        "accountColor": "red",
-        "visibleServices": ["s3", "ec2"],
-        "visibleRegions": ["eu-west-1", "us-east-1"],
-    })
-}
-
-/// The refusal's envelope as a row asserts it: `(status, error-type, `__type`,
-/// `message`)`.
-type Answer = (u16, String, String, String);
-
-/// `(status, error-type, __type, message)` of one response.
-fn answer(status: u16, error_type: &str, body: &Value) -> Answer {
-    (
-        status,
-        error_type.to_string(),
-        body.get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        body.get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-    )
-}
-
-/// Prime the record, so every row below can show it survived.
-async fn prime(router: &MultiServiceRouter) -> Value {
-    let (status, _, body) = update_customizations(router, primed_record()).await;
-    assert_eq!(
-        status, 200,
-        "priming the record must succeed, got {status} ({body})"
-    );
-    body
-}
-
-/// The answer this service gives a body that reads cleanly and breaks a modelled
-/// constraint — the reference every unreadable body is held to.
-async fn reference_answer() -> Answer {
-    let router = build_router();
-    let (status, error_type, body) = update_customizations(&router, readable_but_refused()).await;
-    let reference = answer(status, &error_type, &body);
-    assert_eq!(
-        reference.0, 400,
-        "a body breaking a modelled constraint must be refused with HTTP 400, got {body}"
-    );
-    assert_eq!(
-        reference.1, BAD_REQUEST_EXCEPTION,
-        "a body breaking a modelled constraint must name {BAD_REQUEST_EXCEPTION}, got {body}"
-    );
-    reference
-}
 
 /// A body whose member carries a JSON type the model does not give it never
 /// becomes an input, and is refused exactly as a readable body that breaks a

@@ -225,18 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The Region this cluster LIVES in: the one its ARN was minted in, not the
+        // request's — it is a property of the cluster
+        // (`crate::state::resource_region`). Every Region-qualified value this call
+        // derives for the cluster is derived from it.
+        let cluster_region = state
+            .clusters
+            .get(&input.identifier)
+            .map(|cluster| crate::state::resource_region(&cluster.arn, &region))
+            .unwrap_or_else(|| region.clone());
+
         // A multi-Region configuration's WITNESS Region cannot be the cluster's own
         // Region (this operation's documented constraint), so a request naming it is
         // refused with the modelled 400 and the cluster is left exactly as it was —
         // ahead of the idempotency ledger and the status gate, which decide what to
-        // do with a request whose input is valid in the first place. The cluster's
-        // Region is the one its ARN was minted in, not the request's: it is a
-        // property of the cluster.
-        let cluster_region = state
-            .clusters
-            .get(&input.identifier)
-            .and_then(|cluster| crate::state::arn_region(&cluster.arn))
-            .unwrap_or_else(|| region.clone());
+        // do with a request whose input is valid in the first place.
         if let Err(invalid) = crate::state::validate_witness_region(
             input.multi_region_properties.as_ref(),
             &cluster_region,
@@ -324,10 +327,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // moves BACK to the Amazon-owned key: `encryptionDetails` then reports
         // `AWS_OWNED_KMS_KEY` with no `kmsKeyArn`, and nothing is stored as the
         // cluster's customer key.
+        // A key id or alias expands into a KMS key ARN in the CLUSTER's Region: the
+        // key encrypts this cluster's data, so it is named in the Region the cluster
+        // lives in and not in the one this request was signed for.
         if let Some(kms_encryption_key) = input.kms_encryption_key.as_deref() {
             let customer_key = crate::state::customer_managed_key(Some(kms_encryption_key));
-            cluster.encryption_details =
-                Some(crate::state::encryption_details(&region, customer_key));
+            cluster.encryption_details = Some(crate::state::encryption_details(
+                &cluster_region,
+                customer_key,
+            ));
             cluster.kms_encryption_key = customer_key.map(str::to_string);
         }
         if let Some(multi_region_properties) = input.multi_region_properties {

@@ -34,3 +34,20 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call CreateRouteServerEndpoint and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+`services/service-com-amazonaws-ec2-amazonec2/src/ops/create_route_server_endpoint.rs` is no
+longer a scaffold: the `//! SCAFFOLDED, NOT IMPLEMENTED:` header line is gone and the handler
+resolves the request's `RouteServerId` and `SubnetId` against the store, takes the endpoint's
+VPC off the stored subnet, mints its elastic network interface and an address out of that
+subnet's CIDR block, stores the endpoint in `pending` with the instant the clock owes it
+`available`, replays a repeated `ClientToken` instead of storing a second endpoint, and answers
+the record as stored. The recorded unit `ec2-route-server-error-semantics#task#1` replays green.
+
+This move adds the suite that pins that behaviour rather than one recorded row:
+`services/service-com-amazonaws-ec2-amazonec2/tests/all/create_route_server_endpoint.rs` drives
+the operation end to end over ec2Query with a table of unresolvable ids (both references, each
+EC2 id form, a non-hex suffix, a foreign prefix, an off-length value, a value carrying XML
+metacharacters) asserting status, code, message and that nothing was stored, plus the dry run,
+the idempotency-token replay and the client-token bound, and a create/describe round trip.
+

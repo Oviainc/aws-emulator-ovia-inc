@@ -285,7 +285,7 @@ fn split_shard(
     if status != crate::state::STREAM_ACTIVE {
         return Err(SplitShardErrorModeled::ResourceInUseException(
             ResourceInUseException {
-                message: Some(crate::state::stream_not_active_message(&identifier, status)),
+                message: Some(crate::state::stream_not_active_message(&stream.name, status)),
             },
         )
         .into());

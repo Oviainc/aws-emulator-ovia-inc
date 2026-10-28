@@ -41,6 +41,8 @@ mod campaign_rename;
 mod campaign_resume;
 #[path = "all/campaign_schedule_completion.rs"]
 mod campaign_schedule_completion;
+#[path = "all/campaign_source_update.rs"]
+mod campaign_source_update;
 #[path = "all/campaign_state_batch.rs"]
 mod campaign_state_batch;
 #[path = "all/campaign_stop.rs"]

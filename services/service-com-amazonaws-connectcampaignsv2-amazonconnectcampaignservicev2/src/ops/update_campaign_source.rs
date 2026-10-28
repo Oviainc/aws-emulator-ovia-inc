@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCampaignSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCampaignSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCampaignSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the source of the campaign `{id}` names to the `source` the request carries,
+//! REPLACING whatever that campaign was sourced from: the source is ONE modelled union
+//! (`Source`), so exactly one of its members is in force at a time and the member the
+//! new value does not name is a member the campaign is no longer sourced through. The
+//! source lives on the stored campaign record (`StoredCampaign$source`), which is what
+//! `DescribeCampaign` projects, so this handler writes the store and nothing else: it
+//! keeps no copy of its own.
+//!
+//! Idempotent, as the model declares: the same source sent twice leaves the campaign
+//! exactly as the first call left it.
+//!
+//! A campaign in a terminal lifecycle state takes no further configuration change —
+//! the shared [`crate::state::CampaignState::accepts_configuration_change`] predicate
+//! the sibling configuration updates refuse through — which is what this operation's
+//! modelled `InvalidCampaignStateException` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +178,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCampaignSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCampaignSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCampaignSource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCampaignSourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // One guard spans the lookup and the write, so a concurrent delete of the
+        // campaign itself cannot leave this source on a record no longer in the store.
+        // A campaign is reachable only through the endpoint of the region it was
+        // created in, so the id is resolved in the region this request was signed for
+        // and the write never reaches another region's campaign.
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        let Some(campaign) = store.campaign_mut(&region, &input.id) else {
+            return Err(UpdateCampaignSourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // A campaign in a terminal lifecycle state takes no further configuration
+        // change (see `CampaignState::accepts_configuration_change`), which is what
+        // this operation's `InvalidCampaignStateException` reports. The state is the
+        // one the campaign is at NOW: a campaign whose scheduled run window has
+        // closed has finished, so it is past being reconfigured.
+        let current = campaign.state_at(::std::time::SystemTime::now());
+        if !current.accepts_configuration_change() {
+            return Err(
+                UpdateCampaignSourceErrorModeled::InvalidCampaignStateException(
+                    InvalidCampaignStateException {
+                        state: current.as_wire().to_string(),
+                        message: format!(
+                            "A campaign in state {} cannot be reconfigured",
+                            current.as_wire()
+                        ),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The whole of the operation's effect: the campaign is now sourced from what
+        // the request carried, replacing whatever it held. The source is one union, so
+        // this is a replacement and not a merge: exactly one member is in force, and
+        // the member the new value does not name is one the campaign is no longer
+        // sourced through.
+        campaign.source = Some(input.source);
+
+        Ok(UpdateCampaignSourceOutput)
     }
 }

@@ -338,6 +338,18 @@ impl GraphData {
         Ok(())
     }
 
+    /// Whether this graph holds NOTHING: no nodes and no edges.
+    ///
+    /// Derived from the two maps rather than tracked beside them, so it cannot
+    /// disagree with the data a summary of the graph is computed from. What an
+    /// operation whose documented precondition is an EMPTY target graph decides on
+    /// (see [`graph_not_empty_conflict`]): a graph that was created empty and never
+    /// written to, or whose data a reset carried away, satisfies it; one that came up
+    /// holding a snapshot's capture, or has been written to since, does not.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.edges.is_empty()
+    }
+
     /// Drop every node and edge: the data a graph holds after it is emptied, with
     /// the statistics recomputed `as_of` the instant the caller is emptying it at.
     pub fn clear(&mut self, as_of: SystemTime) {
@@ -2786,6 +2798,28 @@ pub fn graph_state_conflict(action: &str, status: GraphStatus) -> ConflictExcept
         // (`smithy_query(query="shape",shape="ConflictExceptionReason")`), and a status
         // that simply does not permit the transition is not a concurrent modification
         // of the graph, so the member is left absent.
+        reason: None,
+    }
+}
+
+/// The modelled `ConflictException` for an import into a graph that still HOLDS DATA.
+///
+/// `StartImportTask` states two preconditions on the graph it loads into — "The graph
+/// needs to be empty and in the AVAILABLE state"
+/// (`smithy_query(query="doc",shape="StartImportTask")`) — and this is the refusal of the
+/// emptiness half, the sibling of the status half [`graph_state_conflict`] words: a bulk
+/// load FILLS a graph rather than merging into the data it already holds, so a graph
+/// holding any node or edge ([`GraphData::is_empty`]) cannot take one. Worded by the
+/// template this service refuses a precondition with — what it could not do and the
+/// condition that held it back, and no resource identifier, since the graph was addressed
+/// by an identifier the caller sent. Written once here so every operation that needs an
+/// empty target graph words this refusal the same way.
+pub fn graph_not_empty_conflict() -> ConflictException {
+    ConflictException {
+        message: "Unable to start the import task because the graph is not empty.".to_string(),
+        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`, and a
+        // graph that simply holds data is not a concurrent modification of anything, so
+        // the member is left absent — as it is for every other precondition refusal here.
         reason: None,
     }
 }

@@ -1287,6 +1287,22 @@ pub fn arn_region(arn: &str) -> Option<String> {
         .filter(|region| is_arn_region_segment(region))
 }
 
+/// The region a resource ALREADY IN THE STORE lives in: the region of the ARN it
+/// was minted with, with `request_region` only as a fallback for a stored ARN that
+/// carries no region segment [`arn_region`] accepts.
+///
+/// Every region-qualified value a handler derives FOR such a resource — the ARN of
+/// a resource nested under it, a name or an endpoint that fronts it, the KMS key
+/// ARN one of its members expands into — is qualified with this region, not with
+/// the region the request happens to be signed for: the region an ARN was minted
+/// in is part of the resource's identity ([`ArnResource::is_arn_of`]) rather than a
+/// property of the call that reads or changes it. Only the call that MINTS a
+/// resource takes the region from the request, which is then the one its ARN
+/// carries ever after.
+pub fn resource_region(arn: &str, request_region: &str) -> String {
+    arn_region(arn).unwrap_or_else(|| request_region.to_string())
+}
+
 /// Whether `value` is what `ClusterArn`'s pattern accepts for its region segment:
 /// `[a-z0-9-]{1,20}`.
 fn is_arn_region_segment(value: &str) -> bool {
@@ -1334,8 +1350,11 @@ pub fn customer_managed_key(kms_encryption_key: Option<&str>) -> Option<&str> {
 /// Amazon-owned key when there is not — including when the supplied value is the
 /// reserved `AWS_OWNED_KMS_KEY` (see [`customer_managed_key`]).
 ///
-/// `kmsKeyArn` is modelled as an ARN, so a key id or an alias is expanded into
-/// one in the request's own region.
+/// `kmsKeyArn` is modelled as an ARN, so a key id or an alias is expanded into one
+/// in `region` — the region of the CLUSTER whose encryption this describes (see
+/// [`resource_region`]), which for the call that mints the cluster is the request's
+/// own. A key supplied as a full ARN already names its region and is kept as it was
+/// given.
 pub fn encryption_details(region: &str, kms_encryption_key: Option<&str>) -> EncryptionDetails {
     match customer_managed_key(kms_encryption_key) {
         Some(key) => EncryptionDetails {

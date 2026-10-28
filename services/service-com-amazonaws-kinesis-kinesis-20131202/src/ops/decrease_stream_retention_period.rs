@@ -237,15 +237,10 @@ fn decrease_retention_period(
     // retention window anything may change.
     let status = stream.status(now);
     if status != crate::state::STREAM_ACTIVE {
-        let identifier = if identifier.is_empty() {
-            stream.name.clone()
-        } else {
-            identifier
-        };
         return Err(
             DecreaseStreamRetentionPeriodErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(crate::state::stream_not_active_message(&identifier, status)),
+                    message: Some(crate::state::stream_not_active_message(&stream.name, status)),
                 },
             )
             .into(),
