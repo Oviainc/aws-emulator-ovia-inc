@@ -151,12 +151,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Every tag key's and value's length and pattern is a modelled constraint the
-        // centralized walk has already refused anything outside of. The `Tags` map
-        // carries NO modelled length, so the published per-resource maximum is applied
-        // here \u2014 to the set the resource ENDS UP with, which is what the rule bounds \u2014
-        // and neither does any modelled constraint exclude the reserved `aws:` key
-        // namespace, so that rule is applied here too.
+        // Every tag VALUE's length and pattern is a modelled constraint the centralized
+        // walk has already refused anything outside of. A tag KEY's are modelled too,
+        // but the walk never reaches a map's key, so they are applied here
+        // (`crate::state::map_key_rejection`) — first, because a modelled constraint is
+        // what the boundary would have refused the request with before this operation's
+        // own rules ran, and so before the store is consulted. The `Tags` map carries NO
+        // modelled length, so the published per-resource maximum is applied here too —
+        // to the set the resource ENDS UP with, which is what the rule bounds — and
+        // neither does any modelled constraint exclude the reserved `aws:` key
+        // namespace, so that rule is applied here as well.
+        if let Some(why) = crate::state::map_key_rejection(Some(&input.tags), None) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(why),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),

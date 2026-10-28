@@ -27,6 +27,8 @@ mod investigation_group_singleton;
 mod investigation_groups;
 #[path = "all/map_member_refusal_paths.rs"]
 mod map_member_refusal_paths;
+#[path = "all/modelled_map_key_constraints.rs"]
+mod modelled_map_key_constraints;
 #[path = "all/policy_resource_two_step.rs"]
 mod policy_resource_two_step;
 #[path = "all/regional_identifier_resolution.rs"]

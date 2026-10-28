@@ -215,17 +215,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `name`, `roleArn`, `retentionInDays`, `crossAccountConfigurations`' 0..25
-        // length and every string length and pattern on this input are modelled
-        // constraints, so the centralized walk has already refused anything outside
-        // them with a 400 `ValidationException` before this body runs. The `tags` and
-        // `chatbotNotificationChannel` maps and the `tagKeyBoundaries` list carry NO
-        // modelled length, so their bounds are checked here, and so is the one rule
-        // the model cannot express about a cross-account source role.
+        // length and every string length and pattern on a VALUE in this input are
+        // modelled constraints, so the centralized walk has already refused anything
+        // outside them with a 400 `ValidationException` before this body runs. A map
+        // KEY's constraints are modelled too but the walk never reaches them, so they
+        // are applied below. The `tags` and `chatbotNotificationChannel` maps and the
+        // `tagKeyBoundaries` list carry NO modelled length, so their bounds are checked
+        // here, and so is the one rule the model cannot express about a cross-account
+        // source role.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateInvestigationGroupErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
+
+        // The modelled constraints on the KEYS of the `tags` and
+        // `chatbotNotificationChannel` maps are the one class the centralized walk never
+        // reaches, so they are applied here (`crate::state::map_key_rejection`) and
+        // applied FIRST: a modelled constraint is what the boundary would have refused
+        // the request with before any rule of this operation's own ran.
+        if let Some(why) = crate::state::map_key_rejection(
+            input.tags.as_ref(),
+            input.chatbot_notification_channel.as_ref(),
+        ) {
+            return Err(CreateInvestigationGroupErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
 
         // The rules a write's configuration has to satisfy, and the order they are
         // applied in, are single-homed in `crate::state` — the update path applies the

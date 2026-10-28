@@ -33,11 +33,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_smithy_schema::{Schema, ShapeType, TraitMap};
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
 use aws_smithy_schema_server::constraints::{
-    path, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait,
+    path, validate, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait,
 };
 use smithy_server_runtime::{Violation, ViolationKind};
 
@@ -90,11 +92,13 @@ pub const DEFAULT_CLOUD_TRAIL_EVENT_HISTORY_ENABLED: bool = true;
 // The product is therefore finite: at most MAX_INVESTIGATION_GROUPS groups, each
 // carrying at most MAX_TAGS tags, MAX_COLLECTION_ENTRIES tag key boundaries and
 // MAX_COLLECTION_ENTRIES notification channels. Every remaining caller-sized member
-// is already bounded by the model, so the centralized walk refuses it before a
-// handler runs: `crossAccountConfigurations` (0..25), each channel's
+// is bounded by the model: `crossAccountConfigurations` (0..25), each channel's
 // `ChatConfigurationArns` list (1..5) and its SNS topic key (20..2048), each tag key
 // (1..128) and value (1..256), each `tagKeyBoundaries` entry (1..128), `roleArn`
-// (20..2048), `name` (1..512) and the policy document (1..32768).
+// (20..2048), `name` (1..512) and the policy document (1..32768). The centralized
+// walk refuses every one of those BUT a map's KEY, which it never reaches; those are
+// applied by [`map_key_rejection`] instead, so no caller-sized member reaches the
+// store unchecked.
 // ---------------------------------------------------------------------------
 
 /// The most investigation groups one account may hold in one Region.
@@ -658,14 +662,20 @@ fn value_constraints(schema: &Schema) -> Option<&TraitMap> {
     Some(constraints.inner())
 }
 
-/// Every requirement the value shape of the map member `schema` states, each worded
-/// through [`requirement_text`] so a bundled requirement cannot drift from the one a
-/// scalar member's clause states.
+/// Every requirement the value shape of the map member `schema` states, bundled as a
+/// clause lists them.
+fn map_value_requirements(schema: &Schema) -> Vec<String> {
+    requirement_bundle(value_constraints(schema))
+}
+
+/// Every requirement a constraint trait map states, each worded through
+/// [`requirement_text`] so a bundled requirement cannot drift from the one a scalar
+/// member's clause states.
 ///
 /// The order is the one a bundle lists them in: each bound, maximum before minimum,
 /// then the value's character class or value set.
-fn map_value_requirements(schema: &Schema) -> Vec<String> {
-    let Some(traits) = value_constraints(schema) else {
+fn requirement_bundle(traits: Option<&TraitMap>) -> Vec<String> {
+    let Some(traits) = traits else {
         return Vec::new();
     };
     let length = traits
@@ -765,6 +775,196 @@ pub fn validation_exception_message(violations: &[Violation]) -> Option<String> 
         }
     }
     Some(validation_envelope(&clauses))
+}
+
+// ---------------------------------------------------------------------------
+// Map KEYS: the modelled constraints no request boundary applies
+//
+// The centralized constraint walk captures a map entry's KEY as the path segment of
+// that entry's value and returns before any leaf check, so no `@length` and no
+// `@pattern` a map's key shape declares is ever applied there — the walk's own comment
+// in `vendor/smithy-schema-server/src/constraints.rs` says as much. Every modelled
+// constraint on a key shape is therefore applied here, by each operation that accepts
+// the map, before anything is written: a key the model does not admit is otherwise
+// stored and reported back as if the service had accepted it.
+//
+// Nothing about constraint checking is reimplemented. Each key shape is re-declared in
+// the framework's own form — a [`TraitMap`] of [`LengthTrait`]/[`PatternTrait`] hung on
+// a member schema — and the decision is [`validate`], the same walk the request
+// boundary runs, so the Unicode classes a modelled pattern names mean here exactly
+// what they mean there and the requirement a refusal states is worded through
+// [`requirement_text`] like every other clause.
+//
+// A map entry whose VALUE the walk refuses never reaches a handler, so a request
+// breaking a key rule and a value rule at once is refused by the walk's clause alone.
+// ---------------------------------------------------------------------------
+
+/// How a clause states what a map entry's KEY had to satisfy: the key shape's whole
+/// constraint set, bundled at the map member for the same reason a value bundle is
+/// ([`MAP_VALUE_REQUIREMENT_PREFIX`]) — the member is the subject of the clause and one
+/// map may hold many entries that break the rule.
+const MAP_KEY_REQUIREMENT_PREFIX: &str = "Map keys must satisfy constraint: ";
+
+/// This service's Smithy namespace, for the key member schemas below.
+const NAMESPACE: &str = "com.amazonaws.aiops";
+
+/// One map member's KEY shape: the member a clause names, and the key shape's own
+/// modelled constraints as the framework's walk reads them.
+struct MapKeyShape {
+    /// The map member the keys arrived on, which is what a clause names: a key is no
+    /// member of its own, so there is no path below the map to state it at — the same
+    /// rule the value bundle follows.
+    member: &'static str,
+    /// A member schema carrying the key shape's modelled constraints. Its own name is
+    /// never reported.
+    key: &'static Schema,
+}
+
+/// `TagKey`'s modelled constraints, as the model declares them
+/// (`smithy_query(query="shape",shape="Tags")`: the map's key targets `TagKey`,
+/// `@length` 1..128, `@pattern` `^([\p{L}\p{Z}\p{N}_.:/=+\-@]+)$`).
+static TAG_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(1), Some(128))));
+    traits.insert(Box::new(PatternTrait::new(
+        r"^([\p{L}\p{Z}\p{N}_.:/=+\-@]+)$",
+    )));
+    traits
+});
+
+/// The member schema carrying [`TAG_KEY_TRAITS`].
+static M_TAG_KEY: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.aiops#CheckedMapKey$tagKey",
+        NAMESPACE,
+        "tagKey",
+    ),
+    ShapeType::String,
+    "tagKey",
+    0,
+)
+.with_traits(&TAG_KEY_TRAITS);
+
+/// `SNSTopicArn`'s modelled constraints, as the model declares them
+/// (`smithy_query(query="shape",shape="ChatbotNotificationChannel")`: the map's key
+/// targets `SNSTopicArn`, `@length` 20..2048, `@pattern` `^arn:.*$`).
+static SNS_TOPIC_ARN_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(LengthTrait::new(Some(20), Some(2048))));
+    traits.insert(Box::new(PatternTrait::new(r"^arn:.*$")));
+    traits
+});
+
+/// The member schema carrying [`SNS_TOPIC_ARN_TRAITS`].
+static M_SNS_TOPIC_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.aiops#CheckedMapKey$snsTopicArn",
+        NAMESPACE,
+        "snsTopicArn",
+    ),
+    ShapeType::String,
+    "snsTopicArn",
+    0,
+)
+.with_traits(&SNS_TOPIC_ARN_TRAITS);
+
+/// The `tags` map, whose keys every operation that accepts tags judges here.
+static TAGS_KEYS: MapKeyShape = MapKeyShape {
+    member: "tags",
+    key: &M_TAG_KEY,
+};
+
+/// The `chatbotNotificationChannel` map, whose keys a create and an update judge here.
+static CHATBOT_NOTIFICATION_CHANNEL_KEYS: MapKeyShape = MapKeyShape {
+    member: "chatbotNotificationChannel",
+    key: &M_SNS_TOPIC_ARN,
+};
+
+/// The root of the shadow input the walk is driven over. Its member list is empty on
+/// purpose: the walk visits what [`CheckedKey`] WRITES, and a root struct schema
+/// contributes no path segment. The shape id is deliberately one the model does not
+/// declare, so it cannot collide with a modelled shape.
+static CHECKED_MAP_KEY_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "com.amazonaws.aiops#CheckedMapKey",
+        NAMESPACE,
+        "CheckedMapKey",
+    ),
+    ShapeType::Structure,
+    &[],
+);
+
+/// One key written for the validating walk the way the codec writes a string member,
+/// against the member schema whose re-declared constraints the walk is to apply.
+struct CheckedKey<'a> {
+    member: &'static Schema,
+    value: &'a str,
+}
+
+impl SerializableStruct for CheckedKey<'_> {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(self.member, self.value)
+    }
+}
+
+/// Whether `key` satisfies every constraint the key shape `member` carries, decided by
+/// the framework's own constraint walk rather than by character predicates.
+fn satisfies_key_shape(member: &'static Schema, key: &str) -> bool {
+    validate(
+        &CheckedKey {
+            member,
+            value: key,
+        },
+        &CHECKED_MAP_KEY_SCHEMA,
+    )
+    .is_empty()
+}
+
+/// The clause a map member states when any of `keys` is outside its key shape, or
+/// `None` when every one of them satisfies it.
+fn map_keys_clause<'a>(
+    shape: &MapKeyShape,
+    keys: impl IntoIterator<Item = &'a String>,
+) -> Option<String> {
+    keys.into_iter()
+        .any(|key| !satisfies_key_shape(shape.key, key))
+        .then(|| {
+            constraint_clause(
+                shape.member,
+                &format!(
+                    "{MAP_KEY_REQUIREMENT_PREFIX}[{}]",
+                    requirement_bundle(shape.key.traits()).join(", ")
+                ),
+            )
+        })
+}
+
+/// Why the KEYS of the maps a request carries are unacceptable, or `None` when every
+/// one of them satisfies its key shape's modelled constraints.
+///
+/// Every operation that accepts either map applies this one rule — before its own
+/// unmodelled rules, because a modelled constraint is one the boundary would have
+/// refused the request with first — each rendering the returned sentence as its own
+/// modelled `ValidationException`. Pass `None` for a member the operation does not
+/// accept.
+///
+/// The clauses are ordered as the inputs declare the members and counted in the
+/// envelope ([`validation_envelope`]), so a request breaking both members' rules reads
+/// exactly as a boundary refusal of two members does.
+pub fn map_key_rejection(
+    tags: Option<&HashMap<String, String>>,
+    chatbot_notification_channel: Option<&HashMap<String, Vec<String>>>,
+) -> Option<String> {
+    let clauses: Vec<String> = [
+        tags.and_then(|tags| map_keys_clause(&TAGS_KEYS, tags.keys())),
+        chatbot_notification_channel.and_then(|channel| {
+            map_keys_clause(&CHATBOT_NOTIFICATION_CHANNEL_KEYS, channel.keys())
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!clauses.is_empty()).then(|| validation_envelope(&clauses))
 }
 
 /// Why an `encryptionConfiguration` is unacceptable, or `None` when it is fine.
@@ -996,6 +1196,11 @@ pub fn cross_account_configurations_rejection(
 /// disagree about which input is refused nor about which rule reports it.
 ///
 /// Pass `None` for a member the operation does not accept.
+///
+/// The modelled constraints on a map's KEYS are NOT part of this chain:
+/// [`map_key_rejection`] states them, and every operation applies that rule before this
+/// one, because a modelled constraint is what the request boundary would have refused
+/// the request with first.
 pub fn write_configuration_rejection(
     encryption_configuration: Option<&EncryptionConfiguration>,
     cross_account_configurations: Option<&[CrossAccountConfiguration]>,

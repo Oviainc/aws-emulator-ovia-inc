@@ -180,6 +180,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The modelled constraints on the `chatbotNotificationChannel` keys are the one
+        // class the centralized walk never reaches, so they are applied here
+        // (`crate::state::map_key_rejection`) and applied FIRST, exactly as the create
+        // path applies them: a modelled constraint is what the boundary would have
+        // refused the request with before any rule of this operation's own ran.
+        if let Some(why) =
+            crate::state::map_key_rejection(None, input.chatbot_notification_channel.as_ref())
+        {
+            return Err(UpdateInvestigationGroupErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
         // The chain of rules a write's configuration has to satisfy, and the order they
         // are applied in, live in `crate::state` next to the rules they compose — the
         // create path applies the same chain — and the sentence it hands back is
