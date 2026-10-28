@@ -12,7 +12,9 @@
 //! > request shape the model admits can change that answer into a resource-level
 //! > `ResourceNotFoundException` or into a served page; only the account-wide listings that
 //! > report the account's own collection (`ListContacts`, `ListEngagements`) are exempt and
-//! > stay served.
+//! > stay served. The refusal carries one of the two closed-gate wordings — the account's,
+//! > or the one naming the request's own ARN — and WHICH it is follows the resource family
+//! > that ARN names, which `tests/all/account_gate_message.rs` is the suite for.
 //!
 //! What this suite adds to its siblings is the REQUEST dimension. `tests/all/
 //! cold_account_gate.rs` and `tests/all/data_plane_precondition.rs` span the gated
@@ -32,10 +34,9 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_ssmcontacts_ssmcontacts::ops::types::VALIDATION_EXCEPTION_REASON_VALUES;
-use service_com_amazonaws_ssmcontacts_ssmcontacts::state::{
-    AccountReplicationSet, ACCOUNT_NOT_FOUND_MESSAGE,
-};
+use service_com_amazonaws_ssmcontacts_ssmcontacts::state::AccountReplicationSet;
 
+use crate::account_gate_arn_wording::{ACCOUNT_NOT_FOUND, INVALID_RESOURCE_ARN_PREFIX};
 use crate::contact_lifecycle::{error_code, Emulator, ACCOUNT, REGION};
 use crate::contact_updates::{active_replication_set, onboard, set_replication_set};
 
@@ -62,12 +63,15 @@ fn closed_gate_states() -> Vec<(&'static str, Option<AccountReplicationSet>)> {
 // The request catalog
 // ---------------------------------------------------------------------------
 
-/// One row: an operation, a request body, and what the SAME bytes answer once the account
-/// has an active set (the complement that shows the account is what decided).
+/// One row: an operation, a request body, the refusal the closed gate owes it (the resource
+/// ARN it names when that ARN is the one reported, else `None` for the account wording), and
+/// what the SAME bytes answer once the account has an active set (the complement that shows
+/// the account is what decided).
 struct Row {
     case: String,
     operation: &'static str,
     request: Value,
+    reported_arn: Option<String>,
     onboarded_status: u16,
 }
 
@@ -80,29 +84,40 @@ struct Row {
 /// empty string, and whose resource field admits the `/`-joined multi-segment name a contact
 /// channel carries. `TagResource`/`UntagResource` take the looser `AmazonResourceName`
 /// (`length` 1..1011, no pattern), which admits every one of these too.
-fn absent_arns() -> Vec<(&'static str, String)> {
+///
+/// The `bool` is what the closed gate must report for that ARN: `true` for a resource family
+/// reached only through the replication set (a rotation), so the refusal names the ARN;
+/// `false` for one the account resolves without it (a contact, a contact channel), so it
+/// names the account. `tests/all/account_gate_arn_wording.rs` is the suite for that rule;
+/// here it is the expectation each row carries.
+fn absent_arns() -> Vec<(&'static str, String, bool)> {
     vec![
         (
             "a contact ARN in the aws partition",
             format!("arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:contact/never-created"),
+            false,
         ),
         (
             "a contact ARN in the aws-cn partition",
             format!("arn:aws-cn:ssm-contacts:cn-north-1:{ACCOUNT}:contact/never-created"),
+            false,
         ),
         (
             "a rotation ARN in the aws-us-gov partition",
             format!("arn:aws-us-gov:ssm-contacts:us-gov-west-1:{ACCOUNT}:rotation/never-created"),
+            true,
         ),
         (
             "a Region-less contact ARN, which the pattern's Region field admits",
             format!("arn:aws:ssm-contacts::{ACCOUNT}:contact/never-created"),
+            false,
         ),
         (
             "a contact-channel ARN, whose resource field carries two segments",
             format!(
                 "arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:contact-channel/never-created/0123456789ab"
             ),
+            false,
         ),
     ]
 }
@@ -166,12 +181,17 @@ fn update_bodies() -> Vec<(&'static str, Value)> {
 fn gated_rows() -> Vec<Row> {
     let mut rows = Vec::new();
 
-    for (arn_case, arn) in absent_arns() {
+    for (arn_case, arn, reports_the_arn) in absent_arns() {
+        // `ResourceARN` names a contact OR a rotation, so the family the VALUE spells is
+        // what words its refusal; `ContactId` names a contact whatever ARN is sent in it,
+        // so `UpdateContact` is refused about the account throughout.
+        let reported_arn = reports_the_arn.then(|| arn.clone());
         for (tags_case, tags) in tag_lists() {
             rows.push(Row {
                 case: format!("TagResource with {tags_case} on {arn_case}"),
                 operation: "TagResource",
                 request: json!({"ResourceARN": arn, "Tags": tags}),
+                reported_arn: reported_arn.clone(),
                 onboarded_status: 404,
             });
         }
@@ -180,6 +200,7 @@ fn gated_rows() -> Vec<Row> {
                 case: format!("UntagResource with {keys_case} on {arn_case}"),
                 operation: "UntagResource",
                 request: json!({"ResourceARN": arn, "TagKeys": keys}),
+                reported_arn: reported_arn.clone(),
                 onboarded_status: 404,
             });
         }
@@ -192,6 +213,7 @@ fn gated_rows() -> Vec<Row> {
                 case: format!("UpdateContact with {update_case} on {arn_case}"),
                 operation: "UpdateContact",
                 request,
+                reported_arn: None,
                 onboarded_status: 404,
             });
         }
@@ -228,6 +250,7 @@ fn gated_rows() -> Vec<Row> {
             case: format!("ListRotations with {case}"),
             operation: "ListRotations",
             request,
+            reported_arn: None,
             onboarded_status: 200,
         });
     }
@@ -235,11 +258,13 @@ fn gated_rows() -> Vec<Row> {
     rows
 }
 
-/// The account-level refusal, asserted as a class rather than as a transcript: HTTP 400,
-/// the error code `ValidationException`, a `Message` that reports the ACCOUNT (read from the
-/// crate's own constant, not copied), a `Reason` inside the modelled value set and a present
-/// but empty `Fields`, because no member of the request is at fault.
-fn assert_account_refusal(case: &str, status: u16, body: &Value) {
+/// The closed gate's refusal, asserted as a class rather than as a transcript: HTTP 400,
+/// the error code `ValidationException`, a `Reason` inside the modelled value set, a present
+/// but empty `Fields` because no member of the request is at fault, and EXACTLY the message
+/// the row expects — the one naming `reported_arn` when the request addressed a resource
+/// reached only through the replication set, else the account's (read from the crate's own
+/// constant, not copied).
+fn assert_closed_gate_refusal(case: &str, status: u16, body: &Value, reported_arn: Option<&str>) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected the account precondition to answer HTTP 400, got {status} \
@@ -252,10 +277,14 @@ fn assert_account_refusal(case: &str, status: u16, body: &Value) {
         error_code(body)
     );
     let message = body["Message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(ACCOUNT_NOT_FOUND_MESSAGE),
-        "case {case:?}: expected the account-level refusal {ACCOUNT_NOT_FOUND_MESSAGE:?}, got \
-         {message:?} in {body:?}"
+    let expected = reported_arn.map_or_else(
+        || ACCOUNT_NOT_FOUND.to_string(),
+        |arn| format!("{INVALID_RESOURCE_ARN_PREFIX}{arn}"),
+    );
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected the closed-gate refusal {expected:?}, got {message:?} in \
+         {body:?}"
     );
     let reason = body["Reason"].as_str().unwrap_or_default();
     assert!(
@@ -284,7 +313,7 @@ async fn no_admitted_request_shape_escapes_the_closed_account_gate() {
         for row in gated_rows() {
             let case = format!("{}, {account_case}", row.case);
             let (status, body) = emulator.call(row.operation, row.request.clone()).await;
-            assert_account_refusal(&case, status, &body);
+            assert_closed_gate_refusal(&case, status, &body, row.reported_arn.as_deref());
         }
     }
 }
@@ -309,7 +338,7 @@ async fn the_same_requests_answer_about_their_subject_once_the_account_is_onboar
         );
         let message = body["Message"].as_str().unwrap_or_default();
         assert!(
-            !message.contains(ACCOUNT_NOT_FOUND_MESSAGE),
+            !message.contains(ACCOUNT_NOT_FOUND),
             "case {case:?}: an onboarded account may not be refused by the account gate, got \
              {message:?} in {body:?}"
         );
@@ -370,7 +399,7 @@ async fn a_value_past_a_published_bound_is_refused_on_the_member_not_on_the_acco
             if onboarded {
                 let message = body["Message"].as_str().unwrap_or_default();
                 assert!(
-                    !message.contains(ACCOUNT_NOT_FOUND_MESSAGE),
+                    !message.contains(ACCOUNT_NOT_FOUND),
                     "case {case:?}: an onboarded account's refusal must be about the member, \
                      got {message:?} in {body:?}"
                 );
@@ -464,29 +493,42 @@ async fn a_closed_gate_refuses_a_stored_resource_identically_and_writes_nothing(
         let before = reported(&emulator, &contact).await;
 
         set_replication_set(&emulator, replication_set.clone());
-        for (target_case, target) in [("the stored contact", &contact), ("the stored rotation", &rotation)]
-        {
-            let requests: Vec<(String, &'static str, Value)> = vec![
+        // `ResourceARN` names either a contact or a rotation, so a rotation sent in it is
+        // reported as the ARN it is; `ContactId` names a contact, so `UpdateContact` is
+        // refused about the account whatever ARN is sent in it.
+        for (target_case, target, reports_the_arn) in [
+            ("the stored contact", &contact, false),
+            ("the stored rotation", &rotation, true),
+        ] {
+            let requests: Vec<(String, &'static str, Value, bool)> = vec![
                 (
                     "TagResource".to_string(),
                     "TagResource",
                     json!({"ResourceARN": target, "Tags": [{"Key": "gate", "Value": "closed"}]}),
+                    reports_the_arn,
                 ),
                 (
                     "UntagResource".to_string(),
                     "UntagResource",
                     json!({"ResourceARN": target, "TagKeys": ["team"]}),
+                    reports_the_arn,
                 ),
                 (
                     "UpdateContact".to_string(),
                     "UpdateContact",
                     json!({"ContactId": target, "DisplayName": "renamed-by-a-refused-call"}),
+                    false,
                 ),
             ];
-            for (label, operation, request) in requests {
+            for (label, operation, request, reports_the_arn) in requests {
                 let case = format!("{label} on {target_case}, {account_case}");
                 let (status, body) = emulator.call(operation, request).await;
-                assert_account_refusal(&case, status, &body);
+                assert_closed_gate_refusal(
+                    &case,
+                    status,
+                    &body,
+                    reports_the_arn.then_some(target.as_str()),
+                );
             }
         }
 
@@ -575,7 +617,7 @@ async fn the_exempt_listings_report_their_collections_while_the_rotation_listing
         let (status, body) = emulator
             .call("ListRotations", json!({"RotationNamePrefix": "stocked"}))
             .await;
-        assert_account_refusal(&case, status, &body);
+        assert_closed_gate_refusal(&case, status, &body, None);
         assert!(
             body.get("Rotations").is_none(),
             "case {case:?}: a refusal may not also carry a page, got {body:?}"

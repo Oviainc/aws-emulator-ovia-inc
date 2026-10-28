@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // non-onboarded account is refused identically whether or not its engagement
         // exists.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.engagement_id)
             .map_err(account_precondition_failed)?;
 
         let Some(engagement) = state.engagements.get_mut(&input.engagement_id) else {

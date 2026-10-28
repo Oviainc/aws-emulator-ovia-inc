@@ -10,11 +10,11 @@
 //!
 //! 1. The ACCOUNT-level Incident Manager precondition: while the account has no ACTIVE
 //!    replication set the call is refused with the modelled `ValidationException`
-//!    (HTTP 400), BEFORE the engagement is looked up. The precondition is a fact about the
-//!    ACCOUNT — it has no entry in Incident Manager's registry — so the refusal reports the
-//!    account
-//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
-//!    rather than any member of the request.
+//!    (HTTP 400), BEFORE the engagement is looked up. An engagement is addressed THROUGH
+//!    the account's replication set, so the gate is handed the request's `EngagementId`
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set_for`]):
+//!    with no set there is nothing that ARN could name, and the refusal reports that ARN
+//!    as unresolvable.
 //! 2. The resource lookup: an `EngagementId` the store does not hold is the modelled
 //!    `ResourceNotFoundException` (HTTP 404).
 //!
@@ -198,10 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The account gate comes FIRST, before `EngagementId` is resolved, so a
         // non-onboarded account is refused identically whether or not its engagement
-        // exists — and about its own missing registry entry rather than about anything the
-        // request named.
+        // exists. It is given the ARN the request named, which on an account with no
+        // replication set can name no engagement at all.
         state
-            .require_active_replication_set()
+            .require_active_replication_set_for(&input.engagement_id)
             .map_err(account_precondition_failed)?;
 
         let Some(engagement) = state.engagements.get(&input.engagement_id) else {
@@ -227,9 +227,9 @@ const ENGAGEMENT_RESOURCE_TYPE: &str = "engagement";
 /// which the model classifies `client` with `httpError` 400.
 ///
 /// `reason` carries `OTHER` because the failure is not a member-level one — the request's
-/// `EngagementId` is well formed; what cannot be resolved is the account's registry — and
+/// `EngagementId` is well formed; what cannot be resolved is the resource it names — and
 /// `fields` is present but EMPTY for the same reason. The same shape `UpdateContact`
-/// answers this precondition with.
+/// answers this precondition with, carrying the `message` the shared gate worded.
 fn account_precondition_failed(message: String) -> DescribeEngagementError {
     DescribeEngagementErrorModeled::ValidationException(ValidationException {
         message,

@@ -7,19 +7,24 @@
 //!
 //! > While the account holds no ACTIVE Incident Manager replication set, every
 //! > replication-set-scoped operation of this service is refused with its own modelled
-//! > `ValidationException` (HTTP 400) reporting that the ACCOUNT could not be found for the
-//! > request — one wording for the whole gated surface, decided from the account alone
-//! > before any member of the request is read, so nothing of the request appears in it and
-//! > neither the operation called, nor the resource family its ARN names, nor whether that
-//! > ARN resolves to a stored resource, nor the partition or Region it is written in changes
-//! > it. The wording built FROM a supplied ARN reports a different failure — an ARN that
-//! > names no resource of this service — which only an onboarded account reaches.
+//! > `ValidationException` (HTTP 400), decided from the account alone before any member of
+//! > the request is resolved — so neither the operation called, nor whether the ARN it named
+//! > resolves to a stored resource, nor the partition or Region that ARN is written in
+//! > changes the answer. WHICH of the two wordings the refusal carries follows the resource
+//! > family the request addressed: a rotation and an engagement are reachable only THROUGH
+//! > the replication set, so with no set the ARN naming one resolves to nothing and the
+//! > refusal reports that ARN verbatim ("Invalid value provided - Invalid resource Arn
+//! > <arn>"); a call addressing a contact, a contact channel or a page, or naming no
+//! > resource at all, is refused about the ACCOUNT instead. The family comes from what the
+//! > member names: `RotationId` and `EngagementId` name those two families, while the
+//! > tagging trio's `ResourceARN` names "a resource of this service" — a contact or a
+//! > rotation — so there the family is the one the VALUE spells.
 //!
 //! The sibling suites assert the refusal's CLASS (`tests/all/cold_account_gate.rs`,
 //! `tests/all/data_plane_precondition.rs`, `tests/all/arn_read_precondition.rs`) and that no
 //! admitted request shape escapes it (`tests/all/account_gate_request_shapes.rs`); this one
 //! is about its TEXT, which a client branches on when the error code alone cannot tell it
-//! whether to onboard the account or to create the resource.
+//! whether to onboard the account or to fix the ARN.
 //!
 //! The table spans the gated surface — every operation that consults the precondition — and
 //! three subject flavours: well-formed ARNs nothing created, the same ARNs written in the
@@ -29,10 +34,9 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_ssmcontacts_ssmcontacts::ops::types::VALIDATION_EXCEPTION_REASON_VALUES;
-use service_com_amazonaws_ssmcontacts_ssmcontacts::state::{
-    invalid_resource_arn_message, service_state, AccountReplicationSet, ACCOUNT_NOT_FOUND_MESSAGE,
-};
+use service_com_amazonaws_ssmcontacts_ssmcontacts::state::{service_state, AccountReplicationSet};
 
+use crate::account_gate_arn_wording::{ACCOUNT_NOT_FOUND, INVALID_RESOURCE_ARN_PREFIX};
 use crate::contact_lifecycle::{error_code, Emulator, ACCOUNT, REGION};
 use crate::contact_updates::{active_replication_set, onboard, set_replication_set};
 
@@ -243,20 +247,32 @@ async fn stored_subjects(emulator: &Emulator) -> Subjects {
 // The gated surface, as one table
 // ---------------------------------------------------------------------------
 
-/// One gated request: the operation, the body, and the resource ARN it names (which the
-/// refusal may NOT report) when it names one.
+/// Which of the two closed-gate wordings a request is refused with — the expectation this
+/// suite states per row, from the resource family the request addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wording {
+    /// Reports the ACCOUNT, naming nothing of the request.
+    Account,
+    /// Reports the ARN the request named, verbatim.
+    SubjectArn,
+}
+
+/// One gated request: the operation, the body, the resource ARN it names (when it names
+/// one), and which wording its refusal must carry.
 struct Row {
     operation: &'static str,
     request: Value,
     subject: Option<String>,
+    wording: Wording,
 }
 
 /// Every operation of this service that consults the account-level precondition, driven
 /// against `subjects`.
 ///
-/// The `List*` rows that resolve no resource at all (`ListRotations`) are in the table too:
-/// the wording is the account's, so an operation that names no ARN answers exactly what the
-/// ARN-addressed ones do.
+/// `wording` is stated per row from the family the row's subject belongs to: a rotation or
+/// an engagement is addressed through the replication set, so its refusal names the ARN; a
+/// contact, a contact channel, a page, and a request that resolves no resource at all
+/// (`CreateContact`, `CreateRotation`, `ListRotations`) are refused about the account.
 fn gated_requests(subjects: &Subjects) -> Vec<Row> {
     let contact = &subjects.contact;
     let channel = &subjects.channel;
@@ -280,21 +296,25 @@ fn gated_requests(subjects: &Subjects) -> Vec<Row> {
                 "Plan": {"Stages": []},
             }),
             subject: None,
+            wording: Wording::Account,
         },
         Row {
             operation: "GetContact",
             request: json!({"ContactId": contact}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "UpdateContact",
             request: json!({"ContactId": contact, "DisplayName": "renamed"}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "DeleteContact",
             request: json!({"ContactId": contact}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         // Contact channels.
         Row {
@@ -306,41 +326,49 @@ fn gated_requests(subjects: &Subjects) -> Vec<Row> {
                 "DeliveryAddress": {"SimpleAddress": "refused@example.com"},
             }),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "GetContactChannel",
             request: json!({"ContactChannelId": channel}),
             subject: Some(channel.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "ListContactChannels",
             request: json!({"ContactId": contact}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "UpdateContactChannel",
             request: json!({"ContactChannelId": channel, "Name": "renamed"}),
             subject: Some(channel.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "DeleteContactChannel",
             request: json!({"ContactChannelId": channel}),
             subject: Some(channel.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "ActivateContactChannel",
             request: json!({"ContactChannelId": channel, "ActivationCode": "000000"}),
             subject: Some(channel.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "DeactivateContactChannel",
             request: json!({"ContactChannelId": channel}),
             subject: Some(channel.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "SendActivationCode",
             request: json!({"ContactChannelId": channel}),
             subject: Some(channel.clone()),
+            wording: Wording::Account,
         },
         // On-call rotations and their overrides.
         Row {
@@ -352,26 +380,31 @@ fn gated_requests(subjects: &Subjects) -> Vec<Row> {
                 "Recurrence": recurrence,
             }),
             subject: None,
+            wording: Wording::Account,
         },
         Row {
             operation: "ListRotations",
             request: json!({"RotationNamePrefix": "stored"}),
             subject: None,
+            wording: Wording::Account,
         },
         Row {
             operation: "GetRotation",
             request: json!({"RotationId": rotation}),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "UpdateRotation",
             request: json!({"RotationId": rotation, "Recurrence": recurrence}),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "DeleteRotation",
             request: json!({"RotationId": rotation}),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "CreateRotationOverride",
@@ -382,11 +415,13 @@ fn gated_requests(subjects: &Subjects) -> Vec<Row> {
                 "EndTime": WINDOW_END,
             }),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "GetRotationOverride",
             request: json!({"RotationId": rotation, "RotationOverrideId": override_id}),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "ListRotationOverrides",
@@ -396,11 +431,13 @@ fn gated_requests(subjects: &Subjects) -> Vec<Row> {
                 "EndTime": WINDOW_END,
             }),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "DeleteRotationOverride",
             request: json!({"RotationId": rotation, "RotationOverrideId": override_id}),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         // Engagements and the pages they send.
         Row {
@@ -412,63 +449,77 @@ fn gated_requests(subjects: &Subjects) -> Vec<Row> {
                 "Content": "refused",
             }),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "StopEngagement",
             request: json!({"EngagementId": engagement}),
             subject: Some(engagement.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "DescribeEngagement",
             request: json!({"EngagementId": engagement}),
             subject: Some(engagement.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "ListPagesByEngagement",
             request: json!({"EngagementId": engagement}),
             subject: Some(engagement.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "ListPagesByContact",
             request: json!({"ContactId": contact}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "DescribePage",
             request: json!({"PageId": page}),
             subject: Some(page.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "AcceptPage",
             request: json!({"PageId": page, "AcceptType": "READ", "AcceptCode": "000000"}),
             subject: Some(page.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "ListPageReceipts",
             request: json!({"PageId": page}),
             subject: Some(page.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "ListPageResolutions",
             request: json!({"PageId": page}),
             subject: Some(page.clone()),
+            wording: Wording::Account,
         },
         // Resource policies and tags.
         Row {
             operation: "GetContactPolicy",
             request: json!({"ContactArn": contact}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "PutContactPolicy",
             request: json!({"ContactArn": contact, "Policy": A_POLICY}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
         Row {
             operation: "ListTagsForResource",
             request: json!({"ResourceARN": contact}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
+        // The tagging trio takes any taggable ARN, so the family it names decides the
+        // wording: a rotation here, a contact on its two siblings.
         Row {
             operation: "TagResource",
             request: json!({
@@ -476,11 +527,13 @@ fn gated_requests(subjects: &Subjects) -> Vec<Row> {
                 "Tags": [{"Key": "gate", "Value": "closed"}],
             }),
             subject: Some(rotation.clone()),
+            wording: Wording::SubjectArn,
         },
         Row {
             operation: "UntagResource",
             request: json!({"ResourceARN": contact, "TagKeys": ["team"]}),
             subject: Some(contact.clone()),
+            wording: Wording::Account,
         },
     ]
 }
@@ -499,12 +552,19 @@ fn closed_gate_states() -> Vec<(&'static str, Option<AccountReplicationSet>)> {
     ]
 }
 
-/// The one refusal the closed gate answers with: HTTP 400, the error code
-/// `ValidationException`, a `Message` that is EXACTLY the account-level wording (read from
-/// the crate's own constant rather than copied), a `Reason` inside the modelled value set
-/// and a present but empty `Fields` — and never the wording built from the ARN the request
-/// supplied, which reports a different failure.
-fn assert_account_wording(case: &str, status: u16, body: &Value, subject: Option<&str>) {
+/// The refusal the closed gate answers with: HTTP 400, the error code
+/// `ValidationException`, a `Reason` inside the modelled value set, a present but empty
+/// `Fields`, and exactly the `expected` wording — the account-level one (read from the
+/// crate's own constant rather than copied), or the one that names the request's own ARN
+/// after the fixed text AWS words it with. The other wording must NOT appear, which is what
+/// keeps "onboard this account" and "that ARN names nothing" distinguishable.
+fn assert_gate_wording(
+    case: &str,
+    status: u16,
+    body: &Value,
+    subject: Option<&str>,
+    expected: Wording,
+) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected the account precondition to answer HTTP 400, got {status} \
@@ -516,19 +576,29 @@ fn assert_account_wording(case: &str, status: u16, body: &Value, subject: Option
         error_code(body)
     );
     let message = body["Message"].as_str().unwrap_or_default();
-    if let Some(subject) = subject {
-        assert_ne!(
-            message,
-            invalid_resource_arn_message(subject),
-            "case {case:?}: the account precondition may not be reported as the supplied ARN \
-             being unresolvable, got {message:?} in {body:?}"
-        );
+    match expected {
+        Wording::Account => assert_eq!(
+            message, ACCOUNT_NOT_FOUND,
+            "case {case:?}: expected the account-level refusal {ACCOUNT_NOT_FOUND:?}, \
+             got {message:?} in {body:?}"
+        ),
+        Wording::SubjectArn => {
+            let subject = subject.unwrap_or_else(|| {
+                panic!("case {case:?}: an ARN-worded row must name the ARN it expects reported")
+            });
+            assert_eq!(
+                message,
+                format!("{INVALID_RESOURCE_ARN_PREFIX}{subject}"),
+                "case {case:?}: expected the refusal to report the supplied ARN verbatim, got \
+                 {message:?} in {body:?}"
+            );
+            assert_ne!(
+                message, ACCOUNT_NOT_FOUND,
+                "case {case:?}: a replication-set-scoped ARN may not be refused about the \
+                 account, got {message:?} in {body:?}"
+            );
+        }
     }
-    assert_eq!(
-        message, ACCOUNT_NOT_FOUND_MESSAGE,
-        "case {case:?}: expected the account-level refusal {ACCOUNT_NOT_FOUND_MESSAGE:?}, got \
-         {message:?} in {body:?}"
-    );
     let reason = body["Reason"].as_str().unwrap_or_default();
     assert!(
         VALIDATION_EXCEPTION_REASON_VALUES.contains(&reason),
@@ -538,19 +608,20 @@ fn assert_account_wording(case: &str, status: u16, body: &Value, subject: Option
     assert_eq!(
         body["Fields"].as_array().map(Vec::len),
         Some(0),
-        "case {case:?}: an account-level refusal blames no member, so Fields must be present \
+        "case {case:?}: a precondition refusal blames no member, so Fields must be present \
          and empty, got {body:?}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Rule: one wording for the whole gated surface
+// Rule: one wording per resource family, over the whole gated surface
 // ---------------------------------------------------------------------------
 
 /// Every gated operation, over ARNs nothing created and the same ARNs in the other
-/// partitions, is refused in the SAME words — the account's.
+/// partitions, is refused with the wording its subject's family decides — and the partition
+/// and Region it is written in change nothing.
 #[tokio::test]
-async fn every_gated_operation_reports_the_account_in_the_same_words() {
+async fn every_gated_operation_words_the_refusal_from_the_family_it_addressed() {
     for subjects in [Subjects::absent(), Subjects::absent_in_other_partitions()] {
         for (account_case, replication_set) in closed_gate_states() {
             let emulator = Emulator::fresh();
@@ -562,7 +633,7 @@ async fn every_gated_operation_reports_the_account_in_the_same_words() {
                     row.operation, subjects.case
                 );
                 let (status, body) = emulator.call(row.operation, row.request.clone()).await;
-                assert_account_wording(&case, status, &body, row.subject.as_deref());
+                assert_gate_wording(&case, status, &body, row.subject.as_deref(), row.wording);
             }
         }
     }
@@ -581,7 +652,7 @@ async fn a_stored_subject_is_refused_in_the_same_words_as_an_absent_one() {
         for row in gated_requests(&subjects) {
             let case = format!("{} on {}, {account_case}", row.operation, subjects.case);
             let (status, body) = emulator.call(row.operation, row.request.clone()).await;
-            assert_account_wording(&case, status, &body, row.subject.as_deref());
+            assert_gate_wording(&case, status, &body, row.subject.as_deref(), row.wording);
         }
 
         // Onboarded again, the subjects the refused calls named are all still there: a
@@ -613,16 +684,15 @@ async fn a_stored_subject_is_refused_in_the_same_words_as_an_absent_one() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule: the ARN-resolution refusal is a different failure, and a different wording
+// Rule: a value that is no ARN at all leaves the account wording
 // ---------------------------------------------------------------------------
 
-/// The complement: a value that names no resource of this service IS reported as that value
-/// being an invalid resource ARN — but only on an onboarded account, because the account gate
-/// is decided first. So the two wordings stay distinguishable, which is what lets a client
-/// tell "onboard this account" from "fix this ARN".
+/// The complement: a value that is not an ARN of this service names no resource of any
+/// family, so the closed gate reports the ACCOUNT — and once the account is onboarded the
+/// same bytes are reported as that value being an invalid resource ARN. Both wordings stay
+/// reachable, which is what lets a client tell "onboard this account" from "fix this ARN".
 #[tokio::test]
-async fn the_arn_resolution_refusal_keeps_its_own_wording_and_only_an_onboarded_account_reaches_it()
-{
+async fn a_value_that_is_no_arn_is_refused_about_the_account_until_the_account_is_onboarded() {
     // `ResourceARN` is modelled as an `AmazonResourceName` (length only, no pattern), so a
     // value that is not an ARN at all reaches the handler and the service itself reports it.
     let not_an_arn = "my-contact";
@@ -639,11 +709,12 @@ async fn the_arn_resolution_refusal_keeps_its_own_wording_and_only_an_onboarded_
     ];
 
     for (operation, request) in &requests {
-        // Gate closed: the answer is the account's, not the value's.
+        // Gate closed: the answer is the account's, because the value names no
+        // replication-set-scoped resource.
         let emulator = Emulator::fresh();
         let case = format!("{operation} on a value that is no ARN, account not onboarded");
         let (status, body) = emulator.call(operation, request.clone()).await;
-        assert_account_wording(&case, status, &body, Some(not_an_arn));
+        assert_gate_wording(&case, status, &body, Some(not_an_arn), Wording::Account);
 
         // Gate open: the same bytes are reported as the value being an invalid resource ARN.
         onboard(&emulator);
@@ -656,12 +727,12 @@ async fn the_arn_resolution_refusal_keeps_its_own_wording_and_only_an_onboarded_
         let message = body["Message"].as_str().unwrap_or_default();
         assert_eq!(
             message,
-            invalid_resource_arn_message(not_an_arn),
+            format!("{INVALID_RESOURCE_ARN_PREFIX}{not_an_arn}"),
             "case {case:?}: expected the ARN-resolution refusal naming the supplied value, got \
              {message:?} in {body:?}"
         );
         assert_ne!(
-            message, ACCOUNT_NOT_FOUND_MESSAGE,
+            message, ACCOUNT_NOT_FOUND,
             "case {case:?}: an onboarded account may not be refused about the account, got \
              {message:?} in {body:?}"
         );
