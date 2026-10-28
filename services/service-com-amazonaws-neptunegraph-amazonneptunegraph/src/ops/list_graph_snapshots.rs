@@ -77,8 +77,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-// The token format every listing of this service issues, hosted once in
-// `crate::state` beside the id-space predicates its decode half takes.
+// The page-size resolution and the page-plus-token decision every listing of this
+// service shares, hosted once in `crate::state` beside the token codec and the id-space
+// predicates its decode half takes. Only the id space and the key an entry is ordered
+// by are this listing's own.
+use crate::state::{resolve_page_size, take_page};
+// The token format itself is reached through `take_page`, so only this file's own
+// round-trip test names it.
+#[cfg(test)]
 use crate::state::encode_page_token;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -175,10 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
             None => None,
         };
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .unwrap_or(DEFAULT_PAGE_SIZE);
+        let page_size = resolve_page_size(input.max_results);
 
         // A snapshot lives in exactly one Region, so this listing reports the snapshots
         // of the Region the request was signed for and no others.
@@ -208,21 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `snapshots` is a BTreeMap, so one stable total order underlies every page and
         // a token can name a position in it.
-        let mut remaining = store.snapshots_in(&region, of_graph.as_deref(), start_after.as_deref());
-        let graph_snapshots: Vec<GraphSnapshotSummary> = remaining
-            .by_ref()
-            .take(page_size)
-            .map(GraphSnapshotSummary::from)
-            .collect();
-        // A token only when snapshots remain, and it resumes after the last one
-        // reported, so a resumed page returns the remainder without repeats.
-        let next_token = if remaining.next().is_some() {
-            graph_snapshots
-                .last()
-                .map(|summary| encode_page_token(&summary.id))
-        } else {
-            None
-        };
+        let mut remaining = store
+            .snapshots_in(&region, of_graph.as_deref(), start_after.as_deref())
+            .map(GraphSnapshotSummary::from);
+        let (graph_snapshots, next_token) =
+            take_page(&mut remaining, page_size, |summary| &summary.id);
 
         Ok(Self::Output {
             graph_snapshots,
@@ -231,13 +224,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The page size when `maxResults` is absent: the largest the member allows
-/// (`smithy_query(query="operation",operation="ListGraphSnapshots")` -> `maxResults`
-/// range 1..100), so an unpaginated caller sees as much as one page can carry.
-const DEFAULT_PAGE_SIZE: usize = 100;
-
 /// The snapshot id a token resumes after, or `None` when the token is not one
-/// [`encode_page_token`] produced for the snapshot-id space.
+/// [`crate::state::encode_page_token`] produced for the snapshot-id space.
 ///
 /// Only the id space is this listing's own: the wire format, and the decision to refuse
 /// a value that names no position in that space rather than treat it as the start of the

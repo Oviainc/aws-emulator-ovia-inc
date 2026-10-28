@@ -59,6 +59,8 @@ mod import_task_listing;
 mod import_task_minting;
 #[path = "all/import_task_read.rs"]
 mod import_task_read;
+#[path = "all/listing_paging_rule.rs"]
+mod listing_paging_rule;
 #[path = "all/pagination_token_codec.rs"]
 mod pagination_token_codec;
 #[path = "all/pass_role_authorization.rs"]

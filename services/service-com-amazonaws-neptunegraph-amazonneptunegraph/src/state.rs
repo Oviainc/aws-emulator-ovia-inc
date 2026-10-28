@@ -2355,6 +2355,55 @@ pub fn decode_page_token(token: &str, in_id_space: impl Fn(&str) -> bool) -> Opt
     in_id_space(&decoded).then_some(decoded)
 }
 
+/// The page size a listing serves when `maxResults` is absent: the largest the member
+/// allows (`smithy_query(query="operation",operation="ListGraphs,ListGraphSnapshots,ListImportTasks,ListExportTasks,ListPrivateGraphEndpoints")`
+/// -> `maxResults` range 1..100), so an unpaginated caller sees as much as one page can
+/// carry.
+pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// How many entries one page of a listing reports: the `maxResults` the request carries
+/// when it carries one that a count can hold, else [`DEFAULT_PAGE_SIZE`].
+///
+/// ONE resolution for every paginated listing of this service, hosted beside the token
+/// codec the same listings call, so the page-size rule cannot differ between two of
+/// them. The bound is what keeps the invariant the paging relies on — a page of at least
+/// one entry — so a page can never come back empty while entries remain; the modelled
+/// `maxResults` range 1..100 is refused by the boundary validator before any handler
+/// runs, so no response can differ for it.
+pub fn resolve_page_size(max_results: Option<i32>) -> usize {
+    max_results
+        .and_then(|requested| usize::try_from(requested).ok())
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, DEFAULT_PAGE_SIZE)
+}
+
+/// One page of at most `page_size` entries taken from `entries`, and the `nextToken`
+/// that resumes the listing after it.
+///
+/// ONE paging decision for every paginated listing of this service: a token is minted
+/// only when an entry remains after the page, and it names the LAST entry the page
+/// reports — `key_of` is the stable key that entry is ordered by — so a resumed page
+/// returns the remainder without repeats or omissions. A listing whose entries are
+/// exhausted by the page reports no token, which is what tells a client it has seen
+/// everything.
+///
+/// `entries` is consumed past the page and past the one entry the remainder probe
+/// takes, so a caller that needs the rest of the listing re-builds the iterator from the
+/// token rather than reusing this one.
+pub fn take_page<T, I: Iterator<Item = T>>(
+    entries: &mut I,
+    page_size: usize,
+    key_of: impl Fn(&T) -> &str,
+) -> (Vec<T>, Option<String>) {
+    let page: Vec<T> = entries.by_ref().take(page_size).collect();
+    let next_token = if entries.next().is_some() {
+        page.last().map(|entry| encode_page_token(key_of(entry)))
+    } else {
+        None
+    };
+    (page, next_token)
+}
+
 /// Whether `value` matches the modelled `GraphId` pattern `^g-[a-z0-9]{10}$`.
 ///
 /// Shared by the id generator's own test and by `ListGraphs`, which refuses a

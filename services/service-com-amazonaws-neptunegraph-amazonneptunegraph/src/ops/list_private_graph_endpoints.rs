@@ -76,8 +76,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-// The token format every listing of this service issues, hosted once in
-// `crate::state` beside the id-space predicates its decode half takes.
+// The page-size resolution and the page-plus-token decision every listing of this
+// service shares, hosted once in `crate::state` beside the token codec and the id-space
+// predicates its decode half takes. Only the id space and the key an entry is ordered
+// by are this listing's own.
+use crate::state::{resolve_page_size, take_page};
+// The token format itself is reached through `take_page`, so only this file's own
+// round-trip test names it.
+#[cfg(test)]
 use crate::state::encode_page_token;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -179,16 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
             None => None,
         };
-        // The modelled `maxResults` range 1..100 is refused by the boundary validator
-        // before this handler runs, so reaching here with a value outside it is not
-        // possible; the clamp keeps the invariant the paging below relies on LOCAL — a
-        // page of at least one entry — so a page can never come back empty while
-        // endpoints remain.
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, DEFAULT_PAGE_SIZE);
+        let page_size = resolve_page_size(input.max_results);
 
         let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
@@ -215,21 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The endpoints of a graph are keyed by the VPC id they are addressed by, so one
         // stable total order underlies every page and a token can name a position in it.
-        let mut remaining = store.private_endpoints_of(&graph_id, start_after.as_deref());
-        let page: Vec<&crate::state::PrivateGraphEndpoint> =
-            remaining.by_ref().take(page_size).collect();
-        // A token only when endpoints remain, and it resumes after the last one
-        // reported, so a resumed page returns the remainder without repeats.
-        let next_token = if remaining.next().is_some() {
-            page.last()
-                .map(|endpoint| encode_page_token(&endpoint.vpc_id))
-        } else {
-            None
-        };
-        let private_graph_endpoints: Vec<PrivateGraphEndpointSummary> = page
-            .into_iter()
-            .map(PrivateGraphEndpointSummary::from)
-            .collect();
+        let mut remaining = store
+            .private_endpoints_of(&graph_id, start_after.as_deref())
+            .map(PrivateGraphEndpointSummary::from);
+        let (private_graph_endpoints, next_token) =
+            take_page(&mut remaining, page_size, |endpoint| &endpoint.vpc_id);
 
         Ok(Self::Output {
             private_graph_endpoints,
@@ -238,14 +225,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The page size when `maxResults` is absent: the largest the member allows
-/// (`smithy_query(query="operation",operation="ListPrivateGraphEndpoints")` ->
-/// `maxResults` range 1..100), so an unpaginated caller sees as much as one page can
-/// carry.
-const DEFAULT_PAGE_SIZE: usize = 100;
-
 /// The VPC id a token resumes after, or `None` when the token is not one
-/// [`encode_page_token`] produced for the VPC-id space.
+/// [`crate::state::encode_page_token`] produced for the VPC-id space.
 ///
 /// Only the id space is this listing's own: the wire format, and the decision to refuse
 /// a value that names no position in that space rather than treat it as the start of the

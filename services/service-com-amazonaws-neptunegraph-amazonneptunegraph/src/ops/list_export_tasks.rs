@@ -65,8 +65,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-// The token format every listing of this service issues, hosted once in
-// `crate::state` beside the id-space predicates its decode half takes.
+// The page-size resolution and the page-plus-token decision every listing of this
+// service shares, hosted once in `crate::state` beside the token codec and the id-space
+// predicates its decode half takes. Only the id space and the key an entry is ordered
+// by are this listing's own.
+use crate::state::{resolve_page_size, take_page};
+// The token format itself is reached through `take_page`, so only this file's own
+// round-trip test names it.
+#[cfg(test)]
 use crate::state::encode_page_token;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -163,10 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
             None => None,
         };
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .unwrap_or(DEFAULT_PAGE_SIZE);
+        let page_size = resolve_page_size(input.max_results);
 
         // An export task lives in exactly one Region, so this listing reports the tasks
         // of the Region the request was signed for and no others.
@@ -196,34 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `export_tasks` is a BTreeMap, so one stable total order underlies every page
         // and a token can name a position in it.
-        let mut remaining =
-            store.export_tasks_in(&region, of_graph.as_deref(), start_after.as_deref());
-        let tasks: Vec<ExportTaskSummary> = remaining
-            .by_ref()
-            .take(page_size)
-            .map(ExportTaskSummary::from)
-            .collect();
-        // A token only when tasks remain, and it resumes after the last one reported, so
-        // a resumed page returns the remainder without repeats.
-        let next_token = if remaining.next().is_some() {
-            tasks
-                .last()
-                .map(|summary| encode_page_token(&summary.task_id))
-        } else {
-            None
-        };
+        let mut remaining = store
+            .export_tasks_in(&region, of_graph.as_deref(), start_after.as_deref())
+            .map(ExportTaskSummary::from);
+        let (tasks, next_token) = take_page(&mut remaining, page_size, |summary| &summary.task_id);
 
         Ok(Self::Output { tasks, next_token })
     }
 }
 
-/// The page size when `maxResults` is absent: the largest the member allows
-/// (`smithy_query(query="operation",operation="ListExportTasks")` -> `maxResults`
-/// range 1..100), so an unpaginated caller sees as much as one page can carry.
-const DEFAULT_PAGE_SIZE: usize = 100;
-
 /// The export-task id a token resumes after, or `None` when the token is not one
-/// [`encode_page_token`] produced for the task-id space.
+/// [`crate::state::encode_page_token`] produced for the task-id space.
 ///
 /// Only the id space is this listing's own: the wire format, and the decision to refuse
 /// a value that names no position in that space rather than treat it as the start of the
