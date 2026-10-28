@@ -399,6 +399,72 @@ pub fn too_many_outputs_message() -> String {
 /// output exactly as it was and cannot empty it.
 pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.";
 
+/// Why a supplied output list is not one a feed may hold.
+///
+/// An operation that SETS a feed's whole output list — `CreateFeed` and `UpdateFeed`,
+/// which each REPLACE it — holds the list to three rules: a feed holds at least one
+/// output, an output's name identifies it within the feed, and the list is bounded at
+/// [`MAX_OUTPUTS_PER_FEED`]. Which rules are checked, in which order, and which message
+/// and modelled error class each failure earns are stated ONCE here, so no two setters
+/// can come to disagree about what a feed's outputs may look like. A handler only lifts
+/// the outcome into its own modelled error enum, which is per-operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputListRefusal<'a> {
+    /// The list is EMPTY, so it describes a feed holding no output
+    /// ([`MISSING_OUTPUTS_MESSAGE`]). Reported as the modelled `ValidationException`
+    /// (HTTP 400).
+    MissingOutputs,
+    /// The list names one output twice, under the name carried here — the first one it
+    /// repeats ([`first_duplicate_output_name`]). Reported as the modelled
+    /// `ConflictException` (HTTP 409).
+    DuplicateName(&'a str),
+    /// The list is longer than [`MAX_OUTPUTS_PER_FEED`]. Reported as the modelled
+    /// `ServiceQuotaExceededException` (HTTP 402).
+    TooManyOutputs,
+}
+
+impl OutputListRefusal<'_> {
+    /// The message this refusal is reported with: the one sentence each of the three
+    /// rules has, whichever operation supplied the list.
+    pub fn message(self) -> String {
+        match self {
+            Self::MissingOutputs => MISSING_OUTPUTS_MESSAGE.to_string(),
+            Self::DuplicateName(name) => duplicate_output_name_message(name),
+            Self::TooManyOutputs => too_many_outputs_message(),
+        }
+    }
+}
+
+/// Which refusal, if any, an output list whose entries are named by `names` earns from
+/// the rules every operation that SETS a feed's whole output list holds.
+///
+/// The order is the order the rules are decided in: the SHAPE of the list first (an
+/// empty one describes a feed the service would never hold, whatever else it says),
+/// then a name that is not unique (a property of the request's own values, which an
+/// empty list cannot carry), then the bound on the list the feed would be left holding.
+/// Every outcome is decided from the request alone, so a setter can run this before it
+/// takes the store, and `names` is only walked — the caller still owns the outputs it
+/// goes on to store.
+///
+/// `AssociateFeed` is NOT one of these setters: it APPENDS to the stored list ("New
+/// outputs will be appended"), so an empty list leaves the feed as it was and its bound
+/// is on the stored length plus the appended one, not on the request's own length. It
+/// shares the rule it does share, [`first_duplicate_output_name`].
+pub fn output_list_refusal<'a>(
+    names: impl Iterator<Item = &'a str> + Clone,
+) -> Option<OutputListRefusal<'a>> {
+    if names.clone().next().is_none() {
+        return Some(OutputListRefusal::MissingOutputs);
+    }
+    if let Some(duplicate) = first_duplicate_output_name(names.clone()) {
+        return Some(OutputListRefusal::DuplicateName(duplicate));
+    }
+    if names.count() > MAX_OUTPUTS_PER_FEED {
+        return Some(OutputListRefusal::TooManyOutputs);
+    }
+    None
+}
+
 /// A `FixtureId` the data source does not hold.
 ///
 /// One sentence for every operation that resolves a fixture id — `GetFixture`, and the

@@ -55,6 +55,8 @@ mod fixture_search;
 mod harness;
 #[path = "all/output_config_defaults.rs"]
 mod output_config_defaults;
+#[path = "all/output_list_rule.rs"]
+mod output_list_rule;
 #[path = "all/output_provenance.rs"]
 mod output_provenance;
 #[path = "all/pagination_token_binding.rs"]

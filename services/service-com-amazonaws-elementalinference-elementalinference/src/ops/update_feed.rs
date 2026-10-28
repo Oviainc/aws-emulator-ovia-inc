@@ -226,46 +226,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A feed HOLDS at least one output ("The key contents of the feed is an array of
-        // outputs"; a create "must specify at least one output"), and this PUT sets the
-        // whole list, so a replacement that would leave the stored feed with no output
-        // at all is refused (HTTP 400) rather than stored — the same rule, and the same
-        // sentence, that answers a create with an empty list. The list shape carries no
-        // `@length`, so the boundary validator cannot decide this.
-        if input.outputs.is_empty() {
-            return Err(UpdateFeedErrorModeled::ValidationException(
-                ValidationException {
-                    message: crate::state::MISSING_OUTPUTS_MESSAGE.to_string(),
-                },
-            )
-            .into());
-        }
-
-        // An output's name identifies it within the feed, so a replacement list that
-        // names one output twice describes a feed no output of which is addressable by
-        // name. That is a property of the REQUEST, decided before the feed is resolved
-        // exactly as `AssociateFeed` decides it, and it is the same conflict (HTTP 409).
-        if let Some(duplicate) = crate::state::first_duplicate_output_name(
+        // This PUT SETS the feed's whole output list, so the replacement is held to the
+        // rules every setter of one is held to — a feed holds at least one output ("The
+        // key contents of the feed is an array of outputs"), an output's name identifies
+        // it within the feed, and the list is bounded — and a list that breaks one of
+        // them describes a feed the service would never hold, so it is refused rather
+        // than stored. The list shape carries no `@length`, so the boundary validator
+        // cannot decide any of this and the service's own rules do: which rules, in which
+        // order and with which message live in `crate::state::output_list_refusal`, the
+        // one statement the `CreateFeed` that mints a list goes through too, so neither
+        // can come to disagree with the other. Decided from the REQUEST's own members,
+        // before the lock is taken, so the list this call then walks is at most
+        // `MAX_OUTPUTS_PER_FEED` entries and the stored list it compares against is too;
+        // all this handler adds is the modelled error class each refusal is reported as.
+        if let Some(refusal) = crate::state::output_list_refusal(
             input.outputs.iter().map(|output| output.name.as_str()),
         ) {
-            return Err(UpdateFeedErrorModeled::ConflictException(ConflictException {
-                message: crate::state::duplicate_output_name_message(duplicate),
-            })
-            .into());
-        }
-
-        // A feed's output list is BOUNDED, and this PUT SETS that list, so a
-        // replacement longer than the bound is refused rather than stored — the same
-        // quota, and the same modelled refusal (HTTP 402), that an append past it
-        // earns. Decided from the REQUEST's own length, before the lock is taken, so
-        // the list this call then walks is at most that many entries and the stored
-        // list it compares against is too.
-        if input.outputs.len() > crate::state::MAX_OUTPUTS_PER_FEED {
-            return Err(UpdateFeedErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: crate::state::too_many_outputs_message(),
-                },
-            )
+            let message = refusal.message();
+            return Err(match refusal {
+                crate::state::OutputListRefusal::MissingOutputs => {
+                    UpdateFeedErrorModeled::ValidationException(ValidationException { message })
+                }
+                crate::state::OutputListRefusal::DuplicateName(_) => {
+                    UpdateFeedErrorModeled::ConflictException(ConflictException { message })
+                }
+                crate::state::OutputListRefusal::TooManyOutputs => {
+                    UpdateFeedErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException { message },
+                    )
+                }
+            }
             .into());
         }
 
