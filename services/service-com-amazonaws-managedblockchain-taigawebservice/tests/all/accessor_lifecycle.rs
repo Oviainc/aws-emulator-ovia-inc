@@ -644,9 +644,11 @@ async fn a_repeated_delete_leaves_the_accessor_deleted() {
     }
 }
 
-/// An accessor id nothing minted cannot be deleted: `DeleteAccessor` models
+/// A WELL-FORMED accessor id nothing minted cannot be deleted: `DeleteAccessor` models
 /// `ResourceNotFoundException` (HTTP 404) for "a requested resource doesn't exist", and
-/// the refusal changes no stored accessor.
+/// the refusal changes no stored accessor. An id OUTSIDE the accessor-id space is a
+/// different answer — the modelled `InvalidRequestException` (400) — pinned for every
+/// operation that resolves the member in `not_found_and_malformed_ids`.
 #[tokio::test]
 async fn delete_accessor_refuses_an_id_nothing_holds() {
     let router = new_router();
@@ -657,14 +659,13 @@ async fn delete_accessor_refuses_an_id_nothing_holds() {
     let existing = created.text(&["AccessorId"]);
     let before = get_accessor(&router, &existing).await;
 
-    // Rows span the id shapes a caller can name: an unminted accessor id, another
-    // resource family's id, a one-character id, `ResourceIdString`'s 32-character
-    // maximum, and the stored id with one suffix character changed.
+    // Rows span the well-formed accessor ids this service could have minted and did not:
+    // an all-`Z` body, the first and the last id of the base-32 space, and the stored id
+    // with one body character changed.
     let unknown_ids: &[String] = &[
         "ac-ZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
-        format!("nd-{}", "Y".repeat(26)),
-        "q".to_string(),
-        "z".repeat(32),
+        format!("ac-{}", "A".repeat(26)),
+        format!("ac-{}", "7".repeat(26)),
         format!(
             "ac-{}{}",
             if existing[3..4] == *"A" { "B" } else { "A" },

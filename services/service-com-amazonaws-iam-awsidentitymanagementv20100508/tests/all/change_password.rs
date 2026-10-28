@@ -13,6 +13,13 @@
 //! a new password on next sign-in", which the user has just met; a request that presents
 //! anything else is refused HTTP 403 `AccessDenied` and the password in force survives.
 //!
+//! That refusal is about the PASSWORDS the request carried, not about what its caller is
+//! permitted to do, so it carries one FIXED sentence that covers both the stale old
+//! password and a new password an account policy would not admit, and interpolates
+//! nothing: no principal, no action, no resource, no reason, nothing of the account or
+//! of the request. A client must not be able to read out of it which condition failed,
+//! nor to confuse it with a permissions failure.
+//!
 //! Each test is a TABLE whose rows differ along what the rule generalises over: the
 //! password's length (including both published `passwordType` bounds) and alphabet, the
 //! owning user's name alphabet and case, the reset demand the profile carried, which
@@ -25,7 +32,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::user_lifecycle::{
-    assert_access_denied_message, call, call_signed_by, element, elements, error_code, router,
+    account_id, call, call_signed_by, call_signed_in_region, element, elements, error_code, router,
 };
 
 /// The error code AWS answers a `ChangePassword` whose `OldPassword` is not the password
@@ -201,11 +208,32 @@ async fn profile(router: &MultiServiceRouter, user: &str) -> (u16, String) {
     call(router, "GetLoginProfile", &[("UserName", user)]).await
 }
 
-/// The action the refusal names, and the reason clause closing it, spelled out here
-/// rather than imported from the handler, so a change of either wording fails this
-/// suite instead of following it.
-const ACTION: &str = "iam:ChangePassword";
-const REASON: &str = "because the old password supplied is not the user's current password";
+/// The WHOLE message a refused change carries, spelled out here rather than imported
+/// from the handler, so a change of the wording fails this suite instead of following
+/// it. Every character of it is fixed: the one sentence covers both a presented old
+/// password that is not the one in force and a chosen new password an account password
+/// policy would not admit, which is what keeps a client from reading which of the two
+/// conditions failed.
+const REFUSED_MESSAGE: &str = "Either the new password does not conform to the account \
+     password policy or the old password was incorrect.";
+
+/// Assert a refusal's message is exactly [`REFUSED_MESSAGE`] and discloses nothing:
+/// none of `withheld` — the caller's ARN, the account id, the user's name, the action,
+/// the identity-denial wording — appears anywhere in it, so the refusal tells a caller
+/// neither which condition failed nor anything about the account it addressed.
+fn assert_password_refusal_message(case: &str, actual: &str, withheld: &[&str]) {
+    assert_eq!(
+        actual, REFUSED_MESSAGE,
+        "case {case:?}: expected the fixed refusal sentence, got {actual:?}"
+    );
+    for value in withheld {
+        assert!(
+            !actual.contains(value),
+            "case {case:?}: expected the refusal to disclose nothing, found {value:?} in \
+             {actual:?}"
+        );
+    }
+}
 
 /// The ARN the account holds `user` under, read back through `GetUser` rather than
 /// built here, so an assertion about a refusal's message is made against the value the
@@ -330,17 +358,14 @@ async fn a_change_presenting_the_password_in_force_replaces_it() {
             "case {label:?}: expected {REFUSED_CODE}, got {:?}",
             error_code(&refused)
         );
-        // The refusal is worded from the account's own report of the caller: its ARN
-        // (which carries the account id and the user's path) and the user name in the
-        // case the account stores, which differs from the case this row spelled.
+        // The refusal discloses nothing the account holds about the caller: neither the
+        // ARN it reports for the user (which carries the account id and the user's
+        // path), nor the name, nor the action the call asked for.
         let arn = user_arn(&router, &label, case.stored_name).await;
-        assert_access_denied_message(
+        assert_password_refusal_message(
             &label,
             &element(&refused, "Message"),
-            &arn,
-            ACTION,
-            &format!("user {}", case.stored_name),
-            REASON,
+            &[arn.as_str(), account_id(), case.stored_name, "iam:ChangePassword"],
         );
         assert_no_password(
             &label,
@@ -413,13 +438,10 @@ async fn a_change_presenting_anything_else_is_refused_and_changes_nothing() {
             "case {label:?}: expected {REFUSED_CODE}, got {:?}",
             error_code(&refused)
         );
-        assert_access_denied_message(
+        assert_password_refusal_message(
             label,
             &element(&refused, "Message"),
-            &arn,
-            ACTION,
-            "user Refused",
-            REASON,
+            &[arn.as_str(), account_id(), "Refused", "iam:ChangePassword"],
         );
         assert_no_password(label, &refused, &[held, presented, "N3w-password"]);
 
@@ -586,4 +608,157 @@ async fn the_password_in_force_is_the_one_the_last_write_set() {
         "expected the password the change set to be in force, got {status}: {body}"
     );
     assert_no_password("writes", &body, &[created, updated, changed]);
+}
+
+/// One refused change: a caller the account holds under its own name and path, the
+/// password in force for it, and the value presented instead.
+struct Refusal {
+    case: &'static str,
+    /// The name the user is created with, spanning the `^[\w+=,.@-]+$` alphabet and
+    /// both cases.
+    user: &'static str,
+    /// The path the user lives under, which is what its ARN carries: the root, one
+    /// segment and a nested path.
+    path: &'static str,
+    /// The password `CreateLoginProfile` sets for it.
+    held: String,
+    /// The value the change presents, which is not the one in force.
+    presented: String,
+    /// The Region the request's SigV4 credential scope names — the only place a request
+    /// carries the Region it addressed.
+    region: &'static str,
+}
+
+/// RULE: the refusal's message is built from NOTHING, so it does not vary: whatever the
+/// caller's name, the path its ARN carries, the password in force, the value presented
+/// or the Region the request addressed, every refused change is answered the identical
+/// fixed sentence, and none of those values appears in it.
+#[tokio::test]
+async fn every_refused_change_is_answered_the_identical_fixed_sentence() {
+    let router = router();
+
+    // Rows differing along everything the message could have been built from.
+    let rows = vec![
+        Refusal {
+            case: "the account root path",
+            user: "Rooted",
+            path: "/",
+            held: "S3cret-rooted".to_string(),
+            presented: "N0t-the-password".to_string(),
+            region: "us-east-1",
+        },
+        Refusal {
+            case: "a one-segment path, in another Region",
+            user: "eng_user",
+            path: "/eng/",
+            held: "S3cret-\u{00E9}ng".to_string(),
+            presented: "~".to_string(),
+            region: "eu-west-1",
+        },
+        Refusal {
+            case: "a nested path and the longest password the model admits",
+            user: "sales.west@3",
+            path: "/sales/west/",
+            held: "S3cret-sales".to_string(),
+            // The published maximum length, 128.
+            presented: "Z".repeat(128),
+            region: "ap-southeast-2",
+        },
+        Refusal {
+            case: "a one-character password in force",
+            user: "Tiny+1",
+            path: "/eng/tools/",
+            held: "~".to_string(),
+            presented: "S3cret-tiny".to_string(),
+            region: "us-west-2",
+        },
+        Refusal {
+            case: "the whitespace the password alphabet admits",
+            user: "white=2",
+            path: "/eng/",
+            held: "S3cret\u{0009}white\u{000A}x\u{000D}!".to_string(),
+            presented: "S3cret white x !".to_string(),
+            region: "us-east-1",
+        },
+    ];
+
+    let mut seen: Vec<String> = Vec::new();
+    for row in &rows {
+        let (status, body) = call(
+            &router,
+            "CreateUser",
+            &[("UserName", row.user), ("Path", row.path)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the fixture CreateUser must succeed, got {status}: {body}",
+            row.case
+        );
+        let (status, body) = call(
+            &router,
+            "CreateLoginProfile",
+            &[
+                ("UserName", row.user),
+                ("Password", row.held.as_str()),
+                ("PasswordResetRequired", "false"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the fixture CreateLoginProfile must succeed, got {status}: {body}",
+            row.case
+        );
+        let akid = user_key(&router, row.case, row.user).await;
+        let arn = user_arn(&router, row.case, row.user).await;
+
+        let (status, refused) = call_signed_in_region(
+            &router,
+            Some(&akid),
+            row.region,
+            "ChangePassword",
+            &[
+                ("OldPassword", row.presented.as_str()),
+                ("NewPassword", "N3w-password"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "case {:?}: expected 403 from the change, got {status}: {refused}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&refused),
+            REFUSED_CODE,
+            "case {:?}: expected {REFUSED_CODE}, got {:?}",
+            row.case,
+            error_code(&refused)
+        );
+        let message = element(&refused, "Message");
+        assert_password_refusal_message(
+            row.case,
+            &message,
+            &[
+                arn.as_str(),
+                account_id(),
+                row.user,
+                row.path,
+                row.region,
+                "iam:ChangePassword",
+                "is not authorized to perform",
+            ],
+        );
+        assert_no_password(row.case, &refused, &[row.held.as_str(), row.presented.as_str()]);
+        seen.push(message);
+    }
+
+    for (row, message) in rows.iter().zip(&seen) {
+        assert_eq!(
+            message, &seen[0],
+            "case {:?}: expected every refusal to be worded alike, got {message:?}",
+            row.case
+        );
+    }
 }

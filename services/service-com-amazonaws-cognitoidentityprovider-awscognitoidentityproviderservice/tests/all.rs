@@ -57,6 +57,8 @@ mod delete_user_attributes;
 mod delete_user_pool_client;
 #[path = "all/delete_user_pool_domain.rs"]
 mod delete_user_pool_domain;
+#[path = "all/delete_web_authn_credential.rs"]
+mod delete_web_authn_credential;
 #[path = "all/describe_terms_by_client.rs"]
 mod describe_terms_by_client;
 #[path = "all/device_remembering.rs"]

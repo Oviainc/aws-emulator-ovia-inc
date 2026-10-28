@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServerCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServerCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServerCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the server certificate the account holds under the name the request gives, so
+//! no later read reports it, its tags go with it, and the name is free to be uploaded
+//! again. The whole record goes — the metadata the upload minted, the PEM material and the
+//! tags are members of ONE [`crate::state::ServerCertificateRecord`], so a later upload for
+//! the same name cannot look like it inherited the deleted certificate's state.
+//!
+//! Nothing outside IAM is consulted: a load balancer still referencing the certificate does
+//! not block the delete, because "if Elastic Load Balancing doesn't detect the deletion of
+//! bound certificates, it may continue to use the certificates" — IAM does not know of the
+//! binding, so no subordinate entity of a server certificate exists for the modelled
+//! `DeleteConflictException` to report.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +178,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServerCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServerCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServerCertificate"))
+        // `ctx` carries request metadata only; what this reads from it is the signing key
+        // the request presented, which is the acting principal the audit record below
+        // names. Nothing else about the delete depends on it — IAM is global, and the
+        // certificate is named by the request.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteServerCertificateErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the delete reaches the
+        // certificate under the case-folded name `UploadServerCertificate` stored it under,
+        // whatever case this request spells it in. Removing that entry is what deletes the
+        // certificate: its metadata, its PEM material and its tags are all members of the
+        // one record, so none of them outlives it.
+        let Some(removed) = store
+            .server_certificates
+            .remove(&crate::state::name_key(&input.server_certificate_name))
+        else {
+            // A name the account holds no certificate for "referenced a resource entity
+            // that does not exist" (`NoSuchEntityException`), worded as every operation
+            // naming a server certificate by name words that absence.
+            return Err(DeleteServerCertificateErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The Server Certificate with name {} cannot be found.",
+                        input.server_certificate_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Audit record for a destructive call: the acting principal, the operation and the
+        // certificate that went away, so a state-changing call leaves a local record. The
+        // name is the one the account HELD the certificate under, because the request may
+        // have spelled it in another case; the PEM material it carried is not logged — the
+        // record says WHAT was deleted, not what it contained.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteServerCertificate",
+            outcome = "deleted",
+            caller_akid = %caller_akid,
+            server_certificate_name = %removed.metadata.server_certificate_name,
+            "a server certificate was deleted"
+        );
+
+        // The output shape is `Unit`: the operation reports nothing, and the certificate's
+        // absence is read back through `GetServerCertificate`.
+        Ok(DeleteServerCertificateOutput)
     }
 }

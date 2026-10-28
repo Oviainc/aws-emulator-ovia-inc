@@ -54,7 +54,7 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ConflictException, EncryptionDetails, MultiRegionProperties, ResourceNotFoundException,
-    TargetDefinition, ValidationException, ValidationExceptionField,
+    ServiceQuotaExceededException, TargetDefinition, ValidationException, ValidationExceptionField,
 };
 
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
@@ -221,14 +221,12 @@ impl Stream {
         if self.accepts_mutation() {
             return None;
         }
-        Some(ConflictException {
-            message: format!(
+        Some(
+            ResourceIdentity::stream(&self.stream_identifier).conflict(format!(
                 "stream {} cannot {attempted} while its status is {}",
                 self.stream_identifier, self.status
-            ),
-            resource_id: Some(self.stream_identifier.clone()),
-            resource_type: Some(RESOURCE_TYPE_STREAM.to_string()),
-        })
+            )),
+        )
     }
 }
 
@@ -309,14 +307,12 @@ impl Cluster {
         if self.accepts_mutation() {
             return None;
         }
-        Some(ConflictException {
-            message: format!(
+        Some(
+            ResourceIdentity::cluster(&self.identifier).conflict(format!(
                 "cluster {} cannot {attempted} while its status is {}",
                 self.identifier, self.status
-            ),
-            resource_id: Some(self.identifier.clone()),
-            resource_type: Some(RESOURCE_TYPE_CLUSTER.to_string()),
-        })
+            )),
+        )
     }
 
     /// The refusal an update that CONFIGURES this cluster's multi-Region setup
@@ -1617,8 +1613,13 @@ fn crockford_base32(value: u128) -> String {
 
 /// How one resource is identified in the modelled shapes that carry a resource's
 /// identity (`ResourceNotFoundException` and `ServiceQuotaExceededException`, both
-/// of which model a `@required` `resourceId` and `resourceType`): the type segment
-/// the resource is stored under, and that resource's own identifier.
+/// of which model a `@required` `resourceId` and `resourceType`, and
+/// `ConflictException`, which models both as optional): the type segment the
+/// resource is stored under, and that resource's own identifier.
+///
+/// The two members describe ONE resource — the model words them as the resource
+/// that "could not be found" and the resource that "exceeds a quota" — so a
+/// refusal never pairs one resource's type with another's identifier.
 ///
 /// Built from the store rather than per handler
 /// ([`ComAmazonawsDsqlDsqlState::addressed_identity`]), so every operation that
@@ -1632,10 +1633,70 @@ pub struct ResourceIdentity {
 }
 
 impl ResourceIdentity {
+    /// The identity of the cluster `identifier` names: the type segment a cluster
+    /// is stored under, and that cluster's own identifier.
+    pub fn cluster(identifier: &str) -> Self {
+        Self {
+            resource_type: RESOURCE_TYPE_CLUSTER.to_string(),
+            resource_id: identifier.to_string(),
+        }
+    }
+
+    /// The identity of the stream `identifier` names: the type segment a stream is
+    /// stored under, and that stream's OWN identifier — never the identifier of
+    /// the cluster the stream is stored on.
+    pub fn stream(identifier: &str) -> Self {
+        Self {
+            resource_type: RESOURCE_TYPE_STREAM.to_string(),
+            resource_id: identifier.to_string(),
+        }
+    }
+
     /// The modelled `ResourceNotFoundException` for a resource `arn` addressed and
     /// this service does not hold: [`resource_not_found`] over this identity.
     pub fn not_found(&self, arn: &str) -> ResourceNotFoundException {
         resource_not_found(arn, &self.resource_id, &self.resource_type)
+    }
+
+    /// The modelled `ConflictException` for a conflict about THIS resource, worded
+    /// with `message`.
+    ///
+    /// The one place a conflict's identity pair is filled, so every refusal that
+    /// names a resource names one resource's own type and own identifier.
+    pub fn conflict(&self, message: String) -> ConflictException {
+        ConflictException {
+            message,
+            resource_id: Some(self.resource_id.clone()),
+            resource_type: Some(self.resource_type.clone()),
+        }
+    }
+
+    /// The modelled `ConflictException` a call whose `clientToken` is already
+    /// recorded against a DIFFERENT request answers with, reported against this
+    /// resource — the one the refused call addressed.
+    pub fn client_token_mismatch(&self) -> ConflictException {
+        self.conflict(CLIENT_TOKEN_MISMATCH_MESSAGE.to_string())
+    }
+
+    /// The modelled `ServiceQuotaExceededException` for a collection THIS resource
+    /// holds being at its ceiling: the resource whose quota was exceeded is the one
+    /// that holds the collection, so the refusal reports that resource's own type
+    /// and identifier, `message` says which ceiling was reached and `quota_code`
+    /// names the quota.
+    pub fn quota_exceeded(
+        &self,
+        message: String,
+        quota_code: &str,
+    ) -> ServiceQuotaExceededException {
+        ServiceQuotaExceededException {
+            message,
+            resource_id: self.resource_id.clone(),
+            resource_type: self.resource_type.clone(),
+            // The Service Quotas service code of Aurora DSQL, which is the same
+            // string as the service segment of its ARNs.
+            service_code: ARN_SERVICE.to_string(),
+            quota_code: quota_code.to_string(),
+        }
     }
 }
 
