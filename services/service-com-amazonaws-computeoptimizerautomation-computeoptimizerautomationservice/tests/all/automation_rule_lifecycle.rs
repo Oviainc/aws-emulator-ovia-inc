@@ -355,6 +355,22 @@ async fn opting_out_stops_every_rule() {
 async fn created_rules_round_trip_through_get() {
     let router = emulator();
 
+    // The member account the organization-rule case scopes a rule to, in the
+    // model's `AccountId` form, ASSOCIATED first: an organization rule applies
+    // its recommended actions in the accounts its configuration names, which is
+    // what an association permits, so an unassociated account cannot be scoped
+    // (that gate is what `crate::organization_rule_scope_gate` is about). This
+    // suite is about the round trip, so the precondition is established over the
+    // wire here.
+    const SCOPED_MEMBER: &str = "000000000001";
+    call_ok(
+        &router,
+        "AssociateAccounts",
+        &json!({"accountIds": [SCOPED_MEMBER]}),
+        "associate-the-scoped-member",
+    )
+    .await;
+
     // The action types and apply orders come from the model's value sets
     // (`RecommendedActionType`, `RuleApplyOrder`).
     let cases: Vec<(&str, Value)> = vec![
@@ -396,7 +412,7 @@ async fn created_rules_round_trip_through_get() {
                 "ruleType": "OrganizationRule",
                 "organizationConfiguration": {
                     "ruleApplyOrder": "BeforeAccountRules",
-                    "accountIds": ["000000000000", "000000000001"]
+                    "accountIds": [engine::EMULATOR_ACCOUNT_ID, SCOPED_MEMBER]
                 },
                 "recommendedActionTypes": ["SnapshotAndDeleteUnattachedEbsVolume"],
                 "schedule": {"scheduleExpression": "15 1 * * ? *"},
