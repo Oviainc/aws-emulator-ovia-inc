@@ -48,7 +48,10 @@ const MAX_TENANT_NAME_CHARS: usize = state::MAX_TENANT_NAME_CHARS;
 
 /// Convenience calls for the tenant-resource association surface, over the shared
 /// harness.
-trait Associations {
+///
+/// Shared with the sibling suites of this test target, so every case that sets a tenant
+/// and a resource up drives the same wire path.
+pub(crate) trait Associations {
     async fn create_tenant(&self, name: &str) -> Reply;
     async fn get_tenant(&self, name: &str) -> Reply;
     async fn create_configuration_set(&self, name: &str) -> Reply;
@@ -147,7 +150,7 @@ impl Associations for Ses {
 
 /// The `TenantName` of every tenant a resource's listing reported, in the order
 /// reported.
-fn listed_tenants(reply: &Reply) -> Vec<String> {
+pub(crate) fn listed_tenants(reply: &Reply) -> Vec<String> {
     reply
         .member("ResourceTenants")
         .as_array()
@@ -160,7 +163,7 @@ fn listed_tenants(reply: &Reply) -> Vec<String> {
 
 /// The `ResourceArn` of every resource a tenant's listing reported, in the order
 /// reported.
-fn listed_resources(reply: &Reply) -> Vec<String> {
+pub(crate) fn listed_resources(reply: &Reply) -> Vec<String> {
     reply
         .member("TenantResources")
         .as_array()
@@ -187,7 +190,7 @@ fn text(row: &Value, member: &str) -> String {
 /// `CONFIGURATION_SET`, `EMAIL_TEMPLATE`); the two below are the kinds this emulator can
 /// be made to hold, and the template kind is covered by the refusal table, where an ARN
 /// naming a resource the account does not hold belongs.
-enum Resource {
+pub(crate) enum Resource {
     /// A configuration set, created with `CreateConfigurationSet`.
     ConfigurationSet(&'static str),
     /// An email identity — an address or a domain — created with `CreateEmailIdentity`.
@@ -196,7 +199,7 @@ enum Resource {
 
 impl Resource {
     /// The ARN SES addresses this resource by, in the Region the call executes in.
-    fn arn(&self) -> String {
+    pub(crate) fn arn(&self) -> String {
         match self {
             Self::ConfigurationSet(name) => {
                 format!("arn:aws:ses:{REGION}:{ACCOUNT_ID}:configuration-set/{name}")
@@ -209,7 +212,7 @@ impl Resource {
 
     /// Create the resource, failing loudly if the create is refused: a removal case is
     /// only about the removal.
-    async fn create(&self, ses: &Ses, case: &str) {
+    pub(crate) async fn create(&self, ses: &Ses, case: &str) {
         let created = match self {
             Self::ConfigurationSet(name) => ses.create_configuration_set(name).await,
             Self::EmailIdentity(identity) => ses.create_email_identity(identity).await,
@@ -225,7 +228,7 @@ impl Resource {
 
     /// Read the resource back through its own getter, so a case can show it survived the
     /// removal of an association it held.
-    async fn read(&self, ses: &Ses) -> Reply {
+    pub(crate) async fn read(&self, ses: &Ses) -> Reply {
         match self {
             Self::ConfigurationSet(name) => ses.get_set(name).await,
             Self::EmailIdentity(identity) => ses.get_email_identity(identity).await,
