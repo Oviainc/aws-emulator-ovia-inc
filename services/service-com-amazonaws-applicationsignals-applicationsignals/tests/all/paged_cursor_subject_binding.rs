@@ -9,10 +9,14 @@
 //! subject's first entries — while a token resumes the subject it was issued for whatever
 //! spelling of that subject the resuming request uses.
 //!
-//! Every per-subject paged read of this service is a row of the table below, and each row
-//! carries two distinct subjects of its own: the rule generalises over WHICH read, over how
-//! the request names its subject (a path label, a key-attribute map in the body), and over
-//! which subject of that read is named — not over one recorded pair.
+//! Every per-subject paged read whose subject is the ENTITY or the objective a request names is
+//! a row of the table below, and each row carries two distinct subjects of its own: the rule
+//! generalises over WHICH read, over how the request names its subject (a path label, a
+//! key-attribute map in the body), and over which subject of that read is named — not over one
+//! recorded pair. The reads whose selection is wider than one such subject — the audit read,
+//! which names a LIST of targets, and the account-wide reads, whose selection is the period and
+//! the filters alone — are `paged_cursor_selection_binding`'s rows, which pins the same rule for
+//! the rest of a selection.
 //!
 //! The request helpers are `slo_lifecycle`'s and the window configurations `exclusion_windows`'
 //! own, so this suite speaks to the same harness as every other.

@@ -202,10 +202,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `MaxResults` carries the model's own `@default` of 50 and its `range 1..100` is
-        // refused before this handler runs, so the bound is read straight off the input.
+        // refused before this handler runs, so the bound is read straight off the input. The
+        // cursor is an offset into the set this request's PERIOD selects, so the period is
+        // bound into the token's tag and a token issued over another period is refused rather
+        // than honoured as a boundary here ([`crate::state::window_token_tag`]).
+        let token_tag = crate::state::window_token_tag(
+            crate::state::SERVICES_TOKEN_TAG,
+            &input.start_time,
+            &input.end_time,
+        );
         let (service_summaries, next_token) = crate::state::page_of(
             observed,
-            crate::state::SERVICES_TOKEN_TAG,
+            &token_tag,
             input.next_token.as_deref(),
             input.max_results.max(0) as usize,
         )
