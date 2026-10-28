@@ -15,6 +15,8 @@
 mod boundary_validation_field_name;
 #[path = "all/catalog_allowed_values.rs"]
 mod catalog_allowed_values;
+#[path = "all/clock_sample_under_the_store_lock.rs"]
+mod clock_sample_under_the_store_lock;
 #[path = "all/deployment_parameter_expiry.rs"]
 mod deployment_parameter_expiry;
 #[path = "all/deployment_parameter_identity_key.rs"]

@@ -73,7 +73,11 @@ async fn perform(router: &MultiServiceRouter, resource_arn: &str, call: &Call) -
 /// The `(created_at, updated_at)` the store holds for `resource_arn` — the record's
 /// first-written and last-written instants, read out of the store itself because no
 /// operation of this model reports either on the wire.
-fn written_instants(engine: &engine::InMemoryEngine, resource_arn: &str) -> (SystemTime, SystemTime) {
+///
+/// `pub(crate)` because the sibling `clock_sample_under_the_store_lock` suite reads
+/// the same two instants: ONE reader, so the two suites cannot come to read the
+/// field differently.
+pub(crate) fn written_instants(engine: &engine::InMemoryEngine, resource_arn: &str) -> (SystemTime, SystemTime) {
     let state = service_state(engine).expect("the shared engine must hold this service's store");
     let store = state.lock();
     let record = store

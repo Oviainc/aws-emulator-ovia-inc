@@ -262,8 +262,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
+        // The store first, then the clock: this call is served at the instant it
+        // reaches the store, so the expiry it materialises below and the instants it
+        // stamps on the record are read off the clock once the lock is held, never
+        // from before the wait for it.
         let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
 
         // The expiry the clock has already made due, BEFORE this request resolves
         // anything: `expirationDate` is "the date when deployment parameters expire

@@ -1169,8 +1169,12 @@ where
             store_unavailable(),
         )));
     };
-    let now = SystemTime::now();
+    // The sample is taken AFTER the lock, not before waiting for it: the instant a
+    // call is served at is the instant it reaches the store, so a call that waited
+    // behind another one judges the expiry, and stamps the record, with the clock as
+    // it stands once it holds the store — never with a reading from before the wait.
     let mut store = state.lock();
+    let now = SystemTime::now();
     store.purge_expired(now);
     let Some(record) = store.parameters.get_mut(resource_arn) else {
         return Err(parameter_not_found());
