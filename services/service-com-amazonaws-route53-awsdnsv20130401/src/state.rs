@@ -313,6 +313,13 @@ pub const ACCOUNT_LIMIT_MAX_TRAFFIC_POLICIES: &str = "MAX_TRAFFIC_POLICIES_BY_OW
 pub const ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES: &str =
     "MAX_TRAFFIC_POLICY_INSTANCES_BY_OWNER";
 
+/// The `HostedZoneLimitType` naming one zone's record-set quota
+/// (`HostedZoneLimitType` enum).
+pub const HOSTED_ZONE_LIMIT_MAX_RRSETS: &str = "MAX_RRSETS_BY_ZONE";
+/// The `HostedZoneLimitType` naming one private zone's VPC-association quota
+/// (`HostedZoneLimitType` enum).
+pub const HOSTED_ZONE_LIMIT_MAX_VPCS_ASSOCIATED: &str = "MAX_VPCS_ASSOCIATED_BY_ZONE";
+
 /// The `TagResourceType` naming a hosted zone (`TagResourceType` enum).
 pub const TAG_RESOURCE_TYPE_HOSTED_ZONE: &str = "hostedzone";
 /// The `TagResourceType` naming a health check (`TagResourceType` enum).
@@ -848,6 +855,27 @@ impl StoredZone {
     /// them: one entry per KSK the zone holds, in `Name` order.
     pub fn to_key_signing_keys(&self) -> Vec<KeySigningKey> {
         self.key_signing_keys.values().cloned().collect()
+    }
+
+    /// The per-zone quota for one `HostedZoneLimitType` and how much of it this
+    /// zone currently holds, as `(limit value, current count)`. `None` for a
+    /// value outside `HostedZoneLimitType`.
+    ///
+    /// The count is COUNTED off the zone on every call rather than tracked
+    /// beside it, for the same reason
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::account_limit_usage`] counts:
+    /// adding or removing a record set or a VPC association moves the count by
+    /// itself, so no reporting operation has to be told about it and none can
+    /// disagree with what a read of the zone reports. The quota is the same
+    /// constant the mutating path refuses at, so a count that has reached the
+    /// reported limit is exactly the point at which the next create is refused.
+    pub fn limit_usage(&self, limit_type: &str) -> Option<(i64, i64)> {
+        let (limit, count) = match limit_type {
+            HOSTED_ZONE_LIMIT_MAX_RRSETS => (MAX_RECORD_SETS_PER_ZONE, self.records.len()),
+            HOSTED_ZONE_LIMIT_MAX_VPCS_ASSOCIATED => (MAX_VPCS_PER_HOSTED_ZONE, self.vpcs.len()),
+            _ => return None,
+        };
+        Some((count_as_i64(limit), count_as_i64(count)))
     }
 
     /// Whether this zone holds a key-signing key Route 53 could sign with: one

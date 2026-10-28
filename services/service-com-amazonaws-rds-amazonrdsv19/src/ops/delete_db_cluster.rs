@@ -258,8 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (false, None) => {
                 return Err(DeleteDBClusterError::invalid_parameter_combination(
-                    "FinalDBSnapshotIdentifier must be specified unless SkipFinalSnapshot is \
-                     enabled",
+                    crate::state::FINAL_SNAPSHOT_MEMBER_REQUIRED,
                 ));
             }
             _ => {}

@@ -1481,6 +1481,46 @@ pub fn attachment_outcome(active_at: Option<SystemTime>) -> (String, Option<Owed
     }
 }
 
+/// AWS Glue's own `arnNamespace`: the Data Catalog an application reaches its
+/// direct-query data through is a Glue resource, so the ARN that names it carries
+/// Glue's namespace rather than this service's.
+const GLUE_ARN_NAMESPACE: &str = "glue";
+
+/// The resource field of the ARN that names an account's AWS Glue Data Catalog,
+/// `arn:<partition>:glue:<region>:<account-id>:catalog`.
+const GLUE_DATA_CATALOG_RESOURCE: &str = "catalog";
+
+/// Whether `arn` names THIS account's AWS Glue Data Catalog.
+///
+/// An account holds exactly one Data Catalog per Region and no call creates or deletes
+/// it, so an ARN of that form names a resource the account always holds — which is why
+/// resolving it consults no stored record. A catalog ARN carrying another account's id
+/// names a catalog this account does not hold, and one carrying no Region names no
+/// catalog at all.
+pub fn is_account_glue_data_catalog_arn(arn: &str) -> bool {
+    ::service_common::arn::parse(arn).is_some_and(|parsed| {
+        parsed.vendor == GLUE_ARN_NAMESPACE
+            && parsed.resource == GLUE_DATA_CATALOG_RESOURCE
+            && !parsed.region.is_empty()
+            && parsed.account == ::engine::emulator_account_id()
+    })
+}
+
+/// What this account holds under the ARN an attachment names its data source by, and
+/// when that data source becomes active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSourceActivation {
+    /// The account holds the data source and it is active already, so an attachment of
+    /// it completes at once.
+    Active,
+    /// The account holds it and the clock owes it activation at this instant, so an
+    /// attachment of it stays pending until then.
+    ActiveAt(SystemTime),
+    /// The account holds no data source under the ARN, so an attachment of it has
+    /// nothing that becomes active.
+    Absent,
+}
+
 /// The `ResourceNotFoundException` payload for an application and data source pair this
 /// account holds no attachment record for.
 pub fn attachment_not_found(id: &str, data_source_arn: &str) -> ResourceNotFoundException {
@@ -7079,13 +7119,17 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     ///
     /// The data sources the account still holds are resolved FIRST, because that is
     /// what decides whether a pending attachment that has fallen due completes or
-    /// fails: an attachment whose data source is gone can never complete.
+    /// fails: an attachment whose data source is gone can never complete. Each DISTINCT
+    /// ARN the attachments name is resolved once, so two applications attached to one
+    /// data source cost one resolution rather than two.
     pub fn settle_attachments(&mut self, now: SystemTime) {
-        let data_sources: BTreeSet<String> = self
-            .domains
+        let mut data_sources: BTreeSet<String> = self
+            .applications
             .values()
-            .map(|domain| domain.arn.clone())
+            .flat_map(|application| application.attachments.keys())
+            .cloned()
             .collect();
+        data_sources.retain(|arn| self.holds_data_source(arn));
         for application in self.applications.values_mut() {
             for attachment in application.attachments.values_mut() {
                 attachment.settle(now, &data_sources);
@@ -7109,6 +7153,52 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Reads ONLY.
     pub fn domain_of_arn(&self, arn: &str) -> Option<&Domain> {
         self.domains.values().find(|domain| domain.arn == arn)
+    }
+
+    /// When the data source `arn` names becomes active, and whether this account holds
+    /// one under that ARN at all — see [`DataSourceActivation`].
+    ///
+    /// An application's data source is any of the kinds this service attaches to one, so
+    /// the ARN is resolved against every kind the account can hold rather than against
+    /// its domains alone: a domain of this account, a direct query data source of it, or
+    /// this account's AWS Glue Data Catalog. Anything else names no data source of this
+    /// account, which is what an attachment can never complete against.
+    ///
+    /// The ONE resolution of a data source ARN, so the attach that decides an
+    /// attachment's outcome and the settlement that lands it cannot disagree about what
+    /// the account holds.
+    ///
+    /// Reads ONLY.
+    pub fn data_source_activation(&self, arn: &str) -> DataSourceActivation {
+        // A domain is provisioned, so the state of the domain the ARN names is what
+        // decides whether its data is reachable yet.
+        if let Some(domain) = self.domain_of_arn(arn) {
+            return match domain.cluster_up_at() {
+                Some(due) => DataSourceActivation::ActiveAt(due),
+                None => DataSourceActivation::Active,
+            };
+        }
+        // A direct query data source is queryable from the moment the add that minted it
+        // answered: nothing is provisioned for it and no status moves on it.
+        if self
+            .direct_query_data_sources
+            .values()
+            .any(|held| held.arn == arn)
+        {
+            return DataSourceActivation::Active;
+        }
+        // The account's Data Catalog is not a resource anything provisions, so it is
+        // active whenever it is named.
+        if is_account_glue_data_catalog_arn(arn) {
+            return DataSourceActivation::Active;
+        }
+        DataSourceActivation::Absent
+    }
+
+    /// Whether this account holds a data source under `arn` — what decides whether a
+    /// pending attachment that has fallen due completes or fails.
+    pub fn holds_data_source(&self, arn: &str) -> bool {
+        self.data_source_activation(arn) != DataSourceActivation::Absent
     }
 
     /// Materialise the status move the clock owes every stored VPC endpoint, for a

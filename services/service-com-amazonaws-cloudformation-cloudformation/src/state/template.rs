@@ -2447,6 +2447,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // set, since letters, digits and the hyphen are all admitted, but may be longer
         // than the bound.
         MQ_BROKER => rules(50, Characters::AsGenerated),
+        // Amazon OpenSearch Service `CreateDomain.DomainName`: `DomainName`,
+        // `@length(min: 3, max: 28)` with pattern `^[a-z][a-z0-9\-]+$` (that service's own
+        // Smithy model), which admits no upper case and no character a generated name
+        // carries beyond letters, digits and the hyphen.
+        OPENSEARCH_DOMAIN => rules(28, Characters::LowercaseAlphanumeric),
         _ => None,
     }
 }
@@ -4211,6 +4216,16 @@ pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream
 /// `awsService.cloudFormationName` (`OpenSearchServerless`).
 pub const AOSS_COLLECTION: &str = "AWS::OpenSearchServerless::Collection";
 pub const AOSS_SECURITY_POLICY: &str = "AWS::OpenSearchServerless::SecurityPolicy";
+
+/// The type of an Amazon OpenSearch Service domain — a different service from the
+/// serverless one above, whose own model is reached by the `es` signing name. Its middle
+/// segment is the one the resource-type namespace publishes (`OpenSearchService`) rather
+/// than that model's shorter `awsService.cloudFormationName` (`OpenSearch`).
+///
+/// "Ref returns the domain name", which is the name the owning service creates the domain
+/// under — so a GENERATED one is held to that service's own rules for it
+/// ([`naming_rules`]) and the identity is not service-assigned.
+pub const OPENSEARCH_DOMAIN: &str = "AWS::OpenSearchService::Domain";
 
 /// The type of an Amazon S3 bucket, whose middle segment is that model's own
 /// `cloudFormationName` the same way. "Ref returns the bucket name" for this type, so a

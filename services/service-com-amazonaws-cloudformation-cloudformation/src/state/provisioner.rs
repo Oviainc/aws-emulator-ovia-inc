@@ -376,7 +376,7 @@ use super::template::{
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
-    MSK_SERVERLESS_CLUSTER, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
+    MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
     ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HOSTED_ZONE, ROUTE53_RECORD_SET,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET, SAGEMAKER_MODEL_PACKAGE_GROUP, SCHEDULER_SCHEDULE,
@@ -440,6 +440,12 @@ const EKS_ACCESS_ENTRY: &str = "AWS::EKS::AccessEntry";
 /// answers, so it is never mistaken for one of theirs.
 const NOT_IMPLEMENTED: &str = "NotImplemented";
 
+/// How a resource provider built on the CloudFormation resource-provider plugin words a
+/// refusal it classifies as that plugin's invalid-request failure: the class's own sentence
+/// opener, with the owning service's message after it
+/// ([`Provisioner::handler_message`]).
+const INVALID_REQUEST_PROVIDED: &str = "Invalid request provided: ";
+
 /// The services whose resources this emulator creates. One variant per resource type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Provisioner {
@@ -449,6 +455,10 @@ pub(super) enum Provisioner {
     EcrPublicRepository,
     OpenSearchServerlessCollection,
     OpenSearchServerlessSecurityPolicy,
+    /// `AWS::OpenSearchService::Domain`: a domain of Amazon OpenSearch Service, which is a
+    /// different service from the serverless one above — `CreateDomain` creates it and
+    /// `DeleteDomain` deletes it.
+    OpenSearchServiceDomain,
     S3Bucket,
     S3VectorsVectorBucket,
     S3VectorsIndex,
@@ -536,6 +546,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
         AOSS_COLLECTION => Some(Provisioner::OpenSearchServerlessCollection),
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
+        OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
         S3_BUCKET => Some(Provisioner::S3Bucket),
         S3VECTORS_VECTOR_BUCKET => Some(Provisioner::S3VectorsVectorBucket),
         S3VECTORS_INDEX => Some(Provisioner::S3VectorsIndex),
@@ -714,6 +725,9 @@ impl Provisioner {
             }
             Self::OpenSearchServerlessCollection => {
                 create_collection(ctx, region, resource, propagated).await
+            }
+            Self::OpenSearchServiceDomain => {
+                create_domain(ctx, region, resource, propagated).await
             }
             Self::GuardDutyDetector => {
                 create_detector(ctx, region, resource, propagated).await
@@ -969,6 +983,31 @@ impl Provisioner {
             .collect()
     }
 
+    /// How THIS type's resource provider words a refusal of the owning service, which is the
+    /// message CloudFormation quotes in the failed resource's status reason
+    /// ([`super::provisioning`]).
+    ///
+    /// A provider reports the refusal of the service it called, and most of them report that
+    /// service's message as it came — the diagnostic a client of that service would read,
+    /// carrying that service's own name and status. A provider written against the
+    /// CloudFormation resource-provider plugin reports it through the exception class of the
+    /// `HandlerErrorCode` it classified the refusal under, and THAT class's wording is part
+    /// of the message rather than only of the envelope: an `InvalidRequest` refusal reaches
+    /// the reason as `Invalid request provided: <the service's message>`, which is what an
+    /// `AWS::OpenSearchService::Domain` whose cluster its service will not provision is
+    /// reported with.
+    ///
+    /// Which of the two a type is, is that type's provider's and cannot be derived from the
+    /// type's name, so it is stated per type here — the same per-type half of provisioning
+    /// the create and delete arms are. A type not named below reports the message unchanged.
+    pub(super) fn handler_message(self, class: &str, message: &str) -> String {
+        let plugin_worded = matches!(self, Self::OpenSearchServiceDomain);
+        if plugin_worded && class == super::provisioning::HANDLER_ERROR_INVALID_REQUEST {
+            return format!("{INVALID_REQUEST_PROVIDED}{message}");
+        }
+        message.to_string()
+    }
+
     /// Whether the resource this provisioner CREATED has reached the state the owning
     /// service reports it ready in — read from that service, never decided here.
     ///
@@ -993,6 +1032,14 @@ impl Provisioner {
             // (`CertificateDetail$Status`) and is usable once ACM has issued it, so the
             // resource's creation is finished when ACM reports it `ISSUED`.
             Self::AcmCertificate => certificate_readiness(ctx, region, physical_resource_id).await,
+            // `DomainStatus$Created` is "true if domain creation is complete" and
+            // `DomainStatus$Processing` "true if OpenSearch Service is processing
+            // configuration changes", so a domain the create has just answered for is still
+            // coming up and the resource's creation is finished when that service reports it
+            // settled.
+            Self::OpenSearchServiceDomain => {
+                domain_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -1219,6 +1266,9 @@ impl Provisioner {
             }
             Self::OpenSearchServerlessCollection => {
                 delete_collection(ctx, region, physical_resource_id).await
+            }
+            Self::OpenSearchServiceDomain => {
+                delete_domain(ctx, region, physical_resource_id).await
             }
             Self::S3Bucket => delete_bucket(ctx, region, physical_resource_id).await,
             Self::S3VectorsVectorBucket => {
@@ -1483,6 +1533,9 @@ impl Provisioner {
             }
             Self::OpenSearchServerlessSecurityPolicy => {
                 describe_security_policy(ctx, region, resource).await
+            }
+            Self::OpenSearchServiceDomain => {
+                describe_opensearch_domain(ctx, region, physical_resource_id).await
             }
             Self::SageMakerModelPackageGroup => {
                 describe_model_package_group(ctx, region, physical_resource_id).await
@@ -2483,6 +2536,208 @@ async fn delete_collection(
     {
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Amazon OpenSearch Service: AWS::OpenSearchService::Domain
+// ---------------------------------------------------------------------------
+
+/// Amazon OpenSearch Service's signing name, from its model (`sigv4Name: es`). It speaks
+/// `restJson1`, so its calls ride on [`call_rest_json`] with the method and URI each
+/// operation's own `http` binding declares.
+const OPENSEARCH_SIGNING_NAME: &str = "es";
+
+/// Where that service binds its domain operations: `CreateDomain` is `POST` on this URI and
+/// `DescribeDomain`/`DeleteDomain` are `GET`/`DELETE` on `{DomainName}` under it
+/// (`smithy_query(query="operation", operation="CreateDomain,DescribeDomain,DeleteDomain")`).
+const OPENSEARCH_DOMAIN_URI: &str = "/2021-01-01/opensearch/domain";
+
+/// The properties of an `AWS::OpenSearchService::Domain` that `CreateDomain` does NOT take
+/// verbatim:
+///
+/// * `DomainName` is the one value CloudFormation decides — this resource's physical id,
+///   which is what `Ref` returns — so it is set on the way out rather than copied;
+/// * `Tags` is the create's own `TagList`, and carries the tags CloudFormation gives the
+///   resource beside the declared ones ([`tags_of`]);
+/// * `SkipShardMigrationWait` is published for the type's update path and is a member of no
+///   call of that service at all, so nothing is sent for it.
+///
+/// Every other property of the type IS a `CreateDomain` member spelled identically —
+/// `AccessPolicies`, `AdvancedOptions`, `AdvancedSecurityOptions`, `ClusterConfig`,
+/// `CognitoOptions`, `DomainEndpointOptions`, `EBSOptions`, `EncryptionAtRestOptions`,
+/// `EngineVersion`, `IPAddressType`, `IdentityCenterOptions`, `LogPublishingOptions`,
+/// `NodeToNodeEncryptionOptions`, `OffPeakWindowOptions`, `SnapshotOptions`,
+/// `SoftwareUpdateOptions` and `VPCOptions` — so the evaluated property document IS the
+/// request.
+const DOMAIN_NON_CREATE_PROPERTIES: &[&str] = &["DomainName", "Tags", "SkipShardMigrationWait"];
+
+/// Create the domain an `AWS::OpenSearchService::Domain` declares.
+///
+/// VALUES are untouched: the engine version, the cluster configuration and the storage the
+/// template declared reach that service as declared, and ITS validation is what judges them
+/// — an instance type the requested engine release does not offer is its own
+/// `InvalidTypeException`, and that refusal is what fails this resource and rolls the stack
+/// back, rather than a domain recorded as created on a cluster nothing could provision.
+///
+/// "Ref returns the domain name", so the physical resource id the stack reports IS the
+/// domain a client addresses and the service assigns no identity this record has to take
+/// over.
+async fn create_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    for property in DOMAIN_NON_CREATE_PROPERTIES {
+        request.remove(*property);
+    }
+    request.insert(
+        "DomainName".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("TagList".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let reported = call_rest_json(
+        ctx,
+        OPENSEARCH_SIGNING_NAME,
+        region,
+        "POST",
+        OPENSEARCH_DOMAIN_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    Ok(domain_created(
+        &resource.resource_type,
+        &reported_member(&reported, "DomainStatus"),
+    ))
+}
+
+/// What a domain create answered, as the resource's published attributes: the identifiers
+/// the OWNING service decided, never ones rebuilt here.
+///
+/// `DomainStatus$ARN` is the domain's ARN, under this service's own `es` namespace, so it is
+/// what the resource's `Arn`/`<Type>Arn` attributes report
+/// ([`super::template::arn_attributes`]); `DomainStatus$DomainId` is "the unique identifier
+/// for the domain" — the account and the name — which is the `Id` this type publishes, so it
+/// re-points the `Id`/`<Type>Id` pair ([`super::template::identity_attributes`]); and
+/// `DomainStatus$Endpoint` is "the domain-specific endpoint used to submit index, search, and
+/// data upload requests", which is this type's `DomainEndpoint`. A member the answer does not
+/// carry — the public endpoint of a domain reached inside a VPC — leaves its attribute unset
+/// rather than guessed.
+fn domain_created(resource_type: &str, status: &Value) -> Created {
+    let mut attributes: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(arn) = status.get("ARN").and_then(Value::as_str) {
+        attributes.extend(super::template::arn_attributes(resource_type, arn));
+    }
+    if let Some(domain_id) = status.get("DomainId").and_then(Value::as_str) {
+        attributes.extend(super::template::identity_attributes(
+            resource_type,
+            domain_id,
+        ));
+    }
+    if let Some(endpoint) = status.get("Endpoint").and_then(Value::as_str) {
+        attributes.insert("DomainEndpoint".to_string(), endpoint.to_string());
+    }
+    Created::attributes(attributes)
+}
+
+/// Whether Amazon OpenSearch Service has finished bringing up the domain a stack created.
+///
+/// `DomainStatus$Created` is "true if domain creation is complete" and
+/// `DomainStatus$Processing` is "true if OpenSearch Service is processing configuration
+/// changes. False if the configuration is active" — so a domain is ready when that service
+/// reports it created and no longer processing, and until then the state it is still in is
+/// `DomainStatus$DomainProcessingStatus`, "the status of any changes that are currently in
+/// progress for the domain". A domain that service no longer holds is not one any wait will
+/// bring up.
+async fn domain_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let Some(status) = read_domain(ctx, region, physical_resource_id).await? else {
+        return Ok(Readiness::Failed(format!(
+            "Amazon OpenSearch Service holds no domain {physical_resource_id}"
+        )));
+    };
+    let created = status
+        .get("Created")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let processing = status
+        .get("Processing")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if created && !processing {
+        return Ok(Readiness::Ready);
+    }
+    Ok(Readiness::Pending(
+        status
+            .get("DomainProcessingStatus")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    ))
+}
+
+/// Delete the domain a stack created, by the name it was created under. A domain that
+/// service no longer holds (`ResourceNotFoundException`) is already in the state the delete
+/// asks for — judged on the error CODE, never on a message, which carries the request's own
+/// domain name. The name goes into the URI percent-encoded, as a non-greedy `@httpLabel` is
+/// sent.
+async fn delete_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = format!(
+        "{OPENSEARCH_DOMAIN_URI}/{}",
+        percent_encoded(physical_resource_id)
+    );
+    match call_rest_json(ctx, OPENSEARCH_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The domain's configuration as Amazon OpenSearch Service reports it, for drift detection:
+/// the `DomainStatus` its own read answers with. A domain it no longer holds was deleted.
+///
+/// The record's members are that service's own, which this type's properties are spelled
+/// identically to ([`DOMAIN_NON_CREATE_PROPERTIES`]), so a declared property takes part in
+/// the comparison rather than leaving the domain reported as merely existing.
+async fn describe_opensearch_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    read_domain(ctx, region, physical_resource_id).await
+}
+
+/// The `DomainStatus` Amazon OpenSearch Service reports for one domain, or `None` for a
+/// domain it no longer holds. The ONE read behind the readiness answer and the drift one, so
+/// neither can be asked of a different operation than the other.
+async fn read_domain(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = format!(
+        "{OPENSEARCH_DOMAIN_URI}/{}",
+        percent_encoded(physical_resource_id)
+    );
+    match call_rest_json(ctx, OPENSEARCH_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_member(&answer, "DomainStatus"))),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }

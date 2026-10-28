@@ -997,11 +997,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             storage_encrypted: input.storage_encrypted.unwrap_or(false),
             kms_key_id: input.kms_key_id,
             // "The storage type isn't returned when you set it to `aurora`" — the Aurora
-            // default — so only a storage type the cluster was really created with is
-            // stored to be reported.
+            // default, and the sibling control planes' own member says the same of its
+            // `standard` — so only a storage type the cluster was really created with,
+            // rather than the one its engine would have given it anyway, is stored to be
+            // reported.
             storage_type: input.storage_type.filter(|storage_type| {
-                multi_az_cluster
-                    || !storage_type.eq_ignore_ascii_case(crate::state::AURORA_DEFAULT_STORAGE_TYPE)
+                crate::state::default_db_cluster_storage_type(&input.engine)
+                    .is_none_or(|default| !storage_type.eq_ignore_ascii_case(default))
             }),
             iops: input.iops,
             allocated_storage: input.allocated_storage,

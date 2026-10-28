@@ -683,6 +683,27 @@ pub const DB_INSTANCE_ENGINES: [&str; 25] = [
 /// service, so its engine is as published as the ones above.
 pub const SIBLING_CONTROL_PLANE_ENGINES: [&str; 2] = ["docdb", "neptune"];
 
+/// The Amazon DocumentDB engine, the first of [`SIBLING_CONTROL_PLANE_ENGINES`]: named
+/// rather than spelled out wherever that control plane publishes a value of its own for
+/// one of this model's members.
+pub const DOCDB_ENGINE: &str = SIBLING_CONTROL_PLANE_ENGINES[0];
+
+/// The Amazon Neptune engine, the second of [`SIBLING_CONTROL_PLANE_ENGINES`]; see
+/// [`DOCDB_ENGINE`].
+pub const NEPTUNE_ENGINE: &str = SIBLING_CONTROL_PLANE_ENGINES[1];
+
+/// Whether `engine` belongs to one of the two sibling control planes this front door also
+/// serves ([`SIBLING_CONTROL_PLANE_ENGINES`]).
+///
+/// A resource of such an engine is a resource of THAT service: the defaults and the value
+/// lists its own API publishes are the ones that hold for it, not this model's, so every
+/// per-engine rule below asks this first.
+pub fn is_sibling_control_plane_engine(engine: &str) -> bool {
+    SIBLING_CONTROL_PLANE_ENGINES
+        .iter()
+        .any(|sibling| sibling.eq_ignore_ascii_case(engine))
+}
+
 /// The engines a DB CLUSTER can run, as `CreateDBClusterMessage$Engine` lists them
 /// (`smithy_query(query="doc",shape="CreateDBClusterMessage",member="Engine")`: "Valid
 /// Values: aurora-mysql aurora-postgresql mysql postgres neptune"). It is a different,
@@ -747,11 +768,46 @@ pub fn db_cluster_identifier_max_len(engine: &str) -> usize {
 /// The storage types a cluster of `engine` may be created with, as
 /// `CreateDBClusterMessage$StorageType` publishes them ("Aurora DB clusters - aurora |
 /// aurora-iopt1", "Multi-AZ DB clusters - io1 | io2 | gp3").
+///
+/// A cluster of one of [`SIBLING_CONTROL_PLANE_ENGINES`] takes the value list its OWN
+/// control plane publishes instead: `com.amazonaws.docdb#CreateDBClusterMessage$StorageType`
+/// ("Valid values for storage type - standard | iopt1 … Default value is standard"), and
+/// Neptune's member states the same two values.
 pub fn db_cluster_storage_types(engine: &str) -> &'static [&'static str] {
-    if is_multi_az_db_cluster(engine) {
+    if is_sibling_control_plane_engine(engine) {
+        SIBLING_CLUSTER_STORAGE_TYPES
+    } else if is_multi_az_db_cluster(engine) {
         &["io1", "io2", "gp3"]
     } else {
         &[AURORA_DEFAULT_STORAGE_TYPE, "aurora-iopt1"]
+    }
+}
+
+/// The storage types a cluster of a sibling control plane's engine may be created with;
+/// see [`db_cluster_storage_types`]. The first is that engine's default.
+const SIBLING_CLUSTER_STORAGE_TYPES: &[&str] = &["standard", "iopt1"];
+
+/// The `AllocatedStorage` a cluster whose storage size is NOT fixed reports; see
+/// [`DbClusterRecord::reported_allocated_storage`]. One gibibyte is the unit the member is
+/// expressed in, so it is the smallest size such a cluster can report while its real size
+/// "adjusts as needed".
+pub const ELASTIC_CLUSTER_ALLOCATED_STORAGE: i32 = 1;
+
+/// The storage type a DB cluster of `engine` gets when the request names none, or `None`
+/// for a cluster type that has no default because the member is required to create it.
+///
+/// It is also the one value that is NOT reported back for that engine — `StorageType`:
+/// "When you create an Aurora DB cluster with the storage type set to `aurora-iopt1`, the
+/// storage type is returned in the response. The storage type isn't returned when you set
+/// it to `aurora`", and the sibling control planes' own member states the same of
+/// `standard` — so one function answers both questions and the two cannot disagree.
+pub fn default_db_cluster_storage_type(engine: &str) -> Option<&'static str> {
+    if is_sibling_control_plane_engine(engine) {
+        Some(SIBLING_CLUSTER_STORAGE_TYPES[0])
+    } else if is_multi_az_db_cluster(engine) {
+        None
+    } else {
+        Some(AURORA_DEFAULT_STORAGE_TYPE)
     }
 }
 
@@ -842,14 +898,27 @@ pub const MAX_IAM_ROLE_ARN_LEN: usize = 2048;
 /// contain from 8 to 41 characters. Can contain any printable ASCII character except \"/\",
 /// \"\"\", or \"@\"."
 ///
+/// The refusal is worded the way this Query API words a password it will not take: it names
+/// the member and the constraint the value broke ("The parameter MasterUserPassword is not
+/// a valid password because it is shorter than 8 characters."), because that text is all
+/// the caller has to fix the request from.
+///
 /// The password itself is never stored or reported — the member is `@sensitive` and RDS
-/// reports no member carrying it — so this is the only place it is looked at at all.
+/// reports no member carrying it — so this is the only place it is looked at at all, and
+/// the refusal quotes the constraint rather than the value.
 pub fn check_master_user_password(value: &str) -> Result<(), String> {
     let length = value.chars().count();
-    if !MASTER_USER_PASSWORD_LEN.contains(&length) {
+    if length < *MASTER_USER_PASSWORD_LEN.start() {
         return Err(format!(
-            "MasterUserPassword must contain from {} to {} characters; got {length}",
-            MASTER_USER_PASSWORD_LEN.start(),
+            "The parameter MasterUserPassword is not a valid password because it is \
+             shorter than {} characters.",
+            MASTER_USER_PASSWORD_LEN.start()
+        ));
+    }
+    if length > *MASTER_USER_PASSWORD_LEN.end() {
+        return Err(format!(
+            "The parameter MasterUserPassword is not a valid password because it is \
+             longer than {} characters.",
             MASTER_USER_PASSWORD_LEN.end()
         ));
     }
@@ -858,8 +927,9 @@ pub fn check_master_user_password(value: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_graphic() && !matches!(c, '/' | '"' | '@'))
     {
         return Err(
-            "MasterUserPassword can contain any printable ASCII character except '/', '\"' \
-             or '@'"
+            "The parameter MasterUserPassword is not a valid password because it \
+             contains a character that is not allowed. Only printable ASCII characters \
+             besides '/', '\"' and '@' may be used."
                 .to_string(),
         );
     }
@@ -868,6 +938,18 @@ pub fn check_master_user_password(value: &str) -> Result<(), String> {
 
 /// How long a `MasterUserPassword` may be ("Must contain from 8 to 41 characters").
 pub const MASTER_USER_PASSWORD_LEN: std::ops::RangeInclusive<usize> = 8..=41;
+
+/// What a delete that names NEITHER of its two final-snapshot members is refused with.
+///
+/// `SkipFinalSnapshot`: "If you set this value to false or don't specify it, RDS creates a
+/// DB cluster snapshot before it deletes the DB cluster … If SkipFinalSnapshot is disabled,
+/// you must specify a value for the FinalDBSnapshotIdentifier parameter" — exactly one of
+/// the two has to be given, so the refusal ASKS for one of them and names both. One
+/// constant for every delete that carries the pair, so one refusal class is worded one way
+/// whichever resource is being deleted.
+pub const FINAL_SNAPSHOT_MEMBER_REQUIRED: &str =
+    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
+
 
 /// The `BackupRetentionPeriod` a DB cluster accepts ("Constraints: Must be a value from 1
 /// to 35") — a different lower bound than a DB instance's
@@ -2168,11 +2250,15 @@ impl DbInstanceRecord {
     }
 
     /// The DNS name this instance's endpoint resolves to:
-    /// `<identifier>.<minted host>.<region>.rds.amazonaws.com`.
+    /// `<identifier>.<minted host>.<region>.<domain>`, with the domain of the control plane
+    /// that owns the instance's engine — see [`endpoint_domain`].
     pub fn endpoint_address(&self) -> String {
         format!(
-            "{}.{}.{}.rds.amazonaws.com",
-            self.identifier, self.endpoint_host, self.region
+            "{}.{}.{}.{}",
+            self.identifier,
+            self.endpoint_host,
+            self.region,
+            endpoint_domain(&self.engine)
         )
     }
 
@@ -2533,12 +2619,16 @@ impl DbClusterRecord {
 
     /// The cluster endpoint: "the connection endpoint for the primary instance of the DB
     /// cluster", whose published form is
-    /// `<identifier>.cluster-<server-assigned label>.<region>.rds.amazonaws.com` (Amazon
-    /// Aurora User Guide, "Amazon Aurora connection management").
+    /// `<identifier>.cluster-<server-assigned label>.<region>.<domain>` (Amazon Aurora User
+    /// Guide, "Amazon Aurora connection management"), with the domain of the control plane
+    /// that owns the cluster's engine — see [`endpoint_domain`].
     pub fn endpoint(&self) -> String {
         format!(
-            "{}.cluster-{}.{}.rds.amazonaws.com",
-            self.identifier, self.endpoint_host, self.region
+            "{}.cluster-{}.{}.{}",
+            self.identifier,
+            self.endpoint_host,
+            self.region,
+            endpoint_domain(&self.engine)
         )
     }
 
@@ -2547,8 +2637,11 @@ impl DbClusterRecord {
     /// published `cluster-ro-` label.
     pub fn reader_endpoint(&self) -> String {
         format!(
-            "{}.cluster-ro-{}.{}.rds.amazonaws.com",
-            self.identifier, self.endpoint_host, self.region
+            "{}.cluster-ro-{}.{}.{}",
+            self.identifier,
+            self.endpoint_host,
+            self.region,
+            endpoint_domain(&self.engine)
         )
     }
 
@@ -2630,7 +2723,7 @@ impl DbClusterRecord {
             cluster_create_time: Some(self.cluster_create_time),
             storage_encrypted: Some(self.storage_encrypted),
             storage_encryption_type: Some(self.storage_encryption_type().to_string()),
-            allocated_storage: self.allocated_storage,
+            allocated_storage: self.reported_allocated_storage(),
             engine_version: self.engine_version.clone(),
             db_cluster_arn: Some(self.arn()),
             backup_retention_period: Some(self.backup_retention_period),
@@ -2648,6 +2741,25 @@ impl DbClusterRecord {
             aws_backup_recovery_point_arn: None,
             tag_list: Some(self.tags.clone()),
         }
+    }
+
+    /// `AllocatedStorage`: "`AllocatedStorage` specifies the allocated storage size in
+    /// gibibytes (GiB). For Aurora, `AllocatedStorage` can vary because Aurora DB cluster
+    /// storage size adjusts as needed."
+    ///
+    /// A Multi-AZ DB cluster is created with the storage its request asked for ("the amount
+    /// of storage in gibibytes (GiB) to allocate to each DB instance in the Multi-AZ DB
+    /// cluster … required to create a Multi-AZ DB cluster"), and reports that. An
+    /// Aurora-style cluster — the Aurora engines and the two sibling control planes' —
+    /// takes no such parameter at all because its storage is not fixed, and the size it
+    /// reports is the one unit of the member it still has to answer with:
+    /// [`ELASTIC_CLUSTER_ALLOCATED_STORAGE`]. Reporting nothing would say the cluster has no
+    /// storage, which is not what a cluster whose storage grows on its own has.
+    pub fn reported_allocated_storage(&self) -> Option<i32> {
+        self.allocated_storage
+            .or_else(|| (!is_multi_az_db_cluster(&self.engine)).then_some(
+                ELASTIC_CLUSTER_ALLOCATED_STORAGE,
+            ))
     }
 
     /// `StorageEncryptionType`: "the type of encryption used to protect data at rest in
@@ -2727,7 +2839,7 @@ impl DbClusterRecord {
             kms_key_id: self.kms_key_id.clone(),
             storage_type: self.storage_type.clone(),
             iops: self.iops,
-            allocated_storage: self.allocated_storage,
+            allocated_storage: self.reported_allocated_storage(),
             db_cluster_instance_class: self.db_cluster_instance_class.clone(),
             publicly_accessible: self.publicly_accessible,
             auto_minor_version_upgrade: Some(self.auto_minor_version_upgrade),
@@ -4712,9 +4824,18 @@ pub fn hosted_zone_id(region: &str) -> Option<&'static str> {
 /// for Oracle - 1521, RDS for PostgreSQL - 5432". The engine names are the prefixes
 /// the `Engine` member's own value list uses (`custom-sqlserver-ee`, `oracle-se2`,
 /// `aurora-postgresql`, …), so the family is matched on the prefix.
+///
+/// The two engines of the sibling control planes this door also serves are matched FIRST
+/// and exactly: the default port of such a resource is the one THAT service publishes
+/// ([`DOCDB_DEFAULT_PORT`], [`NEPTUNE_DEFAULT_PORT`]), not a value from this model's list,
+/// and neither name carries any of the substrings below.
 pub fn default_port(engine: &str) -> i32 {
     let engine = engine.to_ascii_lowercase();
-    if engine.contains("db2") {
+    if engine == DOCDB_ENGINE {
+        DOCDB_DEFAULT_PORT
+    } else if engine == NEPTUNE_ENGINE {
+        NEPTUNE_DEFAULT_PORT
+    } else if engine.contains("db2") {
         50000
     } else if engine.contains("sqlserver") {
         1433
@@ -4727,6 +4848,39 @@ pub fn default_port(engine: &str) -> i32 {
         3306
     }
 }
+
+/// The port an Amazon DocumentDB cluster and its instances accept connections on when the
+/// request names none: 27017, the port that control plane's `CreateDBCluster` reports for
+/// a cluster created without a `Port` of its own (the Amazon DocumentDB API documents it
+/// as that member's default, and its own emulated front door
+/// `services/service-com-amazonaws-docdb-amazonrdsv19/src/state.rs` states the same
+/// value).
+pub const DOCDB_DEFAULT_PORT: i32 = 27017;
+
+/// The same for Amazon Neptune, from that control plane's own
+/// `CreateDBClusterMessage$Port`: "Default: 8182"
+/// (`smithy_query(query="doc",shape="CreateDBClusterMessage",member="Port",model_path="services/service-com-amazonaws-neptune-amazonrdsv19/smithy-model/com-amazonaws-neptune-amazonrdsv19.json")`).
+pub const NEPTUNE_DEFAULT_PORT: i32 = 8182;
+
+/// The DNS domain the endpoints of a resource running `engine` sit in.
+///
+/// An endpoint's domain belongs to the control plane that OWNS the engine rather than to
+/// this front door: a cluster of one of [`SIBLING_CONTROL_PLANE_ENGINES`], and every
+/// instance in it, is reached under that service's own domain — `docdb.amazonaws.com` for
+/// Amazon DocumentDB, `neptune.amazonaws.com` for Amazon Neptune, both as the endpoint
+/// form those services publish for their clusters — while everything this door creates for
+/// its own engines is reached under `rds.amazonaws.com`. The label in front of the domain
+/// is the same server-assigned one either way; only the domain follows the engine.
+pub fn endpoint_domain(engine: &str) -> &'static str {
+    if engine.eq_ignore_ascii_case(DOCDB_ENGINE) {
+        "docdb.amazonaws.com"
+    } else if engine.eq_ignore_ascii_case(NEPTUNE_ENGINE) {
+        "neptune.amazonaws.com"
+    } else {
+        "rds.amazonaws.com"
+    }
+}
+
 
 /// The CA certificate an instance's server certificate is issued under when the
 /// request names none, and so the system default `DescribeCertificates` reports as
