@@ -37,23 +37,28 @@ use crate::rest_api_lifecycle::{create_api, resource_under, string_member, Gatew
 const REGION: &str = "us-east-1";
 
 /// The stage every case deploys to.
-const STAGE: &str = "test";
+///
+/// `pub(crate)` with the helpers below for the sibling
+/// `request_validator_precedes_the_integration` suite, which drives the same validator
+/// path against the backend integration types rather than a `MOCK`: one harness, so the
+/// two suites cannot stand one validator up two ways.
+pub(crate) const STAGE: &str = "test";
 
 /// The media type the methods under test declare a model for, and the one every request
 /// below sends its payload as.
-const JSON: &str = "application/json";
+pub(crate) const JSON: &str = "application/json";
 
 /// One answered invoke: the status, the headers asserted on and the body verbatim.
-struct Invoked {
-    status: u16,
-    error_type: Option<String>,
-    body: String,
+pub(crate) struct Invoked {
+    pub(crate) status: u16,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: String,
 }
 
 impl Invoked {
     /// The `message` member of a JSON body — what every API Gateway gateway response
     /// carries — or the body verbatim when it carries none.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         serde_json::from_str::<Value>(&self.body)
             .ok()
             .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
@@ -63,7 +68,7 @@ impl Invoked {
 
 /// Issue one unsigned request to `api`'s invoke endpoint at `path`, carrying `headers` and
 /// `body` — what a client of a published invoke URL sends.
-async fn invoke(
+pub(crate) async fn invoke(
     gateway: &Gateway,
     api: &str,
     verb: &str,
@@ -111,7 +116,7 @@ async fn invoke_at(
 }
 
 /// `CreateModel` of `name` with `schema`, asserting the modelled 201.
-async fn create_model(gateway: &Gateway, api: &str, name: &str, schema: Value) {
+pub(crate) async fn create_model(gateway: &Gateway, api: &str, name: &str, schema: Value) {
     let answer = gateway
         .call(
             "POST",
@@ -132,7 +137,7 @@ async fn create_model(gateway: &Gateway, api: &str, name: &str, schema: Value) {
 
 /// `CreateRequestValidator` in the mode `(validateRequestBody, validateRequestParameters)`
 /// names, answering its id.
-async fn create_validator(
+pub(crate) async fn create_validator(
     gateway: &Gateway,
     api: &str,
     name: &str,
@@ -200,7 +205,7 @@ async fn mock_route(
 }
 
 /// `CreateDeployment` of `api` into [`STAGE`], asserting the modelled 201.
-async fn deploy(gateway: &Gateway, api: &str) {
+pub(crate) async fn deploy(gateway: &Gateway, api: &str) {
     let answer = gateway
         .call(
             "POST",
@@ -219,7 +224,7 @@ async fn deploy(gateway: &Gateway, api: &str) {
 /// properties, a bounded integer and no undeclared property. The dialect is the one
 /// `CreateModel$schema` documents a model is written in ("this should be JSON schema
 /// draft 4 model").
-fn order_schema() -> Value {
+pub(crate) fn order_schema() -> Value {
     json!({
         "$schema": "http://json-schema.org/draft-04/schema#",
         "title": "Order",
@@ -234,7 +239,7 @@ fn order_schema() -> Value {
 }
 
 /// The payload that satisfies [`order_schema`].
-const GOOD_BODY: &str = r#"{"id":"a1","qty":2}"#;
+pub(crate) const GOOD_BODY: &str = r#"{"id":"a1","qty":2}"#;
 
 /// The four modes a `RequestValidator` can declare, as
 /// `(route, validateRequestBody, validateRequestParameters)`.
