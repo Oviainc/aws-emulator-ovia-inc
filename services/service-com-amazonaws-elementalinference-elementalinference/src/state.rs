@@ -386,28 +386,27 @@ pub fn too_many_outputs_message() -> String {
     )
 }
 
-/// A request that sets a feed's whole output list to an EMPTY one.
+/// A request that supplies a feed's output list and carries NO output in it.
 ///
-/// "The key contents of the feed is an array of outputs" and a create "must specify at
-/// least one output" (`CreateFeedRequest$outputs`), so a feed HOLDS at least one output
-/// and an operation that sets the whole list cannot leave it with none. The rule is
-/// about the shape of the request rather than about any one value it carried, so the
-/// message is the rule's invariant sentence and interpolates nothing, and the same
-/// sentence answers whichever operation set the list (`CreateFeed`, `UpdateFeed`).
-/// `AssociateFeed` is not one of them: it APPENDS to the stored list ("New outputs will
-/// be appended"), so a call that appends nothing leaves a feed that already holds an
-/// output exactly as it was and cannot empty it.
+/// Every operation whose request carries a feed's output list documents that list as
+/// carrying at least one output — a create "must specify at least one output"
+/// (`CreateFeedRequest$outputs`), an update's list is the one the feed is left holding,
+/// and an append is "an array of one or more outputs that you want to add to this feed
+/// now" (`AssociateFeedRequest$outputs`) — so an empty list is a request that supplies
+/// no output at all and is refused whichever operation carried it. The rule is about the
+/// shape of the request rather than about any one value it carried, so the message is
+/// the rule's invariant sentence and interpolates nothing.
 pub const MISSING_OUTPUTS_MESSAGE: &str = "You must specify at least one output.";
 
 /// Why a supplied output list is not one a feed may hold.
 ///
-/// An operation that SETS a feed's whole output list — `CreateFeed` and `UpdateFeed`,
-/// which each REPLACE it — holds the list to three rules: a feed holds at least one
-/// output, an output's name identifies it within the feed, and the list is bounded at
-/// [`MAX_OUTPUTS_PER_FEED`]. Which rules are checked, in which order, and which message
-/// and modelled error class each failure earns are stated ONCE here, so no two setters
-/// can come to disagree about what a feed's outputs may look like. A handler only lifts
-/// the outcome into its own modelled error enum, which is per-operation.
+/// An operation whose request carries a feed's output list holds it to three rules: the
+/// list carries at least one output, an output's name identifies it within the list, and
+/// the list leaves the feed holding no more than [`MAX_OUTPUTS_PER_FEED`] outputs. Which
+/// rules are checked, in which order, and which message and modelled error class each
+/// failure earns are stated ONCE here, so no two operations that carry such a list can
+/// come to disagree about what a feed's outputs may look like. A handler only lifts the
+/// outcome into its own modelled error enum, which is per-operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputListRefusal<'a> {
     /// The list is EMPTY, so it describes a feed holding no output
@@ -436,28 +435,41 @@ impl OutputListRefusal<'_> {
 }
 
 /// Which refusal, if any, an output list whose entries are named by `names` earns from
-/// the rules every operation that SETS a feed's whole output list holds.
+/// the rules EVERY operation whose request carries such a list holds, whether that list
+/// replaces the stored one (`CreateFeed`, `UpdateFeed`) or is appended to it
+/// (`AssociateFeed`).
 ///
-/// The order is the order the rules are decided in: the SHAPE of the list first (an
-/// empty one describes a feed the service would never hold, whatever else it says),
-/// then a name that is not unique (a property of the request's own values, which an
-/// empty list cannot carry), then the bound on the list the feed would be left holding.
-/// Every outcome is decided from the request alone, so a setter can run this before it
-/// takes the store, and `names` is only walked — the caller still owns the outputs it
-/// goes on to store.
+/// The order is the order the rules are decided in: the SHAPE of the list first (a list
+/// carrying no output supplies none, whatever else the request says), then a name that
+/// is not unique (a property of the request's own values, which an empty list cannot
+/// carry). Both outcomes are decided from the request alone, so a handler can run this
+/// before it takes the store, and `names` is only walked — the caller still owns the
+/// outputs it goes on to store.
 ///
-/// `AssociateFeed` is NOT one of these setters: it APPENDS to the stored list ("New
-/// outputs will be appended"), so an empty list leaves the feed as it was and its bound
-/// is on the stored length plus the appended one, not on the request's own length. It
-/// shares the rule it does share, [`first_duplicate_output_name`].
-pub fn output_list_refusal<'a>(
+/// The bound on a feed's output list is NOT decided here, because it is not a rule about
+/// the request alone: a list that REPLACES the stored one is bounded by its own length
+/// ([`output_list_refusal`]), while an APPEND is bounded by the stored length plus what
+/// it really adds, which only the stored feed can say.
+pub fn supplied_output_list_refusal<'a>(
     names: impl Iterator<Item = &'a str> + Clone,
 ) -> Option<OutputListRefusal<'a>> {
     if names.clone().next().is_none() {
         return Some(OutputListRefusal::MissingOutputs);
     }
-    if let Some(duplicate) = first_duplicate_output_name(names.clone()) {
-        return Some(OutputListRefusal::DuplicateName(duplicate));
+    first_duplicate_output_name(names).map(OutputListRefusal::DuplicateName)
+}
+
+/// Which refusal, if any, an output list that REPLACES a feed's whole stored list earns
+/// — the rules every supplied list is held to ([`supplied_output_list_refusal`]), plus
+/// the bound on the list the feed would be left holding, which for a replacement is the
+/// request's own length.
+///
+/// The operations that replace the list are `CreateFeed` and `UpdateFeed`.
+pub fn output_list_refusal<'a>(
+    names: impl Iterator<Item = &'a str> + Clone,
+) -> Option<OutputListRefusal<'a>> {
+    if let Some(refusal) = supplied_output_list_refusal(names.clone()) {
+        return Some(refusal);
     }
     if names.count() > MAX_OUTPUTS_PER_FEED {
         return Some(OutputListRefusal::TooManyOutputs);

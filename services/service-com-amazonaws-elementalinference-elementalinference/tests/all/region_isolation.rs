@@ -85,7 +85,13 @@ fn feed_probes(id: &str) -> Vec<Probe> {
             label: "AssociateFeed",
             method: "POST",
             path: format!("/v1/feed/{id}/associate"),
-            body: Some(json!({"associatedResourceName": "another-regions-media", "outputs": []})),
+            body: Some(json!({
+                "associatedResourceName": "another-regions-media",
+                "outputs": [
+                    {"name": "assoc1", "outputConfig": output_config("contextualMetadata"),
+                     "status": "ENABLED"}
+                ],
+            })),
         },
         Probe {
             label: "DisassociateFeed",

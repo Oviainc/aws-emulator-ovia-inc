@@ -145,10 +145,12 @@ fn expected_outputs(submitted: &Value, from_association: bool) -> Vec<Value> {
 
 /// One row of the association table: a feed's own outputs, the resource that claims it
 /// and the outputs that claim appends. The rows differ along what the rule generalises
-/// over — how many outputs are appended (none, one, several), which `OutputConfig`
-/// member each carries, the output statuses, and the form and length of the resource
-/// name (every character class its pattern `^[\w \-\.',@:;/]*$` admits, at the minimum
-/// and the maximum of its `@length` 1..2048).
+/// over — how many outputs are appended (one, several), which `OutputConfig` member each
+/// carries, the output statuses, and the form and length of the resource name (every
+/// character class its pattern `^[\w \-\.',@:;/]*$` admits, at the minimum and the
+/// maximum of its `@length` 1..2048). Every row appends at least one output, which is
+/// what `outputs` carries ("an array of one or more outputs"); a request carrying none is
+/// refused, which `supplied_output_cardinality.rs` pins.
 struct AssociationCase {
     label: &'static str,
     feed_outputs: Value,
@@ -176,10 +178,10 @@ fn association_cases() -> Vec<AssociationCase> {
             ]),
         },
         AssociationCase {
-            label: "no appended outputs: the claim alone",
+            label: "a resource name using every character class its pattern admits",
             feed_outputs: json!([output("crop1", "cropping", "ENABLED")]),
             resource: "media@venue:cam/1;take-2".to_string(),
-            appended: json!([]),
+            appended: json!([output("meta1", "contextualMetadata", "DISABLED")]),
         },
         AssociationCase {
             label: "a one-character resource name, the minimum its @length admits",
@@ -270,26 +272,41 @@ async fn re_associating_the_same_resource_appends_more_outputs() {
     )
     .await;
 
-    // Each row appends a different number of further outputs; the expected list grows
-    // by exactly those, in request order.
-    let rounds = [
-        json!([output("subs1", "subtitling", "ENABLED")]),
-        json!([]),
-        json!([
-            output("clip1", "clipping", "DISABLED"),
-            output("meta1", "contextualMetadata", "ENABLED")
-        ]),
+    // (what the round asks for, what it really adds): each row appends a different number
+    // of further outputs, and the expected list grows by exactly the ones the feed does
+    // not hold yet — the second round asks again for the output the first one appended,
+    // which is in place already and so is not appended a second time.
+    let rounds: [(Value, Value); 3] = [
+        (
+            json!([output("subs1", "subtitling", "ENABLED")]),
+            json!([output("subs1", "subtitling", "ENABLED")]),
+        ),
+        (json!([output("subs1", "subtitling", "ENABLED")]), json!([])),
+        (
+            json!([
+                output("clip1", "clipping", "DISABLED"),
+                output("meta1", "contextualMetadata", "ENABLED")
+            ]),
+            json!([
+                output("clip1", "clipping", "DISABLED"),
+                output("meta1", "contextualMetadata", "ENABLED")
+            ]),
+        ),
     ];
     let mut expected = expected_outputs(&json!([output("crop1", "cropping", "ENABLED")]), false);
 
-    for (round, appended) in rounds.iter().enumerate() {
-        let label = format!("round {round} appending {} outputs", appended.as_array().unwrap().len());
+    for (round, (appended, added)) in rounds.iter().enumerate() {
+        let label = format!(
+            "round {round} asking for {} outputs, {} of them new",
+            appended.as_array().unwrap().len(),
+            added.as_array().unwrap().len()
+        );
         let (status, body) = associate(&router, &id, resource, appended.clone()).await;
         assert_eq!(
             status, 200,
             "case {label:?}: re-associating the same resource is accepted, got {status} with {body}"
         );
-        expected.extend(expected_outputs(appended, true));
+        expected.extend(expected_outputs(added, true));
 
         let feed = get_feed(&router, &id, &label).await;
         assert_eq!(
@@ -418,7 +435,13 @@ async fn associate_is_refused_from_every_status_that_takes_no_association() {
             }
             "ARCHIVED" => {
                 let id = available_feed(&router, "archived-feed", feed_outputs.clone()).await;
-                let (status, _) = associate(&router, &id, "released-media", json!([])).await;
+                let (status, _) = associate(
+                    &router,
+                    &id,
+                    "released-media",
+                    json!([output("subs1", "subtitling", "ENABLED")]),
+                )
+                .await;
                 assert_eq!(status, 200, "case {status_under_test:?}: the claim is accepted");
                 let (status, _) = disassociate(&router, &id, "released-media").await;
                 assert_eq!(
@@ -430,11 +453,11 @@ async fn associate_is_refused_from_every_status_that_takes_no_association() {
             other => panic!("no such status row: {other}"),
         };
 
-        let feed = get_feed(&router, &id, status_under_test).await;
+        let before = get_feed(&router, &id, status_under_test).await;
         assert_eq!(
-            feed["status"],
+            before["status"],
             json!(status_under_test),
-            "case {status_under_test:?}: the feed is in the status under test, got {feed}"
+            "case {status_under_test:?}: the feed is in the status under test, got {before}"
         );
 
         let (status, error) = associate(
@@ -470,8 +493,8 @@ async fn associate_is_refused_from_every_status_that_takes_no_association() {
                 "case {status_under_test:?}: the refused call associated nothing, got {feed}"
             );
             assert_eq!(
-                feed["outputs"].as_array().map(Vec::len),
-                Some(1),
+                feed["outputs"],
+                before["outputs"],
                 "case {status_under_test:?}: the refused outputs were not appended, got {}",
                 feed["outputs"]
             );
@@ -510,7 +533,13 @@ async fn a_resource_name_that_resembles_an_arn_is_refused() {
             json!([output("crop1", "cropping", "ENABLED")]),
         )
         .await;
-        let (status, body) = associate(&router, &id, name, json!([])).await;
+        let (status, body) = associate(
+            &router,
+            &id,
+            name,
+            json!([output("subs1", "subtitling", "ENABLED")]),
+        )
+        .await;
         assert!(
             status == 200 || status == 400,
             "case {name:?}: the name is judged, never crashing the handler, got {status} \
@@ -576,7 +605,13 @@ async fn a_resource_name_outside_the_modelled_length_is_refused() {
         } else {
             id.clone()
         };
-        let (status, body) = associate(&router, &id, &name, json!([])).await;
+        let (status, body) = associate(
+            &router,
+            &id,
+            &name,
+            json!([output("subs1", "subtitling", "ENABLED")]),
+        )
+        .await;
         assert_eq!(
             status, expected,
             "case length {length}: expected HTTP {expected}, got {status} with {body}"
@@ -690,26 +725,28 @@ async fn associate_refuses_an_append_past_the_output_quota() {
         feed["outputs"]
     );
 
-    // A call that appends NOTHING grows nothing, so the quota never refuses it — not
-    // even on a feed whose own outputs are already AT the bound, which is as far as
-    // any operation that sets a feed's output list may take it.
-    let over: Vec<Value> = (0..MAX_OUTPUTS_PER_FEED)
-        .map(|index| output(&format!("own{index}"), "cropping", "ENABLED"))
-        .collect();
-    let over_count = over.len();
-    let id = available_feed(&router, "over-quota-feed", json!(over)).await;
-    let (status, body) = associate(&router, &id, "source-media", json!([])).await;
+    // The bound is on what the call really ADDS: a repeat of a request whose outputs are
+    // all in place already adds nothing, so the quota never refuses it — not even on a
+    // feed whose list is AT the bound, which is as far as any operation that replaces a
+    // feed's output list may take it.
+    let (status, body) = associate(
+        &router,
+        &id,
+        "source-media",
+        json!([output("fill1", "subtitling", "ENABLED")]),
+    )
+    .await;
     assert_eq!(
         status, 200,
-        "case {over_count} own outputs, appending none: the claim is accepted, got {status} \
-         with {body}"
+        "case a repeat at the quota ({MAX_OUTPUTS_PER_FEED} outputs): the request is served, \
+         got {status} with {body}"
     );
-    let feed = get_feed(&router, &id, "appending none").await;
+    let feed = get_feed(&router, &id, "a repeat at the quota").await;
     assert_eq!(
         (&feed["status"], feed["outputs"].as_array().map(Vec::len)),
-        (&json!("ACTIVE"), Some(over_count)),
-        "case {over_count} own outputs, appending none: the feed is claimed and unchanged \
-         otherwise, got {feed}"
+        (&json!("ACTIVE"), Some(MAX_OUTPUTS_PER_FEED)),
+        "case a repeat at the quota: the feed is claimed and holds one copy of each output, \
+         got {feed}"
     );
 }
 
@@ -762,7 +799,13 @@ async fn disassociate_releases_the_resource_and_archives_the_feed_irreversibly()
         // Irreversible: the feed takes no further association, and no OTHER resource can
         // be released from it. (Repeating the release that WAS served is that one release
         // again under its idempotency token, not a second release — `feed_release_retry.rs`.)
-        let (status, error) = associate(&router, &id, &case.resource, json!([])).await;
+        let (status, error) = associate(
+            &router,
+            &id,
+            &case.resource,
+            json!([output("post1", "cropping", "ENABLED")]),
+        )
+        .await;
         assert_eq!(
             status, 400,
             "case {label:?}: re-associating an ARCHIVED feed is a 400, got {status} with {error}"
@@ -798,7 +841,13 @@ async fn a_feed_that_is_being_deleted_refuses_both_association_calls() {
     for associated in [false, true] {
         let id = available_feed(&router, "deleting-feed", feed_outputs.clone()).await;
         if associated {
-            let (status, _) = associate(&router, &id, "source-media", json!([])).await;
+            let (status, _) = associate(
+                &router,
+                &id,
+                "source-media",
+                json!([output("subs1", "subtitling", "ENABLED")]),
+            )
+            .await;
             assert_eq!(
                 status, 200,
                 "case associated={associated}: the claim is accepted"
@@ -813,7 +862,13 @@ async fn a_feed_that_is_being_deleted_refuses_both_association_calls() {
         for (operation, answer) in [
             (
                 "associate",
-                associate(&router, &id, "too-late", json!([])).await,
+                associate(
+                    &router,
+                    &id,
+                    "too-late",
+                    json!([output("meta1", "contextualMetadata", "ENABLED")]),
+                )
+                .await,
             ),
             (
                 "disassociate",
@@ -866,7 +921,13 @@ async fn disassociate_with_a_name_that_is_not_the_associated_resource_is_refused
             json!([output("crop1", "cropping", "ENABLED")]),
         )
         .await;
-        let (status, _) = associate(&router, &id, holder, json!([])).await;
+        let (status, _) = associate(
+            &router,
+            &id,
+            holder,
+            json!([output("subs1", "subtitling", "ENABLED")]),
+        )
+        .await;
         assert_eq!(status, 200, "case {other:?}: the claim is accepted");
 
         let (status, error) = disassociate(&router, &id, other).await;
@@ -923,7 +984,13 @@ async fn disassociate_is_refused_from_every_status_that_holds_no_resource() {
             }
             "ARCHIVED" => {
                 let id = available_feed(&router, "released-feed", feed_outputs.clone()).await;
-                let (status, _) = associate(&router, &id, "released-media", json!([])).await;
+                let (status, _) = associate(
+                    &router,
+                    &id,
+                    "released-media",
+                    json!([output("subs1", "subtitling", "ENABLED")]),
+                )
+                .await;
                 assert_eq!(status, 200, "case {status_under_test:?}: the claim is accepted");
                 let (status, _) = disassociate(&router, &id, "released-media").await;
                 assert_eq!(
@@ -977,7 +1044,8 @@ async fn a_dry_run_changes_nothing() {
         (
             "dry-run associate of a second resource",
             "associate",
-            json!({"associatedResourceName": "other-media", "outputs": [], "dryRun": true}),
+            json!({"associatedResourceName": "other-media",
+                   "outputs": [output("subs1", "subtitling", "ENABLED")], "dryRun": true}),
             400,
             true,
         ),
@@ -1000,7 +1068,13 @@ async fn a_dry_run_changes_nothing() {
     for (label, verb, body, expected, pre_associate) in dry_cases {
         let id = available_feed(&router, "dry-run-feed", feed_outputs.clone()).await;
         if pre_associate {
-            let (status, _) = associate(&router, &id, resource, json!([])).await;
+            let (status, _) = associate(
+                &router,
+                &id,
+                resource,
+                json!([output("assoc1", "contextualMetadata", "ENABLED")]),
+            )
+            .await;
             assert_eq!(status, 200, "case {label:?}: the setup claim is accepted");
         }
         let before = get_feed(&router, &id, label).await;
@@ -1056,7 +1130,8 @@ async fn an_unknown_feed_id_is_a_404_on_both_association_operations() {
         for (verb, body) in [
             (
                 "associate",
-                json!({"associatedResourceName": "source-media", "outputs": []}),
+                json!({"associatedResourceName": "source-media",
+                       "outputs": [output("subs1", "subtitling", "ENABLED")]}),
             ),
             (
                 "disassociate",

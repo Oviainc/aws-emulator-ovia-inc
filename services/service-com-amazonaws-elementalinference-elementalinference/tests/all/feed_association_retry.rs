@@ -139,10 +139,10 @@ fn repeat_cases() -> Vec<RepeatCase> {
             repeats: 1,
         },
         RepeatCase {
-            label: "no outputs at all: the claim alone, repeated twice",
+            label: "one output, a resource name carrying every punctuation class, repeated twice",
             feed_outputs: json!([output("crop1", "cropping", "DISABLED")]),
             resource: "media@venue:cam/1;take-2".to_string(),
-            requested: json!([]),
+            requested: json!([output("meta1", "contextualMetadata", "ENABLED")]),
             repeats: 2,
         },
         RepeatCase {

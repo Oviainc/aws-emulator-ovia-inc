@@ -76,16 +76,17 @@ struct LifecycleCase {
 
 /// The rows differ in output count and `OutputConfig` member, in whether a role and tags
 /// are supplied, in the length of the name, and in how many outputs the association
-/// appends (none, one, two) — everything the rule generalises over.
+/// appends (one, two) — everything the rule generalises over. Every claim appends at
+/// least one output, which is what `outputs` carries ("an array of one or more outputs").
 fn lifecycle_cases() -> Vec<LifecycleCase> {
     vec![
         LifecycleCase {
-            label: "one cropping output, nothing appended",
+            label: "one cropping output, one appended",
             create: json!({
                 "name": "usable-one",
                 "outputs": [enabled_output("crop1", "cropping")]
             }),
-            appended: json!([]),
+            appended: json!([enabled_output("meta1", "contextualMetadata")]),
         },
         LifecycleCase {
             label: "a single-character name, one output appended",
@@ -294,7 +295,14 @@ async fn concurrent_claims_on_a_fresh_feed_leave_exactly_one_winner() {
             let id = id.clone();
             let resource = format!("race-media-{caller}");
             tasks.push(tokio::spawn(async move {
-                let (status, body) = associate(&router, &id, &resource, json!([]), false).await;
+                let (status, body) = associate(
+                    &router,
+                    &id,
+                    &resource,
+                    json!([enabled_output("assoc1", "contextualMetadata")]),
+                    false,
+                )
+                .await;
                 (resource, status, body)
             }));
         }

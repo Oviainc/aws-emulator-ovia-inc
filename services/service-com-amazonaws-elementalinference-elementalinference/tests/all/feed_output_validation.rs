@@ -13,9 +13,9 @@
 //! * a feed HOLDS at least one output ("The key contents of the feed is an array of
 //!   outputs"; `CreateFeedRequest$outputs`: "You must specify at least one output"), so an
 //!   operation that SETS the whole list — `CreateFeed` and `UpdateFeed` — refuses an empty
-//!   one with the modelled `ValidationException` (HTTP 400) and stores nothing.
-//!   `AssociateFeed` is not one of them: it appends to the stored list, so a call that
-//!   appends nothing cannot empty a feed;
+//!   one with the modelled `ValidationException` (HTTP 400) and stores nothing. The same
+//!   cardinality rule over every operation that SUPPLIES such a list, `AssociateFeed`
+//!   included, is `supplied_output_cardinality.rs`;
 //! * an output NAMES another resource through its config — a dictionary
 //!   (`SubtitlingConfig$dictionary`) or a fixture of the data source
 //!   (`DataSourceConfiguration$fixtureId`) — and the service keeps that relation in both
@@ -265,7 +265,14 @@ async fn update_feed_refuses_an_empty_output_list_and_changes_nothing() {
         let router = router();
         let id = feed_holding(&router, "feed-to-empty", held).await;
         if associated {
-            let (status, claimed) = associate(&router, &id, json!([]), false).await;
+            let (status, claimed) = associate(
+                &router,
+                &id,
+                json!([{"name": "assoc1", "outputConfig": output_config("contextualMetadata"),
+                        "status": "ENABLED"}]),
+                false,
+            )
+            .await;
             assert_eq!(
                 status, 200,
                 "case {label:?}: the association answers 200, got {status} with {claimed}"

@@ -56,13 +56,17 @@ async fn update_feed(router: &MultiServiceRouter, id: &str, payload: &Value) -> 
     call(router, "PUT", &format!("/v1/feed/{id}"), Some(payload.clone())).await
 }
 
-/// `POST /v1/feed/{id}/associate` claiming `resource` and appending nothing.
+/// `POST /v1/feed/{id}/associate` claiming `resource` and appending the one output a
+/// claim supplies (`outputs` carries "an array of one or more outputs").
 async fn associate(router: &MultiServiceRouter, id: &str, resource: &str) -> (u16, Value) {
     call(
         router,
         "POST",
         &format!("/v1/feed/{id}/associate"),
-        Some(json!({"associatedResourceName": resource, "outputs": []})),
+        Some(json!({
+            "associatedResourceName": resource,
+            "outputs": [enabled_output("assoc1", "contextualMetadata")],
+        })),
     )
     .await
 }

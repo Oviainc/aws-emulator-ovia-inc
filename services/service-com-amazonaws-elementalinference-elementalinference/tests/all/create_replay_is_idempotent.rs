@@ -456,8 +456,12 @@ async fn a_feed_that_has_been_associated_is_not_answered_to_a_repeated_create() 
         &router,
         "POST",
         &format!("/v1/feed/{id}/associate"),
-        // No further outputs: the claim alone is what moves the feed on.
-        Some(json!({"associatedResourceName": "source-media", "outputs": []})),
+        // The claim is what moves the feed on; it appends the one output `outputs`
+        // carries ("an array of one or more outputs").
+        Some(json!({
+            "associatedResourceName": "source-media",
+            "outputs": [enabled_output("assoc1", "contextualMetadata")],
+        })),
     )
     .await;
     assert_eq!(

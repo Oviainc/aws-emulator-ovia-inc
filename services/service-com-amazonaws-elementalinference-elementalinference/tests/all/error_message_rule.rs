@@ -162,7 +162,7 @@ async fn associate_on_an_already_claimed_feed_answers_one_invariant_sentence() {
 
     for (label, holder) in resource_names() {
         let id = available_feed(&router, "claimed-feed", 1).await;
-        let (status, claimed) = associate(&router, &id, &holder, json!([])).await;
+        let (status, claimed) = associate(&router, &id, &holder, json!([output("assoc1")])).await;
         assert_eq!(
             status, 200,
             "case {label:?}: the first claim is accepted, got {status} with {claimed}"
@@ -240,7 +240,7 @@ async fn associate_from_a_non_associable_status_answers_one_invariant_sentence()
             }
             "ARCHIVED" => {
                 let id = available_feed(&router, "archived-feed", 1).await;
-                let (status, body) = associate(&router, &id, "released-media", json!([])).await;
+                let (status, body) = associate(&router, &id, "released-media", json!([output("assoc1")])).await;
                 assert_eq!(
                     status, 200,
                     "case {status_under_test:?}: the claim is accepted, got {body}"
@@ -257,7 +257,7 @@ async fn associate_from_a_non_associable_status_answers_one_invariant_sentence()
 
         let message = refusal(
             status_under_test,
-            associate(&router, &id, "would-be-media", json!([])).await,
+            associate(&router, &id, "would-be-media", json!([output("assoc1")])).await,
             400,
             "ValidationException",
         );
@@ -292,7 +292,7 @@ async fn disassociate_under_the_wrong_name_answers_one_invariant_sentence() {
 
     for (label, holder) in resource_names() {
         let id = available_feed(&router, "released-feed", 1).await;
-        let (status, claimed) = associate(&router, &id, &holder, json!([])).await;
+        let (status, claimed) = associate(&router, &id, &holder, json!([output("assoc1")])).await;
         assert_eq!(
             status, 200,
             "case {label:?}: the claim is accepted, got {status} with {claimed}"
@@ -370,7 +370,7 @@ async fn disassociate_with_nothing_to_release_reports_the_status_it_was_decided_
             }
             "ARCHIVED" => {
                 let id = available_feed(&router, "released-feed", 1).await;
-                let (code, body) = associate(&router, &id, "released-media", json!([])).await;
+                let (code, body) = associate(&router, &id, "released-media", json!([output("assoc1")])).await;
                 assert_eq!(
                     code, 200,
                     "case {status_under_test:?}: the claim is accepted, got {body}"

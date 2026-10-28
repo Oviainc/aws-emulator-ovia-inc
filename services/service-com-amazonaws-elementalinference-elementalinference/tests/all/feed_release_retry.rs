@@ -132,7 +132,7 @@ fn retry_cases() -> Vec<RetryCase> {
             label: "a plain resource name, retried once",
             feed_outputs: json!([output("crop1", "cropping", "ENABLED")]),
             resource: "source-media".to_string(),
-            appended: json!([]),
+            appended: json!([output("subs1", "subtitling", "ENABLED")]),
             retries: 1,
         },
         RetryCase {
@@ -157,7 +157,7 @@ fn retry_cases() -> Vec<RetryCase> {
             label: "a one-character name, the minimum its @length admits",
             feed_outputs: json!([output("meta1", "contextualMetadata", "ENABLED")]),
             resource: "a".to_string(),
-            appended: json!([]),
+            appended: json!([output("crop1", "cropping", "DISABLED")]),
             retries: 2,
         },
         RetryCase {
@@ -256,7 +256,7 @@ async fn a_release_of_a_name_the_feed_never_released_is_still_refused() {
             other,
             json!([output("crop1", "cropping", "ENABLED")]),
             holder,
-            json!([]),
+            json!([output("assoc1", "contextualMetadata", "ENABLED")]),
         )
         .await;
         let (status, _) = disassociate(&router, &id, holder, false).await;
@@ -295,7 +295,14 @@ async fn a_served_release_is_the_release_of_one_feed_only() {
     let resource = "shared-media-name";
     let outputs = json!([output("crop1", "cropping", "ENABLED")]);
 
-    let released_id = claimed_feed(&router, "released", outputs.clone(), resource, json!([])).await;
+    let released_id = claimed_feed(
+        &router,
+        "released",
+        outputs.clone(),
+        resource,
+        json!([output("assoc1", "contextualMetadata", "ENABLED")]),
+    )
+    .await;
     let (status, served) = disassociate(&router, &released_id, resource, false).await;
     assert_eq!(status, 200, "the first feed's release is served, got {served}");
 
@@ -316,7 +323,14 @@ async fn a_served_release_is_the_release_of_one_feed_only() {
 
     // A feed that DOES hold the resource under the same name: a real release of its own,
     // which archives it and disables its outputs.
-    let claimed_id = claimed_feed(&router, "second holder", outputs, resource, json!([])).await;
+    let claimed_id = claimed_feed(
+        &router,
+        "second holder",
+        outputs,
+        resource,
+        json!([output("assoc1", "contextualMetadata", "ENABLED")]),
+    )
+    .await;
     let (status, body) = disassociate(&router, &claimed_id, resource, false).await;
     assert_eq!(
         status, 200,
@@ -345,7 +359,7 @@ async fn a_dry_run_release_leaves_no_release_to_repeat() {
         "dry run first",
         json!([output("crop1", "cropping", "ENABLED")]),
         resource,
-        json!([]),
+        json!([output("assoc1", "contextualMetadata", "ENABLED")]),
     )
     .await;
 

@@ -81,6 +81,8 @@ mod response_members;
 mod shared_pagination_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/supplied_output_cardinality.rs"]
+mod supplied_output_cardinality;
 #[path = "all/supplied_tag_validation.rs"]
 mod supplied_tag_validation;
 #[path = "all/tag_listing.rs"]

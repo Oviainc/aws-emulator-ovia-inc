@@ -887,7 +887,10 @@ async fn update_feed_reports_updating_and_settles_back_into_the_status_it_suspen
                 &router,
                 "POST",
                 &format!("/v1/feed/{feed_id}/associate"),
-                Some(json!({"associatedResourceName": "held-media", "outputs": []})),
+                Some(json!({
+                    "associatedResourceName": "held-media",
+                    "outputs": [enabled_output("assoc1", "contextualMetadata")],
+                })),
             )
             .await;
             assert_eq!(status, 200, "case {label:?}: AssociateFeed answers 200");

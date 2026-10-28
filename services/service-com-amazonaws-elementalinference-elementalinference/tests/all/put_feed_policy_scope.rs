@@ -259,7 +259,8 @@ async fn feed_in_status(router: &MultiServiceRouter, status_under_test: &str) ->
                 router,
                 "POST",
                 &format!("/v1/feed/{id}/associate"),
-                Some(json!({"associatedResourceName": "source-media", "outputs": []})),
+                Some(json!({"associatedResourceName": "source-media",
+                       "outputs": [enabled_output("assoc1", "contextualMetadata")]})),
             )
             .await;
             assert_eq!(
@@ -273,7 +274,8 @@ async fn feed_in_status(router: &MultiServiceRouter, status_under_test: &str) ->
                     router,
                     "POST",
                     &format!("/v1/feed/{id}/{verb}"),
-                    Some(json!({"associatedResourceName": "released-media", "outputs": []})),
+                    Some(json!({"associatedResourceName": "released-media",
+                           "outputs": [enabled_output("assoc1", "contextualMetadata")]})),
                 )
                 .await;
                 assert_eq!(

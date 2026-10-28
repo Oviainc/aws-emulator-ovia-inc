@@ -219,7 +219,9 @@ async fn resource_not_found_carries_one_fixed_message_for_every_operation_and_id
     let claim = json!({
         "associatedResourceName": "some-source-media",
         "dryRun": false,
-        "outputs": []
+        "outputs": [
+            {"name": "crop1", "outputConfig": output_config("cropping"), "status": "ENABLED"}
+        ]
     });
     let release = json!({"associatedResourceName": "some-source-media", "dryRun": false});
 

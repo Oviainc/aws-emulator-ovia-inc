@@ -74,13 +74,17 @@ async fn create_feed(router: &MultiServiceRouter, name: &str, outputs: Value) ->
         .to_string()
 }
 
-/// `POST /v1/feed/{id}/associate`.
+/// `POST /v1/feed/{id}/associate`, appending the one output a claim supplies (`outputs`
+/// carries "an array of one or more outputs").
 async fn associate(router: &MultiServiceRouter, id: &str, resource: &str) -> (u16, Value) {
     call(
         router,
         "POST",
         &format!("/v1/feed/{id}/associate"),
-        Some(json!({"associatedResourceName": resource, "outputs": []})),
+        Some(json!({
+            "associatedResourceName": resource,
+            "outputs": [plain_output("assoc1")],
+        })),
     )
     .await
 }
