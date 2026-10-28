@@ -45,6 +45,8 @@ mod contact_lists;
 mod contact_updates;
 #[path = "all/dedicated_ip_pools.rs"]
 mod dedicated_ip_pools;
+#[path = "all/dedicated_ip_warmup_attributes.rs"]
+mod dedicated_ip_warmup_attributes;
 #[path = "all/dedicated_ips.rs"]
 mod dedicated_ips;
 #[path = "all/email_identity_certificates.rs"]
