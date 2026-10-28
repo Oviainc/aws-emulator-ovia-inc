@@ -23,9 +23,9 @@
 //!    image, and by THIS operation's own validator: an image id it cannot resolve is
 //!    answered `InvalidAMIID.Malformed` whether or not the value reads like the long
 //!    `ami-` id form, which is what the recorded unit `ec2-image-describes#task#4` pins for
-//!    this operation (see [`require_describable_image`], which records why the shared
-//!    [`crate::state::require_visible_image`] — the malformed-before-not-found helper the
-//!    describes use — is NOT what answers here).
+//!    this operation (see [`crate::state::require_resolvable_image`], which records why the
+//!    shared [`crate::state::require_visible_image`] — the malformed-before-not-found helper
+//!    the describes use — is NOT what answers here).
 //! 2. An `Attribute` outside the modelled catalog is refused `InvalidParameterValue`, the
 //!    way every other attribute report of this crate refuses one.
 //! 3. "The blockDeviceMapping attribute is deprecated. Using this attribute returns the
@@ -125,9 +125,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    ComAmazonawsEc2Amazonec2State, EXECUTABLE_BY_ALL, INVALID_AMI_ID_MALFORMED,
-    dry_run_operation, image_is_visible, internal_error, invalid_parameter_value,
-    require_service_state,
+    EXECUTABLE_BY_ALL, dry_run_operation, internal_error, invalid_parameter_value,
+    require_resolvable_image, require_service_state,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -210,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Describes the specified attribute of the specified AMI": the image first, since
         // every member of the response is a fact of it, through this operation's own
         // validator.
-        let image = require_describable_image(&store, &input.image_id)?;
+        let image = require_resolvable_image(&store, &input.image_id)?;
 
         // "You can specify only one attribute at a time" — `Attribute` is one
         // `ImageAttributeName`, and the response carries only the member it names. The
@@ -301,61 +300,6 @@ fn image_attribute_deprecated<E>(attribute: &str) -> crate::scaffolded::Scaffold
              device mappings for an AMI, describe the image instead"
         ),
     )
-}
-
-/// Refuse an image id THIS operation cannot resolve: HTTP 400 `InvalidAMIID.Malformed`
-/// ([`crate::state::INVALID_AMI_ID_MALFORMED`], the one code every AMI-id refusal of this
-/// service names for a value it cannot read as an id).
-///
-/// The same CODE as the crate's syntax-only [`crate::state::invalid_ami_id_malformed`] in a
-/// different WORDING: EC2's per-operation validators do not agree about an id they cannot
-/// resolve, and this operation answers "The image ID '<id>' is malformed" where a describe of
-/// the account's images answers "Invalid id: '<id>'". It lives in this file, beside the one
-/// caller that answers it, for the same reason
-/// `crate::ops::copy_fpga_image::unresolvable_source_fpga_image_id` does — the wording
-/// belongs to the operation, not to the id — and the message is built from the request's own
-/// id, which is the only part of it that varies.
-fn image_id_is_malformed<E>(image_id: &str) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_error(
-        INVALID_AMI_ID_MALFORMED,
-        400,
-        format!("The image ID '{image_id}' is malformed"),
-    )
-}
-
-/// Resolve the AMI `DescribeImageAttribute` is asked about, or refuse the id: HTTP 400
-/// `InvalidAMIID.Malformed`.
-///
-/// The images this account can be told about are the ones it can see at all — "public
-/// images, private images that you own, and private images owned by other Amazon Web
-/// Services accounts for which you have explicit launch permissions" (`DescribeImages`) —
-/// read through the crate's one definition of that question
-/// ([`crate::state::image_is_visible`]), so this operation and the describes agree about
-/// which AMIs exist for a caller.
-///
-/// EC2's per-operation validators do NOT agree about an image id they cannot resolve, and
-/// this operation's is the strict one: it checks the id against the image id space and
-/// answers `InvalidAMIID.Malformed` for anything it does not recognise as an id naming an
-/// image of this account — including a value in the long `ami-` form that names none. The
-/// recorded unit `ec2-image-describes#task#4` probes an id of exactly that shape and
-/// `DescribeImageAttribute` answers `InvalidAMIID.Malformed`, "The image ID '<id>' is
-/// malformed", where `DescribeImages` answers the same id `InvalidAMIID.NotFound`. So the
-/// choice belongs to the OPERATION rather than to the id, which is why this lives here and
-/// not in [`crate::state::require_visible_image`] — the shared malformed-before-not-found
-/// helper the operations that DO draw the distinction keep using. The refusal itself is
-/// [`image_id_is_malformed`] above, which records where its wording comes from.
-///
-/// The resolved image is handed back, so the handler reads it ONCE rather than looking the
-/// same id up again behind an unreachable branch.
-fn require_describable_image<'store, E>(
-    store: &'store ComAmazonawsEc2Amazonec2State,
-    image_id: &str,
-) -> Result<&'store Image, crate::scaffolded::Scaffolded<E>> {
-    store
-        .images
-        .get(image_id)
-        .filter(|image| image_is_visible(image, ::engine::emulator_account_id()))
-        .ok_or_else(|| image_id_is_malformed(image_id))
 }
 
 /// "The launch permissions" of `image` (`ImageAttribute$LaunchPermissions`), out of what the
