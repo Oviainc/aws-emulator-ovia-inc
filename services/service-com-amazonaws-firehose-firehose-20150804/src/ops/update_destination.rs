@@ -17,7 +17,12 @@
 //!   configuration lacks is refused with `InvalidArgumentException`;
 //! * "Switching between Amazon OpenSearch Service and other services is not supported. For
 //!   an Amazon OpenSearch Service destination, you can only update to another Amazon
-//!   OpenSearch Service destination" — also `InvalidArgumentException`.
+//!   OpenSearch Service destination" — also `InvalidArgumentException`;
+//! * every `RoleARN` the update names is resolved against IAM, and every `BucketARN` it
+//!   names against Amazon S3, before the stored destination is rewritten: an update onto a
+//!   role Firehose cannot assume or a bucket that does not exist is refused with
+//!   `InvalidArgumentException` and the stream keeps the destination, version and delivery
+//!   target it had.
 //!
 //! The stream's own status is untouched: "The target Firehose stream remains active while
 //! the configurations are updated." A stream that is not `ACTIVE` (still `CREATING`, or
@@ -226,6 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_argument(message));
         }
 
+        // And every Amazon S3 location the update names is a location Firehose writes
+        // objects to, resolved against Amazon S3 before anything is written: an update that
+        // moves a destination onto a bucket that does not exist is the same argument fault,
+        // and the stream keeps the destination it had.
+        if let Some(message) =
+            crate::state::absent_destination_bucket(ctx, &region, &bucket_arns(&input)).await
+        {
+            return Err(invalid_argument(message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.materialise_due(now);
@@ -395,6 +410,70 @@ fn role_arns(input: &UpdateDestinationInput) -> Vec<&str> {
     }
 
     crate::state::distinct_role_arns(found)
+}
+
+/// Every Amazon S3 bucket ARN the update names.
+///
+/// The same collection as [`role_arns`], over the other resource a destination
+/// configuration names: an object Firehose delivers goes to the bucket of a `BucketARN`,
+/// whichever member of whichever destination type carried it — a plain or extended Amazon
+/// S3 destination's own, the `S3Update` every other destination kind delivers or backs up
+/// through, an extended or Redshift destination's `S3BackupUpdate`, and an Iceberg
+/// destination's `S3Configuration`. An update member that names no bucket contributes
+/// none: an update changes only what it carries, so a bucket it leaves alone was already
+/// resolved when it was written. One bucket named twice is one question for Amazon S3,
+/// which [`crate::state::absent_destination_bucket`] settles over the bucket NAMES it asks
+/// about rather than over the ARNs that spell them.
+fn bucket_arns(input: &UpdateDestinationInput) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+
+    if let Some(update) = input.s3_destination_update.as_ref() {
+        found.extend(update.bucket_arn.as_deref());
+    }
+    if let Some(update) = input.extended_s3_destination_update.as_ref() {
+        found.extend(update.bucket_arn.as_deref());
+        found.extend(s3_update_bucket(update.s3_backup_update.as_ref()));
+    }
+    if let Some(update) = input.redshift_destination_update.as_ref() {
+        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+        found.extend(s3_update_bucket(update.s3_backup_update.as_ref()));
+    }
+    if let Some(update) = input.elasticsearch_destination_update.as_ref() {
+        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.amazonopensearchservice_destination_update.as_ref() {
+        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.splunk_destination_update.as_ref() {
+        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.http_endpoint_destination_update.as_ref() {
+        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input
+        .amazon_open_search_serverless_destination_update
+        .as_ref()
+    {
+        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.snowflake_destination_update.as_ref() {
+        found.extend(s3_update_bucket(update.s3_update.as_ref()));
+    }
+    if let Some(update) = input.iceberg_destination_update.as_ref() {
+        found.extend(
+            update
+                .s3_configuration
+                .as_ref()
+                .map(|config| config.bucket_arn.as_str()),
+        );
+    }
+
+    found
+}
+
+/// The bucket a nested `S3DestinationUpdate` names, when it names one.
+fn s3_update_bucket(update: Option<&S3DestinationUpdate>) -> Option<&str> {
+    update.and_then(|s3| s3.bucket_arn.as_deref())
 }
 
 /// The role a nested `S3DestinationUpdate` names, when it names one.

@@ -457,18 +457,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specified ETag does not match the resource's current entity tag, the update
         // request will be rejected". The model declares no precondition error for this
         // operation, and the resource having moved on under the caller is what
-        // `ConflictException` / `CONFLICTING_OPERATION` describes.
-        if input
-            .e_tag
-            .as_ref()
-            .is_some_and(|expected| expected != &endpoint.etag)
+        // `ConflictException` / `CONFLICTING_OPERATION` describes — which is the ONE rule
+        // every conditional writer of this service resolves through
+        // (`crate::state::stale_entity_tag_rejection`), so this operation judges the
+        // precondition and words the refusal exactly as they do.
+        if let Some(conflict) =
+            crate::state::stale_entity_tag_rejection(input.e_tag.as_deref(), &endpoint.etag)
         {
-            return Err(UpdateOriginEndpointErrorModeled::ConflictException(
-                // One sentence for the whole stale-entity-tag class, so this operation
-                // words the refusal exactly as the other conditional updates do.
-                crate::state::conflicting_operation(),
-            )
-            .into());
+            return Err(UpdateOriginEndpointErrorModeled::ConflictException(conflict).into());
         }
 
         // The URLs of the replacement manifests are rooted exactly where the endpoint's

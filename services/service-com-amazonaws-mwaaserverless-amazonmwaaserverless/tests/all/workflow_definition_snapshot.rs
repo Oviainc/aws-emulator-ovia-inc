@@ -28,14 +28,18 @@ use crate::workflow_lifecycle::role_arn;
 /// The regional endpoint every request below is signed for. The same region is the one
 /// the definition object is staged in, because a workflow's definition is read where the
 /// caller's own Amazon S3 requests go.
-const REGION: &str = "us-west-2";
+///
+/// `pub(crate)` with the staging helpers below, so another suite that needs a workflow
+/// whose definition really is an object in Amazon S3 drives the same path rather than
+/// building a second harness.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The bucket every definition below is staged in.
-const BUCKET: &str = "mwaa-serverless-definitions";
+pub(crate) const BUCKET: &str = "mwaa-serverless-definitions";
 
 /// A router with this service and the Amazon S3 service on one shared engine — what
 /// `build_router` assembles, narrowed to the services under test.
-fn definition_router() -> MultiServiceRouter {
+pub(crate) fn definition_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -78,7 +82,7 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) 
 /// Create [`BUCKET`], so the definitions below have somewhere to live. The create names
 /// its `LocationConstraint`, because Amazon S3 serves a create that names none only at
 /// the endpoint the unspecified constraint stands for.
-async fn create_bucket(router: &MultiServiceRouter) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter) {
     let (status, body) = s3(
         router,
         "PUT",
@@ -100,7 +104,7 @@ async fn create_bucket(router: &MultiServiceRouter) {
 }
 
 /// Store `content` at `key` in [`BUCKET`], overwriting whatever was there.
-async fn stage(router: &MultiServiceRouter, key: &str, content: &[u8]) {
+pub(crate) async fn stage(router: &MultiServiceRouter, key: &str, content: &[u8]) {
     let (status, body) = s3(router, "PUT", &format!("/{BUCKET}/{key}"), content).await;
     assert_eq!(
         status,
@@ -112,7 +116,7 @@ async fn stage(router: &MultiServiceRouter, key: &str, content: &[u8]) {
 
 /// Call one operation of this service over the wire and return its status and parsed
 /// body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let payload = serde_json::to_vec(&body).expect("serialize the request body");
     let request = http::Request::builder()
         .method("POST")
@@ -136,7 +140,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// Create a workflow whose definition is the object at `key`, and answer its ARN.
-async fn create_workflow(router: &MultiServiceRouter, name: &str, key: &str) -> String {
+pub(crate) async fn create_workflow(router: &MultiServiceRouter, name: &str, key: &str) -> String {
     create_workflow_at(router, name, BUCKET, key).await
 }
 

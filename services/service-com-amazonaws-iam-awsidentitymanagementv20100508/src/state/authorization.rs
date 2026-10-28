@@ -112,6 +112,9 @@ pub const GET_GROUP: &str = "iam:GetGroup";
 /// `iam:UpdateGroup`.
 pub const UPDATE_GROUP: &str = "iam:UpdateGroup";
 
+/// `iam:UpdateUser`.
+pub const UPDATE_USER: &str = "iam:UpdateUser";
+
 /// `iam:ListGroupsForUser`.
 pub const LIST_GROUPS_FOR_USER: &str = "iam:ListGroupsForUser";
 

@@ -13,6 +13,10 @@
 //! holds no workflow under with `EntityNotFoundException`, and a start past the
 //! workflow's own concurrency ceiling with `ConcurrentRunsExceededException`.
 //!
+//! The run begins AT that entry point, so it initiates the actions that trigger names
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::initiate_trigger_actions`]): each action
+//! naming a job begins a run of that job, which `GetJobRuns` then reports.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,11 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // How many actions the workflow's entry point initiates, resolved before the
-        // workflow is borrowed to write to. A trigger is served only through the endpoint
-        // that created it, so the entry point is looked for in THIS Region.
-        let starting_actions = store
+        // workflow is borrowed to write to, together with the actions themselves: a run
+        // begins AT that entry point, so what it initiates is what that trigger initiates. A
+        // trigger is served only through the endpoint that created it, so the entry point is
+        // looked for in THIS Region.
+        let starting_trigger = store
             .starting_trigger(&region, &input.name)
-            .map(|trigger| trigger.actions.len());
+            .map(|trigger| (trigger.name.clone(), trigger.actions.clone()));
 
         let Some(workflow) = store.workflow_mut(&input.name) else {
             return Err(StartWorkflowRunErrorModeled::EntityNotFoundException(
@@ -189,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A workflow nothing can begin a run of has no entry point to start from, so the
         // start is refused rather than recorded.
-        let Some(total_actions) = starting_actions else {
+        let Some((trigger_name, starting_actions)) = starting_trigger else {
             return Err(StartWorkflowRunErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(crate::state::messages::no_starting_trigger(&input.name)),
@@ -198,6 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let total_actions = starting_actions.len();
 
         // Everything the clock already owed this workflow's runs is materialised before
         // they are counted, and a run past the ceiling the workflow named is refused with
@@ -229,10 +236,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         };
+        // "The actions initiated by this trigger" (`Trigger$Actions`): the run begins at
+        // that entry point, so beginning it initiates those actions, and each one naming a
+        // job begins a run of that job exactly as the trigger's own start does.
+        let begun_job_runs =
+            store.initiate_trigger_actions(&region, &trigger_name, &starting_actions, now);
         ::tracing::info!(
             operation = "StartWorkflowRun",
             workflow = %input.name,
             run = %run_id,
+            job_runs = begun_job_runs.len(),
             "started a Glue workflow run"
         );
 

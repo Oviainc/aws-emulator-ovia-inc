@@ -45,7 +45,8 @@ use crate::ops::types::{
     DeploymentStrategyOptions,
     DeploymentStrategyOptionsStatus, DirectQueryDataSourceType, DisabledOperationException,
     DomainConfig, DomainEndpointOptions,
-    DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainPackageDetails,
+    DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainMaintenanceDetails,
+    DomainPackageDetails,
     DomainStatus, EBSOptions,
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus, ErrorDetails,
@@ -450,11 +451,24 @@ pub const CHANGE_STATUS_PROCESSING: &str = "PROCESSING";
 /// `OverallChangeStatus`'s `COMPLETED` value: the configuration change has landed.
 pub const CHANGE_STATUS_COMPLETED: &str = "COMPLETED";
 
+/// `OverallChangeStatus`'s `FAILED` value: the configuration change did not land.
+///
+/// What a CANCELLED change's overall status is: `OverallChangeStatus` publishes only
+/// `PENDING`, `PROCESSING`, `COMPLETED` and `FAILED`, so a change that was stopped
+/// before it landed is not `COMPLETED` — which of the two it is is said exactly by
+/// `ConfigChangeStatus`, whose own [`CONFIG_CHANGE_CANCELLED`] value it carries
+/// beside this one.
+pub const CHANGE_STATUS_FAILED: &str = "FAILED";
+
 /// `ConfigChangeStatus`'s `ApplyingChanges` value.
 pub const CONFIG_CHANGE_APPLYING_CHANGES: &str = "ApplyingChanges";
 
 /// `ConfigChangeStatus`'s `Completed` value.
 pub const CONFIG_CHANGE_COMPLETED: &str = "Completed";
+
+/// `ConfigChangeStatus`'s `Cancelled` value: the change was cancelled before it
+/// landed, so the domain kept the configuration it was changing from.
+pub const CONFIG_CHANGE_CANCELLED: &str = "Cancelled";
 
 /// `InitiatedBy`'s `CUSTOMER` value: every change this emulator records was started
 /// by a caller's own `CreateDomain` or `UpdateDomainConfig` request, never by the
@@ -2702,6 +2716,113 @@ pub fn domain_information(info: &AWSDomainInformation) -> DomainInformationConta
     }
 }
 
+/// The values of a domain's `DomainConfig` options, as ONE snapshot: the
+/// configuration a change started FROM, which is what cancelling that change puts
+/// back.
+///
+/// Every member is the [`Domain`] field holding one option an `UpdateDomainConfig`
+/// request can set, so a snapshot carries the whole configuration a change could
+/// have moved and nothing else: the domain's identity, its history and the
+/// resources it holds are not options and are never restored.
+#[derive(Debug, Clone)]
+pub struct DomainOptions {
+    cluster_config: ClusterConfig,
+    ebs_options: Option<EBSOptions>,
+    access_policies: Option<String>,
+    ip_address_type: Option<String>,
+    snapshot_options: Option<SnapshotOptions>,
+    vpc_options: Option<VPCDerivedInfo>,
+    cognito_options: Option<CognitoOptions>,
+    encryption_at_rest_options: Option<EncryptionAtRestOptions>,
+    node_to_node_encryption_options: Option<NodeToNodeEncryptionOptions>,
+    advanced_options: BTreeMap<String, String>,
+    log_publishing_options: BTreeMap<String, LogPublishingOption>,
+    domain_endpoint_options: Option<DomainEndpointOptions>,
+    advanced_security_options: Option<AdvancedSecurityOptions>,
+    identity_center_options: Option<IdentityCenterOptions>,
+    auto_tune_options: Option<AutoTuneOptions>,
+    off_peak_window_options: Option<OffPeakWindowOptions>,
+    software_update_options: Option<SoftwareUpdateOptions>,
+    aiml_options: Option<AIMLOptionsOutput>,
+    deployment_strategy_options: Option<DeploymentStrategyOptions>,
+    automated_snapshot_pause_options: Option<AutomatedSnapshotPauseOptions>,
+    use_case: String,
+    engine_mode: String,
+}
+
+impl DomainOptions {
+    /// The option values `domain` holds right now.
+    pub fn capture(domain: &Domain) -> Self {
+        Self {
+            cluster_config: domain.cluster_config.clone(),
+            ebs_options: domain.ebs_options.clone(),
+            access_policies: domain.access_policies.clone(),
+            ip_address_type: domain.ip_address_type.clone(),
+            snapshot_options: domain.snapshot_options.clone(),
+            vpc_options: domain.vpc_options.clone(),
+            cognito_options: domain.cognito_options.clone(),
+            encryption_at_rest_options: domain.encryption_at_rest_options.clone(),
+            node_to_node_encryption_options: domain.node_to_node_encryption_options.clone(),
+            advanced_options: domain.advanced_options.clone(),
+            log_publishing_options: domain.log_publishing_options.clone(),
+            domain_endpoint_options: domain.domain_endpoint_options.clone(),
+            advanced_security_options: domain.advanced_security_options.clone(),
+            identity_center_options: domain.identity_center_options.clone(),
+            auto_tune_options: domain.auto_tune_options.clone(),
+            off_peak_window_options: domain.off_peak_window_options.clone(),
+            software_update_options: domain.software_update_options.clone(),
+            aiml_options: domain.aiml_options.clone(),
+            deployment_strategy_options: domain.deployment_strategy_options.clone(),
+            automated_snapshot_pause_options: domain.automated_snapshot_pause_options.clone(),
+            use_case: domain.use_case.clone(),
+            engine_mode: domain.engine_mode.clone(),
+        }
+    }
+
+    /// Put these values back on `domain`, leaving everything that is not one of its
+    /// options alone.
+    pub fn restore(self, domain: &mut Domain) {
+        domain.cluster_config = self.cluster_config;
+        domain.ebs_options = self.ebs_options;
+        domain.access_policies = self.access_policies;
+        domain.ip_address_type = self.ip_address_type;
+        domain.snapshot_options = self.snapshot_options;
+        domain.vpc_options = self.vpc_options;
+        domain.cognito_options = self.cognito_options;
+        domain.encryption_at_rest_options = self.encryption_at_rest_options;
+        domain.node_to_node_encryption_options = self.node_to_node_encryption_options;
+        domain.advanced_options = self.advanced_options;
+        domain.log_publishing_options = self.log_publishing_options;
+        domain.domain_endpoint_options = self.domain_endpoint_options;
+        domain.advanced_security_options = self.advanced_security_options;
+        domain.identity_center_options = self.identity_center_options;
+        domain.auto_tune_options = self.auto_tune_options;
+        domain.off_peak_window_options = self.off_peak_window_options;
+        domain.software_update_options = self.software_update_options;
+        domain.aiml_options = self.aiml_options;
+        domain.deployment_strategy_options = self.deployment_strategy_options;
+        domain.automated_snapshot_pause_options = self.automated_snapshot_pause_options;
+        domain.use_case = self.use_case;
+        domain.engine_mode = self.engine_mode;
+    }
+
+    /// `option`'s value as the string `CancelledChangeProperty$CancelledValue` and
+    /// `$ActiveValue` are, for an option whose value IS one.
+    ///
+    /// `None` for the structured containers and the maps: how this service renders
+    /// one of them as a single string is not published, and an unpublished rendering
+    /// is not invented — the property is then reported by name alone.
+    pub fn option_value(&self, option: &str) -> Option<String> {
+        match option {
+            OPT_ACCESS_POLICIES => self.access_policies.clone(),
+            OPT_IP_ADDRESS_TYPE => self.ip_address_type.clone(),
+            OPT_USE_CASE => Some(self.use_case.clone()),
+            OPT_ENGINE_MODE => Some(self.engine_mode.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// One configuration change on a domain: what `DescribeDomainChangeProgress`
 /// reports in full and what `DomainStatus`/`DomainConfig` summarise as a
 /// `ChangeProgressDetails`.
@@ -2727,6 +2848,13 @@ pub struct ConfigChange {
     pub completes_at: Option<SystemTime>,
     /// One of `InitiatedBy`'s values; see [`INITIATED_BY_CUSTOMER`].
     pub initiated_by: String,
+    /// The option values the domain held BEFORE this change, for a change a cancel
+    /// can put back — recorded by [`Domain::record_revert`] and `None` for a change
+    /// there is no going back from (the one a create starts, an engine version
+    /// upgrade), which is therefore not cancellable.
+    pub revert_to: Option<DomainOptions>,
+    /// Whether this change was cancelled before it landed.
+    pub cancelled: bool,
 }
 
 impl ConfigChange {
@@ -2752,10 +2880,20 @@ impl ConfigChange {
         self.completes_at.is_some()
     }
 
+    /// Whether cancelling this change is something the service can do: it is still
+    /// being applied AND the configuration it started from was recorded, so
+    /// cancelling it puts that configuration back rather than leaving the change
+    /// applied under another name.
+    pub fn cancellable(&self) -> bool {
+        self.in_progress() && self.revert_to.is_some()
+    }
+
     /// `ChangeProgressStatusDetails$Status`: one of `OverallChangeStatus`'s values.
     pub fn status(&self) -> &'static str {
         if self.in_progress() {
             CHANGE_STATUS_PROCESSING
+        } else if self.cancelled {
+            CHANGE_STATUS_FAILED
         } else {
             CHANGE_STATUS_COMPLETED
         }
@@ -2763,10 +2901,12 @@ impl ConfigChange {
 
     /// `ConfigChangeStatus` for this change: the emulator applies a change in one
     /// step, so it is `ApplyingChanges` until the change falls due and `Completed`
-    /// after.
+    /// after — or `Cancelled` where a cancel stopped it before it landed.
     pub fn config_change_status(&self) -> &'static str {
         if self.in_progress() {
             CONFIG_CHANGE_APPLYING_CHANGES
+        } else if self.cancelled {
+            CONFIG_CHANGE_CANCELLED
         } else {
             CONFIG_CHANGE_COMPLETED
         }
@@ -2777,11 +2917,12 @@ impl ConfigChange {
     pub fn to_progress_status(&self) -> ChangeProgressStatusDetails {
         // A property of the change in flight is pending; one of a change that has
         // landed is completed. The two lists partition `properties`, so no property
-        // is ever reported as both.
-        let (pending, completed) = if self.in_progress() {
-            (self.properties.clone(), Vec::new())
-        } else {
-            (Vec::new(), self.properties.clone())
+        // is ever reported as both — and a cancelled change landed none of them, so
+        // neither list holds any.
+        let (pending, completed) = match (self.in_progress(), self.cancelled) {
+            (true, _) => (self.properties.clone(), Vec::new()),
+            (false, true) => (Vec::new(), Vec::new()),
+            (false, false) => (Vec::new(), self.properties.clone()),
         };
         ChangeProgressStatusDetails {
             change_id: Some(self.change_id.clone()),
@@ -4036,6 +4177,11 @@ pub struct Domain {
     /// newest is the one `DescribeDomainChangeProgress` reports when the request
     /// names no `ChangeId`.
     pub changes: VecDeque<ConfigChange>,
+    /// The node maintenance actions started on this domain, oldest first, bounded by
+    /// [`MAINTENANCE_HISTORY`]: `StartDomainMaintenance` mints one and
+    /// `GetDomainMaintenanceStatus` reports it, from THIS one record. A FIFO, because
+    /// the cap drops the oldest action.
+    pub maintenances: VecDeque<Maintenance>,
     /// The engine version upgrades and upgrade eligibility checks performed on this
     /// domain, oldest first, bounded by [`UPGRADE_HISTORY`]: a FIFO, because the cap
     /// drops the oldest run and the newest is the one still in flight. See
@@ -4100,12 +4246,110 @@ impl Domain {
             last_updated_at: now,
             completes_at: self.processing_until,
             initiated_by: INITIATED_BY_CUSTOMER.to_string(),
+            // Where this change can be gone back from, the call that started it
+            // records the configuration it started from ([`Self::record_revert`]).
+            revert_to: None,
+            cancelled: false,
         });
         // The history is bounded: past its cap the oldest change is dropped, so a
         // domain updated forever holds a fixed number of records.
         while self.changes.len() > CHANGE_HISTORY {
             self.changes.pop_front();
         }
+    }
+
+    /// Record the configuration the change this domain has just started was applied
+    /// ON TOP of, so cancelling that change puts it back.
+    ///
+    /// Called by the update path right after [`Self::begin_change`]: the snapshot is
+    /// of the stored record as it was BEFORE the merge, which is the configuration
+    /// the change moves the domain away from.
+    pub fn record_revert(&mut self, options: DomainOptions) {
+        if let Some(change) = self.changes.back_mut() {
+            change.revert_to = Some(options);
+        }
+    }
+
+    /// The configuration changes of this domain a cancel would cancel — the ones
+    /// still in flight that can be gone back from — oldest first.
+    pub fn cancellable_changes(&self) -> Vec<&ConfigChange> {
+        self.changes
+            .iter()
+            .filter(|change| change.cancellable())
+            .collect()
+    }
+
+    /// Cancel every configuration change of this domain that is still in flight and
+    /// can be gone back from: put back the configuration the EARLIEST of them
+    /// started from — which is what the whole chain of them moved the domain away
+    /// from — and leave each change in the history marked cancelled, so a change a
+    /// caller already read stays addressable and reports what became of it.
+    ///
+    /// The domain stops `Processing` as soon as no change of it is in flight any
+    /// more: there is then nothing left for the clock to make due.
+    pub fn cancel_changes(&mut self, now: SystemTime) {
+        let revert = self
+            .changes
+            .iter()
+            .find(|change| change.cancellable())
+            .and_then(|change| change.revert_to.clone());
+        for change in &mut self.changes {
+            if !change.cancellable() {
+                continue;
+            }
+            change.completes_at = None;
+            change.cancelled = true;
+            change.last_updated_at = now;
+            change.revert_to = None;
+        }
+        if let Some(options) = revert {
+            options.restore(self);
+        }
+        self.updated_at = now;
+        if self.changes.iter().all(|change| !change.in_progress()) {
+            self.processing = false;
+            self.processing_status = PROCESSING_STATUS_ACTIVE.to_string();
+            self.processing_until = None;
+        }
+    }
+
+    /// Start the node maintenance action a call at `now` asked for, and answer the
+    /// `MaintenanceId` the record it created is addressed by.
+    ///
+    /// The action is `PENDING` when it is started and the clock owes it the rest of
+    /// its run ([`Maintenance::settle`]), so a caller reading straight after the
+    /// call still observes it waiting.
+    pub fn begin_maintenance(
+        &mut self,
+        action: &str,
+        node_id: &str,
+        now: SystemTime,
+    ) -> String {
+        let maintenance_id = new_maintenance_id();
+        self.maintenances.push_back(Maintenance {
+            maintenance_id: maintenance_id.clone(),
+            action: action.to_string(),
+            node_id: node_id.to_string(),
+            status: MAINTENANCE_STATUS_PENDING.to_string(),
+            created_at: now,
+            updated_at: now,
+            starts_at: Some(now + MAINTENANCE_STEP),
+            completes_at: Some(now + MAINTENANCE_STEP + MAINTENANCE_STEP),
+        });
+        // The history is bounded the same way the configuration changes are: past
+        // its cap the oldest action is dropped.
+        while self.maintenances.len() > MAINTENANCE_HISTORY {
+            self.maintenances.pop_front();
+        }
+        maintenance_id
+    }
+
+    /// The maintenance action `maintenance_id` names, or `None` when this domain's
+    /// history holds no such action.
+    pub fn maintenance(&self, maintenance_id: &str) -> Option<&Maintenance> {
+        self.maintenances
+            .iter()
+            .find(|maintenance| maintenance.maintenance_id == maintenance_id)
     }
 
     /// The most recent configuration change, which every full descriptor summarises
@@ -4225,6 +4469,11 @@ impl Domain {
     pub fn settle(&mut self, now: SystemTime) {
         for change in &mut self.changes {
             change.settle(now);
+        }
+        // A node maintenance action is owed its run by the same clock, on its own
+        // spans: it is not one of the domain's configuration changes.
+        for maintenance in &mut self.maintenances {
+            maintenance.settle(now);
         }
         // A service software deployment is owed its completion by the same clock, and
         // on its own span: it is not one of the domain's configuration changes.
@@ -4866,6 +5115,197 @@ pub fn nodes_per_zone(nodes: Option<i32>, zones: i32) -> Vec<Option<i32>> {
     (0..zones)
         .map(|zone| Some(nodes / zones + i32::from(zone < nodes % zones)))
         .collect()
+}
+
+/// `NodeType`'s `Data`: a data node, the role `ClusterConfig$InstanceCount` and
+/// `InstanceType` configure.
+pub const NODE_TYPE_DATA: &str = "Data";
+
+/// `NodeType`'s `Master`: a dedicated master node, the role
+/// `ClusterConfig$DedicatedMasterCount` and `DedicatedMasterType` configure.
+pub const NODE_TYPE_MASTER: &str = "Master";
+
+/// `NodeType`'s `Ultrawarm`: a warm node, the role `ClusterConfig$WarmCount` and
+/// `WarmType` configure. `NodeType` is documented as saying "whether the nodes is a
+/// data, master, or UltraWarm node", and `OpenSearchWarmPartitionInstanceType` names
+/// only `ultrawarm1` instances, so a warm node is reported under this value.
+pub const NODE_TYPE_ULTRAWARM: &str = "Ultrawarm";
+
+/// How many nodes of ONE role this service reports and addresses.
+///
+/// This is the emulator's OWN bound on the node census — it models neither Service
+/// Quotas nor an account's adjustments — set at the number OpenSearch Service
+/// publishes as its default data-nodes-per-domain quota. The per-role counts are
+/// request fields (`CreateDomain` and `UpdateDomainConfig` persist the caller's
+/// `ClusterConfig` verbatim, and `IntegerClass` carries no `@range`), so without this
+/// bound one create could size an unbounded response; nothing a caller sends may do
+/// that.
+pub const NODE_CENSUS_LIMIT: i32 = 80;
+
+/// The `NodeId` of the `index`-th node of one role.
+///
+/// DERIVED from the domain the node belongs to, the role it fills and its index
+/// within that role as a name-based v5 UUID — the way this service derives every id
+/// that has to be the same on the next call — so no two nodes share an id and the id
+/// a caller read in one call is the id the next call reports, which a freshly
+/// generated id would not be. The hyphen-free form's 32 hexadecimal digits sit inside
+/// `NodeId`'s `@length(min: 10, max: 40)`.
+///
+/// The ONE derivation every operation that names a node reads: the census
+/// (`DescribeDomainNodes`) publishes these ids and the maintenance surface resolves
+/// the `NodeId` a caller sends against them, so a node id taken from the census is
+/// the node id maintenance accepts.
+pub fn node_id(domain_id: &str, node_type: &str, index: usize) -> String {
+    ::uuid::Uuid::new_v5(
+        &::uuid::Uuid::NAMESPACE_OID,
+        format!("opensearch/domainNode/{domain_id}/{node_type}/{index}").as_bytes(),
+    )
+    .simple()
+    .to_string()
+}
+
+/// How many nodes of one role the census holds: the count the record carries,
+/// bounded by [`NODE_CENSUS_LIMIT`], and none at all for a count the record carries
+/// no value for or a negative one — an unknown node is not a node.
+pub fn census_size(count: Option<i32>) -> usize {
+    count
+        .filter(|count| *count >= 0)
+        .map(|count| count.min(NODE_CENSUS_LIMIT))
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0)
+}
+
+/// The ids of `domain`'s data nodes, in the order and under the ids the node census
+/// publishes them.
+pub fn data_node_ids(domain: &Domain) -> Vec<String> {
+    (0..census_size(domain.cluster_config.instance_count))
+        .map(|index| node_id(&domain.domain_id, NODE_TYPE_DATA, index))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Node maintenance
+//
+// `StartDomainMaintenance` "starts the node maintenance process on the data
+// node", `GetDomainMaintenanceStatus` reports how that run is going. One record
+// below, held on the domain whose node it ran on.
+// ---------------------------------------------------------------------------
+
+/// The smallest number of data nodes a maintenance action can take one node out of
+/// service in.
+///
+/// Maintaining a node stops the process running on it, so the nodes left have to
+/// carry the cluster on their own: a majority of them has to remain, which
+/// `n - 1 > n / 2` first satisfies at three. A role with fewer nodes than this has no
+/// node that can be taken out, so no node of it is eligible for maintenance.
+pub const MAINTAINABLE_DATA_NODES: i32 = 3;
+
+/// `MaintenanceStatus`'s `PENDING` value: the action has been accepted and has not
+/// begun yet.
+pub const MAINTENANCE_STATUS_PENDING: &str = "PENDING";
+
+/// `MaintenanceStatus`'s `IN_PROGRESS` value: the action is running on the node.
+pub const MAINTENANCE_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `MaintenanceStatus`'s `COMPLETED` value: the action has finished.
+pub const MAINTENANCE_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// How long each step of a maintenance action takes.
+///
+/// The same reasoning as [`PROVISIONING`]: AWS takes as long as the node takes, the
+/// emulator chooses a span, and it is deliberately NOT zero, so a caller reading
+/// straight after the call still observes the action `PENDING` and then
+/// `IN_PROGRESS`. The due instants are stored on the record and materialised by
+/// whichever later call reads it — nothing sleeps.
+pub const MAINTENANCE_STEP: Duration = Duration::from_millis(500);
+
+/// How many maintenance actions a domain's history keeps — the emulator's own bound
+/// on the store, like [`CHANGE_HISTORY`], so a caller starting actions forever cannot
+/// grow it without end.
+pub const MAINTENANCE_HISTORY: usize = 50;
+
+/// One node maintenance action on a domain: the action asked for, the node it runs
+/// on and how far through its run it is.
+#[derive(Debug, Clone)]
+pub struct Maintenance {
+    /// `StartDomainMaintenanceResponse$MaintenanceId`: "the request ID of requested
+    /// action", which `GetDomainMaintenanceStatus` addresses the action by.
+    pub maintenance_id: String,
+    /// One of `MaintenanceType`'s values, as the request named it.
+    pub action: String,
+    /// The `NodeId` of the data node this action runs on.
+    pub node_id: String,
+    /// One of `MaintenanceStatus`'s values; see [`MAINTENANCE_STATUS_PENDING`].
+    pub status: String,
+    /// `CreatedAt`: the instant of the call that started the action.
+    pub created_at: SystemTime,
+    /// `UpdatedAt`: the instant this action's status last moved.
+    pub updated_at: SystemTime,
+    /// When the clock owes this action its start; `None` once it has begun.
+    pub starts_at: Option<SystemTime>,
+    /// When the clock owes this action its completion; `None` once it has completed.
+    pub completes_at: Option<SystemTime>,
+}
+
+impl Maintenance {
+    /// Materialise the status moves the clock owes this action by `now`.
+    ///
+    /// Each move is dated at the DUE instant rather than at `now`, so the `UpdatedAt`
+    /// a caller reads does not move with the moment it happened to look.
+    fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.starts_at.filter(|due| now >= *due) {
+            self.starts_at = None;
+            self.status = MAINTENANCE_STATUS_IN_PROGRESS.to_string();
+            self.updated_at = due;
+        }
+        if let Some(due) = self.completes_at.filter(|due| now >= *due) {
+            self.completes_at = None;
+            self.status = MAINTENANCE_STATUS_COMPLETED.to_string();
+            self.updated_at = due;
+        }
+    }
+
+    /// This record as `DomainMaintenanceDetails` — the element shape
+    /// `ListDomainMaintenances` reports, member for member the projection
+    /// `GetDomainMaintenanceStatus` answers with, so a listing and a read of one
+    /// action cannot disagree.
+    ///
+    /// `StatusMessage` is "the status message of the maintenance action": this
+    /// service's own wording for one is not published, and the status itself is
+    /// reported in `Status`, so none is invented.
+    pub fn to_details(&self, domain_name: &str) -> DomainMaintenanceDetails {
+        DomainMaintenanceDetails {
+            maintenance_id: Some(self.maintenance_id.clone()),
+            domain_name: Some(domain_name.to_string()),
+            action: Some(self.action.clone()),
+            node_id: Some(self.node_id.clone()),
+            status: Some(self.status.clone()),
+            status_message: None,
+            created_at: Some(datetime(self.created_at)),
+            updated_at: Some(datetime(self.updated_at)),
+        }
+    }
+}
+
+/// The `RequestId` a maintenance action is addressed by: a `GUID` like every other id
+/// this service hands out ([`new_guid`]), well inside `RequestId`'s
+/// `@length(min: 1, max: 100)`, so no two actions share one.
+pub fn new_maintenance_id() -> String {
+    new_guid()
+}
+
+/// Whether `node_id` names a data node of `domain` that a maintenance action can be
+/// started on.
+///
+/// Both halves of the eligibility: the id has to be one the domain's node census
+/// publishes for its data nodes, and the role has to be able to lose one of them
+/// ([`MAINTAINABLE_DATA_NODES`]).
+pub fn maintainable_data_node(domain: &Domain, node_id: &str) -> bool {
+    domain
+        .cluster_config
+        .instance_count
+        .is_some_and(|count| count >= MAINTAINABLE_DATA_NODES)
+        && data_node_ids(domain).iter().any(|id| id == node_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -8017,10 +8457,26 @@ pub fn datetime(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
 }
 
+/// What this service says of a name that names no stored domain, in whichever
+/// envelope the operation refusing it answers with: the ONE wording, so two
+/// operations cannot word the same miss differently.
+pub fn domain_not_found_message(domain_name: &str) -> String {
+    format!("Domain not found: {domain_name}")
+}
+
 /// The `ResourceNotFoundException` payload for a name that names no stored domain.
 pub fn domain_not_found(domain_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Domain not found: {domain_name}")),
+        message: Some(domain_not_found_message(domain_name)),
+    }
+}
+
+/// The `BaseException` payload for a name that names no stored domain — the generic
+/// envelope (HTTP 400), for an operation that refuses an unknown domain with it
+/// rather than with the not-found one.
+pub fn domain_not_found_base(domain_name: &str) -> BaseException {
+    BaseException {
+        message: Some(domain_not_found_message(domain_name)),
     }
 }
 
@@ -8184,6 +8640,58 @@ pub fn malformed_guid(member: &str, value: &str) -> ValidationException {
     ValidationException {
         message: Some(format!(
             "{member} must be a GUID of the form xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx: {value}"
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an integer member below the minimum its
+/// modelled `@range` sets, in the envelope AWS states a constraint violation in: the
+/// value the request carried, the member it was carried at as the wire names it, and
+/// the bound it broke.
+pub fn below_range_minimum(member: &str, value: i32, minimum: i32) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+             constraint: Member must have value greater than or equal to {minimum}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a domain that has no pending
+/// configuration change for a cancel to cancel.
+pub fn no_pending_change(domain_name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "No pending configuration change to cancel for domain {domain_name}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a `NodeId` that names no data node of
+/// the domain a maintenance action was asked for on, or one whose role cannot lose a
+/// node ([`MAINTAINABLE_DATA_NODES`]) — the node is then not one this service can
+/// maintain, which is what makes the id invalid.
+pub fn invalid_node_id() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some("The requested node ID is invalid".to_string()),
+    }
+}
+
+/// The `ValidationException` payload for a maintenance request that names no node:
+/// the action is "the node maintenance process on the data node", so there is no
+/// action to start without one.
+pub fn node_id_required() -> ValidationException {
+    ValidationException {
+        message: Some("NodeId is required to start domain maintenance".to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a `MaintenanceId` a domain's history
+/// holds no maintenance action for.
+pub fn maintenance_not_found(domain_name: &str, maintenance_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Maintenance not found for domain {domain_name}: {maintenance_id}"
         )),
     }
 }
@@ -8495,12 +9003,11 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // and `DescribeReservedInstances` reports it, from the one record below.
 // ---------------------------------------------------------------------------
 
-/// The number of instances a purchase reserves when the request names none.
-///
-/// `PurchaseReservedInstanceOffering$InstanceCount` is optional with
-/// `@range(min: 1)`, so a purchase that names no count reserves the fewest it
-/// could have named: one instance.
-pub const DEFAULT_INSTANCE_COUNT: i32 = 1;
+/// The minimum a purchase may reserve, from
+/// `PurchaseReservedInstanceOffering$InstanceCount`'s `@range(min: 1)`. The member
+/// carries no `@default`, so a request that names no count names a count below this
+/// bound rather than one the service fills in.
+pub const INSTANCE_COUNT_MINIMUM: i32 = 1;
 
 /// The states a reservation is reported in.
 ///
@@ -8683,15 +9190,13 @@ impl ReservedInstanceRecord {
 
 /// The refusal of a `GUID` that names no stored Reserved Instance.
 ///
-/// The modelled `ValidationException` (HTTP 400) rather than
-/// `ResourceNotFoundException`: both are documented in this model with the very
-/// same sentence — "an exception for accessing or deleting a resource that
-/// doesn't exist" — and this is the refusal the service answers an identifier
-/// that resolves to no reservation with.
-pub fn reserved_instance_not_found(reserved_instance_id: &str) -> ValidationException {
-    ValidationException {
-        message: Some(format!(
-            "Reserved instance not found: {reserved_instance_id}"
-        )),
+/// A well-formed identifier that addresses no record names no resource, so this is
+/// the modelled `ResourceNotFoundException` (HTTP 409) — the same refusal the
+/// offering catalog answers an id it publishes nothing for with
+/// ([`offering_not_found`]) — in the service's own wording for a reservation id that
+/// resolves to nothing.
+pub fn reserved_instance_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some("Reservation id not found".to_string()),
     }
 }

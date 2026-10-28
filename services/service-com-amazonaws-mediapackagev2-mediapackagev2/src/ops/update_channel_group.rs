@@ -206,18 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `ETag` travels in `x-amzn-update-if-match` and is the caller's claim about
-        // which version of the resource it is updating: a presented tag that is not the
-        // committed one means somebody else committed first, which is what the model's
-        // `ConflictException` / `CONFLICTING_OPERATION` describes.
-        if input
-            .e_tag
-            .as_deref()
-            .is_some_and(|presented| presented != group.etag)
+        // which version of the resource it is updating; the claim is judged by the ONE
+        // rule every conditional writer of this service shares
+        // (`crate::state::stale_entity_tag_rejection`).
+        if let Some(conflict) =
+            crate::state::stale_entity_tag_rejection(input.e_tag.as_deref(), &group.etag)
         {
-            return Err(UpdateChannelGroupErrorModeled::ConflictException(
-                crate::state::conflicting_operation(),
-            )
-            .into());
+            return Err(UpdateChannelGroupErrorModeled::ConflictException(conflict).into());
         }
 
         // PUT semantics: the description is the one editable member

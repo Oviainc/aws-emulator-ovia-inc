@@ -27,6 +27,8 @@ mod addon_catalog_coverage;
 mod addon_catalog_publication;
 #[path = "all/addon_lifecycle.rs"]
 mod addon_lifecycle;
+#[path = "all/addon_update.rs"]
+mod addon_update;
 #[path = "all/addon_versions.rs"]
 mod addon_versions;
 #[path = "all/cancel_update.rs"]

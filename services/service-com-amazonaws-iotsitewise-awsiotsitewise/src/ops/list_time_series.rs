@@ -2,9 +2,11 @@
 
 //! @op ListTimeSeries
 //! IMPLEMENTED: this operation lists, from the shared engine store (`crate::state`),
-//! every time series this service holds — the ones minted for a `propertyAlias` and
-//! the one each stored asset property owns — filtered by `assetId`, `aliasPrefix`
-//! and `timeSeriesType`; this is the ONLY file to touch for it.
+//! every time series the scope the request names holds — for a `workspaceName`, the
+//! series stored under that workspace; otherwise the account's own, the ones minted
+//! for a `propertyAlias` and the one each stored asset property owns — filtered by
+//! `assetId`, `aliasPrefix` and `timeSeriesType`; this is the ONLY file to touch for
+//! it.
 //!
 //! ## Shape of an operation
 //!
@@ -174,23 +176,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // `workspaceName` scopes the listing to one SiteWise workspace: a workspace
-        // the store does not hold is the same absence `DescribeTimeSeries` reports
-        // for a workspace-scoped lookup. A workspace it DOES hold holds no time
-        // series — nothing that ingests one records a workspace for it — so the
-        // listing is empty rather than refused, and reports the workspace it was
-        // scoped to.
-        if let Some(workspace) = input.workspace_name.as_deref() {
+        // the store does not hold is the absence it is, and a workspace it DOES hold
+        // is enumerated from the time series stored under it — the streams ingestion
+        // recorded that workspace for, which `GetCaptureData` reads back by the same
+        // identifiers a summary of one reports — rather than reported as holding
+        // none. An unscoped listing enumerates the account's own streams instead, so
+        // the two scopes name disjoint sets and the filters, the order and the page
+        // walk below are one path over whichever was asked for.
+        let workspace = input.workspace_name.as_deref();
+        if let Some(workspace) = workspace {
             if !store.workspaces.contains_key(workspace) {
                 return Err(not_found(crate::state::not_found_message(
                     crate::state::RESOURCE_WORKSPACE,
                     workspace,
                 )));
             }
-            return Ok(ListTimeSeriesOutput {
-                time_series_summaries: Vec::new(),
-                next_token: None,
-                workspace_name: Some(workspace.to_string()),
-            });
         }
 
         // The label is either the raw UUID or the `externalId:<externalId>` alias form.
@@ -204,22 +204,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // Every time series this store holds, from the two places one can come from:
-        // a DISASSOCIATED stream, which no asset property owns and which carries its
-        // own id and dates, and the series an asset property IS (derived from the
-        // stored property, the same derivation `DescribeTimeSeries` reports). The two
-        // sets are disjoint by construction — an alias names an associated stream or a
-        // disassociated one, never both — so no series is listed twice.
-        let mut summaries: Vec<TimeSeriesSummary> = store
-            .disassociated_time_series
-            .values()
-            .map(|series| disassociated_summary(series, &region))
-            .collect();
-        for asset in store.assets.values() {
-            for property in &asset.properties {
-                summaries.push(property_summary(asset, property, &region));
+        // Every time series the scope holds. For a workspace that is the series
+        // stored under it, each reported through the one summary every operation of
+        // this service reports a workspace's stream through. For the account it is
+        // the two places one can come from: a DISASSOCIATED stream, which no asset
+        // property owns and which carries its own id and dates, and the series an
+        // asset property IS (derived from the stored property, the same derivation
+        // `DescribeTimeSeries` reports). Those two sets are disjoint by construction
+        // — an alias names an associated stream or a disassociated one, never both —
+        // so no series is listed twice.
+        let mut summaries: Vec<TimeSeriesSummary> = match workspace {
+            Some(workspace) => store
+                .workspace_time_series(workspace)
+                .map(|source| source.time_series_summary(&region))
+                .collect(),
+            None => {
+                let mut summaries: Vec<TimeSeriesSummary> = store
+                    .disassociated_time_series
+                    .values()
+                    .map(|series| disassociated_summary(series, &region))
+                    .collect();
+                for asset in store.assets.values() {
+                    for property in &asset.properties {
+                        summaries.push(property_summary(asset, property, &region));
+                    }
+                }
+                summaries
             }
-        }
+        };
 
         // The filters: an asset's own series only, aliases under one prefix, and the
         // series type — "ASSOCIATED – The time series is associated with an asset
@@ -278,8 +290,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListTimeSeriesOutput {
             time_series_summaries: summaries[page.start..page.end].to_vec(),
             next_token: page.next_token,
-            // Reported only for a listing scoped to a workspace, which returns above.
-            workspace_name: None,
+            // "The name of the workspace" — reported for a listing scoped to one,
+            // which is the scope this answer enumerated.
+            workspace_name: workspace.map(ToString::to_string),
         })
     }
 }

@@ -4,8 +4,15 @@
 //!
 //! IMPLEMENTED. `DescribeUpdate` reports one [`crate::state::UpdateRecord`] held on its
 //! cluster's record in the shared engine's store — the record the call that started the
-//! update wrote (`AssociateEncryptionConfig` today) — so a caller polls the update it
-//! was handed until the clock moves it to `Successful`.
+//! update wrote — so a caller polls the update it was handed until the clock moves it to
+//! `Successful`.
+//!
+//! An update is addressed through its cluster, but it may be an update of a resource
+//! INSIDE that cluster, which `addonName`, `nodegroupName` and `capabilityName` are
+//! what narrow the lookup to ("this parameter is required if the update is an add-on
+//! update"): a request that names one of them reads the updates of THAT resource and
+//! never another's, so an id that belongs to a different scope is not found
+//! ([`crate::state::UpdateScope`]).
 //!
 //! It is a REPORTING operation: the only write it makes is materialising the status
 //! moves the clock already owed, which were due whether or not anybody called.
@@ -168,43 +175,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Each of these selects the updates of a resource INSIDE the cluster: "this
-        // parameter is required if the update is a node group update", and the same for an
-        // add-on or a capability. This service holds no nodegroup, add-on or capability at
-        // all (each create is still 501 with its own gap issue), so an update scoped to
-        // one cannot be found.
-        for (member, value) in [
-            ("nodegroupName", input.nodegroup_name.as_deref()),
-            ("addonName", input.addon_name.as_deref()),
-            ("capabilityName", input.capability_name.as_deref()),
-        ] {
-            if let Some(value) = value {
-                // The UPDATE is the resource reported missing, so the message names it
-                // and the member that scoped the lookup; the exception's identity
-                // members stay unset — EKS does not echo the request's
-                // `nodegroupName`/`addonName` into a not-found payload (see
-                // [`crate::state::child_resource_not_found`]).
-                return Err(DescribeUpdateErrorModeled::ResourceNotFoundException(
-                    crate::state::child_resource_not_found(format!(
-                        "No update found for ID: {} with {member}: {value}.",
-                        input.update_id
-                    )),
-                )
-                .into());
-            }
-        }
-
-        match record.updates.get(&input.update_id) {
+        // Each of these narrows the lookup to the updates of ONE resource INSIDE the
+        // cluster — "this parameter is required if the update is a node group update",
+        // and the same for an add-on or a capability. The resolution is the one
+        // `ListUpdates` pages over ([`crate::state::update_scope_of`]), so the two
+        // cannot disagree about which updates belong to the resource a request names.
+        let Some(scope) = crate::state::update_scope_of(
+            input.nodegroup_name.as_deref(),
+            input.addon_name.as_deref(),
+            input.capability_name.as_deref(),
+        ) else {
+            return Err(DescribeUpdateErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    cluster_name: Some(input.name.clone()),
+                    message: Some(crate::state::ONE_UPDATE_SCOPE_MESSAGE.to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+        // The scoping member names the resource the update must belong to, so an update
+        // of another resource of the same cluster — or of the cluster's own control
+        // plane — is not the one asked for. The UPDATE is the resource reported missing,
+        // so the message names it and, when the lookup was scoped, the member that
+        // scoped it; the exception's identity members stay unset — EKS does not echo the
+        // request's `nodegroupName`/`addonName` into a not-found payload (see
+        // [`crate::state::child_resource_not_found`]).
+        let found = record
+            .updates
+            .get(&input.update_id)
+            .filter(|update| update.scope == scope);
+        match found {
             Some(update) => Ok(DescribeUpdateOutput {
                 update: Some(update.to_update()),
             }),
-            None => Err(DescribeUpdateErrorModeled::ResourceNotFoundException(
-                crate::state::child_resource_not_found(format!(
-                    "No update found for ID: {}.",
-                    input.update_id
-                )),
-            )
-            .into()),
+            None => {
+                let scoped_by = [
+                    ("nodegroupName", input.nodegroup_name.as_deref()),
+                    ("addonName", input.addon_name.as_deref()),
+                    ("capabilityName", input.capability_name.as_deref()),
+                ]
+                .into_iter()
+                .find_map(|(member, value)| value.map(|value| format!(" with {member}: {value}")))
+                .unwrap_or_default();
+                Err(DescribeUpdateErrorModeled::ResourceNotFoundException(
+                    crate::state::child_resource_not_found(format!(
+                        "No update found for ID: {}{scoped_by}.",
+                        input.update_id
+                    )),
+                )
+                .into())
+            }
         }
     }
 }

@@ -25,8 +25,10 @@ use service_com_amazonaws_cloudformation_cloudformation::state::template::{
 struct Section {
     /// The section as the template spells it.
     name: &'static str,
-    /// What ONE entry of the section IS, which is how the refusal counts them: a parameter,
-    /// a resource, an output.
+    /// The noun the refusal counts this section's entries by. It is the SERVICE's wording
+    /// for that one limit rather than anything derived from the section's key — a parameter
+    /// and a resource are counted in the singular, the outputs by the section's own plural
+    /// — so each row spells the noun its own limit is worded with.
     entry_name: &'static str,
     quota: usize,
     /// One entry of this section, given its index.
@@ -62,7 +64,7 @@ fn sections() -> Vec<Section> {
         },
         Section {
             name: "Outputs",
-            entry_name: "Output",
+            entry_name: "Outputs",
             quota: MAX_OUTPUTS_PER_TEMPLATE,
             entry: |index| {
                 (

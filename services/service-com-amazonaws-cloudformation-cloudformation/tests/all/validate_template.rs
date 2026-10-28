@@ -647,6 +647,36 @@ async fn template_body_wins_when_both_are_passed() {
 }
 
 #[tokio::test]
+async fn a_lookup_a_parameter_value_would_decide_is_not_refused() {
+    // The template-validation rules `ValidateTemplate` applies are the ones decided from the
+    // DOCUMENT; a request carrying only a body fixes no parameter value, so an expression
+    // whose resolution a supplied value would decide — here an `Fn::FindInMap` whose key a
+    // parameter with no `Default` supplies — is one this verdict has nothing to say about,
+    // and the template is reported on rather than refused. The same template IS refused by
+    // the operations that submit it with a value the map does not carry
+    // (`template_validation.rs`), which is where the value comes from.
+    let router = router();
+    let template = r#"{
+        "Parameters": {"Env": {"Type": "String"}},
+        "Mappings": {"EnvTiers": {"prod": {"Tier": "large"}}},
+        "Resources": {"Topic": {"Type": "AWS::SNS::Topic"}},
+        "Outputs": {"Tier": {"Value": {"Fn::FindInMap": ["EnvTiers", {"Ref": "Env"}, "Tier"]}}}
+    }"#;
+    let (status, body) = validate(&router, template).await;
+    assert_eq!(
+        status, 200,
+        "case \"a lookup keyed on a parameter with no Default\": expected the template to be \
+         reported on, got {status} {body}"
+    );
+    assert_eq!(
+        wire_parameters(&body),
+        vec![parameter("Env", None, false, None)],
+        "case \"a lookup keyed on a parameter with no Default\": expected the declared \
+         parameter to be reported, got {body}"
+    );
+}
+
+#[tokio::test]
 async fn validating_a_template_changes_nothing_a_later_caller_sees() {
     let (router, engine) = router_with_engine();
     let template = r#"{

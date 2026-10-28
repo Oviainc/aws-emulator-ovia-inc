@@ -23,9 +23,13 @@ pub struct GetRecommendationsInput {
 /// `GetRecommendationsResponse`. Its schema and codec come from
 /// [`profiler_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]` for
 /// both reasons that module exists: `profileStartTime`/`profileEndTime` carry
-/// `@timestampFormat("date-time")`, and the two analysis lists — `@required` in the model
-/// — are OMITTED from the body by the service when the analysis has nothing to report,
-/// rather than reported empty, which the derive's always-write serializer cannot express.
+/// `@timestampFormat("date-time")`, and each of the two analysis lists — `@required` in the
+/// model — is written to the body by the service exactly when it holds a finding, so an
+/// analysis with nothing to report carries neither key while the other three `@required`
+/// members are always present, which the derive's always-write serializer cannot express.
+/// That presence rule is implemented by the `req_unless_empty` entries in the member list
+/// below, and this is where it is stated: the handler fills the lists and leaves the wire
+/// to this codec.
 ///
 /// The member list below is the model's, member for member.
 #[derive(Debug, Clone)]

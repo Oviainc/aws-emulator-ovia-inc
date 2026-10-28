@@ -10,12 +10,13 @@
 //! to nothing (absent workflow, absent run, or a run holding no such instance) is the
 //! modelled `ResourceNotFoundException`.
 //!
-//! No modelled operation of this service CREATES a task instance: one exists only once
-//! something executes a workflow definition, and this emulator has no Apache Airflow
-//! engine to execute one with, so every run it starts holds none. These tests therefore
-//! seed the record into the store the handler reads (the same store `GetWorkflowRun`
-//! reads) and drive the read over the real wire path, which is what this operation owns;
-//! the absent-instance rows cover what a client actually sees today.
+//! A run CREATES one task instance per task its workflow definition declares, and
+//! `run_execution_outcome` covers the records that execution produces. These tests cover
+//! the READ itself over values that execution does not produce — an instance that has no
+//! status yet, a failed one, one whose task exchanged cross-task data — so they seed the
+//! record into the store the handler reads (the same store `GetWorkflowRun` reads) and
+//! drive the read over the real wire path, which is what this operation owns; the
+//! absent-instance rows cover a reference that resolves to nothing.
 //!
 //! The listing of the same records is `ListTaskInstances`, covered by the suite
 //! `task_instance_listing`.
@@ -251,9 +252,10 @@ async fn stored_run(harness: &Harness, name: &str) -> (String, String, String) {
     (arn, run_id, version)
 }
 
-/// Put `task` into the run's store. Nothing in this service's API creates a task
-/// instance (no Apache Airflow engine executes a definition here), so seeding the
-/// store is the only way to exercise the read this operation owns.
+/// Put `task` into the run's store: a record for a task its workflow definition never
+/// declared, which is how this suite exercises the read over values the service's own
+/// execution does not produce (an instance that has no status yet, a failed one, one
+/// whose task pushed cross-task data).
 ///
 /// `pub(crate)` so `run_lifecycle_progression` seeds through the same path.
 pub(crate) fn seed(harness: &Harness, workflow_arn: &str, run_id: &str, task: TaskInstance) {

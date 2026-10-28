@@ -1162,11 +1162,9 @@ async fn an_update_of_an_instance_a_deletion_took_away_is_refused() {
     );
     assert_eq!(
         xml_text(&body, "Message").as_deref(),
-        Some(
-            format!("Stack instance in account {ACCOUNT_A} and Region {REGION} not found")
-                .as_str()
-        ),
-        "case {:?}: expected the refusal to name the account and Region, got {body}",
+        Some("StackInstance not found"),
+        "case {:?}: expected the one sentence this service answers for a stack instance it \
+         holds no record of, got {body}",
         "an update of an instance a deletion took away"
     );
 

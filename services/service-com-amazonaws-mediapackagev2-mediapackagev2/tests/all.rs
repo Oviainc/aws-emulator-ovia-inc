@@ -92,3 +92,5 @@ mod multiview_channel_ingest;
 mod quota_refusal_form;
 #[path = "all/no_op_write_commits_nothing.rs"]
 mod no_op_write_commits_nothing;
+#[path = "all/shared_entity_tag_precondition.rs"]
+mod shared_entity_tag_precondition;

@@ -180,10 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeStackInstanceErrorModeled::StackInstanceNotFoundException(
                     StackInstanceNotFoundException {
-                        message: Some(crate::state::stack_instance_does_not_exist(
-                            &input.stack_instance_account,
-                            &input.stack_instance_region,
-                        )),
+                        message: Some(
+                            crate::state::stack_instance_does_not_exist().to_string(),
+                        ),
                     },
                 )
             })?;

@@ -31,6 +31,8 @@ mod create_router_input;
 mod create_router_network_interface_rules;
 #[path = "all/entitlement_listing.rs"]
 mod entitlement_listing;
+#[path = "all/entitlement_subscribers.rs"]
+mod entitlement_subscribers;
 #[path = "all/error_envelopes.rs"]
 mod error_envelopes;
 #[path = "all/flow_entitlements.rs"]

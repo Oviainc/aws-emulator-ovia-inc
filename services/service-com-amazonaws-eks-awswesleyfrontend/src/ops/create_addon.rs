@@ -128,7 +128,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, AddonRecord, PodIdentityAssociationRecord, ADDON_ACTIVATION_DELAY,
+    self, AddonRecord, ADDON_ACTIVATION_DELAY,
     ADDON_DEFAULT_NAMESPACE, ADDON_OWNER_AWS, ADDON_PUBLISHER_EKS, ADDON_STATUS_CREATING,
     DEFAULT_KUBERNETES_VERSION, MAX_ADDONS_PER_CLUSTER,
     MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER, STATUS_ACTIVE,
@@ -589,10 +589,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceInUseException {
                     cluster_name: Some(input.cluster_name.clone()),
                     addon_name: Some(input.addon_name.clone()),
-                    message: Some(format!(
-                        "Association already exists with namespace: {namespace} and \
-                         service account: {}",
-                        association.service_account
+                    message: Some(state::association_already_exists(
+                        &namespace,
+                        &association.service_account,
                     )),
                     ..Default::default()
                 },
@@ -610,56 +609,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The add-on OWNS the EKS Pod Identity associations it was asked for, so each
-        // one is created here as a record of its own — through the same minting path
-        // `CreatePodIdentityAssociation` uses, so the id is unique within the cluster
-        // and has the form every other association id has — carrying this add-on's ARN
-        // as its `ownerArn`. `DescribePodIdentityAssociation` and
+        // one is created here as a record of its own, carrying this add-on's ARN as its
+        // `ownerArn` — through [`crate::state::ComAmazonawsEksAwswesleyfrontendState::create_addon_owned_association`],
+        // the one path an association an add-on owns is written by, which `UpdateAddon`
+        // replaces that set through as well. `DescribePodIdentityAssociation` and
         // `ListPodIdentityAssociations` therefore find exactly the associations whose
         // ARNs the add-on reports.
         let mut association_arns = Vec::with_capacity(requested_associations.len());
         for association in &requested_associations {
-            let association_id = guard.mint_association_id(
+            association_arns.push(guard.create_addon_owned_association(
                 &region,
                 &input.cluster_name,
                 &namespace,
-                &association.service_account,
-            );
-            let association_arn =
-                state::derive_association_arn(&region, &input.cluster_name, &association_id);
-            association_arns.push(association_arn.clone());
-            let association_record = PodIdentityAssociationRecord {
-                cluster_name: input.cluster_name.clone(),
-                association_id: association_id.clone(),
-                association_arn,
-                namespace: namespace.clone(),
-                service_account: association.service_account.clone(),
-                role_arn: association.role_arn.clone(),
-                // `CreateAddon` asks only for a service account and a role, so an
-                // association it creates names no target role — and `externalId`
-                // exists to be matched in a TARGET role's trust policy, so there is
-                // nothing to condition — no permissions policy and no session-tag
-                // override.
-                target_role_arn: None,
-                external_id: None,
-                policy: None,
-                disable_session_tags: None,
-                // "Tags don't propagate to any other cluster or Amazon Web Services
-                // resources" (`CreateAddon$tags`), so the add-on's tags are not copied
-                // onto the associations it creates.
-                tags: ::std::collections::BTreeMap::new(),
-                created_at: now,
-                modified_at: now,
-                // The association is created by the add-on, not by a
-                // `CreatePodIdentityAssociation` call, so no association-level
-                // idempotency token applies to it.
-                client_request_token: None,
-                update_request_token: None,
-                owner_arn: Some(addon_arn.clone()),
-            };
-            guard.pod_identity_associations.insert(
-                (region.clone(), input.cluster_name.clone(), association_id),
-                association_record,
-            );
+                &addon_arn,
+                association,
+                now,
+            ));
         }
 
         let record = AddonRecord {
@@ -688,6 +653,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_request_token: input.client_request_token.clone(),
             cluster_name: input.cluster_name.clone(),
             addon_name: input.addon_name.clone(),
+            // Nothing is in flight on a freshly installed add-on: `UpdateAddon` is
+            // what puts a pending change on the record.
+            pending_update: None,
+            // An add-on this emulator has just installed has nothing wrong with it:
+            // only a change an update could not make leaves an issue here.
+            health_issues: Vec::new(),
             // `resolveConflicts` decides what happens to a SELF-MANAGED copy of the
             // add-on already running on the cluster; this emulator runs no Kubernetes,
             // so there is never a self-managed copy to resolve against, and the member

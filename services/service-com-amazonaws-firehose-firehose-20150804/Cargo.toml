@@ -28,6 +28,10 @@ tracing = { workspace = true }
 # `RoleARN` a configuration names with `GetRole` before the stream is written. Only the
 # generated client is needed — the emulator supplies the transport.
 aws-sdk-iam = { version = "1", default-features = false }
+# The AWS SDK for Amazon S3, driven over the same in-process callback: a destination's
+# `BucketARN` is resolved with `HeadBucket` before `UpdateDestination` rewrites a stream's
+# destination. Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false }
 # `iam_trust_policy`: the one reading of an IAM trust policy, shared with every other
 # service that resolves a caller-supplied role.
 service-common = { path = "../common" }

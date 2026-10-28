@@ -54,7 +54,8 @@
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]), and the
 //! account's default encryption configuration
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::default_encryption`]). A
-//! workspace's capture sources — the video streams `GetCaptureData` reads — live
+//! workspace's capture sources — the video streams `GetCaptureData` reads, and
+//! the time series that workspace holds — live
 //! in [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_sources`], keyed by
 //! the workspace and the source's `timeSeriesId`, with
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::capture_source_aliases`] the
@@ -118,7 +119,8 @@ use crate::ops::types::{
     PipelineExecutionStateDetails, PipelineExecutionStatus, PortalStatus,
     PortalTypeEntry, ProcessingInput, PropertyMapping, PropertyType, QueryStatistics, QuerySummary,
     ResolveTo, Resource, ResourceStatus, RetentionPeriod, SearchFilters, TargetResource,
-    TaskConfiguration, TimeInNanos, TrimSettings, Variant, WarmTierRetentionPeriod,
+    TaskConfiguration, TimeInNanos, TimeSeriesSummary, TrimSettings, Variant,
+    WarmTierRetentionPeriod,
     WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo, WorkspaceStatus,
     DISASSOCIATED_DATA_STORAGE_STATE_VALUES, ENCRYPTION_TYPE_VALUES, STORAGE_TYPE_VALUES,
     VIDEO_DATA_TYPE_VALUES, WARM_TIER_STATE_VALUES,
@@ -592,10 +594,13 @@ pub const MAX_LOGGING_SCOPES: usize = 1_000;
 ///
 /// A capture source is created by the producer path that first writes video for
 /// it ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_capture_segment`]), and
-/// nothing removes one, so the collection needs a bound of its own: past this
-/// many sources a write naming a NEW one is refused rather than evicting a
-/// source a caller can still read. The emulator's own bound, not a published AWS
-/// quota, and high enough that no ordinary workspace meets it.
+/// the only thing that removes one is a `DeleteTimeSeries` scoped to its
+/// workspace
+/// ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::forget_capture_source`]), so
+/// the collection needs a bound of its own: past this many sources a write
+/// naming a NEW one is refused rather than evicting a source a caller can still
+/// read. The emulator's own bound, not a published AWS quota, and high enough
+/// that no ordinary workspace meets it.
 pub const MAX_CAPTURE_SOURCES: usize = 1_000;
 
 /// How many video segments one capture source keeps.
@@ -763,18 +768,22 @@ pub struct CaptureSegment {
 /// entry point a producer path (or a test seeding a capture source) calls.
 /// `GetCaptureData` itself never appends a segment and never creates a source.
 ///
+/// A capture source IS one of its workspace's time series, so it is what the
+/// workspace-scoped forms of `ListTimeSeries`, `DescribeTimeSeries` and
+/// `DeleteTimeSeries` enumerate, report and remove
+/// ([`Self::time_series_summary`],
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::workspace_time_series`]).
+///
 /// WHY this is its own registry rather than a field on the records
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::property_alias_index`] and
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociated_time_series`]
 /// resolve: a capture source is addressed INSIDE a workspace, and those streams
 /// belong to no workspace at all — nothing that creates or ingests one records
-/// one for it, which is why a workspace-scoped `DescribeTimeSeries` resolves to
-/// nothing and a workspace-scoped `ListTimeSeries` is empty. Keying a source by
-/// `(workspaceName, timeSeriesId)` is what makes one identifier free in every
-/// other workspace, and it stays correct when the operations that ingest a
-/// workspace's streams arrive: a stream that gains a workspace gains a capture
-/// source under that key, rather than this read having to guess which workspace
-/// an account-wide stream belongs to.
+/// one for it. Keying a source by `(workspaceName, timeSeriesId)` is what makes
+/// one identifier free in every other workspace, and it stays correct when the
+/// operations that ingest a workspace's streams arrive: a stream that gains a
+/// workspace gains a capture source under that key, rather than a read having to
+/// guess which workspace an account-wide stream belongs to.
 #[derive(Debug, Clone)]
 pub struct CaptureSourceRecord {
     /// The workspace that contains the source. A source is addressable only
@@ -787,9 +796,102 @@ pub struct CaptureSourceRecord {
     pub alias: Option<String>,
     /// A `VideoDataType` value: the type of the media the segments hold.
     pub data_type: String,
+    /// When the write that created the source landed — the instant this time
+    /// series came into being, which `timeSeriesCreationDate` reports.
+    pub creation_date: SystemTime,
+    /// When the last write this source accepted landed, which
+    /// `timeSeriesLastUpdateDate` reports.
+    pub last_update_date: SystemTime,
     /// The source's video, kept sorted ascending by start time and
     /// single-valued at a start time, exactly as a time series' samples are.
     pub segments: Vec<CaptureSegment>,
+}
+
+impl CaptureSourceRecord {
+    /// This source as the time series it is: the one summary every time-series
+    /// operation of this service reports a workspace's stream through, so a
+    /// listing and a describe of one stream cannot disagree about it.
+    ///
+    /// No asset property owns a workspace's video stream — nothing binds one to
+    /// an `(assetId, propertyId)` pair — so the summary carries neither id,
+    /// which is what makes it `DISASSOCIATED` in a listing. Its
+    /// `PropertyDataType` is [`DATA_TYPE_VIDEO`]: the media's own
+    /// `VideoDataType` is finer-grained than that member can express and is
+    /// what `GetCaptureData` reports instead. `dataTypeSpec` stays absent —
+    /// `TimeSeriesSummary$dataTypeSpec` is "required for time series that have
+    /// the `STRUCT` data type".
+    pub fn time_series_summary(&self, region: &str) -> TimeSeriesSummary {
+        TimeSeriesSummary {
+            asset_id: None,
+            property_id: None,
+            alias: self.alias.clone(),
+            data_type: DATA_TYPE_VIDEO.to_string(),
+            data_type_spec: None,
+            time_series_creation_date: to_date_time(self.creation_date),
+            time_series_last_update_date: to_date_time(self.last_update_date),
+            time_series_arn: time_series_arn(region, &self.time_series_id),
+            time_series_id: self.time_series_id.clone(),
+        }
+    }
+}
+
+/// Which identifying form a time-series lookup took.
+///
+/// `DescribeTimeSeries` and `DeleteTimeSeries` accept the same two —
+/// "specify the alias of the time series" or "the assetId and propertyId that
+/// identifies the asset property" — whatever scope they name, and a lookup
+/// scoped to a workspace resolves both through
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::workspace_series`], so neither
+/// handler re-derives it.
+#[derive(Debug, Clone, Copy)]
+pub enum SeriesLookup<'a> {
+    /// The series the `propertyAlias` bound to it names.
+    Alias(&'a str),
+    /// The series of the asset property the pair of `CustomID` labels names.
+    Pair(&'a str, &'a str),
+}
+
+/// Why [`ComAmazonawsIotsitewiseAwsiotsitewiseState::workspace_series`]
+/// resolved no time series, carrying the identifier the request supplied for the
+/// resource that is missing. Each variant is ONE absence, so a handler maps it
+/// to one modelled error and one message
+/// ([`workspace_series_miss_message`]) rather than re-deriving the lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSeriesMiss {
+    /// The store holds no workspace of that name.
+    NoSuchWorkspace,
+    /// No stored asset answers to the `assetId` label the variant carries.
+    NoSuchAsset(String),
+    /// The asset the first label names carries no property the second names.
+    NoSuchProperty(String, String),
+    /// The workspace holds no time series under the identifier the request
+    /// supplied, which the variant carries: the alias as sent, or the
+    /// [`time_series_id`] of the pair the request named.
+    NoSuchSeries(String),
+}
+
+/// How a workspace-scoped time-series lookup states the absence it stopped at:
+/// the missing resource named as the kind it is, echoing the identifier the
+/// REQUEST supplied for it, through the one template every not-found path of
+/// this service uses ([`not_found_message`]).
+///
+/// Shared by every operation that takes a `workspaceName`, so two of them cannot
+/// state one store state differently.
+pub fn workspace_series_miss_message(workspace_name: &str, miss: &WorkspaceSeriesMiss) -> String {
+    match miss {
+        WorkspaceSeriesMiss::NoSuchWorkspace => {
+            not_found_message(RESOURCE_WORKSPACE, workspace_name)
+        }
+        WorkspaceSeriesMiss::NoSuchAsset(asset_label) => {
+            not_found_message(RESOURCE_ASSET, asset_label)
+        }
+        WorkspaceSeriesMiss::NoSuchProperty(asset_label, property_label) => {
+            format!("The asset {asset_label} has no property {property_label}.")
+        }
+        WorkspaceSeriesMiss::NoSuchSeries(requested) => {
+            not_found_message(RESOURCE_TIME_SERIES, requested)
+        }
+    }
 }
 
 /// A stored asset model: everything `DescribeAssetModel` reports, plus the
@@ -3890,7 +3992,9 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// they live in, then the source's own `timeSeriesId`, because a capture
     /// source is addressable only inside its workspace — nested so a lookup
     /// borrows the two names instead of allocating a key on every read. Written
-    /// by [`Self::put_capture_segment`] and read by `GetCaptureData`.
+    /// by [`Self::put_capture_segment`], read by `GetCaptureData` and by the
+    /// workspace-scoped forms of the time-series operations, whose series these
+    /// are, and removed by [`Self::forget_capture_source`].
     pub capture_sources: HashMap<String, HashMap<String, CaptureSourceRecord>>,
     /// `workspaceName` -> `propertyAlias` -> `timeSeriesId`, so the alias form of
     /// a capture-source lookup resolves to the same record the id form does.
@@ -4788,6 +4892,11 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// the producer handlers this serves can map one refusal to one modelled
     /// error instead of re-deriving the checks — and nothing is written on any of
     /// them.
+    ///
+    /// `now` is the instant the write lands: the source's creation date for the
+    /// write that creates it, and its last-update date for every write it
+    /// accepts, which is what the time series it is reports
+    /// ([`CaptureSourceRecord::time_series_summary`]).
     pub fn put_capture_segment(
         &mut self,
         workspace_name: &str,
@@ -4795,6 +4904,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         alias: Option<&str>,
         data_type: &str,
         segment: CaptureSegment,
+        now: SystemTime,
     ) -> Result<(), CaptureWriteRefusal> {
         if !self.workspaces.contains_key(workspace_name) {
             return Err(CaptureWriteRefusal::NoSuchWorkspace);
@@ -4841,8 +4951,14 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 time_series_id: time_series_id.to_string(),
                 alias: None,
                 data_type: data_type.to_string(),
+                creation_date: now,
+                last_update_date: now,
                 segments: Vec::new(),
             });
+        // An accepted write is a write to the series, so its last-update instant
+        // moves to this call's — the creation instant stays the one the write
+        // that created it stamped.
+        source.last_update_date = now;
 
         // A source's `alias` and the alias index move together: the alias the
         // source carried before is dropped from the index below, so nothing
@@ -4921,6 +5037,97 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     ) -> Option<&CaptureSourceRecord> {
         let time_series_id = self.capture_source_aliases.get(workspace_name)?.get(alias)?;
         self.capture_source_by_id(workspace_name, time_series_id)
+    }
+
+    /// Every time series `workspace_name` holds, in no particular order — what a
+    /// listing scoped to that workspace enumerates.
+    ///
+    /// A workspace's time series ARE the capture sources stored under it: the
+    /// streams ingestion recorded a workspace for, which `GetCaptureData` reads
+    /// back by the same two identifiers a summary of one reports.
+    pub fn workspace_time_series(
+        &self,
+        workspace_name: &str,
+    ) -> impl Iterator<Item = &CaptureSourceRecord> {
+        self.capture_sources
+            .get(workspace_name)
+            .into_iter()
+            .flat_map(::std::collections::HashMap::values)
+    }
+
+    /// The one time series `workspace_name` holds that `lookup` names, or which
+    /// absence stopped the lookup ([`WorkspaceSeriesMiss`]).
+    ///
+    /// ONE resolution for every operation scoped to a workspace, so the alias
+    /// form and the asset-property pair form cannot drift between the handlers
+    /// that accept them: the alias resolves through the workspace's alias index,
+    /// and a pair resolves to the [`time_series_id`] that pair owns and is then
+    /// looked for among the workspace's own series.
+    pub fn workspace_series(
+        &self,
+        workspace_name: &str,
+        lookup: SeriesLookup<'_>,
+    ) -> Result<&CaptureSourceRecord, WorkspaceSeriesMiss> {
+        if !self.workspaces.contains_key(workspace_name) {
+            return Err(WorkspaceSeriesMiss::NoSuchWorkspace);
+        }
+        let (held, requested) = match lookup {
+            SeriesLookup::Alias(alias) => (
+                self.capture_source_by_alias(workspace_name, alias),
+                alias.to_string(),
+            ),
+            SeriesLookup::Pair(asset_label, property_label) => {
+                // Both halves are modelled `CustomID`s, so each can arrive as the
+                // raw UUID or as `externalId:<externalId>`; an absent one is the
+                // absence it is, exactly as it is for a lookup naming no
+                // workspace.
+                let asset_id = self
+                    .resolve_asset_id(asset_label)
+                    .ok_or_else(|| WorkspaceSeriesMiss::NoSuchAsset(asset_label.to_string()))?;
+                let property_id = self
+                    .assets
+                    .get(&asset_id)
+                    .and_then(|asset| asset.property(property_label))
+                    .map(|property| property.id.clone())
+                    .ok_or_else(|| {
+                        WorkspaceSeriesMiss::NoSuchProperty(
+                            asset_label.to_string(),
+                            property_label.to_string(),
+                        )
+                    })?;
+                let time_series_id = time_series_id(&asset_id, &property_id);
+                (
+                    self.capture_source_by_id(workspace_name, &time_series_id),
+                    time_series_id,
+                )
+            }
+        };
+        held.ok_or(WorkspaceSeriesMiss::NoSuchSeries(requested))
+    }
+
+    /// Forget the time series `workspace_name` holds under `time_series_id`,
+    /// answering the record that was removed.
+    ///
+    /// What `DeleteTimeSeries` scoped to a workspace does: the stream goes,
+    /// video and all, and neither its id nor the alias bound to it names
+    /// anything in that workspace afterwards.
+    pub fn forget_capture_source(
+        &mut self,
+        workspace_name: &str,
+        time_series_id: &str,
+    ) -> Option<CaptureSourceRecord> {
+        let sources = self.capture_sources.get_mut(workspace_name)?;
+        let record = sources.remove(time_series_id)?;
+        if sources.is_empty() {
+            self.capture_sources.remove(workspace_name);
+        }
+        if let Some(aliases) = self.capture_source_aliases.get_mut(workspace_name) {
+            aliases.retain(|_, held| held != time_series_id);
+            if aliases.is_empty() {
+                self.capture_source_aliases.remove(workspace_name);
+            }
+        }
+        Some(record)
     }
 
     /// The logging options `workspace` reports: the ones last set for that scope,
@@ -5201,7 +5408,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// These are the kinds a caller creates INSIDE a workspace and addresses as
     /// resources of their own — each with its own create and its own delete — so
     /// they are what a delete of the container has to find empty. The records
-    /// this store keys by a workspace but a caller cannot address one at a time
+    /// this store keys by a workspace but a caller cannot CREATE one at a time
     /// (a search, a query, an enrichment job, a dataset export job, a capture
     /// source) are NOT contents in this sense: they are what running the
     /// workspace produced, and they go with it in [`Self::forget_workspace`]. A
@@ -5873,6 +6080,13 @@ pub fn check_property_shape(
 /// The one `PropertyDataType` value that also requires `dataTypeSpec`; see
 /// [`check_property_shape`].
 pub const DATA_TYPE_STRUCT: &str = "STRUCT";
+
+/// The `PropertyDataType` of a time series whose samples are video — what a
+/// workspace's capture source reports (see
+/// [`CaptureSourceRecord::time_series_summary`]). Source:
+/// `smithy_query(query="shape", shape="PropertyDataType")`, whose values are
+/// STRING | INTEGER | DOUBLE | BOOLEAN | STRUCT | VIDEO | ANNOTATION | JSON.
+pub const DATA_TYPE_VIDEO: &str = "VIDEO";
 
 /// `id`, unless it is absent or empty.
 pub fn non_empty_id(id: Option<&str>) -> Option<String> {

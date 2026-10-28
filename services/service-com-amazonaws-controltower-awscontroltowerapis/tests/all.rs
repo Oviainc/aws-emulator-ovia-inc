@@ -55,6 +55,8 @@ mod enabled_control_update;
 mod front_door_validation;
 #[path = "all/get_enabled_control.rs"]
 mod get_enabled_control;
+#[path = "all/in_flight_configuration_change_drift.rs"]
+mod in_flight_configuration_change_drift;
 #[path = "all/landing_zone_decommission.rs"]
 mod landing_zone_decommission;
 #[path = "all/landing_zone_identifier.rs"]

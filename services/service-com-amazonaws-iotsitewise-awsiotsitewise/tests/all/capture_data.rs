@@ -168,6 +168,7 @@ fn seed(
                 end_time: time_in_nanos(seed.end_seconds, seed.end_nanos),
                 data: seed.data.to_vec(),
             },
+            std::time::SystemTime::now(),
         );
         assert_eq!(
             stored,
@@ -756,8 +757,14 @@ async fn the_producer_entry_point_refuses_what_it_cannot_store() {
                 CaptureWriteRefusal::UnmodelledInstant,
             ),
         ] {
-            let refusal =
-                store.put_capture_segment(workspace, id, alias, data_type, segment(span.0, span.1));
+            let refusal = store.put_capture_segment(
+                workspace,
+                id,
+                alias,
+                data_type,
+                segment(span.0, span.1),
+                std::time::SystemTime::now(),
+            );
             assert_eq!(
                 refusal,
                 Err(expected),
@@ -782,6 +789,7 @@ async fn the_producer_entry_point_refuses_what_it_cannot_store() {
                 None,
                 DATA_TYPE,
                 segment(start, start + 10),
+                std::time::SystemTime::now(),
             );
             assert_eq!(
                 stored,
@@ -816,6 +824,7 @@ async fn the_producer_entry_point_refuses_what_it_cannot_store() {
             None,
             "VIDEO-AVI",
             segment(1_700_000_000, 1_700_000_010),
+            std::time::SystemTime::now(),
         );
         assert_eq!(
             mismatched,
@@ -838,6 +847,7 @@ async fn the_producer_entry_point_refuses_what_it_cannot_store() {
                 end_time: time_in_nanos(1_600_000_020, 0),
                 data: b"re-ingested".to_vec(),
             },
+            std::time::SystemTime::now(),
         );
         assert_eq!(
             stored,

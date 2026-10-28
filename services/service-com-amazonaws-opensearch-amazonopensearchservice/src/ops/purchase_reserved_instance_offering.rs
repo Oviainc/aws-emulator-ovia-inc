@@ -7,6 +7,11 @@
 //! reservation is priced from the catalog entry the store itself published, so
 //! the offering and the reservation bought from it cannot disagree.
 //!
+//! The request's own modelled constraints are applied FIRST — `InstanceCount`'s
+//! `@range`, `ReservedInstanceOfferingId`'s `GUID` form — and only then is the
+//! offering resolved, so a malformed request is answered as one instead of as a
+//! resource that could not be found.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -84,7 +89,7 @@
 use super::types::*;
 
 use crate::state::{
-    is_guid, NewReservation, ReservedInstanceRecord, DEFAULT_INSTANCE_COUNT,
+    is_guid, NewReservation, ReservedInstanceRecord, INSTANCE_COUNT_MINIMUM,
     RESERVED_INSTANCE_QUOTA,
 };
 
@@ -177,30 +182,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // `InstanceCount` is `@range(min: 1)`, so the request boundary has already
-        // refused a count below one; a request that named none reserves the
-        // documented default.
-        let instance_count = input.instance_count.unwrap_or(DEFAULT_INSTANCE_COUNT);
+        // `InstanceCount` targets `InstanceCount`, which is `@range(min: 1)`, and
+        // the member carries no `@default` — so a request that named no count has
+        // asked to reserve none, which is a count below the modelled minimum rather
+        // than one the service fills in. The whole input is judged BEFORE anything it
+        // names is resolved against the store, so a caller is told which member to
+        // fix instead of being told about a resource.
+        let instance_count = input.instance_count.unwrap_or(0);
+        if instance_count < INSTANCE_COUNT_MINIMUM {
+            return Err(
+                PurchaseReservedInstanceOfferingErrorModeled::ValidationException(
+                    crate::state::below_range_minimum(
+                        "instanceCount",
+                        instance_count,
+                        INSTANCE_COUNT_MINIMUM,
+                    ),
+                )
+                .into(),
+            );
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // The offering has to be one the published catalog holds — "the ID of the
-        // Reserved Instance offering to purchase" — and an id it does not hold is
-        // refused with the modelled `ValidationException`, which this model
-        // documents with the very sentence it documents `ResourceNotFoundException`
-        // with ("an exception for accessing or deleting a resource that doesn't
-        // exist") and which this service answers a purchase naming an offering
-        // nothing publishes with. The entry is cloned out of the catalog so the
-        // reservation below is priced from what the store itself published.
+        // Reserved Instance offering to purchase" — and a well-formed id it does not
+        // hold addresses no resource, so it is the modelled not-found, the same
+        // refusal the catalog listing answers such an id with. The entry is cloned
+        // out of the catalog so the reservation below is priced from what the store
+        // itself published.
         let Some(offering) = store.reserved_instance_offering(&offering_id).cloned() else {
             return Err(
-                PurchaseReservedInstanceOfferingErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "Reserved Instance offering not found: {offering_id}"
-                        )),
-                    },
+                PurchaseReservedInstanceOfferingErrorModeled::ResourceNotFoundException(
+                    crate::state::offering_not_found(&offering_id),
                 )
                 .into(),
             );

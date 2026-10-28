@@ -347,11 +347,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let (billing_group_cost_report_results, next_token) = crate::state::paginate_bounded(
+            &crate::state::page_scope_within(Self::NAME, &group.arn),
             results,
             input.next_token.as_deref(),
             input.max_results,
             MAX_PAGE_SIZE,
-        );
+        )
+        .map_err(GetBillingGroupCostReportErrorModeled::ValidationException)?;
 
         Ok(GetBillingGroupCostReportOutput {
             billing_group_cost_report_results: Some(billing_group_cost_report_results),

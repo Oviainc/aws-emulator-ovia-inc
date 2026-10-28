@@ -19,14 +19,16 @@
 //!   window the group retains no profile in covers nothing, so the requested bounds are
 //!   reported back as the (empty) analysed span.
 //!
-//! `recommendations` and `anomalies` are reported EMPTY. This emulator stores an agent
+//! `recommendations` and `anomalies` hold NO findings. This emulator stores an agent
 //! profile as the opaque payload `PostAgentProfile` uploaded (`GetProfile` hands the same
 //! bytes back byte-identical) and runs no anti-pattern matcher or anomaly detector over
 //! it: nothing here parses a profile, so there is no match and no anomaly to report.
 //! Inventing `Recommendation`/`Anomaly` entries would be output synthesised to look
-//! computed, so the modelled lists are present and empty — the honest answer for an
-//! analysis that found nothing. When this service grows a real analysis it will persist
-//! its findings against the group, and this handler will report those.
+//! computed, so this handler hands the response the two lists EMPTY. How an empty one
+//! then reaches the body is not this handler's decision and is not restated here: the
+//! response codec declared on `GetRecommendationsOutput` states and implements that
+//! presence rule. When this service grows a real analysis it will persist its
+//! findings against the group, and this handler will report those.
 //!
 //! ## Shape of an operation
 //!
@@ -256,11 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profile_end_time,
             // No anti-pattern matcher and no anomaly detector run over the stored agent
             // profiles (see this module's header), so the analysis reports no findings
-            // rather than invented ones. An analysis with nothing to report OMITS the two
-            // lists from the body rather than sending them empty — that is what the
-            // `GetRecommendationsResponse` serializer does with an empty one (see
-            // `ops/types/date_time_wire.rs`), so a client can tell "no analysis to report"
-            // from "analysis ran and found nothing" by the key's presence.
+            // rather than invented ones. The response codec for GetRecommendationsOutput
+            // decides what an empty list does on the wire.
             recommendations: Vec::new(),
             anomalies: Vec::new(),
         })
