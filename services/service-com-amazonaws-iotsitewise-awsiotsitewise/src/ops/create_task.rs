@@ -185,6 +185,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store_key = crate::state::task_key(&input.workspace_name, &input.task_name);
         let mut store = state.lock();
 
+        // `clientToken` makes this create idempotent, as the member documents: "If
+        // you retry a request that completed successfully using the same client
+        // token, the server returns the cached result from the original successful
+        // request without performing the operation again." The token is resolved
+        // against the store's record of the tokens THIS operation has already
+        // served, the way every other idempotent write of this service resolves
+        // one: a token identifies the call that spent it, so a retry — the SAME
+        // request under that token — replays what that call left behind and writes
+        // nothing, while a DIFFERENT request reusing it belongs to another call and
+        // is the modelled conflict rather than a second task. Comparing the token
+        // against the one task whose name this request repeats would see neither.
+        // Decided BEFORE the request is resolved against the store, because the call
+        // it repeats was already served, whatever has changed since.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.workspace_name,
+                &input.task_name,
+                &input.description,
+                &crate::state::task_configuration_fingerprint(&input.task_configuration),
+            ],
+            input.tags.as_ref(),
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // The retry writes nothing and reports the version the ORIGINAL call
+                // minted — the first one — whatever version a later update has since
+                // written. One deleted since leaves the retry nothing to answer from,
+                // so that retry is served as the fresh create it now is.
+                let key = crate::state::workspace_scoped_token_key(&replayed);
+                if let Some(existing) = store.tasks.get(&key) {
+                    return Ok(CreateTaskOutput {
+                        task_name: existing.name.clone(),
+                        task_arn: existing.arn.clone(),
+                        version: crate::state::FIRST_TASK_VERSION.to_string(),
+                        status: existing.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored task CARRIES,
+                // read back from the record rather than rebuilt, so the refusal cannot
+                // name an ARN no task of this store has. One removed since the token
+                // was spent leaves only its name to build one from.
+                let (workspace_name, task_name) =
+                    crate::state::workspace_scoped_token_key(&spent_on);
+                let conflicting_arn = store
+                    .tasks
+                    .get(&(workspace_name.clone(), task_name.clone()))
+                    .map(|task| task.arn.clone())
+                    .unwrap_or_else(|| {
+                        crate::state::task_arn(&region, &workspace_name, &task_name)
+                    });
+                return Err(token_spent(&task_name, conflicting_arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         // The task is created IN the workspace the path names, so a workspace this
         // store holds no record of is the same absence every other workspace-scoped
         // operation of this service reports — resolved before anything is written,
@@ -201,19 +258,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(existing) = store.tasks.get(&store_key) {
-            // "If you retry a request that completed successfully using the same client
-            // token, the server returns the cached result from the original successful
-            // request without performing the operation again": the retry writes
-            // nothing and reports the version the ORIGINAL call minted — the first one
-            // — whatever version a later update has since written.
-            if input.client_token.is_some() && input.client_token == existing.client_token {
-                return Ok(CreateTaskOutput {
-                    task_name: existing.name.clone(),
-                    task_arn: existing.arn.clone(),
-                    version: crate::state::FIRST_TASK_VERSION.to_string(),
-                    status: existing.status(now),
-                });
-            }
             // `taskName` "must be unique within the workspace", so a second create
             // claiming a name a task already holds collides with that task.
             return Err(CreateTaskError::Modeled(
@@ -286,12 +330,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the instant is stored, never slept on.
             settling_state: crate::state::STATE_CREATING.to_string(),
             active_at: now + crate::state::ACTIVATION_DELAY,
-            client_token: input.client_token.clone(),
             tags: input.tags.clone().unwrap_or_default(),
         };
 
         let output = created(&record, now);
         store.tasks.insert(store_key, record);
+        // The token is spent only now that the create has succeeded: a refused
+        // request created nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &crate::state::workspace_scoped_token_resource(
+                &input.workspace_name,
+                &input.task_name,
+            ),
+            now,
+        );
 
         Ok(output)
     }
@@ -312,5 +367,18 @@ fn created(record: &crate::state::TaskRecord, now: ::std::time::SystemTime) -> C
 fn invalid_request(message: String) -> CreateTaskError {
     CreateTaskError::Modeled(CreateTaskErrorModeled::InvalidRequestException(
         InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the task that request created, so
+/// `resourceId`/`resourceArn` name it — the task the caller has to look at.
+fn token_spent(task_name: &str, resource_arn: String) -> CreateTaskError {
+    CreateTaskError::Modeled(CreateTaskErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("task", "clientToken"),
+            resource_id: task_name.to_string(),
+            resource_arn,
+        },
     ))
 }

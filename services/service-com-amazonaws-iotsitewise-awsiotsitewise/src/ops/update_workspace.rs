@@ -155,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateWorkspaceError::Modeled(UpdateWorkspaceErrorModeled::InternalFailureException(
@@ -164,25 +164,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
+
+        // `clientToken` makes this update idempotent, as the member documents: "If
+        // you retry a request that completed successfully using the same client
+        // token, the retry succeeds without performing any further actions." The
+        // token is resolved against the store's record of the tokens THIS operation
+        // has already served, the way every other idempotent write of this service
+        // resolves one: a token identifies the call that spent it, so a retry — the
+        // SAME request under that token — reports the workspace that call left
+        // behind and writes nothing, not restarting the UPDATING transition it owes,
+        // while a DIFFERENT request reusing it belongs to another call and is the
+        // modelled conflict. Comparing the token against the one workspace this
+        // request addresses would miss a token spent on another workspace, which is
+        // a different request. It is the FIRST thing decided, because the call it
+        // repeats was already accepted.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.workspace_name,
+                &input.workspace_description,
+                &input.encryption_configuration,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // A workspace deleted since leaves the retry nothing to answer from,
+                // so that retry is served as the fresh update it now is — which is
+                // the not-found refusal below.
+                if let Some(workspace) = store.workspaces.get(&replayed) {
+                    return Ok(UpdateWorkspaceOutput {
+                        workspace_status: workspace.status(now),
+                    });
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                // The ARN the conflict reports is the one the stored workspace
+                // CARRIES, read back from the record rather than rebuilt, so the
+                // refusal cannot name an ARN no workspace of this store has. One
+                // removed since the token was spent leaves only its name to build one
+                // from.
+                let conflicting_arn = store
+                    .workspaces
+                    .get(&spent_on)
+                    .map(|workspace| workspace.arn.clone())
+                    .unwrap_or_else(|| crate::state::workspace_arn(&region, &spent_on));
+                return Err(token_spent(&spent_on, conflicting_arn));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
         let record = store
             .workspaces
             .get_mut(&input.workspace_name)
             .ok_or_else(|| not_found(&input.workspace_name))?;
-
-        // "If you retry a request that completed successfully using the same client
-        // token, the retry succeeds without performing any further actions": the retry
-        // writes nothing and reports the workspace's status as it stands. It is the
-        // FIRST thing checked once the workspace resolves — before every rule about
-        // the body it carries — because the call it repeats was already accepted, and
-        // because that very call is what left the workspace in UPDATING.
-        if input.client_token.is_some() && input.client_token == record.update_token {
-            return Ok(UpdateWorkspaceOutput {
-                workspace_status: record.status(now),
-            });
-        }
 
         // A supplied configuration's own rules hold here exactly as they do on the
         // create, and are checked before anything is written so a refused update
@@ -260,11 +298,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The accepted write moves the workspace to UPDATING — `workspaceStatus` is
         // "The status of the workspace after the update, which is UPDATING when the
         // operation returns" — and the instant it settles is stored, never slept on.
-        record.record_update(description, encryption, input.client_token.clone(), now);
-
-        Ok(UpdateWorkspaceOutput {
+        record.record_update(description, encryption, now);
+        let output = UpdateWorkspaceOutput {
             workspace_status: record.status(now),
-        })
+        };
+
+        // The token is spent only now that the update has been accepted: a refused
+        // request wrote nothing, so the caller may send its token again.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &input.workspace_name,
+            now,
+        );
+
+        Ok(output)
     }
 }
 
@@ -285,4 +334,18 @@ fn invalid_request(message: String) -> UpdateWorkspaceError {
     UpdateWorkspaceError::Modeled(UpdateWorkspaceErrorModeled::InvalidRequestException(
         InvalidRequestException { message },
     ))
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the workspace that request
+/// updated, so `resourceId`/`resourceArn` name it — the workspace the caller has
+/// to look at.
+fn token_spent(workspace_name: &str, resource_arn: String) -> UpdateWorkspaceError {
+    UpdateWorkspaceError::Modeled(
+        UpdateWorkspaceErrorModeled::ConflictingOperationException(ConflictingOperationException {
+            message: crate::state::already_using_message("workspace", "clientToken"),
+            resource_id: workspace_name.to_string(),
+            resource_arn,
+        }),
+    )
 }

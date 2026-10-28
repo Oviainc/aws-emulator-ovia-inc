@@ -1750,18 +1750,6 @@ pub struct WorkspaceRecord {
     /// The `WorkspaceState` this workspace reports until [`Self::active_at`]
     /// falls due.
     pub settling_state: String,
-    /// The `clientToken` of the create that made this workspace, if it carried
-    /// one, so a retry of that same create replays its answer rather than
-    /// colliding with the workspace it already made.
-    pub client_token: Option<String>,
-    /// The `clientToken` of the last accepted UPDATE, for the same reason: a
-    /// retry carrying it "succeeds without performing any further actions".
-    ///
-    /// Only the LAST one is kept, so a retry of an update another accepted
-    /// update has since superseded is treated as a fresh request. The retry a
-    /// client actually makes is of its most recent call, which is the one this
-    /// recognises.
-    pub update_token: Option<String>,
     pub tags: HashMap<String, String>,
 }
 
@@ -1793,12 +1781,10 @@ impl WorkspaceRecord {
         &mut self,
         description: Option<String>,
         encryption: WorkspaceEncryptionConfiguration,
-        client_token: Option<String>,
         now: SystemTime,
     ) {
         self.description = description;
         self.encryption = encryption;
-        self.update_token = client_token;
         self.last_update_date = now;
         self.settling_state = STATE_UPDATING.to_string();
         self.active_at = now + ACTIVATION_DELAY;
@@ -2481,10 +2467,6 @@ pub struct PipelineRecord {
     /// due: [`STATE_CREATING`] for a freshly created pipeline, [`STATE_UPDATING`]
     /// while a mutating call it already accepted settles.
     pub settling_state: String,
-    /// The `clientToken` of the create that made this pipeline, if it carried
-    /// one, so a retry of that same create replays its answer rather than
-    /// colliding with the pipeline it already made.
-    pub client_token: Option<String>,
     pub tags: HashMap<String, String>,
 }
 
@@ -2783,10 +2765,6 @@ pub struct TaskRecord {
     /// due: [`STATE_CREATING`] for a freshly created task, [`STATE_UPDATING`]
     /// while a mutating call it already accepted settles.
     pub settling_state: String,
-    /// The `clientToken` of the create that made this task, if it carried one,
-    /// so a retry of that same create replays its answer rather than colliding
-    /// with the task it already made.
-    pub client_token: Option<String>,
     pub tags: HashMap<String, String>,
 }
 
@@ -9250,6 +9228,96 @@ pub fn image_file_fingerprint(file: Option<&ImageFile>) -> String {
             let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(&file.data);
             format!("{}:{}", file.r#type, ::hex::encode(digest))
         }
+    }
+}
+
+/// A canonical rendering of a string MAP a request carried — the environment
+/// variables a pipeline, a compute node or a task declares — for the
+/// [`request_fingerprint`] of that request.
+///
+/// A map has no order of its own, so its pairs go in SORTED by key: a retry of
+/// one call has to render identically to it whatever order either request's map
+/// happens to iterate in. Shared by every operation that takes one, so one map
+/// renders one way.
+pub fn string_map_fingerprint(map: Option<&HashMap<String, String>>) -> String {
+    match map {
+        None => FINGERPRINT_ABSENT.to_string(),
+        Some(map) => {
+            let mut pairs: Vec<(&String, &String)> = map.iter().collect();
+            pairs.sort_by_key(|(key, _)| *key);
+            format!("{pairs:?}")
+        }
+    }
+}
+
+/// A canonical rendering of the `computations` list a request carried, for the
+/// [`request_fingerprint`] of that request.
+///
+/// The list keeps the ORDER the request stated it in — a list is ordered, so two
+/// orderings are two requests — while each node's own environment variables go
+/// in through [`string_map_fingerprint`], because a map has no order of its own.
+pub fn compute_nodes_fingerprint(nodes: &[ComputeNode]) -> String {
+    nodes
+        .iter()
+        .map(|node| {
+            format!(
+                "{:?}/{:?}/{:?}/{}",
+                node.compute_node_name,
+                node.task_name,
+                node.depends_on,
+                string_map_fingerprint(node.environment_variables.as_ref()),
+            )
+        })
+        .collect::<Vec<String>>()
+        .join(",")
+}
+
+/// A canonical rendering of a `taskConfiguration` a request carried, for the
+/// [`request_fingerprint`] of that request.
+///
+/// Every member but the environment variables renders through
+/// [`std::fmt::Debug`]; those go in through [`string_map_fingerprint`], because
+/// a map has no order of its own. Shared by every operation that takes one, so
+/// one configuration renders one way.
+pub fn task_configuration_fingerprint(configuration: &TaskConfiguration) -> String {
+    match configuration {
+        TaskConfiguration::containerTaskConfiguration(container) => format!(
+            "containerTaskConfiguration({:?},{:?},{:?},{:?},{:?},{:?},{:?},{:?},{})",
+            container.ecr_uri,
+            container.task_execution_role,
+            container.processing_type,
+            container.processing_unit,
+            container.ephemeral_storage_configuration,
+            container.command,
+            container.timeout_seconds,
+            container.mounts,
+            string_map_fingerprint(container.environment_variables.as_ref()),
+        ),
+    }
+}
+
+/// How a resource addressed by `(workspaceName, name)` — a pipeline, a task —
+/// is NAMED in the idempotency registry, which remembers one string per spent
+/// token: the resource's own name is unique only within its workspace, so the
+/// workspace goes in beside it.
+///
+/// Both names target shapes bounded by `^[a-zA-Z0-9_-]+$`, so the `/` between
+/// them occurs in neither and one rendering reads back as exactly one pair.
+pub fn workspace_scoped_token_resource(workspace_name: &str, resource_name: &str) -> String {
+    format!("{workspace_name}/{resource_name}")
+}
+
+/// The `(workspaceName, name)` pair a [`workspace_scoped_token_resource`]
+/// rendering names — the key the resource is stored under.
+///
+/// A string carrying no separator names no workspace, so it resolves to no
+/// stored resource while still naming what the registry remembers.
+pub fn workspace_scoped_token_key(resource: &str) -> (String, String) {
+    match resource.split_once('/') {
+        Some((workspace_name, resource_name)) => {
+            (workspace_name.to_string(), resource_name.to_string())
+        }
+        None => (String::new(), resource.to_string()),
     }
 }
 
