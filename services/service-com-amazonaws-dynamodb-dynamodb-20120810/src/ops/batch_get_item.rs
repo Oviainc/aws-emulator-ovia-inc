@@ -255,6 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(lift(crate::state::too_many_batch_items("BatchGetItem")));
         }
         for keys in input.request_items.values() {
+            // Every token one table's entry DEFINES must be one its projection uses.
+            crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
+                .check_all_referenced(&[keys.projection_expression.as_deref()])
+                .map_err(lift)?;
             if keys.projection_expression.is_some() {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(
                     "BatchGetItem with ProjectionExpression",

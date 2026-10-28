@@ -224,8 +224,8 @@ fn cases() -> Vec<Case> {
             }),
         },
         Case {
-            // The shortest `Service`, `Environment` and `FilePath` the modelled
-            // `length 1..255` / `length 1..1024` admit.
+            // The shortest `Service`, `Environment`, `FilePath` and `ClassName` the modelled
+            // `length 1..255` / `length 1..1024` / `length 1..128` admit.
             label: "PROBE, shortest service, environment and file path the model admits",
             request: json!({
                 "Service": "a",
@@ -234,6 +234,7 @@ fn cases() -> Vec<Case> {
                 "InstrumentationType": PROBE,
                 "Location": { "CodeLocation": {
                     "Language": "Java",
+                    "ClassName": "d",
                     "FilePath": "c"
                 }},
                 "CaptureConfiguration": minimal_capture()
@@ -442,6 +443,7 @@ async fn a_get_on_an_empty_store_is_not_found() {
             "by a code location",
             json!({ "CodeLocation": {
                 "Language": "Java",
+                "ClassName": "com.example.CartService",
                 "FilePath": "src/main/java/com/example/CartService.java",
                 "LineNumber": 142
             }}),
@@ -489,6 +491,7 @@ async fn a_configuration_whose_expiry_has_passed_is_no_longer_served() {
     let environment = "ec2:production";
     let location = json!({
         "Language": "Java",
+        "ClassName": "com.example.CartService",
         "FilePath": "src/main/java/com/example/CartService.java",
         "LineNumber": 142
     });

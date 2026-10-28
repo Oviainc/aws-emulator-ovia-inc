@@ -360,8 +360,8 @@ type RefusalCase = (&'static str, Vec<(&'static str, &'static str)>, bool);
 async fn the_cluster_lifecycle_is_consistent_across_calls() {
     let emulator = Emulator::new();
 
-    // CREATE — the record is minted in `creating`, with the endpoint and the
-    // creation time, and the password is nowhere on the wire.
+    // CREATE — the record is minted in `creating`, with the creation time, no
+    // endpoint yet, and the password nowhere on the wire.
     let created = emulator
         .call(
             "CreateCluster",
@@ -391,24 +391,26 @@ async fn the_cluster_lifecycle_is_consistent_across_calls() {
         "case create demo-cluster: expected ClusterStatus=creating, got {:?}",
         created.text("ClusterStatus")
     );
+    // A cluster still being provisioned publishes NO endpoint: its address and
+    // port appear only once it is serving, which is what stops a client that
+    // polls for one from dialling a cluster that is not up.
     assert_eq!(
-        created.text("Port").as_deref(),
-        Some("5439"),
-        "case create demo-cluster: expected the default port 5439, got {:?}",
+        created.text("Port"),
+        None,
+        "case create demo-cluster: expected no endpoint port while creating, got {:?}",
         created.text("Port")
+    );
+    assert_eq!(
+        created.text("Address"),
+        None,
+        "case create demo-cluster: expected no endpoint address while creating, got {:?}",
+        created.text("Address")
     );
     assert_eq!(
         created.text("DBName").as_deref(),
         Some("dev"),
         "case create demo-cluster: expected the default DBName dev, got {:?}",
         created.text("DBName")
-    );
-    let address = created
-        .text("Address")
-        .expect("case create demo-cluster: the response carries an endpoint address");
-    assert!(
-        address.starts_with("demo-cluster.") && address.ends_with(".redshift.amazonaws.com"),
-        "case create demo-cluster: expected a Redshift endpoint host for the identifier, got {address:?}"
     );
     assert!(
         !created.body.contains("Passw0rd"),
@@ -432,6 +434,9 @@ async fn the_cluster_lifecycle_is_consistent_across_calls() {
     );
 
     // DESCRIBE — the stored record comes back with the values create persisted.
+    // Past the provisioning span, so the cluster is serving and publishes the
+    // endpoint a client connects to.
+    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
     let described = emulator
         .call(
             "DescribeClusters",
@@ -457,11 +462,18 @@ async fn the_cluster_lifecycle_is_consistent_across_calls() {
             described.text(member)
         );
     }
+    let address = described
+        .text("Address")
+        .expect("case describe demo-cluster: an available cluster publishes its endpoint");
+    assert!(
+        address.starts_with("demo-cluster.") && address.ends_with(".redshift.amazonaws.com"),
+        "case describe demo-cluster: expected a Redshift endpoint host for the identifier, got {address:?}"
+    );
     assert_eq!(
-        described.text("Address").as_deref(),
-        Some(address.as_str()),
-        "case describe demo-cluster: expected the same endpoint address create reported, got {:?}",
-        described.text("Address")
+        described.text("Port").as_deref(),
+        Some("5439"),
+        "case describe demo-cluster: expected the default port 5439, got {:?}",
+        described.text("Port")
     );
 
     // MODIFY — the mutation persists and a later describe shows it.
@@ -748,7 +760,7 @@ async fn the_cluster_type_and_the_node_count_must_describe_one_another() {
             }
             None => assert_eq!(
                 (answer.status, answer.error_code()),
-                (400, Some("ValidationException".to_string())),
+                (400, Some("InvalidParameterValue".to_string())),
                 "case {case}: expected a 400 refusal, got {} / {:?} with body {}",
                 answer.status,
                 answer.error_code(),
@@ -807,7 +819,7 @@ async fn the_cluster_type_and_the_node_count_must_describe_one_another() {
         .await;
     assert_eq!(
         (back_to_multi.status, back_to_multi.error_code()),
-        (400, Some("ValidationException".to_string())),
+        (400, Some("InvalidParameterValue".to_string())),
         "case modify to multi-node without a count: expected a 400 refusal, got {} / {:?}",
         back_to_multi.status,
         back_to_multi.error_code()
@@ -1495,9 +1507,15 @@ async fn a_rename_re_keys_the_cluster_and_keeps_its_namespace() {
     let namespace = created
         .text("ClusterNamespaceArn")
         .expect("case create: the cluster reports a namespace ARN");
-    let original_address = created
+    // The endpoint is published once the cluster is serving, so the hostname a
+    // rename moves is read past the provisioning span.
+    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
+    let serving = emulator
+        .call("DescribeClusters", &[("ClusterIdentifier", "rename-me")])
+        .await;
+    let original_address = serving
         .text("Address")
-        .expect("case create: the cluster reports an endpoint address");
+        .expect("case create: an available cluster reports an endpoint address");
 
     let taken = emulator.create_minimal("already-there").await;
     assert_eq!(taken.status, 200, "case create collision target: {}", taken.body);

@@ -41,7 +41,7 @@ const NOT_FOUND: &str = "EntityNotFoundException";
 const LIMIT_EXCEEDED: &str = "ResourceNumberLimitExceededException";
 
 /// Register the job the triggers below name, so their actions resolve.
-async fn register_job(router: &MultiServiceRouter) {
+pub async fn register_job(router: &MultiServiceRouter) {
     ok(
         router,
         "CreateJob",
@@ -56,7 +56,7 @@ async fn register_job(router: &MultiServiceRouter) {
 
 /// Register a workflow under `name` with the default run properties `defaults`, and bind an
 /// on-demand entry point to it so runs of it can be started.
-async fn register_workflow(router: &MultiServiceRouter, name: &str, defaults: &Value) {
+pub async fn register_workflow(router: &MultiServiceRouter, name: &str, defaults: &Value) {
     let mut create = json!({ "Name": name });
     if !defaults.is_null() {
         create["DefaultRunProperties"] = defaults.clone();
@@ -76,7 +76,7 @@ async fn register_workflow(router: &MultiServiceRouter, name: &str, defaults: &V
 }
 
 /// Start a run of `workflow` with the run properties `properties`, answering its `RunId`.
-async fn start_run(router: &MultiServiceRouter, workflow: &str, properties: &Value) -> String {
+pub async fn start_run(router: &MultiServiceRouter, workflow: &str, properties: &Value) -> String {
     let mut start = json!({ "Name": workflow });
     if !properties.is_null() {
         start["RunProperties"] = properties.clone();
@@ -91,7 +91,7 @@ async fn start_run(router: &MultiServiceRouter, workflow: &str, properties: &Val
 
 /// The properties `GetWorkflowRunProperties` reports for one run, with an absent map read as
 /// the empty one awsJson may omit.
-async fn get_properties(router: &MultiServiceRouter, workflow: &str, run_id: &str) -> Value {
+pub async fn get_properties(router: &MultiServiceRouter, workflow: &str, run_id: &str) -> Value {
     let body = ok(
         router,
         "GetWorkflowRunProperties",

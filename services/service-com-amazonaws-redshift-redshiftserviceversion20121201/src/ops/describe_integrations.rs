@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIntegrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIntegrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIntegrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's zero-ETL integrations, in creation order: the ONE the
+//! `IntegrationArn` names, or every one when it names none, narrowed by the
+//! request's `Filters` and paged through the service's `MaxRecords` window and
+//! `Marker` cursor. An ARN that names no integration is refused with
+//! `IntegrationNotFoundFault` rather than reported as an empty page.
+//!
+//! Each filter selects the integrations whose own value is one of the filter's
+//! `Values` (the published filter names are `integration-arn`, `source-arn`,
+//! `source-types` and `status`, from
+//! `smithy_query(query="shape", shape="DescribeIntegrationsFilterName")`), and
+//! an integration must satisfy EVERY filter the request carries.
 //!
 //! ## Shape of an operation
 //!
@@ -95,11 +98,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeIntegrationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeIntegrations")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeIntegrations",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeIntegrationsErrorModeled {
     IntegrationNotFoundFault(IntegrationNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,20 +158,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIntegrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIntegrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIntegrations"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeIntegrationsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The only write a read makes: the `creating` / `modifying` ->
+        // `active` transitions the clock already owes.
+        store.settle(::std::time::Instant::now());
+
+        // The integrations this request reports: the ONE the ARN names, or every
+        // one the account holds when it names none. ONE lookup decides both, so
+        // the refusal and the selection can never disagree — an ARN that names
+        // nothing is a refusal, not an empty report.
+        let selected: Vec<&CreateIntegrationOutput> = match input.integration_arn.as_deref() {
+            Some(requested) => match store.integration(requested) {
+                Some(stored) => vec![&stored.integration],
+                None => {
+                    return Err(DescribeIntegrationsErrorModeled::IntegrationNotFoundFault(
+                        IntegrationNotFoundFault {
+                            message: Some(st::integration_not_found_message(requested)),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => store
+                .integrations
+                .iter()
+                .map(|stored| &stored.integration)
+                .collect(),
+        };
+
+        // Each filter names ONE attribute of an integration and the values it
+        // may have, so an integration passes a filter when its own value is one
+        // of them and passes the request when it passes every filter.
+        let filters = input.filters.clone().unwrap_or_default();
+        let matched: Vec<&CreateIntegrationOutput> = selected
+            .into_iter()
+            .filter(|integration| {
+                filters.iter().all(|filter| {
+                    filtered_value(integration, &filter.name)
+                        .is_some_and(|value| filter.values.contains(&value))
+                })
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeIntegrationsOutput {
+            integrations: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|integration| (*integration).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
+    }
+}
+
+/// The value an integration carries for the filter `name`, or `None` when it
+/// carries none — which is what makes such an integration fail that filter.
+///
+/// The names are the published ones (`smithy_query(query="shape",
+/// shape="DescribeIntegrationsFilterName")` — `integration-arn | source-arn |
+/// source-types | status`); the boundary validator has already refused any other
+/// value, so a name outside the set never reaches here. `source-types` is the
+/// SERVICE the source belongs to, which an ARN carries as its second segment
+/// (`arn:aws:s3:::bucket` is an `s3` source).
+fn filtered_value(integration: &CreateIntegrationOutput, name: &str) -> Option<String> {
+    match name {
+        "integration-arn" => integration.integration_arn.clone(),
+        "source-arn" => integration.source_arn.clone(),
+        "source-types" => integration
+            .source_arn
+            .as_deref()
+            .and_then(|arn| arn.split(':').nth(2))
+            .map(str::to_string),
+        "status" => integration.status.clone(),
+        _ => None,
     }
 }

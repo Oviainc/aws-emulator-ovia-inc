@@ -320,8 +320,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // And the documented domain of a custom schedule's creation interval:
-        // `CreateRule$Interval`'s supported value set, which its
-        // `@range(min: 1)` admits every positive integer past.
+        // `CreateRule$Interval`'s supported value set, which the boundary walk
+        // does not judge for this member at all (`skip_validation` on
+        // `CreateRule`, so the interval the service materializes for a
+        // cron-driven rule reaches the handler).
         if let Some((schedule, interval)) =
             crate::state::schedule_with_unsupported_create_interval(input.policy_details.as_ref())
         {

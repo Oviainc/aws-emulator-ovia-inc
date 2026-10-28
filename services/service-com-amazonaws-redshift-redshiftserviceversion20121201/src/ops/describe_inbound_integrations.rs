@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInboundIntegrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInboundIntegrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInboundIntegrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the integrations whose TARGET is a namespace of this account, in
+//! creation order — the same integrations `DescribeIntegrations` reports, seen
+//! from the data warehouse that receives the data (see
+//! `crate::state::StoredIntegration::inbound`) — paged through the service's
+//! `MaxRecords` window and `Marker` cursor. An `IntegrationArn` that names no
+//! integration answers `IntegrationNotFoundFault`, and a `TargetArn` that names
+//! no namespace this account holds answers `InvalidNamespaceFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -101,12 +100,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeInboundIntegrationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeInboundIntegrations")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeInboundIntegrations",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeInboundIntegrationsErrorModeled {
     IntegrationNotFoundFault(IntegrationNotFoundFault),
     InvalidNamespaceFault(InvalidNamespaceFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,20 +161,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInboundIntegrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInboundIntegrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInboundIntegrations"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeInboundIntegrationsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The only write a read makes: the `creating` / `modifying` ->
+        // `active` transitions the clock already owes.
+        store.settle(::std::time::Instant::now());
+
+        // The integrations this request reports: the ONE the ARN names, or every
+        // one whose target this account holds when it names none. ONE lookup
+        // decides both, so the refusal and the selection cannot disagree.
+        let selected: Vec<InboundIntegration> = match input.integration_arn.as_deref() {
+            Some(requested) => match store.integration(requested) {
+                Some(stored) => vec![stored.inbound()],
+                None => {
+                    return Err(
+                        DescribeInboundIntegrationsErrorModeled::IntegrationNotFoundFault(
+                            IntegrationNotFoundFault {
+                                message: Some(st::integration_not_found_message(requested)),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => store
+                .integrations
+                .iter()
+                .map(st::StoredIntegration::inbound)
+                .collect(),
+        };
+
+        // "The Amazon Resource Name (ARN) of the target of an inbound
+        // integration": a namespace this account does not hold is no namespace
+        // at all, so it is refused rather than reported as an empty page.
+        let matched: Vec<InboundIntegration> = match input.target_arn.as_deref() {
+            Some(target) => {
+                if store.cluster_with_namespace_arn(target).is_none() {
+                    return Err(
+                        DescribeInboundIntegrationsErrorModeled::InvalidNamespaceFault(
+                            InvalidNamespaceFault {
+                                message: Some(format!("Namespace not found: {target}")),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                selected
+                    .into_iter()
+                    .filter(|integration| integration.target_arn.as_deref() == Some(target))
+                    .collect()
+            }
+            None => selected,
+        };
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeInboundIntegrationsOutput {
+            inbound_integrations: Some(matched[start..end].to_vec()),
+            marker: next_marker,
+        })
     }
 }

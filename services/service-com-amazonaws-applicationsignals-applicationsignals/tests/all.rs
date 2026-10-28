@@ -21,6 +21,8 @@ mod batch_instrumentation_configuration_deletion;
 mod budget_reports;
 #[path = "all/change_event_attribution.rs"]
 mod change_event_attribution;
+#[path = "all/code_location_class_name.rs"]
+mod code_location_class_name;
 #[path = "all/discovered_metric_references.rs"]
 mod discovered_metric_references;
 #[path = "all/discovery_enablement.rs"]

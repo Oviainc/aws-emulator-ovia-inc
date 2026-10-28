@@ -360,6 +360,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 action.expression_attribute_names(),
                 action.expression_attribute_values(),
             );
+            // Every token this element DEFINES must be one of its own expressions
+            // uses: an unused entry of either substitution table makes the whole
+            // request invalid.
+            substitutions
+                .check_all_referenced(&[
+                    action.condition_expression(),
+                    action.update_expression(),
+                ])
+                .map_err(lift)?;
             // A value a condition compares against, or one an update writes, is held to
             // the same limits a stored value is: the documented nesting depth and this
             // emulator's ceiling on a collection's members.

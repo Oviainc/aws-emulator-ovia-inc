@@ -298,6 +298,12 @@ pub const RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND: &str = "RSLVR-00800";
 /// caller names but cannot address. See [`resource_not_found_message`].
 pub const RSLVR_CODE_RESOURCE_NOT_FOUND: &str = "RSLVR-02025";
 
+/// The service error code Route 53 Resolver reports for an IAM policy document
+/// it will not attach to a resource, carried for the same reason as
+/// [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP status and the error shape alone
+/// do not tell this fault apart from the others that share them.
+pub const RSLVR_CODE_INVALID_IAM_POLICY: &str = "RSLVR-02035";
+
 /// The Route 53 Resolver service error code reported when a caller asks for a
 /// query logging configuration's resource policy and there is no policy to
 /// read.
@@ -1010,10 +1016,34 @@ pub fn invalid_policy_document(fault: &str) -> InvalidPolicyDocument {
     }
 }
 
+/// The `ValidationException` a DNS Firewall rule-group policy write answers for
+/// an IAM policy document the service will not attach.
+///
+/// `PutFirewallRuleGroupPolicy` models no `InvalidPolicyDocument`
+/// (`smithy_query(query="operation",operation="PutFirewallRuleGroupPolicy")`
+/// lists `ValidationException` instead), so the faults the Resolver rule policy
+/// reports through that shape are reported here through the exception this
+/// operation does model.
+///
+/// The sentence carries the service's code for an invalid IAM policy
+/// ([`RSLVR_CODE_INVALID_IAM_POLICY`]) and echoes the document it was handed, so
+/// the caller sees exactly which document was refused. WHY it was refused is not
+/// part of it, so one sentence covers a document outside the policy grammar and
+/// one that shares the resource with nobody but its owner.
+pub fn invalid_iam_policy(policy: &str) -> ValidationException {
+    ValidationException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_INVALID_IAM_POLICY,
+            &format!("The specified IAM policy isn't valid: \"{policy}\""),
+        )),
+    }
+}
+
 /// The policy document a resource with no stored resource policy reports: the
 /// empty JSON object, a document that states no statement and so shares the
-/// resource with nobody. Inside `ResolverRulePolicy`'s modelled length
-/// (0..30000, `smithy_query(query="shape",shape="ResolverRulePolicy")`).
+/// resource with nobody. Inside the modelled length of both members that report
+/// one — `ResolverRulePolicy` and `FirewallRuleGroupPolicy`, each 0..30000
+/// (`smithy_query(query="shape",shape="ResolverRulePolicy,FirewallRuleGroupPolicy")`).
 pub const EMPTY_POLICY_DOCUMENT: &str = "{}";
 
 /// Why `policy` is not a policy document, or `None` when it is one.
@@ -1589,6 +1619,16 @@ pub struct FirewallRuleGroupRecord {
     /// with no transition in flight (one nobody has changed since it was
     /// created empty).
     pub settled_at: Option<Instant>,
+    /// The resource policy attached to this rule group, as the last
+    /// `PutFirewallRuleGroupPolicy` for it wrote it, and `None` while no policy
+    /// has been written — the same relation [`ResolverRuleRecord`] keeps with
+    /// its own policy.
+    ///
+    /// It is held ON the record, and not in a map beside it, because a resource
+    /// policy belongs to the resource it shares: a read of the group's policy
+    /// resolves through the same record every other rule-group operation reads,
+    /// and a group the store no longer holds has no policy to report.
+    pub firewall_rule_group_policy: Option<String>,
 }
 
 impl FirewallRuleGroupRecord {
@@ -3598,6 +3638,31 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// refuses answers `LimitExceededException` and writes nothing.
     pub fn can_store_another_firewall_rule_group(&self) -> bool {
         self.firewall_rule_groups.len() < MAX_STORED_FIREWALL_RULE_GROUPS
+    }
+
+    /// The stored firewall rule group `arn` names, if the store holds one.
+    ///
+    /// The rule-group policy operations address a group by its `Arn` and not by
+    /// its `FirewallRuleGroupId`, so they resolve it through this — the same
+    /// lookup [`Self::rule_by_arn`] is for a Resolver rule. The whole ARN is
+    /// compared, so an ARN naming another account, another region or another
+    /// resource type matches no group. The scan is over a store bounded by
+    /// [`MAX_STORED_FIREWALL_RULE_GROUPS`].
+    pub fn firewall_rule_group_by_arn(&self, arn: &str) -> Option<&FirewallRuleGroupRecord> {
+        self.firewall_rule_groups
+            .values()
+            .find(|record| record.arn == arn)
+    }
+
+    /// The same lookup as [`Self::firewall_rule_group_by_arn`], for the write
+    /// side.
+    pub fn firewall_rule_group_by_arn_mut(
+        &mut self,
+        arn: &str,
+    ) -> Option<&mut FirewallRuleGroupRecord> {
+        self.firewall_rule_groups
+            .values_mut()
+            .find(|record| record.arn == arn)
     }
 
     /// Whether one more query logging configuration may be stored, i.e. the

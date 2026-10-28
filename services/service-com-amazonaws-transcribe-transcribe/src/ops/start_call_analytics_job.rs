@@ -392,10 +392,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The job quota is a CONCURRENCY one, per account per Region as it is for every
-        // job family here: only the jobs this REGION is still working on count against
+        // job family here: only the jobs this REGION is actually working on count
+        // against
         // `crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS`, and a job that has
         // reached a terminal status has released its slot (see
-        // [`crate::state::jobs_in_flight`]).
+        // [`crate::state::jobs_being_processed`]).
         //
         // Reaching it is not by itself a refusal for this family: "Job queuing is
         // available for Call Analytics jobs. If you pass a DataAccessRoleArn in your

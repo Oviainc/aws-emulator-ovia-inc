@@ -174,10 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The 50-tag ceiling applies to the resource's ACCUMULATED map, not just to
-        // one request's `TagMap` (which the model already bounds at 1..50). Count the
-        // merge before applying it, so repeated calls with fresh keys are refused at
-        // the limit instead of growing the record without bound. Nothing is written on
-        // the refusal path.
+        // one request's `TagMap` (which the model already bounds at 1..50, refused
+        // before dispatch by `crate::service::tag_contract`). Count the merge before
+        // applying it, so repeated calls with fresh keys are refused at the limit
+        // instead of growing the record without bound. Nothing is written on the
+        // refusal path, and the refusal is the SAME sentence the modelled bound
+        // earns: one ceiling, one wording, and it echoes nothing the request carried.
         let merged_size = record
             .tags
             .keys()
@@ -187,11 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if merged_size > MAX_TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!(
-                        "Tagging {} would give it {merged_size} tags, more than the \
-                         limit of {MAX_TAGS_PER_RESOURCE} tags per resource",
-                        input.resource_arn
-                    )),
+                    message: Some(crate::state::tag_ceiling_message(MAX_TAGS_PER_RESOURCE)),
                 },
             )
             .into());

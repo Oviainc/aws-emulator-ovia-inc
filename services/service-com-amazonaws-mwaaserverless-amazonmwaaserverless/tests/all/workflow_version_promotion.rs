@@ -19,12 +19,17 @@
 //! seeds them the way the teardown and run-lifecycle suites seed their deadlines rather
 //! than racing the wall clock.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    mint_revision_id, Workflow, RUN_TYPE_ON_DEMAND, TRIGGER_MODE_SCHEDULED,
+    mint_revision_id, Workflow,
 };
 
+use crate::workflow_definition_snapshot::{
+    call, create_bucket, create_workflow_with_mode, definition_router_on, stage,
+    with_stored_workflow, BUCKET,
+};
 use crate::workflow_deletion_teardown::{with_workflow, workflow_with_versions};
 use crate::workflow_lifecycle::{role_arn, Harness};
 
@@ -66,8 +71,8 @@ fn seed_version_clock(harness: &Harness, arn: &str, clock: StoredClock) {
 
 /// The instant the store says this workflow's trigger fires next, and `None` for a
 /// workflow the service does not execute on its own.
-fn trigger(harness: &Harness, arn: &str) -> Option<SystemTime> {
-    with_workflow(harness, arn, |workflow: &mut Workflow| {
+fn trigger(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> Option<SystemTime> {
+    with_stored_workflow(engine, arn, |workflow: &mut Workflow| {
         workflow.next_scheduled_run_at
     })
 }
@@ -289,72 +294,75 @@ async fn exactly_one_version_is_latest_after_a_version_scoped_delete() {
     }
 }
 
-/// One row of the trigger table: the trigger mode the latest version asks for, the one
-/// the version appended before it asked for, and whether the service still executes the
-/// workflow on its own once the latest version has been deleted.
+/// One row of the trigger table: whether the definition the EARLIER version snapshotted
+/// declares a schedule, whether the one the LATEST version snapshotted does, and whether
+/// the service still executes the workflow on its own once the latest version has been
+/// deleted — which is the earlier version's answer, because the promoted version's
+/// definition is the one whose schedule is in force.
 struct TriggerRow {
     case: &'static str,
-    earlier_mode: &'static str,
-    latest_mode: &'static str,
-    automated_after_delete: bool,
+    earlier_declares: bool,
+    latest_declares: bool,
 }
 
 const TRIGGER_ROWS: &[TriggerRow] = &[
     TriggerRow {
-        case: "automated latest deleted over a caller-started version",
-        earlier_mode: RUN_TYPE_ON_DEMAND,
-        latest_mode: TRIGGER_MODE_SCHEDULED,
-        automated_after_delete: false,
+        case: "a version declaring a schedule deleted over one declaring none",
+        earlier_declares: false,
+        latest_declares: true,
     },
     TriggerRow {
-        case: "caller-started latest deleted over an automated version",
-        earlier_mode: TRIGGER_MODE_SCHEDULED,
-        latest_mode: RUN_TYPE_ON_DEMAND,
-        automated_after_delete: true,
+        case: "a version declaring none deleted over one declaring a schedule",
+        earlier_declares: true,
+        latest_declares: false,
     },
     TriggerRow {
-        case: "automated latest deleted over an automated version",
-        earlier_mode: TRIGGER_MODE_SCHEDULED,
-        latest_mode: TRIGGER_MODE_SCHEDULED,
-        automated_after_delete: true,
+        case: "a version declaring a schedule deleted over another declaring one",
+        earlier_declares: true,
+        latest_declares: true,
+    },
+    TriggerRow {
+        case: "neither version declaring a schedule",
+        earlier_declares: false,
+        latest_declares: false,
     },
 ];
+
+/// A definition for a row: one declaring a DAG-level cron schedule, or one declaring
+/// none.
+fn definition(declares: bool) -> &'static str {
+    if declares {
+        "schedule: \"0 2 * * *\"\ntasks:\n  - id: extract\n"
+    } else {
+        "tasks:\n  - id: extract\n"
+    }
+}
 
 #[tokio::test]
 async fn the_promoted_version_puts_its_own_trigger_in_force() {
     for row in TRIGGER_ROWS {
         let case = row.case;
-        let harness = Harness::new("us-west-2");
-        let (status, created) = harness
-            .call(
-                "CreateWorkflow",
-                serde_json::json!({
-                    "Name": "promotedTrigger",
-                    "DefinitionS3Location": {"Bucket": "defs", "ObjectKey": "dags/v1.yaml"},
-                    "RoleArn": role_arn(),
-                    "TriggerMode": row.earlier_mode,
-                }),
-            )
-            .await;
-        assert_eq!(
-            status, 200,
-            "setup {case:?}: expected CreateWorkflow to succeed, got {status} {created:?}"
-        );
-        let arn = created["WorkflowArn"]
-            .as_str()
-            .expect("setup: a created workflow has an ARN")
-            .to_string();
-        let (status, updated) = harness
-            .call(
-                "UpdateWorkflow",
-                serde_json::json!({
-                    "WorkflowArn": arn,
-                    "DefinitionS3Location": {"Bucket": "defs", "ObjectKey": "dags/v2.yaml"},
-                    "RoleArn": role_arn(),
-                    "TriggerMode": row.latest_mode,
-                }),
-            )
-            .await;
+        // The trigger is configured from the definition each version snapshotted, so this
+        // suite's workflows are created through the router that also serves the emulated
+        // Amazon S3 the definitions live in.
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = definition_router_on(Arc::clone(&engine));
+        create_bucket(&router).await;
+        let key = "dags/promoted.yaml";
+        stage(&router, key, definition(row.earlier_declares).as_bytes()).await;
+        let arn = create_workflow_with_mode(&router, "promotedTrigger", key, None).await;
+
+        stage(&router, key, definition(row.latest_declares).as_bytes()).await;
+        let (status, updated) = call(
+            &router,
+            "UpdateWorkflow",
+            serde_json::json!({
+                "WorkflowArn": arn,
+                "DefinitionS3Location": {"Bucket": BUCKET, "ObjectKey": key},
+                "RoleArn": role_arn(),
+            }),
+        )
+        .await;
         assert_eq!(
             status, 200,
             "setup {case:?}: expected UpdateWorkflow to succeed, got {status} {updated:?}"
@@ -364,43 +372,49 @@ async fn the_promoted_version_puts_its_own_trigger_in_force() {
             .expect("setup: an update reports the version it appended")
             .to_string();
         assert_eq!(
-            trigger(&harness, &arn).is_some(),
-            row.latest_mode == TRIGGER_MODE_SCHEDULED,
+            trigger(&engine, &arn).is_some(),
+            row.latest_declares,
             "setup {case:?}: the latest version's trigger is the one in force before the \
-             delete"
+             delete, got {:?}",
+            trigger(&engine, &arn)
         );
 
-        let (status, deleted) = harness
-            .call(
-                "DeleteWorkflow",
-                serde_json::json!({"WorkflowArn": arn, "WorkflowVersion": latest}),
-            )
-            .await;
+        let (status, deleted) = call(
+            &router,
+            "DeleteWorkflow",
+            serde_json::json!({"WorkflowArn": arn, "WorkflowVersion": latest}),
+        )
+        .await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the version-scoped delete to succeed, got {status} \
              {deleted:?}"
         );
         assert_eq!(
-            trigger(&harness, &arn).is_some(),
-            row.automated_after_delete,
+            trigger(&engine, &arn).is_some(),
+            row.earlier_declares,
             "case {case:?}: expected automated execution {} after the promotion, got {:?}",
-            row.automated_after_delete,
-            trigger(&harness, &arn)
+            row.earlier_declares,
+            trigger(&engine, &arn)
         );
-        let (status, fetched) = harness
-            .call("GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
+        let (status, fetched) = call(&router, "GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
             .await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected GetWorkflow to succeed, got {status} {fetched:?}"
         );
         assert_eq!(
-            fetched["TriggerMode"].as_str(),
-            Some(row.earlier_mode),
-            "case {case:?}: expected the promoted version's trigger mode {:?}, got {:?}",
-            row.earlier_mode,
-            fetched["TriggerMode"]
+            fetched["WorkflowDefinition"].as_str(),
+            Some(definition(row.earlier_declares)),
+            "case {case:?}: expected the promoted version's own definition, got {:?}",
+            fetched["WorkflowDefinition"]
+        );
+        assert_eq!(
+            fetched["ScheduleConfiguration"]["CronExpression"].is_string(),
+            row.earlier_declares,
+            "case {case:?}: the promoted version reports the schedule its own definition \
+             declares, got {:?}",
+            fetched["ScheduleConfiguration"]
         );
     }
 }

@@ -405,11 +405,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The job quota is a CONCURRENCY one, per account per Region as it is for every
-        // job family here: only the jobs this REGION is still working on count against
+        // job family here: only the jobs this REGION is actually working on count
+        // against
         // `crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS`, and a job that has
         // reached a terminal status has released its slot (see
-        // [`crate::state::jobs_in_flight`]).
-        if crate::state::jobs_in_flight(&mut store.medical_scribe_jobs, &region, now)
+        // [`crate::state::jobs_being_processed`]; this family's start documents no
+        // queue, so none of its jobs ever waits in one).
+        if crate::state::jobs_being_processed(&mut store.medical_scribe_jobs, &region, now)
             >= crate::state::MAX_CONCURRENT_MEDICAL_SCRIBE_JOBS
         {
             return Err(StartMedicalScribeJobErrorModeled::LimitExceededException(

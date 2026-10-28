@@ -183,12 +183,28 @@ pub fn is_terminal_job_status(status: &str) -> bool {
     status == STATUS_COMPLETED || status == STATUS_FAILED
 }
 
+/// Whether a job in `status` is one the service is WORKING ON: it has neither finished
+/// ([`is_terminal_job_status`]) nor is it merely waiting to be picked up
+/// ([`STATUS_QUEUED`]).
+///
+/// This — not "has not finished" — is what a family's CONCURRENCY ceiling bounds, since
+/// what that ceiling limits is how much work runs at once: the model says so from the
+/// queueing side, where a request past the ceiling waits "until the number of jobs falls
+/// below the concurrent request limit"
+/// (`smithy_query(query="shape", shape="JobExecutionSettings")`), so a job still waiting
+/// for that number to fall cannot itself be part of it. One predicate for every job
+/// family, as [`is_terminal_job_status`] is: `QUEUED` is modelled by each of their status
+/// enums, so none of them may count a waiting job as running.
+pub fn is_processing_job_status(status: &str) -> bool {
+    !is_terminal_job_status(status) && status != STATUS_QUEUED
+}
+
 /// The one lifecycle fact every stored record of this service holds whose status the
 /// CLOCK moves on its own: the transitions that status still has to catch up with.
 ///
 /// One trait rather than one spelling per family, so the rule "materialise what the
 /// clock already owed, then report" is written once ([`record_mut`],
-/// [`materialised_newest_first`], [`jobs_in_flight`]) over any family's store: the
+/// [`materialised_newest_first`], [`jobs_being_processed`]) over any family's store: the
 /// records differ in what a resource IS, not in how a due transition is caught up
 /// with. A family added later reaches those helpers only by implementing this, so it
 /// cannot be served by a lookup or a listing that forgot the clock step.
@@ -282,37 +298,37 @@ pub fn materialised_newest_first<'store, R: ClockedRecord + ListedRecord>(
     newest_first(store, region)
 }
 
-/// How many of `region`'s `jobs` the service is still working on at `now`: the records
-/// whose status is not terminal ([`is_terminal_job_status`]), counted after every
-/// clock-owed transition has been materialised, so a job the clock already finished
-/// is not counted as running.
+/// How many of `region`'s `jobs` the service is actually WORKING ON at `now`: the
+/// records whose status is one it processes in ([`is_processing_job_status`]), counted
+/// after every clock-owed transition has been materialised, so a job the clock already
+/// finished — or already took out of its family's queue — is counted as what it has
+/// become.
 ///
-/// This — not how many records the account holds — is what a job family's ceiling
+/// This — not how many records the account holds, and not how many of them are only
+/// waiting ([`jobs_waiting_in_queue`]) — is what a job family's concurrency ceiling
 /// bounds (see [`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]), so a finished job releases its
-/// slot while staying listable. The ceiling is published per account per REGION, so
-/// only the jobs of the Region the start was signed for are counted.
+/// slot while staying listable and a job still waiting for a slot never held one. The
+/// ceiling is published per account per REGION, so only the jobs of the Region the start
+/// was signed for are counted.
 ///
 /// One spelling for every job family, bounded by the two traits that already state
 /// what it needs of a record — the clock-owed transitions ([`ClockedRecord`]) and the
 /// status ([`ListedRecord`]) — rather than by a third trait of its own: the four job
 /// records differ in what a job IS, not in how its status moves. A family whose model
-/// gives its records no status at all is in flight for nothing.
-pub fn jobs_in_flight<R: ClockedRecord + ListedRecord>(
+/// gives its records no status at all is processing nothing.
+pub fn jobs_being_processed<R: ClockedRecord + ListedRecord>(
     jobs: &mut RegionalStore<R>,
     region: &str,
     now: SystemTime,
 ) -> usize {
-    let mut in_flight = 0;
+    let mut processing = 0;
     for record in jobs.values_in_mut(region) {
         record.materialise_due_transitions(now);
-        if record
-            .status()
-            .is_some_and(|status| !is_terminal_job_status(status))
-        {
-            in_flight += 1;
+        if record.status().is_some_and(is_processing_job_status) {
+            processing += 1;
         }
     }
-    in_flight
+    processing
 }
 
 /// How many of `region`'s `jobs` are only WAITING to be processed at `now`: the records
@@ -320,8 +336,9 @@ pub fn jobs_in_flight<R: ClockedRecord + ListedRecord>(
 /// materialised, so a job the clock has already taken out of the queue is not counted
 /// as waiting.
 ///
-/// A queued job is in flight ([`jobs_in_flight`]) without occupying one of the slots a
-/// family's concurrency ceiling bounds, so for a family whose start documents a queue it
+/// A queued job is unfinished without occupying one of the slots a family's concurrency
+/// ceiling bounds ([`jobs_being_processed`] does not count it), so for a family whose
+/// start documents a queue it
 /// is this count, not that ceiling, that caps how many records one caller can hold
 /// unfinished at once (see [`MAX_QUEUED_TRANSCRIPTION_JOBS`] and
 /// [`MAX_QUEUED_CALL_ANALYTICS_JOBS`]).
@@ -361,7 +378,9 @@ pub enum StartAdmission {
 /// this family's `jobs`.
 ///
 /// The ceiling a start is refused for bounds the jobs of the family the service is
-/// still WORKING ON ([`jobs_in_flight`]), so reaching it is not by itself a refusal:
+/// actually WORKING ON ([`jobs_being_processed`]) — never the ones only waiting in its
+/// queue ([`jobs_waiting_in_queue`]), which hold no slot — so reaching it is not by
+/// itself a refusal:
 /// where a family's start models an opt-in into job queueing, a start carrying it is
 /// placed in a queue until the number of jobs falls below that ceiling, and only a
 /// start without it gets the quota error. `queue` is `Some(depth)` exactly when this
@@ -379,7 +398,7 @@ pub fn admit_start<R: ClockedRecord + ListedRecord>(
     ceiling: usize,
     queue: Option<usize>,
 ) -> StartAdmission {
-    if jobs_in_flight(jobs, region, now) < ceiling {
+    if jobs_being_processed(jobs, region, now) < ceiling {
         return StartAdmission::Process;
     }
     match queue {
@@ -432,7 +451,8 @@ pub fn start_lifecycle(now: SystemTime, queued: bool) -> StartLifecycle {
 /// The most job records of one family this emulator KEEPS for one Region.
 ///
 /// Not a quota and not a refusal: a start is never refused for it. It is the bound on
-/// this process's memory, since the quota above counts only the jobs in flight and so
+/// this process's memory, since the quota above counts only the jobs being processed and
+/// so
 /// cannot cap how many records a caller that keeps starting jobs accumulates; together
 /// with [`MAX_REGIONS`], which caps how many Regions hold job records at all, it bounds
 /// a family's whole store. A
@@ -449,11 +469,13 @@ pub const MAX_RETAINED_JOB_RECORDS: usize = 500;
 /// store is Region-scoped, so one Region's traffic can never evict a job another Region
 /// holds.
 ///
-/// Only a terminal record is ever dropped, so no job in flight and no job a caller
+/// Only a terminal record is ever dropped, so no unfinished job and no job a caller
 /// could still be polling to completion disappears; a record is dropped exactly as a
 /// delete of that job would drop it. With the concurrency quota capping how many jobs
-/// can be in flight at once, the two together bound a family's store for one Region at
-/// [`MAX_RETAINED_JOB_RECORDS`] plus that quota.
+/// can be processed at once and, for a family whose start documents a queue, that
+/// queue's own depth capping how many wait, they together bound a family's store for
+/// one Region at
+/// [`MAX_RETAINED_JOB_RECORDS`] plus those bounds.
 pub fn evict_oldest_finished_jobs<R: ClockedRecord + ListedRecord>(
     jobs: &mut RegionalStore<R>,
     region: &str,
@@ -502,7 +524,7 @@ pub const MEDICAL_SCRIBE_LANGUAGE_CODE: &str = MEDICAL_SCRIBE_LANGUAGE_CODE_VALU
 ///
 /// A CHOSEN figure, not a published one — AWS gives no per-account number for
 /// HealthScribe jobs in the model — applying the same one the other families use. It
-/// bounds the jobs IN FLIGHT, like every other family's
+/// bounds the jobs BEING PROCESSED, like every other family's
 /// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]): a start made while that many jobs of this
 /// family are still running answers the `LimitExceededException` the operation models
 /// for an exceeded quota, and a job that has reached a terminal status releases its
@@ -583,8 +605,9 @@ pub const MAX_LIST_MAX_RESULTS: usize = 100;
 /// `smithy_query(query="shape", shape="LimitExceededException")`); the model says the
 /// same from the other side, since `JobExecutionSettings$AllowDeferredExecution`
 /// queues a request "until the number of jobs falls below the concurrent request
-/// limit". So this figure bounds the jobs the service is still working on
-/// ([`jobs_in_flight`]), never the records an account holds: a job that reached a
+/// limit". So this figure bounds the jobs the service is actually working on
+/// ([`jobs_being_processed`]), never the records an account holds and never the ones
+/// only waiting for a slot: a job that reached a
 /// terminal status releases its slot and stays readable and listable, which is what
 /// makes `ListTranscriptionJobs`' documented `COMPLETED` status filter meaningful.
 pub const MAX_CONCURRENT_TRANSCRIPTION_JOBS: usize = 100;
@@ -612,7 +635,7 @@ pub const MAX_QUEUED_TRANSCRIPTION_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTION_JO
 ///
 /// Amazon Transcribe Medical answers the same `LimitExceededException` for an
 /// exceeded quota, so this family is bounded the same way the non-medical one is
-/// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]): by how many of its jobs are in flight,
+/// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]): by how many of its jobs are being processed,
 /// with a terminal job releasing its slot.
 pub const MAX_CONCURRENT_MEDICAL_TRANSCRIPTION_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTION_JOBS;
 
@@ -626,7 +649,7 @@ pub const FAMILY_MEDICAL_TRANSCRIPTION_JOBS: &str = "medical transcription jobs"
 /// Call Analytics jobs, but it does describe the ceiling this family has as a
 /// concurrency one — a start is queued when an account "exceeds your Concurrent Job
 /// Limit" (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`). So
-/// the same figure the other families use bounds the jobs in flight
+/// the same figure the other families use bounds the jobs being processed
 /// ([`MAX_CONCURRENT_TRANSCRIPTION_JOBS`]), and a terminal job releases its slot.
 pub const MAX_CONCURRENT_CALL_ANALYTICS_JOBS: usize = MAX_CONCURRENT_TRANSCRIPTION_JOBS;
 
