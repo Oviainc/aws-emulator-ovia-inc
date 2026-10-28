@@ -368,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(expiration_date) = input.expiration_date {
                     record.expiration_date = Some(expiration_date);
                 }
-                record.updated_at = now;
+                record.mark_written(now);
                 resource_arn
             }
             None => {
