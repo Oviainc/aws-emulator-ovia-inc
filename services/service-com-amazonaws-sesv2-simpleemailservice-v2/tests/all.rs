@@ -25,6 +25,8 @@ mod account_suppression_attributes;
 mod account_vdm_attributes;
 #[path = "all/boundary_validation_message.rs"]
 mod boundary_validation_message;
+#[path = "all/cloud_watch_dimension_source.rs"]
+mod cloud_watch_dimension_source;
 #[path = "all/configuration_set_event_destination_ceiling.rs"]
 mod configuration_set_event_destination_ceiling;
 #[path = "all/configuration_set_event_destination_deletion.rs"]
@@ -87,6 +89,8 @@ mod metric_data;
 mod multi_region_endpoints;
 #[path = "all/reputation_entities.rs"]
 mod reputation_entities;
+#[path = "all/reputation_entity_policy.rs"]
+mod reputation_entity_policy;
 #[path = "all/request_claim.rs"]
 mod request_claim;
 #[path = "all/resource_tags.rs"]
@@ -99,6 +103,10 @@ mod send_unverified_identity_refusal;
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]
 mod suppressed_destinations;
+#[path = "all/tenant_deletion.rs"]
+mod tenant_deletion;
+#[path = "all/tenant_duplicate_name_refusal.rs"]
+mod tenant_duplicate_name_refusal;
 #[path = "all/tenant_resource_association_removal.rs"]
 mod tenant_resource_association_removal;
 #[path = "all/tenant_resource_associations.rs"]

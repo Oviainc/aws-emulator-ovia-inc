@@ -292,9 +292,9 @@ pub fn ses_resource_of(resource_arn: &str) -> Option<(&str, &str)> {
 ///
 /// Neither the model nor a recording of this surface states the sentence, so it is
 /// this service's own sentence for a named resource it does not hold — the form
-/// [`tenant_not_found`] and [`reputation_entity_not_found`] state for the resources
-/// they name — with the resource written as the ARN the request addressed it by,
-/// which is the only name this operation is given.
+/// [`tenant_not_found`] states for the resource it names — with the resource written
+/// as the ARN the request addressed it by, which is the only name this operation is
+/// given.
 pub fn tagged_resource_not_found(resource_arn: &str) -> String {
     format!("Resource {resource_arn} does not exist.")
 }
@@ -402,14 +402,90 @@ pub fn aggregate_sending_status(customer_managed: &str, aws_ses_managed: &str) -
 /// How this service words the refusal of a reputation entity reference that names no
 /// resource this account holds.
 ///
-/// A reputation entity is not created by a request of its own, so for a write the
-/// reference it carries is invalid input rather than a missing resource of that write's
-/// own making — which is why the writes model `BadRequestException` and no
-/// `NotFoundException` at all. `GetReputationEntity` does model one, and reports the
-/// missing entity with it; the wording is this one either way, so a read and a write
-/// cannot disagree about what was not found.
+/// A reputation entity is not created by a request of its own: it exists only for a
+/// resource this account already owns, so a reference resolving to nothing is a
+/// reference that cannot name an entity AT ALL — invalid input rather than a resource
+/// that happens to be gone. Every operation taking a reference therefore refuses it as
+/// invalid input, with this one sentence, so a read and a write cannot disagree about
+/// what was not found.
+///
+/// The reference is the only variable part, taken verbatim from the request and
+/// delimited with angle brackets the way this service delimits every other resource
+/// name it interpolates (see [`configuration_set_not_found`]); the sentence names the
+/// entity shape rather than a prose rendering of it, and ends without a period.
 pub fn reputation_entity_not_found(reference: &str) -> String {
-    format!("Reputation entity {reference} does not exist.")
+    format!("ReputationEntity <{reference}> does not exist")
+}
+
+/// The account field of an ARN naming a resource Amazon SES itself owns rather than
+/// one of the caller's.
+///
+/// `ReputationEntity$ReputationManagementPolicy` is documented as "an Amazon Web
+/// Services Amazon SES-managed policy": the policy belongs to the service, not to the
+/// account applying it, so its ARN carries the partition owner in the account field
+/// instead of the caller's account id — which is why it is NOT minted through
+/// [`::emulator_server::emulator_arn`], the mint for this account's own resources.
+const SERVICE_OWNED_ARN_ACCOUNT: &str = "aws";
+
+/// The resource type an Amazon-SES-managed reputation management policy's ARN carries.
+const REPUTATION_POLICY_RESOURCE_TYPE: &str = "reputation-policy";
+
+/// The reputation management policy every tracked resource carries until a caller
+/// applies another one: the service's own default policy.
+pub const DEFAULT_REPUTATION_MANAGEMENT_POLICY: &str = "standard";
+
+/// `arn:aws:ses:<region>:aws:reputation-policy/<name>` — the ARN of the
+/// Amazon-SES-managed reputation management policy `policy_name` in `region`.
+///
+/// The Region is the one the call that reads or writes the policy executes in, the
+/// account field is [`SERVICE_OWNED_ARN_ACCOUNT`] because the policy is the service's
+/// own, and the resource field names the policy by the name the service knows it
+/// under.
+pub fn reputation_management_policy_arn(region: &str, policy_name: &str) -> String {
+    format!(
+        "arn:aws:{ARN_NAMESPACE}:{region}:{SERVICE_OWNED_ARN_ACCOUNT}:\
+         {REPUTATION_POLICY_RESOURCE_TYPE}/{policy_name}"
+    )
+}
+
+/// Every Amazon-SES-managed reputation management policy a caller may apply, in the
+/// order `UpdateReputationEntityPolicy` documents them: "reputation management policies
+/// are Amazon Web Services Amazon SES-managed (predefined policies). You can select
+/// from none, standard, and strict policies."
+pub const REPUTATION_MANAGEMENT_POLICIES: [&str; 3] =
+    ["none", DEFAULT_REPUTATION_MANAGEMENT_POLICY, "strict"];
+
+/// The name of the Amazon-SES-managed reputation management policy the ARN `policy`
+/// names, or `None` when it names no such policy.
+///
+/// A policy is the SERVICE's, not the account's, so its ARN is one of this service's
+/// namespace whose account field is [`SERVICE_OWNED_ARN_ACCOUNT`], whose Region field is
+/// a Region label (a policy is selected in the Region the entity lives in) and whose
+/// resource field names a [`REPUTATION_POLICY_RESOURCE_TYPE`] by one of the predefined
+/// names ([`REPUTATION_MANAGEMENT_POLICIES`]). The ARN itself is read by the shared
+/// parse, so what an ARN of this vendor is stays decided in one place.
+pub fn reputation_management_policy_name(policy: &str) -> Option<&'static str> {
+    let arn = ::service_common::arn::parse_of(policy, ARN_NAMESPACE)?;
+    if arn.account != SERVICE_OWNED_ARN_ACCOUNT
+        || ::service_common::arn::region_label(arn.region).is_none()
+    {
+        return None;
+    }
+    let name = ::service_common::arn::resource_id_of_type(policy, REPUTATION_POLICY_RESOURCE_TYPE)?;
+    REPUTATION_MANAGEMENT_POLICIES
+        .into_iter()
+        .find(|predefined| *predefined == name)
+}
+
+/// How this service words `BadRequestException` for a reputation management policy
+/// that names none of the predefined policies, stated once for every operation that
+/// takes one. The offending value is the only variable part, taken from the request.
+pub fn invalid_reputation_management_policy(policy: &str) -> String {
+    format!(
+        "Invalid reputation management policy: {policy}. The policy must be an Amazon SES-managed \
+         policy: {}.",
+        REPUTATION_MANAGEMENT_POLICIES.join(", ")
+    )
 }
 
 /// The account and Region one call is scoped to, and the check that decides which
@@ -581,8 +657,14 @@ pub fn tenant_not_found(tenant_name: &str) -> String {
 }
 
 /// How this service words `AlreadyExistsException` for a tenant name already taken.
-pub fn tenant_already_exists(tenant_name: &str) -> String {
-    format!("Tenant with name: {tenant_name} already exists.")
+///
+/// A tenant name is unique within ONE account, so the refusal names both the name the
+/// request asked for and the account it is already taken in — the fact that tells a
+/// caller holding credentials for several accounts where the collision is. Both are
+/// variable parts: the name as the request spelled it, and the caller's account id
+/// from the call's own scope ([`CallerScope`]).
+pub fn tenant_already_exists(tenant_name: &str, account_id: &str) -> String {
+    format!("Tenant with name {tenant_name} already exists in account {account_id}")
 }
 
 /// How the tenant-resource association surface words `NotFoundException` for a
@@ -1914,12 +1996,30 @@ pub struct TenantRecord {
     pub suppressed_reasons: Vec<String>,
     /// `TenantSuppressionAttributes$SuppressionScope`.
     pub suppression_scope: String,
+    /// `ReputationEntity$ReputationManagementPolicy`: the ARN of the
+    /// Amazon-SES-managed reputation management policy in force on this resource's
+    /// reputation entity. The service's own default policy from the moment the
+    /// resource exists ([`reputation_management_policy_arn`]), until
+    /// `UpdateReputationEntityPolicy` applies another one.
+    pub reputation_management_policy: String,
 }
 
 impl TenantRecord {
-    /// A tenant as `CreateTenant` stores it: sending enabled, and the
-    /// account-level suppression list until a caller asks for a tenant-level one.
-    pub fn new(name: &str, tenant_id: String, arn: String, now: SystemTime) -> Self {
+    /// A tenant as `CreateTenant` stores it: sending enabled, the account-level
+    /// suppression list until a caller asks for a tenant-level one, and the
+    /// service's default reputation management policy.
+    ///
+    /// `region` is the Region the create executes in, which is the Region of the
+    /// Amazon-SES-managed policy the resource's reputation entity starts under: the
+    /// policy is in force from the moment the resource exists, because reputation is
+    /// tracked for a resource rather than created by a request of its own.
+    pub fn new(
+        name: &str,
+        tenant_id: String,
+        arn: String,
+        region: &str,
+        now: SystemTime,
+    ) -> Self {
         Self {
             name: name.to_string(),
             tenant_id,
@@ -1930,6 +2030,10 @@ impl TenantRecord {
             sending_status_updated_at: now,
             suppressed_reasons: Vec::new(),
             suppression_scope: DEFAULT_SUPPRESSION_SCOPE.to_string(),
+            reputation_management_policy: reputation_management_policy_arn(
+                region,
+                DEFAULT_REPUTATION_MANAGEMENT_POLICY,
+            ),
         }
     }
 
@@ -2023,9 +2127,11 @@ impl TenantRecord {
             // the resource."
             reputation_entity_reference: Some(self.arn.clone()),
             reputation_entity_type: Some(REPUTATION_ENTITY_TYPE_RESOURCE.to_string()),
-            // A reputation management policy is attached by
-            // `UpdateReputationEntityPolicy`; until one is, the entity has none.
-            reputation_management_policy: None,
+            // "The ARN of the reputation management policy applied to this entity":
+            // an entity is always under one — the service's own default policy until
+            // `UpdateReputationEntityPolicy` applies another — so the member is read
+            // off the record rather than left absent.
+            reputation_management_policy: Some(self.reputation_management_policy.clone()),
             customer_managed_status: Some(self.customer_managed_status()),
             aws_ses_managed_status: Some(self.aws_ses_managed_status()),
             sending_status_aggregate: Some(self.aggregate_sending_status()),
@@ -2053,6 +2159,17 @@ impl TenantRecord {
     pub fn set_customer_managed_sending_status(&mut self, status: String, now: SystemTime) {
         self.sending_status = status;
         self.sending_status_updated_at = now;
+    }
+
+    /// Apply the reputation management policy `policy` to this resource's reputation
+    /// entity, as `UpdateReputationEntityPolicy` asks for.
+    ///
+    /// The policy REPLACES the one in force: an entity is under exactly one policy,
+    /// so the ARN written here is the one every later read reports. Nothing else on
+    /// the entity moves — neither status record is touched, so the aggregate status
+    /// is unchanged.
+    pub fn set_reputation_management_policy(&mut self, policy: String) {
+        self.reputation_management_policy = policy;
     }
 
     /// The modelled `TagList` view of this record's tags.
@@ -2713,7 +2830,10 @@ pub fn checked_event_destination_definition(
 /// `value` when it is one of `allowed`, and the refusal naming `member` otherwise.
 ///
 /// The wording an operation lifts into its own input error, so every member of this
-/// service refuses an unmodelled value the same way.
+/// service refuses an unmodelled value the same way — and a member SES words the
+/// refusal of itself ([`SERVICE_WORDED_ENUM_MEMBERS`]) gets that sentence here too,
+/// so a handler's own read of the member and the request boundary's read of it cannot
+/// answer differently.
 pub fn modelled_enum_value(
     member: &str,
     value: String,
@@ -2722,10 +2842,51 @@ pub fn modelled_enum_value(
     if allowed.contains(&value.as_str()) {
         return Ok(value);
     }
+    if let Some(sentence) = service_worded_enum_refusal(member) {
+        return Err(sentence.to_string());
+    }
     Err(format!(
         "{member} {value} is not one of {}.",
         allowed.join(", ")
     ))
+}
+
+/// The members whose refusal for a value outside their own modelled value set SES
+/// states as its OWN sentence, rather than as a report of the constraint that failed.
+///
+/// A constraint report names the member and the requirement it broke, which is what
+/// SES answers for most members. For the members below it answers a semantic sentence
+/// about what the member MEANS instead: fixed text with no variable part, naming
+/// neither the offending value nor a member path. Stated once here, keyed by the
+/// member's own name, so the sentence does not depend on which operation carried the
+/// member, where in a collection the offending entry sat, or whether the value was
+/// refused on the request boundary or by a handler reading the member itself.
+const SERVICE_WORDED_ENUM_MEMBERS: [(&str, &str); 1] =
+    [("DimensionValueSource", "invalid CloudWatch dimension source")];
+
+/// SES's own sentence for a value outside `member`'s modelled value set, for a member
+/// it words the refusal of itself; `None` for every other member, which is refused
+/// with the constraint report.
+///
+/// `member` may be a dotted PATH to the member, as the constraint walk spells one, or
+/// the member's own name, as a handler names the one it read: the last segment is what
+/// is matched, and the match ignores case because a path spells a member in lowerCamel
+/// while the model names it in UpperCamel.
+fn service_worded_enum_refusal(member: &str) -> Option<&'static str> {
+    let name = member.rsplit('.').next().unwrap_or(member);
+    SERVICE_WORDED_ENUM_MEMBERS
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, sentence)| *sentence)
+}
+
+/// SES's own sentence for `violation`, when it is a value outside the value set of a
+/// member SES words the refusal of itself ([`service_worded_enum_refusal`]).
+fn service_worded_violation(violation: &Violation) -> Option<&'static str> {
+    if !matches!(violation.kind, ViolationKind::EnumValue(_)) {
+        return None;
+    }
+    service_worded_enum_refusal(&violation.path)
 }
 
 /// The text separating the subject of a validation clause from the requirement it
@@ -2744,6 +2905,13 @@ const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
 ///
 /// `None` when there is nothing to state, which keeps the framework's own wording.
 pub fn boundary_refusal_message(violations: &[Violation]) -> Option<String> {
+    // A member whose refusal for a value outside its own value set SES words ITSELF
+    // answers that sentence alone: it is a semantic refusal about what the member
+    // means, not a report of the walk, so it carries neither the envelope the walk
+    // counts clauses in nor any other clause.
+    if let Some(sentence) = violations.iter().find_map(service_worded_violation) {
+        return Some(sentence.to_string());
+    }
     let clauses: Vec<String> = violations.iter().map(boundary_clause).collect();
     match clauses.len() {
         0 => None,

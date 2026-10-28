@@ -307,6 +307,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_argument(message));
         }
 
+        // And the CMK an encrypted stream names is resolved against KMS before the stream
+        // exists, for the same reason: a stream reported as encrypted under a key KMS
+        // cannot serve could never wrap the records it accepts.
+        if let Some(requested) = input
+            .delivery_stream_encryption_configuration_input
+            .as_ref()
+        {
+            if let Some(refusal) = crate::state::unusable_kms_key(ctx, &region, requested).await {
+                return Err(match refusal {
+                    crate::state::EncryptionConfigRefusal::InvalidArgument(message) => {
+                        invalid_argument(message)
+                    }
+                    crate::state::EncryptionConfigRefusal::InvalidKmsResource {
+                        code,
+                        message,
+                    } => CreateDeliveryStreamErrorModeled::InvalidKMSResourceException(
+                        InvalidKMSResourceException {
+                            code: Some(code),
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                });
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let arn = ::engine::emulator_arn(
             "firehose",
@@ -391,6 +417,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The default `DeliveryStreamType`.
 const DIRECT_PUT: &str = crate::state::DIRECT_PUT_STREAM_TYPE;
+
+/// Firehose's own name for the source configuration a `KinesisStreamAsSource` stream is fed
+/// by, as its refusal for an absent one states it — which is not the request member's name
+/// (`KinesisStreamSourceConfiguration`). The other stream types' refusals name the
+/// configuration the way the model does.
+const KINESIS_SOURCE_CONFIGURATION: &str = "KinesisSourceStreamConfig";
 
 /// Refuse an input combination the model cannot express, with this operation's own
 /// `InvalidArgumentException`: "The specified input parameter has a value that is not
@@ -659,10 +691,12 @@ fn source_description(
     match stream_type {
         "KinesisStreamAsSource" => {
             let Some(config) = input.kinesis_stream_source_configuration.as_ref() else {
-                return Err(invalid_argument(format!(
-                    "KinesisStreamSourceConfiguration is required for a Firehose stream of \
-                     type {stream_type}"
-                )));
+                return Err(invalid_argument(
+                    crate::service::mandatory_source_configuration_message(
+                        KINESIS_SOURCE_CONFIGURATION,
+                        stream_type,
+                    ),
+                ));
             };
             Ok(Some(SourceDescription {
                 kinesis_stream_source_description: Some(KinesisStreamSourceDescription {
@@ -677,9 +711,12 @@ fn source_description(
         }
         "MSKAsSource" => {
             let Some(config) = input.msk_source_configuration.as_ref() else {
-                return Err(invalid_argument(format!(
-                    "MSKSourceConfiguration is required for a Firehose stream of type {stream_type}"
-                )));
+                return Err(invalid_argument(
+                    crate::service::mandatory_source_configuration_message(
+                        "MSKSourceConfiguration",
+                        stream_type,
+                    ),
+                ));
             };
             Ok(Some(SourceDescription {
                 msk_source_description: Some(MSKSourceDescription {
@@ -696,10 +733,12 @@ fn source_description(
         }
         "DatabaseAsSource" => {
             let Some(config) = input.database_source_configuration.as_ref() else {
-                return Err(invalid_argument(format!(
-                    "DatabaseSourceConfiguration is required for a Firehose stream of type \
-                     {stream_type}"
-                )));
+                return Err(invalid_argument(
+                    crate::service::mandatory_source_configuration_message(
+                        "DatabaseSourceConfiguration",
+                        stream_type,
+                    ),
+                ));
             };
             Ok(Some(SourceDescription {
                 database_source_description: Some(DatabaseSourceDescription {

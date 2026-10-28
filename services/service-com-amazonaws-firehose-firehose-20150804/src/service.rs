@@ -528,13 +528,96 @@ pub fn already_exists_message(name: &str) -> String {
     )
 }
 
-/// A control-plane read or delete that resolved no stream: the account the lookup was
-/// scoped to, and not the name it was given.
+/// A control-plane read, delete, update or encryption change that resolved no stream: the
+/// account the lookup was scoped to, and not the name it was given.
 pub fn not_found_message() -> String {
     format!(
-        "Firehose under account {} not found.",
+        "Firehose under accountId {} not found",
         ::engine::emulator_account_id()
     )
+}
+
+/// Which way an encryption change goes, so the two refusals below are stated for the call
+/// that was made rather than for one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionChange {
+    /// `StartDeliveryStreamEncryption`.
+    Enable,
+    /// `StopDeliveryStreamEncryption`.
+    Disable,
+}
+
+impl EncryptionChange {
+    /// The verb the refusal names this change with.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Enable => "enable",
+            Self::Disable => "disable",
+        }
+    }
+}
+
+/// An encryption change the STREAM's own state blocks: the stream and the status it is in,
+/// stated for whatever that status is.
+pub fn encryption_blocked_by_stream_message(
+    change: EncryptionChange,
+    name: &str,
+    status: &str,
+) -> String {
+    format!(
+        "Cannot {} encryption on firehose: {name} when it is in {status} status",
+        change.verb()
+    )
+}
+
+/// An encryption change the stream's ENCRYPTION state blocks: the stream and the
+/// encryption status that blocks it.
+pub fn encryption_blocked_by_encryption_message(
+    change: EncryptionChange,
+    name: &str,
+    status: &str,
+) -> String {
+    format!(
+        "Cannot {} encryption on firehose: {name} when encryption is in {status} status",
+        change.verb()
+    )
+}
+
+/// An update the stream's current state blocks: the stream and the status it is in.
+pub fn update_blocked_message(name: &str, status: &str) -> String {
+    format!("Cannot update firehose: {name} when it is in {status} status")
+}
+
+/// A conditional update whose `CurrentDeliveryStreamVersionId` is not the stream's: both
+/// version ids, so a client can see which revision it was working from.
+pub fn version_mismatch_message(name: &str, current: &str, specified: &str) -> String {
+    format!(
+        "Cannot update firehose: {name} since the current version id: {current} and \
+         specified version id: {specified} do not match"
+    )
+}
+
+/// An update naming a destination id the stream does not have: the id the request named.
+pub fn destination_not_found_message(destination_id: &str) -> String {
+    format!("Destination Id {destination_id} not found")
+}
+
+/// A switch into or out of the Amazon OpenSearch Service destination types, which Firehose
+/// does not support ("Switching between Amazon OpenSearch Service and other services is not
+/// supported" — `UpdateDestination`).
+pub const UNSUPPORTED_SEARCH_TYPE_CHANGE: &str =
+    "Changing the destination type to/from Elasticsearch/Amazonopensearchservice/\
+     AmazonOpenSearchServerless from/to other destinations is not supported at this time.";
+
+/// A switch into or out of the HTTP endpoint destination type, which Firehose does not
+/// support either — however many of the new type's parameters the update carries.
+pub const UNSUPPORTED_HTTP_ENDPOINT_TYPE_CHANGE: &str =
+    "Changing the destination type to or from HttpEndpoint is not supported at this time.";
+
+/// A create of a stream type whose source configuration is absent: the configuration that
+/// type is fed by, and the type that requires it.
+pub fn mandatory_source_configuration_message(configuration: &str, stream_type: &str) -> String {
+    format!("{configuration} is mandatory for {stream_type} stream type.")
 }
 
 /// A put that resolved no stream. Same rule as [`not_found_message`] — the account, not

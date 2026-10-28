@@ -11,7 +11,9 @@
 //! this account holds no asset under is refused with the modelled
 //! `EntityNotFoundException`. The `Attachments` and `IterableForms` of an asset, and the
 //! glossary terms associated with it, are written by the operations that own those
-//! surfaces, so an asset reports none of them until one of those writes has landed.
+//! surfaces, so an asset reports none of them until one of those writes has landed — the
+//! glossary terms `AssociateGlossaryTerms` merged onto the asset
+//! ([`crate::state::AssetEntry::glossary_terms`]) being the surface that has a writer.
 //!
 //! ## Shape of an operation
 //!
@@ -189,9 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every member comes from the store, so two reads of one asset agree and a read
-        // after a put reports what that put stored. The three surfaces another operation
-        // owns are reported as the record holds them: an asset no attachment, iterable form
-        // or glossary term association has been written to carries none.
+        // after a put reports what that put stored, and a read after an association reports
+        // the terms that association merged onto the asset. The two surfaces another
+        // operation owns are reported as the record holds them: an asset no attachment or
+        // iterable form has been written to carries none.
         Ok(GetAssetOutput {
             id: entry.id.clone(),
             name: Some(entry.name.clone()),
@@ -199,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: Some(crate::state::to_date_time(entry.created_at)),
             updated_at: Some(crate::state::to_date_time(entry.updated_at)),
             asset_type_id: entry.asset_type_id.clone(),
-            glossary_terms: None,
+            glossary_terms: entry.glossary_terms_list(),
             forms: Some(entry.forms_map()),
             attachments: None,
             iterable_forms: None,

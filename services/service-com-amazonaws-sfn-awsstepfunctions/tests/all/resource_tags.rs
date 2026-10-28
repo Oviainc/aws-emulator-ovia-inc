@@ -593,15 +593,12 @@ async fn an_unusable_arn_reports_the_condition_it_failed() {
         (
             "an execution ARN, which a tagging call does not accept",
             format!("{prefix}:execution:tag-arn-message:run-1"),
-            "Invalid Arn: 'Invalid ARN resource type: execution, expected stateMachine or \
-             activity'"
-                .to_string(),
+            "Invalid Arn: 'Resource type not valid in this context: execution'".to_string(),
         ),
         (
             "a map-run ARN",
             format!("{prefix}:mapRun:tag-arn-message/abc"),
-            "Invalid Arn: 'Invalid ARN resource type: mapRun, expected stateMachine or activity'"
-                .to_string(),
+            "Invalid Arn: 'Resource type not valid in this context: mapRun'".to_string(),
         ),
         (
             "a taggable resource type with no name",

@@ -196,18 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "You can't delete a delivery source if any current deliveries are associated with
         // it": a delivery names its source by the name it is stored under, so the deliveries
-        // the store holds are what answers that.
-        if let Some(delivery) = store
+        // the store holds are what answers that. The refusal is the error class's fixed
+        // in-use text, which names no delivery — the caller finds every delivery that
+        // references this source through DescribeDeliveries.
+        if store
             .deliveries
             .values()
-            .find(|delivery| delivery.delivery_source_name == input.name)
+            .any(|delivery| delivery.delivery_source_name == input.name)
         {
             return Err(DeleteDeliverySourceErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "The delivery source {} cannot be deleted while delivery {} is \
-                         associated with it.",
-                        input.name, delivery.id
+                    message: Some(crate::state::delivery_resource_in_use_message(
+                        crate::state::DELIVERY_SOURCE_RESOURCE_KIND,
                     )),
                 },
             )

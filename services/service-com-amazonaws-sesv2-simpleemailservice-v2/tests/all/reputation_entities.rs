@@ -18,9 +18,8 @@
 //! request's filter names and windowed by its `PageSize`/`NextToken`; a read reports the
 //! one entity its reference names, which is the entry a listing of the same call reports
 //! for it. Input outside a modelled enum, a token this listing never handed out, and a
-//! reference naming no resource the call reaches are each refused with nothing stored —
-//! the last one with the error for a missing resource where the operation models one, and
-//! as invalid input where it does not.
+//! reference naming no resource the call reaches are each refused as invalid input with
+//! nothing stored.
 //!
 //! The tables below span what the rule generalises over: the number of tracked
 //! resources (one, several), the form of their names, the Region a resource lives in and
@@ -985,15 +984,21 @@ async fn a_read_of_one_entity_reports_the_entry_a_listing_of_it_reports() {
             );
         }
         // "The reputation impact reflects the highest impact reputation finding for the
-        // entity": with no finding against the entity there is no highest one. No policy
-        // was attached to it either, so it reports none.
+        // entity": with no finding against the entity there is no highest one. A policy
+        // is always in force, though — the service's own default until a caller applies
+        // another.
         assert!(
             entity.pointer("/ReputationImpact").is_none(),
             "case {case:?}: an entity with no finding reports no impact, got {entity:?}"
         );
-        assert!(
-            entity.pointer("/ReputationManagementPolicy").is_none(),
-            "case {case:?}: an entity with no policy attached reports none, got {entity:?}"
+        assert_eq!(
+            member(&entity, "/ReputationManagementPolicy"),
+            state::reputation_management_policy_arn(
+                DEFAULT_REGION,
+                state::DEFAULT_REPUTATION_MANAGEMENT_POLICY
+            ),
+            "case {case:?}: an entity nobody has applied a policy to reports the \
+             service's default one, got {entity:?}"
         );
 
         // A read of one entity reports exactly the entry a listing of the same call
@@ -1036,9 +1041,10 @@ async fn a_read_of_an_entity_no_call_reaches_is_refused_and_changes_nothing() {
 
     // One row per way the reference can name no entity this call reaches: a reference
     // naming no resource, one that is not a resource ARN at all, one whose ARN names
-    // another account, and one whose ARN names another service. Each is "the resource you
-    // attempted to access doesn't exist", so none of them tells the caller anything about
-    // what exists outside its own scope.
+    // another account, and one whose ARN names another service. No request creates a
+    // reputation entity, so a reference resolving to nothing cannot name one at all and
+    // each row is invalid input — none of them tells the caller anything about what
+    // exists outside its own scope.
     for (case, target) in [
         (
             "a reference naming no resource this account holds",
@@ -1059,18 +1065,19 @@ async fn a_read_of_an_entity_no_call_reaches_is_refused_and_changes_nothing() {
     ] {
         let refused = ses.get_entity(RESOURCE, &target).await;
         assert_eq!(
-            refused.status, 404,
-            "case {case:?}: expected HTTP 404 from GetReputationEntity, got {}",
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 from GetReputationEntity, got {}",
             refused.status
         );
         assert_eq!(
             refused.error_code(),
-            "NotFoundException",
-            "case {case:?}: expected NotFoundException, got {:?}",
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {:?}",
             refused.error_code()
         );
-        assert!(
-            refused.message().contains(&target),
+        assert_eq!(
+            refused.message(),
+            state::reputation_entity_not_found(&target),
             "case {case:?}: the refusal must name the entity it did not find, got {:?}",
             refused.message()
         );
@@ -1114,14 +1121,14 @@ async fn a_read_of_an_entity_no_call_reaches_is_refused_and_changes_nothing() {
     ] {
         let away = ses.get_entity_in(elsewhere, RESOURCE, &reference).await;
         assert_eq!(
-            away.status, 404,
-            "case {case:?}: expected HTTP 404 reading from {elsewhere:?}, got {}",
+            away.status, 400,
+            "case {case:?}: expected HTTP 400 reading from {elsewhere:?}, got {}",
             away.status
         );
         assert_eq!(
             away.error_code(),
-            "NotFoundException",
-            "case {case:?}: expected NotFoundException, got {:?}",
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {:?}",
             away.error_code()
         );
     }

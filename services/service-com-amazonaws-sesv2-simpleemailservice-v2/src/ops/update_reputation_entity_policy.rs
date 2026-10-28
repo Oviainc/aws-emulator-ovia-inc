@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReputationEntityPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReputationEntityPolicy`'s real behaviour. Implement it here — this is
+//! Applies an Amazon-SES-managed reputation management policy to the reputation entity
+//! the request names: the policy and the entity reference are both resolved before
+//! anything is written, and the entity reports the applied policy from then on. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReputationEntityPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReputationEntityPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReputationEntityPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateReputationEntityPolicy without the shared emulator state",
+            ));
+        };
+
+        // `ReputationEntityType` arrives as a plain string, so a value outside the enum
+        // is this handler's to refuse, with the `BadRequestException` the model binds
+        // for "the input you provided is invalid". The one type the model binds is the
+        // one every entity is of, so the checked value constrains nothing further.
+        crate::state::modelled_enum_value(
+            "ReputationEntityType",
+            input.reputation_entity_type,
+            &[crate::state::REPUTATION_ENTITY_TYPE_RESOURCE],
+        )
+        .map_err(bad_request)?;
+
+        // "Reputation management policies are Amazon Web Services Amazon SES-managed
+        // (predefined policies). You can select from none, standard, and strict
+        // policies": a caller does not author a policy, it selects one, so a value
+        // naming none of the predefined policies names nothing to apply and is refused
+        // on the input — before any lookup and before any write.
+        let policy = input.reputation_entity_policy;
+        if crate::state::reputation_management_policy_name(&policy).is_none() {
+            return Err(bad_request(
+                crate::state::invalid_reputation_management_policy(&policy),
+            ));
+        }
+
+        let reference = input.reputation_entity_reference;
+        // The entity this call can reach is one of the account the request is
+        // authenticated for, in the Region its own credential scope names: the
+        // reference it carries is checked against that scope before it resolves to
+        // anything.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+        let mut store = state.lock();
+        // An entity exists only for a resource this call reaches, and the reference of
+        // a resource-type entity is that resource's ARN, so a reference outside the
+        // call's scope, or naming no resource inside it, is invalid input — and the two
+        // are answered alike, so neither tells the caller about anything outside its
+        // own scope.
+        let Some(tenant) = store.tenant_by_reputation_entity_reference(&reference, &scope) else {
+            return Err(bad_request(crate::state::reputation_entity_not_found(
+                &reference,
+            )));
+        };
+
+        // One policy is in force on an entity, so the selected one REPLACES it and is
+        // what every later read of the entity reports. Neither status record moves, so
+        // the aggregate sending status is unchanged.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReputationEntityPolicy"))
+        // Two callers applying a policy to the same entity at the same time are
+        // serialised by the store's own lock, so each write lands in the order the lock
+        // grants it and the last one is what every read afterwards reports: no caller's
+        // write is lost, which is why nothing here reports the modelled
+        // `ConflictException` — it states "there is already an ongoing account details
+        // update under review", a condition this operation never puts the account in.
+        tenant.set_reputation_management_policy(policy);
+
+        // The response carries no members: the applied policy is observed through the
+        // reputation-entity reads that report the record just written.
+        Ok(UpdateReputationEntityPolicyOutput {})
     }
+}
+
+/// Refuse the request with this operation's input error.
+fn bad_request(message: impl Into<String>) -> UpdateReputationEntityPolicyError {
+    UpdateReputationEntityPolicyErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

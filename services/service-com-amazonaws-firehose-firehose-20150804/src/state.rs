@@ -868,6 +868,126 @@ pub fn check_encryption_configuration_input(
     Ok(())
 }
 
+/// Why KMS cannot serve the CMK `requested` names, when it cannot; `None` when the key is
+/// one this stream can be encrypted under (and for a request that names no key at all,
+/// which asks for the service-account CMK).
+///
+/// Firehose does not take a `KeyARN` on trust: a stream it reports as encrypted is a stream
+/// whose records it can actually wrap, so the key is RESOLVED before the configuration is
+/// recorded — and a key KMS does not serve is reported as `InvalidKMSResourceException`
+/// ("Firehose throws this exception when an attempt to put records or to start or stop
+/// Firehose stream encryption fails. This happens when the KMS service throws one of the
+/// following exception types: AccessDeniedException, InvalidStateException,
+/// DisabledException, or NotFoundException"), whose `Code` relays the KMS exception type.
+///
+/// KMS is reached the way this crate reaches IAM and Amazon S3 ([`unassumable_role`]):
+/// through the in-process callback, so this crate names no other service crate and no
+/// socket is opened. Nothing is refused that could not be grounded in KMS's own answer —
+/// with no KMS mounted to ask, nothing is known about the key and the request proceeds.
+pub async fn unusable_kms_key(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    requested: &DeliveryStreamEncryptionConfigurationInput,
+) -> Option<EncryptionConfigRefusal> {
+    let key_arn = requested.key_arn.as_ref()?;
+    match kms_client(ctx, region)
+        .describe_key()
+        .key_id(key_arn)
+        .send()
+        .await
+    {
+        // KMS holds the key: it can wrap this stream's records only while it is enabled.
+        // A key in any other state is refused under the exception type KMS itself raises
+        // for an operation on a key in that state.
+        Ok(described) => {
+            let state = described
+                .key_metadata()
+                .and_then(::aws_sdk_kms::types::KeyMetadata::key_state)
+                .map(|state| state.as_str().to_string());
+            match state.as_deref() {
+                None | Some(KMS_KEY_ENABLED) => None,
+                Some(KMS_KEY_DISABLED) => Some(EncryptionConfigRefusal::InvalidKmsResource {
+                    code: KMS_DISABLED_EXCEPTION.to_string(),
+                    message: unusable_key_message(key_arn, KMS_KEY_DISABLED),
+                }),
+                Some(other) => Some(EncryptionConfigRefusal::InvalidKmsResource {
+                    code: KMS_INVALID_STATE_EXCEPTION.to_string(),
+                    message: unusable_key_message(key_arn, other),
+                }),
+            }
+        }
+        Err(error) => {
+            // KMS says this account holds no such key: the refusal is grounded, and it
+            // carries KMS's own sentence about the key where KMS stated one.
+            let not_found = error.as_service_error().is_some_and(
+                ::aws_sdk_kms::operation::describe_key::DescribeKeyError::is_not_found_exception,
+            );
+            if not_found {
+                let message = error
+                    .as_service_error()
+                    .and_then(::aws_smithy_types::error::metadata::ProvideErrorMetadata::message)
+                    .map_or_else(
+                        || unusable_key_message(key_arn, KMS_NOT_FOUND_EXCEPTION),
+                        str::to_string,
+                    );
+                return Some(EncryptionConfigRefusal::InvalidKmsResource {
+                    code: KMS_NOT_FOUND_EXCEPTION.to_string(),
+                    message,
+                });
+            }
+            // Any other answer is this emulator failing to ask, not KMS reporting a key it
+            // cannot serve, so it refuses nothing.
+            ::tracing::warn!(
+                kms_key = %key_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the requested CMK could not be resolved against KMS"
+            );
+            None
+        }
+    }
+}
+
+/// The `KeyState` of a CMK KMS can serve: "Enables or disables the key" — only an enabled
+/// key performs cryptographic operations.
+const KMS_KEY_ENABLED: &str = "Enabled";
+/// The `KeyState` of a CMK its owner turned off.
+const KMS_KEY_DISABLED: &str = "Disabled";
+/// The KMS exception types Firehose relays in `InvalidKMSResourceException$Code`, for a key
+/// KMS does not hold and for one whose state does not admit the operation.
+const KMS_NOT_FOUND_EXCEPTION: &str = "NotFoundException";
+const KMS_DISABLED_EXCEPTION: &str = "DisabledException";
+const KMS_INVALID_STATE_EXCEPTION: &str = "InvalidStateException";
+
+/// What Firehose states for a CMK it cannot use: the key the request named and the reason
+/// KMS gave for it.
+fn unusable_key_message(key_arn: &str, reason: &str) -> String {
+    format!("Firehose is unable to use the KMS key {key_arn}: {reason}.")
+}
+
+/// The KMS client this service resolves a CMK through: the AWS SDK driven over the
+/// emulator's own in-process transport, exactly as [`iam_client`] is.
+fn kms_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_kms::Client {
+    let config = ::aws_sdk_kms::Config::builder()
+        .behavior_version(::aws_sdk_kms::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_kms::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://kms.{region}.amazonaws.com"))
+        // The transport is in-process: there is nothing to retry, time out or watch for a
+        // stalled stream, and each of those would need a sleep implementation this client
+        // is not given. The same goes for caching the identity: the credentials are handed
+        // over directly.
+        .retry_config(::aws_sdk_kms::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_kms::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_kms::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_kms::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_kms::Client::from_conf(config)
+}
+
 /// The first role of `role_arns` Firehose cannot assume, worded as the refusal states it.
 ///
 /// Firehose does not take a configuration's `RoleARN` on trust: it assumes the role when

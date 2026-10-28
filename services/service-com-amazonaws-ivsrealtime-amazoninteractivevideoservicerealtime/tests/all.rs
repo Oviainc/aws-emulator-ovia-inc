@@ -19,6 +19,8 @@ mod composition_destination_kinds;
 mod composition_empty_stage_timeout;
 #[path = "all/composition_layout_default_lifetime.rs"]
 mod composition_layout_default_lifetime;
+#[path = "all/composition_stage_emptied_by_replication.rs"]
+mod composition_stage_emptied_by_replication;
 #[path = "all/composition_stop.rs"]
 mod composition_stop;
 #[path = "all/composition_tag_lifetime.rs"]

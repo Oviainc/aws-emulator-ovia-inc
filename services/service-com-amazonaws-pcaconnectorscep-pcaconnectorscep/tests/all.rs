@@ -31,6 +31,8 @@ mod connector_projection_agreement;
 mod connector_vpc_endpoint;
 #[path = "all/region_isolation.rs"]
 mod region_isolation;
+#[path = "all/region_segment_rule.rs"]
+mod region_segment_rule;
 #[path = "all/resource_arn_validation.rs"]
 mod resource_arn_validation;
 #[path = "all/resource_tags.rs"]

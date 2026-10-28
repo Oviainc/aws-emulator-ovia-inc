@@ -2043,39 +2043,82 @@ pub fn replayed_write<'a>(
     }
 }
 
-/// Why a supplied or amended `BenefitApplicationDetails` cannot be stored, or `None`
-/// when it can.
+/// The requirement a `BenefitApplicationDetails` document nested past
+/// [`MAX_DETAILS_DEPTH`] fails, worded like every other requirement this service states
+/// ([`crate::service::member_clause`]).
+///
+/// One construction, so the depth bound reads the same whether the document was refused
+/// by the guard ([`details_requirement`]) or by the schema walk that stops at the same
+/// depth ([`schema_violation`]).
+pub fn details_depth_requirement() -> String {
+    format!("Member must nest no deeper than {MAX_DETAILS_DEPTH} levels")
+}
+
+/// The requirement a supplied or amended `BenefitApplicationDetails` fails, or `None`
+/// when the document can be stored.
 ///
 /// Three rules, each an emulator resource guard on a member the model leaves entirely
 /// caller-controlled: the document must nest no deeper than [`MAX_DETAILS_DEPTH`], hold
 /// no more than [`MAX_DETAILS_MEMBERS`] members over the whole tree, and carry no more
-/// than [`MAX_DETAILS_BYTES`] of text. Every operation that writes the member applies
-/// this — the create and the update to the document they were handed,
-/// `AmendBenefitApplication` to the document its amendments produced — each rendering
-/// the refusal as its own modelled `ValidationException`.
-pub fn details_rejection(details: Option<&Document>) -> Option<String> {
+/// than [`MAX_DETAILS_BYTES`] of text. Each is stated as a REQUIREMENT on the member —
+/// never as a sentence of its own — so [`details_refusal`] can render it through the
+/// same clause and envelope every other refusal of this service goes through. The byte
+/// bound is a length, so it is worded by the walk's own wording helper
+/// ([`crate::service::constraint_requirement`]) rather than by a copy that can drift.
+pub fn details_requirement(details: Option<&Document>) -> Option<String> {
     let document = details?;
     if !document_fits(document, MAX_DETAILS_DEPTH) {
-        return Some(format!(
-            "BenefitApplicationDetails nests deeper than the {MAX_DETAILS_DEPTH} levels this service accepts"
-        ));
+        return Some(details_depth_requirement());
     }
     // Counted only after the depth check, so this walk's recursion is already bounded.
     let (members, bytes) = document_weight(document);
     if members > MAX_DETAILS_MEMBERS {
         return Some(format!(
-            "BenefitApplicationDetails holds more than the {MAX_DETAILS_MEMBERS} members this service stores"
+            "Member must hold no more than {MAX_DETAILS_MEMBERS} members"
         ));
     }
     (bytes > MAX_DETAILS_BYTES).then(|| {
-        format!(
-            "BenefitApplicationDetails carries more than the {MAX_DETAILS_BYTES} bytes of text this service stores"
-        )
+        crate::service::constraint_requirement(&smithy_server_runtime::ViolationKind::MaxLength(
+            MAX_DETAILS_BYTES as i64,
+        ))
+        .unwrap_or_default()
+    })
+}
+
+/// The refusal a request whose `BenefitApplicationDetails` breaks one of the document
+/// guards is answered with, or `None` when the document can be stored.
+///
+/// `member` is the input member the document arrived on, spelled as the wire spells it,
+/// so the clause names the member the caller must fix. The message goes through the same
+/// two helpers every other in-handler refusal of this service uses
+/// ([`crate::service::member_clause`] and [`crate::service::validation_envelope`]), so a
+/// client that parses a clause to learn which member and which requirement failed reads
+/// this refusal exactly as it reads one the centralized walk produced, and NOTHING of the
+/// rejected document is echoed.
+///
+/// Every operation that writes the member applies this — the create and the update to the
+/// document they were handed, `AmendBenefitApplication` to the document its amendments
+/// produced — so one rule is refused in one form wherever it holds.
+pub fn details_refusal(
+    member: &str,
+    details: Option<&Document>,
+) -> Option<crate::ops::types::ValidationException> {
+    let requirement = details_requirement(details)?;
+    let clause = crate::service::member_clause(member, &requirement, false);
+    Some(crate::ops::types::ValidationException {
+        message: crate::service::validation_envelope(std::slice::from_ref(&clause))
+            .unwrap_or_else(|| clause.clone()),
+        reason: VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(validation_field(
+            member,
+            &requirement,
+            VALIDATION_CODE_INVALID_VALUE,
+        )),
     })
 }
 
 /// How many members and how many bytes of text `value` holds, over the whole tree: the
-/// two sizes [`details_rejection`] bounds.
+/// two sizes [`details_requirement`] bounds.
 ///
 /// A member is an object member or an array element; the bytes counted are the member
 /// names and the string values, which is all of the document a caller chooses the SIZE
@@ -2201,11 +2244,11 @@ fn schema_violation(
     // Nothing below the depth this service stores can be judged, so the exhausted walk
     // REFUSES rather than passing a document it did not read: the depth bound and this
     // walk cannot drift into letting one through. A document that deep is already refused
-    // by [`details_rejection`], which every caller of this applies first.
+    // by [`details_requirement`], which every caller of this applies first.
     let Some(next) = budget.checked_sub(1) else {
         return Some(SchemaViolation {
             member: member.to_string(),
-            requirement: format!("Member must nest no deeper than {MAX_DETAILS_DEPTH} levels"),
+            requirement: details_depth_requirement(),
         });
     };
     let Document::Object(keywords) = schema else {
