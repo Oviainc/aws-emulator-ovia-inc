@@ -8,6 +8,11 @@
 //! resources: an endpoint's members are whatever `CreateEndpoint` stored for it, the
 //! Outposts are the ones the store holds, and every operation computes its answer from
 //! those records.
+//!
+//! It is also the crate's single home for the test harness every other suite drives the
+//! service through: the emulator fixtures, the request helpers, the [`Answer`] reader and
+//! the [`Listing`] harness every listing suite pages a listing with — so one listing rule
+//! is written down once and no suite carries a second copy of it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -486,6 +491,248 @@ pub(crate) fn minimal_create(outpost_id: &str) -> Value {
         "SubnetId": "subnet-00000000000000001",
         "SecurityGroupId": "sg-00000000000000001",
     })
+}
+
+/// Which listing a case drives: the Outpost inventory, this account's own endpoints, or
+/// the endpoints on one named Outpost.
+///
+/// The three listings differ only in the store map they walk, the form of their cursor,
+/// which records they report and the shape they project each record into, so this is the
+/// one place each of those differences is written down — every suite that pages a listing
+/// drives it from here.
+#[derive(Debug, Clone)]
+pub(crate) enum Listing {
+    Outposts,
+    OwnEndpoints,
+    EndpointsOn(String),
+}
+
+impl Listing {
+    /// The operation name the listing's refusals name.
+    pub(crate) fn operation(&self) -> &'static str {
+        match self {
+            Listing::Outposts => "ListOutpostsWithS3",
+            Listing::OwnEndpoints => "ListEndpoints",
+            Listing::EndpointsOn(_) => "ListSharedEndpoints",
+        }
+    }
+
+    /// Whether this listing reports endpoint records at all — false for the Outpost
+    /// inventory, which reports Outposts.
+    pub(crate) fn reports_endpoints(&self) -> bool {
+        !matches!(self, Listing::Outposts)
+    }
+
+    /// Call the listing with the page size and cursor a case asks for. `None` for the
+    /// page size means the request carries no `MaxResults` member at all (the model's
+    /// `@default(0)`).
+    pub(crate) async fn page(
+        &self,
+        router: &MultiServiceRouter,
+        page_size: Option<i64>,
+        token: Option<&str>,
+    ) -> Answer {
+        let mut params: Vec<String> = Vec::new();
+        if let Listing::EndpointsOn(outpost) = self {
+            params.push(format!("outpostId={outpost}"));
+        }
+        if let Some(size) = page_size {
+            params.push(format!("maxResults={size}"));
+        }
+        if let Some(token) = token {
+            params.push(format!("nextToken={token}"));
+        }
+        let query = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
+        match self {
+            Listing::Outposts => list_outposts(router, &query).await,
+            Listing::OwnEndpoints => list_endpoints(router, &query).await,
+            Listing::EndpointsOn(_) => list_shared(router, &query).await,
+        }
+    }
+
+    /// The cursor keys an answer reports, in the order it reported them: the key each
+    /// record is stored under, read back off the record the answer carries.
+    pub(crate) fn reported_keys(&self, answer: &Answer) -> Vec<String> {
+        match self {
+            Listing::Outposts => answer
+                .outposts()
+                .iter()
+                .map(|outpost| string_at(outpost, "OutpostId"))
+                .collect(),
+            Listing::OwnEndpoints | Listing::EndpointsOn(_) => {
+                answer.endpoints().iter().map(endpoint_key).collect()
+            }
+        }
+    }
+
+    /// Whether `record` belongs to this listing's set: the caller's own endpoints across
+    /// every Outpost, or every endpoint on the Outpost named. The Outpost inventory
+    /// reports no endpoint at all.
+    fn holds(&self, record: &EndpointRecord) -> bool {
+        match self {
+            Listing::Outposts => false,
+            Listing::OwnEndpoints => record.owner_account == engine::emulator_account_id(),
+            Listing::EndpointsOn(outpost) => &record.outpost_id == outpost,
+        }
+    }
+
+    /// The cursor keys the STORE holds for this listing, in the store map's own key
+    /// order: the whole set the listing owes, whatever page size walks it.
+    pub(crate) fn stored_keys(&self, engine: &Arc<engine::InMemoryEngine>) -> Vec<String> {
+        let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
+        let store = state.lock();
+        match self {
+            Listing::Outposts => store.outposts.keys().cloned().collect(),
+            Listing::OwnEndpoints | Listing::EndpointsOn(_) => store
+                .endpoints
+                .iter()
+                .filter(|(_, record)| self.holds(record))
+                .map(|(key, _)| format!("{}/{}", key.0, key.1))
+                .collect(),
+        }
+    }
+
+    /// The `EndpointArn`s the STORE holds for this endpoint listing, in the store's own
+    /// key order: the whole set the listing owes, whatever page size walks it.
+    pub(crate) fn stored_arns(&self, engine: &Arc<engine::InMemoryEngine>) -> Vec<String> {
+        assert!(
+            self.reports_endpoints(),
+            "{} reports Outposts, so it holds no EndpointArn",
+            self.operation()
+        );
+        let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
+        let store = state.lock();
+        store
+            .endpoints
+            .values()
+            .filter(|record| self.holds(record))
+            .map(|record| {
+                record.endpoint_arn(REGION).unwrap_or_else(|| {
+                    panic!(
+                        "an endpoint on Outpost {} must have an EndpointArn",
+                        record.outpost_id
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Tokens this listing never issues, each with the way it fails the listing's own
+    /// cursor form.
+    ///
+    /// The inventory's cursor is an `OutpostId` (`^(op-[a-f0-9]{17}|\d{12}|ec2)$`) and an
+    /// endpoint listing's is `<OutpostId>/<EndpointId>` with `EndpointId`'s
+    /// `^[a-zA-Z0-9]{19}$` (from
+    /// `smithy_query(query="shape", shape="OutpostId,EndpointId")`), so each listing also
+    /// refuses the OTHER's form: no listing serves a cursor it did not mint.
+    pub(crate) fn never_issued(&self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            Listing::Outposts => vec![
+                ("no published Outpost id form at all", "not-a-cursor"),
+                (
+                    "the other listing's endpoint cursor",
+                    "op-0a1b2c3d4e5f60718/0000000000000000001",
+                ),
+                ("an Outpost id with non-hex digits", "op-zzzzzzzzzzzzzzzzz"),
+                ("an Outpost id one character short", "op-0a1b2c3d4e5f6071"),
+                ("an account id one digit short", "00000000000"),
+                ("the ec2 form with a character added", "ec22"),
+            ],
+            Listing::OwnEndpoints | Listing::EndpointsOn(_) => vec![
+                ("no separator at all", "not-a-cursor"),
+                (
+                    "only the Outpost id, the other listing's cursor form",
+                    "op-0a1b2c3d4e5f60718",
+                ),
+                ("only the endpoint id", "0000000000000000001"),
+                ("an empty Outpost id", "/0000000000000000001"),
+                ("an empty endpoint id", "op-0a1b2c3d4e5f60718/"),
+                ("neither part of a published form", "aaaa/bbbb"),
+                (
+                    "an Outpost id of no published form",
+                    "op-zzzzzzzzzzzzzzzzz/0000000000000000001",
+                ),
+                (
+                    "an endpoint id one character short",
+                    "op-0a1b2c3d4e5f60718/000000000000000000",
+                ),
+            ],
+        }
+    }
+}
+
+/// The cursor key of a reported endpoint: `<OutpostId>/<EndpointId>`, built from the
+/// `OutpostsId` member and the id at the tail of `EndpointArn`.
+fn endpoint_key(endpoint: &Value) -> String {
+    format!(
+        "{}/{}",
+        string_at(endpoint, "OutpostsId"),
+        endpoint_id_of(&string_at(endpoint, "EndpointArn"))
+    )
+}
+
+/// The `EndpointArn`s an answer reports, in the order it reported them.
+pub(crate) fn reported_arns(answer: &Answer) -> Vec<String> {
+    answer
+        .endpoints()
+        .iter()
+        .map(|endpoint| string_at(endpoint, "EndpointArn"))
+        .collect()
+}
+
+/// Create `count` endpoints of this account on `outpost`, answering their ARNs. Each one
+/// sits in its own subnet, so nothing is shared between them but the Outpost.
+pub(crate) async fn create_endpoints(
+    router: &MultiServiceRouter,
+    outpost: &str,
+    count: usize,
+    tag: usize,
+) -> Vec<String> {
+    let mut arns = Vec::with_capacity(count);
+    for index in 0..count {
+        let request = json!({
+            "OutpostId": outpost,
+            "SubnetId": format!("subnet-{:05x}{:012x}", tag, index),
+            "SecurityGroupId": format!("sg-{:05x}{:012x}", tag, index),
+        });
+        let answer = create(router, request).await;
+        assert_eq!(
+            answer.status, 200,
+            "creating endpoint {index} on {outpost} must answer 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        arns.push(string_at(&answer.body, "EndpointArn"));
+    }
+    arns
+}
+
+/// An emulator whose store holds Outposts and endpoints enough for every listing to page
+/// over more than one record — endpoints of this account on both Outposts it owns and on
+/// the Outpost another account shared with it (which already carries that account's own
+/// endpoint) — beside the listings a paging case drives.
+pub(crate) async fn listing_fixture() -> (
+    MultiServiceRouter,
+    Arc<engine::InMemoryEngine>,
+    Vec<Listing>,
+) {
+    let (router, engine) = emulator_with_engine();
+    let owned = owned_outposts(&router).await;
+    let shared = shared_outpost(&router).await;
+    create_endpoints(&router, &owned[0], 3, 0x1).await;
+    create_endpoints(&router, &owned[1], 2, 0x2).await;
+    create_endpoints(&router, &shared, 2, 0x3).await;
+
+    let listings = vec![
+        Listing::Outposts,
+        Listing::OwnEndpoints,
+        Listing::EndpointsOn(owned[0].clone()),
+        Listing::EndpointsOn(shared),
+    ];
+    (router, engine, listings)
 }
 
 /// `CreateEndpoint` persists what it was given and the endpoint listings report that

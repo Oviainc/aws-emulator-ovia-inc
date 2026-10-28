@@ -26,7 +26,7 @@ use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
     create, delete_endpoint, emulator, endpoint_id_of, endpoint_with_arn, list_endpoints,
-    list_shared, owned_outposts, string_at, Answer,
+    list_shared, owned_outposts, reported_arns, string_at,
 };
 
 /// The one text a reference under an `OutpostId` that does not resolve answers with,
@@ -52,15 +52,6 @@ struct Row {
     arrives: Arrives,
     deletes: usize,
     outpost: usize,
-}
-
-/// The ARNs a listing reports, in the order it reports them.
-fn reported_arns(answer: &Answer) -> Vec<String> {
-    answer
-        .endpoints()
-        .iter()
-        .map(|endpoint| string_at(endpoint, "EndpointArn"))
-        .collect()
 }
 
 /// The members of an endpoint that identify what it holds and when it was created — none

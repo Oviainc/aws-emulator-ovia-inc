@@ -26,7 +26,7 @@ use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 use crate::endpoint_lifecycle::{
     create_in, delete_endpoint_in, emulator_holding, emulator_in_region, endpoint_id_of,
     list_endpoints_in, list_outposts_in, list_shared_in, minimal_create, owned_outposts_in,
-    string_at, Answer,
+    reported_arns, string_at, Answer,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -84,15 +84,6 @@ const ROWS: &[Row] = &[
         reader: "me-central-1",
     },
 ];
-
-/// The `EndpointArn`s an answer reports.
-fn reported_arns(answer: &Answer) -> Vec<String> {
-    answer
-        .endpoints()
-        .iter()
-        .map(|endpoint| string_at(endpoint, "EndpointArn"))
-        .collect()
-}
 
 /// The `OutpostId`s an inventory answer reports.
 fn reported_outposts(answer: &Answer) -> Vec<String> {

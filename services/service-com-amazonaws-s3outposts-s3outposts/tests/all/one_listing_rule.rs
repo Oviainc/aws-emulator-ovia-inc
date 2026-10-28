@@ -15,198 +15,12 @@
 //! exercised from the Outpost inventory and from each endpoint listing. The oracle is
 //! the persisted records: every expectation is read out of the store, so no order,
 //! filter or cursor a handler invents can pass.
+//!
+//! The harness those rows are built from — which listing a row drives, the request it
+//! builds, the fixture it drives, the keys it reads out of the store and the cursor
+//! tables — lives once in [`crate::endpoint_lifecycle`].
 
-use std::sync::Arc;
-
-use serde_json::{json, Value};
-use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpostsState;
-use smithy_server_runtime::MultiServiceRouter;
-
-use crate::endpoint_lifecycle::{
-    create, emulator_with_engine, endpoint_id_of, list_endpoints, list_outposts, list_shared,
-    owned_outposts, shared_outpost, string_at, Answer,
-};
-
-/// Which listing a row drives: the Outpost inventory, this account's own endpoints, or
-/// the endpoints on one named Outpost.
-#[derive(Debug, Clone)]
-enum Listing {
-    Outposts,
-    OwnEndpoints,
-    EndpointsOn(String),
-}
-
-impl Listing {
-    /// The operation name the listing's refusals name.
-    fn operation(&self) -> &'static str {
-        match self {
-            Listing::Outposts => "ListOutpostsWithS3",
-            Listing::OwnEndpoints => "ListEndpoints",
-            Listing::EndpointsOn(_) => "ListSharedEndpoints",
-        }
-    }
-
-    /// Call the listing with the page size and cursor a case asks for. `None` for the
-    /// page size means the request carries no `MaxResults` member at all (the model's
-    /// `@default(0)`).
-    async fn page(
-        &self,
-        router: &MultiServiceRouter,
-        page_size: Option<i64>,
-        token: Option<&str>,
-    ) -> Answer {
-        let mut params: Vec<String> = Vec::new();
-        if let Listing::EndpointsOn(outpost) = self {
-            params.push(format!("outpostId={outpost}"));
-        }
-        if let Some(size) = page_size {
-            params.push(format!("maxResults={size}"));
-        }
-        if let Some(token) = token {
-            params.push(format!("nextToken={token}"));
-        }
-        let query = if params.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", params.join("&"))
-        };
-        match self {
-            Listing::Outposts => list_outposts(router, &query).await,
-            Listing::OwnEndpoints => list_endpoints(router, &query).await,
-            Listing::EndpointsOn(_) => list_shared(router, &query).await,
-        }
-    }
-
-    /// The cursor keys an answer reports, in the order it reported them: the key each
-    /// record is stored under, read back off the record the answer carries.
-    fn reported_keys(&self, answer: &Answer) -> Vec<String> {
-        match self {
-            Listing::Outposts => answer
-                .outposts()
-                .iter()
-                .map(|outpost| string_at(outpost, "OutpostId"))
-                .collect(),
-            Listing::OwnEndpoints | Listing::EndpointsOn(_) => answer
-                .endpoints()
-                .iter()
-                .map(endpoint_key)
-                .collect(),
-        }
-    }
-
-    /// The cursor keys the STORE holds for this listing, in the store map's own key
-    /// order: the whole set the listing owes, whatever page size walks it.
-    fn stored_keys(&self, engine: &Arc<engine::InMemoryEngine>) -> Vec<String> {
-        let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
-        let store = state.lock();
-        match self {
-            Listing::Outposts => store.outposts.keys().cloned().collect(),
-            Listing::OwnEndpoints => store
-                .endpoints
-                .iter()
-                .filter(|(_, record)| record.owner_account == engine::emulator_account_id())
-                .map(|(key, _)| format!("{}/{}", key.0, key.1))
-                .collect(),
-            Listing::EndpointsOn(outpost) => store
-                .endpoints
-                .keys()
-                .filter(|(outpost_id, _)| outpost_id == outpost)
-                .map(|(outpost_id, endpoint_id)| format!("{outpost_id}/{endpoint_id}"))
-                .collect(),
-        }
-    }
-
-    /// Tokens this listing never issues, each with the way it fails the listing's own
-    /// cursor form.
-    ///
-    /// The inventory's cursor is an `OutpostId` (`^(op-[a-f0-9]{17}|\d{12}|ec2)$`) and
-    /// an endpoint listing's is `<OutpostId>/<EndpointId>` with `EndpointId`'s
-    /// `^[a-zA-Z0-9]{19}$` (from
-    /// `smithy_query(query="shape", shape="OutpostId,EndpointId")`), so each listing
-    /// also refuses the OTHER's form: no listing serves a cursor it did not mint.
-    fn never_issued(&self) -> Vec<(&'static str, &'static str)> {
-        match self {
-            Listing::Outposts => vec![
-                ("no published Outpost id form at all", "not-a-cursor"),
-                (
-                    "the other listing's endpoint cursor",
-                    "op-0a1b2c3d4e5f60718/0000000000000000001",
-                ),
-                ("an Outpost id with non-hex digits", "op-zzzzzzzzzzzzzzzzz"),
-                ("an Outpost id one character short", "op-0a1b2c3d4e5f6071"),
-                ("an account id one digit short", "00000000000"),
-                ("the ec2 form with a character added", "ec22"),
-            ],
-            Listing::OwnEndpoints | Listing::EndpointsOn(_) => vec![
-                ("no separator at all", "not-a-cursor"),
-                ("the other listing's Outpost cursor", "op-0a1b2c3d4e5f60718"),
-                ("an empty Outpost id", "/0000000000000000001"),
-                ("an empty endpoint id", "op-0a1b2c3d4e5f60718/"),
-                (
-                    "an Outpost id of no published form",
-                    "op-zzzzzzzzzzzzzzzzz/0000000000000000001",
-                ),
-                (
-                    "an endpoint id one character short",
-                    "op-0a1b2c3d4e5f60718/000000000000000000",
-                ),
-            ],
-        }
-    }
-}
-
-/// The cursor key of a reported endpoint: `<OutpostId>/<EndpointId>`, built from the
-/// `OutpostsId` member and the id at the tail of `EndpointArn`.
-fn endpoint_key(endpoint: &Value) -> String {
-    format!(
-        "{}/{}",
-        string_at(endpoint, "OutpostsId"),
-        endpoint_id_of(&string_at(endpoint, "EndpointArn"))
-    )
-}
-
-/// Create `count` endpoints of this account on `outpost`, each in its own subnet.
-async fn create_endpoints(router: &MultiServiceRouter, outpost: &str, count: usize, tag: usize) {
-    for index in 0..count {
-        let answer = create(
-            router,
-            json!({
-                "OutpostId": outpost,
-                "SubnetId": format!("subnet-{:05x}{:012x}", tag, index),
-                "SecurityGroupId": format!("sg-{:05x}{:012x}", tag, index),
-            }),
-        )
-        .await;
-        assert_eq!(
-            answer.status, 200,
-            "creating endpoint {index} on {outpost} must answer 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-    }
-}
-
-/// An emulator whose store holds Outposts and endpoints enough for every listing to
-/// page over more than one record, beside the three listings these cases drive.
-async fn fixture() -> (
-    MultiServiceRouter,
-    Arc<engine::InMemoryEngine>,
-    Vec<Listing>,
-) {
-    let (router, engine) = emulator_with_engine();
-    let owned = owned_outposts(&router).await;
-    let shared = shared_outpost(&router).await;
-    create_endpoints(&router, &owned[0], 3, 0x1).await;
-    create_endpoints(&router, &owned[1], 2, 0x2).await;
-    create_endpoints(&router, &shared, 2, 0x3).await;
-
-    let listings = vec![
-        Listing::Outposts,
-        Listing::OwnEndpoints,
-        Listing::EndpointsOn(owned[0].clone()),
-        Listing::EndpointsOn(shared),
-    ];
-    (router, engine, listings)
-}
+use crate::endpoint_lifecycle::listing_fixture;
 
 /// Every listing walks its whole set exactly once, in the store map's own key order,
 /// whatever page size the caller asks for — and the token an unfinished page carries
@@ -219,7 +33,7 @@ async fn fixture() -> (
 /// of its published `@range(min: 0, max: 100)` and sizes between them.
 #[tokio::test]
 async fn every_listing_pages_over_one_stable_order() {
-    let (router, engine, listings) = fixture().await;
+    let (router, engine, listings) = listing_fixture().await;
 
     for listing in &listings {
         let expected = listing.stored_keys(&engine);
@@ -294,7 +108,7 @@ async fn every_listing_pages_over_one_stable_order() {
 /// exercised at the start, in the middle and at the last record.
 #[tokio::test]
 async fn every_listing_resumes_at_the_key_its_cursor_names() {
-    let (router, engine, listings) = fixture().await;
+    let (router, engine, listings) = listing_fixture().await;
 
     for listing in &listings {
         let expected = listing.stored_keys(&engine);
@@ -328,10 +142,11 @@ async fn every_listing_resumes_at_the_key_its_cursor_names() {
 /// issued it — never served as an arbitrary page.
 ///
 /// The rows differ along the way the token fails the listing's own cursor form, the
-/// other listing's cursor form included (see [`Listing::never_issued`]).
+/// other listing's cursor form included (see
+/// [`crate::endpoint_lifecycle::Listing::never_issued`]).
 #[tokio::test]
 async fn every_listing_refuses_a_token_it_never_issued() {
-    let (router, engine, listings) = fixture().await;
+    let (router, engine, listings) = listing_fixture().await;
 
     for listing in &listings {
         // A cursor the listing DOES issue is served, so the rows below are refused for

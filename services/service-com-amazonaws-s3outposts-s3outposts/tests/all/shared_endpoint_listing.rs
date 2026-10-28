@@ -13,15 +13,12 @@
 //! The oracle is the persisted records themselves: each case compares the listing with the
 //! endpoints the store holds for that Outpost, so no filter the handler invents can pass.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpostsState;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::endpoint_lifecycle::{
-    create, emulator_with_engine, list_endpoints, list_shared, minimal_create, owned_outposts,
-    shared_outpost, string_at, Answer, REGION,
+    create, create_endpoints, emulator_with_engine, list_endpoints, list_shared, minimal_create,
+    owned_outposts, reported_arns, shared_outpost, string_at, Listing,
 };
 
 /// Which Outpost of the fixture a case names: one of the two this account owns, or the one
@@ -43,60 +40,11 @@ async fn outpost_id(router: &MultiServiceRouter, which: Which) -> String {
     }
 }
 
-/// The `EndpointArn`s of the endpoints the STORE holds against `outpost`, in the order the
-/// store keeps them: the answer every listing of that Outpost owes, whoever owns each
-/// record.
-fn stored_arns(engine: &Arc<engine::InMemoryEngine>, outpost: &str) -> Vec<String> {
-    let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
-    let store = state.lock();
-    store
-        .endpoints
-        .values()
-        .filter(|record| record.outpost_id == outpost)
-        .map(|record| {
-            record.endpoint_arn(REGION).unwrap_or_else(|| {
-                panic!(
-                    "an endpoint on Outpost {} must have an EndpointArn",
-                    record.outpost_id
-                )
-            })
-        })
-        .collect()
-}
-
-/// The `EndpointArn`s an answer reports, in the order it reported them.
-fn reported_arns(answer: &Answer) -> Vec<String> {
-    answer
-        .endpoints()
-        .iter()
-        .map(|endpoint| string_at(endpoint, "EndpointArn"))
-        .collect()
-}
-
-/// Create `count` endpoints of this account on `outpost`, answering their ARNs. Each one
-/// sits in its own subnet so nothing is shared between them but the Outpost.
-async fn create_endpoints(
-    router: &MultiServiceRouter,
-    outpost: &str,
-    count: usize,
-    tag: usize,
-) -> Vec<String> {
-    let mut arns = Vec::with_capacity(count);
-    for index in 0..count {
-        let request = json!({
-            "OutpostId": outpost,
-            "SubnetId": format!("subnet-{:05x}{:012x}", tag, index),
-            "SecurityGroupId": format!("sg-{:05x}{:012x}", tag, index),
-        });
-        let answer = create(router, request).await;
-        assert_eq!(
-            answer.status, 200,
-            "creating endpoint {index} on {outpost} must answer 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-        arns.push(string_at(&answer.body, "EndpointArn"));
-    }
-    arns
+/// The listing of `outpost`, whose stored set is every endpoint record held against it,
+/// in the order the store keeps them — the answer every listing of that Outpost owes,
+/// whoever owns each record.
+fn stored_listing(outpost: &str) -> Listing {
+    Listing::EndpointsOn(outpost.to_string())
 }
 
 /// The listing of an Outpost is exactly the endpoints stored against it — the calling
@@ -130,7 +78,7 @@ async fn the_listing_of_an_outpost_is_every_endpoint_stored_against_it() {
             answer.status, answer.body
         );
 
-        let expected = stored_arns(&engine, &outpost);
+        let expected = stored_listing(&outpost).stored_arns(&engine);
         let reported = reported_arns(&answer);
         assert_eq!(
             reported, expected,
@@ -243,7 +191,7 @@ async fn paging_an_outposts_listing_walks_the_same_set_in_the_same_order() {
     let (router, engine) = emulator_with_engine();
     let shared = shared_outpost(&router).await;
     create_endpoints(&router, &shared, 5, 0xa).await;
-    let expected = stored_arns(&engine, &shared);
+    let expected = stored_listing(&shared).stored_arns(&engine);
     assert_eq!(
         expected.len(),
         6,
