@@ -24,6 +24,7 @@
 //! contrast.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_opensearch_amazonopensearchservice::state::PACKAGE_NOT_FOUND;
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
 
@@ -196,12 +197,15 @@ async fn a_collection_every_element_satisfies_is_not_refused() {
             }),
         )
         .await;
-        assert_ne!(
-            error_code(&answer),
-            "ValidationException",
+        // Nothing in this account holds the well-formed id the rows carry, so the only
+        // refusal left for them is the one a `PackageID` that resolves to no package
+        // gets: a list every element of which satisfies its shape states no constraint
+        // violation of its own.
+        let stated = message(&answer, case);
+        assert_eq!(
+            stated, PACKAGE_NOT_FOUND,
             "case {case:?}: a list every element satisfies must not be refused as invalid \
-             input, got {:?}",
-            answer.body
+             input, got {stated:?}"
         );
     }
 }

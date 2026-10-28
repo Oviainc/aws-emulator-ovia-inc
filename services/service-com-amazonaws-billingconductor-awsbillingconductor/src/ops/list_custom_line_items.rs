@@ -296,8 +296,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let (custom_line_items, next_token) =
-            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let (custom_line_items, next_token) = crate::state::paginate(
+            Self::NAME,
+            selected,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListCustomLineItemsErrorModeled::ValidationException)?;
 
         Ok(ListCustomLineItemsOutput {
             custom_line_items: Some(custom_line_items),

@@ -201,11 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The unique identifier of the package": the history belongs to the package
         // the request names, so an id this account holds no package under names no
-        // history — the modelled not-found refusal rather than an empty page.
+        // history — refused as the bad input value it is rather than as an empty page.
         let package = store.packages.get(&input.package_id).ok_or_else(|| {
-            GetPackageVersionHistoryErrorModeled::ResourceNotFoundException(package_not_found(
-                &input.package_id,
-            ))
+            GetPackageVersionHistoryErrorModeled::ValidationException(package_not_found())
         })?;
 
         // The versions of the content a package has had are a SEQUENCE numbered from

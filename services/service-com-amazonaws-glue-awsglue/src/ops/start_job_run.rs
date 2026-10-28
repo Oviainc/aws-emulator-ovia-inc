@@ -341,7 +341,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let run_id = crate::state::new_job_run_id();
-        let run = crate::state::JobRunEntry::start(job, &input, run_id.clone(), now, retries);
+        let run = crate::state::JobRunEntry::start(
+            job,
+            &input,
+            run_id.clone(),
+            now,
+            retries,
+            // "The name of the trigger that started this job run": a caller started this
+            // one, so no trigger did.
+            None,
+        );
         job.record_run(run);
         ::tracing::info!(
             operation = "StartJobRun",

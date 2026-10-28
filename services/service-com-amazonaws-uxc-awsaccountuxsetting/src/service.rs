@@ -63,13 +63,21 @@
 //! HTTP BINDING of the violated member off that operation's own input schema.
 //!
 //! The front door refuses a body it cannot READ on the same terms as one it read
-//! and rejected: a document that is not well-formed JSON, and a member whose JSON
-//! type is not the type the model gives it, never become an input at all, and the
-//! front door that validates a body against the shape will not act on either, so
-//! both earn the same `BadRequestException` answer. Only the request's BODY earns
-//! it: WHICH part of the request the codec could not read is decided by reading
-//! the same request again with no body at all (see [`read_request`]), so a value
-//! bound to the URI keeps the modelled wording.
+//! and rejected: a document that is not well-formed JSON, a well-formed document
+//! whose JSON type is not the object an input structure is read from, and a member
+//! whose JSON type is not the type the model gives it never become an input at
+//! all, and the front door that validates a body against the shape will not act on
+//! any of them, so they all earn the same `BadRequestException` answer. Whether
+//! the document is an object is asked of the BYTES ([`non_object_document`])
+//! rather than left to the codec, which reads some non-object documents as a
+//! structure with every member absent. Only the request's BODY earns the refusal:
+//! WHICH part of the request the codec could not read is decided by reading the
+//! same request again with no body at all (see [`read_request`]), so a value bound
+//! to the URI keeps the modelled wording.
+//!
+//! A request with no body, and one carrying the empty object, are not such
+//! bodies: they supply no member, which for an update is a request that sets
+//! nothing, not one the service cannot read.
 //!
 //! The same wrapper is why a URI-bound violation is answered with the MODELLED
 //! `ValidationException` value rather than through the refusal channel: that
@@ -357,8 +365,9 @@ pub fn sent_as_null(ctx: &OperationContext<'_>, member: &str) -> bool {
 ///
 /// Empty for a request with no body, a body that is not a JSON object, and a body
 /// this operation's input declares no `null` member of — including a body the
-/// codec cannot read, which is refused before this is reached
-/// ([`read_request`]) rather than re-judged here.
+/// codec cannot read and one that is well-formed JSON but not an object, both of
+/// which are refused before this is reached ([`read_request`]) for every operation
+/// that carries a member in the body, rather than re-judged here.
 fn members_sent_as_null<O: Operation>(req: &RtRequest) -> Vec<String> {
     let Some(bytes) = req.body().bytes() else {
         return Vec::new();
@@ -443,10 +452,22 @@ fn read_input<O: Operation>(
 /// own is reported as an unreadable body. An operation that carries no member in
 /// the body validates no body, so a codec failure there is never one of its
 /// ([`reads_a_body`]).
+///
+/// One class of body is placed WITHOUT the codec, before it is asked: a body that
+/// is a well-formed JSON document of a type other than an object travelled in the
+/// body by definition and declares no member of the input structure, so it is a
+/// body refusal whether or not the codec reports it ([`non_object_document`]).
 fn read_request<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
 ) -> RequestReading {
+    // Asked first, and asked of the request bytes: a well-formed document that is
+    // not a JSON object supplies no member of the input structure however the
+    // codec happens to treat it, so it is a body refusal before anything is read
+    // into the shape.
+    if let Some(failure) = non_object_document(O::INPUT_SCHEMA, req) {
+        return RequestReading::UnreadableBody(failure);
+    }
     let failure = match read_input::<O>(protocol, req) {
         Ok(input) => return RequestReading::Read(constraints::validate(&input, O::INPUT_SCHEMA)),
         Err(failure) => failure,
@@ -459,6 +480,53 @@ fn read_request<O: Operation>(
             RequestReading::UnreadableBody(failure)
         }
         _ => RequestReading::UnreadableRequest,
+    }
+}
+
+/// The failure to refuse `req` with when its body is a well-formed JSON document
+/// that is NOT a JSON object, or `None` when its body is not one of those.
+///
+/// An operation that carries members in the request body is defined over a
+/// structure, and the only JSON document a structure is read from is an object: a
+/// document of any other JSON type declares no member, so it is a body the service
+/// will not act on just as much as one that is not well-formed JSON. The codec
+/// reports most of them by failing, but not all — a well-formed document can be
+/// read as a structure with every member absent — so the question is asked of the
+/// bytes here, which is also where the neighbouring reading of the body lives
+/// ([`members_sent_as_null`]).
+///
+/// `None` for a body that IS a JSON object, for a request with no body, for a body
+/// that is not a well-formed JSON document at all — which the codec reports
+/// itself, with its own failure, so this does not restate what it will say — and
+/// for an operation that carries no member in the body, which validates no body
+/// ([`reads_a_body`]).
+///
+/// The reading holds while the body IS the input structure, which is every
+/// operation of this model: no member of it binds `@httpPayload`, which would make
+/// the body one member's own value and a bare JSON scalar a legal document for it.
+fn non_object_document(input_schema: &Schema, req: &RtRequest) -> Option<ProtocolError> {
+    if !reads_a_body(input_schema) {
+        return None;
+    }
+    let bytes = req.body().bytes()?;
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(_)) | Err(_) => None,
+        Ok(document) => Some(ProtocolError::Malformed(format!(
+            "the request body is a JSON {}, and a request body is read from an object",
+            json_type_name(&document)
+        ))),
+    }
+}
+
+/// The JSON type of `document`, by the name JSON gives that type.
+fn json_type_name(document: &serde_json::Value) -> &'static str {
+    match document {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 

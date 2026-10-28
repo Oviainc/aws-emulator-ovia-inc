@@ -183,6 +183,19 @@ pub const KEY_MANAGER_AWS: &str = "AWS";
 /// (`smithy_query(query="doc",shape="EncryptRequest",member="EncryptionAlgorithm")`).
 pub const ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT: &str = "SYMMETRIC_DEFAULT";
 
+/// The `EncryptionAlgorithmSpec` of RSAES-OAEP with SHA-1, from
+/// `smithy_query(query="shape",shape="EncryptionAlgorithmSpec")`: the OAEP scheme of
+/// RFC 8017 with SHA-1 as both the message digest and the hash of MGF1, which is the
+/// parameter set the published public half of an RSA KMS key encrypts under (see
+/// [`decrypt_asymmetric`]).
+pub const ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_1: &str = "RSAES_OAEP_SHA_1";
+
+/// The `EncryptionAlgorithmSpec` of RSAES-OAEP with SHA-256, the other algorithm an
+/// RSA KMS key advertises: "if you are using an asymmetric KMS key, we recommend
+/// RSAES_OAEP_SHA_256"
+/// (`smithy_query(query="doc",shape="EncryptRequest",member="EncryptionAlgorithm")`).
+pub const ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_256: &str = "RSAES_OAEP_SHA_256";
+
 /// The `RotationType` of a rotation a caller asked for, as opposed to `AUTOMATIC`,
 /// from `smithy_query(shape="RotationType")`.
 pub const ROTATION_TYPE_ON_DEMAND: &str = "ON_DEMAND";
@@ -2711,6 +2724,18 @@ impl Cmk {
                 .is_some_and(|profile| matches!(profile.material, MaterialKind::Aes256))
     }
 
+    /// Whether this key is an ASYMMETRIC KMS key: one whose key material is a key
+    /// pair, so the material KMS holds is the PRIVATE half and the public half is
+    /// published ([`Cmk::public_key`]). It is the partition that decides which
+    /// cryptographic scheme a key performs — "both symmetric or both asymmetric or
+    /// both HMAC"
+    /// (`smithy_query(query="doc",shape="UpdateAliasRequest",member="TargetKeyId")`) —
+    /// and it is read from the key's spec profile rather than from one spec's name.
+    pub fn is_asymmetric(&self) -> bool {
+        key_spec_profile(&self.key_spec)
+            .is_some_and(|profile| matches!(profile.material, MaterialKind::KeyPair))
+    }
+
     /// Add or edit this key's tags: "To add a tag, specify a new tag key and a tag
     /// value. To edit a tag, specify an existing tag key and a new tag value"
     /// (`smithy_query(query="doc",shape="TagResource")`). A tag key the key already
@@ -3759,7 +3784,10 @@ const RSA_SIGNING_ALGORITHMS: &[&str] = &[
 ];
 
 /// The `EncryptionAlgorithmSpec` values an RSA key pair supports.
-const RSA_ENCRYPTION_ALGORITHMS: &[&str] = &["RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"];
+const RSA_ENCRYPTION_ALGORITHMS: &[&str] = &[
+    ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_1,
+    ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_256,
+];
 
 /// The only `KeyAgreementAlgorithmSpec` (`smithy_query(shape="KeyAgreementAlgorithmSpec")`),
 /// which every spec that can derive a shared secret supports.
@@ -4442,6 +4470,98 @@ fn encryption_context_aad(context: Option<&HashMap<String, String>>) -> Vec<u8> 
         }
     }
     aad
+}
+
+// ---------------------------------------------------------------------------
+// Asymmetric encryption: a ciphertext produced OUTSIDE KMS
+// ---------------------------------------------------------------------------
+
+/// Why a ciphertext presented for an asymmetric KMS key could not be opened with the
+/// private half this store holds.
+#[derive(Debug)]
+pub enum AsymmetricRefusal {
+    /// No library reachable from here performs the encryption scheme this key pair and
+    /// algorithm name, so there is no plaintext to answer with. The KMS key is still
+    /// real — the caller is told the capability is not written yet rather than handed
+    /// bytes that are not the plaintext of its ciphertext.
+    Unsupported,
+    /// The bytes are not a ciphertext this key pair's private half opens under those
+    /// parameters: they were produced for another key, under another algorithm, or
+    /// they have been altered.
+    NotThisCiphertext,
+}
+
+/// The plaintext of `ciphertext`, which was encrypted under the PUBLIC half of `key`'s
+/// key pair — the bytes `GetPublicKey` publishes ([`public_key_spki`]) — with
+/// `encryption_algorithm`.
+///
+/// This is the one-way path an asymmetric encryption KMS key exists for: a party
+/// holding only the published public key encrypts without calling KMS at all, and only
+/// the private half held here opens the result. Nothing about the ciphertext says which
+/// key or algorithm produced it, so both come from the request; the ciphertext carries
+/// no additional authenticated data either, since "the standard asymmetric encryption
+/// algorithms ... that KMS uses do not support an encryption context"
+/// (`smithy_query(query="doc",shape="DecryptRequest",member="EncryptionContext")`).
+///
+/// The RSA-OAEP decryption comes from `aws-lc-rs` (`aws_lc_rs::rsa`), under the private
+/// key this store holds, with no label — the parameter set
+/// [`rsa_oaep_algorithm`] names for the algorithm. Nothing cryptographic is composed
+/// here.
+pub fn decrypt_asymmetric(
+    key: &Cmk,
+    encryption_algorithm: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, AsymmetricRefusal> {
+    let (Some(private_key), Some(key_pair)) = (
+        key.material.private_key_pkcs8(),
+        key_pair_kind(&key.key_spec),
+    ) else {
+        return Err(AsymmetricRefusal::Unsupported);
+    };
+
+    match key_pair {
+        KeyPairKind::Rsa(_) => {
+            let oaep_algorithm =
+                rsa_oaep_algorithm(encryption_algorithm).ok_or(AsymmetricRefusal::Unsupported)?;
+            let private_key = ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(private_key)
+                .map_err(|_| AsymmetricRefusal::Unsupported)?;
+            let key_size_bytes = private_key.key_size_bytes();
+            let private_key = ::aws_lc_rs::rsa::OaepPrivateDecryptingKey::new(private_key)
+                .map_err(|_| AsymmetricRefusal::Unsupported)?;
+            // An OAEP plaintext is shorter than the modulus the ciphertext occupies,
+            // so one modulus of room always holds it.
+            let mut plaintext = vec![0u8; key_size_bytes];
+            let len = private_key
+                .decrypt(oaep_algorithm, ciphertext, &mut plaintext, None)
+                .map_err(|_| AsymmetricRefusal::NotThisCiphertext)?
+                .len();
+            plaintext.truncate(len);
+            Ok(plaintext)
+        }
+        // SM2PKE, the public-key encryption of GM/T 0003-2012, is the one encryption
+        // scheme no library reachable from here performs; the remaining key pairs are
+        // signing and key-agreement pairs, whose specs advertise no encryption
+        // algorithm at all, so a request naming one is refused before it reaches here.
+        KeyPairKind::Sm2 | KeyPairKind::Ecdsa(_) | KeyPairKind::Ed25519 => {
+            Err(AsymmetricRefusal::Unsupported)
+        }
+    }
+}
+
+/// The RSA-OAEP parameters an `EncryptionAlgorithmSpec` names: the OAEP scheme of RFC
+/// 8017 with the digest the algorithm's own name carries, used both as the message
+/// digest and as the hash of MGF1.
+///
+/// `None` for an algorithm that is not one an RSA key pair encrypts under
+/// ([`RSA_ENCRYPTION_ALGORITHMS`] is that set).
+fn rsa_oaep_algorithm(
+    encryption_algorithm: &str,
+) -> Option<&'static ::aws_lc_rs::rsa::OaepAlgorithm> {
+    match encryption_algorithm {
+        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_1 => Some(&::aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1),
+        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_256 => Some(&::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------

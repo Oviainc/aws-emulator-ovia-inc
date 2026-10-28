@@ -9,9 +9,21 @@
 //! cannot describe one task differently. The object key the response names is derived from
 //! the AMI's id and read back out of the store.
 //!
-//! The same storage-location rule `CreateRestoreImageTask` and the FPGA-image create keep
-//! applies first: a bucket name outside Amazon S3's published naming rules names no bucket
-//! at all ([`crate::state::s3_bucket_name_is_well_formed`]), which is the same refusal. No
+//! The AMI is resolved by THIS operation's own validator, EC2's strict one: an image id it
+//! cannot resolve to an image the calling account can see is answered
+//! `InvalidAMIID.Malformed` whether or not the value reads like the long `ami-` id form
+//! ([`crate::state::require_resolvable_image`]), which is what the recorded unit
+//! `ec2-image-store-restore-error-paths#task#1` pins for this operation — the same answer
+//! `DescribeImageAttribute` gives, and not the malformed-before-not-found split the
+//! describes of the account's images keep.
+//!
+//! The same storage-location rule `CreateRestoreImageTask` keeps applies first: a bucket name
+//! outside Amazon S3's published naming rules names no bucket at all
+//! ([`crate::state::s3_bucket_name_is_well_formed`]), so it is refused as a malformed
+//! parameter ([`crate::state::invalid_s3_bucket_name`]) rather than as a location that could
+//! not be reached. An `ImageId` or `Bucket` the request carried EMPTY gave the parameter no
+//! value at all, which is EC2's `MissingParameter`, as it is for every other
+//! `clientOptional` `@required` member of this crate. No
 //! Amazon S3 object is written — this emulator stores none — so the task records the upload
 //! EC2 tracks, and nothing claims an object a later read could not find.
 //!
@@ -147,43 +159,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            MAX_S3_BUCKET_NAME_CHARS, MAX_STORE_IMAGE_TASKS, MAX_STORED_BYTES,
-            MIN_S3_BUCKET_NAME_CHARS, inaccessible_storage_location, require_service_state,
-            require_visible_image, s3_bucket_name_is_well_formed, store_image_task_limit_exceeded,
-            store_image_task_payload_bytes_for,
+            MAX_STORE_IMAGE_TASKS, MAX_STORED_BYTES, invalid_s3_bucket_name, missing_parameter,
+            require_resolvable_image, require_service_state, s3_bucket_name_is_well_formed,
+            store_image_task_limit_exceeded, store_image_task_payload_bytes_for,
         };
 
         // `ctx` carries request metadata only; this operation reads none of it. The store
         // is reached through the engine held on `self`.
         let _ = ctx;
 
-        // `Bucket` and `ImageId` are both `required`, so the boundary validator has already
-        // refused a request that omits either; an empty one that is PRESENT reaches here and
-        // is refused below — the bucket by its name rules, the AMI id as a malformed id.
+        // `ImageId` and `Bucket` are both `clientOptional` `@required`, so a request that
+        // sends either of them EMPTY reaches a handler with the empty string rather than
+        // being refused at the boundary. An empty value gave the parameter no value at all,
+        // which is a fact of the request: EC2 answers `MissingParameter` for it, naming the
+        // parameter that was not given, and answers it before anything is looked up or any
+        // other value is read.
+        for (parameter, value) in [("ImageId", &input.image_id), ("Bucket", &input.bucket)] {
+            if value.is_empty() {
+                return Err(missing_parameter(format!(
+                    "The request must contain the parameter {parameter}"
+                )));
+            }
+        }
 
         // "The name of the Amazon S3 bucket in which the AMI object will be stored"
         // (`Bucket`): EC2 names a bucket here rather than creating one, so what it can tell
         // about the name without reading another service's state is whether it is a bucket
-        // name at all — the same storage-location rule, and the same refusal, as
-        // `CreateRestoreImageTask` and the FPGA-image create keep.
+        // name at all. That is a fact of the PARAMETER, so it is read before anything is
+        // looked up — a value outside Amazon S3's published naming rules names no bucket,
+        // which is the malformed-parameter refusal `CreateRestoreImageTask` answers for the
+        // same value ([`crate::state::invalid_s3_bucket_name`]), not a location that could
+        // not be reached.
         if !s3_bucket_name_is_well_formed(&input.bucket) {
-            return Err(inaccessible_storage_location(format!(
-                "The S3 bucket '{}' is not an accessible storage location: an S3 bucket name \
-                 holds {MIN_S3_BUCKET_NAME_CHARS} to {MAX_S3_BUCKET_NAME_CHARS} lowercase \
-                 letters, digits, dots and hyphens, begins and ends with a letter or a digit, \
-                 and is not formatted as an IP address",
-                input.bucket
-            )));
+            return Err(invalid_s3_bucket_name());
         }
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
         store.materialize_due_transitions();
 
-        // "The ID of the AMI" (`ImageId`): an id that is not an AMI id is malformed, and one
-        // the account can see no image for does not exist — an AMI has to be there to be
-        // stored.
-        require_visible_image(&store, &input.image_id)?;
+        // "The ID of the AMI" (`ImageId`): an AMI has to be there to be stored, and this
+        // operation's validator is EC2's STRICT one — every id it cannot resolve to an image
+        // this account can see is `InvalidAMIID.Malformed`, whether or not the value reads
+        // like the long `ami-` id form ([`crate::state::require_resolvable_image`], which
+        // records why the malformed-before-not-found
+        // [`crate::state::require_visible_image`] is not what answers here). The image it
+        // hands back is dropped: no member of this response is a fact of the AMI — the task's
+        // object key is derived from its id — so the id is all this operation reads of it.
+        require_resolvable_image(&store, &input.image_id)?;
 
         // A count ceiling is not a memory bound on its own: the bucket name is
         // caller-sized, so the bytes this task would hold are asked for BEFORE the insert,

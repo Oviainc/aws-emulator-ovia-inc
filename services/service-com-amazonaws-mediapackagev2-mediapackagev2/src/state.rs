@@ -287,6 +287,27 @@ pub fn conflicting_operation() -> ConflictException {
     }
 }
 
+/// The whole conditional-write precondition, for every operation that binds
+/// `x-amzn-update-if-match`: an absent entity tag makes the write unconditional, a
+/// presented tag that IS the resource's committed one lets it proceed, and a presented tag
+/// that is not means somebody else committed first — the refusal
+/// [`conflicting_operation`] words, with nothing written.
+///
+/// `presented` is the request's optional `ETag` member and `committed` the tag the store
+/// holds the addressed resource at. Returns the refusal to answer with, or `None` when the
+/// write may proceed, which is the shape this crate's other cross-handler rules
+/// ([`channel_input_type_violation`], [`speke_role_arn_rejection`]) hand back — so the
+/// rule that SELECTS the refusal lives beside the sentence it selects and every
+/// conditional writer resolves through this one copy of it.
+pub fn stale_entity_tag_rejection(
+    presented: Option<&str>,
+    committed: &str,
+) -> Option<ConflictException> {
+    presented
+        .is_some_and(|tag| tag != committed)
+        .then(conflicting_operation)
+}
+
 // ---------------------------------------------------------------------------
 // The tagging front end's own rejections.
 //

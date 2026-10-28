@@ -121,6 +121,8 @@ mod parameter_refusal_codes;
 mod query_catalog_reads;
 #[path = "all/query_error_envelope.rs"]
 mod query_error_envelope;
+#[path = "all/reboot_db_shard_group.rs"]
+mod reboot_db_shard_group;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/sibling_control_plane_clusters.rs"]

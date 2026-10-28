@@ -190,6 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // One instant for the whole send, with the verification move the clock
+        // already owes each of this account's identities materialised against
+        // it: the sender gate below reads the status a caller reading the same
+        // identity at this instant is reported.
+        let now = SystemTime::now();
+        state.settle_identities(now);
+
         // The account-wide restriction, read before anything the request names:
         // this operation is served only to an account that has been granted
         // production access, whichever template, configuration set or address the
@@ -285,7 +292,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account (`GetSendQuota$Max24HourSend`, "the maximum number of emails the
         // user is allowed to send in a 24-hour interval"). A negative quota
         // "signifies an unlimited quota" (the member's own documentation).
-        let now = SystemTime::now();
         let quota = state.account.max_24_hour_send;
         let already_sent = state.sent_last_24_hours(now);
         if quota >= 0.0 && already_sent + 1.0 > quota {
@@ -298,14 +304,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Adds an email address to the list of identities for your Amazon SES
         // account in the current Amazon Web Services Region and attempts to verify
         // it": the same list, and the same recording of a verification, as
-        // `VerifyEmailIdentity`. The record is stored VERIFIED rather than
-        // pending, which is this store's one choice for every writer that adds an
-        // identity (`state::verify_identity` carries the reasoning): nothing here
-        // delivers the message, so nobody can follow the link in it, and a record
-        // left pending could never advance. A caller reading the address back
-        // therefore sees `Success` where AWS would still show `Pending` until the
-        // recipient confirms. `None` means the account is already at its identity
-        // limit, so the message is refused instead and nothing is logged.
+        // `VerifyEmailIdentity` — the address is recorded with its verification
+        // only REQUESTED, so it is not a sender until the move the clock owes it
+        // falls due (`state::verify_identity`). `None` means the account is
+        // already at its identity limit, so the message is refused instead and
+        // nothing is logged.
         if state
             .verify_identity(&address, crate::state::IdentityType::EmailAddress)
             .is_none()

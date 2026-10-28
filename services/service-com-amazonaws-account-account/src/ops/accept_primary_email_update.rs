@@ -12,10 +12,11 @@
 //! ([`crate::state::PRIMARY_EMAIL_UPDATE_COMPLETION`]).
 //!
 //! The order the refusals are decided in: the authorization rule, then the
-//! address's syntax, then the update's status, then the input members the
-//! request presents (the address, then the passcode), and last the conflict
-//! with another account's hold on the address — so a refused input member is
-//! reported as the 400 it is, whatever else the store holds.
+//! address's syntax, then whether there is an update at all (the modelled 404
+//! `ResourceNotFoundException`), then the update's status, then the input
+//! members the request presents (the address, then the passcode), and last the
+//! conflict with another account's hold on the address — so a refused input
+//! member is reported as the 400 it is, whatever else the store holds.
 //!
 //! ## Shape of an operation
 //!
@@ -243,11 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(update) = account.primary_email_update.as_mut() else {
             // Nothing originated from `StartPrimaryEmailUpdate` for this
-            // account, so there is no request to accept.
-            return Err(AcceptPrimaryEmailUpdateErrorModeled::ValidationException(
-                crate::state::no_primary_email_update(),
-            )
-            .into());
+            // account, so there is no request to accept. The account resolved
+            // and is readable and every input member was valid: the update this
+            // call acts on can't be found.
+            return Err(
+                AcceptPrimaryEmailUpdateErrorModeled::ResourceNotFoundException(
+                    crate::state::no_primary_email_update(),
+                )
+                .into(),
+            );
         };
 
         if !update.is_pending() {

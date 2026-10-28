@@ -129,6 +129,8 @@ mod single_package_dissociation;
 mod state_roundtrip;
 #[path = "all/tag_accumulation.rs"]
 mod tag_accumulation;
+#[path = "all/unresolvable_package_id.rs"]
+mod unresolvable_package_id;
 #[path = "all/upgrade_eligibility_checks.rs"]
 mod upgrade_eligibility_checks;
 #[path = "all/upgrade_history.rs"]

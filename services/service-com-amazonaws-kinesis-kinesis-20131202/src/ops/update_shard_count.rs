@@ -283,7 +283,7 @@ fn update_shard_count(
         return Err(UpdateShardCountErrorModeled::ResourceInUseException(
             ResourceInUseException {
                 message: Some(crate::state::stream_not_active_message(
-                    &identifier,
+                    &stream.name,
                     status,
                 )),
             },

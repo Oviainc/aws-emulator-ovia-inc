@@ -26,11 +26,14 @@
 //! read from the crate rather than written again here, and each is driven at the
 //! bound and one past it.
 
-use crate::harness::{call, element, emulator, field, xml_text, Field};
+use crate::harness::{
+    call, element, emulator_and_engine, field, settle_verifications, xml_text, Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::state::{
     MAX_MESSAGE_BYTES, MAX_MULTIPART_CONTAINERS, MAX_RECIPIENTS,
 };
 use smithy_server_runtime::MultiServiceRouter;
+use std::sync::Arc;
 
 /// The line ending RFC 5322 writes between header lines.
 const CRLF: &str = "\r\n";
@@ -76,8 +79,15 @@ async fn send_raw(
     call(router, "SendRawEmail", &params).await
 }
 
-/// `VerifyEmailIdentity`, which is what puts a sending identity in the store.
-async fn verify_email(router: &MultiServiceRouter, address: &str) {
+/// `VerifyEmailIdentity`, which is what asks for a sending identity — and then
+/// the store settled past the span that request leaves the record pending for,
+/// because what these rows are about is the send path rather than the span
+/// (`settle_verifications`).
+async fn verify_email(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    address: &str,
+) {
     let (status, body) = call(
         router,
         "VerifyEmailIdentity",
@@ -88,6 +98,7 @@ async fn verify_email(router: &MultiServiceRouter, address: &str) {
         status, 200,
         "case verify {address:?}: expected 200, got {status} with {body}"
     );
+    settle_verifications(engine);
 }
 
 /// `GetSendQuota`'s `SentLast24Hours`, which is DERIVED from the send log: it is
@@ -134,8 +145,8 @@ struct Accepted {
 
 #[tokio::test]
 async fn a_raw_message_is_accepted_in_every_form_its_headers_can_take() {
-    let router = emulator();
-    verify_email(&router, "sender@example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_email(&router, &engine, "sender@example.com").await;
 
     // The rows differ along what the rule generalises over: how many recipient
     // lines the message carries, how many addresses sit on one line, the form
@@ -360,8 +371,8 @@ async fn the_sender_is_the_source_parameter_or_the_messages_own_from_line() {
 
     for row in &rows {
         let case = row.case;
-        let router = emulator();
-        verify_email(&router, "sender@example.com").await;
+        let (router, engine) = emulator_and_engine();
+        verify_email(&router, &engine, "sender@example.com").await;
 
         let mut headers: Vec<(&str, &str)> = Vec::new();
         if let Some(from) = row.from {
@@ -401,8 +412,8 @@ async fn the_sender_is_the_source_parameter_or_the_messages_own_from_line() {
 
 #[tokio::test]
 async fn a_message_with_neither_a_source_nor_a_from_line_is_refused() {
-    let router = emulator();
-    verify_email(&router, "sender@example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_email(&router, &engine, "sender@example.com").await;
 
     // "If you do not provide a value for this parameter, you must specify a
     // 'From' address in the raw text of the message": neither, and there is no
@@ -452,8 +463,8 @@ async fn the_destinations_parameter_is_the_recipient_set_when_the_request_names_
         ("two destinations and no recipient line at all", &["a@example.net", "b@example.net"], "", 2.0),
     ];
     for (case, listed, header, expected) in rows {
-        let router = emulator();
-        verify_email(&router, "sender@example.com").await;
+        let (router, engine) = emulator_and_engine();
+        verify_email(&router, &engine, "sender@example.com").await;
         let mut headers: Vec<(&str, &str)> = vec![("From", "sender@example.com")];
         if !header.is_empty() {
             headers.push(("To", header));
@@ -487,12 +498,21 @@ fn recipient_line(n: usize) -> String {
 /// `levels` is exactly the number of `multipart/` declarations the message
 /// carries, which is what the handler counts.
 fn nested_multipart_message(levels: usize) -> String {
+    nested_message_declared_by(levels, &|boundary| {
+        format!("Content-Type: multipart/mixed; boundary=\"{boundary}\"")
+    })
+}
+
+/// A MIME tree `levels` containers deep, where `declare` writes the whole
+/// `Content-Type` header FIELD of each container from its boundary — so a row can
+/// vary how that field is SPELLED without varying the tree it builds.
+fn nested_message_declared_by(levels: usize, declare: &dyn Fn(&str) -> String) -> String {
     let mut inner = "Content-Type: text/plain\r\n\r\nThe deepest part.\r\n".to_string();
     for level in (0..levels).rev() {
         let boundary = format!("b{level}");
+        let field = declare(&boundary);
         inner = format!(
-            "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n\
-             --{boundary}\r\n{inner}\r\n--{boundary}--\r\n"
+            "{field}\r\n\r\n--{boundary}\r\n{inner}\r\n--{boundary}--\r\n"
         );
     }
     format!("From: sender@example.com\r\nTo: one@example.net\r\n{inner}")
@@ -534,8 +554,8 @@ async fn the_recipient_ceiling_is_the_published_one_wherever_the_recipients_come
         ),
     ];
     for (case, header, extra, expected) in &rows {
-        let router = emulator();
-        verify_email(&router, "sender@example.com").await;
+        let (router, engine) = emulator_and_engine();
+        verify_email(&router, &engine, "sender@example.com").await;
         let mut headers: Vec<(&str, &str)> = vec![("From", "sender@example.com")];
         if !header.is_empty() {
             headers.push(("To", header));
@@ -565,8 +585,8 @@ async fn a_message_past_the_published_size_is_refused_and_one_at_it_is_not() {
         ("a message of exactly the published maximum", MAX_MESSAGE_BYTES, 200u16),
         ("one byte past the published maximum", MAX_MESSAGE_BYTES + 1, 400),
     ] {
-        let router = emulator();
-        verify_email(&router, "sender@example.com").await;
+        let (router, engine) = emulator_and_engine();
+        verify_email(&router, &engine, "sender@example.com").await;
         let head = message(
             &[
                 ("From", "sender@example.com"),
@@ -625,8 +645,8 @@ async fn a_message_nested_past_the_multipart_ceiling_is_refused_and_one_at_it_is
             400,
         ),
     ] {
-        let router = emulator();
-        verify_email(&router, "sender@example.com").await;
+        let (router, engine) = emulator_and_engine();
+        verify_email(&router, &engine, "sender@example.com").await;
         let raw = nested_multipart_message(levels);
         let (status, body) = send_raw(&router, &raw, &[]).await;
         assert_eq!(
@@ -646,8 +666,8 @@ async fn a_message_nested_past_the_multipart_ceiling_is_refused_and_one_at_it_is
     // A message whose BODY merely mentions the media type is not a nested one:
     // only a `Content-Type` field declares a media type, so prose past the
     // ceiling is accepted.
-    let router = emulator();
-    verify_email(&router, "sender@example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_email(&router, &engine, "sender@example.com").await;
     let prose = (0..MAX_MULTIPART_CONTAINERS * 3)
         .map(|n| format!("line {n}: a multipart/mixed container holds parts.\r\n"))
         .collect::<String>();
@@ -668,8 +688,8 @@ async fn a_message_nested_past_the_multipart_ceiling_is_refused_and_one_at_it_is
 
     // A truncated tree — the closing boundaries cut off — is answered rather
     // than hung on, whichever way it is cut.
-    let router = emulator();
-    verify_email(&router, "sender@example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_email(&router, &engine, "sender@example.com").await;
     let full = nested_multipart_message(4);
     for (case, raw) in [
         ("a tree truncated mid-body", &full[..full.len() / 2]),
@@ -690,9 +710,103 @@ async fn a_message_nested_past_the_multipart_ceiling_is_refused_and_one_at_it_is
 }
 
 #[tokio::test]
+async fn the_container_ceiling_holds_however_the_content_type_field_is_spelled() {
+    // The ceiling is about the media type a part DECLARES, not about the bytes
+    // the declaration happens to be written in: a reader of the message unfolds
+    // the field, ignores the case of its name and of the media type and tolerates
+    // white space before the colon, so each of those spellings declares the same
+    // container and a tree built out of any of them is accepted at the ceiling
+    // and refused one level past it.
+    //
+    // The last row is the other side of that: a value a reader does NOT read as a
+    // media type — here the type written as an RFC 2047 encoded word, which is not
+    // a place encoded words are decoded — declares no container at all, so the
+    // message is one leaf whose body happens to carry that text. What matters for
+    // such a row is that the call is ANSWERED at any depth rather than walked: the
+    // declaration count and the tree the parser builds are read through the same
+    // reading, so neither one lets a nesting past the ceiling through. A
+    // declaration this suite can only write by hand is written through the codec
+    // the service reads it with (`aws_smithy_types::base64::encode`), never as a
+    // copied literal.
+    /// One row: how the container's `Content-Type` field is spelled, and the
+    /// status a tree of that spelling gets at the ceiling and one past it.
+    type Spelling<'row> = (&'row str, &'row dyn Fn(&str) -> String, u16, u16);
+    let spellings: &[Spelling<'_>] = &[
+        (
+            "the plain field",
+            &|boundary: &str| format!("Content-Type: multipart/mixed; boundary=\"{boundary}\""),
+            200,
+            400,
+        ),
+        (
+            "the name and the media type in another case",
+            &|boundary: &str| format!("CONTENT-type: MULTIPART/Mixed; boundary=\"{boundary}\""),
+            200,
+            400,
+        ),
+        (
+            "white space between the name and the colon",
+            &|boundary: &str| format!("Content-Type : multipart/mixed; boundary=\"{boundary}\""),
+            200,
+            400,
+        ),
+        (
+            "the value folded over two lines",
+            &|boundary: &str| {
+                format!("Content-Type: multipart/mixed;\r\n boundary=\"{boundary}\"")
+            },
+            200,
+            400,
+        ),
+        (
+            "the media type written as an RFC 2047 encoded word, which declares no media type",
+            &|boundary: &str| {
+                format!(
+                    "Content-Type: =?utf-8?B?{}?=; boundary=\"{boundary}\"",
+                    ::aws_smithy_types::base64::encode("multipart/mixed")
+                )
+            },
+            200,
+            200,
+        ),
+    ];
+
+    for (case, declare, at_the_ceiling, past_the_ceiling) in spellings {
+        for (levels, expected) in [
+            (MAX_MULTIPART_CONTAINERS, *at_the_ceiling),
+            (MAX_MULTIPART_CONTAINERS + 1, *past_the_ceiling),
+            (MAX_MULTIPART_CONTAINERS * 50, *past_the_ceiling),
+        ] {
+            let (router, engine) = emulator_and_engine();
+            verify_email(&router, &engine, "sender@example.com").await;
+            let raw = nested_message_declared_by(levels, *declare);
+            let (status, body) = send_raw(&router, &raw, &[]).await;
+            assert_eq!(
+                status, expected,
+                "case {case} at {levels} containers: expected HTTP {expected}, got {status} with \
+                 {body}"
+            );
+            if expected == 400 {
+                let (code, stated) = refusal(&body);
+                assert_eq!(
+                    code, "MessageRejected",
+                    "case {case} at {levels} containers: expected the modelled MessageRejected, \
+                     got {code:?} in {body}"
+                );
+                assert!(
+                    stated.contains(&MAX_MULTIPART_CONTAINERS.to_string()),
+                    "case {case} at {levels} containers: expected the refusal to name the \
+                     published ceiling, got {stated:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_malformed_or_unaddressed_message_is_refused_and_logs_nothing() {
-    let router = emulator();
-    verify_email(&router, "sender@example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_email(&router, &engine, "sender@example.com").await;
 
     // Each row is a message SES could not send, for a reason the operation's own
     // documentation states: no header/body separator, a header block that is not
@@ -772,7 +886,7 @@ async fn each_send_gate_is_refused_with_its_own_modelled_error() {
     let raw = simple_message("sender@example.com", "one@example.net");
 
     // An unverified sender.
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     let (status, body) = send_raw(&router, &raw, &[]).await;
     let (code, stated) = refusal(&body);
     assert_eq!(
@@ -786,7 +900,7 @@ async fn each_send_gate_is_refused_with_its_own_modelled_error() {
     );
 
     // A configuration set the account does not hold.
-    verify_email(&router, "sender@example.com").await;
+    verify_email(&router, &engine, "sender@example.com").await;
     let (status, body) = send_raw(
         &router,
         &raw,
@@ -880,7 +994,7 @@ async fn a_verified_domain_covers_the_mailboxes_that_send_from_it() {
     // The same reading of a verified sender as every other send: "You can only
     // send email from verified email addresses or domains", and a verified domain
     // covers the mailboxes in it and under its subdomains.
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     let (status, body) = call(
         &router,
         "VerifyDomainIdentity",
@@ -891,6 +1005,10 @@ async fn a_verified_domain_covers_the_mailboxes_that_send_from_it() {
         status, 200,
         "case VerifyDomainIdentity: expected 200, got {status} with {body}"
     );
+    // The request only ASKS for the domain's verification; these rows are about
+    // which mailboxes a verified domain covers, so the store is settled past the
+    // span rather than slept through.
+    settle_verifications(&engine);
 
     let cases: &[(&str, u16)] = &[
         ("anyone@example.org", 200),

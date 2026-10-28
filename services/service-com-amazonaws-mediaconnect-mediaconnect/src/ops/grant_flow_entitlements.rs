@@ -254,12 +254,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`GrantEntitlementRequest$EntitlementTags`) and an ARN of its own, so it is a
         // resource the tagging operations address: its tag map is bounded by the same rules
         // a tag write is (see `crate::state::tag_set_rejection`), checked before anything is
-        // stored.
+        // stored. `Subscribers` holds the ACCOUNTS the content is shared with, so each entry
+        // has to be able to be an account ID (see `crate::state::subscribers_rejection`) —
+        // the same rule UpdateFlowEntitlement applies when it replaces the list.
         for (index, entitlement) in input.entitlements.iter().enumerate() {
-            if let Some(rejection) = crate::state::tag_set_rejection(
-                &format!("Entitlements[{index}]"),
-                entitlement.entitlement_tags.as_ref(),
-            ) {
+            let member = format!("Entitlements[{index}]");
+            if let Some(rejection) =
+                crate::state::tag_set_rejection(&member, entitlement.entitlement_tags.as_ref())
+            {
+                return Err(bad_request(rejection));
+            }
+            if let Some(rejection) =
+                crate::state::subscribers_rejection(&member, &entitlement.subscribers)
+            {
                 return Err(bad_request(rejection));
             }
         }

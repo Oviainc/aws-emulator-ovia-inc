@@ -4,7 +4,7 @@
 //!
 //! Mints and persists a change data capture stream of a cluster: a fresh
 //! lowercase-ULID `streamIdentifier`, the ARN derived from it, the cluster and
-//! the request's region, `CREATING` with the clock owing it `ACTIVE`, and the
+//! the cluster's own region, `CREATING` with the clock owing it `ACTIVE`, and the
 //! target, ordering, format and tags the caller asked for. The target's
 //! `roleArn` has to be a role this account can pass.
 //!
@@ -331,7 +331,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stream_identifier = crate::state::new_resource_identifier();
         }
         let stream = crate::state::Stream {
-            arn: crate::state::stream_arn(&region, &cluster.identifier, &stream_identifier),
+            // A stream is nested UNDER its cluster (`cluster/{cluster}/stream/{stream}`),
+            // so its ARN carries the Region the CLUSTER lives in — the Region that
+            // cluster's own ARN was minted in (`crate::state::resource_region`) — and
+            // not the Region this request happens to be signed for.
+            arn: crate::state::stream_arn(
+                &crate::state::resource_region(&cluster.arn, &region),
+                &cluster.identifier,
+                &stream_identifier,
+            ),
             status: crate::state::STREAM_STATUS_CREATING.to_string(),
             creation_time: now,
             ordering: input.ordering.clone(),

@@ -6853,6 +6853,13 @@ pub const DOMAIN_PACKAGE_STATUS_DISSOCIATION_FAILED: &str = "DISSOCIATION_FAILED
 /// request and names neither the package nor the index.
 pub const PACKAGE_IN_USE: &str = "Operation not allowed. Package is in use.";
 
+/// The message every refusal of a `PackageID` that resolves to no package of this
+/// account carries ([`package_not_found`]).
+///
+/// The service's own fixed sentence for that condition: it is the WHOLE message and
+/// has no variable part, so the id the call could not resolve does not appear in it.
+pub const PACKAGE_NOT_FOUND: &str = "Package not found.";
+
 /// `ErrorDetails$ErrorType` for an association whose last transition failed — "the type
 /// of error that occurred".
 ///
@@ -7005,11 +7012,19 @@ pub fn package_reference_path(package: &Package) -> Option<String> {
         .then(|| format!("{ANALYZERS_DIRECTORY}/{}", package.package_id))
 }
 
-/// The `ResourceNotFoundException` payload for an id that names no package of this
-/// account — the package mirror of [`domain_not_found`].
-pub fn package_not_found(package_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Package not found: {package_id}")),
+/// The refusal every package operation answers a `PackageID` that resolves to no
+/// package of this account with.
+///
+/// The service treats such an id as a bad input VALUE rather than as a resource that
+/// is missing: a package that was deleted leaves no record behind, so there is no
+/// state for the call to conflict with and nothing about the request will ever make
+/// it succeed — which is the client-input refusal (HTTP 400) and not the
+/// conflict-shaped missing-resource one (HTTP 409). Its wording is the service's
+/// fixed sentence for that condition ([`PACKAGE_NOT_FOUND`]), which carries no value
+/// of the request: the rejected id is NOT interpolated into it.
+pub fn package_not_found() -> ValidationException {
+    ValidationException {
+        message: Some(PACKAGE_NOT_FOUND.to_string()),
     }
 }
 
@@ -7158,12 +7173,14 @@ pub struct AssociationRequest {
 /// though the error channels do not.
 #[derive(Debug)]
 pub enum AssociationRefusal {
-    /// The domain, the package, one of its prerequisites or the link itself names
-    /// nothing this account holds.
+    /// The link the call asks to remove is not there — the domain holds no
+    /// association with the package named.
     NotFound(ResourceNotFoundException),
     /// The package or the association is in a status that cannot serve the call.
     Conflict(ConflictException),
-    /// The request is not one the domain can serve as asked.
+    /// The request is not one the domain can serve as asked — a value it carries
+    /// (the domain, the package, one of its prerequisites) resolves to nothing, or
+    /// the request contradicts itself.
     Validation(ValidationException),
 }
 
@@ -7952,7 +7969,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         let package = self
             .packages
             .get(&request.package_id)
-            .ok_or_else(|| AssociationRefusal::NotFound(package_not_found(&request.package_id)))?;
+            .ok_or_else(|| AssociationRefusal::Validation(package_not_found()))?;
 
         // A package can be put on a domain only once its content is in place: until
         // then there is no version of it to associate, which is the conflict between
@@ -7984,9 +8001,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
                 )));
             }
             if !self.packages.contains_key(prerequisite) {
-                return Err(AssociationRefusal::NotFound(package_not_found(
-                    prerequisite,
-                )));
+                return Err(AssociationRefusal::Validation(package_not_found()));
             }
             // A prerequisite "must be linked to the domain before or simultaneously
             // with the package association": one the domain already holds satisfies
@@ -8088,7 +8103,7 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         let package = self
             .packages
             .get(package_id)
-            .ok_or_else(|| AssociationRefusal::NotFound(package_not_found(package_id)))?;
+            .ok_or_else(|| AssociationRefusal::Validation(package_not_found()))?;
 
         // The service runs one change to a domain's package associations at a time, so
         // a call made while another associate or dissociate on the SAME domain has not

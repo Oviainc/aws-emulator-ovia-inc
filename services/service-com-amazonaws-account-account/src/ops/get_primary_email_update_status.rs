@@ -4,8 +4,8 @@
 //! Reports the status of the MOST RECENT primary email update of the resolved
 //! account (the one the request names, else the caller's own), as
 //! `StartPrimaryEmailUpdate` recorded it. An account with no update has no
-//! status to report, so the call is refused with the modelled 400
-//! `ValidationException` rather than answered with an invented status.
+//! status to report, so the call is refused with the modelled 404
+//! `ResourceNotFoundException` rather than answered with an invented status.
 //!
 //! ## Shape of an operation
 //!
@@ -206,8 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(update) = account.primary_email_update.as_ref() else {
             // No update has ever been started for this account, and `Status` is a
             // REQUIRED output member: there is no most-recent update to report.
+            // The account resolved and is readable and the one input member was
+            // valid, so what this call named can't be found — the answer the
+            // readers of this service's other sub-resources give for the same
+            // condition.
             return Err(
-                GetPrimaryEmailUpdateStatusErrorModeled::ValidationException(
+                GetPrimaryEmailUpdateStatusErrorModeled::ResourceNotFoundException(
                     crate::state::no_primary_email_update(),
                 )
                 .into(),

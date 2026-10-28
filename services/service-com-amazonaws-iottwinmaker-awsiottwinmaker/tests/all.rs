@@ -65,6 +65,9 @@ mod execute_query_hierarchy;
 #[path = "all/harness.rs"]
 mod harness;
 
+#[path = "all/max_results_zero_page.rs"]
+mod max_results_zero_page;
+
 #[path = "all/metadata_transfer_job.rs"]
 mod metadata_transfer_job;
 

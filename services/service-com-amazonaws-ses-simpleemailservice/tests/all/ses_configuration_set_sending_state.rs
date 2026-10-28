@@ -22,7 +22,9 @@
 //!   with `ConfigurationSetDoesNotExist`, whatever the name and whichever flag
 //!   it asked for, and stores nothing.
 
-use crate::harness::{call, element, emulator, field, xml_text, Field};
+use crate::harness::{
+    call, element, emulator, emulator_and_engine, field, settle_verifications, xml_text, Field,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::time::SystemTime;
 
@@ -222,13 +224,17 @@ async fn the_sets_sending_flag_is_whatever_the_last_write_left() {
 
 #[tokio::test]
 async fn a_paused_set_refuses_a_send_naming_it() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
     ok(
         &router,
         "VerifyEmailIdentity",
         &[field("EmailAddress", "sender@example.com")],
     )
     .await;
+    // The request only ASKS for the address's verification; this suite is about a
+    // set's sending flag, so the store is settled past the span the clock owes
+    // the record rather than slept through.
+    settle_verifications(&engine);
     // Names spanning the forms the documented naming rule admits, so the rule is
     // asserted over the name as well as the flag.
     let names = ["paused-set", "Paused_Set_2", "z", &"a".repeat(64)];

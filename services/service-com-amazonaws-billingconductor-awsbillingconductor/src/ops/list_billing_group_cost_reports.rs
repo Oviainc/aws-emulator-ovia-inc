@@ -214,8 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (1..100) being the very bound `crate::state::paginate` clamps to — so the
         // charges are computed for at most one page of groups rather than for every group
         // the store holds.
-        let (page, next_token) =
-            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+        let (page, next_token) = crate::state::paginate(
+            Self::NAME,
+            selected,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(ListBillingGroupCostReportsErrorModeled::ValidationException)?;
 
         // "A summary report of actual Amazon Web Services charges and calculated Amazon
         // Web Services charges, based on the associated pricing plan of a billing group":

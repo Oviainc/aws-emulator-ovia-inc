@@ -30,8 +30,15 @@
 //! value is one the model's enum declares. That choice belongs to the shared
 //! write path both spellings use (`state::verify_identity`), not to this
 //! operation, so it is left to its own issue rather than fixed in place here.
+//! The address listing reports the addresses whose verification has GONE
+//! THROUGH, and the call only asks for it, so the rows settle the store past the
+//! span the clock owes each record (`harness::settle_verifications`) instead of
+//! waiting for it.
 
-use crate::harness::{call, element, elements, emulator, field, map_entries, Field};
+use crate::harness::{
+    call, element, elements, emulator, emulator_and_engine, field, map_entries,
+    settle_verifications, Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::ops::types::VERIFICATION_STATUS_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -111,7 +118,7 @@ async fn verification_attributes(
 
 #[tokio::test]
 async fn verify_email_address_records_the_mailbox_every_reader_reports() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
 
     assert!(
         verified_addresses(&router).await.is_empty(),
@@ -164,6 +171,7 @@ async fn verify_email_address_records_the_mailbox_every_reader_reports() {
                 status, 200,
                 "case {case} attempt {attempt}: expected 200, got {status} with {body}"
             );
+            settle_verifications(&engine);
 
             let listed = verified_addresses(&router).await;
             assert_eq!(
@@ -238,7 +246,7 @@ async fn verify_email_address_records_the_mailbox_every_reader_reports() {
 
 #[tokio::test]
 async fn the_deprecated_and_current_spellings_write_one_record() {
-    let router = emulator();
+    let (router, engine) = emulator_and_engine();
 
     // Both operations verify an email address, so whichever order a caller uses
     // them in, the account ends up holding ONE record for that mailbox. The rows
@@ -274,6 +282,7 @@ async fn the_deprecated_and_current_spellings_write_one_record() {
         for action in *actions {
             ok(&router, action, &[field("EmailAddress", *mailbox)]).await;
         }
+        settle_verifications(&engine);
         let listed = verified_addresses(&router).await;
         assert_eq!(
             listed.iter().filter(|entry| entry == mailbox).count(),
