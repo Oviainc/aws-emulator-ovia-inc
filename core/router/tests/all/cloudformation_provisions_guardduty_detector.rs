@@ -745,9 +745,9 @@ async fn re_deploying_a_detector_stack_keeps_the_detector_it_already_created() {
         cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
     assert_eq!(
         opt_element(&described, "StackStatus").as_deref(),
-        Some("UPDATE_FAILED"),
-        "case {case:?}: expected the stack to fail rather than report a change nothing \
-         applied, got {described}"
+        Some("UPDATE_ROLLBACK_COMPLETE"),
+        "case {case:?}: expected the stack to fail and roll back rather than report a change \
+         nothing applied, got {described}"
     );
     let (status, detector) =
         guardduty(&router, region, "GET", &format!("/detector/{detector_id}")).await;

@@ -3089,8 +3089,7 @@ impl StoredStack {
         }
     }
 
-    /// Open the ROLLBACK the UPDATE that has just failed owes, and say whether one was
-    /// opened.
+    /// Open the ROLLBACK the UPDATE that has just failed owes.
     ///
     /// "If the stack update fails, CloudFormation rolls back the stack to the previous stack
     /// configuration": the stack moves to `UPDATE_ROLLBACK_IN_PROGRESS` and the work that
@@ -3099,24 +3098,24 @@ impl StoredStack {
     /// knows what the update changed there.
     ///
     /// Called after [`Self::fail_transition`] has recorded the update's own failure, with
-    /// that failure's reason. Nothing is opened for an update that changed nothing in any
-    /// owning service (the previous configuration is the one in force already) or for a
-    /// caller that asked for the failed state to be kept (`DisableRollback`), which is the
-    /// same rule [`crate::ops::update_stack`]'s failure path follows.
-    pub fn begin_owed_update_rollback(&mut self, now: SystemTime, reason: String) -> bool {
+    /// that failure's reason. The rollback is owed HOWEVER far the update got: the plan the
+    /// handler held ([`Self::hold_rollback_plan`]) says what has to be put back in the owning
+    /// services, and an update that changed nothing there has a rollback that asks them for
+    /// nothing while the stack still goes through `UPDATE_ROLLBACK_IN_PROGRESS` to
+    /// `UPDATE_ROLLBACK_COMPLETE`. Nothing is opened only for a caller that asked for the
+    /// failed state to be kept (`DisableRollback`), which is the one update that parks at
+    /// `UPDATE_FAILED`.
+    pub fn begin_owed_update_rollback(&mut self, now: SystemTime, reason: String) {
         if self.disable_rollback {
             // The caller asked for the failed state to be KEPT, so nothing is put back now
             // — and the plan is kept with it: `RollbackStack` is the call that clears such a
             // stack up, and it is the only record of what the failed update changed in the
             // owning services.
-            return false;
+            return;
         }
-        let Some(plan) = self.rollback_plan.take() else {
-            return false;
-        };
+        let plan = self.rollback_plan.take();
         self.begin_update_rollback(now, reason);
-        self.owed_rollback = Some(plan);
-        true
+        self.owed_rollback = plan;
     }
 
     /// Hold what the ROLLBACK of the update in flight would owe the services that own the
@@ -3124,10 +3123,10 @@ impl StoredStack {
     /// it.
     ///
     /// Called by the handler that drove the update's own calls to those services, once it
-    /// has — only that handler knows what the update changed there. An update that changed
-    /// nothing in any owning service owes no rollback: the previous configuration is the one
-    /// in force, which is the rule [`crate::ops::update_stack`] follows for a failure a
-    /// service answered.
+    /// has — only that handler knows what the update changed there. It says WHAT such a
+    /// rollback has to put back, not whether one happens
+    /// ([`Self::begin_owed_update_rollback`] decides that): a plan over resources the update
+    /// left exactly as they were asks those services for nothing.
     pub fn hold_rollback_plan(&mut self, plan: Option<OwedRollback>) {
         self.rollback_plan = plan;
     }

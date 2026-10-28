@@ -9,7 +9,10 @@
 //! just as it does after `CreateStack`/`UpdateStack`. Executing it also DEPLOYS that
 //! template, which creates the resources it declares in the services that own them
 //! (`crate::state::provisioning`) and settles the stack in the FAILED status of the
-//! operation it opened when one of them refuses.
+//! operation it opened when one of them refuses. A failed CREATE is rolled back the way
+//! `CreateStack`'s is — what it had made is removed again — and a failed UPDATE is rolled
+//! back to the previous stack configuration the way `UpdateStack`'s is, however far the
+//! execution got, unless rollback is disabled for it.
 //!
 //! Executing a change set DEPLOYS its template, so the resources this emulator really
 //! CREATES (rather than only records) are created here through their own service, exactly
@@ -534,9 +537,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // The resources' own transitions come BEFORE the stack's terminal
                     // event: the event stream is what the execution did, in order.
                     stack.schedule_resource_events(&materialised.transitions);
+                    // What the ROLLBACK of a failed UPDATE would have to put back in the
+                    // services that own the resources, read before the records are replaced:
+                    // the set in force before this execution, against what it left there.
+                    let owed = crate::state::OwedRollback {
+                        previous: previous_resources.clone(),
+                        applied: materialised.resources.clone(),
+                    };
                     stack.record_materialised_resources(materialised.resources);
+                    // WHICH operation this execution opened, read once for both arms: a
+                    // CREATE change set creates the stack it had left in REVIEW_IN_PROGRESS,
+                    // an UPDATE one updates a stack that already exists, and the two end and
+                    // roll back differently.
+                    let creating = stack.status == status::CREATE_IN_PROGRESS;
                     match materialised.failure {
-                        None => None,
+                        None => {
+                            // The execution got through its calls to the owning services and
+                            // is not over: a wait condition it is held at, or a resource one
+                            // of those services has not reported ready, can still fail it,
+                            // with no call of its own to work out what that failure's
+                            // rollback owes them. So the plan is held HERE, exactly as
+                            // `UpdateStack` holds it, and
+                            // [`crate::state::settle_due_rollbacks`] performs it when that
+                            // failure falls due. Only an UPDATE has a previous configuration
+                            // to put back — a failed CREATE's rollback removes what it made
+                            // instead, which needs no plan.
+                            if !creating {
+                                stack.hold_rollback_plan(Some(owed));
+                            }
+                            None
+                        }
                         Some(failure) => {
                             // The deployment could not be carried out: the stack does not
                             // reach the status this execution was headed for, and it
@@ -546,7 +576,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // whose own refusals are on those resources' events, or
                             // CloudFormation's own diagnostic where it refused the
                             // deployment before asking anybody.
-                            let creating = stack.status == status::CREATE_IN_PROGRESS;
                             let failed = if creating {
                                 status::CREATE_FAILED
                             } else {
@@ -554,10 +583,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             };
                             let failed_at = ::std::time::SystemTime::now();
                             stack.fail_transition(failed_at, failed, failure.clone());
-                            if creating && !stack.disable_rollback {
-                                stack.begin_rollback(failed_at, failure);
-                                Some(stack.current_resources())
+                            if creating {
+                                if stack.disable_rollback {
+                                    None
+                                } else {
+                                    stack.begin_rollback(failed_at, failure);
+                                    Some(stack.current_resources())
+                                }
                             } else {
+                                // A failed UPDATE is rolled back to the previous stack
+                                // configuration, exactly as one `UpdateStack` started is and
+                                // however far this execution got: the plan says what those
+                                // services have to be asked to put back, and the rollback
+                                // this opens is carried out below
+                                // ([`crate::state::settle_due_rollbacks`]) before the
+                                // terminal status falls due.
+                                stack.hold_rollback_plan(Some(owed));
+                                stack.begin_owed_update_rollback(failed_at, failure);
                                 None
                             }
                         }
@@ -584,6 +626,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+
+        // Putting the previous configuration back in the services that own the resources is
+        // the work a failed UPDATE's rollback owes them, opened just above: it is performed
+        // through the one path every owed rollback of this service goes through, with the
+        // store unlocked, before the rollback's own terminal status falls due.
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
 
         Ok(ExecuteChangeSetOutput {})
     }

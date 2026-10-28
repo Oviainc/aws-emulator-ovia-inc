@@ -15,10 +15,15 @@
 //! the update is then ROLLED BACK to the previous stack configuration — put back in the
 //! services that own the resources it had already changed there — which lands the stack in
 //! `UPDATE_ROLLBACK_COMPLETE`, or in `UPDATE_ROLLBACK_FAILED` where one of them refuses to
-//! put a resource back. That rollback is owed however the update failed, including a
+//! put a resource back. That rollback is owed however the update failed and however far it
+//! got — an update whose very first resource the owning service refused changed nothing
+//! anywhere, so its rollback asks those services for nothing and the stack still reaches
+//! `UPDATE_ROLLBACK_COMPLETE` — including a
 //! failure the clock makes due after this call has answered: an update held at a wait
 //! condition whose `Timeout` runs out is rolled back the same way
-//! ([`crate::state::settle_due_rollbacks`]). A
+//! ([`crate::state::settle_due_rollbacks`]). Only a caller that asked for the failed state
+//! to be kept (`DisableRollback`) stops at `UPDATE_FAILED`, which is the status
+//! `ContinueUpdateRollback` and `RollbackStack` act on. A
 //! template that declares a transform the request has not acknowledged with
 //! `CAPABILITY_AUTO_EXPAND` is refused with the modelled
 //! `InsufficientCapabilitiesException`. A request whose `ClientRequestToken` an operation
@@ -226,8 +231,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    resource_status, status, StoredDeploymentConfig, StoredParameter,
-    StoredRollbackConfiguration, StoredStack, StoredTag,
+    status, StoredDeploymentConfig, StoredParameter, StoredRollbackConfiguration, StoredStack,
+    StoredTag,
 };
 
 /// The stored values this update is resolved against: every member the merge below reads
@@ -965,22 +970,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_id: Some(operation_id),
         };
         // What the failure (if any) owes the stack beyond the UPDATE_FAILED it records: the
-        // configuration to put back in the services that own the resources the update had
-        // already changed there.
+        // ROLLBACK of the update, and the configuration to put back in the services that own
+        // the resources the update had already changed there.
         //
         // "If the stack update fails, CloudFormation rolls back the stack to the previous
-        // stack configuration" — and a rollback is owed only where there is something to put
-        // back. An update whose first resource the owning service REFUSED changed nothing in
-        // any service, so the previous configuration is already the one in force: the stack
-        // stops at UPDATE_FAILED with that service's refusal, which is what a caller reading
-        // it has to act on. This is what the transitions say: a resource the update really
-        // carried its work out on reported a COMPLETED transition.
-        let applied_a_change = materialised.transitions.iter().any(|transition| {
-            transition.status == resource_status::UPDATE_COMPLETE
-                || transition.status == resource_status::CREATE_COMPLETE
-                || transition.status == resource_status::DELETE_COMPLETE
-        });
-        let rollback = {
+        // stack configuration" — so the rollback is what a failed update is owed WHATEVER the
+        // update got through before it failed. How far it got decides how much the rollback
+        // has to put back, never whether the stack rolls back: an update whose very first
+        // resource the owning service REFUSED changed nothing anywhere, so its rollback asks
+        // those services for nothing, and the stack still goes through
+        // UPDATE_ROLLBACK_IN_PROGRESS to UPDATE_ROLLBACK_COMPLETE — the terminal status a
+        // client waiting on a failed update reads. The one update that stops at
+        // UPDATE_FAILED is the one whose caller asked for the failed state to be kept
+        // (`DisableRollback`), which is the state `ContinueUpdateRollback` and
+        // `RollbackStack` act on.
+        let owed = crate::state::OwedRollback {
+            previous: previous_resources.clone(),
+            applied: materialised.resources.clone(),
+        };
+        {
             let mut store = state.lock();
             let Some(stack) = store.resolve_mut(&request_region, &stack_id) else {
                 return Ok(output);
@@ -993,95 +1001,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // event stream is what the update did, in the order it did it.
             stack.schedule_resource_events(&materialised.transitions);
             stack.record_materialised_resources(materialised.resources.clone());
-            match materialised.failure {
-                None => {
-                    // The update got through its calls to the owning services and is not
-                    // over: a wait condition it is held at can still fail it, with no call
-                    // of its own to work out what that failure's rollback owes those
-                    // services. So it is worked out HERE and held on the stack
-                    // (`crate::state::settle_due_rollbacks` performs it), under the same
-                    // rule the failure path below follows: a rollback is owed only where the
-                    // update really carried a change out, since otherwise the previous
-                    // configuration is the one in force.
-                    stack.hold_rollback_plan(applied_a_change.then(|| {
-                        crate::state::OwedRollback {
-                            previous: previous_resources.clone(),
-                            applied: materialised.resources.clone(),
-                        }
-                    }));
-                    None
-                }
-                Some(failure) => {
-                    // The deployment could not be carried out: the update does not reach
-                    // UPDATE_COMPLETE, and the stack reports what failed
-                    // ([`crate::state::provisioning::Materialised::failure`]) — the
-                    // summary of the resources an owning service refused, whose own
-                    // refusals are on those resources' events, or CloudFormation's own
-                    // diagnostic where it refused the deployment before asking anybody.
-                    let failed_at = ::std::time::SystemTime::now();
-                    stack.fail_transition(failed_at, status::UPDATE_FAILED, failure.clone());
-                    // Nothing to put back, or a caller that asked for the failed state to be
-                    // kept (`DisableRollback`), which says what it wants left behind. The
-                    // plan is HELD in the second case: `RollbackStack` is the call that
-                    // clears such a stack up, and this is the only record of what the failed
-                    // update changed in the owning services.
-                    if !applied_a_change || stack.disable_rollback {
-                        stack.hold_rollback_plan(applied_a_change.then(|| {
-                            crate::state::OwedRollback {
-                                previous: previous_resources.clone(),
-                                applied: materialised.resources.clone(),
-                            }
-                        }));
-                        None
-                    } else {
-                        stack.begin_update_rollback(failed_at, failure);
-                        Some(stack.provenance())
-                    }
-                }
-            }
-        };
-
-        // Putting the previous configuration back is the rollback's own work in the
-        // services that own the resources: the set the stack had BEFORE this update is
-        // declared again, against what the failed update left there.
-        if let Some(provenance) = rollback {
-            let reverted = crate::state::provisioning::reconcile(
-                ctx,
-                &region,
-                &provenance,
-                previous_resources.clone(),
-                &materialised.resources,
-            )
-            .await;
-            let mut store = state.lock();
-            if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
-                stack.schedule_resource_events(&reverted.transitions);
-                stack.record_materialised_resources(reverted.resources);
-                // What the rollback left each resource in, which is what a client reads
-                // back — and what says which resource a resumed rollback may skip.
-                stack.record_rollback_resource_statuses(
-                    &reverted.transitions,
-                    ::std::time::SystemTime::now(),
-                );
-                if let Some(failure) = reverted.failure {
-                    // "A stack goes into the UPDATE_ROLLBACK_FAILED state when
-                    // CloudFormation can't roll back all changes after a failed stack
-                    // update": a resource the owning service would not put back leaves the
-                    // stack there, which is the state `ContinueUpdateRollback` resumes from
-                    // — against what those services are still holding, which is why it is
-                    // kept.
-                    stack.fail_transition(
-                        ::std::time::SystemTime::now(),
-                        status::UPDATE_ROLLBACK_FAILED,
-                        failure,
-                    );
-                    stack.unreverted_rollback = Some(crate::state::OwedRollback {
-                        previous: previous_resources,
-                        applied: materialised.resources,
-                    });
-                }
+            // What a rollback of THIS update would have to put back in the services that own
+            // the resources — held whether or not the update has failed yet, since a wait
+            // condition it is held at can still fail it with no call of its own to work that
+            // out. The plan says WHAT such a rollback has to put back, which for an update
+            // that changed nothing anywhere is nothing at all.
+            stack.hold_rollback_plan(Some(owed));
+            if let Some(failure) = materialised.failure {
+                // The deployment could not be carried out: the update does not reach
+                // UPDATE_COMPLETE, and the stack reports what failed
+                // ([`crate::state::provisioning::Materialised::failure`]) — the summary of
+                // the resources an owning service refused, whose own refusals are on those
+                // resources' events, or CloudFormation's own diagnostic where it refused the
+                // deployment before asking anybody.
+                let failed_at = ::std::time::SystemTime::now();
+                stack.fail_transition(failed_at, status::UPDATE_FAILED, failure.clone());
+                // ...and the failed update is rolled back, unless its caller asked for the
+                // failed state to be kept (`DisableRollback`), which says what it wants left
+                // behind: that stack stays at UPDATE_FAILED with the plan still held, since
+                // `RollbackStack` is the call that clears it up and the plan is the only
+                // record of what the failed update changed in the owning services.
+                stack.begin_owed_update_rollback(failed_at, failure);
             }
         }
+
+        // Putting the previous configuration back is the rollback's own work in the services
+        // that own the resources, and it is performed through the ONE path every rollback
+        // this service owes goes through — with the store unlocked, and before the rollback's
+        // own terminal status falls due.
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
 
         Ok(output)
     }
