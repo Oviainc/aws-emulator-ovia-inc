@@ -55,6 +55,8 @@ mod image_set_series_attributes;
 mod image_set_version_listing;
 #[path = "all/import_job_listing.rs"]
 mod import_job_listing;
+#[path = "all/metadata_document_structure.rs"]
+mod metadata_document_structure;
 #[path = "all/regional_isolation.rs"]
 mod regional_isolation;
 #[path = "all/resource_tagging.rs"]

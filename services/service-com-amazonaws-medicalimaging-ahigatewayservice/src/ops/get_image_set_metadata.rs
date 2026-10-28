@@ -12,8 +12,13 @@
 //! The model names sixteen DICOM attributes and DICOM defines thousands, so an image set
 //! also holds the attributes written into it that the model does not name
 //! ([`crate::state::ImageSet::extra_attributes`]). Those are reported at the very path of
-//! this document they were written at, merged over the levels built above — an attribute
-//! is served from where it was stored, whether or not the model has a member for it.
+//! this document they were written at, merged INTO the levels built above — an attribute
+//! is served from where it was stored, whether or not the model has a member for it. The
+//! document the handler builds from state is what it reports: a stored attribute fills a
+//! place the document has nothing at, and never displaces a value computed here (the
+//! schema declaration, the two identifiers, a modelled attribute, the image frames of a
+//! SOP instance) or collapses a level of the hierarchy, so the document can only ever name
+//! the records it was built from.
 //!
 //! The document is JSON, written into the blob as it stands: `contentType` states the
 //! format a client reads it as ([`METADATA_CONTENT_TYPE`]), and `contentEncoding` — "the
@@ -94,7 +99,11 @@ use ::std::collections::BTreeMap;
 
 use ::serde_json::{Map, Value};
 
-use crate::state::{ImageFrame, ImageSet};
+use crate::state::{
+    ImageFrame, ImageSet, METADATA_DATASTORE_ID_KEY, METADATA_DICOM_KEY,
+    METADATA_IMAGE_SET_ID_KEY, METADATA_INSTANCES_KEY, METADATA_PATIENT_KEY,
+    METADATA_SCHEMA_VERSION_KEY, METADATA_SERIES_KEY, METADATA_STUDY_KEY,
+};
 
 /// The `contentType` this operation reports: the document in the blob is JSON.
 pub const METADATA_CONTENT_TYPE: &str = "application/json";
@@ -206,7 +215,7 @@ fn instances(image_set: &ImageSet) -> Value {
         instances.insert(
             uid.to_string(),
             ::serde_json::json!({
-                "DICOM": { "SOPInstanceUID": uid },
+                METADATA_DICOM_KEY: { "SOPInstanceUID": uid },
                 "ImageFrames": image_frames,
             }),
         );
@@ -242,8 +251,8 @@ fn series(image_set: &ImageSet) -> Value {
         series.insert(
             series_instance_uid.clone(),
             ::serde_json::json!({
-                "DICOM": Value::Object(dicom),
-                "Instances": instances(image_set),
+                METADATA_DICOM_KEY: Value::Object(dicom),
+                METADATA_INSTANCES_KEY: instances(image_set),
             }),
         );
     }
@@ -254,9 +263,14 @@ fn series(image_set: &ImageSet) -> Value {
 /// was written at.
 ///
 /// A DEEP merge over objects: a stored object descends into the document level of the same
-/// name, and anything else is the attribute's own value and takes the place the document
-/// held for it. So a level the document already builds gains the attributes stored under
-/// it, and a level the document has no member for appears because something stored one.
+/// name, so a level the document already builds gains the attributes stored under it, and a
+/// level the document has no member for appears because something stored one.
+///
+/// What the document already holds from state STANDS: the merge only fills places the
+/// document has nothing at. So a stored value never takes the place of a value this handler
+/// computed (the schema declaration, the identifiers naming the records the document was
+/// built from, a modelled attribute, the image frames of a SOP instance) and never collapses
+/// a level of the hierarchy it built, whatever it was stored under.
 fn merge_stored_attributes(document: &mut Value, stored: &Map<String, Value>) {
     let Some(level) = document.as_object_mut() else {
         return;
@@ -266,7 +280,10 @@ fn merge_stored_attributes(document: &mut Value, stored: &Map<String, Value>) {
             (Some(held), Value::Object(nested)) if held.is_object() => {
                 merge_stored_attributes(held, nested);
             }
-            _ => {
+            // The document already reports something computed from state here, so what was
+            // stored under the same name does not displace it.
+            (Some(_), _) => {}
+            (None, _) => {
                 level.insert(name.clone(), value.clone());
             }
         }
@@ -277,16 +294,18 @@ fn merge_stored_attributes(document: &mut Value, stored: &Map<String, Value>) {
 ///
 /// Every value in it is read from state: the two identifiers name the records the document
 /// was built from, and the attribute objects carry what has been stored for the image set
-/// and nothing besides.
+/// and nothing besides. The structure built here is what the document reports — the
+/// attributes stored for the image set are merged INTO it ([`merge_stored_attributes`]), so
+/// nothing a caller stored can report another identity for it or hide a level of it.
 fn metadata_document(datastore_id: &str, image_set: &ImageSet) -> Value {
     let mut document = ::serde_json::json!({
-        "SchemaVersion": METADATA_SCHEMA_VERSION,
-        "DatastoreID": datastore_id,
-        "ImageSetID": image_set.image_set_id,
-        "Patient": { "DICOM": patient_attributes(&image_set.dicom_tags) },
-        "Study": {
-            "DICOM": study_attributes(&image_set.dicom_tags),
-            "Series": series(image_set),
+        METADATA_SCHEMA_VERSION_KEY: METADATA_SCHEMA_VERSION,
+        METADATA_DATASTORE_ID_KEY: datastore_id,
+        METADATA_IMAGE_SET_ID_KEY: image_set.image_set_id,
+        METADATA_PATIENT_KEY: { METADATA_DICOM_KEY: patient_attributes(&image_set.dicom_tags) },
+        METADATA_STUDY_KEY: {
+            METADATA_DICOM_KEY: study_attributes(&image_set.dicom_tags),
+            METADATA_SERIES_KEY: series(image_set),
         },
     });
     merge_stored_attributes(&mut document, &image_set.extra_attributes);

@@ -53,13 +53,15 @@ pub(crate) const SERIES_UID: &str = "1.2.840.113619.2.1.2.3";
 
 /// The SOP Instance UID the seeded pixel data came from, so the served document has an
 /// instance level for a case that writes an attribute of one SOP instance.
-const SOP_UID: &str = "1.2.840.113619.2.1.1.4";
+pub(crate) const SOP_UID: &str = "1.2.840.113619.2.1.1.4";
 
 /// The Study Instance UID a seeded image set holds unless a case names another.
 ///
 /// `pub(crate)` because `crate::image_set_capacity` puts a retired image set in the same
-/// study, and `crate::image_set_series_attributes` seeds the same study while varying only
-/// the series — each of which is that suite's rule rather than this one's.
+/// study, `crate::image_set_series_attributes` seeds the same study while varying only the
+/// series, and `crate::metadata_document_structure` seeds an image set this way to assert
+/// the structure of the served document — each of which is that suite's rule rather than
+/// this one's.
 pub(crate) const STUDY_UID: &str = "1.2.840.113619.2.1.9.1";
 
 /// The `contentType` `GetImageSetMetadata` serves the document with.

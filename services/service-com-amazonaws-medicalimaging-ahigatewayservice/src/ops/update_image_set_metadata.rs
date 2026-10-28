@@ -36,7 +36,9 @@
 //!   of every series it names while no identifier says which series the image set holds —
 //!   are among those others; and an identifier that leaves takes the attributes of the
 //!   series it identified to the path of that series with it, so no stored attribute is
-//!   left where the document cannot report it ([`settle_modelled_series`]).
+//!   left where the document cannot report it ([`settle_modelled_series`]). What the
+//!   document says about ITSELF rather than about an image set ([`METADATA_COMPUTED_KEYS`])
+//!   names no attribute at all, so an update carrying one stores nothing for it.
 //! * `force` is what the model says it is: the flag that admits a change to
 //!   `Tag.StudyInstanceUID`, `Tag.SeriesInstanceUID`, `Tag.SOPInstanceUID` and
 //!   `Tag.StudyID`, and to a PRIVATE attribute of an individual SOP instance — a DICOM
@@ -146,7 +148,7 @@ use ::serde_json::{Map, Value};
 
 use crate::state::{
     ImageSet, ImageSetAttributes, ImageSetState, ImageSetWorkflowStatus,
-    PendingImageSetTransition,
+    PendingImageSetTransition, METADATA_COMPUTED_KEYS,
 };
 
 /// The validation path a refusal about the attributes to WRITE names.
@@ -166,15 +168,8 @@ const REVERT_TO_VERSION_PATH: &str = "updateImageSetMetadataUpdates.revertToVers
 /// The validation path a refusal about the study-wide flag names.
 const INCLUDE_STUDY_IMAGE_SETS_PATH: &str = "includeStudyImageSets";
 
-/// The document key that declares which SHAPE of aggregated metadata document this is,
-/// rather than naming an attribute of an image set — the one
-/// `crate::ops::get_image_set_metadata` writes at the top of every document it serves. An
-/// update document carries it to say how it is written, so there is nothing in it to
-/// store.
-const SCHEMA_VERSION_KEY: &str = "SchemaVersion";
-
 /// The patient level of the aggregated metadata document.
-const PATIENT_KEY: &str = "Patient";
+const PATIENT_KEY: &str = crate::state::METADATA_PATIENT_KEY;
 
 /// The study level of the aggregated metadata document.
 const STUDY_KEY: &str = crate::state::METADATA_STUDY_KEY;
@@ -186,7 +181,7 @@ const SERIES_KEY: &str = crate::state::METADATA_SERIES_KEY;
 const INSTANCES_KEY: &str = crate::state::METADATA_INSTANCES_KEY;
 
 /// The object holding one level's DICOM attributes, keyed by attribute keyword.
-const DICOM_KEY: &str = "DICOM";
+const DICOM_KEY: &str = crate::state::METADATA_DICOM_KEY;
 
 /// The attribute keywords the `force` flag exists for, from that member's own
 /// documentation: "Tag.StudyInstanceUID, Tag.SeriesInstanceUID, Tag.SOPInstanceUID, and
@@ -549,8 +544,9 @@ fn needs_force(path: &[String]) -> bool {
 /// Every attribute `document` names, in document order.
 ///
 /// A level of the document is an object; anything else is an attribute's VALUE, so an
-/// array (the image frames of one SOP instance) is one attribute rather than a level. The
-/// document's own schema declaration is not an attribute and is skipped.
+/// array (the image frames of one SOP instance) is one attribute rather than a level. What
+/// the document says about ITSELF — its schema declaration and the identifiers naming the
+/// records it describes ([`METADATA_COMPUTED_KEYS`]) — names no attribute and is skipped.
 fn attributes_of(document: &Map<String, Value>) -> Vec<DocumentAttribute> {
     let mut found = Vec::new();
     let mut path = Vec::new();
@@ -565,7 +561,7 @@ fn collect_attributes(
     found: &mut Vec<DocumentAttribute>,
 ) {
     for (name, value) in level {
-        if path.is_empty() && name == SCHEMA_VERSION_KEY {
+        if path.is_empty() && METADATA_COMPUTED_KEYS.contains(&name.as_str()) {
             continue;
         }
         path.push(name.clone());

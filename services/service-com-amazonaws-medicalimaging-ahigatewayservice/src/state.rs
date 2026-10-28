@@ -332,10 +332,13 @@ pub const IMAGE_SET_COPY_INCONSISTENT_METADATA_MESSAGE: &str =
 /// with no identifier from the request in it.
 pub const IMAGE_FRAME_NOT_FOUND_MESSAGE: &str = "ImageFrame resource is not found.";
 
-/// The `Study` level of the aggregated DICOM metadata document — the document
+/// The `Patient` level of the aggregated DICOM metadata document — the document
 /// `GetImageSetMetadata` serves, `UpdateImageSetMetadata` writes and `CopyImageSet`'s
 /// subset selector is written in. Held here because more than one operation reads a
 /// document by these level names, so they are spelled once.
+pub const METADATA_PATIENT_KEY: &str = "Patient";
+
+/// The `Study` level of that document.
 pub const METADATA_STUDY_KEY: &str = "Study";
 
 /// The map of series inside the study level of that document, keyed by Series Instance
@@ -344,6 +347,32 @@ pub const METADATA_SERIES_KEY: &str = "Series";
 
 /// The map of SOP instances inside one series of that document, keyed by SOP Instance UID.
 pub const METADATA_INSTANCES_KEY: &str = "Instances";
+
+/// The object holding one level's DICOM attributes in that document, keyed by attribute
+/// keyword.
+pub const METADATA_DICOM_KEY: &str = "DICOM";
+
+/// The key of that document declaring which SHAPE of document it is, written at the top of
+/// every document `GetImageSetMetadata` serves.
+pub const METADATA_SCHEMA_VERSION_KEY: &str = "SchemaVersion";
+
+/// The key of that document naming the data store the document was built from.
+pub const METADATA_DATASTORE_ID_KEY: &str = "DatastoreID";
+
+/// The key of that document naming the image set the document was built from.
+pub const METADATA_IMAGE_SET_ID_KEY: &str = "ImageSetID";
+
+/// The top-level keys of that document the service COMPUTES from the records it served the
+/// document out of, rather than naming an attribute of an image set: which shape of
+/// document it is, and which data store and image set it was built from. A document a
+/// caller sends carries them to say what it is written against, so there is nothing in them
+/// to store — which is why `UpdateImageSetMetadata` stores none of them and
+/// `GetImageSetMetadata` always reports its own.
+pub const METADATA_COMPUTED_KEYS: [&str; 3] = [
+    METADATA_SCHEMA_VERSION_KEY,
+    METADATA_DATASTORE_ID_KEY,
+    METADATA_IMAGE_SET_ID_KEY,
+];
 
 /// The text this service refuses a call that would act on a data store, or on the
 /// contents of one, that has not settled into `ACTIVE` with — one still `CREATING` or
