@@ -4216,6 +4216,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // states.)
         || resource_type == BACKUP_PLAN
         || resource_type == BACKUP_SELECTION
+        // An Amazon EC2 VPC and a subnet of one are two more: `CreateVpc` and
+        // `CreateSubnet` take no identifier at all — EC2 assigns each resource an id of its
+        // own published form — and "Ref returns the ID of the VPC" / "Ref returns the subnet
+        // ID", so the identifier in force is the one that service answered. The `vpc-`/
+        // `subnet-` value [`ec2_network_identity`] computes is the stand-in a declaration is
+        // resolved against before either exists, which the deployment then re-points at the
+        // id EC2 minted.
+        || resource_type == EC2_VPC
+        || resource_type == EC2_SUBNET
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -5097,6 +5106,13 @@ const EC2_ID_HEX_DIGITS: usize = 17;
 /// form, so a property of another resource that references it (a Resolver endpoint's
 /// `IpAddresses[].SubnetId`, a DB subnet group's `SubnetIds`) carries a value the owning
 /// service's own API accepts instead of a name it refuses.
+///
+/// For the two types this emulator really CREATES in Amazon EC2 — [`EC2_VPC`] and
+/// [`EC2_SUBNET`] ([`super::provisioner`]) — that computed value is only the STAND-IN a
+/// declaration is resolved against before either resource exists:
+/// [`identity_is_service_assigned`] names both, so the identifier in force is the one EC2
+/// answered its create with. For the rest it is still the identifier the stack reports,
+/// because nothing here holds such a resource yet.
 pub const EC2_VPC: &str = "AWS::EC2::VPC";
 pub const EC2_SUBNET: &str = "AWS::EC2::Subnet";
 pub const EC2_SECURITY_GROUP: &str = "AWS::EC2::SecurityGroup";
