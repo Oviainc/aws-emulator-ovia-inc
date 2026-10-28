@@ -197,58 +197,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "The actions initiated by this trigger when it fires": a trigger that names no
-        // action initiates nothing when it fires, so an empty list is refused rather than
-        // stored. The model makes `Actions` required, so a request reaching here carries
-        // the member; only its emptiness is left to decide.
-        if input.actions.is_empty() {
-            return Err(invalid_input(
-                crate::state::messages::TRIGGER_ACTIONS_REQUIRED.to_string(),
-            ));
-        }
-
-        // The members a type requires: "This field is required when the trigger type is
-        // SCHEDULED" (`Schedule`) and "...is CONDITIONAL" (`Predicate`). Without them the
-        // service would hold a trigger with nothing to decide when it fires.
-        if input.r#type == crate::state::TRIGGER_TYPE_SCHEDULED && input.schedule.is_none() {
-            return Err(invalid_input(
-                crate::state::messages::trigger_member_required("Schedule", &input.r#type),
-            ));
-        }
-        let conditions = input
-            .predicate
-            .as_ref()
-            .and_then(|predicate| predicate.conditions.as_ref())
-            .map_or(0, Vec::len);
-        if input.r#type == crate::state::TRIGGER_TYPE_CONDITIONAL && conditions == 0 {
-            return Err(invalid_input(
-                crate::state::messages::trigger_member_required("Predicate", &input.r#type),
-            ));
-        }
-
-        // "An optional field if only one condition is listed. If multiple conditions are
-        // listed, then this field is required" (`Predicate$Logical`): without it a
-        // multi-condition predicate does not say whether all or any of them must hold.
-        if conditions > 1
-            && input
-                .predicate
-                .as_ref()
-                .is_none_or(|predicate| predicate.logical.is_none())
-        {
-            return Err(invalid_input(
-                crate::state::messages::predicate_logical_required(conditions),
-            ));
-        }
-
-        // A `Schedule` is "a cron expression used to specify the schedule", whose
-        // documented form is `cron(<six fields>)`. Anything else is not a schedule this
-        // service can run, so it is refused rather than stored and reported back.
-        if let Some(schedule) = input.schedule.as_deref() {
-            if !crate::state::is_cron_expression(schedule) {
-                return Err(invalid_input(
-                    crate::state::messages::schedule_not_a_cron_expression(schedule),
-                ));
-            }
+        // Every check here is on the definition this create would store: one copy of the
+        // rule, shared with the update that overwrites a stored definition with another.
+        if let Some(message) = crate::state::trigger_definition_refusal(
+            &input.r#type,
+            input.schedule.as_deref(),
+            &input.actions,
+            input.predicate.as_ref(),
+        ) {
+            return Err(invalid_input(message));
         }
 
         // "Set to true to start SCHEDULED and CONDITIONAL triggers when created. True is
@@ -294,23 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.actions,
             input.predicate.as_ref(),
         ) {
-            let message = match missing {
-                // The job-definition miss is the same fixed sentence wherever a job is
-                // looked up, so a trigger that would run a job nothing holds is refused
-                // with it too, and discloses no name.
-                crate::state::TriggerReference::Job(_) => {
-                    crate::state::messages::JOB_NOT_FOUND.to_string()
-                }
-                crate::state::TriggerReference::Crawler(name) => {
-                    crate::state::messages::crawler_not_found(name)
-                }
-                crate::state::TriggerReference::Workflow(name) => {
-                    crate::state::messages::workflow_not_found(name)
-                }
-            };
             return Err(CreateTriggerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(message),
+                    message: Some(missing.refusal_message()),
                     from_federation_source: None,
                 },
             )

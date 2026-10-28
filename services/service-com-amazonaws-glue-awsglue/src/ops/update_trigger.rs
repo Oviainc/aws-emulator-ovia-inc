@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrigger
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrigger`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrigger::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Overwrites the definition of a trigger this service holds with the one the request's
+//! `TriggerUpdate` carries, and answers with the definition that overwrite leaves behind:
+//! "this object updates the previous trigger definition by overwriting it completely", so a
+//! definition member the update omits is left with no value rather than with the one the
+//! previous definition had. The members `TriggerUpdate` does not carry — the trigger's type,
+//! its state, the workflow it belongs to — are the create's and are not moved here.
+//!
+//! The replacement has to be a definition the service could fire, so the update is refused
+//! with `InvalidInputException` when it would leave the trigger initiating nothing, without
+//! the member its type requires (a `Schedule` for a scheduled trigger, a `Predicate` for a
+//! conditional one), with a multi-condition predicate that does not say whether all or any
+//! of them must hold, or with a `Schedule` that is no cron expression; and with
+//! `EntityNotFoundException` when no trigger of this Region has the requested name, or when
+//! an action or condition names a job or crawler this account does not hold (see
+//! [`crate::state::missing_trigger_reference`]). A refused update writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +156,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrigger` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTriggerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrigger"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault of its own, so an unreachable store is
+            // reported as that rather than as a client error the caller could act on —
+            // the same way `StartTrigger` reports it.
+            return Err(UpdateTriggerErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue trigger store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let update = &input.trigger_update;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // The trigger this request addresses is resolved FIRST: a trigger is served only
+        // through the endpoint that created it, so a name no trigger of THIS Region has
+        // addresses no trigger this endpoint can update, whatever the update carries.
+        let Some(stored) = store.trigger(&region, &input.name) else {
+            return Err(UpdateTriggerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::trigger_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The record this update would LEAVE BEHIND, built from the stored one: "this
+        // object updates the previous trigger definition by overwriting it completely"
+        // (`TriggerUpdate`), so the definition becomes the update's own members rather than
+        // a merge of them with what is stored, while the members `TriggerUpdate` carries no
+        // value for — the type, the state, the workflow — stay as the create left them.
+        // Nothing is stored until every check below has passed, so a refused update leaves
+        // the trigger exactly as it was.
+        let mut updated = stored.clone();
+        updated.apply_update(update);
+
+        // The definition has to be one the service could fire, by the same rule the create
+        // enforces on the definition it stores.
+        if let Some(message) = crate::state::trigger_definition_refusal(
+            &updated.trigger_type,
+            updated.schedule.as_deref(),
+            &updated.actions,
+            updated.predicate.as_ref(),
+        ) {
+            return Err(invalid_input(message));
+        }
+
+        // The entities the replacement definition runs and waits on have to exist for it to
+        // resolve, exactly as on the create: a trigger cannot be left running a job this
+        // Region does not hold. The workflow the trigger belongs to is NOT re-resolved —
+        // `TriggerUpdate` carries no `WorkflowName`, so this update does not move it.
+        if let Some(missing) = crate::state::missing_trigger_reference(
+            &store,
+            &region,
+            None,
+            &updated.actions,
+            updated.predicate.as_ref(),
+        ) {
+            return Err(UpdateTriggerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(missing.refusal_message()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // "The resulting trigger definition": the record is stored under the name it
+        // already had, and the answer is built from the same record, so a later read of the
+        // trigger reports exactly the definition this answer carries. The lock has been
+        // held since the trigger was read, so this write replaces the record that read
+        // reported.
+        ::tracing::info!(
+            operation = "UpdateTrigger",
+            trigger = %input.name,
+            region = %region,
+            trigger_type = %updated.trigger_type,
+            actions = updated.actions.len(),
+            "updated a Glue trigger"
+        );
+        let trigger = updated.to_trigger();
+        store.insert_trigger(&region, updated);
+
+        Ok(UpdateTriggerOutput {
+            trigger: Some(trigger),
+        })
     }
+}
+
+/// Refuse a request this operation models no more specific error for, with the modelled
+/// `InvalidInputException` ("The input provided was not valid.") and `message` as its
+/// wording. One helper, so every input refusal this handler makes answers alike.
+fn invalid_input(message: String) -> UpdateTriggerError {
+    UpdateTriggerErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }
