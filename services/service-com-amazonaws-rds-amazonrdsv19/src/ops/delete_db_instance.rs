@@ -255,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (false, None) => {
                 return Err(DeleteDBInstanceError::validation(
-                    "FinalDBSnapshotIdentifier must be specified unless SkipFinalSnapshot is enabled",
+                    crate::state::FINAL_SNAPSHOT_MEMBER_REQUIRED,
                 ));
             }
             _ => {}
