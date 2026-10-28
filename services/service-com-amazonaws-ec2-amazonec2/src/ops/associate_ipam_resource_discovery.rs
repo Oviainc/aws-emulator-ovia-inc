@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateIpamResourceDiscovery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateIpamResourceDiscovery`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: links the resource discovery the request names to the IPAM it names, stores
+//! that link as the modelled [`IpamResourceDiscoveryAssociation`] shape (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::insert_ipam_resource_discovery_association`]),
+//! recounts the IPAM's `ResourceDiscoveryAssociationCount`, and answers the association in
+//! `associate-in-progress` with the instant the clock owes it `associate-complete` recorded
+//! beside it. A replayed `ClientToken` answers with the association that token made, or
+//! refuses with `IdempotentParameterMismatch` when the rest of the request differs. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateIpamResourceDiscovery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateIpamResourceDiscovery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateIpamResourceDiscoveryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — an
+        // association belongs to the two resources it links, so "the IPAM home Region"
+        // (`IpamResourceDiscoveryAssociation$IpamRegion`) comes from the stored IPAM rather
+        // than from the Region this call was signed for. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // The request's own FORM first, before anything is resolved and before the DryRun arm
+        // below: "not an id of this kind at all" is a malformed request rather than a
+        // resource that does not exist, which is the order every resource of this crate asks
+        // the two questions in (`crate::state::require_well_formed_id`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateIpamResourceDiscovery"))
+        // The DISCOVERY is asked about first, and resolved first below: "Associates an IPAM
+        // resource discovery with an Amazon VPC IPAM" makes the discovery the resource being
+        // associated and the IPAM the one it is associated WITH, and the recorded corpus
+        // behind this operation shows AWS answering the discovery's own `NotFound` for a
+        // request whose IPAM the account does not hold either.
+        let discovery_id = input.ipam_resource_discovery_id.as_str();
+        state::require_well_formed_ipam_resource_discovery_id(discovery_id)?;
+        let ipam_id = input.ipam_id.as_str();
+        state::require_well_formed_id(
+            state::IPAM_ID_PREFIX,
+            ipam_id,
+            state::INVALID_IPAM_ID_MALFORMED,
+        )?;
+
+        // "A client token" (`AssociateIpamResourceDiscoveryRequest$ClientToken`): the token
+        // map keeps whatever it is given for the process's lifetime, so its length is bounded
+        // the way every other request-idempotent operation in this crate bounds it.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "Tag specifications" (`AssociateIpamResourceDiscoveryRequest$TagSpecifications`):
+        // the association is the only resource this call creates, so a specification naming
+        // any other resource type is refused rather than accepted and discarded — by the one
+        // helper every create in this crate bounds its tag payload with.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY_ASSOCIATION,
+            Self::NAME,
+        )?;
+
+        // The caller-chosen bytes this call would retain for the process's lifetime, asked of
+        // the store below: a COUNT ceiling admits megabytes on its own, because each record
+        // holds strings the caller chose the length of.
+        let payload_bytes = state::STORED_RECORD_OVERHEAD_BYTES
+            + state::tag_list_bytes(&tags)
+            + input.client_token.as_deref().unwrap_or_default().len();
+
+        // "A check for whether you have the required permissions for the action WITHOUT
+        // ACTUALLY MAKING THE REQUEST and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`AssociateIpamResourceDiscoveryRequest$DryRun`): the flag asks about PERMISSION,
+        // not about the resources the request names, so it is answered once the request's own
+        // form has been checked and before anything is resolved. Every caller of this
+        // emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts:
+        // an association whose `associate-complete` move has fallen due is already in that
+        // state, so the questions below are asked of the states things are ACTUALLY in.
+        store.materialize_due_transitions();
+
+        // "A resource discovery ID" (`$IpamResourceDiscoveryId`): a discovery this account
+        // holds none of is refused with the discovery's own `NotFound` code, and the owning
+        // account the association reports is then taken from that discovery.
+        if !store.ipam_resource_discoveries.contains_key(discovery_id) {
+            return Err(state::invalid_ipam_resource_discovery_id_not_found(
+                discovery_id,
+            ));
+        }
+        // "An IPAM ID" (`$IpamId`): likewise, and the association's IPAM ARN and home Region
+        // are taken from the stored IPAM rather than from the request.
+        if !store.ipams.contains_key(ipam_id) {
+            return Err(state::invalid_ipam_id_not_found(ipam_id));
+        }
+
+        // Idempotency: one client token names the one association it made, so a replay
+        // reports that association and writes nothing. Resolved after the two resources,
+        // because a replay the token cannot serve is a request that would NOT have succeeded.
+        if let Some(association_id) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store
+                    .ipam_resource_discovery_association_client_tokens
+                    .get(token)
+            })
+            .cloned()
+        {
+            let association = store
+                .ipam_resource_discovery_associations
+                .get(&association_id)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names resource discovery association \
+                         '{association_id}', which is not stored"
+                    ))
+                })?;
+            // A token is only idempotent for the REQUEST it was first given with: replayed
+            // with a different parameter it names an association the caller did not ask for,
+            // which EC2 refuses rather than answers.
+            if !same_request(association, ipam_id, discovery_id, &tags) {
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            return Ok(AssociateIpamResourceDiscoveryOutput {
+                ipam_resource_discovery_association: Some(association.clone()),
+            });
+        }
+
+        // One IPAM-and-discovery PAIR holds at most one association — the association IS that
+        // link, so a second one between the same pair would say nothing the first does not,
+        // which is EC2's `Resource.AlreadyAssociated`. This is what an IPAM's own default
+        // resource discovery runs into: `CreateIpam` already associated it.
+        if let Some(held) = store.ipam_resource_discovery_association(ipam_id, discovery_id) {
+            let association_id = held
+                .ipam_resource_discovery_association_id
+                .as_deref()
+                .unwrap_or_default();
+            return Err(state::resource_already_associated(format!(
+                "The resource discovery '{discovery_id}' is already associated with the IPAM \
+                 '{ipam_id}' by the association '{association_id}'"
+            )));
+        }
+
+        // The store's ceilings, asked before the first write: nothing in this emulator
+        // reclaims an association, so both the COUNT of records and the caller-chosen BYTES
+        // they retain are bounded. The ONE wording of the count refusal, so the pre-check and
+        // the writer's own `None` cannot answer it two ways.
+        let at_the_ceiling = || {
+            state::resource_limit_exceeded(format!(
+                "This emulator holds {max} IPAM resource discovery associations, which is as \
+                 many as it stores",
+                max = state::MAX_STORED_RECORDS_PER_STORE,
+            ))
+        };
+        if !store.has_ipam_resource_discovery_association_capacity() {
+            return Err(at_the_ceiling());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The writer asks the same ceiling again before it writes anything, so this arm is
+        // unreachable while the pre-check above holds; it is what keeps the refusal honest if
+        // the two ever stop agreeing.
+        let association_id = store
+            .insert_ipam_resource_discovery_association(
+                ipam_id,
+                discovery_id,
+                input.client_token.as_deref(),
+                tags,
+            )
+            .ok_or_else(at_the_ceiling)?;
+
+        // Read the answer back OUT of the store, so the caller sees the association a later
+        // reader will see rather than the request object.
+        store
+            .ipam_resource_discovery_associations
+            .get(&association_id)
+            .cloned()
+            .map(|association| AssociateIpamResourceDiscoveryOutput {
+                ipam_resource_discovery_association: Some(association),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the new resource discovery association '{association_id}' could not be \
+                     read back"
+                ))
+            })
     }
+}
+
+/// Does `association` — the one a replayed `ClientToken` names — hold what THIS request asks
+/// for?
+///
+/// Every member the request decides is compared, so a token replayed with any different
+/// parameter is refused with `IdempotentParameterMismatch` rather than answered with an
+/// association the caller did not ask for; the same contract `create_ipam_scope`'s
+/// `same_request` has for a scope. The tags are compared through the one tag-set comparison
+/// every create of this crate that honors a token uses ([`crate::state::same_tags`]). The
+/// members this service derives (the id, the ARN, the owner, the IPAM's ARN and Region, the
+/// default flag, the discovery status and the state) are not compared: they follow from the
+/// two resources that are.
+fn same_request(
+    association: &IpamResourceDiscoveryAssociation,
+    ipam_id: &str,
+    discovery_id: &str,
+    tags: &[Tag],
+) -> bool {
+    association.ipam_id.as_deref() == Some(ipam_id)
+        && association.ipam_resource_discovery_id.as_deref() == Some(discovery_id)
+        && crate::state::same_tags(association.tags.as_deref().unwrap_or_default(), tags)
 }

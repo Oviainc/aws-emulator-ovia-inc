@@ -1329,33 +1329,33 @@ pub fn alternate_contact_not_found() -> ResourceNotFoundException {
     }
 }
 
-/// The `ResourceNotFoundException` payload for a primary-email call on an
-/// account that has never had an update started: there is no update to report or
-/// to accept.
+/// The `ValidationException` payload for a primary-email call on an account that
+/// has never had an update started: there is no update to report or to accept.
 ///
 /// `GetPrimaryEmailUpdateStatus` reports "the status of the MOST RECENT primary
 /// email update" and models `Status` as REQUIRED, so an account with no update
 /// has no status to report and the call is refused rather than answered with an
 /// invented status; `AcceptPrimaryEmailUpdate` accepts "the request that
 /// originated from StartPrimaryEmailUpdate", so with no such request there is
-/// nothing it can accept. Either way the account resolved and is readable and
-/// every input member was valid: what is missing is the update the call names,
-/// so the refusal is the modelled 404 `ResourceNotFoundException` — "the
-/// operation failed because it specified a resource that can't be found" — the
-/// same answer [`alternate_contact_not_found`] and
-/// [`gov_cloud_account_not_linked`] give for a sub-resource an otherwise
-/// readable account does not hold. A 400 `ValidationException` would state an
-/// invalid input parameter, which is a different fact and leaves its modelled
-/// `reason` unpopulated.
+/// nothing it can accept. Account Management refuses that condition as a request
+/// it cannot act on — the modelled 400 `ValidationException`, "the operation
+/// failed because one of the input parameters was invalid" — rather than as a
+/// resource that is missing: the update is not a sub-resource a caller can
+/// address, it is the in-flight request the call's own parameters assume, so the
+/// refusal is terminal for this request instead of the retry-or-create signal a
+/// 404 reads as. Neither modelled `reason` covers it (the enum admits only an
+/// invalid Region opt target and a failed field validation, and no single input
+/// member is at fault), so `reason` and `fieldList` stay unset.
 ///
 /// INVARIANT OF THE REQUEST: the message names no account id, so it is the same
 /// sentence whichever account the call resolved to, as it is on the status read
 /// (where the account id can be absent from the request entirely) and on the
 /// acceptance.
-pub fn no_primary_email_update() -> ResourceNotFoundException {
-    ResourceNotFoundException {
+pub fn no_primary_email_update() -> ValidationException {
+    ValidationException {
         message: NO_PRIMARY_EMAIL_UPDATE_MESSAGE.to_string(),
-        error_type: None,
+        reason: None,
+        field_list: None,
     }
 }
 

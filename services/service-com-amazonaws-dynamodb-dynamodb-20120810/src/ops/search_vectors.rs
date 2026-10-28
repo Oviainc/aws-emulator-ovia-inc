@@ -270,8 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_values.as_ref(),
         )
         .check_all_referenced(&[
-            input.search_condition_expression.as_deref(),
-            input.projection_expression.as_deref(),
+            (
+                "SearchConditionExpression",
+                input.search_condition_expression.as_deref(),
+            ),
+            ("ProjectionExpression", input.projection_expression.as_deref()),
         ])
         .map_err(lift)?;
 

@@ -3593,6 +3593,46 @@ pub fn page_size(max_results: Option<i32>) -> usize {
         .max(1)
 }
 
+/// Serve one page of an already-selected sequence, and mint the `nextToken` that
+/// resumes it.
+///
+/// The walk itself, beside the rules [`page_size`], [`PageCursor`] and
+/// [`encode_page_token`] already state, so every paginated operation of this
+/// service performs ONE walk rather than a copy of it: resume at `offset` —
+/// where the previous page stopped — take one item BEYOND the page, whose
+/// presence is what says another page exists (so "is there more" never needs a
+/// second pass over the sequence), cut the page back to `page_size`, and carry a
+/// token only while that extra item was there, pointing at exactly the item this
+/// page stopped before.
+///
+/// `selected` is the sequence the caller's filters already narrowed, in the order
+/// the operation reports it; `filter_fingerprint` is the one that selection would
+/// be issued under, so a token can only resume the query it was minted for.
+pub fn serve_page<T, I>(
+    selected: I,
+    offset: usize,
+    page_size: usize,
+    filter_fingerprint: String,
+) -> (Vec<T>, Option<String>)
+where
+    I: IntoIterator<Item = T>,
+{
+    let mut page: Vec<T> = selected
+        .into_iter()
+        .skip(offset)
+        .take(page_size.saturating_add(1))
+        .collect();
+    let has_more = page.len() > page_size;
+    page.truncate(page_size);
+    let next_token = has_more.then(|| {
+        encode_page_token(&PageCursor {
+            offset: offset.saturating_add(page.len()),
+            filter_fingerprint,
+        })
+    });
+    (page, next_token)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

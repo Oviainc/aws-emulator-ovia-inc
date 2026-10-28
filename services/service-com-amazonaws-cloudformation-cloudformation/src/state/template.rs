@@ -4168,7 +4168,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// The three Route 53 Resolver types are in the same position: that service mints a
 /// `rslvr-`-prefixed id for an endpoint, a rule and a rule association, none of its creates
 /// takes one, and each type's `Ref` returns that id — the `Name` such a type declares is
-/// only "a friendly name that lets you easily find [it] in the Resolver dashboard".
+/// only "a friendly name that lets you easily find [it] in the Resolver dashboard". Its
+/// three DNS Firewall types are the same case ([`ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST`] and
+/// its siblings): a domain list, a rule group and a rule group association each carry the
+/// `rslvr-`-prefixed id that service minted, which is what their `Ref` returns and what
+/// every call on them takes.
 ///
 /// An API Gateway v2 api and an api mapping are two more: `CreateApi` and
 /// `CreateApiMapping` take no identifier and answer the `ApiId` / `ApiMappingId` that
@@ -4239,6 +4243,9 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == ROUTE53RESOLVER_ENDPOINT
         || resource_type == ROUTE53RESOLVER_RULE
         || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION
+        || resource_type == ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST
+        || resource_type == ROUTE53RESOLVER_FIREWALL_RULE_GROUP
+        || resource_type == ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION
         || resource_type == ROUTE53_HOSTED_ZONE
         // An Amazon Route 53 health check is one more: `CreateHealthCheck` takes no
         // identifier and answers the id Route 53 assigned, "Ref returns the health check
@@ -4687,6 +4694,23 @@ pub const ROUTE53RESOLVER_ENDPOINT: &str = "AWS::Route53Resolver::ResolverEndpoi
 pub const ROUTE53RESOLVER_RULE: &str = "AWS::Route53Resolver::ResolverRule";
 pub const ROUTE53RESOLVER_RULE_ASSOCIATION: &str =
     "AWS::Route53Resolver::ResolverRuleAssociation";
+
+/// The three Route 53 Resolver DNS Firewall resource types a stack creates in that service
+/// (the same `cloudFormationName: Route53Resolver`).
+///
+/// Each one's identifier is Route 53 Resolver's OWN to mint, exactly as for the three types
+/// above: `Ref` of a domain list returns its `rslvr-fdl-…` id, of a rule group its
+/// `rslvr-frg-…` id and of a rule group association its `rslvr-frgassoc-…` id, and none of
+/// the three calls that make them takes an identifier — a `Name` such a type declares is only
+/// "a name that lets you identify [it], to manage and use it". So the id a stack's output
+/// reports for one is the id that service answered with, which is what
+/// `GetFirewallDomainList`, `GetFirewallRuleGroup` and `GetFirewallRuleGroupAssociation`
+/// resolve.
+pub const ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST: &str =
+    "AWS::Route53Resolver::FirewallDomainList";
+pub const ROUTE53RESOLVER_FIREWALL_RULE_GROUP: &str = "AWS::Route53Resolver::FirewallRuleGroup";
+pub const ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION: &str =
+    "AWS::Route53Resolver::FirewallRuleGroupAssociation";
 
 /// The two Amazon Route 53 resource types a stack creates in that service (the Route 53
 /// model: `cloudFormationName: Route53`).

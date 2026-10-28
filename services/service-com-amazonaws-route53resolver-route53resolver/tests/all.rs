@@ -33,6 +33,8 @@ mod firewall_rule_group_listing;
 mod firewall_rule_group_policies;
 #[path = "all/firewall_rule_groups.rs"]
 mod firewall_rule_groups;
+#[path = "all/firewall_rules_and_associations.rs"]
+mod firewall_rules_and_associations;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/list_page_size_echo.rs"]

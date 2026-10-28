@@ -249,32 +249,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due, so this reader and `GetAutomationEvent` agree on
         // every event's status and a status filter selects on the current one.
         guard.events.settle_due(::std::time::SystemTime::now());
-        let matching: Vec<AutomationEvent> = guard
-            .events
-            .iter_in_order()
-            .filter(|event| {
-                crate::state::within_window(
-                    event.created_timestamp,
-                    Some(window_start),
-                    input.end_time_exclusive,
-                )
-            })
-            .filter(|event| crate::state::event_matches_filters(event, &filters))
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .map(crate::state::StoredEvent::to_automation_event)
-            .collect();
-
-        // One extra event was taken: its presence is what says another page
-        // exists, and the token resumes exactly where this page stopped.
-        let has_more = matching.len() > page_size;
-        let page: Vec<AutomationEvent> = matching.into_iter().take(page_size).collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_page_token(&crate::state::PageCursor {
-                offset: offset + page.len(),
-                filter_fingerprint: query_fingerprint,
-            })
-        });
+        // The events inside the window that match the filters are what gets
+        // paged, and the page walk is the one every paginated listing of this
+        // service performs: `crate::state::serve_page`.
+        let (page, next_token): (Vec<AutomationEvent>, Option<String>) = crate::state::serve_page(
+            guard
+                .events
+                .iter_in_order()
+                .filter(|event| {
+                    crate::state::within_window(
+                        event.created_timestamp,
+                        Some(window_start),
+                        input.end_time_exclusive,
+                    )
+                })
+                .filter(|event| crate::state::event_matches_filters(event, &filters))
+                .map(crate::state::StoredEvent::to_automation_event),
+            offset,
+            page_size,
+            query_fingerprint,
+        );
 
         Ok(ListAutomationEventsOutput {
             automation_events: Some(page),

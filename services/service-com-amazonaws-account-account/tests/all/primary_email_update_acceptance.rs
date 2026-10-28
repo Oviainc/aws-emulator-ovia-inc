@@ -12,7 +12,7 @@
 //! 2. Only an update that is still waiting for its passcode can be accepted: an
 //!    update already accepted (or completed) conflicts — HTTP 409
 //!    `ConflictException` — and an account with no update at all has nothing to
-//!    accept (HTTP 404 `ResourceNotFoundException`, or HTTP 403
+//!    accept (HTTP 400 `ValidationException`, or HTTP 403
 //!    `AccessDeniedException` for an account outside the caller's
 //!    organization, and for the caller's OWN account, which this operation
 //!    cannot target).
@@ -579,7 +579,7 @@ async fn a_passcode_that_is_not_the_one_that_was_sent_is_refused() {
 /// has never been told about is outside the caller's organization (HTTP 403),
 /// the caller's OWN account is not a target of this operation at all (HTTP
 /// 403), and an account that exists with no update started has nothing to
-/// accept (HTTP 404).
+/// accept (HTTP 400).
 #[tokio::test]
 async fn accepting_without_a_pending_update_is_refused() {
     let router = Emulator::new();
@@ -622,8 +622,8 @@ async fn accepting_without_a_pending_update_is_refused() {
         (
             "an account the store knows with no update started",
             known.to_string(),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
         ),
     ];
 

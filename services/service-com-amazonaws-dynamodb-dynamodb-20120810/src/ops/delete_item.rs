@@ -311,7 +311,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every token the request DEFINES must be one an expression uses: an unused
         // entry of either substitution table makes the whole request invalid.
         substitutions
-            .check_all_referenced(&[input.condition_expression.as_deref()])
+            .check_all_referenced(&[(
+                "ConditionExpression",
+                input.condition_expression.as_deref(),
+            )])
             .map_err(lift)?;
         // Like PutItem, DeleteItem accepts only NONE and ALL_OLD
         // (`DeleteItem$ReturnValues`).

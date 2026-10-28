@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InsightFeedback
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InsightFeedback`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InsightFeedback::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the caller's rating of ONE insight on the insight itself
+//! ([`crate::state::InsightFeedbackRecord`]) and answers with the status of that
+//! submission.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +82,23 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    feedback_text_too_long, unknown_insight_feedback_thumbs, InsightEntityRefusal,
+    InsightFeedbackRecord,
+};
+
+/// `InsightResponseStatus`' `SUCCESS` value — "the status of the feedback submission.
+/// Possible values are SUCCESS and ERROR" — what a submission this service recorded
+/// is answered with. One of [`super::types::INSIGHT_RESPONSE_STATUS_VALUES`].
+const FEEDBACK_SUBMITTED: &str = "SUCCESS";
+
+/// The longest `FeedbackText` a submission may carry: the member is
+/// `@length(min: 0, max: 1000)` — "maximum length is 1000 characters" — so text past
+/// that bound is not feedback this operation can record.
+const MAX_FEEDBACK_TEXT: usize = 1000;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +172,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InsightFeedback` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InsightFeedbackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InsightFeedback"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `Thumbs` targets an enum of exactly two values, the model's record of the
+        // ratings an insight can be given, so a value outside it is no rating at all
+        // and leaves nothing to record. The membership test is against the model's own
+        // generated catalog, so it cannot drift from the enum, and it is this
+        // operation's only enforcement of it: the member reaches the handler as a plain
+        // string.
+        if !INSIGHT_FEEDBACK_THUMBS_VALUES.contains(&input.thumbs.as_str()) {
+            return Err(InsightFeedbackErrorModeled::ValidationException(
+                unknown_insight_feedback_thumbs(&input.thumbs),
+            )
+            .into());
+        }
+
+        // "Optional text feedback providing additional details about the insight.
+        // Maximum length is 1000 characters": text past that bound is refused rather
+        // than recorded in part, and its length is measured in the characters the bound
+        // is stated in. This is the operation's only enforcement of the bound: the
+        // member reaches the handler as a plain string.
+        let length = input
+            .feedback_text
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
+        if length > MAX_FEEDBACK_TEXT {
+            return Err(InsightFeedbackErrorModeled::ValidationException(
+                feedback_text_too_long(length, MAX_FEEDBACK_TEXT),
+            )
+            .into());
+        }
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // The submission is feedback ABOUT one insight of one domain, and resolving
+        // that pair is the store's one decision
+        // ([`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::insight_for_feedback_mut`]):
+        // a domain this account does not hold, and an id that domain holds no insight
+        // under, each leave no insight the rating could be about.
+        let insight = store
+            .insight_for_feedback_mut(&input.entity, &input.insight_id)
+            .map_err(|refusal| match refusal {
+                InsightEntityRefusal::NotFound(payload) => {
+                    InsightFeedbackErrorModeled::ResourceNotFoundException(payload)
+                }
+                InsightEntityRefusal::Validation(payload) => {
+                    InsightFeedbackErrorModeled::ValidationException(payload)
+                }
+            })?;
+
+        // The rating is written onto the insight it rates, replacing whatever rating of
+        // that same insight an earlier submission left: one caller holds one verdict on
+        // an insight. "Optional text feedback" is kept exactly as the submission
+        // carried it, and absent where it carried none.
+        insight.feedback = Some(InsightFeedbackRecord {
+            thumbs: input.thumbs,
+            feedback_text: input.feedback_text,
+            submitted_at: now,
+        });
+
+        // "The status of the feedback submission": the rating is persisted by the time
+        // this is answered, so the submission succeeded.
+        Ok(InsightFeedbackOutput {
+            status: Some(FEEDBACK_SUBMITTED.to_string()),
+        })
     }
 }
+

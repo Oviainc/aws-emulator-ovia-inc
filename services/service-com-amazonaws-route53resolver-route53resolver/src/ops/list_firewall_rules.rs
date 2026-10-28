@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFirewallRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFirewallRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFirewallRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The page is cut out of the rules the named
+//! group holds ([`crate::state::FirewallRuleGroupRecord::rules`]), so the group's
+//! `RuleCount` and this list cannot disagree. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFirewallRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFirewallRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFirewallRules"))
+        // The engine is reachable from `&self` (constructor-injected); this pure
+        // read needs nothing from `ctx`: every member the rule shape declares is
+        // already on the record.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFirewallRulesErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `Action` narrows the collection to the rules carrying it, so a value
+        // outside the modelled enum is refused rather than silently matching
+        // nothing.
+        if let Some(action) = input.action.as_deref() {
+            if !crate::ops::types::ACTION_VALUES.contains(&action) {
+                return Err(ListFirewallRulesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Action must be one of {:?}",
+                            crate::ops::types::ACTION_VALUES
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Retrieves the firewall rules that you have defined for the specified
+        // firewall rule group": a pure read. The rules are reported in the order
+        // DNS Firewall processes them — "by order of priority, starting from the
+        // lowest setting" — which is a total order, each priority being unique
+        // within the group, so a page cut at an offset into it never depends on
+        // the order the rules happened to be created in.
+        let now = ::std::time::Instant::now();
+        let page = {
+            let store = state.lock();
+            let Some(group) = store.firewall_rule_groups.get(&input.firewall_rule_group_id) else {
+                return Err(ListFirewallRulesErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+                )
+                .into());
+            };
+            let mut selected: Vec<FirewallRule> = group
+                .rules
+                .iter()
+                .map(|record| record.to_rule(now))
+                .filter(|rule| {
+                    input
+                        .priority
+                        .is_none_or(|priority| rule.priority == Some(priority))
+                        && input
+                            .action
+                            .as_deref()
+                            .is_none_or(|action| rule.action.as_deref() == Some(action))
+                })
+                .collect();
+            selected.sort_by_key(|rule| rule.priority.unwrap_or(i32::MAX));
+            crate::state::paginate(
+                selected,
+                &crate::state::firewall_rule_list_scope(
+                    &input.firewall_rule_group_id,
+                    input.priority,
+                    input.action.as_deref(),
+                ),
+                input.max_results,
+                input.next_token.as_deref(),
+            )
+        };
+
+        let Some(page) = page else {
+            // This operation models no `InvalidNextTokenException`, so a cursor
+            // this service did not mint for this query is refused with the
+            // `ValidationException` it does model, rather than being read as
+            // "start from the beginning" and silently repeating page one.
+            return Err(ListFirewallRulesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "The NextToken you provided was not issued by this service for this query"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListFirewallRulesOutput {
+            firewall_rules: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

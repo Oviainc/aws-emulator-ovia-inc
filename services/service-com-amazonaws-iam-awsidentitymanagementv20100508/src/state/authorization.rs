@@ -109,6 +109,9 @@ pub const LIST_POLICIES: &str = "iam:ListPolicies";
 /// `iam:ListInstanceProfiles`.
 pub const LIST_INSTANCE_PROFILES: &str = "iam:ListInstanceProfiles";
 
+/// `iam:ListInstanceProfilesForRole`.
+pub const LIST_INSTANCE_PROFILES_FOR_ROLE: &str = "iam:ListInstanceProfilesForRole";
+
 /// `iam:ListPoliciesGrantingServiceAccess`.
 pub const LIST_POLICIES_GRANTING_SERVICE_ACCESS: &str = "iam:ListPoliciesGrantingServiceAccess";
 

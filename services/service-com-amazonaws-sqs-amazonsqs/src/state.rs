@@ -3727,25 +3727,13 @@ pub fn empty_batch_entry_value_message(operation: &str, position: usize, member:
 /// value [`MAXIMUM_MESSAGE_SIZE`] admits, so it is read from that attribute's documented
 /// range rather than written twice. A queue's own (possibly lowered)
 /// `MaximumMessageSize` bounds EACH message, not the sum of a batch's entries.
+///
+/// It is also the most message content ANY request of this service can carry, batch or
+/// not, which is what the transport ceiling is built from
+/// (`crate::service::max_request_body_bytes`): a request carrying more than this many
+/// bytes of payload is past what the service accepts however it is spelled.
 pub fn maximum_batch_payload_bytes() -> i64 {
     integer_bounds(MAXIMUM_MESSAGE_SIZE).1
-}
-
-/// The largest payload one request can carry that this service has to READ in order to
-/// judge it, in bytes.
-///
-/// A batch over the payload ceiling is refused by the SERVICE and not by the transport:
-/// `BatchRequestTooLong` — "the length of all the messages put together is more than the
-/// limit" — is a modelled error of the operation, so the request carrying that batch has
-/// to be read and deserialized before it can be answered with the code and the message
-/// that state which limit it broke. The largest request that can need that answer carries
-/// [`MAX_BATCH_ENTRIES`] entries, each holding at most one maximum-size message
-/// ([`maximum_batch_payload_bytes`], which is also the largest a single message may be),
-/// so that product is the most any one request can make this service read; past it a
-/// request carries more than ten maximum-size messages, which no batch operation of this
-/// service could act on however it is spelled.
-pub fn maximum_request_payload_bytes() -> i64 {
-    maximum_batch_payload_bytes().saturating_mul(i64::try_from(MAX_BATCH_ENTRIES).unwrap_or(1))
 }
 
 // ---------------------------------------------------------------------------

@@ -161,18 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // THE AUTHORIZATION GATE, asked before anything else about the request is examined,
-        // with the same predicate `AssociateUser` and the pre-handler gate in
-        // `crate::service` ask: an instance neither this service's fleet seam nor the
-        // service that OWNS instances reports cannot be shown to be the caller's, so the
-        // request fails closed whatever else it says — exactly as `AssociateUser` is
-        // refused identically however else the request is wrong. Asked before the store is
-        // locked, because resolving it reaches another service over the in-process
-        // callback.
-        if !crate::state::ec2_fleet::authorizes_instance(&*self.engine, ctx, &input.instance_id)
-            .await
-        {
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
-        }
+        // through the same one function `AssociateUser`, `DisassociateUser` and the
+        // pre-handler gate in `crate::service` reach it by: an instance neither this
+        // service's fleet seam nor the service that OWNS instances reports cannot be shown
+        // to be the caller's, so the request fails closed whatever else it says — exactly as
+        // `AssociateUser` is refused identically however else the request is wrong. Asked
+        // before the store is locked, because resolving it reaches another service over the
+        // in-process callback.
+        crate::state::ec2_fleet::authorize_instance(
+            &*self.engine,
+            ctx,
+            Some(input.instance_id.as_str()),
+        )
+        .await?;
 
         let mut state = state.lock();
         // The only write a read may make: the transition the clock already owed — an

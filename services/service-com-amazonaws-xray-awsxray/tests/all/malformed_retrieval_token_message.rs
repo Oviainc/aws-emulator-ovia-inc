@@ -6,11 +6,10 @@
 //!
 //! The rule the rows below generalise over: the refusal is TWO clauses — the
 //! operation's own clause naming the parameter and the value the request
-//! submitted, then the clause of the execution-id decoder the value was handed
-//! to — and the rejected value is substituted into EACH of them, so the value is
-//! recoverable from either clause alone. Nothing else in the sentence varies:
-//! the decoder's clause is the same sentence-cased phrase whatever operation was
-//! called and whatever the value was.
+//! submitted, then the fixed cause clause of the execution-id decoder the value
+//! was handed to. The rejected value is the sentence's only variable and it
+//! appears once, in the outer clause; the cause clause is the same text whatever
+//! operation was called and whatever the value was.
 //!
 //! Rows differ along what that rule generalises over: how the value misses the
 //! minted form (a character flipped inside the minted alphabet and width, a
@@ -43,9 +42,9 @@ const TOKEN_READERS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-/// The fixed lead-in of the decoder clause, as X-Ray words it: sentence-cased,
-/// and closed by the rejected value.
-const DECODER_CLAUSE: &str = "Invalid execution id provided: ";
+/// The decoder's cause clause, as X-Ray words it: fixed text, capitalised
+/// exactly this way, and naming no value.
+const DECODER_CLAUSE: &str = "Invalid Execution Id";
 
 /// The request body a reader needs to reach its token check: `TraceFormat` is a
 /// member of `ListRetrievedTraces` alone, and that operation judges it first.
@@ -132,7 +131,7 @@ async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
 
     for (case, token) in &rejected {
         for (operation, path, member) in TOKEN_READERS {
-            let expected = format!("Invalid {member} {token} passed: {DECODER_CLAUSE}{token}");
+            let expected = format!("Invalid {member} {token} passed: {DECODER_CLAUSE}");
             let refused = xray.call(path, &body(path, token)).await;
             assert_eq!(
                 (refused.status, refused.error_type.as_deref()),
@@ -144,8 +143,9 @@ async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
                 said, expected,
                 "case {case:?} on {operation}: expected {expected:?}, got {said:?}"
             );
-            // Each clause names the rejected value on its own, which is what
-            // tells an operator WHICH of several concurrent tokens failed.
+            // The outer clause names the rejected value, which is what tells an
+            // operator WHICH of several concurrent tokens failed; the cause
+            // clause states only why it could not be read.
             let (outer, inner) = said
                 .split_once(" passed: ")
                 .unwrap_or_else(|| panic!("case {case:?} on {operation}: expected two clauses, got {said:?}"));
@@ -153,15 +153,9 @@ async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
                 outer.contains(token.as_str()),
                 "case {case:?} on {operation}: the parameter clause must name the value, got {outer:?}"
             );
-            assert!(
-                inner.contains(token.as_str()),
-                "case {case:?} on {operation}: the decoder clause must name the value, got {inner:?}"
-            );
             assert_eq!(
-                inner,
-                format!("{DECODER_CLAUSE}{token}"),
-                "case {case:?} on {operation}: the decoder clause is sentence-cased and closed by \
-                 the value, got {inner:?}"
+                inner, DECODER_CLAUSE,
+                "case {case:?} on {operation}: the cause clause is fixed text, got {inner:?}"
             );
         }
     }

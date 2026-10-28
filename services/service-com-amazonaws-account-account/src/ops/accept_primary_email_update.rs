@@ -244,11 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(update) = account.primary_email_update.as_mut() else {
             // Nothing originated from `StartPrimaryEmailUpdate` for this
-            // account, so there is no request to accept. The account resolved
-            // and is readable and every input member was valid: the update this
-            // call acts on can't be found.
+            // account, so there is no request to accept — the same condition the
+            // status read states, worded the same way; see
+            // `crate::state::no_primary_email_update`.
             return Err(
-                AcceptPrimaryEmailUpdateErrorModeled::ResourceNotFoundException(
+                AcceptPrimaryEmailUpdateErrorModeled::ValidationException(
                     crate::state::no_primary_email_update(),
                 )
                 .into(),

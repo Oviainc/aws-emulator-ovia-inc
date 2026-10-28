@@ -332,8 +332,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entry of either substitution table makes the whole request invalid.
         substitutions
             .check_all_referenced(&[
-                input.update_expression.as_deref(),
-                input.condition_expression.as_deref(),
+                ("UpdateExpression", input.update_expression.as_deref()),
+                ("ConditionExpression", input.condition_expression.as_deref()),
             ])
             .map_err(lift)?;
         let report_item_collection = crate::state::returns_item_collection_metrics(

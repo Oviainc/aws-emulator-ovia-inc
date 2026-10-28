@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFirewallRuleGroupAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFirewallRuleGroupAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFirewallRuleGroupAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The page is cut out of the association
+//! records the associate wrote, narrowed by the four filters this operation
+//! models. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFirewallRuleGroupAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFirewallRuleGroupAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFirewallRuleGroupAssociations"))
+        // The engine is reachable from `&self` (constructor-injected); this pure
+        // read needs nothing from `ctx`: every member the association shape
+        // declares is already on the record.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListFirewallRuleGroupAssociationsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Status` narrows the collection to the associations carrying it, so a
+        // value outside the modelled enum is refused rather than silently
+        // matching nothing.
+        if let Some(status) = input.status.as_deref() {
+            if !crate::ops::types::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES.contains(&status)
+            {
+                return Err(
+                    ListFirewallRuleGroupAssociationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "Status must be one of {:?}",
+                                crate::ops::types::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "Retrieves the firewall rule group associations that you have defined":
+        // a pure read. The page is cut out of the stored records in creation
+        // order, and the cursor is a pure function of the offset, so nothing a
+        // later caller sees changes.
+        let now = ::std::time::Instant::now();
+        let page = {
+            let store = state.lock();
+            let selected: Vec<FirewallRuleGroupAssociation> = store
+                .firewall_rule_group_associations_in_creation_order()
+                .into_iter()
+                .filter(|record| {
+                    input.firewall_rule_group_id.as_deref().is_none_or(|id| {
+                        record.firewall_rule_group_id == id
+                    })
+                        && input
+                            .vpc_id
+                            .as_deref()
+                            .is_none_or(|vpc_id| record.vpc_id == vpc_id)
+                        && input
+                            .priority
+                            .is_none_or(|priority| record.priority == priority)
+                        && input
+                            .status
+                            .as_deref()
+                            .is_none_or(|status| record.status_at(now) == status)
+                })
+                .map(|record| record.to_association(now))
+                .collect();
+            crate::state::paginate(
+                selected,
+                &crate::state::firewall_rule_group_association_list_scope(
+                    input.firewall_rule_group_id.as_deref(),
+                    input.vpc_id.as_deref(),
+                    input.priority,
+                    input.status.as_deref(),
+                ),
+                input.max_results,
+                input.next_token.as_deref(),
+            )
+        };
+
+        let Some(page) = page else {
+            // This operation models no `InvalidNextTokenException`, so a cursor
+            // this service did not mint for this query is refused with the
+            // `ValidationException` it does model, rather than being read as
+            // "start from the beginning" and silently repeating page one.
+            return Err(
+                ListFirewallRuleGroupAssociationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "The NextToken you provided was not issued by this service for this query"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListFirewallRuleGroupAssociationsOutput {
+            firewall_rule_group_associations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

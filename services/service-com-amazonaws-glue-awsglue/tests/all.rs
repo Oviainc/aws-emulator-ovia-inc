@@ -19,6 +19,8 @@ mod asset_types;
 mod assets;
 #[path = "all/batch_delete_connection.rs"]
 mod batch_delete_connection;
+#[path = "all/batch_delete_partition.rs"]
+mod batch_delete_partition;
 #[path = "all/batch_get_crawlers.rs"]
 mod batch_get_crawlers;
 #[path = "all/batch_get_custom_entity_types.rs"]

@@ -71,7 +71,8 @@ struct InstanceGatedRoute {
 /// That is `AssociateUser`, `ListUserAssociations` and `DisassociateUser`, the three whose
 /// input declares the member (`smithy_query(query="operation",
 /// operation="AssociateUser,ListUserAssociations,DisassociateUser")`), and whose handlers
-/// each open with that predicate. Listing them in ONE table is what keeps the hoisted gate
+/// each open with that same gate ([`crate::state::ec2_fleet::authorize_instance`]). Listing
+/// them in ONE table is what keeps the hoisted gate
 /// from covering some of them and not others: the refusal a caller gets for an instance
 /// this service will not authorize cannot depend on which of those operations it called,
 /// nor on what else the request got wrong.
@@ -176,9 +177,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // why the decision lives here and not in the handlers.
         //
         // It covers EVERY such operation ([`INSTANCE_GATED_ROUTES`]), so the refusal does
-        // not depend on which one the caller reached for; each handler asks the same
-        // predicate again, so the two gates cannot disagree about a request that gets this
-        // far.
+        // not depend on which one the caller reached for; each handler runs the same gate
+        // again ([`crate::state::ec2_fleet::authorize_instance`]), so the two cannot
+        // disagree about a request that gets this far.
         //
         // What is picked here is the GATE, not the refusal: resolving the instance reaches
         // the service that owns instances, which cannot be awaited in this sync seam, so the
@@ -279,8 +280,8 @@ fn request_path(uri: &str) -> &str {
 /// It is an operation rather than a predicate because the decision needs an await: the
 /// account's EC2 instances are EC2's, so resolving the one a request names asks the service
 /// that owns them over the in-process callback
-/// ([`crate::state::ec2_fleet::authorizes_instance`]), the same resolution each handler
-/// makes. Running here is what puts that decision AHEAD of the boundary validator.
+/// ([`crate::state::ec2_fleet::instance_refusal`]), the same gate each handler asks.
+/// Running here is what puts that decision AHEAD of the boundary validator.
 ///
 /// An authorized request is handed to the modelled operation the route names, read off this
 /// service's own routing table, so it is served by exactly the centralized
@@ -291,12 +292,12 @@ fn request_path(uri: &str) -> &str {
 /// correct for a caller that reaches it without this seam. The cost is one extra
 /// `DescribeInstances` for one id, in process, on an authorized gated request.
 ///
-/// A request it refuses answers one thing: the non-modelled `UnauthorizedException` and its
-/// fixed sentence, with the SAME code, sentence and status the handler's own gate answers
-/// ([`crate::scaffolded::Scaffolded::unauthorized`]), so a caller cannot tell which gate
-/// refused the request — only that it was refused. It is rendered through the service's own
-/// protocol envelope (`refusal_response`), so a fail-closed refusal is shaped exactly like
-/// every other refusal this service sends.
+/// A request it refuses answers one thing: the refusal the gate itself carries, which is the
+/// very value a handler returns on its own error channel
+/// ([`crate::state::ec2_fleet::authorize_instance`]) — so the code and the sentence are not
+/// restated here and a caller cannot tell which gate refused the request, only that it was
+/// refused. It is rendered through the service's own protocol envelope (`refusal_response`),
+/// so a fail-closed refusal is shaped exactly like every other refusal this service sends.
 ///
 /// The refusal travels as an `Invalid` protocol error with no violations, which is what
 /// gives it the 400 this service reports a refusal with
@@ -324,18 +325,13 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
             // gives the gate nothing to authorize: there is no instance to resolve, so the
             // request goes on to the modelled operation and the framework's own refusal
             // stands.
-            let authorized = match named_instance(req) {
-                None => true,
-                Some(instance_id) => {
-                    crate::state::ec2_fleet::authorizes_instance(
-                        &*self.engine,
-                        ctx,
-                        &instance_id,
-                    )
-                    .await
-                }
-            };
-            if authorized {
+            let refusal = crate::state::ec2_fleet::instance_refusal(
+                &*self.engine,
+                ctx,
+                named_instance(req).as_deref(),
+            )
+            .await;
+            let Some(refusal) = refusal else {
                 // The modelled operation this route names, from this service's own
                 // model-derived routing table (keyed by operation name).
                 if let Some(operation) = svc.definition().routing_table().get(self.route.operation)
@@ -346,17 +342,21 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
                 // same model the route's path and operation come from. Answered as the
                 // request naming no modelled operation, which is what it would be.
                 return svc.definition().routing_error_response(req);
-            }
+            };
+            // The code travels to the telemetry row below as well as onto the wire, so it is
+            // read off the refusal once rather than named again here.
+            let code = refusal.code;
             let response = svc.definition().refusal_response(
                 aws_smithy_schema_server::ProtocolError::Invalid(Vec::new()),
                 Some(Refused {
-                    code: crate::scaffolded::UNAUTHORIZED_EXCEPTION_CODE.to_string(),
-                    message: crate::scaffolded::UNAUTHORIZED_EXCEPTION_MESSAGE.to_string(),
+                    code: code.to_string(),
+                    message: refusal.message,
                 }),
             );
             record_refusal(
                 ctx,
                 self.route.operation,
+                code,
                 response.status().as_u16(),
                 started.elapsed(),
             );
@@ -392,6 +392,7 @@ fn named_instance(req: &aws_smithy_runtime_api::http::Request) -> Option<String>
 fn record_refusal(
     ctx: &OperationContext<'_>,
     operation: &'static str,
+    code: &str,
     status: u16,
     latency: std::time::Duration,
 ) {
@@ -407,7 +408,7 @@ fn record_refusal(
         latency,
         Some(emulator_telemetry::OperationFailure::classify(
             status,
-            crate::scaffolded::UNAUTHORIZED_EXCEPTION_CODE,
+            code,
         )),
         smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
     );

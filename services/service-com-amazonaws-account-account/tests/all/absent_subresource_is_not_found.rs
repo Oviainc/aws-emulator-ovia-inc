@@ -4,13 +4,16 @@
 //! named sub-resource is not stored, over the real request path.
 //!
 //! RULE under test: when every input member of the request is valid and the
-//! account the call resolves to is one the caller may read, a sub-resource that
-//! account does not hold is the modelled HTTP 404 `ResourceNotFoundException`
-//! ("the operation failed because it specified a resource that can't be found");
-//! HTTP 400 `ValidationException` stays reserved for a request one of whose
-//! input parameters was invalid, and HTTP 403 `AccessDeniedException` for an
-//! account the caller may not read. The three conditions are therefore
-//! distinguishable by status code on every operation that models all three.
+//! account the call resolves to is one the caller may read, a STORED
+//! sub-resource that account does not hold — one the request addresses by name,
+//! an alternate contact or a GovCloud link — is the modelled HTTP 404
+//! `ResourceNotFoundException` ("the operation failed because it specified a
+//! resource that can't be found"), while an absent IN-FLIGHT primary-email
+//! update, which no request addresses and which only `StartPrimaryEmailUpdate`
+//! can bring into being, is the modelled HTTP 400 `ValidationException`: the
+//! call's own parameters assume a request that is not there. HTTP 403
+//! `AccessDeniedException` stays reserved for an account the caller may not
+//! read, so the conditions remain distinguishable by status code.
 //!
 //! The rows span what the rule generalises over rather than one request: the
 //! operation (the primary-email update status read and its acceptance, the
@@ -18,7 +21,7 @@
 //! (an email update, each of the three alternate-contact types, a GovCloud
 //! link), and how the account was resolved (named explicitly, or left out so
 //! the call resolves to the caller's own). Each absence row is paired with the
-//! write that CREATES the sub-resource, so the 404 is shown to come from the
+//! write that CREATES the sub-resource, so the refusal is shown to come from the
 //! store's contents and not from the operation being unimplemented, and with
 //! the invalid-input and unreadable-account rows the rule separates it from.
 
@@ -159,9 +162,11 @@ async fn make_readable(router: &MultiServiceRouter, case: &str, account_id: &str
     );
 }
 
-/// Every operation whose target account is readable and whose named
+/// Every operation whose target account is readable and whose named STORED
 /// sub-resource is absent answers the modelled 404, whichever sub-resource it
-/// is and however the account was resolved.
+/// is and however the account was resolved; the two primary-email calls, whose
+/// absent sub-resource is an in-flight request rather than a stored one, answer
+/// the modelled 400.
 #[tokio::test]
 async fn an_absent_subresource_of_a_readable_account_is_not_found() {
     let router = emulator();
@@ -171,18 +176,20 @@ async fn an_absent_subresource_of_a_readable_account_is_not_found() {
     let known = MEMBER_ACCOUNTS[0];
     make_readable(&router, "the shared readable member account", known).await;
 
-    // (case, uri, request) — the rows differ in the operation, in the
+    // (case, uri, request, expected) — the rows differ in the operation, in the
     // sub-resource named and in how the target account is resolved.
-    let mut cases: Vec<(String, &str, Value)> = vec![
+    let mut cases: Vec<(String, &str, Value, (u16, &str))> = vec![
         (
             "the status read of the caller's own account, which has no update".to_string(),
             "/getPrimaryEmailUpdateStatus",
             json!({}),
+            INVALID,
         ),
         (
             "the status read of a member account the store holds with no update".to_string(),
             "/getPrimaryEmailUpdateStatus",
             json!({"AccountId": known}),
+            INVALID,
         ),
         (
             "the acceptance of a member account the store holds with no update".to_string(),
@@ -192,16 +199,19 @@ async fn an_absent_subresource_of_a_readable_account_is_not_found() {
                 "PrimaryEmail": WELL_FORMED_ADDRESS,
                 "Otp": WELL_FORMED_OTP,
             }),
+            INVALID,
         ),
         (
             "the GovCloud report of the caller's own account, which has no link".to_string(),
             "/getGovCloudAccountInformation",
             json!({}),
+            NOT_FOUND,
         ),
         (
             "the GovCloud report of a member account the store holds with no link".to_string(),
             "/getGovCloudAccountInformation",
             json!({"StandardAccountId": known}),
+            NOT_FOUND,
         ),
     ];
     // One row per alternate-contact type the model admits, on both the operation
@@ -211,17 +221,19 @@ async fn an_absent_subresource_of_a_readable_account_is_not_found() {
             format!("the read of an unset {contact_type} contact of the caller's own account"),
             "/getAlternateContact",
             json!({"AlternateContactType": contact_type}),
+            NOT_FOUND,
         ));
         cases.push((
             format!("the delete of an unset {contact_type} contact of a member account"),
             "/deleteAlternateContact",
             json!({"AccountId": known, "AlternateContactType": contact_type}),
+            NOT_FOUND,
         ));
     }
 
-    for (case, uri, request) in cases {
+    for (case, uri, request, expected) in cases {
         let answer = call(&router, uri, request).await;
-        assert_refused(&case, &answer, NOT_FOUND);
+        assert_refused(&case, &answer, expected);
     }
 }
 
@@ -242,7 +254,7 @@ async fn the_same_call_reports_the_subresource_once_it_is_stored() {
         json!({"AccountId": account_id}),
     )
     .await;
-    assert_refused("the update before it is started", &before, NOT_FOUND);
+    assert_refused("the update before it is started", &before, INVALID);
 
     let started = call(
         &router,

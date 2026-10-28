@@ -259,18 +259,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|action| crate::state::recommended_action_matches_filters(action, &filters)),
         );
 
-        // The page walk is the same one every paginated list of this service
-        // performs — one group beyond the page is what says another page exists,
-        // and the token resumes exactly where this page stopped.
-        let taken: Vec<crate::state::ActionGroup> = grouped
+        // The groups are what gets paged, and the page walk is the one every
+        // paginated listing of this service performs:
+        // `crate::state::serve_page`. Each group is projected into the modelled
+        // summary afterwards, so the projection runs only for the page served.
+        let (groups, next_token): (Vec<crate::state::ActionGroup>, Option<String>) =
+            crate::state::serve_page(grouped, offset, page_size, filter_fingerprint);
+        let page: Vec<RecommendedActionSummary> = groups
             .into_iter()
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .collect();
-        let has_more = taken.len() > page_size;
-        let page: Vec<RecommendedActionSummary> = taken
-            .into_iter()
-            .take(page_size)
             .map(|group| RecommendedActionSummary {
                 key: group.key,
                 total: RecommendedActionTotal {
@@ -279,12 +275,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             })
             .collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_page_token(&crate::state::PageCursor {
-                offset: offset + page.len(),
-                filter_fingerprint,
-            })
-        });
 
         Ok(ListRecommendedActionSummariesOutput {
             recommended_action_summaries: Some(page),
