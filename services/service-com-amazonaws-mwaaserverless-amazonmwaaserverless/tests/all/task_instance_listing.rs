@@ -24,10 +24,10 @@
 //! length of a completed span, the form and length of the `TaskInstanceId`, and where a
 //! presented cursor came from.
 //!
-//! No modelled operation of this service CREATES a task instance: one exists only once
-//! something executes a workflow definition, and this emulator has no Apache Airflow
-//! engine to execute one with, so every run it starts holds none. These tests therefore
-//! seed the records into the store the handler reads — through
+//! A run creates one task instance per task its workflow definition declares, and
+//! `run_execution_outcome` covers the listing over the records that execution produces.
+//! These tests cover the paging and the reported members over values that execution does
+//! not produce, so they seed the records into the store the handler reads — through
 //! `task_instance_reads::seed`, the same seam the `GetTaskInstance` suite uses — and
 //! drive the listing over the real wire path, which is what this operation owns.
 

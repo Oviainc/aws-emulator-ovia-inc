@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelDomainConfigChange
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelDomainConfigChange`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: cancels the configuration change in flight on the stored
+//! [`crate::state::Domain`] record — the change `UpdateDomainConfig` started and the
+//! clock has not yet made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelDomainConfigChange::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancelling a change puts back the configuration the change was applied on top of
+//! ([`crate::state::DomainOptions`], recorded by the call that started it), so the
+//! domain keeps the values it had and the change itself stays in the history marked
+//! cancelled: a caller that read the change by id still finds it, reporting what
+//! became of it. The answer names the changes cancelled and, per property they set,
+//! the value that was pending and the value the domain is left with.
+//!
+//! A domain with no such change has nothing to cancel, which is the modelled
+//! not-found refusal rather than an empty success — as is a name no domain is stored
+//! under. The change a create starts and an engine version upgrade are not
+//! cancellable: there is no earlier configuration to go back to
+//! ([`crate::state::ConfigChange::cancellable`]).
+//!
+//! `DryRun` "returns the list of change IDs and properties that will be cancelled
+//! without actually cancelling the change", so a dry run computes the same answer
+//! from the same code and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +94,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::DomainOptions;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +168,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelDomainConfigChange` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelDomainConfigChangeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelDomainConfigChange"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let dry_run = input.dry_run.unwrap_or(false);
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Resolving the domain materialises only the configuration change the clock
+        // already owed it at `now` — a change whose span has passed has landed
+        // whether or not anybody called, and a change that has landed is no longer
+        // one this call can cancel.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            CancelDomainConfigChangeErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // The changes this call cancels, and the `DomainConfig` members they set —
+        // in the order the changes started, each member once however many of them
+        // set it.
+        let cancelled: Vec<&crate::state::ConfigChange> = domain.cancellable_changes();
+        if cancelled.is_empty() {
+            return Err(CancelDomainConfigChangeErrorModeled::ResourceNotFoundException(
+                crate::state::no_pending_change(&input.domain_name),
+            )
+            .into());
+        }
+        let change_ids: Vec<String> = cancelled
+            .iter()
+            .map(|change| change.change_id.clone())
+            .collect();
+        let mut properties: Vec<String> = Vec::new();
+        for change in &cancelled {
+            for property in &change.properties {
+                if !properties.contains(property) {
+                    properties.push(property.clone());
+                }
+            }
+        }
+        // What each property's value would have become had the chain of changes not
+        // been cancelled is what the domain holds NOW; what it is left with is what
+        // the earliest cancelled change was applied on top of.
+        let pending = DomainOptions::capture(domain);
+        let active = cancelled
+            .iter()
+            .find_map(|change| change.revert_to.clone());
+        let cancelled_properties: Vec<CancelledChangeProperty> = properties
+            .iter()
+            .map(|property| CancelledChangeProperty {
+                property_name: Some(property.clone()),
+                cancelled_value: pending.option_value(property),
+                active_value: active
+                    .as_ref()
+                    .and_then(|options| options.option_value(property)),
+            })
+            .collect();
+
+        if !dry_run {
+            domain.cancel_changes(now);
+        }
+
+        Ok(CancelDomainConfigChangeOutput {
+            cancelled_change_ids: Some(change_ids),
+            cancelled_change_properties: Some(cancelled_properties),
+            // "Whether or not the request was a dry run": what this request asked
+            // for.
+            dry_run: Some(dry_run),
+        })
     }
 }

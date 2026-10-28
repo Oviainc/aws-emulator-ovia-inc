@@ -31,7 +31,7 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    Workflow, NO_AIRFLOW_ENGINE, RUN_STATUS_FAILED, RUN_STATUS_QUEUED, RUN_STATUS_STARTING,
+    Workflow, RUN_STATUS_FAILED, RUN_STATUS_QUEUED, RUN_STATUS_RUNNING, RUN_STATUS_STARTING,
     RUN_STATUS_STOPPED, RUN_STATUS_STOPPING, RUN_STATUS_SUCCESS, RUN_STATUS_TIMEOUT,
     RUN_STOPPED_AFTER, RUN_TERMINAL_STATUSES,
 };
@@ -42,14 +42,11 @@ use crate::task_instance_reads::epoch_seconds;
 use crate::workflow_lifecycle::{role_arn, Harness};
 
 /// Every `WorkflowRunStatus` value the model declares, in the model's own order
-/// (`smithy_query(query="shape", shape="WorkflowRunStatus")`). `RUNNING` has no
-/// constant in `crate::state` because nothing here assigns it — no Apache Airflow
-/// engine executes a definition in this emulator — but it IS a state the delete's
-/// cleanup has to answer for, so the table covers it.
+/// (`smithy_query(query="shape", shape="WorkflowRunStatus")`).
 const RUN_STATUSES: &[&str] = &[
     RUN_STATUS_STARTING,
     RUN_STATUS_QUEUED,
-    "RUNNING",
+    RUN_STATUS_RUNNING,
     RUN_STATUS_SUCCESS,
     RUN_STATUS_FAILED,
     RUN_STATUS_TIMEOUT,
@@ -279,7 +276,7 @@ async fn deleting_a_workflow_stops_its_unfinished_runs_whatever_state_they_were_
             detail["RunState"]
         );
         // The defect this pins: the delete must not leave the run being admitted or
-        // failed on its pre-delete schedule.
+        // executed on its pre-delete schedule.
         assert_ne!(
             detail["RunState"].as_str(),
             Some(RUN_STATUS_QUEUED),
@@ -287,13 +284,15 @@ async fn deleting_a_workflow_stops_its_unfinished_runs_whatever_state_they_were_
              got {:?}",
             detail["RunState"]
         );
-        assert_ne!(
-            detail["ErrorMessage"].as_str(),
-            Some(NO_AIRFLOW_ENGINE),
-            "case {seeded:?}: the cleanup stops the run, so nothing may fail it for want \
-             of an execution engine, got {:?}",
-            detail["ErrorMessage"]
-        );
+        if !terminal {
+            assert_ne!(
+                detail["RunState"].as_str(),
+                Some(RUN_STATUS_SUCCESS),
+                "case {seeded:?}: the cleanup stops the run, so nothing may carry an \
+                 unfinished one on to a successful completion, got {:?}",
+                detail["RunState"]
+            );
+        }
         assert_eq!(
             listed_status(&harness, &arn, &run_id).await.as_deref(),
             Some(expected),

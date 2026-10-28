@@ -420,13 +420,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // ([`crate::state::stack_instance_does_not_exist`], which
                     // `DescribeStackInstance` and `ListStackInstanceResourceDrifts` answer
                     // too), so the exception reads the same whichever operation addressed the
-                    // instance, with the pair the request named as its only variable parts.
+                    // instance.
                     return Err(
                         UpdateStackInstancesErrorModeled::StackInstanceNotFoundException(
                             StackInstanceNotFoundException {
-                                message: Some(crate::state::stack_instance_does_not_exist(
-                                    pair.0, pair.1,
-                                )),
+                                message: Some(
+                                    crate::state::stack_instance_does_not_exist().to_string(),
+                                ),
                             },
                         )
                         .into(),

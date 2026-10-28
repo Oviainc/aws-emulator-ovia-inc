@@ -189,6 +189,8 @@ pub fn route(method: &str, path: &str, query: Option<&str>) -> Option<Request> {
         }
         (prefix, Endpoint::UploadPack)
     } else {
+        // The last endpoint of the three, written as a `?` rather than a third
+        // `else if let`: a path matching none of them is not a git request.
         let prefix = path.strip_suffix("/git-receive-pack")?;
         if method != "POST" {
             return None;

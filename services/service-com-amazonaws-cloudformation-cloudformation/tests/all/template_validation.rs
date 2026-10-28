@@ -196,20 +196,25 @@ fn refused() -> Vec<Refused> {
             message: "Unable to get mapping for EnvTiers::staging::Tier",
         },
         Refused {
+            // The cycle is listed as the chain it is, from the member whose logical id
+            // sorts first: a resource, then the resource it depends on.
             case: "two resources that Ref each other",
             template: r#"{"Resources":{"ParamA":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"ParamB"}}},"ParamB":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"ParamA"}}}}}"#,
-            message: "Circular dependency between resources: [ParamB, ParamA]",
+            message: "Circular dependency between resources: [ParamA, ParamB]",
         },
         Refused {
             case: "three resources in a cycle through DependsOn and Fn::GetAtt",
             template: r#"{"Resources":{"First":{"Type":"AWS::SNS::Topic","DependsOn":"Second"},"Second":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::GetAtt":["Third","Arn"]}}},"Third":{"Type":"AWS::SNS::Topic","DependsOn":"First"}}}"#,
-            message: "Circular dependency between resources: [",
+            message: "Circular dependency between resources: [First, Second, Third]",
         },
     ]
 }
 
 /// The refusal a response carries, or the whole body when it is no refusal.
-fn refusal(body: &str) -> String {
+///
+/// Shared with the suites that assert the WORDING of these refusals
+/// (`template_refusal_wording.rs`), so one rendering of a refusal serves both.
+pub(crate) fn refusal(body: &str) -> String {
     match (xml_text(body, "Code"), xml_text(body, "Message")) {
         (Some(code), Some(message)) => format!("{code}: {message}"),
         _ => body.to_string(),

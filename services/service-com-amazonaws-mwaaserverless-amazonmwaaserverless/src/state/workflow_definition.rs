@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The workflow definition a version SNAPSHOTS, and the schedule that definition
-//! declares.
+//! The workflow definition a version SNAPSHOTS, and what that definition declares: the
+//! schedule it runs on and the tasks it is made of.
 //!
 //! `DefinitionS3Location` is documented as the place the service "takes a snapshot of
 //! the definition file at the time of workflow creation", so the definition a workflow
@@ -59,6 +59,42 @@ const SCHEDULE_KEYS: &[&str] = &["schedule", "schedule_interval"];
 /// wraps them in one mapping declares its schedule at `dag.schedule` rather than at the
 /// document root.
 const DAG_KEY: &str = "dag";
+
+/// The key a definition declares its TASKS under, at the document root or inside its
+/// [`DAG_KEY`] mapping: the definition "defines the workflow structure using supported
+/// Amazon Web Services operators and tasks" and is written to "include task dependencies,
+/// scheduling information, and operator configurations"
+/// (`smithy_query(query="doc", shape="CreateWorkflowRequest",
+/// member="DefinitionS3Location")`), and `tasks` is the key Apache Airflow's own DAG
+/// vocabulary spells that collection with.
+const TASKS_KEY: &str = "tasks";
+
+/// The keys ONE task entry declares its own identifier under, in the order they are
+/// looked for: Apache Airflow's `task_id` and the shorter `id` and `name` spellings a
+/// declaration carries it under. A task entry that is the VALUE of a key in a `tasks`
+/// MAPPING takes that key as its identifier, which an explicit declaration overrides.
+const TASK_ID_KEYS: &[&str] = &["id", "task_id", "name"];
+
+/// The keys a task entry names the operator that runs it under — what
+/// `TaskInstanceSummary$OperatorName` ("The name of the Apache Airflow operator used for
+/// this task instance") reports.
+const TASK_OPERATOR_KEYS: &[&str] = &["operator", "operator_name", "type"];
+
+/// The keys a task entry declares the tasks it waits for under ("include task
+/// dependencies"): one task identifier, or a sequence of them. The relation is the
+/// UPSTREAM one — the tasks that must finish before this one runs — which is the direction
+/// each of these keys names.
+const TASK_DEPENDENCY_KEYS: &[&str] = &["dependencies", "depends_on", "upstream"];
+
+/// The most task declarations this reader takes out of ONE definition.
+///
+/// A run materialises one task instance per declared task, so this is what bounds that
+/// map; with [`crate::state::MAX_RUNS_PER_WORKFLOW`] and [`crate::state::MAX_WORKFLOWS`]
+/// it keeps the whole store finite. The number is the emulator's own ceiling, not a
+/// published service limit, and is set well past the tasks a definition within
+/// [`MAX_DEFINITION_BYTES`] realistically declares; a definition declaring more is one
+/// this emulator does not run (see `crate::state::workflow_execution::ExecutionPlan`).
+pub const MAX_DECLARED_TASKS: usize = 128;
 
 /// Apache Airflow's cron PRESETS and the cron expression each one stands for, from the
 /// preset table in Airflow's DAG scheduling documentation (`@hourly`, `@daily` /
@@ -281,7 +317,7 @@ fn declared_schedule_value(definition: &str) -> Option<String> {
     finder.found
 }
 
-/// One open YAML collection, as the walk below tracks it.
+/// One open YAML collection, as the walks below track it.
 #[derive(Debug)]
 struct Frame {
     /// Whether this collection is a mapping, so its children alternate key and value.
@@ -292,91 +328,104 @@ struct Frame {
     key: Option<String>,
 }
 
-/// The walk that finds a definition's declared schedule: it tracks which key each scalar
-/// sits under and keeps the first value at a DAG-level schedule path.
+/// The collections a walk has OPEN at one point, outermost first, and the bookkeeping
+/// every walk over a definition needs: which key the node now being read sits under, and
+/// how deep the walk is.
+///
+/// Both walks below are driven off one of these, so the key-and-value stepping a mapping
+/// needs — including the two positions a collection or an alias can occupy without being
+/// a scalar — is written once.
 #[derive(Debug, Default)]
-struct ScheduleFinder {
-    /// The collections open at this point, outermost first.
+struct OpenNodes {
     open: Vec<Frame>,
-    /// How many documents have begun. Only the first document's declarations count: a
-    /// definition file is one DAG declaration.
-    documents: usize,
-    /// The first declared schedule value seen, if any.
-    found: Option<String>,
 }
 
-impl ScheduleFinder {
-    /// Take ONE parser event, and report whether the walk may go on: `false` for a
-    /// document that nests past [`MAX_DEFINITION_NESTING`], which is the point past
-    /// which this reader stops following it.
-    fn accept(&mut self, event: ::yaml_rust2::parser::Event) -> bool {
-        use ::yaml_rust2::parser::Event;
-        match event {
-            Event::DocumentStart => {
-                self.documents += 1;
-                self.open.clear();
-            }
-            Event::MappingStart(..) | Event::SequenceStart(..) => {
-                if self.open.len() >= MAX_DEFINITION_NESTING {
-                    return false;
-                }
-                let mapping = matches!(event, Event::MappingStart(..));
-                self.consume_node_slot();
-                self.open.push(Frame {
-                    mapping,
-                    expecting_key: mapping,
-                    key: None,
-                });
-            }
-            Event::MappingEnd | Event::SequenceEnd => {
-                self.open.pop();
-            }
-            Event::Scalar(value, ..) => {
-                if let Some(frame) = self.open.last_mut() {
-                    if frame.mapping && frame.expecting_key {
-                        frame.key = Some(value);
-                        frame.expecting_key = false;
-                        return true;
-                    }
-                }
-                let declares_schedule =
-                    self.documents == 1 && self.found.is_none() && self.at_schedule_path();
-                if let Some(frame) = self.open.last_mut() {
-                    if frame.mapping {
-                        frame.expecting_key = true;
-                    }
-                }
-                if declares_schedule {
-                    self.found = Some(value);
-                }
-            }
-            // An alias refers to an anchored node. Nothing here expands one, so it only
-            // occupies the position it stands in.
-            Event::Alias(..) => self.consume_node_slot(),
-            _ => {}
+impl OpenNodes {
+    /// How many collections are open.
+    fn depth(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Forget every open collection: the walk has reached another document.
+    fn clear(&mut self) {
+        self.open.clear();
+    }
+
+    /// Open one collection, charging the node it occupies to the collection around it.
+    ///
+    /// `false` for a document that nests past [`MAX_DEFINITION_NESTING`], which is the
+    /// point past which these readers stop following it.
+    fn push(&mut self, mapping: bool) -> bool {
+        if self.open.len() >= MAX_DEFINITION_NESTING {
+            return false;
         }
+        self.consume_node_slot();
+        self.open.push(Frame {
+            mapping,
+            expecting_key: mapping,
+            key: None,
+        });
         true
     }
 
-    /// Whether the node now being read is the value of a DAG-level schedule key: the
-    /// open collections are all mappings, and their keys spell either `<schedule key>`
-    /// at the document root or `dag.<schedule key>` one level in.
-    fn at_schedule_path(&self) -> bool {
+    /// Close the innermost collection and report the depth it occupied, so a walk can
+    /// recognise the collection it was tracking.
+    fn pop(&mut self) -> Option<usize> {
+        let index = self.open.len().checked_sub(1)?;
+        self.open.pop();
+        Some(index)
+    }
+
+    /// Whether the scalar now being read stands in the KEY position of the enclosing
+    /// mapping, so it names what comes next rather than being a value.
+    fn expects_key(&self) -> bool {
+        self.open
+            .last()
+            .is_some_and(|frame| frame.mapping && frame.expecting_key)
+    }
+
+    /// Record `key` as the enclosing mapping's current key.
+    fn set_key(&mut self, key: String) {
+        if let Some(frame) = self.open.last_mut() {
+            frame.key = Some(key);
+            frame.expecting_key = false;
+        }
+    }
+
+    /// Step the enclosing mapping on to its next key: the node that stood in the value
+    /// position has been read.
+    fn consumed_value(&mut self) {
+        if let Some(frame) = self.open.last_mut() {
+            if frame.mapping {
+                frame.expecting_key = true;
+            }
+        }
+    }
+
+    /// The key the node at `depth` sits under: the current key of the collection at that
+    /// depth, and `None` when it is not a mapping or carries a key this reader cannot
+    /// name.
+    fn key_at(&self, depth: usize) -> Option<&str> {
+        self.open.get(depth)?.key.as_deref()
+    }
+
+    /// Whether the collection at `depth` is a mapping, and `None` when nothing is open
+    /// that deep.
+    fn is_mapping_at(&self, depth: usize) -> Option<bool> {
+        Some(self.open.get(depth)?.mapping)
+    }
+
+    /// The keys the node now being read sits under, outermost first, and `None` when any
+    /// collection in the chain is not a mapping or carries a key this reader cannot name.
+    fn key_path(&self) -> Option<Vec<&str>> {
         let mut keys = Vec::with_capacity(self.open.len());
         for frame in &self.open {
             if !frame.mapping {
-                return false;
+                return None;
             }
-            match frame.key.as_deref() {
-                Some(key) => keys.push(key),
-                None => return false,
-            }
+            keys.push(frame.key.as_deref()?);
         }
-        match keys.as_slice() {
-            [key] => SCHEDULE_KEYS.contains(key),
-            [DAG_KEY, key] => SCHEDULE_KEYS.contains(key),
-            _ => false,
-        }
+        Some(keys)
     }
 
     /// Account for a node that occupies a position in the enclosing mapping without being
@@ -398,6 +447,286 @@ impl ScheduleFinder {
                 frame.expecting_key = true;
             }
         }
+    }
+}
+
+/// The walk that finds a definition's declared schedule: it tracks which key each scalar
+/// sits under and keeps the first value at a DAG-level schedule path.
+#[derive(Debug, Default)]
+struct ScheduleFinder {
+    /// The collections open at this point.
+    nodes: OpenNodes,
+    /// How many documents have begun. Only the first document's declarations count: a
+    /// definition file is one DAG declaration.
+    documents: usize,
+    /// The first declared schedule value seen, if any.
+    found: Option<String>,
+}
+
+impl ScheduleFinder {
+    /// Take ONE parser event, and report whether the walk may go on.
+    fn accept(&mut self, event: ::yaml_rust2::parser::Event) -> bool {
+        use ::yaml_rust2::parser::Event;
+        match event {
+            Event::DocumentStart => {
+                self.documents += 1;
+                self.nodes.clear();
+            }
+            Event::MappingStart(..) | Event::SequenceStart(..) => {
+                if !self.nodes.push(matches!(event, Event::MappingStart(..))) {
+                    return false;
+                }
+            }
+            Event::MappingEnd | Event::SequenceEnd => {
+                self.nodes.pop();
+            }
+            Event::Scalar(value, ..) => {
+                if self.nodes.expects_key() {
+                    self.nodes.set_key(value);
+                    return true;
+                }
+                let declares_schedule =
+                    self.documents == 1 && self.found.is_none() && self.at_schedule_path();
+                self.nodes.consumed_value();
+                if declares_schedule {
+                    self.found = Some(value);
+                }
+            }
+            // An alias refers to an anchored node. Nothing here expands one, so it only
+            // occupies the position it stands in.
+            Event::Alias(..) => self.nodes.consume_node_slot(),
+            _ => {}
+        }
+        true
+    }
+
+    /// Whether the node now being read is the value of a DAG-level schedule key: the
+    /// open collections are all mappings, and their keys spell either `<schedule key>`
+    /// at the document root or `dag.<schedule key>` one level in.
+    fn at_schedule_path(&self) -> bool {
+        match self.nodes.key_path().as_deref() {
+            Some([key]) => SCHEDULE_KEYS.contains(key),
+            Some([DAG_KEY, key]) => SCHEDULE_KEYS.contains(key),
+            _ => false,
+        }
+    }
+}
+
+/// ONE task a definition declares, exactly as the definition writes it: nothing here
+/// resolves a dependency or checks an identifier, which is the plan's business
+/// (`crate::state::workflow_execution::ExecutionPlan`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskDeclaration {
+    /// The task's own identifier ([`TASK_ID_KEYS`]), and `None` for an entry this reader
+    /// finds no identifier in — which is therefore not a task it can run.
+    pub task_id: Option<String>,
+    /// The operator the task runs under ([`TASK_OPERATOR_KEYS`]), when it names one.
+    pub operator_name: Option<String>,
+    /// The identifiers of the tasks this one waits for ([`TASK_DEPENDENCY_KEYS`]), in the
+    /// order the definition lists them.
+    pub dependencies: Vec<String>,
+}
+
+/// What a definition declares about its tasks.
+#[derive(Debug, Clone, Default)]
+pub struct DeclaredTasks {
+    /// The declarations read, in the order the definition writes them.
+    pub tasks: Vec<TaskDeclaration>,
+    /// Whether the definition declares MORE tasks than [`MAX_DECLARED_TASKS`], in which
+    /// case the list above is not all of them.
+    pub past_ceiling: bool,
+}
+
+/// The tasks the FIRST document in `definition` declares at a DAG-level [`TASKS_KEY`]
+/// collection, written either as a sequence of task entries or as a mapping from task
+/// identifier to task entry.
+///
+/// Driven event by event off the parser's own scanner under the same three bounds the
+/// schedule walk carries ([`MAX_DEFINITION_BYTES`] on the content, [`MAX_DEFINITION_EVENTS`]
+/// on how many events are read and [`MAX_DEFINITION_NESTING`] on how deep the walk
+/// follows a document), plus [`MAX_DECLARED_TASKS`] on how many declarations it keeps: it
+/// builds no tree, recurses nowhere, and an alias costs it one event like any other node.
+/// A document the parser cannot read to the end is not followed further, so the walk
+/// answers with the declarations it had already read.
+pub fn declared_tasks(definition: &str) -> DeclaredTasks {
+    use ::yaml_rust2::parser::Event;
+
+    let mut parser = ::yaml_rust2::parser::Parser::new_from_str(definition);
+    let mut finder = TaskFinder::default();
+    for _ in 0..MAX_DEFINITION_EVENTS {
+        let Ok((event, _marker)) = parser.next_token() else {
+            break;
+        };
+        if matches!(event, Event::StreamEnd) || !finder.accept(event) {
+            break;
+        }
+    }
+    DeclaredTasks {
+        tasks: finder.found,
+        past_ceiling: finder.past_ceiling,
+    }
+}
+
+/// Which part of a task entry the scalar now being read declares.
+#[derive(Debug, Clone, Copy)]
+enum TaskField {
+    /// The task's identifier.
+    Id,
+    /// The operator the task runs under.
+    Operator,
+    /// One task this one waits for.
+    Dependency,
+}
+
+/// The part of a task entry the key `key` declares, and `None` for a key this reader does
+/// not read (an operator's own configuration, say).
+fn task_field(key: &str) -> Option<TaskField> {
+    if TASK_ID_KEYS.contains(&key) {
+        Some(TaskField::Id)
+    } else if TASK_OPERATOR_KEYS.contains(&key) {
+        Some(TaskField::Operator)
+    } else if TASK_DEPENDENCY_KEYS.contains(&key) {
+        Some(TaskField::Dependency)
+    } else {
+        None
+    }
+}
+
+/// The walk that finds a definition's declared tasks: it tracks the DAG-level `tasks`
+/// collection, reads one declaration per entry in it, and keeps the identifier, operator
+/// and dependencies each entry declares.
+#[derive(Debug, Default)]
+struct TaskFinder {
+    /// The collections open at this point.
+    nodes: OpenNodes,
+    /// How many documents have begun. Only the first document's declarations count.
+    documents: usize,
+    /// The depth of the DAG-level `tasks` collection, once the walk is inside one.
+    tasks_at: Option<usize>,
+    /// The entry now being read, and the depth of its own collection.
+    building: Option<(usize, TaskDeclaration)>,
+    /// The declarations read so far.
+    found: Vec<TaskDeclaration>,
+    /// Whether the walk stopped at [`MAX_DECLARED_TASKS`].
+    past_ceiling: bool,
+}
+
+impl TaskFinder {
+    /// Take ONE parser event, and report whether the walk may go on: `false` once the
+    /// document nests past [`MAX_DEFINITION_NESTING`] or declares more tasks than
+    /// [`MAX_DECLARED_TASKS`].
+    fn accept(&mut self, event: ::yaml_rust2::parser::Event) -> bool {
+        use ::yaml_rust2::parser::Event;
+        match event {
+            Event::DocumentStart => {
+                self.documents += 1;
+                self.nodes.clear();
+                self.tasks_at = None;
+                self.building = None;
+            }
+            Event::MappingStart(..) | Event::SequenceStart(..) => {
+                let mapping = matches!(event, Event::MappingStart(..));
+                let container = self.documents == 1 && self.tasks_at.is_none() && self.at_tasks_path();
+                // A task entry is a mapping whose parent IS the tasks collection. In a
+                // mapping of tasks the key it sits under names it; in a sequence of them
+                // the entry declares its own identifier.
+                let entry = mapping && !container && self.entering_entry();
+                let named_by_key = entry
+                    .then(|| self.tasks_at.and_then(|at| self.nodes.key_at(at)))
+                    .flatten()
+                    .map(str::to_string);
+                if !self.nodes.push(mapping) {
+                    return false;
+                }
+                let depth = self.nodes.depth() - 1;
+                if container {
+                    self.tasks_at = Some(depth);
+                } else if entry {
+                    if self.found.len() >= MAX_DECLARED_TASKS {
+                        self.past_ceiling = true;
+                        return false;
+                    }
+                    self.building = Some((
+                        depth,
+                        TaskDeclaration {
+                            task_id: named_by_key,
+                            ..TaskDeclaration::default()
+                        },
+                    ));
+                }
+            }
+            Event::MappingEnd | Event::SequenceEnd => {
+                let Some(depth) = self.nodes.pop() else {
+                    return true;
+                };
+                if self.building.as_ref().is_some_and(|(at, _)| *at == depth) {
+                    if let Some((_, task)) = self.building.take() {
+                        self.found.push(task);
+                    }
+                }
+                if self.tasks_at == Some(depth) {
+                    self.tasks_at = None;
+                }
+            }
+            Event::Scalar(value, ..) => {
+                if self.nodes.expects_key() {
+                    self.nodes.set_key(value);
+                    return true;
+                }
+                let declares = self.declared_field();
+                self.nodes.consumed_value();
+                if let (Some(field), Some((_, task))) = (declares, self.building.as_mut()) {
+                    match field {
+                        // An explicit identifier overrides the key the entry sits under.
+                        TaskField::Id => task.task_id = Some(value),
+                        TaskField::Operator => task.operator_name = Some(value),
+                        TaskField::Dependency => task.dependencies.push(value),
+                    }
+                }
+            }
+            Event::Alias(..) => self.nodes.consume_node_slot(),
+            _ => {}
+        }
+        true
+    }
+
+    /// Whether the collection now being opened is a DAG-level `tasks` collection: the
+    /// open collections are all mappings, and their keys spell either `tasks` at the
+    /// document root or `dag.tasks` one level in.
+    fn at_tasks_path(&self) -> bool {
+        match self.nodes.key_path().as_deref() {
+            Some([key]) => *key == TASKS_KEY,
+            Some([DAG_KEY, key]) => *key == TASKS_KEY,
+            _ => false,
+        }
+    }
+
+    /// Whether the collection now being opened is an ENTRY of the tasks collection: one
+    /// is being tracked, nothing deeper inside it is being read, and this node is its
+    /// direct child.
+    fn entering_entry(&self) -> bool {
+        self.building.is_none()
+            && self
+                .tasks_at
+                .is_some_and(|at| self.nodes.depth() == at + 1)
+    }
+
+    /// Which part of the entry being read the scalar now being read declares: a scalar in
+    /// the entry's own mapping, under a key this reader knows, or one in a sequence that
+    /// entry's dependency key carries.
+    fn declared_field(&self) -> Option<TaskField> {
+        let (at, _) = self.building.as_ref()?;
+        let key = self.nodes.key_at(*at)?;
+        if self.nodes.depth() == at + 1 {
+            return task_field(key);
+        }
+        if self.nodes.depth() == at + 2
+            && self.nodes.is_mapping_at(at + 1) == Some(false)
+            && TASK_DEPENDENCY_KEYS.contains(&key)
+        {
+            return Some(TaskField::Dependency);
+        }
+        None
     }
 }
 

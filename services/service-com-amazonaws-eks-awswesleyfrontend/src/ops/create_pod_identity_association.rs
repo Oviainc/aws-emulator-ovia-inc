@@ -342,10 +342,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreatePodIdentityAssociationErrorModeled::ResourceInUseException(
                     ResourceInUseException {
                         cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "Association already exists with namespace: {} and service \
-                             account: {}",
-                            input.namespace, input.service_account
+                        message: Some(crate::state::association_already_exists(
+                            &input.namespace,
+                            &input.service_account,
                         )),
                         ..Default::default()
                     },

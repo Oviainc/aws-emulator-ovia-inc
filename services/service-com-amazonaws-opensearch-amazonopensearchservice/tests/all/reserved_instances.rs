@@ -20,8 +20,13 @@
 //!   type, term, payment option, instance count and reservation-name length;
 //! * paging the reservations with every page size returns each record exactly once,
 //!   in the one order, and a token this service did not mint is refused;
-//! * the id filter names ONE reservation: a stored id reports exactly it, while an
-//!   id nobody holds and a value that is not a `GUID` are both refused;
+//! * the id filter names ONE reservation: a stored id reports exactly it, while a
+//!   value that is not a `GUID` is refused as the malformed request it is and a
+//!   well-formed id nobody holds a reservation under is the modelled not-found;
+//! * a purchase is judged on its own input BEFORE anything it names is resolved:
+//!   `InstanceCount` is `@range(min: 1)` and carries no default, so a count below
+//!   that bound — including the count a request that names none asks for — is the
+//!   modelled constraint refusal, whatever offering the request names;
 //! * a reservation name is an identifier, so a purchase re-using one is refused and
 //!   leaves the stored record exactly as it was;
 //! * the store is bounded: instances are reserved up to the quota and the purchase
@@ -175,21 +180,22 @@ fn offering<'a>(
 }
 
 /// One purchase to make: the offering's attributes, the `ReservationName` to send
-/// and the `InstanceCount` (absent where `None`).
+/// and the `InstanceCount`.
 struct Row {
     instance_type: &'static str,
     duration: i32,
     payment_option: &'static str,
     reservation_name: String,
-    instance_count: Option<i32>,
+    instance_count: i32,
 }
 
 /// The purchase table: one row per way an accepted purchase differs from another —
 /// the instance type (a burstable, a general-purpose, a memory-optimised, an
 /// UltraWarm and an OR1 type, spanning the families
 /// `OpenSearchPartitionInstanceType` names), both published terms, all three payment
-/// options, a count absent / 1 / many, and `ReservationName` at each of its
-/// published length bounds (`@length(min: 5, max: 64)`).
+/// options, a count at `InstanceCount`'s published minimum and several above it, and
+/// `ReservationName` at each of its published length bounds
+/// (`@length(min: 5, max: 64)`).
 fn purchase_rows() -> Vec<Row> {
     vec![
         Row {
@@ -198,20 +204,21 @@ fn purchase_rows() -> Vec<Row> {
             payment_option: PAYMENT_OPTION_NO_UPFRONT,
             // The shortest name the constraint allows.
             reservation_name: "ri-01".to_string(),
-            instance_count: None,
+            // The smallest count `InstanceCount`'s `@range(min: 1)` allows.
+            instance_count: 1,
         },
         Row {
             instance_type: "m5.xlarge.search",
             duration: RESERVED_INSTANCE_TERMS[1],
             payment_option: PAYMENT_OPTION_ALL_UPFRONT,
             reservation_name: "search-tier-prod".to_string(),
-            instance_count: Some(1),
+            instance_count: 1,
         },
         Row {
             instance_type: "r6g.large.search",
             duration: RESERVED_INSTANCE_TERMS[0],
             payment_option: PAYMENT_OPTION_PARTIAL_UPFRONT,
-            instance_count: Some(6),
+            instance_count: 6,
             // The longest name the constraint allows.
             reservation_name: "n".repeat(64),
         },
@@ -220,28 +227,25 @@ fn purchase_rows() -> Vec<Row> {
             duration: RESERVED_INSTANCE_TERMS[1],
             payment_option: PAYMENT_OPTION_NO_UPFRONT,
             reservation_name: "warm tier 2026".to_string(),
-            instance_count: Some(3),
+            instance_count: 3,
         },
         Row {
             instance_type: "or1.2xlarge.search",
             duration: RESERVED_INSTANCE_TERMS[0],
             payment_option: PAYMENT_OPTION_ALL_UPFRONT,
             reservation_name: "OR1_indexing".to_string(),
-            instance_count: Some(2),
+            instance_count: 2,
         },
     ]
 }
 
 /// The body a row purchases with.
 fn purchase_body(row: &Row, offering_id: &str) -> Value {
-    let mut body = json!({
+    json!({
         "ReservedInstanceOfferingId": offering_id,
         "ReservationName": row.reservation_name,
-    });
-    if let Some(count) = row.instance_count {
-        body["InstanceCount"] = json!(count);
-    }
-    body
+        "InstanceCount": row.instance_count,
+    })
 }
 
 #[tokio::test]
@@ -391,7 +395,7 @@ async fn a_purchase_is_reported_back_with_its_offering_terms() {
 
     for row in purchase_rows() {
         let case = format!(
-            "{} / {}s / {} x{:?}",
+            "{} / {}s / {} x{}",
             row.instance_type, row.duration, row.payment_option, row.instance_count
         );
         let published = offering(&catalog, row.instance_type, row.duration, row.payment_option);
@@ -478,7 +482,7 @@ async fn a_purchase_is_reported_back_with_its_offering_terms() {
         );
         assert_eq!(
             reservation["InstanceCount"].as_i64(),
-            Some(i64::from(row.instance_count.unwrap_or(1))),
+            Some(i64::from(row.instance_count)),
             "case {case}: the reservation counts the instances the purchase asked for, got \
              {reservation:?}"
         );
@@ -691,13 +695,10 @@ async fn an_id_filter_names_one_resource_and_an_unknown_one_is_refused() {
         "the offering filter: expected the offering named"
     );
 
-    // A well-formed `GUID` that names nothing is refused: the reservations listing
-    // answers with the modelled `ValidationException`, which this model documents
-    // with the very sentence it documents `ResourceNotFoundException` with ("an
-    // exception for accessing or deleting a resource that doesn't exist") and which
-    // the recorded service answers a reserved-instance identifier that resolves to
-    // nothing with; the catalog listing answers an unpublished offering id with the
-    // modelled not-found. Over several such ids.
+    // A well-formed `GUID` that names nothing addresses no resource, so both reads
+    // answer the modelled not-found: the reservations listing for an id this account
+    // holds no reservation under, the catalog listing for an offering id it
+    // publishes nothing for. Over several such ids.
     for unknown in [
         "00000000-0000-0000-0000-000000000000",
         "deadbeef-dead-beef-dead-beefdeadbeef",
@@ -706,14 +707,21 @@ async fn an_id_filter_names_one_resource_and_an_unknown_one_is_refused() {
         let case = format!("DescribeReservedInstances with {unknown}");
         let answer = reservations(&emulator, &format!("?reservationId={unknown}")).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case}: expected HTTP 400, got {} {:?}",
+            answer.status, 409,
+            "case {case}: expected the modelled not-found's HTTP 409, got {} {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             error_code(&answer),
-            "ValidationException",
-            "case {case}: expected the modelled validation refusal, got {:?}",
+            "ResourceNotFoundException",
+            "case {case}: expected the modelled not-found, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some("Reservation id not found"),
+            "case {case}: expected the service's wording for a reservation id that resolves to \
+             nothing, got {:?}",
             answer.body
         );
 
@@ -730,25 +738,32 @@ async fn an_id_filter_names_one_resource_and_an_unknown_one_is_refused() {
             "case {case}: expected the modelled not-found, got {:?}",
             answer.body
         );
+
+        // A purchase from an offering the catalog does not publish is the same miss:
+        // the id is well formed and names no offering, so it is the not-found rather
+        // than a malformed request.
+        let case = format!("PurchaseReservedInstanceOffering from {unknown}");
+        let answer = purchase(
+            &emulator,
+            json!({
+                "ReservedInstanceOfferingId": unknown,
+                "ReservationName": "no-such-offering",
+                "InstanceCount": 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 409,
+            "case {case}: expected the modelled not-found's HTTP 409, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ResourceNotFoundException",
+            "case {case}: expected the modelled not-found, got {:?}",
+            answer.body
+        );
     }
-    // A purchase from an offering the catalog does not publish is refused as the
-    // request it is: the offering id is a required input member rather than a
-    // filter, and the recorded service answers it with the validation refusal.
-    let answer = purchase(
-        &emulator,
-        json!({
-            "ReservedInstanceOfferingId": "11111111-2222-3333-4444-555555555555",
-            "ReservationName": "no-such-offering",
-        }),
-    )
-    .await;
-    assert_eq!(
-        error_code(&answer),
-        "ValidationException",
-        "a purchase from an unpublished offering: expected the modelled validation refusal, got \
-         {:?}",
-        answer.body
-    );
 
     // A value of the right LENGTH that is not a `GUID` is refused: the request
     // boundary enforces `@length(36, 36)` but not the pattern, so the handler does.
@@ -845,7 +860,7 @@ async fn a_reused_reservation_name_is_refused_and_changes_nothing() {
                 duration: rows[1].duration,
                 payment_option: rows[1].payment_option,
                 reservation_name: first.reservation_name.clone(),
-                instance_count: Some(4),
+                instance_count: 4,
             },
             "another offering under the same name",
         ),
@@ -998,5 +1013,104 @@ async fn the_reserved_instance_store_is_bounded_by_the_quota() {
         i64::from(half) * 2,
         "at the quota: the store holds exactly the instances the accepted purchases reserved, \
          got {reserved}"
+    );
+}
+
+/// A `GUID` the published catalog holds no offering for: the catalog is keyed by the
+/// attributes that make an offering, so an id derived from none of them is not one
+/// of its keys.
+const UNPUBLISHED_OFFERING: &str = "11111111-2222-3333-4444-555555555555";
+
+#[tokio::test]
+async fn a_count_below_the_modelled_range_is_refused_before_the_offering_is_resolved() {
+    let emulator = Emulator::new();
+    let catalog = fetch_catalog(&emulator).await;
+    let published = text(
+        offering(
+            &catalog,
+            "m5.large.search",
+            RESERVED_INSTANCE_TERMS[0],
+            PAYMENT_OPTION_NO_UPFRONT,
+        ),
+        "ReservedInstanceOfferingId",
+        "the range case",
+    );
+
+    // `InstanceCount` is `@range(min: 1)` and carries no `@default`, so the counts
+    // below the bound span: the count a request that names none asks for, the bound
+    // minus one, a negative count and the smallest integer the member can carry.
+    // Each is sent BOTH against an offering the catalog publishes and against one it
+    // does not, because the input is judged before anything it names is resolved:
+    // every row must be answered about the member, never about the offering.
+    for offering_id in [published.as_str(), UNPUBLISHED_OFFERING] {
+        for (count, shown) in [
+            (None, "0"),
+            (Some(0), "0"),
+            (Some(-1), "-1"),
+            (Some(i32::MIN), "-2147483648"),
+        ] {
+            let case = format!("InstanceCount {count:?} on offering {offering_id}");
+            let mut body = json!({
+                "ReservedInstanceOfferingId": offering_id,
+                "ReservationName": "range-rule",
+            });
+            if let Some(count) = count {
+                body["InstanceCount"] = json!(count);
+            }
+            let answer = purchase(&emulator, body).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case}: expected the modelled constraint refusal's HTTP 400, got {} {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ValidationException",
+                "case {case}: expected the modelled constraint refusal, got {:?}",
+                answer.body
+            );
+            let message = answer.body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            assert_eq!(
+                message,
+                format!(
+                    "1 validation error detected: Value '{shown}' at 'instanceCount' failed to \
+                     satisfy constraint: Member must have value greater than or equal to 1"
+                ),
+                "case {case}: expected the constraint refusal to name the member and its bound, \
+                 got {message:?}"
+            );
+        }
+    }
+
+    // The bound itself is accepted, so it is the value that was refused above and
+    // not the member: one instance on a published offering is a purchase.
+    let accepted = purchase(
+        &emulator,
+        json!({
+            "ReservedInstanceOfferingId": published,
+            "ReservationName": "range-rule-accepted",
+            "InstanceCount": 1,
+        }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 200,
+        "the published minimum: expected HTTP 200, got {} {:?}",
+        accepted.status, accepted.body
+    );
+
+    // Nothing but that one purchase was stored: a refused request reserves nothing.
+    let reported = array(
+        &reservations(&emulator, "").await,
+        "ReservedInstances",
+        "after the range refusals",
+    );
+    assert_eq!(
+        reported.len(),
+        1,
+        "after the range refusals: the store holds only the accepted purchase, got {reported:?}"
     );
 }

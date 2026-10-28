@@ -19,6 +19,8 @@ mod change_progress;
 mod collection_element_refusals;
 #[path = "all/compatible_versions.rs"]
 mod compatible_versions;
+#[path = "all/config_change_cancellation.rs"]
+mod config_change_cancellation;
 #[path = "all/connection_decisions.rs"]
 mod connection_decisions;
 #[path = "all/cross_cluster_connections.rs"]
@@ -49,6 +51,8 @@ mod domain_configuration_rules;
 mod domain_health;
 #[path = "all/domain_lifecycle.rs"]
 mod domain_lifecycle;
+#[path = "all/domain_maintenance.rs"]
+mod domain_maintenance;
 #[path = "all/domain_nodes.rs"]
 mod domain_nodes;
 #[path = "all/domain_package_listing_cursor.rs"]

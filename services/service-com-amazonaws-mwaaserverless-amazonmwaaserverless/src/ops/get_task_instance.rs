@@ -11,13 +11,17 @@
 //! `ResourceNotFoundException`, the way every other lookup of this service refuses one
 //! (`crate::state::unresolved` / `crate::state::lookup_miss`).
 //!
-//! A task instance comes into being only when something executes the workflow
-//! definition, and this emulator has no Apache Airflow engine to execute one with
-//! (`crate::state::NO_AIRFLOW_ENGINE`), so no run it starts holds a task instance and
-//! this operation reports the refusal rather than a task nothing ran.
+//! A task instance comes into being when the run its workflow definition declared it in
+//! starts executing that task (`crate::state::WorkflowRun::settle`), so the records this
+//! reports are the ones the run's own progress has produced: a run that has not been
+//! dequeued yet, and a definition whose task graph could not be built at all, hold none,
+//! and this operation reports the refusal rather than a task the definition never
+//! declared.
 //!
-//! This operation is REPORTING: it writes nothing, not even the run's clock-owed
-//! settle, because nothing it reports depends on the run's status.
+//! This operation is REPORTING, so the only write it makes is to materialise the changes
+//! the CLOCK already made due — the run's own progress through its tasks, owed at the same
+//! instants whether or not anybody called — because WHICH instances a run holds, and what
+//! each of them reports, is exactly what that progress decides.
 //!
 //! ## Shape of an operation
 //!
@@ -234,11 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
         let mut store = state.lock();
+        let now = SystemTime::now();
 
         // The writes a read may make, each a change the clock already owed: finish
         // every workflow teardown due and fire every automated run due, so a task
         // instance of a workflow past its `DELETING` span is gone with it.
-        store.advance_clock(SystemTime::now());
+        store.advance_clock(now);
 
         // The TASK INSTANCE is what this operation resolves, so an absent workflow
         // (including one of ANOTHER region, which this endpoint does not serve), an
@@ -253,9 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
         let run = store
-            .workflow_in(&region, &input.workflow_arn)
-            .and_then(|workflow| workflow.runs.get(&input.run_id))
+            .workflow_in_mut(&region, &input.workflow_arn)
+            .and_then(|workflow| workflow.runs.get_mut(&input.run_id))
             .ok_or_else(unresolved_task_instance)?;
+
+        // The other change the clock already owed: the run's own progress through the
+        // tasks its definition declared, which is what decides which instances it holds
+        // and what each of them reports.
+        run.settle(now);
+
         let task = run
             .task_instances
             .get(&input.task_instance_id)

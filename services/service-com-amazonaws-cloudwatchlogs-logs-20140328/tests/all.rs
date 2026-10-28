@@ -133,6 +133,8 @@ mod metric_filter_testing;
 mod metric_filters;
 #[path = "all/metric_transformation_exclusion_wording.rs"]
 mod metric_transformation_exclusion_wording;
+#[path = "all/missing_destination_refusal.rs"]
+mod missing_destination_refusal;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
 #[path = "all/query_compilation.rs"]

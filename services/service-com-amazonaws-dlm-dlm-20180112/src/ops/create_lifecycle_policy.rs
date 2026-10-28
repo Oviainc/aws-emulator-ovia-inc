@@ -304,11 +304,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // And the either/or rules inside a schedule: a `CreateRule` states when
-        // to create in exactly one of its two documented forms, and a
-        // `RetainRule` retains by exactly one of its two documented modes.
-        // Refused before anything is stored, so a request AWS would never have
-        // accepted leaves no policy behind.
+        // And the cross-member rules inside a schedule: a `CreateRule` states
+        // when to create in exactly one of its two documented forms, a
+        // `RetainRule` retains by exactly one of its two documented modes, and a
+        // schedule that specifies a rule acting on the snapshots it retains (a
+        // `FastRestoreRule`, a `ShareRule`, a `CrossRegionCopyRule`) retains at
+        // least one of them. Refused before anything is stored, so a request AWS
+        // would never have accepted leaves no policy behind.
         if let Some(refusal) =
             crate::state::schedule_rule_violation(input.policy_details.as_ref())
         {

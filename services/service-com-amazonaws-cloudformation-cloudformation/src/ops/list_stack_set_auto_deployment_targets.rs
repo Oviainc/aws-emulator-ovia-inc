@@ -6,7 +6,10 @@
 //! StackSet's instances are deployed under, each carrying the Regions it is deployed to
 //! there, read off the stored stack set and one bounded page at a time. A `StackSetName`
 //! that resolves to no StackSet of this administrator account and Region is refused with
-//! the modelled `StackSetNotFoundException` rather than answered with an empty list.
+//! the modelled `StackSetNotFoundException` rather than answered with an empty list, and a
+//! StackSet whose permission model is not the service-managed one is refused with
+//! `ValidationError`: automatic deployment is deployment through Organizations, so such a
+//! StackSet has no automatic-deployment targets to report.
 //!
 //! ## Shape of an operation
 //!
@@ -191,9 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One summary per organization root or OU the StackSet is targeted at, carrying
         // "the list of Regions targeted for this organization or OU" — both read off the
-        // StackSet's own deployments. A StackSet targeted at no OU (a self-managed one, or
-        // one nothing has been deployed for yet) answers the EMPTY list, which is a
-        // different answer from one that does not exist.
+        // StackSet's own deployments. A service-managed StackSet nothing has been deployed
+        // for yet answers the EMPTY list, which is a different answer from one that does
+        // not exist.
+        //
+        // Automatic deployment belongs to the SERVICE_MANAGED permission model — deployment
+        // to "accounts managed by Organizations" — so a StackSet resolved under any other
+        // model has no automatic-deployment targets to report at all, and the request is
+        // refused rather than answered a list that would read as "none yet".
+        if stack_set.permission_model != crate::state::stack_sets::permission_model::SERVICE_MANAGED
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::AUTO_DEPLOYMENT_IS_SERVICE_MANAGED_ONLY,
+            ));
+        }
+
         let summaries: Vec<StackSetAutoDeploymentTargetSummary> = stack_set
             .deployment_targets()
             .into_iter()

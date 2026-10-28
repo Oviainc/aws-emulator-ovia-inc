@@ -8,10 +8,12 @@
 //! model documents a just-created run carries ("This is typically STARTING when you first
 //! create the run"). The clock then owes it the rest of the lifecycle
 //! (`crate::state::WorkflowRun::settle`): `STARTING` -> `QUEUED` once the control plane has
-//! admitted it, and then, because this emulator has no Apache Airflow engine to execute the
-//! workflow definition with, `QUEUED` -> the modelled failure status `FAILED` with an
-//! `ErrorMessage` that says exactly that (`crate::state::NO_AIRFLOW_ENGINE`). No status is
-//! ever reported for work that ran, and the run holds no task instance.
+//! admitted it, `QUEUED` -> `RUNNING` once an executor picks it up, and then one task
+//! instance per task the definition declares, level by level, until the run reaches
+//! `SUCCESS`. The run "executes the tasks defined in your workflow definition", so what it
+//! executes is decided here, once: the task graph of the version it runs
+//! (`crate::state::workflow_execution::ExecutionPlan`), which also decides the
+//! `FAILED` outcome of a definition whose graph no run of it can execute.
 //!
 //! A repeated `ClientToken` starts nothing and REPORTS the run it already started, so it
 //! reports it the way every other reader of a run does: the owed status changes are
@@ -317,9 +319,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version = store
             .workflow_in(&region, &input.workflow_arn)
             .and_then(|workflow| workflow.version(requested))
-            .ok_or_else(unresolved_version)?
-            .version
-            .clone();
+            .ok_or_else(unresolved_version)?;
+        // What this run executes: the task graph of the definition THIS version froze. A
+        // version is immutable, so the plan is built once, here, and the run answers from
+        // it however the workflow is updated afterwards.
+        let execution = crate::state::workflow_execution::ExecutionPlan::of(
+            version.snapshot.workflow_definition.as_deref(),
+        );
+        let version = version.version.clone();
 
         // The emulator's own ceiling on this workflow's run store, refused with the
         // error the model already declares for exceeding a run quota.
@@ -364,10 +371,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: now,
             duration: None,
             error_message: None,
-            // No task instance exists until something executes the workflow
-            // definition, and this emulator has no Apache Airflow engine to do it
-            // (`crate::state::NO_AIRFLOW_ENGINE`), so a started run holds none.
+            // The instances of the tasks this run's definition declares are recorded
+            // when it starts executing them (`crate::state::WorkflowRun::settle`).
             task_instances: BTreeMap::new(),
+            execution,
             // The instant the run's exit from `STARTING` falls due. Recorded, never
             // waited on, so a caller reading the run straight back still sees the
             // `STARTING` this call reported (`crate::state::WorkflowRun::settle`

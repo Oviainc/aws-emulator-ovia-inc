@@ -240,14 +240,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the only failures it may answer are the ones its own error set declares, and a
         // not-found error is not among them.
         let run = store
-            .workflow_in(&region, &input.workflow_arn)
-            .and_then(|workflow| workflow.runs.get(&input.run_id));
+            .workflow_in_mut(&region, &input.workflow_arn)
+            .and_then(|workflow| workflow.runs.get_mut(&input.run_id));
         let Some(run) = run else {
             return Ok(ListTaskInstancesOutput {
                 task_instances: Some(Vec::new()),
                 next_token: None,
             });
         };
+
+        // The other change the clock already owed: the run's own progress through the
+        // tasks its definition declared, which is what decides which instances it holds
+        // and what each of them reports — the same step `GetWorkflowRun` takes.
+        run.settle(now);
+        let run = &*run;
 
         // A run holds its instances keyed by `TaskInstanceId`, so the walk is that key's
         // order — the same set and order `GetWorkflowRun` reports as

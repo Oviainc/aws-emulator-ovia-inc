@@ -1509,3 +1509,79 @@ async fn the_streaming_inference_variant_is_still_a_stub() {
         String::from_utf8_lossy(&answer.body)
     );
 }
+
+/// The session store is bounded AND always makes room: past its bound the oldest
+/// session is released, so sessions nothing can ever settle — a queue blocked on a
+/// missing sequence number never reaches a terminal status — cannot fill the store and
+/// leave every later submit refused for the life of the process.
+#[tokio::test]
+async fn the_session_store_still_accepts_a_submit_once_it_is_full_of_blocked_sessions() {
+    use service_com_amazonaws_sagemakertrainingsessionruntime_legorouterservice::state::MAX_SESSIONS;
+
+    let router = emulator();
+    // One session per slot, each holding a single operation parked behind a gap: the
+    // queue starts at sequence number 1, so a slot above that never executes and the
+    // session never settles.
+    for index in 0..MAX_SESSIONS {
+        let answer = submit_training(
+            &router,
+            &format!("blocked-{index}"),
+            json!({
+                "sequenceNumber": 5,
+                "operationConfig": {"saveState": {}},
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case blocked-{index}: expected HTTP 200, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+
+    // The store is full of sessions that can never settle; a submit naming a fresh
+    // session is still served, and so is the one after it.
+    for name in ["after-the-bound", "after-the-bound-two"] {
+        let answer = submit_training(
+            &router,
+            name,
+            json!({
+                "sequenceNumber": 1,
+                "operationConfig": {"saveState": {}},
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {name}: a full store releases its oldest session rather than refusing \
+             for ever, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        let id = answer.text("operationId");
+        assert!(
+            !id.is_empty(),
+            "case {name}: expected the submit to mint an operation id, got {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        // The operation the accepted submit stored is readable back, so the session it
+        // was made in is the one the store kept.
+        let poll = call(
+            &router,
+            "GET",
+            &format!("/v1/training-sessions/{name}/operations/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            poll.status,
+            200,
+            "case {name}: expected the stored operation to be readable, got {} {}",
+            poll.status,
+            String::from_utf8_lossy(&poll.body)
+        );
+    }
+}

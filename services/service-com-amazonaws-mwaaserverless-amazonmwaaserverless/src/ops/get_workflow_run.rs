@@ -12,7 +12,9 @@
 //! Every optional member is reported only when the stored run HOLDS a value for it: a run
 //! started with no `OverrideParameters` and a run holding no task instance report neither
 //! member rather than an empty map or an empty list, the same way `GetTaskInstance` omits
-//! the `Xcom` of an instance that exchanged no cross-task data.
+//! the `Xcom` of an instance that exchanged no cross-task data. Which task instances a run
+//! holds, and the status, completion and `ErrorMessage` it reports, are what the execution
+//! of its definition's task graph produced (`crate::state::workflow_execution`).
 //!
 //! The entity this operation resolves is the RUN, so neither a workflow nor a run the
 //! store does not hold resolves one: both are the modelled `ResourceNotFoundException`
@@ -261,8 +263,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 modified_at: Some(crate::state::timestamp(run.modified_at)),
                 duration: run.duration,
                 error_message: run.error_message.clone(),
-                // Absent for a run that holds no task instance, which is every run
-                // nothing executed the workflow definition for.
+                // Absent for a run that holds no task instance: one whose definition
+                // declared none, and one whose graph could not be built at all.
                 task_instances: {
                     let ids = run.task_instance_ids();
                     (!ids.is_empty()).then_some(ids)
