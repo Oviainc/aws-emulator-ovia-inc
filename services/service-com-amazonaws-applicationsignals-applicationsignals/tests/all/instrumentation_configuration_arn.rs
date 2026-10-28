@@ -216,6 +216,7 @@ fn cases() -> Vec<Case> {
             instrumentation_type: BREAKPOINT,
             location: json!({
                 "Language": "Java",
+                "ClassName": "com.example.CartService",
                 "FilePath": "src/main/java/com/example/CartService.java",
                 "LineNumber": 142
             }),
@@ -373,6 +374,7 @@ async fn only_the_region_segment_follows_the_credential_scope() {
         "InstrumentationType": BREAKPOINT,
         "Location": { "CodeLocation": {
             "Language": "Java",
+            "ClassName": "com.example.CartService",
             "FilePath": "src/main/java/com/example/CartService.java",
             "LineNumber": 142
         }},
