@@ -123,6 +123,8 @@ mod missing_series_alarms;
 mod not_found_messages;
 #[path = "all/otel_enrichment.rs"]
 mod otel_enrichment;
+#[path = "all/period_refusal_message.rs"]
+mod period_refusal_message;
 #[path = "all/put_metric_data_validation.rs"]
 mod put_metric_data_validation;
 #[path = "all/query_form_metrics.rs"]
@@ -149,3 +151,5 @@ mod statistic_name_refusals;
 mod stop_metric_streams;
 #[path = "all/unit_read_identity.rs"]
 mod unit_read_identity;
+#[path = "all/usage_call_count.rs"]
+mod usage_call_count;

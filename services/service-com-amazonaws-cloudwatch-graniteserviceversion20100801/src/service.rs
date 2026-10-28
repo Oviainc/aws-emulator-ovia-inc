@@ -21,11 +21,12 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — EDITED HERE: not a re-route. The key and the handler stay the
-//!   generated routing table's, but `PutMetricData` is served through
-//!   [`ReportingDroppedEntities`], so an accepted call whose entity this service could not
-//!   hold says so in its response header, and `GetMetricStatistics` through
-//!   [`RefusingValuesOutsideAnEnum`], so a value outside an enumerated type is refused as one
-//!   of the parameter faults ITS model declares; every other key falls through to that table.
+//!   generated routing table's, but every operation is served through [`Metering`], so each
+//!   call this service answers is counted into the usage telemetry it publishes about its own
+//!   API; `PutMetricData` is served through [`ReportingDroppedEntities`], so an accepted call
+//!   whose entity this service could not hold says so in its response header, and
+//!   `GetMetricStatistics` through [`RefusingValuesOutsideAnEnum`], so a value outside an
+//!   enumerated type is refused as one of the parameter faults ITS model declares.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -77,8 +78,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// read whose model declares a parameter fault to refuse a value outside an enumerated
     /// type with ([`RefusingValuesOutsideAnEnum`]). Each is built from the SAME shared engine
     /// as the generated table's and keyed by the routing key the protocol resolves, so the
-    /// operation served is the modelled one.
+    /// operation served is the modelled one, and each is METERED ([`Metering`]) like every
+    /// other operation of this service.
     overridden: OperationRoutingTable,
+    /// Every OTHER modelled operation, served through the generated table and metered
+    /// ([`Metering`] over [`TheModelledOperation`]): the call count this service publishes
+    /// about its own API is owed by every operation, so the seam that counts a call is the one
+    /// every request passes through rather than a line in each handler.
+    metered: Metering<Eng, TheModelledOperation>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -89,8 +96,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let mut overridden = OperationRoutingTable::new();
         overridden.add_operation(
             "PutMetricData",
-            Box::new(ReportingDroppedEntities::new(
-                crate::ops::put_metric_data::PutMetricData::new(Arc::clone(&engine)),
+            Box::new(Metering::new(
+                Arc::clone(&engine),
+                ReportingDroppedEntities::new(crate::ops::put_metric_data::PutMetricData::new(
+                    Arc::clone(&engine),
+                )),
             )) as Box<dyn ErasedOperation>,
         );
         // `GetMetricStatistics` validates the SAME enumerated types as the retrieving read and
@@ -100,12 +110,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // validation code ([`scalar_enum_refusal`]).
         overridden.add_operation(
             "GetMetricStatistics",
-            Box::new(RefusingValuesOutsideAnEnum::new(
-                crate::ops::get_metric_statistics::GetMetricStatistics::new(Arc::clone(&engine)),
-                parameter_fault_for,
+            Box::new(Metering::new(
+                Arc::clone(&engine),
+                RefusingValuesOutsideAnEnum::new(
+                    crate::ops::get_metric_statistics::GetMetricStatistics::new(Arc::clone(
+                        &engine,
+                    )),
+                    parameter_fault_for,
+                ),
             )) as Box<dyn ErasedOperation>,
         );
         Self {
+            metered: Metering::new(Arc::clone(&engine), TheModelledOperation),
             entry: crate::ServiceDefinition::new(engine),
             overridden,
         }
@@ -474,6 +490,109 @@ where
     }
 }
 
+/// One operation, served so that the call this service answers is COUNTED into the usage
+/// telemetry it publishes about its own API ([`crate::state::usage`]).
+///
+/// Every operation of this service is served through one of these, so a call is counted
+/// wherever it was answered from — the handler, a modelled refusal, or the boundary refusal
+/// one of the wrappers above words. The count is taken AFTER the answer is built and is
+/// written off it: the response a caller sees is the wrapped operation's own, and a count that
+/// could not be stored costs the telemetry a datapoint and never the answer.
+///
+/// The operation counted is named by the routing key the service's OWN protocol resolves —
+/// the modelled operation's shape name, the same key the generated routing table is read with
+/// — so the series a reader asks for by operation name is the series the call was counted in.
+struct Metering<Eng, O> {
+    /// The shared engine, so the count reaches the same store every handler of this service
+    /// writes ([`crate::state::service_state`]).
+    engine: Arc<Eng>,
+    /// The operation whose answer this one is.
+    operation: O,
+}
+
+impl<Eng, O> Metering<Eng, O> {
+    /// Meter the operation, already constructed from the shared engine.
+    fn new(engine: Arc<Eng>, operation: O) -> Self {
+        Self { engine, operation }
+    }
+}
+
+impl<Eng, O> ErasedOperation for Metering<Eng, O>
+where
+    Eng: Send + Sync + 'static,
+    O: ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The protocol is read, used and dropped inside this one statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let operation = svc
+                .definition()
+                .protocol()
+                .routing_key(req)
+                .ok()
+                .map(ToString::to_string);
+            let response = self.operation.run(svc, req, ctx).await;
+            // A served call is counted whatever it answered: "every request" includes the
+            // refused ones, which are requests the API answered.
+            if let Some(operation) = operation {
+                crate::state::usage::count_api_call(&*self.engine, &operation);
+            }
+            response
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: metering a call must not change which
+    /// schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// The modelled operation this service's generated routing table holds for the request's own
+/// routing key: what the request would have been served by had this file claimed nothing.
+///
+/// It re-implements NOTHING — it resolves the same key the router would have resolved and runs
+/// the generated table's own operation — and exists only so that the metering above can wrap
+/// every operation of this service without this file naming all 55 of them.
+struct TheModelledOperation;
+
+impl ErasedOperation for TheModelledOperation {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            // The definition is read and dropped inside this one statement, as above: the
+            // operation it hands back is `Send`, the definition reference is not.
+            let modelled = {
+                let definition = svc.definition();
+                definition
+                    .protocol()
+                    .routing_key(req)
+                    .ok()
+                    .and_then(|key| definition.routing_table().get(key))
+            };
+            match modelled {
+                Some(operation) => operation.run(svc, req, ctx).await,
+                // Unreachable through `override_operation`, which hands a request here only
+                // once the generated table has answered for its key; a request whose key the
+                // table does not name is the framework's own routing failure, worded by this
+                // service's entry exactly as it would be had nothing claimed the key.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -500,12 +619,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the operation it names is the one served — `PutMetricData` wrapped in
         // [`ReportingDroppedEntities`] so an accepted call reports the entity it dropped, and
         // `GetMetricStatistics` wrapped in [`RefusingValuesOutsideAnEnum`] so a value outside
-        // an enumerated type is refused as one of the parameter faults its model declares.
-        // Every other key resolves to `None` here, exactly as it would in an unedited service,
-        // and falls through to the generated table — where a refusal of such a value keeps this
-        // service's own validation code ([`scalar_enum_refusal`]).
+        // an enumerated type is refused as one of the parameter faults its model declares —
+        // where a refusal of such a value by any OTHER operation keeps this service's own
+        // validation code ([`scalar_enum_refusal`]).
+        //
+        // Every modelled key resolves here, because every call this service answers is counted
+        // into the usage telemetry it publishes about its own API ([`Metering`]): a key the two
+        // wrappers above do not claim is served by the generated table's own operation
+        // ([`TheModelledOperation`]), metered. A key the table does not name at all resolves to
+        // `None`, exactly as it would in an unedited service, and falls through to the
+        // framework's routing failure.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.overridden.get(key)
+        if let Some(operation) = self.overridden.get(key) {
+            return Some(operation);
+        }
+        self.entry
+            .routing_table()
+            .get(key)
+            .map(|_| &self.metered as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

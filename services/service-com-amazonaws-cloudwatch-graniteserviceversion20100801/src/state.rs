@@ -71,6 +71,10 @@ pub mod metric_math;
 /// alarm's configuration is — resolved over the series this store holds.
 pub mod metric_query;
 
+/// The usage telemetry this service publishes about its own API: the `CallCount` series every
+/// served call is counted into.
+pub mod usage;
+
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
 /// keys the same time series whatever order a request listed it in.
 pub type DimensionSet = BTreeMap<String, String>;
@@ -393,9 +397,18 @@ fn upper_camel(segment: &str) -> String {
 pub fn period_error(period: i32) -> Option<String> {
     let documented = period >= 1 && (SUB_MINUTE_PERIODS.contains(&period) || period % 60 == 0);
     (!documented).then(|| {
-        format!("Period must be a positive 1, 5, 10, 20, 30 or multiple of 60; got {period}")
+        // Stated the way CloudWatch states a value outside the set its member accepts
+        // ([`value_in_set_message`]): the member and the granularities it names, and nothing
+        // of the submitted value. The set the sentence enumerates is the sub-minute
+        // granularities, the values a caller cannot reach by multiplying a minute.
+        let allowed: Vec<String> = SUB_MINUTE_PERIODS.iter().map(i32::to_string).collect();
+        value_in_set_message(PERIOD_PARAMETER, &allowed)
     })
 }
+
+/// The request member a period arrives on, as every operation that takes one spells it
+/// (`GetMetricStatisticsInput$Period`, `MetricStat$Period`, `MetricDataQuery$Period`).
+const PERIOD_PARAMETER: &str = "Period";
 
 /// How long a datapoint stays readable at a SUB-MINUTE period: "Data points with a period of
 /// less than 60 seconds are available for 3 hours." (`GetMetricStatistics`,

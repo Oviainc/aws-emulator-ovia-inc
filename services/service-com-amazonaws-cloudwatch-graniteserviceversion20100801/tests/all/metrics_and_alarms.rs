@@ -822,7 +822,10 @@ async fn list_metrics_filters_only_the_series_that_exist() {
     )
     .await;
 
-    // Rows differ along which filter member is supplied and how selective it is.
+    // Rows differ along which filter member is supplied and how selective it is. The counts
+    // are of the series this test PUBLISHED: the service also meters its own API into the
+    // reserved usage namespace, so a series of that namespace is one no caller published and
+    // is not what these filters are being counted over ([`published_metrics`]).
     let cases: Vec<(&str, Value, usize)> = vec![
         ("no filter lists every series", json!({}), 4),
         (
@@ -864,15 +867,36 @@ async fn list_metrics_filters_only_the_series_that_exist() {
 
     for (case, filter, expected) in cases {
         let listed = ok(&router, "ListMetrics", &filter).await;
-        let got = listed
-            .get("Metrics")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
+        let got = published_metrics(&listed).len();
         assert_eq!(
             got, expected,
             "case {case:?}: expected {expected} metrics, got {listed}"
         );
     }
+}
+
+/// The namespace the service publishes its own API usage telemetry in, which belongs to no
+/// caller's publish.
+const SERVICE_USAGE_NAMESPACE: &str = "AWS/Usage";
+
+/// The series a `ListMetrics` answer reports that a CALLER published: every reported metric
+/// outside the namespace the service meters itself in ([`SERVICE_USAGE_NAMESPACE`]), whose
+/// series exist because calls were served rather than because anything was published.
+fn published_metrics(listed: &Value) -> Vec<Value> {
+    listed
+        .get("Metrics")
+        .and_then(Value::as_array)
+        .map(|metrics| {
+            metrics
+                .iter()
+                .filter(|metric| {
+                    metric.get("Namespace").and_then(Value::as_str)
+                        != Some(SERVICE_USAGE_NAMESPACE)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[tokio::test]
