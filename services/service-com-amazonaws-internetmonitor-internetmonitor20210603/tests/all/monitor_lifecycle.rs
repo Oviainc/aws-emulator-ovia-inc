@@ -142,6 +142,28 @@ pub(crate) fn member<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value.get(name).filter(|found| !found.is_null())
 }
 
+/// The error code a refusal carries: the `__type` of the JSON error envelope, with any
+/// namespace prefix dropped, which is what an SDK branches on. One rule for every suite
+/// that reads a refusal, rather than one copy per suite.
+pub(crate) fn error_code(body: &Value) -> String {
+    body["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `message` a refusal carries; see [`error_code`] for why it lives here.
+pub(crate) fn error_message(body: &Value) -> String {
+    body["message"]
+        .as_str()
+        .or_else(|| body["Message"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// `Resources` as a set, so a case can assert set semantics without depending on order.
 fn resource_set(value: &Value, field: &str) -> BTreeSet<String> {
     value
@@ -1131,8 +1153,8 @@ async fn deleting_a_monitor_makes_it_unobservable_and_frees_its_name() {
 
     let (status, got) = call(&router, "GET", "/v20210603/Monitors/doomed-monitor", None).await;
     assert_eq!(
-        status, 400,
-        "GetMonitor after a delete must fail, got {status} with {got}"
+        status, 404,
+        "GetMonitor after a delete must answer not found, got {status} with {got}"
     );
 
     let (_, listed) = call(&router, "GET", "/v20210603/Monitors", None).await;
@@ -1287,12 +1309,13 @@ async fn the_tagging_operations_refuse_an_arn_no_monitor_carries() {
 async fn a_monitor_name_no_monitor_carries_is_refused_with_the_modelled_error() {
     let router = emulator();
 
-    // GetMonitor models ValidationException (400) as its only client error for a name it
-    // cannot resolve; UpdateMonitor models ResourceNotFoundException (404).
+    // A monitor this account does not hold is a not-found condition for both the read and
+    // the mutate: 404 ResourceNotFoundException. The shapes and the shared message are
+    // asserted row by row in `crate::refusal_shapes`.
     let (status, got) = call(&router, "GET", "/v20210603/Monitors/ghost-monitor", None).await;
     assert_eq!(
-        status, 400,
-        "GetMonitor for an unknown name: expected 400, got {status} with {got}"
+        status, 404,
+        "GetMonitor for an unknown name: expected 404, got {status} with {got}"
     );
 
     let (status, updated) = call(
@@ -1340,17 +1363,15 @@ async fn the_operations_outside_this_slice_still_answer_501() {
     create_monitor(&router, json!({ "MonitorName": "untouched-monitor" })).await;
 
     // A stub answers 501 NotImplemented rather than an empty success, so the stub census
-    // stays honest while these operations are filed separately.
+    // stays honest while these operations are filed separately. The query interface's
+    // own operations (StartQuery, GetQueryStatus, StopQuery) are implemented and have
+    // their own suite; `GetQueryResults` is still filed on its own.
     let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
         (
-            "StartQuery",
-            "POST",
-            "/v20210603/Monitors/untouched-monitor/Queries".to_string(),
-            Some(json!({
-                "StartTime": 1_792_000_000,
-                "EndTime": 1_792_003_600,
-                "QueryType": "MEASUREMENTS",
-            })),
+            "GetQueryResults",
+            "GET",
+            "/v20210603/Monitors/untouched-monitor/Queries/some-query-id/Results".to_string(),
+            None,
         ),
         (
             "GetInternetEvent",

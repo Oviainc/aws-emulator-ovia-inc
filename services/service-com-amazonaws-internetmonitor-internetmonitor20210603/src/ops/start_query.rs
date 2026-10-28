@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a query of the query interface against a stored monitor: it mints the
+//! `QueryId` the model calls "the internally-generated identifier of a specific query",
+//! records the query in [`crate::state`] in the non-terminal `QUEUED` state and leaves
+//! the clock to carry it to `RUNNING` and then `SUCCEEDED`. `GetQueryStatus` reports it
+//! and `StopQuery` cancels it.
+//!
+//! A monitor whose `Resources` is empty has no application traffic to query, so a start
+//! against one is refused with `BadRequestException` (400) and nothing is recorded.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +96,8 @@
 //!
 //! * `AccessDeniedException` (HTTP 403) — You don't have sufficient permission to perform
 //!   this action.
+//! * `BadRequestException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   shape this service answers an input-validation failure with.
 //! * `InternalServerException` (HTTP 500) — An internal error occurred.
 //! * `LimitExceededException` (HTTP 403) — The request exceeded a service quota.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
@@ -115,10 +117,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-internetmonitor-interne
 // here — hence the `StartQueryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.internetmonitor#StartQuery")]
+//
+// `BadRequestException` is widened in through `extra_errors`: this SERVICE models it
+// (`TagResource` lists it, "A bad request was received", HTTP 400) and it is the shape
+// this service answers an input-validation failure of a request with — here, a request
+// that asks for data a monitor cannot have, or a time period that ends before it starts.
+#[smithy_macros::operation_error(
+    "com.amazonaws.internetmonitor#StartQuery",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum StartQueryErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    BadRequestException(BadRequestException),
     InternalServerException(InternalServerException),
     LimitExceededException(LimitExceededException),
     ThrottlingException(ThrottlingException),
@@ -174,20 +185,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQuery"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartQueryError::Modeled(StartQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // `LinkedAccountId` names an account whose monitors this monitoring account can
+        // query. This emulator serves exactly one account, so the only id that can name a
+        // monitor here is its own.
+        if let Some(linked) = input.linked_account_id.as_deref() {
+            if linked != ::engine::emulator_account_id() {
+                return Err(StartQueryErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "LinkedAccountId {linked} is not an account linked to this monitoring account."
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // A query runs against one monitor, so a name this account does not hold names no
+        // queryable resource at all. The wording extends the form this service uses for a
+        // resource id it cannot resolve (recorded for a health event) to the monitor's own
+        // resource path; it is that form applied here, not a separately recorded message.
+        let Some(monitor) = store.monitors.get(&input.monitor_name) else {
+            return Err(StartQueryErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::invalid_resource_id_message(
+                    &crate::state::monitor_resource_path(&input.monitor_name),
+                )),
+            })
+            .into());
+        };
+
+        // "Specify a time period for the data that you want returned by using StartTime
+        // and EndTime": a period that ends before it starts is no period, so the request
+        // is refused as an input-validation failure rather than recording a query that can
+        // return nothing.
+        let start_time = input.start_time.as_secs_f64();
+        let end_time = input.end_time.as_secs_f64();
+        if end_time < start_time {
+            return Err(StartQueryErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        // A monitor is "built based on information from the application resources that you
+        // add", and every query type reports measurements of the traffic to those
+        // resources: a monitor with none has no data any query type could return, so the
+        // request is refused whatever it asked for, and no query is recorded and no
+        // lifecycle started.
+        if monitor.resources.is_empty() {
+            return Err(StartQueryErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        let query_id = crate::state::mint_query_id(store.take_query_seq());
+        let record = crate::state::QueryRecord::new(
+            query_id.clone(),
+            &input.monitor_name,
+            &input.query_type,
+            start_time,
+            end_time,
+            input.filter_parameters.unwrap_or_default(),
+            now,
+        );
+        store.record_query(record);
+        Ok(StartQueryOutput { query_id })
     }
 }

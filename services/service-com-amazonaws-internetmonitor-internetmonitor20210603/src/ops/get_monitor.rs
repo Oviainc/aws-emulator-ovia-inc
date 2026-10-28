@@ -3,8 +3,10 @@
 //! @op GetMonitor
 //!
 //! Reports one stored monitor from [`crate::state`], exactly as `CreateMonitor` /
-//! `UpdateMonitor` / `TagResource` left it. A name no monitor carries is refused with
-//! the only client error this operation models, `ValidationException` (400).
+//! `UpdateMonitor` / `TagResource` left it. A name no monitor carries is a not-found
+//! condition, refused with `ResourceNotFoundException` (404) — the shape this service
+//! answers for a monitor the account does not hold, widened in through `extra_errors`
+//! below — and never a malformed-request error.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +104,8 @@
 //! * `AccessDeniedException` (HTTP 403) — You don't have sufficient permission to perform
 //!   this action.
 //! * `InternalServerException` (HTTP 500) — An internal error occurred.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see
+//!   below): the request specifies a resource that doesn't exist.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 //! * `ValidationException` (HTTP 400) — Invalid request.
 
@@ -119,11 +123,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-internetmonitor-interne
 // here — hence the `GetMonitorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.internetmonitor#GetMonitor")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: this SERVICE models
+// it (`UpdateMonitor` lists it, "The request specifies a resource that doesn't exist",
+// HTTP 404) and it is the shape a read of a monitor the account does not hold is refused
+// with — a terminal, non-retryable condition a waiter or a cleanup loop keys on, which
+// the generic client-input error cannot express.
+#[smithy_macros::operation_error(
+    "com.amazonaws.internetmonitor#GetMonitor",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetMonitorErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -209,9 +223,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_all(now);
 
         let Some(monitor) = store.monitors.get(&input.monitor_name) else {
-            return Err(GetMonitorErrorModeled::ValidationException(ValidationException {
-                message: Some(format!("The monitor {} does not exist.", input.monitor_name)),
-            })
+            // Not found, not malformed: the message is the one the service builds from the
+            // request and the caller's account, shared with `UpdateMonitor`.
+            return Err(GetMonitorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::monitor_not_found_message(
+                        &input.monitor_name,
+                    )),
+                },
+            )
             .into());
         };
 

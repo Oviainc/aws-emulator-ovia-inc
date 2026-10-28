@@ -221,10 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flatten();
         let Some(event) = event else {
             return Err(GetHealthEventErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "resourceID is invalid: health-event/{}/{}",
+                message: Some(crate::state::invalid_resource_id_message(&format!(
+                    "health-event/{}/{}",
                     input.monitor_name, input.event_id
-                )),
+                ))),
             })
             .into());
         };

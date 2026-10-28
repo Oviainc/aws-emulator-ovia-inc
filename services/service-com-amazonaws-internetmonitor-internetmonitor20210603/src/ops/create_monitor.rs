@@ -108,6 +108,8 @@
 //!
 //! * `AccessDeniedException` (HTTP 403) — You don't have sufficient permission to perform
 //!   this action.
+//! * `BadRequestException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   shape this service answers an input-validation failure with.
 //! * `ConflictException` (HTTP 409) — The requested resource is in use.
 //! * `InternalServerException` (HTTP 500) — An internal error occurred.
 //! * `LimitExceededException` (HTTP 403) — The request exceeded a service quota.
@@ -128,10 +130,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-internetmonitor-interne
 // here — hence the `CreateMonitorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.internetmonitor#CreateMonitor")]
+//
+// `BadRequestException` is widened in through `extra_errors`: this SERVICE models it
+// (`TagResource` lists it, "A bad request was received", HTTP 400) and it is the shape
+// Internet Monitor answers an input-validation failure of this operation's request with —
+// the boundary validator refuses a modelled constraint with it through
+// `crate::service`'s refusal seam, and the per-monitor tag maximum below, which no
+// modelled constraint expresses, is the same class of failure.
+#[smithy_macros::operation_error(
+    "com.amazonaws.internetmonitor#CreateMonitor",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum CreateMonitorErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    BadRequestException(BadRequestException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     LimitExceededException(LimitExceededException),
@@ -229,8 +242,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if store.monitors.contains_key(&input.monitor_name) {
+            // The conflict is worded from the request: it names the `MonitorName` that was
+            // rejected, so a client can tell which create of a batch conflicted.
             return Err(CreateMonitorErrorModeled::ConflictException(ConflictException {
-                message: Some(format!("The monitor {} already exists.", input.monitor_name)),
+                message: Some(format!(
+                    "Monitor with name {} already exists",
+                    input.monitor_name
+                )),
             })
             .into());
         }
@@ -268,16 +286,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The model states the per-monitor tag maximum, and `TagMap`'s own 0..200 length
-        // does not enforce it.
+        // does not enforce it. A request carrying more is an input-validation failure, so
+        // it is refused with the same shape and wording as one the boundary validator
+        // catches.
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
         if tags.len() > crate::state::MAX_TAGS_PER_MONITOR {
-            return Err(CreateMonitorErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "Tags carries {} tags; a monitor holds at most {}.",
-                    tags.len(),
-                    crate::state::MAX_TAGS_PER_MONITOR
-                )),
+            return Err(CreateMonitorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string()),
             })
             .into());
         }
