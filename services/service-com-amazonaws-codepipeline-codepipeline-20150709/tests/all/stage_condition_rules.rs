@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use crate::execution_engine::{
-    artifact_bucket, declaration, source_stage, wait_for_terminal, zip_of, Emulator,
+    artifact_bucket, creation_run, declaration, source_stage, wait_for_terminal, zip_of, Emulator,
 };
 
 /// The bucket the source object lives in.
@@ -219,14 +219,11 @@ async fn every_rule_of_a_reached_condition_is_recorded_most_recent_first() {
             )
             .await;
 
-        // Nothing has been evaluated before an execution reaches the stage.
-        assert_eq!(
-            rule_names(&list(&emulator, &pipeline, json!({})).await),
-            Vec::<String>::new(),
-            "case {case:?}: a pipeline that has not run has evaluated no rule"
-        );
-
-        let execution = start(&emulator, &pipeline).await;
+        // The execution under test is the one the pipeline's creation started: creating
+        // a pipeline runs it once, so that run is what reaches the stage's condition.
+        // (Rules on a stage NO execution has reached are the sibling suite's subject,
+        // `tests/all/rule_executions.rs`.)
+        let execution = creation_run(&emulator, &pipeline).await;
         let answer = wait_for_terminal(&emulator, &pipeline, &execution).await;
         assert_eq!(
             answer["pipelineExecution"]["status"],
@@ -343,7 +340,8 @@ async fn a_declared_result_does_not_act_on_a_condition_nothing_decided() {
             )
             .await;
 
-        let execution = start(&emulator, &pipeline).await;
+        // The execution under test is the run the pipeline's creation started.
+        let execution = creation_run(&emulator, &pipeline).await;
         let answer = wait_for_terminal(&emulator, &pipeline, &execution).await;
         assert_eq!(
             answer["pipelineExecution"]["status"],
@@ -741,7 +739,9 @@ async fn the_listing_is_ordered_paged_and_filtered_by_execution() {
         )
         .await;
 
-    let first = start(&emulator, pipeline).await;
+    // The two executions whose evaluations this listing orders: the run the pipeline's
+    // creation started, and one more start.
+    let first = creation_run(&emulator, pipeline).await;
     let second = start(&emulator, pipeline).await;
     for execution in [&first, &second] {
         let answer = wait_for_terminal(&emulator, pipeline, execution).await;

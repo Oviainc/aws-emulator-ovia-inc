@@ -27,8 +27,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::execution_engine::{
-    artifact_bucket, declaration, deploy_stage, source_stage, status_of, wait_for_terminal,
-    Emulator,
+    artifact_bucket, creation_run, declaration, deploy_stage, source_stage, status_of,
+    wait_for_terminal, Emulator,
 };
 
 /// The bytes the source action of these pipelines reads.
@@ -147,7 +147,9 @@ async fn a_stop_settles_the_execution_and_nothing_runs_after_it() {
     {
         let pipeline = format!("stop-{}", case.replace([' ', ','], "-"));
         let emulator = emulator_with(&pipeline, deploy_keys, execution_mode).await;
-        let execution = start(&emulator, &pipeline).await;
+        // The execution under test is the one the pipeline's creation started: creating
+        // a pipeline runs it once, so that run is the one in flight to be stopped.
+        let execution = creation_run(&emulator, &pipeline).await;
 
         let stopped = emulator
             .ok(

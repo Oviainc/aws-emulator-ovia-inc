@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::execution_engine::{
-    artifact_bucket, source_stage, wait_for_terminal, Emulator, WAIT,
+    artifact_bucket, creation_run, source_stage, wait_for_terminal, Emulator, WAIT,
 };
 use crate::pipeline_lifecycle::ROLE_ARN;
 
@@ -193,13 +193,9 @@ async fn a_second_response_to_one_approval_is_refused_with_one_invariant_message
         emulator
             .ok("CreatePipeline", &approval_declaration(row, &bucket))
             .await;
-        let started = emulator
-            .ok("StartPipelineExecution", &json!({"name": row.pipeline}))
-            .await;
-        let execution = started["pipelineExecutionId"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {:?}: the start reports an execution id", row.case))
-            .to_string();
+        // The execution under test is the one the pipeline's creation started: creating
+        // a pipeline runs it once, and that run is what reaches the approval action.
+        let execution = creation_run(&emulator, &row.pipeline).await;
 
         let token = approval_token(&emulator, row).await;
         let answered = emulator

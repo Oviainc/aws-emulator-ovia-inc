@@ -436,8 +436,12 @@ fn artifact_bucket(name: &str) -> String {
     format!("{name}-artifacts")
 }
 
-/// Create the buckets, the source object, the custom action type and the pipeline, and
-/// start an execution; answer the action type and the execution id.
+/// Create the buckets, the source object, the custom action type and the pipeline;
+/// answer the action type and the id of the execution the pipeline's creation started.
+///
+/// Creating a pipeline RUNS it once — `TriggerType` carries `CreatePipeline` for that
+/// run — so the execution whose custom action queues the job each case below polls for
+/// is the one the create began.
 async fn running_pipeline(
     emulator: &Emulator,
     pipeline: &str,
@@ -454,12 +458,16 @@ async fn running_pipeline(
             &custom_action_pipeline(pipeline, &action_type, configuration),
         )
         .await;
-    let started = emulator
-        .ok("StartPipelineExecution", &json!({"name": pipeline}))
+    let listed = emulator
+        .ok("ListPipelineExecutions", &json!({"pipelineName": pipeline}))
         .await;
-    let execution = started["pipelineExecutionId"]
-        .as_str()
-        .expect("a started execution carries its id")
+    let execution = listed["pipelineExecutionSummaries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|summary| summary["trigger"]["triggerType"] == json!("CreatePipeline"))
+        .and_then(|summary| summary["pipelineExecutionId"].as_str())
+        .unwrap_or_else(|| panic!("creating {pipeline} ran it once, got {listed}"))
         .to_string();
     (action_type, execution)
 }

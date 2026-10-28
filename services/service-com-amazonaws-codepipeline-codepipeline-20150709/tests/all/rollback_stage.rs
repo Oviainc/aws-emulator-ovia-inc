@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::execution_engine::{
-    artifact_bucket, declaration, deploy_stage, source_stage, wait_for_terminal, Emulator, WAIT,
+    artifact_bucket, creation_run, declaration, deploy_stage, source_stage, wait_for_terminal,
+    Emulator, WAIT,
 };
 
 /// The source bytes the rollback target runs with — the state a rollback restores.
@@ -446,7 +447,9 @@ async fn a_rollback_naming_what_cannot_be_rolled_back_is_refused() {
         listed["pipelineExecutionSummaries"]
             .as_array()
             .map(Vec::len),
-        Some(1),
+        // The two the calls above began: the run the pipeline's creation started and
+        // the one `run` started. A refused rollback adds none.
+        Some(2),
         "a refused rollback starts no execution, got {listed}"
     );
 
@@ -566,13 +569,9 @@ async fn a_rollback_of_a_stage_that_is_still_running_is_refused() {
             ),
         )
         .await;
-    let started = emulator
-        .ok("StartPipelineExecution", &json!({"name": pipeline}))
-        .await;
-    let execution = started["pipelineExecutionId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the start reports an execution id, got {started}"))
-        .to_string();
+    // The execution under test is the one the pipeline's creation started: creating a
+    // pipeline runs it once, and that run is what holds the stage at the approval.
+    let execution = creation_run(&emulator, pipeline).await;
 
     // The approval holds the stage, so the stage is running while the token waits.
     let token = approval_token(&emulator, pipeline).await;
