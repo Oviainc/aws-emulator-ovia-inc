@@ -160,15 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // "Specifies whether to include a graph when returning the workflow resource
-        // metadata": the reader that did not ask for one is answered without it, which is
-        // also what a request that named no `IncludeGraph` asked for, and the reader that
-        // asked gets the components this workflow's triggers make it of. Read before the
-        // record is borrowed to write to, so the projection is handed the graph it reports.
-        let graph = input
-            .include_graph
-            .unwrap_or(false)
-            .then(|| store.workflow_graph(&region, &input.name));
         let Some(entry) = store.workflow_mut(&input.name) else {
             return Err(GetWorkflowErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
@@ -179,9 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         entry.settle_due_runs(now);
+        // The runs those executions' actions began were owed the same clock, and this read
+        // reports the state each has reached, so what it owed them is materialised too.
+        store.settle_due_action_job_runs(&region, &input.name, now);
 
-        Ok(GetWorkflowOutput {
-            workflow: Some(entry.to_workflow(graph)),
-        })
+        // "Specifies whether to include a graph when returning the workflow resource
+        // metadata": the reader that did not ask for one is answered without it, which is
+        // also what a request that named no `IncludeGraph` asked for, and the reader that
+        // asked gets the components this workflow's triggers make it of. The projection is
+        // the STORE's, because the graph's job nodes and the last run's statistics report
+        // the job runs the workflow's actions began.
+        let include_graph = input.include_graph.unwrap_or(false);
+        let workflow = store
+            .workflow(&input.name)
+            .map(|entry| store.to_workflow(&region, entry, include_graph));
+
+        Ok(GetWorkflowOutput { workflow })
     }
 }

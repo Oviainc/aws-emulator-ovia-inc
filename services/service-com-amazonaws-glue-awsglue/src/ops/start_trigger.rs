@@ -246,6 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             Vec::new()
         };
+        // When the firing also began a run of the trigger's workflow, those job runs are
+        // what that run's actions amount to, so the run records them: a later read reports
+        // them under its graph's job nodes and counts them in its statistics.
+        if let (Some(workflow_name), Some(run_id)) =
+            (workflow_name.as_deref(), begun_run.as_deref())
+        {
+            store.record_workflow_run_job_runs(workflow_name, run_id, &begun_job_runs);
+        }
 
         // "Starts an existing trigger": the state the start leaves the trigger in is the
         // state its TYPE is left in by a start ([`crate::state::TriggerEntry::start`]) —

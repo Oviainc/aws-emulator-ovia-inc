@@ -65,6 +65,11 @@ async fn register_targets(router: &MultiServiceRouter) {
             "Name": JOB,
             "Role": ROLE_ARN,
             "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/etl.py" },
+            // Room for every row's entry point to begin its one run of this shared job,
+            // so the action counts a run reports are not bounded by a slot an earlier
+            // row's run is still holding. The ceiling's own effect on a firing is the
+            // subject of `trigger_action_runs`.
+            "ExecutionProperty": { "MaxConcurrentRuns": 10 },
         }),
     )
     .await;
@@ -340,6 +345,10 @@ async fn a_started_workflow_run_is_read_back_from_the_store() {
         // Hold the transient window open, so what is asserted below is the status a start
         // leaves a run in and not whatever the clock has since made due.
         set_due_instant(&engine, &workflow, far_future());
+        // The run the entry point's one job action began is held in flight for the same
+        // reason: this row asserts the action counts a start leaves, not what the clock has
+        // since made of that run.
+        crate::job_runs::set_due_instant(&engine, JOB, far_future());
 
         assert!(
             run_id.starts_with(WORKFLOW_RUN_ID_PREFIX),
@@ -379,21 +388,28 @@ async fn a_started_workflow_run_is_read_back_from_the_store() {
             "case {case}: expected {} total actions, got {statistics}",
             row.total_actions
         );
-        // Nothing here executes an action, so no action of the run has any outcome yet.
+        // The one job action every row's entry point initiates began a run of that job,
+        // held in flight above, so the run counts that action as running.
+        assert_eq!(
+            statistics.get("RunningActions").and_then(Value::as_i64),
+            Some(1),
+            "case {case}: the run the entry point's job action began is in flight, got \
+             {statistics}"
+        );
+        // Nothing here executes an action and nothing has stopped one, so no action of the
+        // run has reached any of the states those produce.
         for counted in [
             "TimeoutActions",
             "FailedActions",
             "StoppedActions",
             "SucceededActions",
-            "RunningActions",
             "ErroredActions",
             "WaitingActions",
         ] {
             assert_eq!(
                 statistics.get(counted).and_then(Value::as_i64).unwrap_or(0),
                 0,
-                "case {case}: no action of the run has an outcome, so {counted} is 0, got \
-                 {statistics}"
+                "case {case}: no action of the run has reached {counted}, got {statistics}"
             );
         }
         let started_on = run

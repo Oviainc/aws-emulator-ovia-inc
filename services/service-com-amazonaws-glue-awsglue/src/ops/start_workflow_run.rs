@@ -241,6 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // job begins a run of that job exactly as the trigger's own start does.
         let begun_job_runs =
             store.initiate_trigger_actions(&region, &trigger_name, &starting_actions, now);
+        // Those runs are what this workflow run's actions amount to, so the run records
+        // them: a later read reports them under its graph's job nodes and counts them in
+        // its statistics.
+        store.record_workflow_run_job_runs(&input.name, &run_id, &begun_job_runs);
         ::tracing::info!(
             operation = "StartWorkflowRun",
             workflow = %input.name,

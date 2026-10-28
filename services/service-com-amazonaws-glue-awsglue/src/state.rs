@@ -214,7 +214,7 @@
 pub mod catalog_encryption;
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -244,7 +244,8 @@ use crate::ops::types::{
     FederatedTable, GlueTable, GrokClassifier, IcebergOptimizationPropertiesOutput, Job,
     JsonClassifier, MLTransform,
     CreateUsageProfileInput,
-    JobCommand, JobRun, JobUpdate, LakeFormationConfiguration, LineageConfiguration,
+    JobCommand, JobNodeDetails, JobRun, JobUpdate, LakeFormationConfiguration,
+    LineageConfiguration,
     Node, NotificationProperty, Partition, PartitionInput, Predicate, PrincipalPermissions,
     ProfileConfiguration,
     RLSProperties,
@@ -1732,7 +1733,16 @@ impl ComAmazonawsGlueAwsglueState {
     /// The walk is over that Region's triggers, bounded by [`MAX_TRIGGERS`], and takes them
     /// in name order (the map is ordered), so two reads of an unchanged store report the
     /// same graph.
-    pub fn workflow_graph(&self, region: &str, workflow_name: &str) -> WorkflowGraph {
+    ///
+    /// `run` is the workflow run the graph is reported BESIDE, whose job runs each `JOB`
+    /// node reports as "the information for the job runs represented by the job node"
+    /// (`JobNodeDetails$JobRuns`), and `None` for a read that reports no run at all.
+    pub fn workflow_graph(
+        &self,
+        region: &str,
+        workflow_name: &str,
+        run: Option<&WorkflowRunEntry>,
+    ) -> WorkflowGraph {
         let mut graph = WorkflowGraphBuilder::default();
         let attached = self
             .triggers
@@ -1741,12 +1751,13 @@ impl ComAmazonawsGlueAwsglueState {
             .flat_map(BTreeMap::values)
             .filter(|trigger| trigger.workflow_name.as_deref() == Some(workflow_name));
         for trigger in attached {
-            let trigger_id = graph.node(NODE_TYPE_TRIGGER, &trigger.name, Some(trigger));
+            let trigger_id = graph.node(NODE_TYPE_TRIGGER, &trigger.name, Some(trigger), &[]);
             for action in &trigger.actions {
                 for (node_type, name) in
                     named_components(action.job_name.as_deref(), action.crawler_name.as_deref())
                 {
-                    let initiated = graph.node(node_type, name, None);
+                    let runs = self.component_job_runs(region, run, node_type, name);
+                    let initiated = graph.node(node_type, name, None, &runs);
                     graph.edge(&trigger_id, &initiated);
                 }
             }
@@ -1761,12 +1772,187 @@ impl ComAmazonawsGlueAwsglueState {
                     condition.job_name.as_deref(),
                     condition.crawler_name.as_deref(),
                 ) {
-                    let waited_on = graph.node(node_type, name, None);
+                    let runs = self.component_job_runs(region, run, node_type, name);
+                    let waited_on = graph.node(node_type, name, None, &runs);
                     graph.edge(&waited_on, &trigger_id);
                 }
             }
         }
         graph.build()
+    }
+
+    /// The runs of the workflow run `run` that belong to the graph node for the component
+    /// `name` of type `node_type`, as the modelled `JobRun` shape.
+    ///
+    /// Only a `JOB` node has job runs to report, and only the runs THIS workflow run began
+    /// are its: a run of the same job that another workflow run — or a caller's own
+    /// `StartJobRun` — began is not part of this run. The runs are read out of the job
+    /// definition they belong to ([`JobEntry::runs`]), so a node reports the state each run
+    /// has reached by now rather than the state it was begun in, and they are taken in the
+    /// order the actions initiated them, so two reads of an unchanged store agree.
+    fn component_job_runs(
+        &self,
+        region: &str,
+        run: Option<&WorkflowRunEntry>,
+        node_type: &str,
+        name: &str,
+    ) -> Vec<JobRun> {
+        if node_type != NODE_TYPE_JOB {
+            return Vec::new();
+        }
+        let Some(run) = run else {
+            return Vec::new();
+        };
+        let Some(job) = self.job(region, name) else {
+            return Vec::new();
+        };
+        run.action_job_runs
+            .iter()
+            .filter(|begun| begun.job_name == name)
+            .filter_map(|begun| job.run(&begun.run_id))
+            .map(JobRunEntry::to_job_run)
+            .collect()
+    }
+
+    /// `WorkflowRun$Statistics`: "Workflow run statistics provides statistics about the
+    /// workflow run."
+    ///
+    /// "Total number of Actions in the workflow run" is what the entry point that began the
+    /// run initiates, which the run itself records ([`WorkflowRunEntry::total_actions`]).
+    /// Every other count is of the run's actions that are IN one state, so each is taken
+    /// from the state the job run that action began has reached by now — the same records
+    /// the graph's `JOB` nodes report — rather than from anything stored on the run, so a
+    /// later read reports the counts the clock has since moved.
+    ///
+    /// An action whose job run the store no longer holds, and a terminal `JobRunState` the
+    /// shape has no counter for, are counted in none of them.
+    pub fn workflow_run_statistics(
+        &self,
+        region: &str,
+        run: &WorkflowRunEntry,
+    ) -> WorkflowRunStatistics {
+        let mut statistics = WorkflowRunStatistics {
+            total_actions: run.total_actions,
+            ..WorkflowRunStatistics::default()
+        };
+        for begun in &run.action_job_runs {
+            let Some(state) = self
+                .job(region, &begun.job_name)
+                .and_then(|job| job.run(&begun.run_id))
+                .map(|job_run| job_run.state.as_str())
+            else {
+                continue;
+            };
+            let counted = match state {
+                JOB_RUN_STATE_SUCCEEDED => &mut statistics.succeeded_actions,
+                JOB_RUN_STATE_FAILED => &mut statistics.failed_actions,
+                JOB_RUN_STATE_TIMEOUT => &mut statistics.timeout_actions,
+                JOB_RUN_STATE_STOPPED => &mut statistics.stopped_actions,
+                JOB_RUN_STATE_ERROR => &mut statistics.errored_actions,
+                JOB_RUN_STATE_WAITING => &mut statistics.waiting_actions,
+                // "Total number Actions in running state": a run that has not finished and
+                // is not waiting for a slot is consuming resources.
+                other if !TERMINAL_JOB_RUN_STATES.contains(&other) => {
+                    &mut statistics.running_actions
+                }
+                _ => continue,
+            };
+            *counted = counted.saturating_add(1);
+        }
+        statistics
+    }
+
+    /// The modelled `Workflow` for the stored workflow `workflow`, read in `region`.
+    ///
+    /// `include_graph` is the reader's own `IncludeGraph`; the graph is reported beside
+    /// "the information about the last execution of the workflow" (`Workflow$LastRun`), so
+    /// that run is the one its `JOB` nodes report the job runs of.
+    pub fn to_workflow(
+        &self,
+        region: &str,
+        workflow: &WorkflowEntry,
+        include_graph: bool,
+    ) -> Workflow {
+        let last_run = workflow.runs.last();
+        let graph =
+            include_graph.then(|| self.workflow_graph(region, &workflow.name, last_run));
+        workflow.to_workflow(
+            graph,
+            last_run.map(|run| {
+                run.to_workflow_run(None, self.workflow_run_statistics(region, run))
+            }),
+        )
+    }
+
+    /// The modelled `WorkflowRun` for the stored run `run`, read in `region`: the ONE
+    /// projection every read of a workflow run serves, so the single-run read and the run
+    /// listing report a run identically.
+    ///
+    /// `include_graph` is the reader's own `IncludeGraph`, and the graph it asks for is the
+    /// graph of THIS run — its `JOB` nodes report the runs this run's actions began.
+    pub fn to_workflow_run(
+        &self,
+        region: &str,
+        run: &WorkflowRunEntry,
+        include_graph: bool,
+    ) -> WorkflowRun {
+        let graph =
+            include_graph.then(|| self.workflow_graph(region, &run.workflow_name, Some(run)));
+        run.to_workflow_run(graph, self.workflow_run_statistics(region, run))
+    }
+
+    /// Give the job runs the workflow `workflow_name`'s runs began the state the CLOCK
+    /// already owed them at `now`.
+    ///
+    /// A read of one of those workflow runs reports the state each of its actions has
+    /// reached — under the `JOB` nodes of its graph and in its statistics — and that state
+    /// was due at the job run's own settle instant whether or not anybody called, so the
+    /// read materialises it exactly as it materialises the statuses the workflow's own runs
+    /// were owed ([`WorkflowEntry::settle_due_runs`]). Nothing else about those runs moves.
+    ///
+    /// The walk is over the jobs this workflow's runs named, bounded by
+    /// [`MAX_RUNS_PER_WORKFLOW`] runs each naming the actions of one trigger.
+    pub fn settle_due_action_job_runs(
+        &mut self,
+        region: &str,
+        workflow_name: &str,
+        now: SystemTime,
+    ) {
+        let named: BTreeSet<String> = self
+            .workflow(workflow_name)
+            .into_iter()
+            .flat_map(|workflow| workflow.runs.iter())
+            .flat_map(|run| run.action_job_runs.iter())
+            .map(|begun| begun.job_name.clone())
+            .collect();
+        for job_name in named {
+            if let Some(job) = self.job_mut(region, &job_name) {
+                job.settle_due_runs(now);
+            }
+        }
+    }
+
+    /// Record on the run `run_id` of the workflow `workflow_name` the job runs `begun` that
+    /// its actions started, so a later read of that run reports them.
+    ///
+    /// The association lives on the RUN because a job run is addressed by its job and its
+    /// own id and carries no workflow run of its own: without it, two runs of the same
+    /// workflow could not be told apart by what each initiated.
+    pub fn record_workflow_run_job_runs(
+        &mut self,
+        workflow_name: &str,
+        run_id: &str,
+        begun: &[ActionJobRun],
+    ) {
+        if begun.is_empty() {
+            return;
+        }
+        if let Some(run) = self
+            .workflow_mut(workflow_name)
+            .and_then(|workflow| workflow.run_mut(run_id))
+        {
+            run.action_job_runs.extend(begun.iter().cloned());
+        }
     }
 
     /// Store `entry` as this account's workflow under its own name, which is the key every
@@ -1902,8 +2088,7 @@ impl ComAmazonawsGlueAwsglueState {
     }
 
     /// Initiate `actions` — the actions of the trigger `trigger_name`, which has just FIRED
-    /// in the Region `region` — and answer the id of every job run they began, in action
-    /// order.
+    /// in the Region `region` — and answer every job run they began, in action order.
     ///
     /// "Defines an action to be initiated by a trigger" (`Action`): an action naming a job
     /// begins a RUN of that job, carrying the overrides the action names over the job's own
@@ -1929,7 +2114,7 @@ impl ComAmazonawsGlueAwsglueState {
         trigger_name: &str,
         actions: &[Action],
         now: SystemTime,
-    ) -> Vec<String> {
+    ) -> Vec<ActionJobRun> {
         let mut begun = Vec::new();
         for action in actions {
             let Some(job_name) = action.job_name.as_deref() else {
@@ -1956,7 +2141,10 @@ impl ComAmazonawsGlueAwsglueState {
                 Some(trigger_name),
             );
             job.record_run(run);
-            begun.push(run_id);
+            begun.push(ActionJobRun {
+                job_name: job_name.to_string(),
+                run_id,
+            });
         }
         begun
     }
@@ -7649,17 +7837,33 @@ pub const JOB_RUN_STATE_STOPPING: &str = "STOPPING";
 /// The `JobRunState` a submitted stop brings a run to rest in. See
 /// [`JOB_RUN_STATE_STARTING`].
 pub const JOB_RUN_STATE_STOPPED: &str = "STOPPED";
+/// The `JobRunState` of a run whose script finished without failing. See
+/// [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_SUCCEEDED: &str = "SUCCEEDED";
+/// The `JobRunState` of a run that "is terminated and enters `TIMEOUT` status"
+/// (`JobRun$Timeout`). See [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_TIMEOUT: &str = "TIMEOUT";
+/// The `JobRunState` of a run that ended on a service error rather than on its script.
+/// See [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_ERROR: &str = "ERROR";
+/// The `JobRunState` of a run held back by job-run queuing: "when a job run is in a
+/// WAITING state as a result of job run queuing" (`JobRun$StateDetail`). See
+/// [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_WAITING: &str = "WAITING";
+/// The `JobRunState` of a queued run that waited past its queuing window. See
+/// [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_EXPIRED: &str = "EXPIRED";
 
 /// The `JobRunState` values a run never moves out of again: of the modelled enum quoted
 /// on [`JOB_RUN_STATE_STARTING`], the ones that name a finished run. The other four
 /// (`STARTING`, `RUNNING`, `STOPPING`, `WAITING`) each still owe a further state.
 pub const TERMINAL_JOB_RUN_STATES: [&str; 6] = [
     JOB_RUN_STATE_STOPPED,
-    "SUCCEEDED",
+    JOB_RUN_STATE_SUCCEEDED,
     JOB_RUN_STATE_FAILED,
-    "TIMEOUT",
-    "ERROR",
-    "EXPIRED",
+    JOB_RUN_STATE_TIMEOUT,
+    JOB_RUN_STATE_ERROR,
+    JOB_RUN_STATE_EXPIRED,
 ];
 
 /// How long a run stays in the state a call put it in before the clock owes it the next
@@ -10964,7 +11168,14 @@ impl WorkflowEntry {
     /// whether to include a graph when returning the workflow resource metadata") —
     /// [`ComAmazonawsGlueAwsglueState::workflow_graph`] for this workflow — and `None` when
     /// it asked for none, because an unasked-for graph is reported as no graph at all.
-    pub fn to_workflow(&self, graph: Option<WorkflowGraph>) -> Workflow {
+    /// `last_run` is "the information about the last execution of the workflow" projected
+    /// by the STORE, which holds the runs that execution's actions began
+    /// ([`ComAmazonawsGlueAwsglueState::to_workflow`]).
+    pub fn to_workflow(
+        &self,
+        graph: Option<WorkflowGraph>,
+        last_run: Option<WorkflowRun>,
+    ) -> Workflow {
         Workflow {
             name: Some(self.name.clone()),
             description: self.description.clone(),
@@ -10975,7 +11186,7 @@ impl WorkflowEntry {
             // recently started run this workflow holds, and nothing at all for a workflow
             // no run has been started of. The nested run carries no graph of its own —
             // `IncludeGraph` asks for the WORKFLOW's graph, which is reported beside it.
-            last_run: self.runs.last().map(|run| run.to_workflow_run(None)),
+            last_run,
             graph,
             max_concurrent_runs: self.max_concurrent_runs,
             // "The details of the blueprint that this particular workflow is created
@@ -11064,6 +11275,21 @@ pub fn new_workflow_run_id() -> String {
     )
 }
 
+/// One job run an action of a workflow run began: the job definition it is a run of and
+/// the id that addresses it inside that definition ([`JobEntry::run`]).
+///
+/// A job run carries the trigger that started it (`JobRun$TriggerName`) but no workflow
+/// run, so this pair is what ties the run an action began back to the workflow run that
+/// initiated the action — which is what a `JOB` node of a run's graph reports and what the
+/// run's statistics count.
+#[derive(Debug, Clone)]
+pub struct ActionJobRun {
+    /// The name of the job definition the run belongs to.
+    pub job_name: String,
+    /// `JobRun$Id` of the run.
+    pub run_id: String,
+}
+
 /// One run of a workflow, as `StartWorkflowRun` recorded it: "A workflow run is an
 /// execution of a workflow providing all the runtime information" (`WorkflowRun`).
 #[derive(Debug, Clone)]
@@ -11092,6 +11318,12 @@ pub struct WorkflowRunEntry {
     /// `WorkflowRunStatistics$TotalActions`: "Total number of Actions in the workflow run",
     /// which are the actions the trigger that began the run initiates.
     pub total_actions: i32,
+    /// The job runs this run's actions began, in the order they were initiated.
+    ///
+    /// Only the IDENTITY of each run is held here: its state, and everything else a read
+    /// reports about it, is read out of the job definition the run belongs to, so a read of
+    /// this workflow run reports what the clock has since made of each of its actions.
+    pub action_job_runs: Vec<ActionJobRun>,
 }
 
 impl WorkflowRunEntry {
@@ -11139,6 +11371,9 @@ impl WorkflowRunEntry {
             // Nothing has gone wrong yet: a run carries an error message only once it has.
             error_message: None,
             total_actions,
+            // The actions are initiated by the call that began this run, which records what
+            // they began ([`ComAmazonawsGlueAwsglueState::record_workflow_run_job_runs`]).
+            action_job_runs: Vec::new(),
         }
     }
 
@@ -11186,8 +11421,15 @@ impl WorkflowRunEntry {
     ///
     /// `graph` is the graph the reader asked for with its own `IncludeGraph` ("Specifies
     /// whether to include the workflow graph in response or not"), handled as a workflow
-    /// read handles it ([`WorkflowEntry::to_workflow`]).
-    pub fn to_workflow_run(&self, graph: Option<WorkflowGraph>) -> WorkflowRun {
+    /// read handles it ([`WorkflowEntry::to_workflow`]). `statistics` are this run's
+    /// statistics, which count the runs its actions began and so are computed by the STORE
+    /// that holds those runs
+    /// ([`ComAmazonawsGlueAwsglueState::workflow_run_statistics`]) rather than here.
+    pub fn to_workflow_run(
+        &self,
+        graph: Option<WorkflowGraph>,
+        statistics: WorkflowRunStatistics,
+    ) -> WorkflowRun {
         WorkflowRun {
             name: Some(self.workflow_name.clone()),
             workflow_run_id: Some(self.id.clone()),
@@ -11199,25 +11441,11 @@ impl WorkflowRunEntry {
             completed_on: self.completed_on.map(to_date_time),
             status: Some(self.status.clone()),
             error_message: self.error_message.clone(),
-            statistics: Some(self.statistics()),
+            statistics: Some(statistics),
             graph,
             // "The batch condition that started the workflow run": only an EVENT trigger's
             // batch condition starts a run, and a start a caller made carries none.
             starting_event_batch_condition: None,
-        }
-    }
-
-    /// `WorkflowRun$Statistics`: "Workflow run statistics provides statistics about the
-    /// workflow run."
-    ///
-    /// Every count but the total is the model's own default of 0: nothing here executes an
-    /// action, so no action of this run has succeeded, failed, timed out, stopped, errored,
-    /// or is running or waiting. The total is the number of actions the trigger that began
-    /// the run initiates.
-    fn statistics(&self) -> WorkflowRunStatistics {
-        WorkflowRunStatistics {
-            total_actions: self.total_actions,
-            ..WorkflowRunStatistics::default()
         }
     }
 }
@@ -11248,8 +11476,16 @@ impl WorkflowGraphBuilder {
     ///
     /// `trigger` is the stored trigger a TRIGGER node stands for, and `None` for the job and
     /// crawler nodes: "details of the Trigger when the node represents a Trigger"
-    /// (`Node$TriggerDetails`).
-    fn node(&mut self, node_type: &str, name: &str, trigger: Option<&TriggerEntry>) -> String {
+    /// (`Node$TriggerDetails`). `job_runs` are "the information for the job runs represented
+    /// by the job node" (`JobNodeDetails$JobRuns`), which only a JOB node has and only for a
+    /// graph reported beside a workflow run.
+    fn node(
+        &mut self,
+        node_type: &str,
+        name: &str,
+        trigger: Option<&TriggerEntry>,
+        job_runs: &[JobRun],
+    ) -> String {
         let unique_id = workflow_node_id(node_type, name);
         if self.placed_nodes.insert(unique_id.clone()) {
             self.nodes.push(Node {
@@ -11260,11 +11496,17 @@ impl WorkflowGraphBuilder {
                     trigger: Some(trigger.to_trigger()),
                 }),
                 // "The information for the job runs represented by the job node"
-                // (`JobNodeDetails$JobRuns`) and "a list of crawls represented by the crawl
-                // node" (`CrawlerNodeDetails$Crawls`): nothing here runs the actions a
-                // workflow's triggers initiate, so no run of that job and no crawl of that
-                // crawler belongs to this workflow to report.
-                job_details: None,
+                // (`JobNodeDetails$JobRuns`): the runs the workflow run this graph is
+                // reported beside began of this job, and no details at all for a node with
+                // none — a job no run of this workflow has begun, or a graph reported beside
+                // no run.
+                job_details: (!job_runs.is_empty()).then(|| JobNodeDetails {
+                    job_runs: Some(job_runs.to_vec()),
+                }),
+                // "A list of crawls represented by the crawl node"
+                // (`CrawlerNodeDetails$Crawls`): nothing here records a crawl of a crawler
+                // ([`CrawlerEntry`] holds none), so there is no crawl of this workflow to
+                // report.
                 crawler_details: None,
             });
         }

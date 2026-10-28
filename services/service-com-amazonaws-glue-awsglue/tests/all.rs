@@ -217,6 +217,8 @@ mod usage_profiles;
 mod wire;
 #[path = "all/workflow_graph.rs"]
 mod workflow_graph;
+#[path = "all/workflow_run_actions.rs"]
+mod workflow_run_actions;
 #[path = "all/workflow_run_listing.rs"]
 mod workflow_run_listing;
 #[path = "all/workflow_run_properties.rs"]

@@ -160,15 +160,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // "Specifies whether to include the workflow graph in response or not": the
-        // reader that did not ask for one is answered without it, which is also what a
-        // request that named no `IncludeGraph` asked for, and the reader that asked gets
-        // the graph of the workflow this is a run of. Read before the record is borrowed to
-        // write to, so the projection is handed the graph it reports.
-        let graph = input
-            .include_graph
-            .unwrap_or(false)
-            .then(|| store.workflow_graph(&region, &input.name));
         // `Name` and `RunId` are both `@required` with `length 1..255`, so an absent or
         // over-long one is refused at the boundary: reaching here, the only question is
         // whether this account holds that workflow and that workflow holds that run.
@@ -179,16 +170,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // The only write a read makes: the status changes the clock had already made due.
         workflow.settle_due_runs(now);
+        // The runs this run's actions began were owed the same clock, and this read reports
+        // the state each has reached, so what it owed them is materialised too.
+        store.settle_due_action_job_runs(&region, &input.name, now);
 
-        let Some(run) = workflow.run(&input.run_id) else {
+        let Some(run) = store
+            .workflow(&input.name)
+            .and_then(|workflow| workflow.run(&input.run_id))
+        else {
             return Err(not_found(crate::state::messages::workflow_run_not_found(
                 &input.name,
                 &input.run_id,
             )));
         };
 
+        // "Specifies whether to include the workflow graph in response or not": the
+        // reader that did not ask for one is answered without it, which is also what a
+        // request that named no `IncludeGraph` asked for, and the reader that asked gets
+        // the graph of THIS run — the one whose job nodes report the runs this run's
+        // actions began, which only the store that holds those runs can project.
         Ok(GetWorkflowRunOutput {
-            run: Some(run.to_workflow_run(graph)),
+            run: Some(store.to_workflow_run(
+                &region,
+                run,
+                input.include_graph.unwrap_or(false),
+            )),
         })
     }
 }

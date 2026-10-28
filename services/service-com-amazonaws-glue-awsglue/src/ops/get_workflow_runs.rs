@@ -238,24 +238,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(_, run)| (*run).clone())
             .collect();
 
+        // The runs those runs' actions began were owed the same clock, and this read reports
+        // the state each has reached, so what it owed them is materialised too.
+        store.settle_due_action_job_runs(&region, &input.name, now);
+
         // "Specifies whether to include the workflow graph in response or not": the reader
         // that did not ask for one — which is also what a request naming no `IncludeGraph`
         // asked for — is answered without it, and the reader that asked gets the graph of
-        // the workflow these are runs of, the same graph the single-run read reports. Read
-        // only once the workflow has been resolved, so no graph is built for a name this
-        // account holds no workflow under. The Region is what the GRAPH is read by, not the
-        // workflow: a trigger is served only through the endpoint that created it, so the
-        // graph reports the components attached to this workflow through THIS endpoint,
-        // exactly as `GetWorkflow` and the single-run read report them.
-        let graph = input
-            .include_graph
-            .unwrap_or(false)
-            .then(|| store.workflow_graph(&region, &input.name));
+        // the RUN, the same graph the single-run read reports for it, so each run's job
+        // nodes report the runs that run's own actions began. The Region is what the graph
+        // is read by, not the workflow: a trigger is served only through the endpoint that
+        // created it, so the graph reports the components attached to this workflow through
+        // THIS endpoint, exactly as `GetWorkflow` and the single-run read report them.
+        //
+        // One graph per reported run, which is what makes them differ; the work that costs
+        // is bounded by the STORE and not by the request, because a workflow keeps at most
+        // [`crate::state::MAX_RUNS_PER_WORKFLOW`] runs however large a `MaxResults` asks
+        // for, and each graph walks only the triggers attached to this one workflow.
+        let include_graph = input.include_graph.unwrap_or(false);
 
         // Element for element the SAME projection the single-run read serves.
         let runs: Vec<WorkflowRun> = page
             .iter()
-            .map(|run| run.to_workflow_run(graph.clone()))
+            .map(|run| store.to_workflow_run(&region, run, include_graph))
             .collect();
 
         Ok(GetWorkflowRunsOutput {
