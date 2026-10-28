@@ -29,7 +29,10 @@
 //! It also holds the add-on slice: `CreateAddon` writes an [`AddonRecord`] here
 //! and `DescribeAddon` reads it back. An add-on lives INSIDE a cluster, so its
 //! key carries the cluster's key and `DeleteCluster` drops the add-ons of the
-//! cluster it removes.
+//! cluster it removes. `UpdateAddon` does not write the change it is asked for
+//! onto that record straight away: the update it starts is asynchronous, so the
+//! change waits on the record as a [`PendingAddonUpdate`] until the clock
+//! completes that update.
 //!
 //! It also holds the managed-capability slice that hangs off a cluster:
 //! `CreateCapability` writes a [`CapabilityRecord`], and `DescribeCapability`,
@@ -96,7 +99,9 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AccessConfigResponse, AccessEntry, AccessScope, Addon, AddonHealth, AddonInfo,
-    AddonNamespaceConfigResponse, AddonPodIdentityConfiguration, AddonVersionInfo,
+    AddonIssue,
+    AddonNamespaceConfigResponse, AddonPodIdentityAssociations, AddonPodIdentityConfiguration,
+    AddonVersionInfo,
     AssociatedAccessPolicy, BadRequestException, Cancellation,
     Capability, Compatibility,
     CapabilityConfigurationResponse, CapabilityHealth, CapabilityIssue, CapabilitySummary,
@@ -1943,12 +1948,12 @@ pub fn derive_insight_id(cluster_arn: &str, check_key: &str) -> String {
 /// update records WHICH resource it is an update of, and a listing reports only
 /// the updates of the resource the request names.
 ///
-/// Every operation that mints an update today changes the cluster's own control
-/// plane, so [`UpdateScope::Cluster`] is what each of them records; the other
-/// variants are what an update of a resource inside the cluster carries, and are
-/// what the minters of those updates (`UpdateNodegroupVersion`,
-/// `UpdateNodegroupConfig`, `UpdateAddon`, `UpdateCapability`, each still a
-/// scaffold with its own gap issue) will record.
+/// Every operation that mints an update of the cluster's own control plane
+/// records [`UpdateScope::Cluster`]; the other variants are what an update of a
+/// resource INSIDE the cluster carries, which is what `UpdateAddon` records for
+/// the add-on it updates and what the minters of the remaining kinds
+/// (`UpdateNodegroupVersion`, `UpdateNodegroupConfig`, `UpdateCapability`, each
+/// still a scaffold with its own gap issue) will record.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum UpdateScope {
     /// The cluster's own control plane: the scope a request that names no node
@@ -1961,6 +1966,52 @@ pub enum UpdateScope {
     Addon(String),
     /// One managed capability of the cluster, by capability name.
     Capability(String),
+}
+
+/// The sentence this service refuses a second EKS Pod Identity association for
+/// one `(namespace, service account)` pair with.
+///
+/// A pair with two associations makes the credential lookup it resolves
+/// ambiguous, which is why every writer of an association refuses one — the
+/// `CreatePodIdentityAssociation` call, the `CreateAddon` install and the
+/// `UpdateAddon` update that owns associations, and the completion of that update
+/// — so the wording lives here once rather than in each of them.
+#[must_use]
+pub fn association_already_exists(namespace: &str, service_account: &str) -> String {
+    format!(
+        "Association already exists with namespace: {namespace} and service account: \
+         {service_account}"
+    )
+}
+
+/// The sentence a request that names more than one of the members selecting a
+/// resource inside a cluster is refused with.
+///
+/// `ListUpdates` and `DescribeUpdate` each read the updates of ONE resource, so
+/// `nodegroupName`, `addonName` and `capabilityName` are alternatives rather than
+/// filters that compose.
+pub const ONE_UPDATE_SCOPE_MESSAGE: &str =
+    "Only one of nodegroupName, addonName and capabilityName can be specified.";
+
+/// Which resource of a cluster a request's `nodegroupName`, `addonName` and
+/// `capabilityName` select the updates of, or `None` when it names more than one
+/// (see [`ONE_UPDATE_SCOPE_MESSAGE`]).
+///
+/// Shared by every operation that selects updates, so the scope a request names
+/// cannot be resolved two ways.
+#[must_use]
+pub fn update_scope_of(
+    nodegroup_name: Option<&str>,
+    addon_name: Option<&str>,
+    capability_name: Option<&str>,
+) -> Option<UpdateScope> {
+    match (nodegroup_name, addon_name, capability_name) {
+        (None, None, None) => Some(UpdateScope::Cluster),
+        (Some(nodegroup), None, None) => Some(UpdateScope::Nodegroup(nodegroup.to_string())),
+        (None, Some(addon), None) => Some(UpdateScope::Addon(addon.to_string())),
+        (None, None, Some(capability)) => Some(UpdateScope::Capability(capability.to_string())),
+        _ => None,
+    }
 }
 
 /// One asynchronous update of a cluster, as this service stores it.
@@ -2226,13 +2277,19 @@ impl ClusterRecord {
             };
             update.status = UPDATE_SUCCESSFUL.to_string();
             update.succeeds_at = None;
+            let scope = update.scope.clone();
             let pending = update.pending_config.take();
             if let Some(pending) = pending {
                 pending.apply(self);
             }
-            // An update only starts from an `ACTIVE` cluster, so completing one
-            // hands the cluster back to the status it was taken from.
-            self.status = STATUS_ACTIVE.to_string();
+            // An update of the cluster's own control plane only starts from an
+            // `ACTIVE` cluster and took it out of that status to make the change,
+            // so completing one hands the cluster back to the status it was taken
+            // from. An update of a resource INSIDE the cluster never moved the
+            // cluster's status, so completing it does not write one.
+            if scope == UpdateScope::Cluster {
+                self.status = STATUS_ACTIVE.to_string();
+            }
         }
     }
 
@@ -2304,14 +2361,28 @@ impl ClusterRecord {
             .map(|update| (update.r#type.as_str(), update.created_at))
     }
 
-    /// The update this cluster is still running, if any.
+    /// The update of this cluster's own control plane that is still running, if
+    /// any.
     ///
-    /// A cluster runs at most one update at a time, so this is what a mutating
-    /// operation checks before starting another.
+    /// A cluster's control plane takes at most one update at a time, so this is
+    /// what an operation that changes the control plane checks before starting
+    /// another. An update of a resource INSIDE the cluster is a change to THAT
+    /// resource and is not reported here — see [`Self::in_flight_update_in_scope`],
+    /// which is what the operation that updates such a resource checks for the
+    /// resource it names.
     pub fn in_flight_update(&self) -> Option<&UpdateRecord> {
+        self.in_flight_update_in_scope(&UpdateScope::Cluster)
+    }
+
+    /// The update of `scope` this cluster is still running, if any.
+    ///
+    /// One resource takes at most one update at a time, so this is what the
+    /// operation that updates a resource of the cluster checks before starting
+    /// another for it.
+    pub fn in_flight_update_in_scope(&self, scope: &UpdateScope) -> Option<&UpdateRecord> {
         self.updates
             .values()
-            .find(|update| update.is_in_progress())
+            .find(|update| update.is_in_progress() && &update.scope == scope)
     }
 
     /// The ids of this cluster's updates that belong to `scope`, in the stable
@@ -2632,6 +2703,55 @@ pub const ADDON_STATUS_CREATING: &str = "CREATING";
 /// `UPDATE_FAILED`, the cluster enum has `PENDING`), so a change to one must not
 /// silently change the other.
 pub const ADDON_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`ADDON_STATUS_CREATING`] — the status an add-on reports while the
+/// asynchronous update `UpdateAddon` started is still in flight.
+pub const ADDON_STATUS_UPDATING: &str = "UPDATING";
+/// See [`ADDON_STATUS_CREATING`] — the status an add-on reports when the change
+/// an update carried could not be made.
+pub const ADDON_STATUS_UPDATE_FAILED: &str = "UPDATE_FAILED";
+
+/// The `AddonIssueCode` an add-on reports for a change an update could not make
+/// because the cluster already holds something it conflicts with
+/// (`smithy_query query="shape" shape="AddonIssueCode"`).
+pub const ADDON_ISSUE_CONFIGURATION_CONFLICT: &str = "ConfigurationConflict";
+
+/// See [`ADDON_STATUS_CREATING`] — the status an add-on reports when it is
+/// running but not healthy.
+pub const ADDON_STATUS_DEGRADED: &str = "DEGRADED";
+
+/// The `AddonStatus` members an add-on can take an update from: the ones in
+/// which it has SETTLED.
+///
+/// An add-on that is still being created, is being deleted, or is already taking
+/// an update has not settled, and nothing can be asked of it until it has. The
+/// other three have: a running add-on, one running in a degraded state, and one
+/// whose last update failed — for the last two, another `UpdateAddon` is how such
+/// an add-on is remediated, which is why they are not refused.
+pub const ADDON_STATUSES_AN_UPDATE_STARTS_FROM: &[&str] = &[
+    ADDON_STATUS_ACTIVE,
+    ADDON_STATUS_DEGRADED,
+    ADDON_STATUS_UPDATE_FAILED,
+];
+
+/// The `UpdateType` an add-on's own asynchronous update reports
+/// (`smithy_query query="shape" shape="UpdateType"`): `UpdateAddon` answers "an
+/// object representing an asynchronous update", and this is the one member of
+/// that enum which names a change to an installed add-on.
+pub const UPDATE_TYPE_ADDON: &str = "AddonUpdate";
+
+/// The `UpdateParamType` keys an add-on update reports its requested values
+/// under (`smithy_query query="shape" shape="UpdateParamType"`), one key per
+/// member of the request that asks for a change — so a caller reading the update
+/// back sees what it asked to change.
+pub const UPDATE_PARAM_ADDON_VERSION: &str = "AddonVersion";
+/// See [`UPDATE_PARAM_ADDON_VERSION`].
+pub const UPDATE_PARAM_SERVICE_ACCOUNT_ROLE_ARN: &str = "ServiceAccountRoleArn";
+/// See [`UPDATE_PARAM_ADDON_VERSION`].
+pub const UPDATE_PARAM_RESOLVE_CONFLICTS: &str = "ResolveConflicts";
+/// See [`UPDATE_PARAM_ADDON_VERSION`].
+pub const UPDATE_PARAM_CONFIGURATION_VALUES: &str = "ConfigurationValues";
+/// See [`UPDATE_PARAM_ADDON_VERSION`].
+pub const UPDATE_PARAM_POD_IDENTITY_ASSOCIATIONS: &str = "PodIdentityAssociations";
 
 /// How long a newly created add-on reports `CREATING` before the clock owes it
 /// `ACTIVE`.
@@ -2685,6 +2805,31 @@ pub const ADDON_DEFAULT_NAMESPACE: &str = "kube-system";
 /// runs, and `MAX_STORED_CLUSTERS` bounds how many clusters can hold that many.
 pub const MAX_ADDONS_PER_CLUSTER: usize = 100;
 
+/// The change an in-flight add-on update puts on its add-on when it completes.
+///
+/// `UpdateAddon` answers "an object representing an asynchronous update", so the
+/// values the request asked for are held HERE until the clock completes that
+/// update, and only then written onto the [`AddonRecord`] and the EKS Pod
+/// Identity associations the add-on owns. A member left `None` is one the request
+/// did not ask to change: applying the change leaves whatever the add-on already
+/// reports for it.
+#[derive(Debug, Clone, Default)]
+pub struct PendingAddonUpdate {
+    /// The id of the update that carries this change, so completing it reaches
+    /// the record on the cluster this change belongs to — whether to report it
+    /// `Successful` or, where the change can no longer be made, `Failed`.
+    pub update_id: String,
+    pub addon_version: Option<String>,
+    pub service_account_role_arn: Option<String>,
+    pub configuration_values: Option<String>,
+    /// The EKS Pod Identity associations the add-on owns once the update
+    /// completes. `None` when the request named none — "if this value is left
+    /// blank, no change" (`UpdateAddonRequest$podIdentityAssociations`) — and an
+    /// EMPTY list when it asked for the associations the add-on owns to be
+    /// deleted.
+    pub pod_identity_associations: Option<Vec<AddonPodIdentityAssociations>>,
+}
+
 /// One add-on of one cluster, as this service stores it.
 ///
 /// Everything an `Addon` reports is held here — including the server-generated
@@ -2718,19 +2863,87 @@ pub struct AddonRecord {
     pub publisher: String,
     pub owner: String,
     pub client_request_token: Option<String>,
+    /// The change the asynchronous update this add-on is taking puts on it when
+    /// the clock completes that update; `None` when the add-on is taking none.
+    ///
+    /// The update itself is a record on the cluster ([`ClusterRecord::updates`]),
+    /// which is where its own due instant and status live; this is the part of it
+    /// that belongs to the add-on, applied at [`Self::active_at`] — the instant
+    /// the add-on is owed its `ACTIVE` status back, which is the instant that
+    /// update is owed its `Successful` one.
+    pub pending_update: Option<PendingAddonUpdate>,
+    /// The add-on's open health issues — "An object representing the health
+    /// issues for an add-on" (`AddonHealth$issues`).
+    ///
+    /// This emulator runs no Kubernetes, so nothing the add-on itself does can go
+    /// wrong and a healthy add-on reports an EMPTY list. The one thing that can is
+    /// a change an update carried that could not be made, which leaves the issue
+    /// saying why ([`Self::fail_update`]) until a later update succeeds.
+    pub health_issues: Vec<AddonIssue>,
 }
 
 impl AddonRecord {
-    /// Materialise the status move the clock already owes at `now`.
+    /// Materialise the status move the clock already owes at `now`, and hand back
+    /// the change an add-on update owes this record, at the instant it was owed.
     ///
     /// As on [`ClusterRecord::materialize_due_transitions`], the move was due at
     /// `active_at` whether or not anybody called, so applying it on read does
     /// not change what a later caller sees.
-    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
-        if self.active_at.is_some_and(|due| now >= due) {
-            self.status = ADDON_STATUS_ACTIVE.to_string();
-            self.active_at = None;
+    ///
+    /// Whether that change can be MADE depends on the EKS Pod Identity
+    /// associations the add-on owns, which are records of their own, so the change
+    /// is returned rather than written here: the one caller that can reach them
+    /// ([`ComAmazonawsEksAwswesleyfrontendState::complete_addon_update`]) applies
+    /// it, or fails the update, in the same call.
+    #[must_use = "the change an add-on update carries is applied by the caller; dropping it \
+                  would leave the add-on reporting UPDATING for an update nothing completes"]
+    pub fn materialize_due_transitions(
+        &mut self,
+        now: SystemTime,
+    ) -> Option<(SystemTime, PendingAddonUpdate)> {
+        let due = self.active_at.filter(|due| now >= *due)?;
+        self.active_at = None;
+        match self.pending_update.take() {
+            // No update is in flight, so the instant was stored for a create's
+            // `CREATING` -> `ACTIVE` move: the add-on is running once the clock
+            // reaches it.
+            None => {
+                self.status = ADDON_STATUS_ACTIVE.to_string();
+                None
+            }
+            Some(pending) => Some((due, pending)),
         }
+    }
+
+    /// Write the change an add-on update carried, which is what completing that
+    /// update does: the add-on reports the values the request asked for, carries no
+    /// open issue and is running again.
+    ///
+    /// `at` is the instant the update was owed its completion, so `modifiedAt` is
+    /// the same value whenever the read that materialises it comes. A member the
+    /// change leaves `None` is one the request did not ask to change.
+    pub fn apply_update(&mut self, at: SystemTime, pending: &PendingAddonUpdate) {
+        if let Some(addon_version) = pending.addon_version.clone() {
+            self.addon_version = addon_version;
+        }
+        if let Some(role_arn) = pending.service_account_role_arn.clone() {
+            self.service_account_role_arn = Some(role_arn);
+        }
+        if let Some(configuration_values) = pending.configuration_values.clone() {
+            self.configuration_values = Some(configuration_values);
+        }
+        self.status = ADDON_STATUS_ACTIVE.to_string();
+        self.health_issues.clear();
+        self.modified_at = at;
+    }
+
+    /// Record that the change an add-on update carried could not be made: the
+    /// add-on keeps every value it had, reports `UPDATE_FAILED` and carries the
+    /// issue that says why.
+    pub fn fail_update(&mut self, at: SystemTime, issue: AddonIssue) {
+        self.status = ADDON_STATUS_UPDATE_FAILED.to_string();
+        self.health_issues = vec![issue];
+        self.modified_at = at;
     }
 
     /// This record as the modelled `Addon` shape.
@@ -2740,11 +2953,11 @@ impl AddonRecord {
             cluster_name: Some(self.cluster_name.clone()),
             status: Some(self.status.clone()),
             addon_version: Some(self.addon_version.clone()),
-            // The add-on runs nowhere in this emulator, so nothing can go wrong
-            // with it: the health object is reported with an EMPTY issue list,
-            // which is what a healthy add-on reports, rather than left unset.
+            // The add-on runs nowhere in this emulator, so nothing it does can go
+            // wrong: the health object reports the issue list the record holds,
+            // which on a healthy add-on is EMPTY rather than absent.
             health: Some(AddonHealth {
-                issues: Some(Vec::new()),
+                issues: Some(self.health_issues.clone()),
             }),
             addon_arn: Some(self.arn.clone()),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
@@ -4897,6 +5110,19 @@ impl ComAmazonawsEksAwswesleyfrontendState {
 
     /// Materialise every clock-owed status move across the store.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        // The ADD-ONS go first: completing an add-on's update may FAIL it (see
+        // [`Self::complete_addon_update`]), and the cluster pass below is what
+        // would otherwise already have reported that same update `Successful`.
+        let mut completed: Vec<((String, String, String), SystemTime, PendingAddonUpdate)> =
+            Vec::new();
+        for (key, addon) in self.addons.iter_mut() {
+            if let Some((at, pending)) = addon.materialize_due_transitions(now) {
+                completed.push((key.clone(), at, pending));
+            }
+        }
+        for (key, at, pending) in completed {
+            self.complete_addon_update(&key, at, pending);
+        }
         for cluster in self.clusters.values_mut() {
             cluster.materialize_due_transitions(now);
         }
@@ -4906,12 +5132,182 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         for profile in self.fargate_profiles.values_mut() {
             profile.materialize_due_transitions(now);
         }
-        for addon in self.addons.values_mut() {
-            addon.materialize_due_transitions(now);
-        }
         for capability in self.capabilities.values_mut() {
             capability.materialize_due_transitions(now);
         }
+    }
+
+    /// Complete the add-on update the clock owed at `at`: write the change it
+    /// carries, or fail it where that change can no longer be made.
+    ///
+    /// An add-on update is asynchronous, so the cluster can have taken another
+    /// association for a `(namespace, service account)` pair the change asks for
+    /// between the call that started the update and this instant. Mapping that
+    /// pair twice is the ambiguity the pod identity slice refuses, so the update
+    /// FAILS — the add-on keeps every value it had, reports `UPDATE_FAILED` with
+    /// the issue that says why, and the update reports `Failed` rather than the
+    /// `Successful` the clock owed it.
+    ///
+    /// Both sides of that — the add-on, and the associations and the update record
+    /// — are only reachable here, which is why this lives on the store rather than
+    /// on [`AddonRecord`].
+    fn complete_addon_update(
+        &mut self,
+        key: &(String, String, String),
+        at: SystemTime,
+        pending: PendingAddonUpdate,
+    ) {
+        let (region, cluster_name, _) = key.clone();
+        let Some(addon) = self.addons.get(key) else {
+            return;
+        };
+        let owner_arn = addon.arn.clone();
+        let namespace = addon.namespace.clone();
+        // Only an association ANOTHER owner holds can conflict: the ones this
+        // add-on owns are the ones the requested set replaces.
+        let taken: ::std::collections::BTreeSet<String> = self
+            .pod_identity_associations_in(&region, &cluster_name)
+            .filter(|record| {
+                record.namespace == namespace
+                    && record.owner_arn.as_deref() != Some(owner_arn.as_str())
+            })
+            .map(|record| record.service_account.clone())
+            .collect();
+        let conflict = pending
+            .pod_identity_associations
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|association| association.service_account.clone())
+            .find(|service_account| taken.contains(service_account));
+
+        if let Some(service_account) = conflict {
+            if let Some(addon) = self.addons.get_mut(key) {
+                addon.fail_update(
+                    at,
+                    AddonIssue {
+                        code: Some(ADDON_ISSUE_CONFIGURATION_CONFLICT.to_string()),
+                        message: Some(association_already_exists(&namespace, &service_account)),
+                        resource_ids: Some(vec![service_account]),
+                    },
+                );
+            }
+            if let Some(update) = self
+                .clusters
+                .get_mut(&(region, cluster_name))
+                .and_then(|cluster| cluster.updates.get_mut(&pending.update_id))
+            {
+                update.status = UPDATE_FAILED.to_string();
+                update.succeeds_at = None;
+            }
+            return;
+        }
+
+        if let Some(addon) = self.addons.get_mut(key) {
+            addon.apply_update(at, &pending);
+        }
+        if let Some(requested) = pending.pod_identity_associations.as_deref() {
+            self.replace_addon_associations(key, requested, at);
+        }
+    }
+
+    /// Make the EKS Pod Identity associations one add-on owns be exactly
+    /// `requested`, which is what completing an add-on update that named them
+    /// does.
+    ///
+    /// "An array of EKS Pod Identity associations to be updated... If an empty
+    /// array is provided, existing associations owned by the add-on are deleted"
+    /// (`UpdateAddonRequest$podIdentityAssociations`), so the requested list is
+    /// the SET the add-on owns afterwards: the ones it owned are dropped and one
+    /// record is created per requested entry — which is also what deletes them
+    /// all when the list is empty.
+    fn replace_addon_associations(
+        &mut self,
+        key: &(String, String, String),
+        requested: &[AddonPodIdentityAssociations],
+        at: SystemTime,
+    ) {
+        let (region, cluster_name, _) = key.clone();
+        let Some(addon) = self.addons.get(key) else {
+            return;
+        };
+        let owner_arn = addon.arn.clone();
+        let namespace = addon.namespace.clone();
+        self.pod_identity_associations
+            .retain(|_, record| record.owner_arn.as_deref() != Some(owner_arn.as_str()));
+        let mut association_arns = Vec::with_capacity(requested.len());
+        for association in requested {
+            association_arns.push(self.create_addon_owned_association(
+                &region,
+                &cluster_name,
+                &namespace,
+                &owner_arn,
+                association,
+                at,
+            ));
+        }
+        if let Some(addon) = self.addons.get_mut(key) {
+            addon.pod_identity_association_arns = association_arns;
+        }
+    }
+
+    /// Create the EKS Pod Identity association an add-on owns for one entry of
+    /// the `podIdentityAssociations` it was asked for, and answer that
+    /// association's ARN.
+    ///
+    /// The id is minted through [`Self::mint_association_id`] — the same path
+    /// `CreatePodIdentityAssociation` takes — so an association an add-on owns is
+    /// unique within its cluster and has the form every other association id has,
+    /// and it carries the add-on's ARN as its `ownerArn`: "If defined, the EKS Pod
+    /// Identity association is owned by an Amazon EKS add-on"
+    /// (`PodIdentityAssociation$ownerArn`). One path for both the install that
+    /// creates such an association and the update that replaces it, so the two
+    /// cannot write different records for the same request member.
+    pub fn create_addon_owned_association(
+        &mut self,
+        region: &str,
+        cluster_name: &str,
+        namespace: &str,
+        owner_arn: &str,
+        association: &AddonPodIdentityAssociations,
+        at: SystemTime,
+    ) -> String {
+        let association_id =
+            self.mint_association_id(region, cluster_name, namespace, &association.service_account);
+        let association_arn = derive_association_arn(region, cluster_name, &association_id);
+        let record = PodIdentityAssociationRecord {
+            cluster_name: cluster_name.to_string(),
+            association_id: association_id.clone(),
+            association_arn: association_arn.clone(),
+            namespace: namespace.to_string(),
+            service_account: association.service_account.clone(),
+            role_arn: association.role_arn.clone(),
+            // An add-on asks only for a service account and a role, so an
+            // association it owns names no target role — and `externalId` exists
+            // to be matched in a TARGET role's trust policy, so there is nothing
+            // to condition — no permissions policy and no session-tag override.
+            target_role_arn: None,
+            external_id: None,
+            policy: None,
+            disable_session_tags: None,
+            // "Tags don't propagate to any other cluster or Amazon Web Services
+            // resources" (`CreateAddon$tags`), so the add-on's tags are not
+            // copied onto the associations it owns.
+            tags: BTreeMap::new(),
+            created_at: at,
+            modified_at: at,
+            // The association is created by the add-on rather than by a call of
+            // the pod identity slice, so no association-level idempotency token
+            // applies to it.
+            client_request_token: None,
+            update_request_token: None,
+            owner_arn: Some(owner_arn.to_string()),
+        };
+        self.pod_identity_associations.insert(
+            (region.to_string(), cluster_name.to_string(), association_id),
+            record,
+        );
+        association_arn
     }
 
     /// The names of the add-ons installed on one cluster, in sorted order.
