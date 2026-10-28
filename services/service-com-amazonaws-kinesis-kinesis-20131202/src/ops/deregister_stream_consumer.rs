@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterStreamConsumer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterStreamConsumer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterStreamConsumer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the consumer the request names off the stream it was registered with
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::deregister_consumer`]),
+//! resolving it by `ConsumerARN`, by `StreamARN` and `ConsumerName`, or by all three as long
+//! as they name ONE consumer — the same rule `DescribeStreamConsumer` resolves a consumer
+//! by, so a deregistration addresses the consumer a read addresses. The consumer stops being
+//! registered with the stream, so a read of it is `ResourceNotFoundException`, the stream's
+//! `ConsumerCount` drops by one, and the name is free for a registration that mints a new
+//! consumer with a new ARN.
+//!
+//! A request naming no consumer at all, or whose members name different consumers, is
+//! refused with the modelled `InvalidArgumentException`; one naming a stream or a consumer
+//! this account and region do not hold is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -118,12 +122,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeregisterStreamConsumer
 // here — hence the `DeregisterStreamConsumerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DeregisterStreamConsumer")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DeregisterStreamConsumer",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it
+    // ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer for
+    // a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DeregisterStreamConsumerErrorModeled {
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -149,6 +161,73 @@ impl From<DeregisterStreamConsumerErrorModeled> for DeregisterStreamConsumerErro
 /// concrete engine where it mounts the service, not here.
 pub struct DeregisterStreamConsumer<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the consumer was deregistered in, and
+/// how the call ended. No stream name, no consumer name and no ARN: a log sink needs none of
+/// them to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "DeregisterStreamConsumer",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// The modelled refusal for a request whose consumer identifiers name no consumer of this
+/// account and region. Built FROM the request, so the identifier at fault is what names it.
+fn lookup_refusal(
+    failure: crate::state::ConsumerLookupFailure,
+    input: &DeregisterStreamConsumerInput,
+) -> DeregisterStreamConsumerError {
+    match failure {
+        crate::state::ConsumerLookupFailure::ConsumerUnspecified => {
+            DeregisterStreamConsumerErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        crate::state::CONSUMER_IDENTIFIER_REQUIRED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        }
+        crate::state::ConsumerLookupFailure::Mismatch => {
+            DeregisterStreamConsumerErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        crate::state::CONSUMER_IDENTIFIER_CONFLICT_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        }
+        crate::state::ConsumerLookupFailure::StreamNotFound => {
+            DeregisterStreamConsumerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::stream_not_found_message(
+                        input.stream_arn.as_deref().unwrap_or_default(),
+                    )),
+                },
+            )
+        }
+        crate::state::ConsumerLookupFailure::ConsumerNotFound => {
+            DeregisterStreamConsumerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::consumer_not_found_message(
+                        input
+                            .consumer_name
+                            .as_deref()
+                            .or(input.consumer_arn.as_deref())
+                            .unwrap_or_default(),
+                        input.stream_arn.as_deref().unwrap_or_default(),
+                    )),
+                },
+            )
+        }
+    }
+    .into()
 }
 
 impl<Eng> DeregisterStreamConsumer<Eng> {
@@ -177,18 +256,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterStreamConsumer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterStreamConsumerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterStreamConsumer"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose streams this request
+        // addresses, since a stream name "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            DeregisterStreamConsumerError::from(
+                DeregisterStreamConsumerErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+        // carries one and a request naming only that member names no consumer.
+        let deregistered = {
+            let mut store = state.lock();
+            store.deregister_consumer(
+                now,
+                &region,
+                input.stream_arn.as_deref(),
+                input.consumer_name.as_deref(),
+                input.consumer_arn.as_deref(),
+            )
+        };
+        audit(
+            &akid,
+            &region,
+            if deregistered.is_ok() {
+                "deregistered"
+            } else {
+                "refused"
+            },
+        );
+        deregistered.map_err(|failure| lookup_refusal(failure, &input))?;
+
+        // `DeregisterStreamConsumer` models no output members: what the call leaves behind is
+        // a stream the consumer is no longer registered with, which `DescribeStreamConsumer`
+        // and `DescribeStreamSummary` report.
+        Ok(DeregisterStreamConsumerOutput)
     }
 }
