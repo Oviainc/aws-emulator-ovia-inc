@@ -29,12 +29,16 @@
 //!   `delete_inactive_approval_team_version.rs` applies to a pair naming no stored
 //!   version. A repeat call on a source already `DELETING` is that same success and
 //!   keeps the recorded due instant, so asking twice does not postpone the removal.
-//! * An identity source a stored approval team's approvers authenticate through is IN
-//!   USE, and removing it would leave that team pointing at a source this store no
-//!   longer holds: `ConflictException` (409), the error this model declares for
+//! * An identity source an approver record a stored approval team holds authenticates
+//!   through is IN USE, and removing it would leave that team pointing at a source this
+//!   store no longer holds: `ConflictException` (409), the error this model declares for
 //!   `DeleteIdentitySource` and for none of the other identity-source operations
 //!   ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`]
-//!   resolves the reference).
+//!   resolves the reference). A team holds TWO approver sets and a reference in either
+//!   one is a reference this store holds: the live approvers, and the approvers of the
+//!   change the team has been asked to approve, which `GetApprovalTeam` reports in
+//!   `PendingUpdate$Approvers` and which activation installs as the live set
+//!   ([`crate::state::ApprovalTeam::approver_records`] reads both).
 //!
 //! The management-account gate [`crate::service`] puts in front of the creates does not
 //! apply: this request identifies its resource BY ARN, so its authorization decision

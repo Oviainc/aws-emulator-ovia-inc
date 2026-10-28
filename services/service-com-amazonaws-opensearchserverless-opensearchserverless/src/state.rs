@@ -25,7 +25,7 @@ use crate::ops::types::{
     CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
     CollectionGroupErrorDetail, CollectionGroupStorageConfiguration, CollectionSummary,
     CreateCollectionDetail, CreateCollectionGroupDetail, CreateVpcEndpointDetail, CurrentCapacity,
-    DeleteCollectionDetail, FipsEndpoints, IamFederationConfigOptions,
+    DeleteCollectionDetail, DeleteVpcEndpointDetail, FipsEndpoints, IamFederationConfigOptions,
     IamIdentityCenterConfigOptions, LifecyclePolicyDetail, LifecyclePolicyErrorDetail,
     SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail,
     SecurityPolicySummary, Tag, UpdateCollectionDetail, UpdateCollectionGroupDetail,
@@ -107,6 +107,22 @@ pub const VPC_ENDPOINT_PENDING: &str = "PENDING";
 /// `VpcEndpointStatus$ACTIVE` — "VPCEndpoint resource is ready to use", the status a
 /// `PENDING` endpoint settles into.
 pub const VPC_ENDPOINT_ACTIVE: &str = "ACTIVE";
+
+/// `VpcEndpointStatus$DELETING` — "Deleting VPCEndpoint resource", the status an endpoint
+/// whose deletion has been accepted is reported in until its PURGE falls due.
+pub const VPC_ENDPOINT_DELETING: &str = "DELETING";
+
+/// `VpcEndpointStatus$FAILED` — "VPCEndpoint resource create or delete failed". Nothing in
+/// this slice fails an endpoint, so no stored record carries it; it is named here because
+/// it is one of the statuses an endpoint may be DELETED from.
+pub const VPC_ENDPOINT_FAILED: &str = "FAILED";
+
+/// The statuses a managed interface endpoint may be deleted from: the states
+/// `ConflictException`'s own documentation lists ("When deleting a resource, thrown when
+/// the resource is not in the ACTIVE, FAILED, or UPDATE_FAILED state") that
+/// `VpcEndpointStatus` actually models — it declares `PENDING`, `DELETING`, `ACTIVE` and
+/// `FAILED`, and no `UPDATE_FAILED`.
+pub const VPC_ENDPOINT_DELETABLE_STATUSES: [&str; 2] = [VPC_ENDPOINT_ACTIVE, VPC_ENDPOINT_FAILED];
 
 /// `ServerlessGeneration$CLASSIC`, the generation a collection group carries when its
 /// create request does not name one.
@@ -1905,6 +1921,23 @@ fn rule_covers(rule: &::aws_smithy_types::Document, resource: &str) -> bool {
     })
 }
 
+/// A list of statuses as the sentence fragment `ConflictException`'s own documentation
+/// states them in — `'ACTIVE', 'FAILED', or 'UPDATE_FAILED'` — so a refusal's text and the
+/// check it explains are read off one list and can never disagree, whichever resource's
+/// list it is ([`DELETABLE_STATUSES`], [`VPC_ENDPOINT_DELETABLE_STATUSES`]).
+pub fn statuses_phrase(statuses: &[&str]) -> String {
+    let quoted: Vec<String> = statuses
+        .iter()
+        .map(|status| format!("'{status}'"))
+        .collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, [only])) => format!("{only} or {last}"),
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// How this service words a collection that is not there, from its id.
 pub fn collection_not_found_message(id: &str) -> String {
     format!("Collection with ID {id} is not found")
@@ -2021,6 +2054,11 @@ pub struct VpcEndpointRecord {
     pub created_date: i64,
     /// The transition the clock owes this endpoint, while one is outstanding.
     pub pending_status: Option<PendingStatus>,
+    /// When this endpoint's accepted deletion is due to be PURGED — the instant from which
+    /// it stops being an endpoint any read reports at all. Set by [`Self::begin_deletion`],
+    /// which is also what moves it to `DELETING`; held exactly as
+    /// [`CollectionRecord::purge_at`] is.
+    pub purge_at: Option<Instant>,
 }
 
 impl VpcEndpointRecord {
@@ -2038,6 +2076,38 @@ impl VpcEndpointRecord {
     pub fn settle(&mut self, now: Instant) {
         if let Some(pending) = self.pending_status.take_if(|pending| now >= pending.due_at) {
             self.status = pending.status.to_string();
+        }
+    }
+
+    /// Accept this endpoint's deletion: report it `DELETING` from now, and owe its PURGE
+    /// from [`SETTLE_AFTER`] onwards.
+    ///
+    /// `DeleteVpcEndpoint` answers `deleteVpcEndpointDetail` with that status — the
+    /// "current status of the endpoint deletion process" its own member documents — and the
+    /// endpoint stays readable in it until the purge, so a caller polling the deletion
+    /// observes it rather than seeing the resource vanish in one step. Mirrors
+    /// [`CollectionRecord::begin_deletion`].
+    pub fn begin_deletion(&mut self) {
+        self.status = VPC_ENDPOINT_DELETING.to_string();
+        // A delete supersedes whatever transition was outstanding: the only thing still
+        // owed on this endpoint is the purge.
+        self.pending_status = None;
+        self.purge_at = Some(Instant::now() + SETTLE_AFTER);
+    }
+
+    /// Whether the clock has already made this endpoint's purge due at `now`.
+    pub fn is_purge_due(&self, now: Instant) -> bool {
+        self.purge_at.is_some_and(|due_at| now >= due_at)
+    }
+
+    /// The `DeleteVpcEndpointDetail` body for this record — the one place this crate renders
+    /// that shape, so an accepted deletion cannot report an endpoint differently from the
+    /// reads beside it.
+    pub fn delete_detail(&self) -> DeleteVpcEndpointDetail {
+        DeleteVpcEndpointDetail {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            status: Some(self.status.clone()),
         }
     }
 
@@ -2140,11 +2210,12 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
 }
 
 impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
-    /// Apply every collection transition the clock has already made due: a status a
-    /// collection settles into, and the PURGE of one whose deletion was accepted. Call it
-    /// before reading or writing a collection, so no caller observes a status the service
-    /// has already moved on from. See [`CollectionRecord::settle`] and
-    /// [`CollectionRecord::begin_deletion`].
+    /// Apply every transition the clock has already made due, for a collection and for a
+    /// managed interface endpoint alike: a status the record settles into, and the PURGE of
+    /// one whose deletion was accepted. Call it before reading or writing either, so no
+    /// caller observes a status the service has already moved on from. See
+    /// [`CollectionRecord::settle`], [`CollectionRecord::begin_deletion`],
+    /// [`VpcEndpointRecord::settle`] and [`VpcEndpointRecord::begin_deletion`].
     pub fn settle_due_transitions(&mut self) {
         let now = Instant::now();
         for record in self.collections.values_mut() {
@@ -2163,6 +2234,15 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
             .collect();
         for id in purged {
             self.remove_collection(&id);
+        }
+        let purged: Vec<String> = self
+            .vpc_endpoints
+            .values()
+            .filter(|record| record.is_purge_due(now))
+            .map(|record| record.id.clone())
+            .collect();
+        for id in purged {
+            self.remove_vpc_endpoint(&id);
         }
     }
 
@@ -2554,6 +2634,17 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
         self.vpc_endpoint_name_index
             .insert(record.name.clone(), record.id.clone());
         self.vpc_endpoints.insert(record.id.clone(), record);
+    }
+
+    /// Remove the VPC endpoint `id` names, dropping its name index entry and every
+    /// idempotency token that named it with it — so a later `BatchGetVpcEndpoint` of that id
+    /// reports the `NOT_FOUND` error detail instead of a stale `VpcEndpointDetail`, and the
+    /// freed name may be created again. Mirrors [`Self::remove_collection`].
+    pub fn remove_vpc_endpoint(&mut self, id: &str) -> Option<VpcEndpointRecord> {
+        let record = self.vpc_endpoints.remove(id)?;
+        self.vpc_endpoint_name_index.remove(&record.name);
+        self.forget_tokens_for(id);
+        Some(record)
     }
 
     /// The VPC endpoint a replayed `clientToken` on `operation` already created, if any;

@@ -13,7 +13,9 @@
 //! removed is reported `DELETING`, the state the clock no longer decides for it, the way
 //! every other removal of a tie in this service reports the record it just removed. A pair
 //! that holds no registration is the missing-resource answer, so a repeat of the call is a
-//! not-found.
+//! not-found, and a pair whose registration a stored transit gateway Connect peer
+//! association still stands on is the dependency `ValidationException` (400) every removal
+//! of this service refuses with until the tie is untied.
 //!
 //! ## Reaching this service's state
 //!
@@ -204,17 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.global_network_id,
             &input.transit_gateway_arn,
         );
-        let removed = store
-            .transit_gateway_registrations
-            .remove(&key)
-            .ok_or_else(|| {
+        if !store.transit_gateway_registrations.contains_key(&key) {
+            return Err(
                 DeregisterTransitGatewayErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(
                         crate::state::TRANSIT_GATEWAY_REGISTRATION_KIND,
                         &key,
                     ),
                 )
-            })?;
+                .into(),
+            );
+        }
 
         // "This action removes any customer gateway associations" (the operation's own
         // documentation): the associations it means are those of the customer gateways
@@ -225,6 +227,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation="AssociateCustomerGateway"`). So no stored association is removed here:
         // removing the global network's associations wholesale would delete ties this
         // gateway never carried.
+        //
+        // A tie the deregister therefore does NOT take with it is the transit gateway
+        // Connect peer association, which stands on this very registration: it can only be
+        // made while the global network carries a registration of a gateway the peer could
+        // have been created on (`AssociateTransitGatewayConnectPeer`, and
+        // `crate::state::transit_gateway_connect_peer_associations_standing_on` for which
+        // registrations those are). Removing the last such registration would leave the tie
+        // standing on a precondition it no longer satisfies, so — like every other removal
+        // of this service — the caller has to disassociate first, and the refusal is the
+        // dependency `ValidationException` (400) `crate::state::dependents_block_delete`
+        // builds, which no retry of THIS call can clear.
+        let standing = store.transit_gateway_connect_peer_associations_standing_on(
+            &input.global_network_id,
+            &key,
+        );
+        if let Some(refusal) = crate::state::dependents_block_delete(
+            crate::state::TRANSIT_GATEWAY_REGISTRATION_KIND,
+            &[(
+                crate::state::TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND,
+                standing,
+            )],
+        ) {
+            return Err(DeregisterTransitGatewayErrorModeled::ValidationException(refusal).into());
+        }
+
+        let removed = store
+            .transit_gateway_registrations
+            .remove(&key)
+            .ok_or_else(|| {
+                DeregisterTransitGatewayErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the transit gateway registration vanished while being deregistered"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+            })?;
 
         // The removed registration is reported as `DELETING`, the way every other removal of
         // a tie in this service reports the record it just removed; a later read no longer

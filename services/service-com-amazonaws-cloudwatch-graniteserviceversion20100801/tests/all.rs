@@ -81,6 +81,8 @@ mod forced_state_reclaim;
 mod get_dashboard_reader;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/insight_rule_batch_failures.rs"]
+mod insight_rule_batch_failures;
 #[path = "all/insight_rule_state.rs"]
 mod insight_rule_state;
 #[path = "all/insight_rules.rs"]

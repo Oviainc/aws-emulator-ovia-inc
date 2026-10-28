@@ -2242,20 +2242,22 @@ pub const INSIGHT_RULE_ENABLED: &str = "ENABLED";
 /// (`PutInsightRuleInput$RuleState`).
 pub const INSIGHT_RULE_DISABLED: &str = "DISABLED";
 
-/// The `ExceptionType` a batch Contributor Insights rule operation reports a name it could
-/// not act on under: "The type of error." (`PartialFailure$ExceptionType`) — the parameter
-/// fault every one of those operations models for a value it cannot use, reported per entry
-/// rather than as a refusal of the whole request.
-const INSIGHT_RULE_FAILURE_EXCEPTION: &str = "InvalidParameterValueException";
+/// The `ExceptionType` a batch Contributor Insights rule operation reports a well-formed name
+/// it holds no rule for under: "The type of error." (`PartialFailure$ExceptionType`) — the
+/// name addresses a rule that is not there, which is the resource-not-found class and not a
+/// fault in the value itself, reported per entry rather than as a refusal of the whole
+/// request.
+const INSIGHT_RULE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-/// The `FailureCode` beside it: "The code of the error." (`PartialFailure$FailureCode`) — the
-/// query error code that same parameter fault carries on the wire.
-const INSIGHT_RULE_FAILURE_CODE: &str = "InvalidParameterValue";
+/// The `FailureCode` beside it: "The code of the error." (`PartialFailure$FailureCode`) —
+/// which member of the entry the failure is about, here the rule name the request carried.
+const INSIGHT_RULE_NAME_FAILURE_CODE: &str = "RULE_NAME";
 
 /// How a batch Contributor Insights rule operation states that one of the names it was given
-/// is not a rule this store holds.
+/// is not a rule this store holds: fixed text around the name the request carried, ended as a
+/// sentence.
 fn unknown_insight_rule(rule_name: &str) -> String {
-    format!("Rule {rule_name} does not exist")
+    format!("Rule {rule_name} does not exist.")
 }
 
 /// The one `Failures` entry a batch Contributor Insights rule operation reports for a name
@@ -2265,8 +2267,8 @@ fn unknown_insight_rule(rule_name: &str) -> String {
 fn unknown_insight_rule_failure(rule_name: &str) -> PartialFailure {
     PartialFailure {
         failure_resource: Some(rule_name.to_string()),
-        exception_type: Some(INSIGHT_RULE_FAILURE_EXCEPTION.to_string()),
-        failure_code: Some(INSIGHT_RULE_FAILURE_CODE.to_string()),
+        exception_type: Some(INSIGHT_RULE_NOT_FOUND_EXCEPTION.to_string()),
+        failure_code: Some(INSIGHT_RULE_NAME_FAILURE_CODE.to_string()),
         failure_description: Some(unknown_insight_rule(rule_name)),
     }
 }
@@ -2354,6 +2356,48 @@ pub fn resource_arn_error(value: &str) -> Option<String> {
 
 /// CloudWatch's wording for a `ResourceARN` that is not an ARN.
 pub const INVALID_RESOURCE_ARN: &str = "INVALID_RESOURCE_ARN: Invalid ARN.";
+
+/// The resource types this service's OWN ARN namespace addresses, each as the token an ARN of
+/// such a resource carries before the resource's own name
+/// (`::service_common::arn::Arn::resource_type`).
+///
+/// "The ARN format of an alarm is arn:aws:cloudwatch:Region:account-id:alarm:alarm-name The
+/// ARN format of a Contributor Insights rule is
+/// arn:aws:cloudwatch:Region:account-id:insight-rule/insight-rule-name The ARN format of a
+/// dashboard is arn:aws:cloudwatch::account-id:dashboard/dashboard-name The ARN format of a
+/// metric stream is arn:aws:cloudwatch:Region:account-id:metric-stream/metric-stream-name"
+/// (`TagResourceInput$ResourceARN`); a dataset is addressed "in the format
+/// arn:aws:cloudwatch:Region:account-id:dataset/dataset-id" (`GetDatasetInput$DatasetIdentifier`)
+/// and an alarm mute rule as `arn:aws:cloudwatch:[REGION]:123456789012:alarm-mute-rule:*`
+/// (`PutAlarmMuteRule`).
+const ARN_RESOURCE_TYPES: [&str; 6] = [
+    "alarm",
+    "alarm-mute-rule",
+    "dashboard",
+    "dataset",
+    "insight-rule",
+    "metric-stream",
+];
+
+/// Whether `value` addresses an Amazon Web Services resource, as against being well formed as
+/// an ARN while addressing nothing.
+///
+/// An ARN's resource field opens with the resource TYPE, and only the service that owns the
+/// ARN's vendor field defines which types it has — so a value in THIS service's namespace is
+/// held to the resource types this service addresses ([`ARN_RESOURCE_TYPES`]), each carrying a
+/// non-empty id of a resource of that type (the same thing [`parse_taggable_arn`] requires of
+/// the ARNs it reads), while a value in another vendor's namespace is that vendor's to judge:
+/// this service cannot enumerate another's resources, and treating them as unaddressed would
+/// reject the resources of the very services whose data a managed rule collects.
+pub fn addresses_resource(value: &str) -> bool {
+    parse_resource_arn(value).is_some_and(|arn| {
+        arn.vendor != ARN_NAMESPACE
+            || ARN_RESOURCE_TYPES.iter().any(|resource_type| {
+                ::service_common::arn::resource_id_of_type(value, resource_type)
+                    .is_some_and(|id| !id.is_empty())
+            })
+    })
+}
 
 /// The largest number of Contributor Insights rules this in-memory store holds.
 ///

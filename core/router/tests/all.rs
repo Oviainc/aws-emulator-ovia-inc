@@ -481,6 +481,11 @@ mod personalize_signing_name_routing;
 mod cloudformation_provisions_redshift_clusters;
 #[path = "all/cloudformation_provisions_route53resolver_rules.rs"]
 mod cloudformation_provisions_route53resolver_rules;
+// Declared HERE, beside the sibling Route 53 Resolver suite in the same quiet span, for the
+// reason that entry records: the appended tail at the end of this file and the `c` span are
+// both regions every concurrently landing router suite puts its line in.
+#[path = "all/cloudformation_provisions_route53resolver_firewall.rs"]
+mod cloudformation_provisions_route53resolver_firewall;
 // `query_wire` and `rds_query_front_door` are declared HERE, in the sorted list,
 // rather than appended at the end: the end of this file is where every new router
 // suite lands, so a line added there collides with every other suite landing in the

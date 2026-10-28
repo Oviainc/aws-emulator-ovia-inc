@@ -4099,14 +4099,67 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         region: &str,
         account: Option<&str>,
     ) -> bool {
+        self.carries_transit_gateway_in_besides(global_network_id, region, account, None)
+    }
+
+    /// [`Self::carries_transit_gateway_in`] with the registration held under `besides`
+    /// left out: what the global network would still carry once that registration is gone.
+    fn carries_transit_gateway_in_besides(
+        &self,
+        global_network_id: &str,
+        region: &str,
+        account: Option<&str>,
+        besides: Option<&str>,
+    ) -> bool {
         self.transit_gateway_registrations
-            .values()
-            .filter(|registration| registration.global_network_id == global_network_id)
-            .any(|registration| {
+            .iter()
+            .filter(|(key, registration)| {
+                registration.global_network_id == global_network_id
+                    && Some(key.as_str()) != besides
+            })
+            .any(|(_, registration)| {
                 ec2_resource_region(&registration.transit_gateway_arn, TRANSIT_GATEWAY_TYPE)
                     == Some(region)
                     && arn_account_id(&registration.transit_gateway_arn) == account
             })
+    }
+
+    /// How many stored transit gateway Connect peer associations of `global_network_id`
+    /// would be left standing on no registration at all once the registration held under
+    /// `registration_key` is gone — the count the deregister's dependency refusal is built
+    /// from ([`dependents_block_delete`]).
+    ///
+    /// An association of this kind can only be made while the global network carries a
+    /// registration of a gateway the peer could have been created on
+    /// ([`Self::carries_transit_gateway_in`]), and it keeps standing on that precondition
+    /// for as long as it is stored, so removing the LAST registration that satisfies it
+    /// would leave the tie in exactly the state the associate refuses to create. Another
+    /// registration in the peer's Region and account still satisfies it, which is why the
+    /// question is asked of the registrations that would remain rather than of the one
+    /// being removed.
+    pub fn transit_gateway_connect_peer_associations_standing_on(
+        &self,
+        global_network_id: &str,
+        registration_key: &str,
+    ) -> usize {
+        self.transit_gateway_connect_peer_associations
+            .values()
+            .filter(|association| association.global_network_id == global_network_id)
+            .filter(|association| {
+                ec2_resource_region(
+                    &association.transit_gateway_connect_peer_arn,
+                    TRANSIT_GATEWAY_CONNECT_PEER_TYPE,
+                )
+                .is_some_and(|region| {
+                    !self.carries_transit_gateway_in_besides(
+                        global_network_id,
+                        region,
+                        arn_account_id(&association.transit_gateway_connect_peer_arn),
+                        Some(registration_key),
+                    )
+                })
+            })
+            .count()
     }
 
     /// How many managed prefix lists `core_network_id` is associated with, for the

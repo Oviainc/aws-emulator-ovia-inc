@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateFirewallRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateFirewallRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateFirewallRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Removes the association record the associate
+//! wrote, so the VPC stops being filtered by that rule group. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateFirewallRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateFirewallRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateFirewallRuleGroup"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN — it reports the one the stored record already
+        // carries — so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateFirewallRuleGroupErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // An association whose last change has not settled yet still has one in
+        // flight, so the disassociate is refused with the sentence the model
+        // states for that class and the record is left exactly as it is; a
+        // mutation-protected association refuses the removal outright, which is
+        // what that setting is for. Both are read out as owned values, so the
+        // record is no longer borrowed when it is taken out of the store below.
+        let standing = store
+            .firewall_rule_group_associations
+            .get(&input.firewall_rule_group_association_id)
+            .map(|record| {
+                (
+                    record.status_at(now).to_string(),
+                    record.mutation_protection.clone(),
+                )
+            });
+        if let Some((status, mutation_protection)) = standing {
+            if status != crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE {
+                return Err(DisassociateFirewallRuleGroupErrorModeled::ConflictException(
+                    crate::state::state_transition_conflict(),
+                )
+                .into());
+            }
+            if mutation_protection == crate::state::MUTATION_PROTECTION_ENABLED {
+                return Err(
+                    DisassociateFirewallRuleGroupErrorModeled::ValidationException(
+                        crate::state::mutation_protection_forbids_change(
+                            &input.firewall_rule_group_association_id,
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Nothing is stored under that id — including a second disassociate of
+        // the same association, which the first one already removed.
+        let Some(record) = store
+            .firewall_rule_group_associations
+            .remove(&input.firewall_rule_group_association_id)
+        else {
+            return Err(
+                DisassociateFirewallRuleGroupErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_rule_group_association_not_found(
+                        &input.firewall_rule_group_association_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // The `CreatorRequestId` is released with the association, so an
+        // associate that reuses it makes a new one rather than resolving to the
+        // removed record — the same rule the other deletes of this service
+        // follow.
+        store
+            .firewall_rule_group_association_creator_request_ids
+            .remove(&record.creator_request_id);
+
+        // The answer is the association this call took out, as it stood, and it
+        // is on its way out — so it reports the model's `DELETING` rather than
+        // the settled status it held until now.
+        let mut association = record.to_association(now);
+        association.status =
+            Some(crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING.to_string());
+        association.modification_time = Some(crate::state::now_rfc3339());
+
+        Ok(DisassociateFirewallRuleGroupOutput {
+            firewall_rule_group_association: Some(association),
+        })
     }
 }

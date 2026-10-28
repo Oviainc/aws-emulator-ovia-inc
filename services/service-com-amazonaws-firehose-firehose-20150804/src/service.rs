@@ -583,6 +583,17 @@ pub fn encryption_blocked_by_encryption_message(
     )
 }
 
+/// A disable with nothing to disable: the stream, and the state its encryption is ALREADY
+/// in, which is the state the call asks for.
+///
+/// Stated as a fact about the stream rather than as a status this call is waiting on
+/// ([`encryption_blocked_by_encryption_message`]), because no change is in flight: the
+/// stream simply has no encryption in force to turn off, whichever way it came to have
+/// none.
+pub fn encryption_already_disabled_message(name: &str) -> String {
+    format!("Cannot disable encryption on firehose: {name} when encryption is already disabled")
+}
+
 /// An update the stream's current state blocks: the stream and the status it is in.
 pub fn update_blocked_message(name: &str, status: &str) -> String {
     format!("Cannot update firehose: {name} when it is in {status} status")

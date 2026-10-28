@@ -12,6 +12,10 @@
 //! so a create while that Region's bundle still exists is refused with the
 //! modelled `ServiceQuotaExceededException`.
 //!
+//! The `tags` the request carries are stored as the MAP they are (see
+//! [`crate::state::tag_set`]), so a key the list repeats is held once with the
+//! last value the list gave it — exactly what `TagResource` would have stored.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request.
@@ -147,12 +151,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .customer_managed_key_identifier
             .as_deref()
             .map(|identifier| crate::state::customer_managed_key_arn(identifier, &region));
+        // A tag list is a map of key-value pairs, so the list this request
+        // carried is collapsed onto one entry per key BEFORE it is stored or
+        // fingerprinted: what the resource holds is the map, not the list that
+        // carried it (see [`crate::state::tag_set`]).
+        let tags = crate::state::tag_set(input.tags.as_deref());
         let fingerprint = crate::state::request_fingerprint(
             &[(
                 "customerManagedKeyArn",
                 customer_managed_key_arn.as_deref().unwrap_or(""),
             )],
-            input.tags.as_deref(),
+            Some(&tags),
         );
 
         let mut store = state.lock();
@@ -222,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             region: region.clone(),
             customer_managed_key_arn,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             created_at: ::std::time::SystemTime::now(),
             sequence,
             ingestions: ::std::collections::HashMap::new(),

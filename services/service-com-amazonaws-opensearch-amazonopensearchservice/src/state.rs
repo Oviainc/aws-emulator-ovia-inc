@@ -54,7 +54,7 @@ use crate::ops::types::{
     IAMFederationOptionsOutput, IPAddressTypeStatus, IamIdentityCenterOptions,
     IamIdentityCenterOptionsInput, IdentityCenterOptions,
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InboundConnection,
-    InboundConnectionStatus, Insight, InsightEntity, InsightField,
+    InboundConnectionStatus, Insight, InsightEntity, InsightFeedbackEntity, InsightField,
     InstanceCountLimits, InstanceLimits,
     InstanceTypeDetails, InternalException,
     InvalidPaginationTokenException, InvalidTypeException, JWTOptionsOutput,
@@ -4063,6 +4063,30 @@ impl InsightDetailField {
     }
 }
 
+/// The feedback a caller has submitted on one insight, as this emulator persists it.
+///
+/// A submission "allows users to provide a thumbs up or thumbs down rating and
+/// optional text feedback for a specific insight", so a record is that rating, the
+/// text that came with it where the caller wrote any, and the instant it was
+/// submitted. It is held on the insight it rates ([`InsightRecord::feedback`]), so it
+/// goes when that insight goes.
+///
+/// One caller holds ONE rating of an insight — "thumbs up or thumbs down" is a single
+/// verdict, not a tally — so a later submission about the same insight REPLACES the
+/// rating an earlier one left rather than accumulating beside it.
+#[derive(Debug, Clone)]
+pub struct InsightFeedbackRecord {
+    /// `InsightFeedbackRequest$Thumbs`, one of `InsightFeedbackThumbs`' values: the
+    /// thumbs up or thumbs down rating the caller gave the insight.
+    pub thumbs: String,
+    /// `InsightFeedbackRequest$FeedbackText`: "optional text feedback providing
+    /// additional details about the insight", `None` where the submission carried
+    /// none.
+    pub feedback_text: Option<String>,
+    /// The instant this rating was submitted — the submission this record is of.
+    pub submitted_at: SystemTime,
+}
+
 /// One insight, as this emulator persists it.
 ///
 /// An insight is "a notification about a domain event or recommendation that helps
@@ -4104,6 +4128,10 @@ pub struct InsightRecord {
     /// on the insight itself, because a detail field details THAT insight and goes
     /// when it goes; empty for an insight the service has raised no detail for.
     pub details: Vec<InsightDetailField>,
+    /// The feedback submitted on THIS insight, or `None` while no caller has rated it.
+    /// Held on the insight itself, because feedback rates THAT insight and goes when
+    /// it goes. See [`InsightFeedbackRecord`].
+    pub feedback: Option<InsightFeedbackRecord>,
 }
 
 impl InsightRecord {
@@ -4128,6 +4156,13 @@ impl InsightRecord {
 pub const INSIGHT_ENTITY_ACCOUNT: &str = "Account";
 /// See [`INSIGHT_ENTITY_ACCOUNT`].
 pub const INSIGHT_ENTITY_DOMAIN_NAME: &str = "DomainName";
+
+/// The values `InsightFeedbackThumbs` admits: "the thumbs up or thumbs down feedback
+/// for an insight. Possible values are `Up` and `Down`". One of
+/// [`crate::ops::types::INSIGHT_FEEDBACK_THUMBS_VALUES`].
+pub const INSIGHT_FEEDBACK_THUMBS_UP: &str = "Up";
+/// See [`INSIGHT_FEEDBACK_THUMBS_UP`].
+pub const INSIGHT_FEEDBACK_THUMBS_DOWN: &str = "Down";
 
 /// Why the entity a request names has no insights to report, as the modelled
 /// exception payload the refusal is reported through.
@@ -8026,6 +8061,38 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
             .find(|record| record.insight_id == insight_id))
     }
 
+    /// The one insight a feedback submission addresses, ready to be written.
+    ///
+    /// Feedback "submits feedback for an EXISTING insight in an Amazon OpenSearch
+    /// Service domain", and `InsightFeedbackEntityType` admits `DomainName` alone, so
+    /// a submission is addressed by the domain that holds the insight and the
+    /// insight's own id together: BOTH have to resolve, because a domain this account
+    /// does not hold and an id that domain holds no insight under alike leave no
+    /// insight for the rating to be about. Which of the two failed to resolve is not
+    /// reported — the submission named a resource this service cannot resolve either
+    /// way ([`insight_resource_not_found`]) — while an entity whose type is outside
+    /// the enum names no kind of resource at all and is refused as a malformed
+    /// request.
+    pub fn insight_for_feedback_mut(
+        &mut self,
+        entity: &InsightFeedbackEntity,
+        insight_id: &str,
+    ) -> Result<&mut InsightRecord, InsightEntityRefusal> {
+        if entity.r#type != INSIGHT_ENTITY_DOMAIN_NAME {
+            return Err(InsightEntityRefusal::Validation(
+                unknown_insight_feedback_entity(&entity.r#type),
+            ));
+        }
+        // "The value of the entity, such as a domain name": an entity of this type
+        // names its domain in `Value`, and `Value` is `@required` here, so one that
+        // names no name at all resolves to no domain rather than to every domain.
+        let name = entity.value.trim();
+        self.domains
+            .get_mut(name)
+            .and_then(|domain| domain.insights.get_mut(insight_id))
+            .ok_or_else(|| InsightEntityRefusal::NotFound(insight_resource_not_found()))
+    }
+
     /// The tag set of the resource `arn` names, for a caller about to READ it.
     ///
     /// A domain, an application and a direct query data source are the taggable
@@ -8954,6 +9021,54 @@ pub fn unknown_insight_entity(entity_type: &str) -> ValidationException {
             "Entity type {entity_type} is not supported. Supported values are \
              {INSIGHT_ENTITY_ACCOUNT} and {INSIGHT_ENTITY_DOMAIN_NAME}."
         )),
+    }
+}
+
+/// The `ValidationException` payload for a feedback entity whose type is outside
+/// `InsightFeedbackEntityType` — which admits `DomainName` alone, so feedback accepts
+/// strictly fewer entity types than a listing does.
+pub fn unknown_insight_feedback_entity(entity_type: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Entity type {entity_type} is not supported. Supported values are \
+             {INSIGHT_ENTITY_DOMAIN_NAME}."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a feedback rating outside
+/// `InsightFeedbackThumbs`.
+pub fn unknown_insight_feedback_thumbs(thumbs: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Thumbs {thumbs} is not supported. Supported values are {} and {}.",
+            INSIGHT_FEEDBACK_THUMBS_UP, INSIGHT_FEEDBACK_THUMBS_DOWN
+        )),
+    }
+}
+
+/// The `ValidationException` payload for feedback text past the longest the modelled
+/// member admits: it names the bound and the length the submission carried, so the
+/// caller can fix the request from the refusal alone.
+pub fn feedback_text_too_long(length: usize, maximum: usize) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "FeedbackText must be at most {maximum} characters: {length}"
+        )),
+    }
+}
+
+/// What a feedback submission says of a resource it cannot resolve: the submission
+/// named an insight of a domain, and neither the domain nor the insight resolved to
+/// something this account holds.
+///
+/// The wording is the generic one this operation refuses with, naming no resource:
+/// one refusal for both halves of the address, so a caller cannot tell a domain it
+/// does not hold from an insight that domain does not hold — which is what the
+/// service answers.
+pub fn insight_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some("Resource not found".to_string()),
     }
 }
 

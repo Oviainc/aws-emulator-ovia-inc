@@ -147,8 +147,13 @@ fn detailed_id() -> String {
     guid("000000000001")
 }
 
-/// An insight raised at `raised`, carrying `details`.
-fn record(insight_id: &str, raised: SystemTime, details: Vec<InsightDetailField>) -> InsightRecord {
+/// An insight raised at `raised`, carrying `details`. Shared with
+/// [`super::insight_feedback`], which rates the insights this builder raises.
+pub(crate) fn record(
+    insight_id: &str,
+    raised: SystemTime,
+    details: Vec<InsightDetailField>,
+) -> InsightRecord {
     InsightRecord {
         insight_id: insight_id.to_string(),
         display_name: "Shard count is above the recommended ceiling".to_string(),
@@ -159,11 +164,12 @@ fn record(insight_id: &str, raised: SystemTime, details: Vec<InsightDetailField>
         updated_at: raised,
         is_experimental: false,
         details,
+        feedback: None,
     }
 }
 
-/// Raise `record` on the domain `name`.
-fn raise_on_domain(emulator: &Emulator, name: &str, record: InsightRecord) {
+/// Raise `record` on the domain `name`. Shared with [`super::insight_feedback`].
+pub(crate) fn raise_on_domain(emulator: &Emulator, name: &str, record: InsightRecord) {
     let store = emulator.store();
     let mut guard = store.lock();
     let domain = guard

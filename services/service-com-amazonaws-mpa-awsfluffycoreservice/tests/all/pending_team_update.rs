@@ -88,7 +88,7 @@ fn make_approval_due(harness: &Harness, team_arn: &str) {
 
 /// Push that same instant well past the end of a test, so a requested change stays
 /// waiting on its approvers for as long as the test needs it to.
-fn postpone_approval(harness: &Harness, team_arn: &str) {
+pub(crate) fn postpone_approval(harness: &Harness, team_arn: &str) {
     with_pending_update(harness, team_arn, |update| {
         update.approval_due = Some(SystemTime::now() + Duration::from_secs(3600));
     });

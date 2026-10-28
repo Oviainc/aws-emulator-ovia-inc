@@ -27,7 +27,7 @@ use ::service_com_amazonaws_outposts_outpostsolafservice::state as outposts;
 use crate::ops::types::{
     AccessDeniedException, ConflictException, FirewallConfig, FirewallDomainList,
     FirewallDomainListMetadata,
-    FirewallRule, FirewallRuleGroup, FirewallRuleGroupMetadata,
+    FirewallRule, FirewallRuleGroup, FirewallRuleGroupAssociation, FirewallRuleGroupMetadata,
     InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
     LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
@@ -470,6 +470,125 @@ pub const RESOURCE_TYPE_FIREWALL_RULE_GROUP: &str = "FirewallRuleGroup";
 /// `CreatorRequestId` already stored stays allowed, because it allocates no new
 /// record.
 pub const MAX_STORED_FIREWALL_RULE_GROUPS: usize = 1_000;
+
+/// The most rules one DNS Firewall rule group holds in this store.
+///
+/// `CreateFirewallRule` admits any new `CreatorRequestId`, so without a bound a
+/// caller looping creates would grow one record without limit — the same
+/// reasoning as [`MAX_STORED_FIREWALL_RULE_GROUPS`], and not a published AWS
+/// quota. A create past it is refused with the `LimitExceededException` that
+/// operation models and the group's rules are left exactly as they were.
+pub const MAX_RULES_PER_FIREWALL_RULE_GROUP: usize = 1_000;
+
+/// The `FirewallRuleGroupAssociationStatus` an association reports once no
+/// change to it is in flight, the model's `COMPLETE`
+/// (`smithy_query(query="shape",shape="FirewallRuleGroupAssociationStatus")`,
+/// re-exported as
+/// [`crate::ops::types::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES`]).
+pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The `FirewallRuleGroupAssociationStatus` an association reports while the
+/// service is still putting it in place: the model's enum carries no `CREATING`
+/// value at all, so `UPDATING` is the status an association that has just been
+/// asked for reports until the move to
+/// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE`] the clock owes falls due.
+pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING: &str = "UPDATING";
+
+/// The `FirewallRuleGroupAssociationStatus` an association reports once a
+/// disassociate has been accepted for it, the model's `DELETING`:
+/// `DisassociateFirewallRuleGroup` answers with the association it removed, and
+/// that association is on its way out.
+pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING: &str = "DELETING";
+
+/// `ResourceNotFoundException$ResourceType` for a rule-group-to-VPC
+/// association: the modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_FIREWALL_RULE_GROUP_ASSOCIATION: &str = "FirewallRuleGroupAssociation";
+
+/// The most rule-group-to-VPC associations this store holds, for the same reason
+/// as [`MAX_STORED_FIREWALL_RULE_GROUPS`]: `AssociateFirewallRuleGroup` admits
+/// any new `CreatorRequestId`, so without a bound a caller looping associates
+/// would grow one emulator process without limit.
+pub const MAX_STORED_FIREWALL_RULE_GROUP_ASSOCIATIONS: usize = 1_000;
+
+/// The `MutationProtectionStatus` an association carries when the request names
+/// none.
+///
+/// `MutationProtection`'s doc says the setting "disallows modification or
+/// removal of the association", which is not in force unless it was asked for,
+/// so an association made without it reports the model's `DISABLED`
+/// (`smithy_query(query="shape",shape="MutationProtectionStatus")`, re-exported
+/// as [`crate::ops::types::MUTATION_PROTECTION_STATUS_VALUES`]).
+pub const MUTATION_PROTECTION_DISABLED: &str = "DISABLED";
+
+/// The `MutationProtectionStatus` that holds an association against
+/// modification and removal, the model's `ENABLED`.
+pub const MUTATION_PROTECTION_ENABLED: &str = "ENABLED";
+
+/// The values a rule-group association's `Priority` may take.
+///
+/// `AssociateFirewallRuleGroup$Priority`'s doc states them: "The allowed values
+/// for Priority are between 100 and 9900." The model puts no `range` on
+/// `Priority`, so the bounds are enforced by the handlers, which refuse a
+/// priority outside them with the `ValidationException` both the associate and
+/// the update model.
+pub const ASSOCIATION_PRIORITY_RANGE: ::std::ops::RangeInclusive<i32> = 100..=9_900;
+
+/// The `Action` a DNS Firewall rule takes to "disallow the request", from the
+/// model's `Action` enum (`smithy_query(query="shape",shape="Action")`,
+/// re-exported as [`crate::ops::types::ACTION_VALUES`]). It is the one action
+/// whose handling the rule's `BlockResponse` has to state.
+pub const FIREWALL_RULE_ACTION_BLOCK: &str = "BLOCK";
+
+/// The `Action` a DNS Firewall rule takes to "permit the request to go through",
+/// from the same enum. Its doc states where it may not be used: "Not available
+/// for DNS Firewall Advanced rules."
+pub const FIREWALL_RULE_ACTION_ALLOW: &str = "ALLOW";
+
+/// The `BlockResponse` that answers a blocked query with "a custom override in
+/// the response", from the model's `BlockResponse` enum
+/// (`smithy_query(query="shape",shape="BlockResponse")`, re-exported as
+/// [`crate::ops::types::BLOCK_RESPONSE_VALUES`]). It is the one response whose
+/// handling the rule's `BlockOverride*` members have to state.
+pub const FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE: &str = "OVERRIDE";
+
+/// The `FirewallDomainRedirectionAction` a rule carries when the request names
+/// none.
+///
+/// `FirewallDomainRedirectionAction`'s doc states it: "`INSPECT_REDIRECTION_DOMAIN`:
+/// (Default) inspects all domains in the redirection chain."
+pub const FIREWALL_DOMAIN_REDIRECTION_INSPECT: &str = "INSPECT_REDIRECTION_DOMAIN";
+
+/// The `FirewallRuleStatus` of a rule whose provisioning is still running, from
+/// that shape's doc (`smithy_query(query="shape",shape="FirewallRuleStatus")`):
+/// "`CREATING` — DNS Firewall is provisioning the rule."
+pub const FIREWALL_RULE_STATUS_CREATING: &str = "CREATING";
+
+/// The `FirewallRuleStatus` of a provisioned rule, from the same doc:
+/// "`COMPLETE` — The rule is provisioned and enforcing matches."
+pub const FIREWALL_RULE_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The `FirewallRuleStatus` of a rule whose provisioning did not succeed, from
+/// the same doc: "`CREATION_FAILED` — Provisioning failed", with
+/// `StatusMessage` carrying "a human-readable reason".
+pub const FIREWALL_RULE_STATUS_CREATION_FAILED: &str = "CREATION_FAILED";
+
+/// The `StatusMessage` of a rule whose match source is a partner product this
+/// account holds no subscription to.
+///
+/// `PartnerThreatProtectionConfig$Partner`'s doc requires one: "The calling
+/// account must hold an active Amazon Web Services Marketplace subscription to
+/// this product", and `FirewallRuleType`'s doc states the outcome when it does
+/// not — "the rule is created with `Status` `CREATION_FAILED` and cannot be
+/// modified — only deleted". This emulator holds no Marketplace subscription for
+/// any product, so a rule naming one reports that reason, with the product it
+/// named.
+pub fn partner_subscription_missing(partner: &str) -> String {
+    format!(
+        "The calling account holds no active Amazon Web Services Marketplace subscription to the \
+         partner product \"{partner}\""
+    )
+}
 
 /// The most VPC firewall configurations this store holds records for.
 ///
@@ -1326,6 +1445,42 @@ pub fn firewall_rule_group_not_found(firewall_rule_group_id: &str) -> ResourceNo
     }
 }
 
+/// The `ResourceNotFoundException` the rule-group association operations answer
+/// for an association the caller cannot address, built here so every operation
+/// that resolves a `FirewallRuleGroupAssociationId` reports the same body — the
+/// same relation [`firewall_rule_group_not_found`] has to the rule-group
+/// operations.
+pub fn firewall_rule_group_association_not_found(
+    firewall_rule_group_association_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(
+            firewall_rule_group_association_id,
+        )),
+        resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE_GROUP_ASSOCIATION.to_string()),
+    }
+}
+
+/// The `ValidationException` a write to a mutation-protected association is
+/// refused with.
+///
+/// `MutationProtection`'s doc states what the setting does: "If enabled, this
+/// setting disallows modification or removal of the association, to help prevent
+/// against accidentally altering DNS firewall protections." A caller that asked
+/// for that protection is told which association refused the change and how to
+/// lift it.
+pub fn mutation_protection_forbids_change(
+    firewall_rule_group_association_id: &str,
+) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "The firewall rule group association with ID \
+             \"{firewall_rule_group_association_id}\" has MutationProtection {MUTATION_PROTECTION_ENABLED}; \
+             disable it before modifying or removing the association"
+        )),
+    }
+}
+
 /// The key a firewall domain list decides membership on: the domain name, case
 /// folded.
 ///
@@ -1630,6 +1785,51 @@ impl FirewallDomainListRecord {
     }
 }
 
+/// One rule of a DNS Firewall rule group, as stored.
+///
+/// The rule itself is held as the modelled shape every operation reports it as,
+/// beside the two things that are not part of that shape: where the clock stands
+/// on a rule whose provisioning is asynchronous, and nothing else — so a rule
+/// cannot report one set of values to one operation and another set to the next.
+#[derive(Debug, Clone, Default)]
+pub struct FirewallRuleRecord {
+    /// The rule as created, WITHOUT its lifecycle state: `Status` and
+    /// `StatusMessage` are decided by [`Self::to_rule`] from the clock, so the
+    /// two cannot disagree.
+    pub rule: FirewallRule,
+    /// The `FirewallRuleStatus` this rule reports until [`Self::settled_at`]
+    /// falls due, or `None` for a rule whose provisioning needs no time at all —
+    /// `FirewallRule$Status`'s doc: "For rules that do not require asynchronous
+    /// provisioning, this field may be absent."
+    pub status: Option<String>,
+    /// The `FirewallRuleStatus` the clock owes this rule, reported from
+    /// [`Self::settled_at`] onwards, with the message that states why.
+    pub settled_status: Option<String>,
+    pub settled_status_message: Option<String>,
+    /// The instant at which the move to [`Self::settled_status`] is owed, or
+    /// `None` for a rule with no transition in flight.
+    pub settled_at: Option<Instant>,
+}
+
+impl FirewallRuleRecord {
+    /// Project the record onto the modelled `FirewallRule`, with the lifecycle
+    /// state this rule carries as of `now`: the transient one until the
+    /// transition the clock owes falls due, the settled one after it — the same
+    /// shape as [`FirewallRuleGroupRecord::status_at`].
+    pub fn to_rule(&self, now: Instant) -> FirewallRule {
+        let mut rule = self.rule.clone();
+        let settled = self.settled_at.is_some_and(|due| now >= due);
+        if settled {
+            rule.status = self.settled_status.clone();
+            rule.status_message = self.settled_status_message.clone();
+        } else {
+            rule.status = self.status.clone();
+            rule.status_message = None;
+        }
+        rule
+    }
+}
+
 /// A DNS Firewall rule group, as stored.
 ///
 /// `RuleCount` is DERIVED from [`Self::rules`] and never held separately — the
@@ -1655,7 +1855,7 @@ pub struct FirewallRuleGroupRecord {
     /// added — a group is created empty ("you can add rules to the new rule
     /// group by calling CreateFirewallRule"), so the rule operations are what
     /// populate it.
-    pub rules: Vec<FirewallRule>,
+    pub rules: Vec<FirewallRuleRecord>,
     /// The `FirewallRuleGroupStatus` this group reports, as of
     /// [`Self::settled_at`].
     pub status: String,
@@ -1736,6 +1936,82 @@ impl FirewallRuleGroupRecord {
             owner_id: Some(self.owner_id.clone()),
             creator_request_id: Some(self.creator_request_id.clone()),
             share_status: Some(self.share_status.clone()),
+        }
+    }
+}
+
+/// An association between a DNS Firewall rule group and a VPC, as stored.
+///
+/// The association is a resource of its own — `AssociateFirewallRuleGroup` mints
+/// an id for it and `GetFirewallRuleGroupAssociation` resolves that id — so it is
+/// held in its own collection rather than on either of the two resources it
+/// joins, exactly as [`ResolverRuleAssociationRecord`] is for a Resolver rule and
+/// a VPC.
+#[derive(Debug, Clone, Default)]
+pub struct FirewallRuleGroupAssociationRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
+    /// list order and the source of the minted id.
+    pub seq: u64,
+    pub id: String,
+    pub arn: String,
+    pub firewall_rule_group_id: String,
+    pub vpc_id: String,
+    pub name: String,
+    /// "The setting that determines the processing order of the rule group among
+    /// the rule groups that are associated with a single VPC."
+    pub priority: i32,
+    /// One of [`crate::ops::types::MUTATION_PROTECTION_STATUS_VALUES`].
+    pub mutation_protection: String,
+    pub creator_request_id: String,
+    /// The `FirewallRuleGroupAssociationStatus` this association reports, as of
+    /// [`Self::settled_at`].
+    pub status: String,
+    pub status_message: Option<String>,
+    /// `AssociateFirewallRuleGroup$Tags`, kept with the record so they are not
+    /// silently discarded; `FirewallRuleGroupAssociation` models no `Tags`
+    /// member, so they are reported by `ListTagsForResource` alone.
+    pub tags: Vec<Tag>,
+    pub creation_time: String,
+    pub modification_time: String,
+    /// The instant at which the move from the transient [`Self::status`] to
+    /// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE`] is owed, or `None` for
+    /// an association with no transition in flight.
+    pub settled_at: Option<Instant>,
+}
+
+impl FirewallRuleGroupAssociationRecord {
+    /// This association's `FirewallRuleGroupAssociationStatus` as of `now`: the
+    /// transient status until the transition the clock owes falls due,
+    /// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE`] after it — the same
+    /// shape as [`FirewallRuleGroupRecord::status_at`].
+    pub fn status_at(&self, now: Instant) -> &str {
+        match self.settled_at {
+            Some(due) if now < due => &self.status,
+            Some(_) => FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE,
+            None => &self.status,
+        }
+    }
+
+    /// Project the record onto the modelled `FirewallRuleGroupAssociation`.
+    pub fn to_association(&self, now: Instant) -> FirewallRuleGroupAssociation {
+        FirewallRuleGroupAssociation {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            firewall_rule_group_id: Some(self.firewall_rule_group_id.clone()),
+            vpc_id: Some(self.vpc_id.clone()),
+            name: Some(self.name.clone()),
+            priority: Some(self.priority),
+            mutation_protection: Some(self.mutation_protection.clone()),
+            // `ManagedOwnerName` is "the owner of the association, used only for
+            // associations that are NOT managed by you"; an association this
+            // account made is its own, so it stays unset.
+            managed_owner_name: None,
+            status: Some(self.status_at(now).to_string()),
+            status_message: self.status_message.clone(),
+            creator_request_id: Some(self.creator_request_id.clone()),
+            creation_time: Some(self.creation_time.clone()),
+            modification_time: Some(self.modification_time.clone()),
         }
     }
 }
@@ -3322,12 +3598,16 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// `firewall-domain-list/<id>`, `resolver-query-log-config/<id>`); the shape
 /// names are what every other refusal of this service reports in
 /// `ResourceNotFoundException$ResourceType`.
-const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 6] = [
+const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 7] = [
     ("resolver-endpoint", RESOURCE_TYPE_RESOLVER_ENDPOINT),
     ("resolver-rule", RESOURCE_TYPE_RESOLVER_RULE),
     ("outpost-resolver", RESOURCE_TYPE_OUTPOST_RESOLVER),
     ("firewall-domain-list", RESOURCE_TYPE_FIREWALL_DOMAIN_LIST),
     ("firewall-rule-group", RESOURCE_TYPE_FIREWALL_RULE_GROUP),
+    (
+        "firewall-rule-group-association",
+        RESOURCE_TYPE_FIREWALL_RULE_GROUP_ASSOCIATION,
+    ),
     (
         "resolver-query-log-config",
         RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG,
@@ -3362,6 +3642,7 @@ pub enum TaggedResource {
     OutpostResolver(String),
     FirewallDomainList(String),
     FirewallRuleGroup(String),
+    FirewallRuleGroupAssociation(String),
     ResolverQueryLogConfig(String),
 }
 
@@ -3502,6 +3783,14 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// `CreatorRequestId` identifies a request to ONE operation, so this map is
     /// kept apart from theirs.
     pub firewall_rule_group_creator_request_ids: HashMap<String, String>,
+    /// Every stored association between a DNS Firewall rule group and a VPC,
+    /// keyed by its `Id`.
+    pub firewall_rule_group_associations: HashMap<String, FirewallRuleGroupAssociationRecord>,
+    /// `CreatorRequestId` -> rule-group association id, the same retry index as
+    /// [`Self::creator_request_id_index`] for the other resources: a
+    /// `CreatorRequestId` identifies a request to ONE operation, so this map is
+    /// kept apart from theirs.
+    pub firewall_rule_group_association_creator_request_ids: HashMap<String, String>,
     /// Every stored Resolver query logging configuration, keyed by its `Id`.
     pub resolver_query_log_configs: HashMap<String, ResolverQueryLogConfigRecord>,
     /// `CreatorRequestId` -> query logging configuration id, the same retry
@@ -3692,6 +3981,47 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         self.firewall_rule_groups.len() < MAX_STORED_FIREWALL_RULE_GROUPS
     }
 
+    /// Whether one more rule-group-to-VPC association may be stored, i.e. the
+    /// store is still below [`MAX_STORED_FIREWALL_RULE_GROUP_ASSOCIATIONS`]. An
+    /// associate that this refuses answers `LimitExceededException` and writes
+    /// nothing.
+    pub fn can_store_another_firewall_rule_group_association(&self) -> bool {
+        self.firewall_rule_group_associations.len() < MAX_STORED_FIREWALL_RULE_GROUP_ASSOCIATIONS
+    }
+
+    /// The association between `firewall_rule_group_id` and `vpc_id`, if the
+    /// store holds one.
+    ///
+    /// One rule group is associated with one VPC at most once, so this is what
+    /// `AssociateFirewallRuleGroup` consults before writing a second record for
+    /// the same pair — the same lookup [`Self::find_rule_association`] is for a
+    /// Resolver rule. The scan is over a store bounded by
+    /// [`MAX_STORED_FIREWALL_RULE_GROUP_ASSOCIATIONS`].
+    pub fn find_firewall_rule_group_association(
+        &self,
+        firewall_rule_group_id: &str,
+        vpc_id: &str,
+    ) -> Option<&FirewallRuleGroupAssociationRecord> {
+        self.firewall_rule_group_associations
+            .values()
+            .find(|record| {
+                record.firewall_rule_group_id == firewall_rule_group_id && record.vpc_id == vpc_id
+            })
+    }
+
+    /// Every stored rule-group-to-VPC association in creation order — the order
+    /// `ListFirewallRuleGroupAssociations`' pages and its cursor are defined
+    /// over, for the same reason as
+    /// [`Self::firewall_rule_groups_in_creation_order`].
+    pub fn firewall_rule_group_associations_in_creation_order(
+        &self,
+    ) -> Vec<&FirewallRuleGroupAssociationRecord> {
+        let mut all: Vec<&FirewallRuleGroupAssociationRecord> =
+            self.firewall_rule_group_associations.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
+    }
+
     /// The stored firewall rule group `arn` names, if the store holds one.
     ///
     /// The rule-group policy operations address a group by its `Arn` and not by
@@ -3840,8 +4170,9 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// such configurations enumerates VPCs and not override records. This
     /// emulator keeps no VPC inventory of its own, so the VPCs it knows the
     /// account has are exactly those its own records name: a VPC a Resolver rule
-    /// is associated with, a VPC a Resolver endpoint is hosted in, and a VPC one
-    /// of the per-VPC configurations was written for.
+    /// is associated with, a VPC a Resolver endpoint is hosted in, a VPC a DNS
+    /// Firewall rule group is associated with, and a VPC one of the per-VPC
+    /// configurations was written for.
     ///
     /// Ordered by the position in the store's creation order ([`Self::id_seq`])
     /// of the FIRST record that named the VPC, so the sequence never depends on
@@ -3874,6 +4205,11 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 self.firewall_configs
                     .values()
                     .map(|record| (record.resource_id.as_str(), record.seq)),
+            )
+            .chain(
+                self.firewall_rule_group_associations
+                    .values()
+                    .map(|record| (record.vpc_id.as_str(), record.seq)),
             );
 
         let mut first_seen: HashMap<&str, u64> = HashMap::new();
@@ -3990,6 +4326,15 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             return Some(TaggedResource::FirewallRuleGroup(record.id.clone()));
         }
         if let Some(record) = self
+            .firewall_rule_group_associations
+            .values()
+            .find(|record| record.arn == resource_arn)
+        {
+            return Some(TaggedResource::FirewallRuleGroupAssociation(
+                record.id.clone(),
+            ));
+        }
+        if let Some(record) = self
             .resolver_query_log_configs
             .values()
             .find(|record| record.arn == resource_arn)
@@ -4023,6 +4368,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .firewall_rule_groups
                 .get(&id)
                 .map(|record| record.tags.as_slice()),
+            TaggedResource::FirewallRuleGroupAssociation(id) => self
+                .firewall_rule_group_associations
+                .get(&id)
+                .map(|record| record.tags.as_slice()),
             TaggedResource::ResolverQueryLogConfig(id) => self
                 .resolver_query_log_configs
                 .get(&id)
@@ -4053,6 +4402,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .map(|record| &mut record.tags),
             TaggedResource::FirewallRuleGroup(id) => self
                 .firewall_rule_groups
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::FirewallRuleGroupAssociation(id) => self
+                .firewall_rule_group_associations
                 .get_mut(&id)
                 .map(|record| &mut record.tags),
             TaggedResource::ResolverQueryLogConfig(id) => self
@@ -4155,6 +4508,26 @@ pub fn mint_firewall_domain_list_id(seq: u64) -> String {
 /// (length 1..64).
 pub fn mint_firewall_rule_group_id(seq: u64) -> String {
     format!("rslvr-frg-{:016x}", scramble(seq))
+}
+
+/// Mint the `Id` of a rule-group-to-VPC association from the id sequence. AWS
+/// names a DNS Firewall rule group association `rslvr-frgassoc-<hex>`. Every
+/// result fits `ResourceId` (length 1..64).
+pub fn mint_firewall_rule_group_association_id(seq: u64) -> String {
+    format!("rslvr-frgassoc-{:016x}", scramble(seq))
+}
+
+/// Mint the `FirewallThreatProtectionId` of a DNS Firewall Advanced rule from
+/// the id sequence.
+///
+/// The model constrains the member only to `ResourceId`'s length (1..64), so the
+/// shape is taken from [`mint_firewall_rule_group_id`]'s `rslvr-<infix>-<hex>`
+/// with this resource's own infix — the same reasoning as
+/// [`mint_outpost_resolver_id`]: an id is recognisable as this resource's and
+/// collides with no other, since every infix is distinct and the counter is
+/// shared.
+pub fn mint_firewall_threat_protection_id(seq: u64) -> String {
+    format!("rslvr-ftp-{:016x}", scramble(seq))
 }
 
 /// The `Id` of a VPC's DNS Firewall configuration. AWS names one
@@ -4351,6 +4724,64 @@ pub const FIREWALL_CONFIG_LIST_SCOPE: &str = "ListFirewallConfigs/all/v1";
 /// — so, for the same reason as [`FIREWALL_DOMAIN_LIST_LIST_SCOPE`], the scope
 /// is a constant that names the operation.
 pub const FIREWALL_RULE_GROUP_LIST_SCOPE: &str = "ListFirewallRuleGroups/all/v1";
+
+/// The cursor scope of one `ListFirewallRules` query.
+///
+/// The offset a cursor carries is an index into the collection the query
+/// selects, which the rule group and the `Priority` and `Action` filters narrow
+/// (`smithy_query(query="operation",operation="ListFirewallRules")`), so — for
+/// the same reason as [`endpoint_list_scope`] — resuming with a different group
+/// or filter is answered as an unknown cursor rather than with a page cut at the
+/// wrong position.
+pub fn firewall_rule_list_scope(
+    firewall_rule_group_id: &str,
+    priority: Option<i32>,
+    action: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ListFirewallRules/group-priority-action/v1");
+    feed_field(&mut hasher, firewall_rule_group_id.as_bytes());
+    if let Some(priority) = priority {
+        feed_field(&mut hasher, priority.to_string().as_bytes());
+    }
+    if let Some(action) = action {
+        feed_field(&mut hasher, action.as_bytes());
+    }
+    format!("ListFirewallRules/{}", hex::encode(&hasher.finalize()[..8]))
+}
+
+/// The cursor scope of one `ListFirewallRuleGroupAssociations` query.
+///
+/// Its four filters (`FirewallRuleGroupId`, `VpcId`, `Priority`, `Status`) each
+/// narrow the collection a page is cut out of
+/// (`smithy_query(query="operation",operation="ListFirewallRuleGroupAssociations")`),
+/// so they belong in the scope for the same reason as in
+/// [`firewall_rule_list_scope`].
+pub fn firewall_rule_group_association_list_scope(
+    firewall_rule_group_id: Option<&str>,
+    vpc_id: Option<&str>,
+    priority: Option<i32>,
+    status: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ListFirewallRuleGroupAssociations/group-vpc-priority-status/v1");
+    if let Some(firewall_rule_group_id) = firewall_rule_group_id {
+        feed_field(&mut hasher, firewall_rule_group_id.as_bytes());
+    }
+    if let Some(vpc_id) = vpc_id {
+        feed_field(&mut hasher, vpc_id.as_bytes());
+    }
+    if let Some(priority) = priority {
+        feed_field(&mut hasher, priority.to_string().as_bytes());
+    }
+    if let Some(status) = status {
+        feed_field(&mut hasher, status.as_bytes());
+    }
+    format!(
+        "ListFirewallRuleGroupAssociations/{}",
+        hex::encode(&hasher.finalize()[..8])
+    )
+}
 
 /// The largest page `ListFirewallConfigs` may be asked for, from the range the
 /// model puts on its `MaxResults` (5..10,

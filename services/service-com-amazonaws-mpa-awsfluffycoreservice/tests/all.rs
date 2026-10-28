@@ -35,6 +35,8 @@ mod identity_source_approval_portal;
 mod identity_source_deletion;
 #[path = "all/identity_source_detail.rs"]
 mod identity_source_detail;
+#[path = "all/identity_source_in_use_by_pending_update.rs"]
+mod identity_source_in_use_by_pending_update;
 #[path = "all/identity_source_region.rs"]
 mod identity_source_region;
 #[path = "all/identity_sources.rs"]

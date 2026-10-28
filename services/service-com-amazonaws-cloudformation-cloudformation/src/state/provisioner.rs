@@ -245,6 +245,17 @@
 //!   association is removed by the rule/VPC PAIR its declaration carries rather than by its
 //!   own id.
 //!
+//! * the three `AWS::Route53Resolver::Firewall*` types are the same case with one difference
+//!   each: a DNS Firewall domain list's `Domains` are not members of its create at all —
+//!   "creates an EMPTY firewall domain list", which `UpdateFirewallDomains` then populates
+//!   ([`create_firewall_domain_list`]) — a rule group's `FirewallRules` are each a
+//!   `CreateFirewallRule` against the group the first call made
+//!   ([`create_firewall_rule_group`]), and an association's properties ARE
+//!   `AssociateFirewallRuleGroup`'s own members ([`associate_firewall_rule_group`]). All
+//!   three identities are Route 53 Resolver's own (`rslvr-fdl-…`, `rslvr-frg-…`,
+//!   `rslvr-frgassoc-…`), and an association is removed by the id that service minted for
+//!   it, which is what `DisassociateFirewallRuleGroup` takes.
+//!
 //! * the three `AWS::CodeDeploy::*` types' properties are their creates' own members with the
 //!   initial letter lower-cased — EXCEPT the ones whose nested structures CodeDeploy ITSELF
 //!   spells in upper camel, its `Tag`, `EC2TagFilter` and `TagFilter` shapes each spelling
@@ -422,6 +433,8 @@ use super::template::{
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER, ROUTE53RESOLVER_ENDPOINT,
+    ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST, ROUTE53RESOLVER_FIREWALL_RULE_GROUP,
+    ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION,
     ROUTE53RESOLVER_RULE,
     ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HEALTH_CHECK, ROUTE53_HOSTED_ZONE,
     ROUTE53_RECORD_SET,
@@ -569,6 +582,9 @@ pub(super) enum Provisioner {
     Route53ResolverEndpoint,
     Route53ResolverRule,
     Route53ResolverRuleAssociation,
+    Route53ResolverFirewallDomainList,
+    Route53ResolverFirewallRuleGroup,
+    Route53ResolverFirewallRuleGroupAssociation,
     Route53HostedZone,
     Route53RecordSet,
     Route53HealthCheck,
@@ -661,6 +677,13 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         ROUTE53RESOLVER_ENDPOINT => Some(Provisioner::Route53ResolverEndpoint),
         ROUTE53RESOLVER_RULE => Some(Provisioner::Route53ResolverRule),
         ROUTE53RESOLVER_RULE_ASSOCIATION => Some(Provisioner::Route53ResolverRuleAssociation),
+        ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST => {
+            Some(Provisioner::Route53ResolverFirewallDomainList)
+        }
+        ROUTE53RESOLVER_FIREWALL_RULE_GROUP => Some(Provisioner::Route53ResolverFirewallRuleGroup),
+        ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION => {
+            Some(Provisioner::Route53ResolverFirewallRuleGroupAssociation)
+        }
         ROUTE53_HOSTED_ZONE => Some(Provisioner::Route53HostedZone),
         ROUTE53_RECORD_SET => Some(Provisioner::Route53RecordSet),
         ROUTE53_HEALTH_CHECK => Some(Provisioner::Route53HealthCheck),
@@ -885,6 +908,15 @@ impl Provisioner {
             // tags are propagated to an association.
             Self::Route53ResolverRuleAssociation => {
                 associate_resolver_rule(ctx, region, resource).await
+            }
+            Self::Route53ResolverFirewallDomainList => {
+                create_firewall_domain_list(ctx, region, resource, propagated).await
+            }
+            Self::Route53ResolverFirewallRuleGroup => {
+                create_firewall_rule_group(ctx, region, resource, propagated).await
+            }
+            Self::Route53ResolverFirewallRuleGroupAssociation => {
+                associate_firewall_rule_group(ctx, region, resource, propagated).await
             }
             Self::Route53HostedZone => {
                 create_hosted_zone(ctx, region, resource, propagated).await
@@ -1504,6 +1536,17 @@ impl Provisioner {
             Self::Route53ResolverRuleAssociation => {
                 disassociate_resolver_rule(ctx, region, resource).await
             }
+            Self::Route53ResolverFirewallDomainList => {
+                delete_firewall_domain_list(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverFirewallRuleGroup => {
+                delete_firewall_rule_group(ctx, region, physical_resource_id).await
+            }
+            // The disassociate addresses the association by the id Route 53 Resolver minted
+            // for it, which is this resource's physical id.
+            Self::Route53ResolverFirewallRuleGroupAssociation => {
+                disassociate_firewall_rule_group(ctx, region, physical_resource_id).await
+            }
             Self::Route53HostedZone => {
                 delete_hosted_zone(ctx, region, physical_resource_id).await
             }
@@ -1751,6 +1794,15 @@ impl Provisioner {
             }
             Self::Route53ResolverRuleAssociation => {
                 describe_resolver_rule_association(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverFirewallDomainList => {
+                describe_firewall_domain_list(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverFirewallRuleGroup => {
+                describe_firewall_rule_group(ctx, region, physical_resource_id).await
+            }
+            Self::Route53ResolverFirewallRuleGroupAssociation => {
+                describe_firewall_rule_group_association(ctx, region, physical_resource_id).await
             }
             Self::Route53HostedZone => {
                 describe_hosted_zone(ctx, region, physical_resource_id).await
@@ -13432,6 +13484,435 @@ async fn describe_resolver_rule_association(
             ("Name", "Name"),
             ("ResolverRuleId", "ResolverRuleId"),
             ("VPCId", "VPCId"),
+        ],
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Route 53 Resolver DNS Firewall: AWS::Route53Resolver::FirewallDomainList /
+// ::FirewallRuleGroup / ::FirewallRuleGroupAssociation
+// ---------------------------------------------------------------------------
+
+/// The `AWS::Route53Resolver::FirewallDomainList` property that is no member of
+/// `CreateFirewallDomainList`: the domains the list holds, which that call does not take at
+/// all — it "creates an empty firewall domain list" — so they travel in the
+/// `UpdateFirewallDomains` the arm makes next.
+const FIREWALL_DOMAINS: &str = "Domains";
+
+/// The other property that is no member of the create: a file of domains to import. The
+/// import is `ImportFirewallDomains`' own, which this emulator has not written, so a
+/// declaration naming one is REFUSED rather than reported as a list that silently holds
+/// nothing.
+const FIREWALL_DOMAIN_FILE_URL: &str = "DomainFileUrl";
+
+/// The `AWS::Route53Resolver::FirewallRuleGroup` property that is no member of
+/// `CreateFirewallRuleGroup`: the rules of the group, each of which is one
+/// `CreateFirewallRule` against the group the create made ("you can add rules to the new
+/// rule group by calling CreateFirewallRule").
+const FIREWALL_RULES: &str = "FirewallRules";
+
+/// The `FirewallDomainUpdateOperation` that adds the declared domains to the list,
+/// `UpdateFirewallDomains`' own `ADD`: "Add the domains to the ones that are already in the
+/// domain list" — a list CloudFormation has just created being empty, the ADD leaves it
+/// holding exactly what the template declares.
+const FIREWALL_DOMAINS_ADD: &str = "ADD";
+
+/// The members of a declared `FirewallRule` that `CreateFirewallRule` takes as WHOLE
+/// NUMBERS: a template may write an integer as a quoted scalar (`Priority: "100"`), which
+/// the evaluated declaration carries through as text, and the create takes the integer the
+/// model declares — the same transformation [`create_resolver_rule`] makes for a target's
+/// port.
+const FIREWALL_RULE_NUMBERS: &[&str] = &["Priority", "BlockOverrideTtl"];
+
+/// Create the DNS Firewall domain list an `AWS::Route53Resolver::FirewallDomainList`
+/// declares, and put the domains it declares in it.
+///
+/// `Ref` on this resource returns the list's ID — the `rslvr-fdl-…` value
+/// `CreateFirewallDomainList` MINTS, which is what `GetFirewallDomainList` takes and what a
+/// rule's `FirewallDomainListId` names — so the create's own answer replaces the computed
+/// physical id. `Domains` is no member of that create, so the declared domains are added by
+/// the one call that takes them; a list whose domains could not be stored is deleted again,
+/// so a create the stack reports as failed leaves nothing behind.
+async fn create_firewall_domain_list(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    if property(resource, FIREWALL_DOMAIN_FILE_URL).is_some() {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not implement the {FIREWALL_DOMAIN_FILE_URL} property of {}",
+                resource.resource_type
+            ),
+        });
+    }
+    let mut request = resolver_request(resource, Some(tags_of(&resource.properties, propagated)));
+    let domains = request.remove(FIREWALL_DOMAINS);
+    request.insert(
+        "CreatorRequestId".to_string(),
+        Value::String(resolver_creator_request_id(resource)),
+    );
+    let reported = call_route53resolver(
+        ctx,
+        region,
+        "CreateFirewallDomainList",
+        &Value::Object(request),
+    )
+    .await?;
+    let created = resolver_created(
+        &reported,
+        "CreateFirewallDomainList",
+        "FirewallDomainList",
+        FIREWALL_DOMAIN_LIST_ATTRIBUTES,
+    )?;
+    let Some(id) = created.physical_resource_id.clone() else {
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateFirewallDomainList answered no FirewallDomainList.Id".to_string(),
+        });
+    };
+    if let Some(Value::Array(domains)) = domains {
+        if !domains.is_empty() {
+            let update = serde_json::json!({
+                "FirewallDomainListId": id,
+                "Operation": FIREWALL_DOMAINS_ADD,
+                "Domains": Value::Array(domains),
+            });
+            if let Err(refusal) =
+                call_route53resolver(ctx, region, "UpdateFirewallDomains", &update).await
+            {
+                let _ = delete_firewall_domain_list(ctx, region, &id).await;
+                return Err(refusal);
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// The members `GetFirewallDomainList` reports, paired with the `Fn::GetAtt` attribute
+/// `AWS::Route53Resolver::FirewallDomainList` publishes for each: that type's attributes are
+/// the reported list's own members, spelled identically.
+const FIREWALL_DOMAIN_LIST_ATTRIBUTES: &[(&str, &str)] = &[
+    ("Arn", "Arn"),
+    ("CreationTime", "CreationTime"),
+    ("CreatorRequestId", "CreatorRequestId"),
+    ("DomainCount", "DomainCount"),
+    ("Id", "Id"),
+    ("ManagedOwnerName", "ManagedOwnerName"),
+    ("ModificationTime", "ModificationTime"),
+    ("Status", "Status"),
+    ("StatusMessage", "StatusMessage"),
+];
+
+/// Delete the domain list a stack created, by the id its create minted. A list Route 53
+/// Resolver no longer holds (`ResourceNotFoundException`) is already in the state the delete
+/// asks for.
+async fn delete_firewall_domain_list(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "FirewallDomainListId": physical_resource_id });
+    match call_route53resolver(ctx, region, "DeleteFirewallDomainList", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The domain list's configuration as Route 53 Resolver reports it, for drift detection. An
+/// id it no longer holds a list for (`ResourceNotFoundException`) was deleted.
+///
+/// Only `Name` is compared: the reported list carries no `Domains` member at all — those are
+/// read with `ListFirewallDomains` — and a property the actual document does not carry is not
+/// evidence of anything ([`super::drift::differs`]).
+async fn describe_firewall_domain_list(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "FirewallDomainListId": physical_resource_id });
+    let reported =
+        match call_route53resolver(ctx, region, "GetFirewallDomainList", &request).await {
+            Ok(reported) => reported,
+            Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        };
+    let Some(domain_list) = reported.get("FirewallDomainList") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        domain_list,
+        &[("Name", "Name")],
+    )))
+}
+
+/// Create the DNS Firewall rule group an `AWS::Route53Resolver::FirewallRuleGroup` declares,
+/// with each rule it declares.
+///
+/// `Ref` on this resource returns the group's ID — the `rslvr-frg-…` value
+/// `CreateFirewallRuleGroup` MINTS, which is what `GetFirewallRuleGroup` takes and what an
+/// association's `FirewallRuleGroupId` names — so the create's own answer replaces the
+/// computed physical id. `FirewallRules` is no member of that create ("creates an EMPTY DNS
+/// Firewall rule group"), so each declared rule is one `CreateFirewallRule` against the
+/// group; a group whose rules could not be created is deleted again, so a create the stack
+/// reports as failed leaves nothing behind.
+///
+/// A declared rule carries no name — the type's `FirewallRule` property publishes none — and
+/// `CreateFirewallRule` requires one, so the name is CloudFormation's to supply: the group's
+/// own physical id and the rule's priority, which is unique within the group, so the name is
+/// unique within it too and is the SAME string if this deployment is attempted again.
+async fn create_firewall_rule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = resolver_request(resource, Some(tags_of(&resource.properties, propagated)));
+    let rules = request.remove(FIREWALL_RULES);
+    request.insert(
+        "CreatorRequestId".to_string(),
+        Value::String(resolver_creator_request_id(resource)),
+    );
+    let reported = call_route53resolver(
+        ctx,
+        region,
+        "CreateFirewallRuleGroup",
+        &Value::Object(request),
+    )
+    .await?;
+    let created = resolver_created(
+        &reported,
+        "CreateFirewallRuleGroup",
+        "FirewallRuleGroup",
+        FIREWALL_RULE_GROUP_ATTRIBUTES,
+    )?;
+    let Some(id) = created.physical_resource_id.clone() else {
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateFirewallRuleGroup answered no FirewallRuleGroup.Id".to_string(),
+        });
+    };
+    if let Some(Value::Array(rules)) = rules {
+        for (position, rule) in rules.iter().enumerate() {
+            let request = firewall_rule_request(&id, resource, position, rule);
+            if let Err(refusal) =
+                call_route53resolver(ctx, region, "CreateFirewallRule", &request).await
+            {
+                let _ = delete_firewall_rule_group(ctx, region, &id).await;
+                return Err(refusal);
+            }
+        }
+    }
+    Ok(created)
+}
+
+/// The `CreateFirewallRule` request one declared rule of a rule group makes.
+///
+/// The declared members ARE that call's own, spelled identically (`Action`, `BlockResponse`,
+/// the three `BlockOverride*`, `FirewallDomainListId`, `FirewallDomainRedirectionAction`,
+/// `Priority`, `Qtype`, `DnsThreatProtection`, `ConfidenceThreshold` and
+/// `FirewallRuleType`), so the declaration is carried through with the two members
+/// CloudFormation decides added: the rule's name and the `CreatorRequestId`, both built from
+/// the group's physical id so a second attempt at this deployment re-asks for the same rule
+/// instead of a duplicate.
+fn firewall_rule_request(
+    firewall_rule_group_id: &str,
+    resource: &StoredResource,
+    position: usize,
+    rule: &Value,
+) -> Value {
+    let mut request = match rule {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    for member in FIREWALL_RULE_NUMBERS {
+        if let Some(number) = whole_number(request.get(*member)) {
+            request.insert((*member).to_string(), Value::from(number));
+        }
+    }
+    let suffix = whole_number(request.get("Priority"))
+        .map(|priority| priority.to_string())
+        .unwrap_or_else(|| position.to_string());
+    request.insert(
+        "FirewallRuleGroupId".to_string(),
+        Value::String(firewall_rule_group_id.to_string()),
+    );
+    request.insert(
+        "Name".to_string(),
+        Value::String(format!("{firewall_rule_group_id}-{suffix}")),
+    );
+    request.insert(
+        "CreatorRequestId".to_string(),
+        Value::String(format!(
+            "{}-{suffix}",
+            resolver_creator_request_id(resource)
+        )),
+    );
+    Value::Object(request)
+}
+
+/// The members `GetFirewallRuleGroup` reports, paired with the `Fn::GetAtt` attribute
+/// `AWS::Route53Resolver::FirewallRuleGroup` publishes for each: that type's attributes are
+/// the reported group's own members, spelled identically.
+const FIREWALL_RULE_GROUP_ATTRIBUTES: &[(&str, &str)] = &[
+    ("Arn", "Arn"),
+    ("CreationTime", "CreationTime"),
+    ("CreatorRequestId", "CreatorRequestId"),
+    ("Id", "Id"),
+    ("ModificationTime", "ModificationTime"),
+    ("OwnerId", "OwnerId"),
+    ("RuleCount", "RuleCount"),
+    ("ShareStatus", "ShareStatus"),
+    ("Status", "Status"),
+    ("StatusMessage", "StatusMessage"),
+];
+
+/// Delete the rule group a stack created, by the id its create minted. A group Route 53
+/// Resolver no longer holds is already in the state the delete asks for.
+///
+/// A group a VPC is still filtered by cannot be deleted, so a stack that declares both
+/// removes the association FIRST, because [`super::provisioning::delete`] deletes a stack's
+/// resources in the reverse of the order they were created in and the association depends on
+/// the group.
+async fn delete_firewall_rule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "FirewallRuleGroupId": physical_resource_id });
+    match call_route53resolver(ctx, region, "DeleteFirewallRuleGroup", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The rule group's configuration as Route 53 Resolver reports it, for drift detection.
+///
+/// Only `Name` is compared: the reported group carries no `FirewallRules` member — those are
+/// read with `ListFirewallRules` — and a property the actual document does not carry is not
+/// evidence of anything.
+async fn describe_firewall_rule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "FirewallRuleGroupId": physical_resource_id });
+    let reported = match call_route53resolver(ctx, region, "GetFirewallRuleGroup", &request).await {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(rule_group) = reported.get("FirewallRuleGroup") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        rule_group,
+        &[("Name", "Name")],
+    )))
+}
+
+/// Associate the rule group an `AWS::Route53Resolver::FirewallRuleGroupAssociation` declares
+/// with the VPC it names.
+///
+/// `Ref` on this resource returns the association's ID — the `rslvr-frgassoc-…` value
+/// `AssociateFirewallRuleGroup` MINTS, which is what `GetFirewallRuleGroupAssociation` and
+/// `DisassociateFirewallRuleGroup` take — so that answer replaces the computed physical id.
+/// The declared properties are that call's own members, spelled identically
+/// (`FirewallRuleGroupId`, `VpcId`, `Priority`, `Name`, `MutationProtection`), with the
+/// `CreatorRequestId` CloudFormation decides and the tags it gives the resource.
+async fn associate_firewall_rule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = resolver_request(resource, Some(tags_of(&resource.properties, propagated)));
+    if let Some(priority) = whole_number(request.get("Priority")) {
+        request.insert("Priority".to_string(), Value::from(priority));
+    }
+    request.insert(
+        "CreatorRequestId".to_string(),
+        Value::String(resolver_creator_request_id(resource)),
+    );
+    // Required by the type and by the call alike, so a declaration missing one is refused
+    // here rather than with a request the owning service would have to reject.
+    required_property(resource, "FirewallRuleGroupId")?;
+    required_property(resource, "VpcId")?;
+    let reported = call_route53resolver(
+        ctx,
+        region,
+        "AssociateFirewallRuleGroup",
+        &Value::Object(request),
+    )
+    .await?;
+    resolver_created(
+        &reported,
+        "AssociateFirewallRuleGroup",
+        "FirewallRuleGroupAssociation",
+        FIREWALL_RULE_GROUP_ASSOCIATION_ATTRIBUTES,
+    )
+}
+
+/// The members `GetFirewallRuleGroupAssociation` reports, paired with the `Fn::GetAtt`
+/// attribute `AWS::Route53Resolver::FirewallRuleGroupAssociation` publishes for each.
+const FIREWALL_RULE_GROUP_ASSOCIATION_ATTRIBUTES: &[(&str, &str)] = &[
+    ("Arn", "Arn"),
+    ("CreationTime", "CreationTime"),
+    ("CreatorRequestId", "CreatorRequestId"),
+    ("Id", "Id"),
+    ("ManagedOwnerName", "ManagedOwnerName"),
+    ("ModificationTime", "ModificationTime"),
+    ("Status", "Status"),
+    ("StatusMessage", "StatusMessage"),
+];
+
+/// Remove the association a stack created, by the id that service minted for it. An
+/// association Route 53 Resolver no longer holds is already in the state the delete asks
+/// for.
+async fn disassociate_firewall_rule_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request =
+        serde_json::json!({ "FirewallRuleGroupAssociationId": physical_resource_id });
+    match call_route53resolver(ctx, region, "DisassociateFirewallRuleGroup", &request).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The association's configuration as Route 53 Resolver reports it, for drift detection. An
+/// id it no longer holds an association for (`ResourceNotFoundException`) was deleted.
+async fn describe_firewall_rule_group_association(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request =
+        serde_json::json!({ "FirewallRuleGroupAssociationId": physical_resource_id });
+    let reported =
+        match call_route53resolver(ctx, region, "GetFirewallRuleGroupAssociation", &request).await
+        {
+            Ok(reported) => reported,
+            Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        };
+    let Some(association) = reported.get("FirewallRuleGroupAssociation") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        association,
+        &[
+            ("FirewallRuleGroupId", "FirewallRuleGroupId"),
+            ("VpcId", "VpcId"),
+            ("Name", "Name"),
+            ("MutationProtection", "MutationProtection"),
         ],
     )))
 }

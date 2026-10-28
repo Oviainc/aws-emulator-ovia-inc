@@ -220,16 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StopDeliveryStreamEncryptionErrorModeled::InvalidArgumentException(
                     InvalidArgumentException {
-                        // The same sentence an in-flight change is refused with, stated for
-                        // the encryption status that leaves nothing to disable — a stream
-                        // that was never encrypted carries the documented `DISABLED` one.
-                        message: Some(
-                            crate::service::encryption_blocked_by_encryption_message(
-                                crate::service::EncryptionChange::Disable,
-                                &stream.name,
-                                stream.reported_encryption_status(),
-                            ),
-                        ),
+                        // Nothing is in flight here, so the refusal states the stream's
+                        // own encryption as the fact it is: already off, whichever way it
+                        // came to be — see
+                        // `crate::service::encryption_already_disabled_message`.
+                        message: Some(crate::service::encryption_already_disabled_message(
+                            &stream.name,
+                        )),
                     },
                 )
                 .into(),
