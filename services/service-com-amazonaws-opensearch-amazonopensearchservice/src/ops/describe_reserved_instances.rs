@@ -6,6 +6,11 @@
 //! `PurchaseReservedInstanceOffering` persisted, narrowed by
 //! `ReservedInstanceId` and paged by `MaxResults`/`NextToken`.
 //!
+//! `ReservedInstanceId` is checked against its own modelled `GUID` form FIRST and
+//! only then resolved against the store, so a malformed id is a malformed request
+//! (`ValidationException`) while a well-formed one that addresses no reservation is
+//! the modelled not-found (`ResourceNotFoundException`).
+//!
 //! A REPORTING operation. The one write it makes is materialising the state
 //! change the clock already owed each reservation — owed at this instant whether
 //! or not anybody called — through
@@ -207,14 +212,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ReservedInstanceId` "shows only the reservation that matches the
         // specified reserved OpenSearch instance ID": it names ONE resource, so it
-        // narrows the listing to that reservation — and an id this account holds no
-        // reservation under is refused rather than served as an empty page.
+        // narrows the listing to that reservation — and a well-formed id this
+        // account holds no reservation under addresses no resource, so it is the
+        // modelled not-found rather than a malformed request or an empty page.
         let selected: Vec<&crate::state::ReservedInstanceRecord> =
             match input.reserved_instance_id.as_deref() {
                 Some(id) => {
                     let reservation = store.reserved_instances.get(id).ok_or_else(|| {
-                        DescribeReservedInstancesErrorModeled::ValidationException(
-                            crate::state::reserved_instance_not_found(id),
+                        DescribeReservedInstancesErrorModeled::ResourceNotFoundException(
+                            crate::state::reserved_instance_not_found(),
                         )
                     })?;
                     vec![reservation]

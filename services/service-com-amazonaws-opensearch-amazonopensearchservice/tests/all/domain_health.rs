@@ -23,6 +23,11 @@
 //! regimes (`Creating` and a settled domain with an update in flight), and a sweep
 //! over node-and-zone combinations asserting the invariants the spread must satisfy
 //! for every one of them.
+//!
+//! A name no domain is stored under is a second rule of its own: this operation
+//! refuses it with the service's GENERIC envelope — the modelled `BaseException`,
+//! HTTP 400, saying what was not found — asserted below over a set of such names
+//! rather than over one.
 
 use std::collections::BTreeSet;
 
@@ -764,7 +769,7 @@ async fn health_reports_the_same_cluster_the_domain_record_does() {
 }
 
 #[tokio::test]
-async fn health_of_an_unknown_domain_is_the_modelled_refusal() {
+async fn health_of_an_unknown_domain_is_the_generic_envelope() {
     let emulator = Emulator::new();
     // One created domain, so the refusal is about the name asked for and not about an
     // empty store.
@@ -775,18 +780,44 @@ async fn health_of_an_unknown_domain_is_the_modelled_refusal() {
         &json!({ "InstanceCount": 1 }),
     )
     .await;
+    // A domain that WAS stored and is not any more is the same miss as one that never
+    // was.
+    let deleted = emulator
+        .call("DELETE", &format!("{PREFIX}/opensearch/domain/known-domain"), None)
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case DeleteDomain(known-domain): expected 200, got {} with {:?}",
+        deleted.status, deleted.body
+    );
 
-    for name in ["absent-domain", "known-domain-2", "zzz-nothing-here"] {
+    // The rule holds for every name no domain is stored under, whatever its shape
+    // inside `DomainName`'s own constraint: the shortest and the longest it allows,
+    // one near-miss of a name that was created, and a deleted one.
+    for name in [
+        "abc",
+        &"d".repeat(28),
+        "known-domain-2",
+        "zzz-nothing-here",
+        "known-domain",
+    ] {
         let answer = health(&emulator, name).await;
         assert_eq!(
-            answer.status, 409,
-            "case DescribeDomainHealth({name:?}): expected 409, got {} with {:?}",
+            answer.status, 400,
+            "case DescribeDomainHealth({name:?}): expected 400, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             error_code(&answer),
-            "ResourceNotFoundException",
-            "case DescribeDomainHealth({name:?}): expected ResourceNotFoundException, got {:?}",
+            "BaseException",
+            "case DescribeDomainHealth({name:?}): expected BaseException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(format!("Domain not found: {name}").as_str()),
+            "case DescribeDomainHealth({name:?}): expected the miss to name the domain asked \
+             for, got {:?}",
             answer.body
         );
     }

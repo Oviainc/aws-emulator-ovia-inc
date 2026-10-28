@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDomainMaintenance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDomainMaintenance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the node maintenance process on a data node of the stored
+//! [`crate::state::Domain`] record — one [`crate::state::Maintenance`] record per
+//! accepted call, which `GetDomainMaintenanceStatus` reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDomainMaintenance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The action runs on ONE node, named by `NodeId` ("the ID of the data node"), so
+//! that is what decides whether this call can be served:
+//!
+//! * the id has to be one the domain's node census publishes for its data nodes —
+//!   the same derivation `DescribeDomainNodes` reports them under
+//!   ([`crate::state::data_node_ids`]), so an id a caller read there is an id this
+//!   operation resolves;
+//! * the role has to be able to lose one of its nodes: maintaining a node stops the
+//!   process running on it, so a majority of the data nodes has to remain, which
+//!   first holds at [`crate::state::MAINTAINABLE_DATA_NODES`].
+//!
+//! A `NodeId` failing either half names no node this service can maintain, which is
+//! what makes the id invalid ([`crate::state::invalid_node_id`]); a request naming
+//! none names no node at all.
+//!
+//! Starting an action materialises the configuration change the clock already owed
+//! the domain, exactly as [`crate::ops::describe_domain`] does, and then writes the
+//! maintenance record this call creates — nothing else about the domain moves: node
+//! maintenance is not a configuration change of it.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +167,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDomainMaintenance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDomainMaintenanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDomainMaintenance"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // "Starts the node maintenance process on the data node": the action runs on
+        // one node, so a request that names none names nothing to act on.
+        let Some(node_id) = input.node_id.as_deref() else {
+            return Err(StartDomainMaintenanceErrorModeled::ValidationException(
+                crate::state::node_id_required(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            StartDomainMaintenanceErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // The node has to be one of this domain's data nodes, and its role has to be
+        // able to lose it; any other id names no node this service can maintain.
+        if !crate::state::maintainable_data_node(domain, node_id) {
+            return Err(StartDomainMaintenanceErrorModeled::ResourceNotFoundException(
+                crate::state::invalid_node_id(),
+            )
+            .into());
+        }
+
+        // The record this call persists is what the answer names, so the id a caller
+        // gets is the id `GetDomainMaintenanceStatus` resolves.
+        let maintenance_id = domain.begin_maintenance(&input.action, node_id, now);
+        Ok(StartDomainMaintenanceOutput {
+            maintenance_id: Some(maintenance_id),
+        })
     }
 }
