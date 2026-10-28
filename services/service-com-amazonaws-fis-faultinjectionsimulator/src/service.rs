@@ -106,10 +106,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // reword it.
         //
         // FIS states a value longer than its member's `@length` maximum as
-        // "Maximum length exceeded: <member>" — a message built from the request, naming
-        // the member that was too long and nothing else: the rejected value is NOT echoed
-        // back. Every other refusal class keeps the framework's wording, because FIS
-        // publishes no rule for how it words those.
+        // "Maximum length exceeded: <member>" — see [`max_length_message`], the one place
+        // that sentence is written. Every other refusal class keeps the framework's
+        // wording, because FIS publishes no rule for how it words those.
         let Refusal::Invalid(violations) = refusal else {
             return None;
         };
@@ -124,7 +123,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         })?;
         Some(Refused {
             code: VALIDATION_EXCEPTION.to_string(),
-            message: format!("Maximum length exceeded: {}", member_of(&violation.path)),
+            message: max_length_message(&violation.path),
         })
     }
 
@@ -155,6 +154,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// How this service words the refusal of a value longer than its member's `@length`
+/// maximum: a message built from the request, naming the member that was too long
+/// ([`member_of`] `path`) and nothing else — the rejected value is NOT echoed back.
+///
+/// The ONE place that sentence is written, so a value past a modelled `@length` maximum is
+/// refused the same way wherever the bound was applied. A refusal the boundary validator
+/// raised reaches it through [`EmulatedService::override_refusal`]; the one modelled leaf
+/// that validator does not reach — a map's KEY, whose bounds are applied in
+/// [`crate::state::map_key_refusal`] — reaches it from the handler, with the dotted path
+/// of the map it keys.
+pub(crate) fn max_length_message(path: &str) -> String {
+    format!("Maximum length exceeded: {}", member_of(path))
 }
 
 /// The member a violation's dotted path names.

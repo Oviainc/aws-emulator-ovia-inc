@@ -3051,6 +3051,12 @@ pub const PARAMETER_NAME_BOUNDS: MapKeyBounds = MapKeyBounds {
 /// checked), so a request carrying a key outside the modelled bounds of the map's key
 /// target reaches the handler. This is where those bounds are enforced, for every map this
 /// service persists — see [`MapKeyBounds`].
+///
+/// Standing in for that validator also means wording its refusals: a key past the key
+/// target's `@length` maximum is the class this service words with
+/// [`crate::service::max_length_message`], so one and the same constraint reads the same
+/// to a caller whether the over-long value sat in a map key or in a member the validator
+/// reaches.
 pub fn map_key_refusal(
     member: &str,
     bounds: MapKeyBounds,
@@ -3065,7 +3071,13 @@ pub fn map_key_refusal(
     // The bound is on CHARACTERS, as a Smithy `@length` on a string is, so a key of
     // non-ASCII characters is judged by how many of them it carries and not by its bytes.
     let length = key.chars().count();
-    if !(min_length..=max_length).contains(&length) {
+    if length > max_length {
+        // A key past its target's `@length` maximum is the same constraint class the
+        // boundary validator reports for every other member, so it is worded by the one
+        // rule this service states for that class instead of by prose of its own.
+        return Some(invalid_input(crate::service::max_length_message(member)));
+    }
+    if length < min_length {
         return Some(invalid_input(format!(
             "{member}: {noun} is {min_length} to {max_length} characters long; this \
              request carries one of {length}."
