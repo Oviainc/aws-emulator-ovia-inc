@@ -19,6 +19,8 @@ mod create_node_member_scope;
 mod delete_member;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/idempotency_ledger_liveness.rs"]
+mod idempotency_ledger_liveness;
 #[path = "all/invitations.rs"]
 mod invitations;
 #[path = "all/invite_principal.rs"]

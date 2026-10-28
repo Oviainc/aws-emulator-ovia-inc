@@ -182,6 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Application Signals, which this emulator never receives, so they produce no result
     /// and `Auditors` naming only those reports nothing. `DetailLevel` selects how much
     /// context each finding carries.
+    ///
+    /// The page cursor is an offset into THIS projection's order, so the whole selection the
+    /// request makes — its targets, its auditor filter and its period — travels in the token's
+    /// tag ([`crate::state::audit_findings_token_tag`]): a `NextToken` issued over another
+    /// selection is refused like any other token this service did not issue, rather than
+    /// honoured as an offset that skips this one's first findings.
     async fn handle(
         &self,
         input: Self::Input,
@@ -223,12 +229,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.end_time,
         );
 
-        // Paged through the same cursor the other lists of this service use, so a
-        // `NextToken` this service did not issue is refused rather than read as a page
-        // boundary.
+        // The findings are the projection the REQUEST selects — its targets, its auditor
+        // filter and its period — so that whole selection is bound into the token's tag: the
+        // cursor is a bare offset into this projection's order, and a token issued over
+        // another selection is refused rather than read as a boundary in this one
+        // ([`crate::state::audit_findings_token_tag`]).
+        let token_tag = crate::state::audit_findings_token_tag(
+            crate::state::AUDIT_FINDINGS_TOKEN_TAG,
+            &input.audit_targets,
+            input.auditors.as_deref(),
+            &input.start_time,
+            &input.end_time,
+        );
         let (audit_findings, next_token) = crate::state::page_of(
             findings,
-            crate::state::AUDIT_FINDINGS_TOKEN_TAG,
+            &token_tag,
             input.next_token.as_deref(),
             page_size,
         )

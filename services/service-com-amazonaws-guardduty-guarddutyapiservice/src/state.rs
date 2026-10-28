@@ -5658,28 +5658,38 @@ const KMS_SERVICE: &str = "kms";
 
 /// Write a `Features` list onto `detector`. A feature the list does not name keeps
 /// the status it already had.
+///
+/// Answers whether the list configured any switch at all: an absent member, an
+/// empty list, and a list whose entries name no feature each write nothing, which
+/// is what lets a caller tell a request that configured the record from one that
+/// asked for no change.
 pub fn apply_feature_configurations(
     detector: &mut Detector,
     features: Option<&Vec<crate::ops::types::DetectorFeatureConfiguration>>,
     now: i64,
-) {
-    let Some(features) = features else { return };
+) -> bool {
+    let Some(features) = features else {
+        return false;
+    };
+    let mut configured = false;
     for feature in features {
         let Some(name) = feature.name.as_deref() else {
             continue;
         };
+        configured = true;
         let status = feature.status.as_deref().unwrap_or(ENABLED);
         detector.set_feature(name, status, now);
         if let Some(additional) = feature.additional_configuration.as_ref() {
-            let configured = additional_configuration_records(
+            let additional_records = additional_configuration_records(
                 additional
                     .iter()
                     .map(|cfg| (cfg.name.as_deref(), cfg.status.as_deref())),
                 now,
             );
-            set_additional_configuration_in(&mut detector.features, name, configured);
+            set_additional_configuration_in(&mut detector.features, name, additional_records);
         }
     }
+    configured
 }
 
 /// Write a member-account `Features` list onto `member`'s stored configuration,
@@ -5938,8 +5948,8 @@ pub fn apply_data_sources(
     detector: &mut Detector,
     data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
     now: i64,
-) {
-    apply_data_sources_to(&mut detector.features, data_sources, now);
+) -> bool {
+    apply_data_sources_to(&mut detector.features, data_sources, now)
 }
 
 /// Write the deprecated `DataSources` view onto `member`'s stored configuration,
@@ -5948,24 +5958,30 @@ pub fn apply_member_data_sources(
     member: &mut MemberRecord,
     data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
     now: i64,
-) {
-    apply_data_sources_to(&mut member.features, data_sources, now);
+) -> bool {
+    apply_data_sources_to(&mut member.features, data_sources, now)
 }
 
 /// Write the deprecated `DataSources` view onto a stored feature list: the switch
 /// each data source names is the feature that governs it, so the detector view and
 /// the member view cannot disagree about which switch a node writes.
+///
+/// Answers whether the view configured any switch, the same reading
+/// [`apply_feature_configurations`] gives its own list: a view that names no data
+/// source writes nothing.
 fn apply_data_sources_to(
     features: &mut Vec<FeatureRecord>,
     data_sources: Option<&crate::ops::types::DataSourceConfigurations>,
     now: i64,
-) {
+) -> bool {
     let Some(data_sources) = data_sources else {
-        return;
+        return false;
     };
+    let mut configured = false;
     let status = |enable: bool| if enable { ENABLED } else { DISABLED };
     if let Some(s3) = data_sources.s3_logs.as_ref() {
         set_feature_in(features, FEATURE_S3_DATA_EVENTS, status(s3.enable), now);
+        configured = true;
     }
     if let Some(kubernetes) = data_sources.kubernetes.as_ref() {
         set_feature_in(
@@ -5974,6 +5990,7 @@ fn apply_data_sources_to(
             status(kubernetes.audit_logs.enable),
             now,
         );
+        configured = true;
     }
     if let Some(enable) = data_sources
         .malware_protection
@@ -5982,7 +5999,9 @@ fn apply_data_sources_to(
         .and_then(|s| s.ebs_volumes)
     {
         set_feature_in(features, FEATURE_EBS_MALWARE_PROTECTION, status(enable), now);
+        configured = true;
     }
+    configured
 }
 
 /// Every feature a member-account request may configure: the `OrgFeature` members

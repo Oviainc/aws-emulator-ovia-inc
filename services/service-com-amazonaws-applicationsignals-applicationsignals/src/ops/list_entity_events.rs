@@ -213,11 +213,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `MaxResults` carries the model's own `@default` of 20 and its `range 1..250` is
         // refused before this handler runs, so the bound is read straight off the input. The
-        // cursor is an offset into the ordered history of THIS entity, so the entity is bound
-        // into the token's tag and a token issued for another entity's history is refused
-        // rather than honoured as a boundary here ([`crate::state::entity_token_tag`]).
-        let token_tag =
-            crate::state::entity_token_tag(crate::state::ENTITY_EVENTS_TOKEN_TAG, &input.entity);
+        // cursor is an offset into the ordered history THIS request selects, so the selection
+        // — the entity and the period the history is read over — is bound into the token's
+        // tag, and a token issued over another selection is refused rather than honoured as a
+        // boundary here ([`crate::state::entity_token_tag`]).
+        let token_tag = crate::state::entity_token_tag(
+            crate::state::ENTITY_EVENTS_TOKEN_TAG,
+            &input.entity,
+            &input.start_time,
+            &input.end_time,
+        );
         let (change_events, next_token) = crate::state::page_of(
             observed,
             &token_tag,

@@ -355,16 +355,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         network.proposals.insert(proposal_id.clone(), proposal);
-        guard.remember_idempotent(
-            token,
-            crate::state::CreatedIds {
-                network_id: Some(input.network_id.clone()),
-                member_id: Some(input.member_id.clone()),
-                node_id: None,
-                proposal_id: Some(proposal_id.clone()),
-                accessor_id: None,
-            },
-        );
+        guard.remember_idempotent(token, crate::state::CreatedIds::proposal(&proposal_id));
 
         // Answer from the STORED record, so this is the id every later read of the
         // proposal answers to — read back through the same Region-scoped resolver every

@@ -130,7 +130,11 @@ async fn wait_for_state(emulator: &Emulator, name: &str, want: &str) -> Value {
 /// Whether `value` is a long-form Amazon EC2 resource id under `prefix`:
 /// `<prefix>` plus 17 lowercase hexadecimal characters
 /// (`crate::state::ec2_destination_id`).
-fn is_ec2_resource_id(value: &str, prefix: &str) -> bool {
+///
+/// `pub(crate)` so the sibling suite for what an export says about each KIND of
+/// snapshot (`export_snapshot_source_kinds.rs`) checks a destination id the same
+/// way rather than writing the check a second time.
+pub(crate) fn is_ec2_resource_id(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(|hex| {
         hex.len() == 17
             && hex

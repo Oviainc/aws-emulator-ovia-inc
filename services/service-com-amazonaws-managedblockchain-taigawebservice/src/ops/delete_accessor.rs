@@ -183,6 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never re-arms the transition.
         accessor.begin_deletion(now);
 
+        // The idempotency ledger must not outlive the resources it describes: the accessor
+        // is the only id its create minted, and one whose removal has begun is not one a
+        // replayed token could hand back, so that record goes — the same sweep every other
+        // call that starts a removal makes.
+        guard.forget_dangling_tokens();
+
         Ok(DeleteAccessorOutput {})
     }
 }
