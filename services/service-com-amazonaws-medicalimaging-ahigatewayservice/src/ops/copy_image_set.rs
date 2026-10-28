@@ -76,6 +76,15 @@
 //! `ResourceNotFoundException` worded by the image-set kind, exactly as the other calls on
 //! an image set's content do ([`crate::state::ImageSet::is_deleted`]).
 //!
+//! A copy that MINTS its destination is bounded by how many image sets one data store
+//! will hold ([`crate::state::MAX_IMAGE_SETS_PER_DATASTORE`]), refused past that with the
+//! modelled `ServiceQuotaExceededException` (402). The bound counts the image sets the
+//! store still HOLDS, never the tombstones beside them
+//! ([`crate::state::Datastore::held_image_sets`]): a retired image set has given up its
+//! content, so it takes no place and its deletion gives its place back. What a tombstone
+//! does keep is its RECORD, which is still reported, so the records are bounded in their
+//! own right ([`crate::state::MAX_IMAGE_SET_RECORDS_PER_DATASTORE`]).
+//!
 //! ---
 //!
 //! # Modeled contract for `CopyImageSet`
@@ -585,7 +594,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(selected) => attributes_of_instances(source.attributes(), selected),
             None => source.attributes(),
         };
-        let held_image_sets = datastore.image_sets.len();
+        // The image sets this data store still HOLDS, which is what the cap on its image
+        // sets counts: a retired one has given up its content and takes no place, so a
+        // deletion gives its place back ([`crate::state::Datastore::held_image_sets`]).
+        let held_image_sets = datastore.held_image_sets().count();
+        // Every image set RECORD it holds, the tombstones of finished deletions included:
+        // a retired record is still reported, so it still occupies memory, which is what
+        // the record cap bounds.
+        let image_set_records = datastore.image_sets.len();
 
         // Every refusal the destination can raise, before anything is written.
         let plan = match &information.destination_image_set {
@@ -656,13 +672,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {
                 // The same per-data-store memory bound the import jobs carry
                 // (`crate::state::MAX_IMAGE_SETS_PER_DATASTORE`), refused with this
-                // operation's modelled quota error.
+                // operation's modelled quota error. Counted over the image sets the store
+                // still holds, so a data store whose image sets have all been deleted can
+                // be copied into again.
                 if held_image_sets >= crate::state::MAX_IMAGE_SETS_PER_DATASTORE {
                     return Err(CopyImageSetErrorModeled::ServiceQuotaExceededException(
                         ServiceQuotaExceededException {
                             message: format!(
                                 "this emulator holds at most {} image sets per data store",
                                 crate::state::MAX_IMAGE_SETS_PER_DATASTORE
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                // A retired image set gives its place back but keeps a record that is
+                // still reported, so what this emulator HOLDS is bounded separately
+                // (`crate::state::MAX_IMAGE_SET_RECORDS_PER_DATASTORE`): without it a
+                // mint/delete loop would grow one data store without limit.
+                if image_set_records >= crate::state::MAX_IMAGE_SET_RECORDS_PER_DATASTORE {
+                    return Err(CopyImageSetErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "this emulator holds at most {} image set records per data store",
+                                crate::state::MAX_IMAGE_SET_RECORDS_PER_DATASTORE
                             ),
                         },
                     )

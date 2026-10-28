@@ -161,11 +161,31 @@ pub const MAX_DATASTORES_ALL_REGIONS: usize = 1024;
 /// Past the cap `StartDICOMImportJob` is refused with `ServiceQuotaExceededException`.
 pub const MAX_IMPORT_JOBS_PER_DATASTORE: usize = 128;
 
-/// How many image sets one data store will hold at once — the same memory bound as
+/// How many image sets one data store will HOLD at once — the same memory bound as
 /// [`MAX_IMPORT_JOBS_PER_DATASTORE`], applied per data store. Past the cap an operation
 /// that would mint another image set (`CopyImageSet` without a destination image set)
 /// is refused with `ServiceQuotaExceededException`.
+///
+/// Counted over the image sets the data store still holds
+/// ([`Datastore::held_image_sets`]), exactly as the per-region [`MAX_DATASTORES`] is
+/// counted over the data stores a region still holds: a tombstone has given up the
+/// content it held, so it takes no place here and a deletion gives its place back.
+/// [`MAX_IMAGE_SET_RECORDS_PER_DATASTORE`] is what bounds the records.
 pub const MAX_IMAGE_SETS_PER_DATASTORE: usize = 128;
+
+/// How many image set RECORDS one data store will hold at once, the tombstones of
+/// finished deletions included.
+///
+/// The companion of [`MAX_IMAGE_SETS_PER_DATASTORE`] that bounds MEMORY, as
+/// [`MAX_DATASTORES_ALL_REGIONS`] is the companion of the per-region data store cap: a
+/// retired image set gives up its place among the image sets the store holds, but its
+/// record lives on to be reported in `DELETED`, so a mint/delete loop would otherwise
+/// grow one data store without limit. Past this cap a mint is refused with the same
+/// `ServiceQuotaExceededException`.
+///
+/// Well above the cap on what a store HOLDS, so that reaching it takes a caller that is
+/// cycling image sets rather than one using the data store as the service intends.
+pub const MAX_IMAGE_SET_RECORDS_PER_DATASTORE: usize = 1024;
 
 /// How many versions one image set will hold at once.
 ///
@@ -1413,6 +1433,23 @@ impl Datastore {
     /// and not reachable.
     pub fn is_deleted(&self) -> bool {
         self.datastore_status == DatastoreStatus::Deleted
+    }
+
+    /// Every image set this data store still HOLDS, in no particular order — what the
+    /// per-data-store cap on image sets counts ([`MAX_IMAGE_SETS_PER_DATASTORE`]), and
+    /// what work that reaches the image sets of a data store at large walks.
+    ///
+    /// A tombstone occupies no place: an image set whose deletion has landed has given up
+    /// the content it held, so it neither takes a place among the image sets the store
+    /// holds nor can be worked on ([`ImageSet::is_deleted`]) — the rule
+    /// [`ComAmazonawsMedicalimagingAhigatewayserviceState::datastores_in`] states for the
+    /// data stores of a region. Use [`Datastore::image_sets`] directly where the records
+    /// themselves are what the call is about: reporting one by its id, or bounding how
+    /// many records this emulator holds ([`MAX_IMAGE_SET_RECORDS_PER_DATASTORE`]).
+    pub fn held_image_sets(&self) -> impl Iterator<Item = &ImageSet> {
+        self.image_sets
+            .values()
+            .filter(|image_set| !image_set.is_deleted())
     }
 
     /// Materialise every change the clock owed this data store by `now`.

@@ -246,11 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // Every image set the data store still holds that satisfies every filter, paired
-        // with the key the requested order ranks it by.
+        // with the key the requested order ranks it by. A tombstone takes part in no
+        // further work ([`crate::state::Datastore::held_image_sets`]).
         let mut matched: Vec<(SortKey, &ImageSet)> = datastore
-            .image_sets
-            .values()
-            .filter(|image_set| !image_set.is_deleted())
+            .held_image_sets()
             .filter(|image_set| {
                 predicates
                     .iter()

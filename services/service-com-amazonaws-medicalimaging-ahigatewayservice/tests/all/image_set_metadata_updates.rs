@@ -56,14 +56,17 @@ const SERIES_UID: &str = "1.2.840.113619.2.1.2.3";
 const SOP_UID: &str = "1.2.840.113619.2.1.1.4";
 
 /// The Study Instance UID a seeded image set holds unless a case names another.
-const STUDY_UID: &str = "1.2.840.113619.2.1.9.1";
+///
+/// `pub(crate)` because `crate::image_set_capacity` puts a retired image set in the same
+/// study, which is that suite's rule rather than this one's.
+pub(crate) const STUDY_UID: &str = "1.2.840.113619.2.1.9.1";
 
 /// The `contentType` `GetImageSetMetadata` serves the document with.
 const METADATA_CONTENT_TYPE: &str = "application/json";
 
 /// The DICOM attributes a seeded image set starts from: every modelled member filled, so
 /// a case can write one, remove one, and still tell what it did not touch.
-fn seeded_tags(study_instance_uid: &str) -> DICOMTags {
+pub(crate) fn seeded_tags(study_instance_uid: &str) -> DICOMTags {
     DICOMTags {
         dicom_patient_id: Some("PID-1".to_string()),
         dicom_patient_name: Some("DOE^JANE".to_string()),
@@ -89,7 +92,7 @@ fn seeded_tags(study_instance_uid: &str) -> DICOMTags {
 ///
 /// Built with the crate's own `ImageSet::new`, so a seeded image set is shaped exactly
 /// like one a handler mints.
-fn seed_image_set(emulator: &Emulator, datastore_id: &str, tags: DICOMTags) -> String {
+pub(crate) fn seed_image_set(emulator: &Emulator, datastore_id: &str, tags: DICOMTags) -> String {
     let state = service_state(emulator.engine()).expect("the medical-imaging state store");
     let mut store = state.lock();
     let image_set_id = store.mint_id();
@@ -136,7 +139,7 @@ fn dicom_updates_raw(updatable: Option<&str>, removable: Option<&str>) -> Value 
 }
 
 /// [`dicom_updates_raw`] for documents a case spells as JSON.
-fn dicom_updates(updatable: Option<&Value>, removable: Option<&Value>) -> Value {
+pub(crate) fn dicom_updates(updatable: Option<&Value>, removable: Option<&Value>) -> Value {
     dicom_updates_raw(
         updatable.map(Value::to_string).as_deref(),
         removable.map(Value::to_string).as_deref(),
@@ -151,7 +154,7 @@ fn revert_to(version_id: &str) -> Value {
 /// `POST /datastore/{datastoreId}/imageSet/{imageSetId}/updateImageSetMetadata` —
 /// `UpdateImageSetMetadata`. `latestVersion`, `force` and `includeStudyImageSets` are
 /// `@httpQuery`; the body IS the `updateImageSetMetadataUpdates` payload.
-async fn update_metadata(
+pub(crate) async fn update_metadata(
     emulator: &Emulator,
     datastore_id: &str,
     image_set_id: &str,

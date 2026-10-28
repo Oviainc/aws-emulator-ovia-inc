@@ -39,10 +39,12 @@
 //!   `ValidationException` (400); with it, the new version records `Overrides.forced`,
 //!   which is what `GetImageSet` reads back.
 //! * `includeStudyImageSets` applies the same updates "to all image sets in the same Study
-//!   as the requested image set ID": every other image set of the data store holding the
-//!   requested image set's `StudyInstanceUID` takes the same document and comes back
-//!   `UPDATING_FOR_STUDY_CONSISTENCY`. All of them must be able to take the update, since
-//!   a study left half updated is the inconsistent state `ConflictException` reports. An
+//!   as the requested image set ID": every other image set the data store still HOLDS that
+//!   carries the requested image set's `StudyInstanceUID` takes the same document and comes
+//!   back `UPDATING_FOR_STUDY_CONSISTENCY`. All of them must be able to take the update,
+//!   since a study left half updated is the inconsistent state `ConflictException` reports.
+//!   A RETIRED image set is not one of them: a tombstone takes part in no further work, so
+//!   it neither takes the update nor blocks it. An
 //!   image set holding no `StudyInstanceUID` is in no study, so the flag reaches nothing
 //!   else; a REVERT names a version of one image set's own history, which names nothing in
 //!   another image set, so the two members cannot be combined.
@@ -873,13 +875,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 // The study the requested image set is in, as it stands going in. An image
                 // set holding no `StudyInstanceUID` is in no study, so the flag reaches
-                // nothing besides the image set the request named.
+                // nothing besides the image set the request named. The study is made up of
+                // the image sets the data store still HOLDS: a retired one takes part in no
+                // further work, so it neither takes this update nor blocks it
+                // ([`crate::state::Datastore::held_image_sets`]).
                 let study_instance_uid = image_set.dicom_tags.dicom_study_instance_uid.clone();
                 if include_study_image_sets {
                     if let Some(study_instance_uid) = study_instance_uid {
                         let mut study: Vec<&ImageSet> = datastore
-                            .image_sets
-                            .values()
+                            .held_image_sets()
                             .filter(|other| {
                                 other.image_set_id != input.image_set_id
                                     && other.dicom_tags.dicom_study_instance_uid.as_deref()

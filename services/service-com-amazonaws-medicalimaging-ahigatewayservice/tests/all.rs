@@ -25,6 +25,8 @@ mod error_message_texts;
 mod image_frames;
 #[path = "all/image_set_access_time.rs"]
 mod image_set_access_time;
+#[path = "all/image_set_capacity.rs"]
+mod image_set_capacity;
 #[path = "all/image_set_copy.rs"]
 mod image_set_copy;
 #[path = "all/image_set_copy_subsets.rs"]
