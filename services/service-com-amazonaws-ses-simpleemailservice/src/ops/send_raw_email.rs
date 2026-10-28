@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendRawEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendRawEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendRawEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts a message a caller composed itself: reads the sender and the
+//! recipients out of the raw MIME message (or the parameters that override
+//! them), checks them the way SES does, appends the message to this account's
+//! send log, and answers with the id it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -201,6 +197,180 @@ impl From<SendRawEmailErrorModeled> for SendRawEmailError {
     }
 }
 
+/// The number of recipients one message may address, from this operation's own
+/// documentation: "Each message can include up to 50 recipient addresses across
+/// the To:, CC:, or BCC: lines." The same ceiling every send of this service
+/// documents, so the number itself lives in one place
+/// ([`crate::state::MAX_RECIPIENTS`]).
+const MAX_RECIPIENTS: usize = crate::state::MAX_RECIPIENTS;
+
+/// The bytes one raw message may carry, from this operation's own documentation:
+/// "The maximum message size, including attachments, is 10 MB."
+/// ([`crate::state::MAX_MESSAGE_BYTES`]).
+const MAX_MESSAGE_BYTES: usize = crate::state::MAX_MESSAGE_BYTES;
+
+/// The `multipart` containers one raw message may declare, which bounds how
+/// deeply the message this handler reads can nest
+/// ([`crate::state::MAX_MULTIPART_CONTAINERS`]).
+const MAX_MULTIPART_CONTAINERS: usize = crate::state::MAX_MULTIPART_CONTAINERS;
+
+/// The media type every MIME container carries, which is what one level of
+/// nesting costs a message: `Content-Type: multipart/<subtype>; boundary=…`.
+const MULTIPART_MEDIA_TYPE: &[u8] = b"multipart/";
+
+/// The header field a part's media type is declared in, which is the only place
+/// a media type DECLARES anything: the same bytes in a body are prose.
+const CONTENT_TYPE_FIELD: &[u8] = b"content-type:";
+
+/// The header line naming the mailbox a message is from, which is where the
+/// sender comes from when the request names no `Source`: "If you do not provide a
+/// value for this parameter, you must specify a 'From' address in the raw text of
+/// the message" (`SendRawEmailRequest$Source`).
+const FROM_HEADER: &str = "From";
+
+/// The header lines a message's recipients sit on: "A recipient address includes
+/// any address on the To:, CC:, or BCC: lines" (this operation's own
+/// documentation).
+const RECIPIENT_HEADERS: [&str; 3] = ["To", "Cc", "Bcc"];
+
+/// The header line carrying a message's subject, which is the part of the message
+/// the send log keeps to identify it.
+const SUBJECT_HEADER: &str = "Subject";
+
+/// Refuse the message, as `MessageRejected` (HTTP 400): "Indicates that the
+/// action failed, and the message could not be sent."
+fn rejected(message: String) -> SendRawEmailError {
+    SendRawEmailErrorModeled::MessageRejected(MessageRejected {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Whether the message carries the header/body separator SES requires: "The
+/// message has to contain a header and a body, separated by a blank line"
+/// (`SendRawEmailRequest$RawMessage`).
+///
+/// Both line endings count: RFC 5322 writes `CRLF CRLF`, and a message composed
+/// with bare line feeds is the same message with the same separator.
+fn has_header_body_separator(data: &[u8]) -> bool {
+    data.windows(4).any(|window| window == b"\r\n\r\n")
+        || data.windows(2).any(|window| window == b"\n\n")
+}
+
+/// Every addr-spec on one address header's value, in the order it lists them.
+///
+/// An address header is an RFC 5322 address list, so one line may carry several
+/// mailboxes, each of them optionally behind a display name, and may group them
+/// behind a group name; every mailbox of it is a recipient. `None` when the value
+/// is not an address list at all, which makes the whole message rejected.
+fn header_addresses(value: &str) -> Option<Vec<String>> {
+    let parsed = ::mailparse::addrparse(value).ok()?;
+    let mut addresses = Vec::new();
+    for entry in parsed.iter() {
+        match entry {
+            ::mailparse::MailAddr::Single(single) => addresses.push(single.addr.clone()),
+            ::mailparse::MailAddr::Group(group) => {
+                addresses.extend(group.addrs.iter().map(|single| single.addr.clone()));
+            }
+        }
+    }
+    Some(addresses)
+}
+
+/// Whether `line` opens with `prefix`, however either is cased: a header field
+/// name "is case-insensitive" (RFC 5322), as is a media type (RFC 2045).
+fn opens_with_ignore_ascii_case(line: &[u8], prefix: &[u8]) -> bool {
+    line.get(..prefix.len())
+        .is_some_and(|opening| opening.eq_ignore_ascii_case(prefix))
+}
+
+/// How many times `needle` occurs in `line`, however either is cased.
+fn occurrences_ignore_ascii_case(line: &[u8], needle: &[u8]) -> usize {
+    let mut found = 0;
+    let mut at = 0usize;
+    while let Some(window) = line.get(at..at.saturating_add(needle.len())) {
+        if window.eq_ignore_ascii_case(needle) {
+            found += 1;
+            at += needle.len();
+        } else {
+            at += 1;
+        }
+    }
+    found
+}
+
+/// How many `multipart` containers the raw message DECLARES.
+///
+/// Counted on the BYTES, before the message is parsed: parsing a MIME tree
+/// descends once per nesting level, and each level is one part declaring a
+/// `multipart` media type in its own `Content-Type` field, so this count is what
+/// stands between a caller's chosen nesting and the depth of that descent.
+///
+/// Only a `Content-Type` field DECLARES a media type, so only those lines are
+/// counted — the same bytes in a body are prose, and a message that merely
+/// discusses MIME is not a deeply nested one. A field value may be folded over
+/// several lines (RFC 5322), so a continuation line, which opens with white
+/// space, stays inside the field it continues. The scan is linear in the bytes,
+/// which [`MAX_MESSAGE_BYTES`] has already bounded.
+fn multipart_containers(data: &[u8]) -> usize {
+    let mut found = 0;
+    let mut in_content_type = false;
+    for line in data.split(|byte| *byte == b'\n') {
+        // A line of a `CRLF`-delimited message keeps its carriage return when
+        // split on the line feed alone; it is part of the ending, not the field.
+        let line = match line.split_last() {
+            Some((last, rest)) if *last == b'\r' => rest,
+            _ => line,
+        };
+        let continuation = line
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'));
+        if !continuation {
+            in_content_type = opens_with_ignore_ascii_case(line, CONTENT_TYPE_FIELD);
+        }
+        if in_content_type {
+            found += occurrences_ignore_ascii_case(line, MULTIPART_MEDIA_TYPE);
+        }
+    }
+    found
+}
+
+/// The text of the first `text/*` part of the message, which is the part of the
+/// body the send log keeps a bounded prefix of.
+///
+/// A message may be a single part or a multipart tree; the first textual leaf, in
+/// document order, is the text a reader of the message would be shown. A part
+/// whose content this emulator cannot decode contributes nothing rather than
+/// contributing bytes that are not its text.
+///
+/// Walked through an explicit worklist rather than by recursion: the DEPTH of the
+/// tree is the caller's to choose, and a recursive walk would turn that choice
+/// into stack depth. The worklist holds at most the parts the message carries,
+/// which [`MAX_MESSAGE_BYTES`] bounds, and the tree's depth is bounded before it
+/// is built ([`MAX_MULTIPART_CONTAINERS`]).
+fn text_part<'data>(message: &'data ::mailparse::ParsedMail<'data>) -> Option<String> {
+    let mut pending: Vec<&'data ::mailparse::ParsedMail<'data>> = vec![message];
+    while let Some(part) = pending.pop() {
+        if part.subparts.is_empty() {
+            let text = part
+                .ctype
+                .mimetype
+                .starts_with("text/")
+                .then(|| part.get_body().ok())
+                .flatten();
+            if text.is_some() {
+                return text;
+            }
+            continue;
+        }
+        // Pushed in reverse, because the worklist is a stack: that is what makes
+        // the walk visit the parts in document order, so the text is the FIRST
+        // textual leaf of the message rather than an arbitrary one.
+        pending.extend(part.subparts.iter().rev());
+    }
+    None
+}
+
 /// The `SendRawEmail` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -237,18 +407,228 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendRawEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendRawEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendRawEmail"))
+        // `ctx` carries the request metadata the identity gate reports: SES
+        // identities are per-Region, so the Region this send is scoped to is part
+        // of the refusal naming an unverified sender.
+        let region = crate::state::region_from_request(ctx.parts());
+        let raw = input.raw_message.data.as_slice();
+
+        // "The maximum message size, including attachments, is 10 MB." Read
+        // before the message is parsed, so a message past the ceiling is refused
+        // instead of being walked.
+        if raw.len() > MAX_MESSAGE_BYTES {
+            return Err(rejected(format!(
+                "Message exceeds the maximum message size of {MAX_MESSAGE_BYTES} bytes, \
+                 including attachments, got {} bytes",
+                raw.len()
+            )));
+        }
+        // Each level of a MIME tree is one part declaring a `multipart` media
+        // type, which is one header line, so the size ceiling above bounds how
+        // BIG a message is and not how deeply it nests. The nesting is bounded
+        // here, on the raw bytes, because parsing the tree descends once per
+        // level.
+        let containers = multipart_containers(raw);
+        if containers > MAX_MULTIPART_CONTAINERS {
+            return Err(rejected(format!(
+                "Message may declare at most {MAX_MULTIPART_CONTAINERS} multipart containers, \
+                 got {containers}"
+            )));
+        }
+        // "The message has to contain a header and a body, separated by a blank
+        // line. All of the required header fields must be present in the
+        // message." A message with no separator has no body, and one whose header
+        // block is not a header block at all cannot be read for the sender and
+        // the recipients SES delivers it to.
+        if !has_header_body_separator(raw) {
+            return Err(rejected(
+                "Message must contain a header and a body, separated by a blank line".to_string(),
+            ));
+        }
+        let Ok(message) = ::mailparse::parse_mail(raw) else {
+            return Err(rejected(
+                "Message is not a MIME message: its headers could not be read".to_string(),
+            ));
+        };
+        let headers = message.headers.as_slice();
+
+        // The sender: "If you do not provide a value for this parameter, you must
+        // specify a 'From' address in the raw text of the message. (You can also
+        // specify both.)" — so `Source` wins when the request carries one, and the
+        // message's own `From` line is read when it does not.
+        let from_header = ::mailparse::MailHeaderMap::get_first_value(headers, FROM_HEADER);
+        let source = match input.source.as_deref() {
+            Some(source) => crate::state::addr_spec(source).to_string(),
+            None => {
+                let from = from_header.as_deref().unwrap_or_default();
+                let Some(mailbox) = header_addresses(from)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                else {
+                    return Err(rejected(
+                        "Message must specify a From address in its raw text when the request \
+                         names no Source"
+                            .to_string(),
+                    ));
+                };
+                mailbox
+            }
+        };
+
+        // The recipients: the `Destinations` parameter is the destination list
+        // when the request carries one ("A list of destinations for the message,
+        // consisting of To:, CC:, and BCC: addresses"), and otherwise they are the
+        // addresses on the message's own recipient lines — "A recipient address
+        // includes any address on the To:, CC:, or BCC: lines."
+        let mut destinations: Vec<String> = input
+            .destinations
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|address| crate::state::addr_spec(address).to_string())
+            .collect();
+        if destinations.is_empty() {
+            for header in RECIPIENT_HEADERS {
+                for value in ::mailparse::MailHeaderMap::get_all_values(headers, header) {
+                    let Some(addresses) = header_addresses(&value) else {
+                        return Err(rejected(crate::state::illegal_address_message(&value)));
+                    };
+                    destinations.extend(addresses);
+                }
+            }
+        }
+
+        // "Each message has to include at least one recipient address."
+        if destinations.is_empty() {
+            return Err(rejected(
+                "Message must include at least one recipient address, across the Destinations \
+                 parameter and the To:, CC: and BCC: lines of the raw message"
+                    .to_string(),
+            ));
+        }
+        if destinations.len() > MAX_RECIPIENTS {
+            return Err(rejected(format!(
+                "Message may include at most {MAX_RECIPIENTS} recipient addresses across the \
+                 To:, CC: and BCC: lines, got {}",
+                destinations.len()
+            )));
+        }
+        // "If you send a single message to more than one recipient address, and
+        // one of the recipient addresses isn't in a valid format (that is, it's
+        // not in the format UserName@[SubDomain.]Domain.TopLevelDomain), Amazon
+        // SES rejects the entire message, even if the other addresses are valid."
+        if let Some(invalid) = destinations
+            .iter()
+            .find(|address| !crate::state::is_email_address(crate::state::addr_spec(address)))
+        {
+            return Err(rejected(crate::state::illegal_address_message(invalid)));
+        }
+
+        // The subject and the first textual part, taken while the parsed message
+        // is still in hand: the log keeps a bounded prefix of each.
+        let subject = ::mailparse::MailHeaderMap::get_first_value(headers, SUBJECT_HEADER);
+        let body = text_part(&message);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all. Every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("SendRawEmail"));
+        };
+        let mut state = state.lock();
+
+        // Account-wide pause, then the configuration set's own: each has its own
+        // modeled error, and the set must exist before its sending state is read.
+        if !state.account.sending_enabled {
+            return Err(SendRawEmailErrorModeled::AccountSendingPausedException(
+                AccountSendingPausedException {
+                    message: Some(
+                        "Email sending is disabled for this account. Enable it with \
+                         UpdateAccountSendingEnabled."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if let Some(configuration_set_name) = input.configuration_set_name.as_deref() {
+            let Some(configuration_set) = state.configuration_sets.get(configuration_set_name)
+            else {
+                return Err(
+                    SendRawEmailErrorModeled::ConfigurationSetDoesNotExistException(
+                        ConfigurationSetDoesNotExistException {
+                            configuration_set_name: Some(configuration_set_name.to_string()),
+                            message: Some(format!(
+                                "Configuration set <{configuration_set_name}> does not exist."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if !configuration_set.sending_enabled {
+                return Err(
+                    SendRawEmailErrorModeled::ConfigurationSetSendingPausedException(
+                        ConfigurationSetSendingPausedException {
+                            configuration_set_name: Some(configuration_set_name.to_string()),
+                            message: Some(format!(
+                                "Email sending is disabled for configuration set \
+                                 <{configuration_set_name}>."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "You can only send email from verified email addresses or domains. If
+        // you try to send email from an address that isn't verified, the operation
+        // results in an 'Email address not verified' error."
+        if !state.is_verified_sender(&source) {
+            return Err(rejected(crate::state::unverified_identities_message(
+                &region,
+                &[source.as_str()],
+            )));
+        }
+
+        // The account's own 24-hour quota, which every recipient of this message
+        // counts against: a send past it is refused rather than accepted, which is
+        // also what keeps the send log bounded. A negative `Max24HourSend`
+        // "signifies an unlimited quota" (the member's own documentation).
+        let now = std::time::SystemTime::now();
+        let quota = state.account.max_24_hour_send;
+        let already_sent = state.sent_last_24_hours(now);
+        if quota >= 0.0 && already_sent + destinations.len() as f64 > quota {
+            return Err(rejected(crate::state::daily_quota_exceeded_message(
+                quota,
+                already_sent,
+            )));
+        }
+
+        // The message is accepted: mint its id, log it, and answer with the id
+        // that was stored — never one computed from the request.
+        let message_id = state.new_message_id();
+        state.log_sent_message(crate::state::SentMessage {
+            message_id: message_id.clone(),
+            source,
+            destinations,
+            // Bounded prefixes: the log identifies the message, and no operation
+            // serves the stored text back, so a 10 MB body is not kept whole.
+            subject: crate::state::logged_text(subject.as_deref()),
+            body: crate::state::logged_text(body.as_deref()),
+            configuration_set: input.configuration_set_name.clone(),
+            tags: input
+                .tags
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|tag| (tag.name.clone(), tag.value.clone()))
+                .collect(),
+            sent_at: now,
+        });
+
+        Ok(SendRawEmailOutput { message_id })
     }
 }

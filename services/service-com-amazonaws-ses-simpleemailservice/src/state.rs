@@ -96,6 +96,37 @@ pub const MAX_CONFIGURATION_SETS: usize = 10_000;
 /// fewer".
 pub const MAX_CONFIGURATION_SET_NAME: usize = 64;
 
+/// The recipients ONE message may address, across every recipient line it
+/// carries.
+///
+/// Every send operation of this service documents the same ceiling: `SendEmail`
+/// as "The message may not include more than 50 recipients, across the To:, CC:
+/// and BCC: fields", and `SendRawEmail` as "Each message can include up to 50
+/// recipient addresses across the To:, CC:, or BCC: lines". One constant, so the
+/// operations that share the rule cannot disagree about the number.
+pub const MAX_RECIPIENTS: usize = 50;
+
+/// The bytes one raw message may carry, attachments included.
+///
+/// `SendRawEmail` documents it: "The maximum message size, including
+/// attachments, is 10 MB." It is the size [`MAX_LOGGED_TEXT`] keeps a prefix of,
+/// and the bound on the bytes one request can hand this emulator to read: a
+/// message past it is refused rather than accepted.
+pub const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// The `multipart` containers one raw message may declare, and so the deepest
+/// MIME nesting this service reads.
+///
+/// Each level of a MIME tree is one part declaring a `multipart/*` media type,
+/// and such a declaration is one header line, so [`MAX_MESSAGE_BYTES`] alone
+/// would leave the DEPTH of the tree a request asks for effectively unbounded
+/// while bounding its size. The declarations are counted on the raw bytes before
+/// anything parses them, so the tree is never built deeper than this. Real
+/// messages nest two or three deep — a `multipart/mixed` holding a
+/// `multipart/alternative` — so this leaves a wide margin over anything a mail
+/// client composes.
+pub const MAX_MULTIPART_CONTAINERS: usize = 64;
+
 /// The characters an event destination name may be built from, and the longest
 /// such name.
 ///
