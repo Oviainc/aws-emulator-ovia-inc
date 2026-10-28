@@ -17,6 +17,8 @@ mod clock_driven_timeout_is_materialised;
 mod command_execution_concurrency;
 #[path = "all/command_execution_validation.rs"]
 mod command_execution_validation;
+#[path = "all/describe_job_execution_against_the_clock.rs"]
+mod describe_job_execution_against_the_clock;
 #[path = "all/job_execution_lifecycle.rs"]
 mod job_execution_lifecycle;
 #[path = "all/job_execution_state_machine.rs"]
@@ -25,5 +27,9 @@ mod job_execution_state_machine;
 mod response_document_completeness;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// The harness the suites above share: the emulator, its HTTP calls and the
+// stored-record helpers, declared last so the list of SUITES stays sorted.
+#[path = "all/support.rs"]
+mod support;
 #[path = "all/update_after_a_passed_deadline.rs"]
 mod update_after_a_passed_deadline;

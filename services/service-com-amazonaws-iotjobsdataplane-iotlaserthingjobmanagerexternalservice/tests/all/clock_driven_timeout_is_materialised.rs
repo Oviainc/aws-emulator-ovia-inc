@@ -26,159 +26,15 @@
 //! a second past, exactly due, still to come, none armed), and the status the
 //! execution is in (`QUEUED`, `IN_PROGRESS`, already finished).
 
-use std::sync::Arc;
-
-use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::state::{
-    command_registry, iot_commands::CommandFacts, now_epoch_seconds, service_state,
-    JobExecutionRecord, STATUS_IN_PROGRESS, STATUS_QUEUED,
+    now_epoch_seconds, STATUS_IN_PROGRESS, STATUS_QUEUED,
 };
-use service_com_amazonaws_iotjobsdataplane_iotlaserthingjobmanagerexternalservice::EmulatedService;
 use service_common::iot_job_executions::STATUS_TIMED_OUT;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header whose credential scope names this service's
-/// signing name, which is how the router picks the service for a request.
-const SIGV4: &str = "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/us-east-1/iot-jobs-data/aws4_request, SignedHeaders=host, Signature=0";
-
-const COMMAND_ARN: &str = "arn:aws:iot:us-east-1:111122223333:command/reboot";
-
-/// A terminal value of the model's `JobExecutionStatus` that a device reported
-/// before any deadline passed, for the row that proves a FINISHED execution is left
-/// exactly as it finished.
-const STATUS_SUCCEEDED: &str = "SUCCEEDED";
-
-/// One emulator holding one shared engine, driven over HTTP.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        // An execution starts only for a command that EXISTS; commands are the
-        // control plane's resource, so the shared index is seeded with the one
-        // command these rows start.
-        command_registry(&*engine)
-            .expect("the shared IoT command index")
-            .lock()
-            .register(COMMAND_ARN, CommandFacts::default())
-            .expect("register the command these tests start");
-        let mut router = MultiServiceRouter::new();
-        // These tests exercise handler behaviour, not request signing.
-        router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
-    }
-
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
-        let payload = body.map_or_else(Bytes::new, |body| Bytes::from(body.to_string()));
-        let request = http::Request::builder()
-            .method(method)
-            .uri(format!("https://data.jobs.iot.us-east-1.amazonaws.com{path}"))
-            .header("authorization", SIGV4)
-            .header("content-type", "application/json")
-            .body(payload)
-            .expect("build the request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, parsed)
-    }
-
-    /// Start a command execution on `thing` and answer the minted id, which is the
-    /// `jobId` the device's own operations name it by.
-    async fn start_command_on(&self, thing: &str) -> String {
-        let (status, body) = self
-            .call(
-                "POST",
-                "/command-executions",
-                Some(json!({
-                    "targetArn": format!("arn:aws:iot:us-east-1:111122223333:thing/{thing}"),
-                    "commandArn": COMMAND_ARN,
-                })),
-            )
-            .await;
-        assert_eq!(
-            status, 200,
-            "starting a command on {thing} must answer 200, got {status} {body}"
-        );
-        body["executionId"]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected an executionId, got {body}"))
-            .to_string()
-    }
-
-    async fn pending(&self, thing: &str) -> (u16, Value) {
-        self.call("GET", &format!("/things/{thing}/jobs"), None).await
-    }
-
-    async fn describe(&self, thing: &str, job_id: &str) -> (u16, Value) {
-        self.call("GET", &format!("/things/{thing}/jobs/{job_id}"), None)
-            .await
-    }
-
-    async fn start_next(&self, thing: &str, body: Value) -> (u16, Value) {
-        self.call("PUT", &format!("/things/{thing}/jobs/$next"), Some(body))
-            .await
-    }
-
-    async fn update(&self, thing: &str, job_id: &str, body: Value) -> (u16, Value) {
-        self.call("POST", &format!("/things/{thing}/jobs/{job_id}"), Some(body))
-            .await
-    }
-
-    /// Put one stored execution into the state a row asks about: the status a device
-    /// drove it to and the deadlines its timers were armed with. This is the state a
-    /// live service reaches by waiting, without a test that sleeps for it.
-    fn with_stored_execution<F>(&self, thing: &str, job_id: &str, mutate: F)
-    where
-        F: FnOnce(&mut JobExecutionRecord),
-    {
-        let store = service_state(&*self.engine).expect("the shared job-execution store");
-        let mut store = store.lock();
-        let index = store
-            .execution_index(thing, job_id, None)
-            .unwrap_or_else(|| panic!("{thing} must hold the execution {job_id}"));
-        mutate(
-            store
-                .record_mut(thing, index)
-                .expect("the index came from this store"),
-        );
-    }
-
-    /// The status and `lastUpdatedAt` the SHARED store holds — what the IoT control
-    /// plane, reading the same record, would report.
-    fn stored(&self, thing: &str, job_id: &str) -> (String, i64) {
-        let store = service_state(&*self.engine).expect("the shared job-execution store");
-        let store = store.lock();
-        store
-            .execution_index(thing, job_id, None)
-            .and_then(|index| store.record(thing, index))
-            .map(|record| (record.status.clone(), record.last_updated_at))
-            .unwrap_or_else(|| panic!("{thing} must hold the execution {job_id}"))
-    }
-}
-
-/// The wire error code of a modeled failure (restJson1 carries it in `__type`).
-fn error_code(body: &Value) -> &str {
-    body["__type"].as_str().unwrap_or("")
-}
-
-/// The `jobId`s of one pending list, in the order the service returned them.
-fn job_ids(list: &Value) -> Vec<String> {
-    list.as_array()
-        .unwrap_or_else(|| panic!("expected a list of summaries, got {list}"))
-        .iter()
-        .map(|summary| summary["jobId"].as_str().unwrap_or_default().to_string())
-        .collect()
-}
+// The emulator, the HTTP calls and the stored-record helpers these rows drive are
+// the ones every suite of this crate shares.
+use crate::support::{error_code, job_ids, Emulator, STATUS_SUCCEEDED};
 
 /// One row of the timer table: the record a device drove to `status` with the
 /// deadlines `step_timeout_in` / `execution_timeout_in` seconds from now, and the
@@ -293,7 +149,7 @@ fn timer_cases() -> Vec<TimerCase> {
 async fn seeded(emulator: &Emulator, cases: &[TimerCase]) -> (Vec<String>, i64) {
     let mut ids = Vec::new();
     for case in cases {
-        ids.push(emulator.start_command_on(case.thing).await);
+        ids.push(emulator.start_command_on(case.thing, None).await);
     }
     let seeded_at = now_epoch_seconds();
     for (case, id) in cases.iter().zip(&ids) {
@@ -394,7 +250,7 @@ async fn a_read_and_an_update_answer_the_refusals_a_passed_deadline_earns() {
     for (case, id) in cases.iter().zip(&ids) {
         let label = case.case;
 
-        let (status, described) = emulator.describe(case.thing, id).await;
+        let (status, described) = emulator.describe(case.thing, id, "").await;
         if case.expected_status == STATUS_QUEUED || case.expected_status == STATUS_IN_PROGRESS {
             assert_eq!(
                 (status, described["execution"]["status"].as_str()),
@@ -457,7 +313,7 @@ async fn the_next_pending_execution_skips_every_deadline_that_has_passed() {
     for (case, thing, enqueued, expired) in rows {
         let mut ids = Vec::new();
         for _ in 0..enqueued {
-            ids.push(emulator.start_command_on(thing).await);
+            ids.push(emulator.start_command_on(thing, None).await);
         }
         let seeded_at = now_epoch_seconds();
         for id in ids.iter().take(expired) {
