@@ -195,10 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata only, and this write needs nothing from it.
-        let _ = ctx;
-
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
         // denied)" — `PutObjectRetentionRequest$ExpectedBucketOwner`, judged the way every
@@ -408,6 +404,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+
+        // Placing a retention is an object event of its own (`s3:ObjectRetention:Put`),
+        // published to whatever destinations the bucket's notification configuration names
+        // for it — through the same seam `PutObject` publishes its write through.
+        let retention_put = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::RetentionPut,
+            &input.key,
+        );
+        let retention_put = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.addressed_object(&input.key, version_id))
+        {
+            Some(object) => retention_put.of_object(object),
+            None => retention_put,
+        };
+        let pending =
+            crate::state::notifications::pending(&store, &input.bucket, &[retention_put]);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
 
         Ok(PutObjectRetentionOutput {
             // "If present, indicates that the requester was successfully charged for the

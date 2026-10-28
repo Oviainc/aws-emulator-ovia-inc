@@ -216,10 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Everything this delete needs is in its deserialized input; the expected owner
-        // and the MFA token travel as members, not as raw headers.
-        let _ = ctx;
-
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
         // denied)" (`DeleteObjectsRequest$ExpectedBucketOwner`), judged the way every
@@ -294,6 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would.
         let mut deleted: Vec<DeletedObject> = Vec::new();
         let mut errors: Vec<Error> = Vec::new();
+        // The object events this batch produced — one per identifier that really took
+        // something away, because each identifier performs exactly what a `DeleteObject`
+        // for it would, notifications included.
+        let mut events: Vec<crate::state::notifications::ObjectEvent> = Vec::new();
         for identifier in identifiers {
             let key = identifier.key.as_str();
             match identifier.version_id.as_deref() {
@@ -319,15 +319,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .and_then(|bucket| bucket.stored_version(key, version_id))
                         .is_some_and(|held| held.as_delete_marker().is_some());
                     match store.remove_object_version(&input.bucket, key, version_id) {
-                        Some(true) => deleted.push(DeletedObject {
-                            key: Some(key.to_string()),
-                            version_id: Some(version_id.to_string()),
-                            // "Indicates whether the specified object version that was
-                            // permanently deleted was (true) or was not (false) a delete
-                            // marker before deletion" (`DeletedObject$DeleteMarker`).
-                            delete_marker: removed_marker.then_some(true),
-                            delete_marker_version_id: None,
-                        }),
+                        Some(true) => {
+                            events.push(
+                                crate::state::notifications::ObjectEvent::new(
+                                    crate::state::notifications::ObjectEventKind::Removed,
+                                    key,
+                                )
+                                .of_version(Some(version_id.to_string())),
+                            );
+                            deleted.push(DeletedObject {
+                                key: Some(key.to_string()),
+                                version_id: Some(version_id.to_string()),
+                                // "Indicates whether the specified object version that was
+                                // permanently deleted was (true) or was not (false) a delete
+                                // marker before deletion" (`DeletedObject$DeleteMarker`).
+                                delete_marker: removed_marker.then_some(true),
+                                delete_marker_version_id: None,
+                            });
+                        }
                         // A version the bucket holds none of is this key's own failure,
                         // reported beside the keys that did delete rather than failing the
                         // whole request: `NoSuchVersion`, the code a single-object delete
@@ -344,18 +353,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // in the request isn't found, Amazon S3 confirms the deletion by returning
                 // the result as deleted", so nothing-there is a success too.
                 None => match store.remove_object(&input.bucket, key) {
-                    Some(crate::state::ObjectDeletion::Removed)
-                    | Some(crate::state::ObjectDeletion::NothingThere)
-                    | None => deleted.push(DeletedObject {
-                        key: Some(key.to_string()),
-                        ..DeletedObject::default()
-                    }),
+                    // A removal took something away, so it notifies; a delete that found
+                    // nothing there took nothing away and notifies about nothing, even
+                    // though both answer as deleted.
+                    Some(crate::state::ObjectDeletion::Removed) => {
+                        events.push(crate::state::notifications::ObjectEvent::new(
+                            crate::state::notifications::ObjectEventKind::Removed,
+                            key,
+                        ));
+                        deleted.push(DeletedObject {
+                            key: Some(key.to_string()),
+                            ..DeletedObject::default()
+                        });
+                    }
+                    Some(crate::state::ObjectDeletion::NothingThere) | None => {
+                        deleted.push(DeletedObject {
+                            key: Some(key.to_string()),
+                            ..DeletedObject::default()
+                        });
+                    }
                     // The delete laid a delete marker, which "becomes the current version
                     // of the object": `DeleteMarkerVersionId` is "the version ID of the
                     // delete marker created as a result of the DELETE operation", the
                     // `null` marker of a suspended bucket under the id a request names it
                     // by.
                     Some(crate::state::ObjectDeletion::MarkerLaid { version_id, .. }) => {
+                        events.push(
+                            crate::state::notifications::ObjectEvent::new(
+                                crate::state::notifications::ObjectEventKind::DeleteMarkerCreated,
+                                key,
+                            )
+                            .of_version(version_id.clone()),
+                        );
                         deleted.push(DeletedObject {
                             key: Some(key.to_string()),
                             version_id: None,
@@ -413,12 +442,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // default, the operation uses verbose mode… In quiet mode the response includes
         // only keys where the delete operation encountered an error."
         let quiet = input.delete.quiet.unwrap_or(false);
-        Ok(DeleteObjectsOutput {
+        let output = DeleteObjectsOutput {
             deleted: (!quiet && !deleted.is_empty()).then_some(deleted),
             errors: (!errors.is_empty()).then_some(errors),
             // A Requester Pays charge this emulator does not model.
             request_charged: None,
-        })
+        };
+
+        // Published with the store released, the way `DeleteObject` publishes the one
+        // event its own delete produced.
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &events);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
+
+        Ok(output)
     }
 }
 

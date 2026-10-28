@@ -321,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A conditional delete answers 412 when the condition fails.
         if input.if_match.is_some()
@@ -368,7 +368,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .bucket(&input.bucket)
                 .and_then(|bucket| bucket.stored_version(&input.key, version_id))
                 .is_some_and(|held| held.as_delete_marker().is_some());
-            return match store.remove_object_version(&input.bucket, &input.key, version_id) {
+            let outcome = store.remove_object_version(&input.bucket, &input.key, version_id);
+            return match outcome {
                 None => Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
                 Some(false) => Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::NO_SUCH_VERSION_CODE,
@@ -378,10 +379,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "Returns the version ID of the delete marker created as a result of the
                 // DELETE operation" (`DeleteObjectOutput$VersionId`): for a delete that
                 // named a version, the version it removed.
-                Some(true) => Ok(DeleteObjectNoContent {
-                    delete_marker: removed_marker.then_some(true),
-                    version_id: Some(version_id.to_string()),
-                }),
+                Some(true) => {
+                    // One version was permanently removed, which is the object event this
+                    // delete produced; the bucket's notification configuration decides
+                    // which destinations hear about it.
+                    let removed = crate::state::notifications::ObjectEvent::new(
+                        crate::state::notifications::ObjectEventKind::Removed,
+                        &input.key,
+                    )
+                    .of_version(Some(version_id.to_string()));
+                    let pending =
+                        crate::state::notifications::pending(&store, &input.bucket, &[removed]);
+                    drop(store);
+                    crate::state::notifications::publish(ctx, pending);
+                    Ok(DeleteObjectNoContent {
+                        delete_marker: removed_marker.then_some(true),
+                        version_id: Some(version_id.to_string()),
+                    })
+                }
             };
         }
 
@@ -398,6 +413,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(outcome) = store.remove_object(&input.bucket, &input.key) else {
             return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+
+        // What this delete DID is also what it notifies about: a removal is
+        // `s3:ObjectRemoved:Delete` and a delete marker is
+        // `s3:ObjectRemoved:DeleteMarkerCreated`, while a delete that found nothing there
+        // took nothing away and so notifies about nothing. The refused outcomes below
+        // recorded nothing either, so they owe no notification; `pending` is empty for
+        // all of them.
+        let events: Vec<crate::state::notifications::ObjectEvent> = match &outcome {
+            crate::state::ObjectDeletion::Removed => {
+                vec![crate::state::notifications::ObjectEvent::new(
+                    crate::state::notifications::ObjectEventKind::Removed,
+                    &input.key,
+                )]
+            }
+            crate::state::ObjectDeletion::MarkerLaid { version_id, .. } => {
+                vec![crate::state::notifications::ObjectEvent::new(
+                    crate::state::notifications::ObjectEventKind::DeleteMarkerCreated,
+                    &input.key,
+                )
+                .of_version(version_id.clone())]
+            }
+            crate::state::ObjectDeletion::NothingThere
+            | crate::state::ObjectDeletion::VersionCountReached
+            | crate::state::ObjectDeletion::TotalVersionCountReached => Vec::new(),
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &events);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
+
         match outcome {
             // Nothing versioned happened, so there is no marker and no version id to
             // report: the 204 carries no header of its own.

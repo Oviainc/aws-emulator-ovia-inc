@@ -237,10 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata only, and this write needs nothing from it.
-        let _ = ctx;
-
         // "The account ID of the expected bucket owner"
         // (`DeleteObjectAnnotationRequest$ExpectedBucketOwner`), judged the way the writer
         // and the reader of this same subresource judge it: this emulator serves one
@@ -363,6 +359,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             }
         }
+
+        // Removing an annotation is an object event of its own
+        // (`s3:ObjectAnnotation:Delete`), published the way the writer publishes
+        // `s3:ObjectAnnotation:Put`.
+        let unannotated = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::AnnotationDelete,
+            &input.key,
+        );
+        let unannotated = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.addressed_object(&input.key, input.version_id.as_deref()))
+        {
+            Some(object) => unannotated.of_object(object),
+            None => unannotated,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[unannotated]);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
 
         Ok(DeleteObjectAnnotationNoContent {
             object_version_id,

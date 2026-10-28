@@ -224,10 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata only, and this write needs nothing from it.
-        let _ = ctx;
-
         // "If the account ID that you provide does not match the actual owner of the
         // bucket, the request fails with the HTTP status code 403 Forbidden (access
         // denied)" — `DeleteObjectTaggingRequest$ExpectedBucketOwner`, judged the way the
@@ -325,6 +321,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+
+        // Taking the tag set away is an object event of its own
+        // (`s3:ObjectTagging:Delete`), published the way the putter publishes
+        // `s3:ObjectTagging:Put`.
+        let untagged = crate::state::notifications::ObjectEvent::new(
+            crate::state::notifications::ObjectEventKind::TaggingDelete,
+            &input.key,
+        );
+        let untagged = match store
+            .bucket(&input.bucket)
+            .and_then(|bucket| bucket.object(&input.key))
+        {
+            Some(object) => untagged.of_object(object),
+            None => untagged,
+        };
+        let pending = crate::state::notifications::pending(&store, &input.bucket, &[untagged]);
+        drop(store);
+        crate::state::notifications::publish(ctx, pending);
 
         Ok(DeleteObjectTaggingNoContent {
             // "The versionId of the object the tag-set was removed from" — reported for a
