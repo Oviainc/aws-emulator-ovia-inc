@@ -3,8 +3,8 @@
 //! The account-id well-formedness refusal, asserted through EVERY operation whose
 //! input carries account ids — the member operations that take an `AccountIds` list,
 //! the invitation decline and delete that take one, the create that takes an `AccountDetails`
-//! list, and the organization-configuration pair whose include/exclude lists together
-//! name one account scope.
+//! list, the organization-configuration pair whose include/exclude lists together
+//! name one account scope, and the usage report whose criteria carry the list.
 //!
 //! Every request goes over the wire through `MultiServiceRouter::dispatch` (the
 //! harness lives in the `detector_lifecycle` suite), so routing, restJson1
@@ -61,14 +61,20 @@ const ORG_CONFIGURATION_PATH: &str = "/custom-detection-rule/org-configuration";
 /// require (`smithy_query(shape="AssociationMode")`).
 const MODE: &str = "LIVE";
 
+/// One `UsageStatisticType` member, which `GetUsageStatistics` requires
+/// (`smithy_query(shape="UsageStatisticType")`); the usage suite asserts the rule
+/// holds for every member of that enum.
+const USAGE_STATISTIC_TYPE: &str = "SUM_BY_ACCOUNT";
+
 /// Every operation whose input carries account ids, with the list that carries them.
 ///
 /// The last two carry the scope as a PAIR of lists ("mutually exclusive" —
 /// `smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`),
 /// so the create is driven through `includeAccountIds` and the update through
 /// `excludeAccountIds`: both sides of the pair are covered.
-const OPERATIONS: [&str; 11] = [
+const OPERATIONS: [&str; 12] = [
     "GetMembers",
+    "GetUsageStatistics",
     "InviteMembers",
     "DeclineInvitations",
     "DeleteInvitations",
@@ -231,6 +237,21 @@ async fn send(
                 "PUT",
                 &format!("{ORG_CONFIGURATION_PATH}/{rule_id}"),
                 Some(json!({"mode": MODE, "excludeAccountIds": ids})),
+            )
+            .await
+        }
+        "GetUsageStatistics" => {
+            // The one operation that carries the list inside a criteria structure
+            // rather than at the top level, and the same `AccountIds` shape either
+            // way (`smithy_query(query="shape",shape="UsageCriteria")`).
+            call(
+                router,
+                "POST",
+                &format!("/detector/{detector_id}/usage/statistics"),
+                Some(json!({
+                    "usageStatisticsType": USAGE_STATISTIC_TYPE,
+                    "usageCriteria": {"accountIds": ids},
+                })),
             )
             .await
         }

@@ -180,6 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Decided from the REQUEST alone, before the store is looked at: the currency
         // the amounts are reported in, and what the criteria restrict them to.
         let unit = reported_unit(input.unit.as_deref())?;
+        // A criteria entry that cannot be a value of its member at all is refused
+        // whatever the store holds, through the one reader every account-id-taking
+        // member of this service is read by: a request that was not understood is
+        // never answered as if it had been processed, and an unreadable id must not
+        // become a filter that silently selects nothing.
+        if let Some(message) =
+            crate::state::account_ids_rejection(input.usage_criteria.account_ids.iter().flatten())
+        {
+            return Err(bad_request(message));
+        }
         let selected_accounts = exact_values(input.usage_criteria.account_ids.as_deref());
         let selected_resources = exact_values(input.usage_criteria.resources.as_deref());
         let selected_features = selected_features(&input.usage_criteria);

@@ -28,15 +28,22 @@
 //!    so any other currency is refused.
 //! 6. A `detectorId` this account/Region does not hold is refused with the modelled
 //!    `BadRequestException` envelope under the `InvalidInputException` class.
+//! 7. A `usageCriteria.accountIds` entry that cannot be an account id at all refuses the
+//!    whole call, the way every other account-id-taking member of this service is read,
+//!    rather than becoming a filter that selects nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
+use super::client_rejections::invalid_parameter;
 use super::detector_lifecycle::{
     all_finding_ids, call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
+// The malformed-account-id table the member suites share, so this suite cannot drift
+// from them on what a malformed account id is.
+use super::member_association::MALFORMED_ACCOUNT_IDS;
 
 /// The marker for a finding type whose feature `UsageFeature` carries no member for, so
 /// its usage is reported under no feature at all.
@@ -998,4 +1005,113 @@ async fn a_detector_id_the_endpoint_does_not_hold_is_refused() {
             "case {case:?}: expected the modelled envelope, got {response:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 7: a criteria account id that cannot be an account id at all.
+// ---------------------------------------------------------------------------
+
+/// The wire name a refusal over an account id names: `AccountIds`' entries target
+/// `AccountId` (`smithy_query(query="shape",shape="UsageCriteria")` for the criteria
+/// list, `smithy_query(shape="AccountId")` for the entry).
+const ACCOUNT_ID_MEMBER: &str = "accountId";
+
+/// An entry of `usageCriteria.accountIds` that cannot be an account id at all refuses
+/// the WHOLE call, rather than becoming a filter that silently selects no record. The
+/// rows span every malformed shape, every `UsageStatisticType`, and both a list whose
+/// only entry is malformed and one where it sits beside the account the records belong
+/// to; the control row — a well-formed id that owns none of the recorded work — is
+/// answered instead, with no row.
+#[tokio::test]
+async fn a_criteria_account_id_that_cannot_be_one_is_refused() {
+    let router = new_router();
+    let detector_id = detector_with_recorded_usage(&router, &[VOLUME_ARN]).await;
+    let account = recorded_account(&router, &detector_id).await;
+
+    for (statistic_type, member) in STATISTIC_MEMBERS {
+        for (malformed, why) in MALFORMED_ACCOUNT_IDS {
+            let placements: [(&str, Vec<String>); 3] = [
+                ("the only entry", vec![malformed.to_string()]),
+                (
+                    "before the account the records belong to",
+                    vec![malformed.to_string(), account.clone()],
+                ),
+                (
+                    "after the account the records belong to",
+                    vec![account.clone(), malformed.to_string()],
+                ),
+            ];
+            for (placement, account_ids) in placements {
+                let case = format!("{statistic_type}: {why} as {placement}");
+                let (status, response) = usage(
+                    &router,
+                    &detector_id,
+                    json!({
+                        "usageStatisticsType": statistic_type,
+                        "usageCriteria": {"accountIds": account_ids},
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected 400, got {status} {response:?}"
+                );
+                assert_eq!(
+                    error_code(&response),
+                    "InvalidInputException",
+                    "case {case:?}: expected the InvalidInputException class, got {response:?}"
+                );
+                assert_eq!(
+                    error_shape(&response),
+                    "BadRequestException",
+                    "case {case:?}: expected the modelled envelope, got {response:?}"
+                );
+                assert_eq!(
+                    response["message"].as_str(),
+                    Some(invalid_parameter(ACCOUNT_ID_MEMBER).as_str()),
+                    "case {case:?}: expected the refusal to name {ACCOUNT_ID_MEMBER}, got {response:?}"
+                );
+                let rendered = response.to_string();
+                assert!(
+                    !rendered.contains(malformed),
+                    "case {case:?}: expected the refusal not to echo the caller's value, \
+                     got {rendered}"
+                );
+            }
+        }
+
+        // The control: a WELL-FORMED id that owns none of the recorded work is not a
+        // refusal at all — it selects no record, so the statistic reports no row.
+        let case = format!("{statistic_type}: a well-formed account id that owns nothing");
+        let response = usage_ok(
+            &router,
+            &detector_id,
+            json!({
+                "usageStatisticsType": statistic_type,
+                "usageCriteria": {"accountIds": [OTHER_ACCOUNT_ID]},
+            }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            response["usageStatistics"][member].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: expected no row for an account that owns no record, got {response:?}"
+        );
+    }
+
+    // The refusal materialised nothing: the unrestricted statistics still report the
+    // recorded work exactly as they did before any of the refused calls.
+    let case = "after the refusals";
+    let got = reported_totals(
+        &statistic(&router, &detector_id, "SUM_BY_FEATURES").await,
+        "sumByFeature",
+        "feature",
+        case,
+    );
+    assert_eq!(
+        got,
+        as_amounts(&expected_feature_observations(1)),
+        "case {case:?}: expected the recorded work untouched by the refusals, got {got:?}"
+    );
 }
