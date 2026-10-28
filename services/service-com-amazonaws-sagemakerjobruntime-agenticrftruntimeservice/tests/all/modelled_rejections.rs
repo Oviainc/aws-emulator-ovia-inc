@@ -36,154 +36,27 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState as ServiceState;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
-use service_common::agentic_rft_jobs::{JobDirectory, JobRecord};
 use smithy_server_runtime::{MultiServiceRouter, Service};
 
-/// A SigV4 `Authorization` header whose credential scope names `service` — the primary
-/// routing signal `resolve_route_key` reads. Request authentication is off on the test
-/// router, so the signature itself is never checked.
-fn authorization(service: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-east-1/{service}/aws4_request, \
-         SignedHeaders=host, Signature=\
-         0000000000000000000000000000000000000000000000000000000000000000"
-    )
-}
+// The shared harness: the wire-answer reduction and the job-directory setup every suite
+// of this crate drives (`tests/all/harness.rs`).
+use crate::harness::{
+    authorization, create_job_at_arn as create_job, mounted_service, send, Reply,
+    COMPLETE_ROLLOUT_PATH, JOB_ARN_HEADER, SAMPLE_PATH, SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER,
+    UPDATE_REWARD_PATH,
+};
 
-/// The header `JobArn` is bound to.
-const JOB_ARN_HEADER: &str = "x-amzn-sagemaker-job-arn";
-
-/// The header `TrajectoryId` is bound to on the sampling operations.
-const TRAJECTORY_ID_HEADER: &str = "x-amzn-sagemaker-trajectory-id";
-
-/// The paths this service's model binds, one per operation.
-const SAMPLE_PATH: &str = "/sample";
-const SAMPLE_STREAM_PATH: &str = "/sample-with-response-stream";
-const COMPLETE_ROLLOUT_PATH: &str = "/complete-rollout";
-const UPDATE_REWARD_PATH: &str = "/update-reward";
-
-/// A job ARN satisfying the modelled
+/// A job ARN in the `aws` partition satisfying the modelled
 /// `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:job/[a-zA-Z0-9_\-]+/[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$`
 /// pattern, so a row can vary the region, the account and the job name.
 fn job_arn(region: &str, account: &str, job: &str, run: &str) -> String {
-    format!("arn:aws:sagemaker:{region}:{account}:job/{job}/{run}")
-}
-
-/// One HTTP answer, reduced to what these tests assert on.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    content_type: Option<String>,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    /// The bare error code out of `x-amzn-errortype`, which the recorded front door
-    /// sends in a Coral-suffixed form (`ValidationException:http://…`); an SDK reads the
-    /// name before the colon.
-    fn error_code(&self) -> String {
-        let raw = self.error_type.clone().unwrap_or_default();
-        raw.split(':')
-            .next()
-            .unwrap_or_default()
-            .rsplit('#')
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// The `Message` member of a restJson1 error document.
-    ///
-    /// Read under the name the MODEL declares (`Message`, on every error shape of this
-    /// service) and under no other: the framework's own pre-dispatch refusal envelope
-    /// writes a lowercase `message` instead, so accepting both would hide a refusal that
-    /// never reached this service's modelled `ValidationException`.
-    fn message(&self) -> String {
-        serde_json::from_slice::<Value>(&self.body)
-            .ok()
-            .and_then(|body| {
-                body.get("Message")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_default()
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
-    }
-}
-
-/// A router carrying exactly this service over one shared engine.
-fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router
-        .set_request_authentication(false)
-        .register_service(EmulatedService::new(Arc::clone(&engine)));
-    (engine, router)
+    crate::harness::job_arn("aws", region, account, job, run)
 }
 
 /// A `JobArn` satisfying every modelled constraint, in the emulator's own region and
 /// account.
 fn emulator_job(run: &str) -> String {
     job_arn("us-east-1", "000000000000", "AgentRFT", run)
-}
-
-/// Create the job `job_arn` names in the shared job directory — the registration the
-/// SageMaker control plane's `CreateJob` writes, which is what makes a job addressable in
-/// this data plane. Every job a row of this suite expects to be SERVED is created this
-/// way; a row that expects a refusal about something else creates it too, so the refusal
-/// is about the member under test and not about the job.
-fn create_job(engine: &engine::InMemoryEngine, job_arn: &str) {
-    let resource = ::service_common::arn::resource_id_of_type(job_arn, "job")
-        .expect("a job ARN naming a job resource");
-    let (category, name) = resource
-        .split_once('/')
-        .expect("a job resource of the form <category>/<name>");
-    engine.state::<JobDirectory>().lock().register(JobRecord {
-        name: name.to_string(),
-        category: category.to_string(),
-        arn: job_arn.to_string(),
-    });
-}
-
-async fn send(
-    router: &MultiServiceRouter,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Vec<u8>,
-) -> Reply {
-    let mut request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://job-runtime.sagemaker.us-east-1.amazonaws.com{path}"))
-        .header("authorization", authorization("sagemaker"))
-        .header("host", "job-runtime.sagemaker.us-east-1.amazonaws.com");
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    let request = request
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-    Reply {
-        status,
-        error_type,
-        content_type,
-        body: response.into_body().to_vec(),
-    }
 }
 
 async fn sample(

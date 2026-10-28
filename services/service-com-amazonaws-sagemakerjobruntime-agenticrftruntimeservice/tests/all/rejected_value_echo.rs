@@ -32,25 +32,14 @@
 //! `JobArn` (`@length` min 1 max 256 plus the job-ARN `@pattern`), `Status` targets the
 //! `CompletionStatus` enum (`ready`, `failed`).
 
-use std::sync::Arc;
-
-use serde_json::{json, Value};
-use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
+use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 `Authorization` header whose credential scope names the `sagemaker` signing
-/// name — the routing signal this service is claimed by. Request authentication is off on
-/// the test router, so the signature itself is never checked.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20240101/us-east-1/sagemaker/aws4_request, SignedHeaders=host, \
-     Signature=0000000000000000000000000000000000000000000000000000000000000000";
-
-/// This service's own endpoint host.
-const HOST: &str = "job-runtime.sagemaker.us-east-1.amazonaws.com";
-
-/// The headers `JobArn` and `TrajectoryId` are bound to.
-const JOB_ARN_HEADER: &str = "x-amzn-sagemaker-job-arn";
-const TRAJECTORY_ID_HEADER: &str = "x-amzn-sagemaker-trajectory-id";
+// The shared harness: the wire-answer reduction and the job-directory setup every suite
+// of this crate drives (`tests/all/harness.rs`).
+use crate::harness::{
+    create_job_at_arn, mounted_service, send, Reply, JOB_ARN_HEADER, TRAJECTORY_ID_HEADER,
+};
 
 /// `TrajectoryId`'s modelled `@length` bounds (`smithy_query(query="shape",shape="TrajectoryId")`).
 const TRAJECTORY_ID_MAX: usize = 256;
@@ -81,65 +70,14 @@ impl Op {
     }
 }
 
-/// One HTTP answer, reduced to what this suite asserts on.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    content_type: Option<String>,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    /// The bare error code out of `x-amzn-errortype`.
-    fn error_code(&self) -> String {
-        let raw = self.error_type.clone().unwrap_or_default();
-        raw.split(':')
-            .next()
-            .unwrap_or_default()
-            .rsplit('#')
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// The `Message` member of a restJson1 error document, read under the name the MODEL
-    /// declares (`Message`) and no other.
-    fn message(&self) -> String {
-        serde_json::from_slice::<Value>(&self.body)
-            .ok()
-            .and_then(|body| {
-                body.get("Message")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_default()
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
-    }
-}
-
 /// A router carrying exactly this service over one shared engine, with the job
 /// [`well_formed_job`] names already created.
-fn mounted_service() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+fn mounted_service_with_job() -> MultiServiceRouter {
+    let (engine, router) = mounted_service();
     // The registration the SageMaker control plane's `CreateJob` writes: this data plane
     // resolves the `JobArn` a call carries against it, so the job every row addresses
     // exists and a refusal is about the member under test.
-    engine
-        .state::<::service_common::agentic_rft_jobs::JobDirectory>()
-        .lock()
-        .register(::service_common::agentic_rft_jobs::JobRecord {
-            name: JOB_NAME.to_string(),
-            category: JOB_CATEGORY.to_string(),
-            arn: well_formed_job(),
-        });
-    let mut router = MultiServiceRouter::new();
-    router
-        .set_request_authentication(false)
-        .register_service(EmulatedService::new(engine));
+    create_job_at_arn(&engine, &well_formed_job());
     router
 }
 
@@ -148,8 +86,8 @@ const JOB_CATEGORY: &str = "AgentRFT";
 const JOB_NAME: &str = "echo-run-1";
 
 /// A `JobArn` satisfying every modelled constraint and naming a job the control plane
-/// created ([`mounted_service`]), so a refusal is about the member under test and not
-/// about the job ARN.
+/// created ([`mounted_service_with_job`]), so a refusal is about the member under test and
+/// not about the job ARN.
 fn well_formed_job() -> String {
     format!("arn:aws:sagemaker:us-east-1:123456789012:job/{JOB_CATEGORY}/{JOB_NAME}")
 }
@@ -158,42 +96,6 @@ fn well_formed_job() -> String {
 fn chat_payload() -> Vec<u8> {
     serde_json::to_vec(&json!({ "messages": [{ "role": "user", "content": "go" }] }))
         .expect("a serializable payload")
-}
-
-async fn send(
-    router: &MultiServiceRouter,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Vec<u8>,
-) -> Reply {
-    let mut request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{HOST}{path}"))
-        .header("authorization", AUTHORIZATION)
-        .header("host", HOST);
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    let request = request
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let header = |name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string)
-    };
-    let error_type = header("x-amzn-errortype");
-    let content_type = header("content-type");
-    Reply {
-        status,
-        error_type,
-        content_type,
-        body: response.into_body().to_vec(),
-    }
 }
 
 /// Call `op` with this `job_arn`, `trajectory_id` and (for `CompleteRollout`) `status`,
@@ -343,7 +245,7 @@ async fn an_over_long_value_is_echoed_in_full() {
     ];
 
     for (case, op, value) in rows {
-        let router = mounted_service();
+        let router = mounted_service_with_job();
         let reply = call(&router, op, &job_arn, &value, "ready").await;
         assert_refused(
             case,
@@ -367,7 +269,7 @@ async fn every_constraint_class_echoes_the_submitted_value() {
         ("an empty trajectory id, header-bound", Op::Sample),
         ("an empty trajectory id, body-bound", Op::UpdateReward),
     ] {
-        let router = mounted_service();
+        let router = mounted_service_with_job();
         let reply = call(&router, op, &job_arn, "", "ready").await;
         assert_refused(
             case,
@@ -384,7 +286,7 @@ async fn every_constraint_class_echoes_the_submitted_value() {
         ("a 300-character status", "s".repeat(300)),
         ("a multibyte status", "ré".repeat(200)),
     ] {
-        let router = mounted_service();
+        let router = mounted_service_with_job();
         let reply = call(&router, Op::CompleteRollout, &job_arn, "traj-1", &status).await;
         assert_refused(
             &format!("{case} on CompleteRollout"),
@@ -413,7 +315,7 @@ async fn every_constraint_class_echoes_the_submitted_value() {
             Op::CompleteRollout,
             Op::UpdateReward,
         ] {
-            let router = mounted_service();
+            let router = mounted_service_with_job();
             let reply = call(&router, op, &bad_arn, "traj-1", "ready").await;
             assert_refused(
                 &format!("{case} on {op:?}"),
@@ -428,7 +330,7 @@ async fn every_constraint_class_echoes_the_submitted_value() {
 /// the rows above are about what a refusal echoes and not about length in general.
 #[tokio::test]
 async fn a_value_at_the_maximum_is_not_refused() {
-    let router = mounted_service();
+    let router = mounted_service_with_job();
     let at_max = "t".repeat(TRAJECTORY_ID_MAX);
     let reply = call(&router, Op::Sample, &well_formed_job(), &at_max, "ready").await;
     assert_eq!(
@@ -457,7 +359,7 @@ async fn the_echo_is_restored_up_to_the_stated_bound_and_bounded_past_it() {
     // AT the bound: restored in full. Carried in the JSON body, the binding with no
     // per-header size convention of its own.
     let at_bound = "b".repeat(MAX_RESTORED_ECHO);
-    let router = mounted_service();
+    let router = mounted_service_with_job();
     let reply = call(&router, Op::CompleteRollout, &job_arn, &at_bound, "ready").await;
     assert_refused(
         "a value at the 16 KiB echo bound",
@@ -473,7 +375,7 @@ async fn the_echo_is_restored_up_to_the_stated_bound_and_bounded_past_it() {
         ),
         ("far past the echo bound", "b".repeat(4 * MAX_RESTORED_ECHO)),
     ] {
-        let router = mounted_service();
+        let router = mounted_service_with_job();
         let reply = call(&router, Op::CompleteRollout, &job_arn, &value, "ready").await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),

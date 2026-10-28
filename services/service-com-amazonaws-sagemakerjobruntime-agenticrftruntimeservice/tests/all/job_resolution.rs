@@ -25,32 +25,17 @@
 //! afterwards the way the NEXT request would read it, so what is pinned is the emulator's
 //! HTTP behaviour and that the answer came from persisted state.
 
-use std::sync::Arc;
-
-use serde_json::{json, Value};
+use serde_json::json;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState as ServiceState;
-use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
-use service_common::agentic_rft_jobs::{JobDirectory, JobRecord};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// This service's own endpoint host, built from the model's endpoint prefix.
-const HOST: &str = "job-runtime.sagemaker.us-east-1.amazonaws.com";
-
-/// A SigV4 `Authorization` header whose credential scope names this service's signing
-/// name (`sagemaker`). Request authentication is off on the test router, so the signature
-/// itself is never checked.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20240101/us-east-1/sagemaker/aws4_request, SignedHeaders=host, \
-     Signature=0000000000000000000000000000000000000000000000000000000000000000";
-
-/// The headers `JobArn` and `TrajectoryId` are bound to.
-const JOB_ARN_HEADER: &str = "x-amzn-sagemaker-job-arn";
-const TRAJECTORY_ID_HEADER: &str = "x-amzn-sagemaker-trajectory-id";
-
-/// The two sampling paths this model binds.
-const SAMPLE_PATH: &str = "/sample";
-const SAMPLE_STREAM_PATH: &str = "/sample-with-response-stream";
+// The shared harness: the wire-answer reduction and the job-directory setup every suite
+// of this crate drives (`tests/all/harness.rs`).
+use crate::harness::{
+    create_job, delete_job, job_arn, mounted_service, send, Reply, JOB_ARN_HEADER, SAMPLE_PATH,
+    SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER,
+};
 
 /// The `JobCategory` values the SageMaker control plane creates a job under.
 ///
@@ -59,82 +44,6 @@ const SAMPLE_STREAM_PATH: &str = "/sample-with-response-stream";
 /// — exactly `AgentRFT` and `AgentRFTEvaluation`.
 const JOB_CATEGORIES: [&str; 2] = ["AgentRFT", "AgentRFTEvaluation"];
 
-/// One HTTP answer, reduced to what these tests assert on.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    content_type: Option<String>,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    /// The bare error code out of `x-amzn-errortype`, which may carry a namespace or a
-    /// Coral shape-id suffix alongside the name.
-    fn error_code(&self) -> String {
-        let raw = self.error_type.clone().unwrap_or_default();
-        raw.split(':')
-            .next()
-            .unwrap_or_default()
-            .rsplit('#')
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// The `Message` member of a restJson1 error document, read under the name the MODEL
-    /// declares (`Message`) and no other.
-    fn message(&self) -> String {
-        serde_json::from_slice::<Value>(&self.body)
-            .ok()
-            .and_then(|body| {
-                body.get("Message")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_default()
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
-    }
-}
-
-/// A router carrying exactly this service over one shared engine. The engine comes back
-/// too, so a test can create a job the way the control plane does and read this service's
-/// store the way the next request would.
-fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router
-        .set_request_authentication(false)
-        .register_service(EmulatedService::new(Arc::clone(&engine)));
-    (engine, router)
-}
-
-/// Create the job `category` / `name` in the shared job directory — the registration the
-/// SageMaker control plane's `CreateJob` writes, which is what makes a job addressable
-/// here. The runtime binds no operation that creates one, so this is how a job comes to
-/// exist for a test of this crate.
-fn create_job(engine: &engine::InMemoryEngine, category: &str, name: &str) {
-    engine.state::<JobDirectory>().lock().register(JobRecord {
-        name: name.to_string(),
-        category: category.to_string(),
-        arn: format!(
-            "arn:aws:sagemaker:us-east-1:000000000000:job/{category}/{name}"
-        ),
-    });
-}
-
-/// Delete the job `category` / `name` from the shared directory, as the control plane's
-/// delete does.
-fn delete_job(engine: &engine::InMemoryEngine, category: &str, name: &str) {
-    engine
-        .state::<JobDirectory>()
-        .lock()
-        .forget(category, name);
-}
-
 async fn sample(
     router: &MultiServiceRouter,
     path: &str,
@@ -142,44 +51,23 @@ async fn sample(
     trajectory_id: &str,
     payload: &[u8],
 ) -> Reply {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{HOST}{path}"))
-        .header("authorization", AUTHORIZATION)
-        .header("host", HOST)
-        .header(JOB_ARN_HEADER, job_arn)
-        .header(TRAJECTORY_ID_HEADER, trajectory_id)
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(payload.to_vec()))
-        .expect("a well-formed test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let header = |name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string)
-    };
-    let error_type = header("x-amzn-errortype");
-    let content_type = header("content-type");
-    Reply {
-        status,
-        error_type,
-        content_type,
-        body: response.into_body().to_vec(),
-    }
+    send(
+        router,
+        path,
+        &[
+            (JOB_ARN_HEADER, job_arn),
+            (TRAJECTORY_ID_HEADER, trajectory_id),
+            ("content-type", "application/json"),
+        ],
+        payload.to_vec(),
+    )
+    .await
 }
 
 /// An OpenAI-compatible chat-completions request body.
 fn chat_payload(text: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({ "messages": [{ "role": "user", "content": text }] }))
         .expect("a serializable payload")
-}
-
-/// A job ARN assembled from the parts the modelled pattern lets vary.
-fn job_arn(partition: &str, region: &str, account: &str, category: &str, name: &str) -> String {
-    format!("arn:{partition}:sagemaker:{region}:{account}:job/{category}/{name}")
 }
 
 /// RULE (the refused half): a well-formed `JobArn` that resolves to no created job is

@@ -8,6 +8,11 @@
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
 
+// The ONE harness every suite below shares: the wire-answer reduction and the job
+// directory setup, declared first so each suite reaches it as `crate::harness`.
+#[path = "all/harness.rs"]
+mod harness;
+
 #[path = "all/job_arn_is_the_callers_job.rs"]
 mod job_arn_is_the_callers_job;
 
@@ -28,6 +33,9 @@ mod rollout_operations_resolve_the_job;
 
 #[path = "all/sampling_path_is_shared.rs"]
 mod sampling_path_is_shared;
+
+#[path = "all/shared_harness_is_one_path.rs"]
+mod shared_harness_is_one_path;
 
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what

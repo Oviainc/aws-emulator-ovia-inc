@@ -17,115 +17,18 @@
 //! payload, the terminal completion status, and the length and values of the
 //! reward list.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::state;
 use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState as ServiceState;
-use service_com_amazonaws_sagemakerjobruntime_agenticrftruntimeservice::EmulatedService;
-use service_common::agentic_rft_jobs::{JobDirectory, JobRecord};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A host-style endpoint built from the model's endpoint prefix
-/// (`job-runtime.sagemaker`).
-const ENDPOINT: &str = "https://job-runtime.sagemaker.us-east-1.amazonaws.com";
-
-/// A SigV4 `Authorization` header whose credential scope names this service's
-/// sigv4 signing name (`sagemaker`) — the routing signal `resolve_route_key`
-/// reads. Request authentication is off on the test router, so the signature
-/// itself is never checked.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20240101/us-east-1/sagemaker/aws4_request, \
-     SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000";
-
-/// The header `JobArn` is bound to.
-const JOB_ARN_HEADER: &str = "x-amzn-sagemaker-job-arn";
-
-/// The header `TrajectoryId` is bound to on the sampling operations.
-const TRAJECTORY_ID_HEADER: &str = "x-amzn-sagemaker-trajectory-id";
-
-/// One HTTP answer, reduced to what these tests assert on.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    /// `x-amzn-errortype` — how restJson1 names the error shape.
-    error_type: Option<String>,
-    content_type: Option<String>,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    /// The bare error code out of an `x-amzn-errortype` value, which may carry a
-    /// namespace or a shape-id URL alongside the name.
-    fn error_code(&self) -> String {
-        let raw = self.error_type.clone().unwrap_or_default();
-        raw.split(':')
-            .next()
-            .unwrap_or_default()
-            .rsplit('#')
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.body).into_owned()
-    }
-}
-
-/// A router carrying exactly this service over one shared engine — the same
-/// assembly `core/router` performs, minus the other services. The engine comes
-/// back too, so a test can read this service's store the way the next request
-/// would.
-fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router
-        .set_request_authentication(false)
-        .register_service(EmulatedService::new(Arc::clone(&engine)));
-    (engine, router)
-}
-
-async fn send(
-    router: &MultiServiceRouter,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Vec<u8>,
-) -> Reply {
-    let mut request = http::Request::builder()
-        .method("POST")
-        .uri(format!("{ENDPOINT}{path}"))
-        .header("authorization", AUTHORIZATION)
-        .header("host", "job-runtime.sagemaker.us-east-1.amazonaws.com");
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    let request = request
-        .body(bytes::Bytes::from(body))
-        .expect("a well-formed test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-    Reply {
-        status,
-        error_type,
-        content_type,
-        body: response.into_body().to_vec(),
-    }
-}
+// The shared harness: the wire-answer reduction and the job-directory setup every suite
+// of this crate drives (`tests/all/harness.rs`).
+use crate::harness::{
+    create_job_at_arn as create_job, job_arn, mounted_service, send, Reply,
+    COMPLETE_ROLLOUT_PATH, JOB_ARN_HEADER, SAMPLE_PATH, SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER,
+    UPDATE_REWARD_PATH,
+};
 
 /// One `Sample` or `SampleWithResponseStream` call.
 async fn sample(
@@ -136,9 +39,9 @@ async fn sample(
     streamed: bool,
 ) -> Reply {
     let path = if streamed {
-        "/sample-with-response-stream"
+        SAMPLE_STREAM_PATH
     } else {
-        "/sample"
+        SAMPLE_PATH
     };
     send(
         router,
@@ -167,7 +70,7 @@ async fn complete_rollout(
     }
     send(
         router,
-        "/complete-rollout",
+        COMPLETE_ROLLOUT_PATH,
         &[
             (JOB_ARN_HEADER, job_arn),
             ("content-type", "application/json"),
@@ -192,7 +95,7 @@ async fn update_reward(
     });
     send(
         router,
-        "/update-reward",
+        UPDATE_REWARD_PATH,
         &[
             (JOB_ARN_HEADER, job_arn),
             ("content-type", "application/json"),
@@ -205,31 +108,6 @@ async fn update_reward(
 // ---------------------------------------------------------------------------
 // The trajectory table
 // ---------------------------------------------------------------------------
-
-/// A job ARN that satisfies the modelled
-/// `^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:job/[a-zA-Z0-9_\-]+/[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$`
-/// pattern, assembled so a row can vary the partition, the region, the account,
-/// the job category and the job name independently.
-fn job_arn(partition: &str, region: &str, account: &str, job: &str, run: &str) -> String {
-    format!("arn:{partition}:sagemaker:{region}:{account}:job/{job}/{run}")
-}
-
-/// Create the job `job_arn` names in the shared job directory — the registration the
-/// SageMaker control plane's `CreateJob` writes, which is what makes a job addressable in
-/// this data plane. This service binds no operation that creates a job, so every rollout
-/// below starts from one created this way.
-fn create_job(engine: &engine::InMemoryEngine, job_arn: &str) {
-    let resource = ::service_common::arn::resource_id_of_type(job_arn, "job")
-        .expect("a job ARN naming a job resource");
-    let (category, name) = resource
-        .split_once('/')
-        .expect("a job resource of the form <category>/<name>");
-    engine.state::<JobDirectory>().lock().register(JobRecord {
-        name: name.to_string(),
-        category: category.to_string(),
-        arn: job_arn.to_string(),
-    });
-}
 
 /// One row of the trajectory table: a whole rollout, so a row differs from its
 /// neighbours along the ARN's partition/region/account, the trajectory id's
