@@ -4,10 +4,21 @@
 //! Submits a batch inference job: the job is minted `Submitted` — "this job has been
 //! submitted to a queue for validation" — and the submission arms the whole clock the job
 //! runs on (`state::ModelInvocationJobClock`), so it is owed `Validating`, then
-//! `Scheduled`, then `InProgress`, and only then `Completed`. The record this operation
-//! writes is the one `ops/get_model_invocation_job.rs` reads back and
+//! `Scheduled`, then `InProgress`, and only then its terminal status. The record this
+//! operation writes is the one `ops/get_model_invocation_job.rs` reads back and
 //! `ops/list_model_invocation_jobs.rs` reports, so the job this call submits is the job
 //! every later request sees.
+//!
+//! The submission also performs the `Validating` step over REAL data: it reads the records
+//! of the object `inputDataConfig` names out of this emulator's own Amazon S3
+//! (`state::model_invocation_run::read_input_records`), and those records are what the job
+//! reports as its `totalRecordCount` and what its run — owed at the instant the job begins
+//! — invokes the model over, writing one result record each under the `outputDataConfig`
+//! prefix. A submission is never refused over its input, because on AWS that validation
+//! runs after the job is queued: an input the object store itself reports unusable fails
+//! the JOB, with the message it failed on, while an input nothing is known about (an
+//! emulator assembled with no object store to ask) leaves the job the records and the
+//! lifecycle it has always had.
 //!
 //! `timeoutDurationInHours` is reported as the instant the job WOULD time out
 //! (`jobExpirationTime`) and nothing more: the member is modelled `range 24..168`, so the
@@ -220,78 +231,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let mut store = state.lock();
+        {
+            let mut store = state.lock();
 
-        // `@idempotencyToken`: a replay answers with what the first request submitted.
-        let replayed = input
-            .client_request_token
-            .as_ref()
-            .and_then(|token| {
-                store
-                    .model_invocation_job_create_tokens
-                    .get(&(region.clone(), token.clone()))
-            })
-            .cloned();
-        if let Some(minted) = replayed {
-            if let Some(job) = store.model_invocation_jobs.get(&minted) {
-                return Ok(CreateModelInvocationJobOutput {
-                    job_arn: job.arn.clone(),
-                });
+            // `@idempotencyToken`: a replay answers with what the first request submitted.
+            let replayed = input
+                .client_request_token
+                .as_ref()
+                .and_then(|token| {
+                    store
+                        .model_invocation_job_create_tokens
+                        .get(&(region.clone(), token.clone()))
+                })
+                .cloned();
+            if let Some(minted) = replayed {
+                if let Some(job) = store.model_invocation_jobs.get(&minted) {
+                    return Ok(CreateModelInvocationJobOutput {
+                        job_arn: job.arn.clone(),
+                    });
+                }
+            }
+
+            // `modelId` admits a foundation model — by its bare id or by its ARN — a
+            // `custom-model` ARN and an inference profile ARN
+            // (`smithy_query(query="operation",operation="CreateModelInvocationJob")`: its
+            // pattern carries all three), so each of those families is asked in turn,
+            // through the very index its own reads resolve an identifier through. A value
+            // naming none of them names no model there is anything to invoke, reported
+            // absent exactly as `ops/create_model_customization_job.rs` reports a base
+            // model the catalog does not carry.
+            let names_a_model = store
+                .foundation_models
+                .qualified_model(crate::state::base_model_id_of(&input.model_id))
+                .is_some()
+                || store.custom_model(&input.model_id, &region, now).is_some()
+                || store
+                    .inference_profile_arn_of(&input.model_id, &region)
+                    .is_some();
+            if !names_a_model {
+                return Err(
+                    CreateModelInvocationJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "modelId {} does not name a model in this account in {region}",
+                                input.model_id
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The account's batch inference job quota. Enforcing it here is also what bounds
+            // this part of the store: without a server-side cap a caller could grow it with
+            // nothing but further submissions.
+            if store.model_invocation_jobs.len()
+                >= crate::state::MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT
+            {
+                return Err(
+                    CreateModelInvocationJobErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this account already holds the maximum of {} batch inference \
+                                 jobs; request a quota increase",
+                                crate::state::MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT
+                            )),
+                        },
+                    )
+                    .into(),
+                );
             }
         }
 
-        // `modelId` admits a foundation model — by its bare id or by its ARN — a
-        // `custom-model` ARN and an inference profile ARN
-        // (`smithy_query(query="operation",operation="CreateModelInvocationJob")`: its
-        // pattern carries all three), so each of those families is asked in turn, through
-        // the very index its own reads resolve an identifier through. A value naming none of
-        // them names no model there is anything to invoke, reported absent exactly as
-        // `ops/create_model_customization_job.rs` reports a base model the catalog does not
-        // carry.
-        let names_a_model = store
-            .foundation_models
-            .qualified_model(crate::state::base_model_id_of(&input.model_id))
-            .is_some()
-            || store.custom_model(&input.model_id, &region, now).is_some()
-            || store
-                .inference_profile_arn_of(&input.model_id, &region)
-                .is_some();
-        if !names_a_model {
-            return Err(
-                CreateModelInvocationJobErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "modelId {} does not name a model in this account in {region}",
-                            input.model_id
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
+        // The `Validating` step over the object this submission points at: "your files are
+        // .jsonl files and each individual record is a JSON object in the correct format"
+        // and "your files fulfill the requirements for file size and number of records" are
+        // criteria about REAL data, so the input is read here — out of this emulator's own
+        // Amazon S3, over the in-process callback — and the records it holds are what the
+        // job reports as its `totalRecordCount` and runs over. The read happens with no
+        // store guard held, so no lock is held across the call into object storage.
+        //
+        // A submission is never REFUSED over its input: on AWS the validation runs after
+        // the job has been queued, so an input the store itself reports as unusable fails
+        // the JOB — with the message it failed on — while an input nothing is known about
+        // (an emulator assembled with no object store to ask) leaves the job the records
+        // and the lifecycle it has always had.
+        let input_verdict = crate::state::model_invocation_run::read_input_records(
+            ctx,
+            &region,
+            crate::state::model_invocation_run::input_s3_uri(&input.input_data_config),
+        )
+        .await;
 
-        // The account's batch inference job quota. Enforcing it here is also what bounds
-        // this part of the store: without a server-side cap a caller could grow it with
-        // nothing but further submissions.
-        if store.model_invocation_jobs.len() >= crate::state::MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT
-        {
-            return Err(
-                CreateModelInvocationJobErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "this account already holds the maximum of {} batch inference jobs; \
-                             request a quota increase",
-                            crate::state::MAX_MODEL_INVOCATION_JOBS_PER_ACCOUNT
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        let mut store = state.lock();
         let job_id = store.mint_model_invocation_job_id(now);
         let arn = crate::state::model_invocation_job_arn(&region, &job_id);
         let clock = crate::state::ModelInvocationJobClock::armed_at(now);
+        // What the validation step established about the input decides BOTH the records the
+        // job runs over and the lifecycle it is owed: a job whose input the object store
+        // served is owed the whole progression and the run over those records, while one
+        // whose input that store itself reported unusable is owed its validation and then
+        // the modelled failure, carrying the message it failed on. An input nothing is
+        // known about leaves the job the lifecycle it has always had and no count to
+        // report.
+        let (total_record_count, failure, run_owed) = match &input_verdict {
+            crate::state::model_invocation_run::InputVerdict::Records(records) => (
+                Some(i64::try_from(records.len()).unwrap_or(i64::MAX)),
+                None,
+                true,
+            ),
+            crate::state::model_invocation_run::InputVerdict::Rejected(message) => {
+                (None, Some(message.clone()), false)
+            }
+            crate::state::model_invocation_run::InputVerdict::Unknown => (None, None, false),
+        };
         let job = crate::state::ModelInvocationJobRecord {
             arn: arn.clone(),
             name: input.job_name,
@@ -323,9 +376,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // dwells in each of them and no single later call both arms a move and spends it.
             status: crate::state::MODEL_INVOCATION_JOB_STATUS_SUBMITTED,
             validating_due_at: Some(clock.validating_at),
-            scheduled_due_at: Some(clock.scheduled_at),
-            in_progress_due_at: Some(clock.in_progress_at),
-            completed_due_at: Some(clock.completed_at),
+            // A job whose input cannot be processed is never scheduled and never begins:
+            // it is owed the terminal `Failed` at the instant the next move was owed at, so
+            // the failure is observed one span after the validation that found it.
+            scheduled_due_at: failure.is_none().then_some(clock.scheduled_at),
+            in_progress_due_at: failure.is_none().then_some(clock.in_progress_at),
+            completed_due_at: Some(if failure.is_some() {
+                clock.scheduled_at
+            } else {
+                clock.completed_at
+            }),
+            terminal_status: if failure.is_some() {
+                crate::state::MODEL_INVOCATION_JOB_STATUS_FAILED
+            } else {
+                crate::state::MODEL_INVOCATION_JOB_STATUS_COMPLETED
+            },
+            message: failure,
+            total_record_count,
+            // Nothing has been processed yet: the run that processes the records is owed at
+            // the instant the job begins, and it is what advances these three.
+            processed_record_count: 0,
+            success_record_count: 0,
+            error_record_count: 0,
+            run_owed,
             // No stop has been asked for, so nothing owes the job its wind-down.
             stopped_due_at: None,
             submit_time: now,

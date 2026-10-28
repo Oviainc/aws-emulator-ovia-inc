@@ -26,9 +26,27 @@ tracing = { workspace = true }
 # The digest an Automated Reasoning policy's `definitionHash` is, and its hex rendering.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The Amazon S3 client a batch inference job reads its input records with and writes its
+# result records with, over the in-process callback into this same emulator (no network
+# client feature is enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Bedrock Runtime emulator's inference path: a batch inference job invokes the model
+# over every record of its input through the very functions that service's `InvokeModel`
+# and `Converse` handlers answer from, so a batch record and a synchronous call carrying
+# the same body are served by ONE inference rather than by two that could drift.
+service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The execution suite mounts Amazon S3 beside this service on one engine: a batch
+# inference job reads its input records out of the object store and writes its result
+# records back into it, which is asserted end to end by staging the input through S3 and
+# fetching the output back through it.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The execution suite waits out the clock-owed span after which a submitted job has begun.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

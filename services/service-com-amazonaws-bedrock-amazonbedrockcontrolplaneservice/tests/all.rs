@@ -77,6 +77,8 @@ mod model_customization_jobs;
 mod model_customization_pass_role;
 #[path = "all/model_import_jobs.rs"]
 mod model_import_jobs;
+#[path = "all/model_invocation_job_execution.rs"]
+mod model_invocation_job_execution;
 #[path = "all/model_invocation_jobs.rs"]
 mod model_invocation_jobs;
 #[path = "all/model_invocation_logging.rs"]

@@ -125,7 +125,10 @@
 //! `ops/get_model_invocation_job.rs` reads back, `ops/list_model_invocation_jobs.rs`
 //! reports and `ops/stop_model_invocation_job.rs` winds down, together with the instant
 //! each job's non-terminal `status` is owed its next move and the instant the job would
-//! time out.
+//! time out. Each of those records also holds what the job's WORK established — the records
+//! read out of its input object and the tally of the run that invoked the model over them
+//! ([`model_invocation_run`]) — because the counts the two reads report and the results
+//! stored under the job's output prefix are two sides of one run.
 //!
 //! And it holds the published foundation model catalog — the base models
 //! `ops/list_foundation_models.rs` reports and `ops/get_foundation_model.rs` resolves one
@@ -186,6 +189,13 @@ use crate::ops::types::{
     ProvisionedModelSummary, RoutingCriteria, SelectiveContentGuarding, Tag, TrainingDataConfig,
     ValidationDataConfig, VpcConfig,
 };
+
+/// The WORK a batch inference job performs: the records it reads out of its input object,
+/// the model invocation it performs over each one and the result records it writes under
+/// its output prefix. It lives beside this module rather than in it because it reaches
+/// another emulated service (object storage, and the inference surface), while the record
+/// and its lifecycle live here.
+pub mod model_invocation_run;
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
 /// (`^DRAFT$`) spells it.
@@ -1937,6 +1947,22 @@ pub const MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
 /// the end of its input: "Completed – This job has successfully completed".
 pub const MODEL_INVOCATION_JOB_STATUS_COMPLETED: &str = "Completed";
 
+/// `ModelInvocationJobStatus` — the terminal status of a batch inference job some but not
+/// all of whose records were processed: "PartiallyCompleted – This job has partially
+/// completed. Not all of your records could be processed in time. View the output files in
+/// the output S3 location".
+pub const MODEL_INVOCATION_JOB_STATUS_PARTIALLY_COMPLETED: &str = "PartiallyCompleted";
+
+/// `ModelInvocationJobStatus` — the terminal status of a batch inference job that could not
+/// be run: "Failed – This job has failed. Check the failure message for any further
+/// details". The failure message is [`ModelInvocationJobRecord::message`].
+pub const MODEL_INVOCATION_JOB_STATUS_FAILED: &str = "Failed";
+
+/// `ModelInvocationType` — the Converse endpoint, one of the two values the modelled enum
+/// carries (`crate::ops::types::MODEL_INVOCATION_TYPE_VALUES`). Named because the job's
+/// work step invokes each record through the endpoint the submission chose.
+pub const MODEL_INVOCATION_TYPE_CONVERSE: &str = "Converse";
+
 /// `ModelInvocationJobStatus` — a batch inference job a user asked to stop, while that
 /// stop is still being carried out: "Stopping – This job is being stopped by a user".
 pub const MODEL_INVOCATION_JOB_STATUS_STOPPING: &str = "Stopping";
@@ -2104,6 +2130,46 @@ pub struct ModelInvocationJobRecord {
     pub tags: Vec<Tag>,
     /// `ModelInvocationJobStatus`.
     pub status: &'static str,
+    /// The terminal `ModelInvocationJobStatus` this job's [`Self::completed_due_at`] moves
+    /// it to: [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`] for a job whose every record was
+    /// processed, [`MODEL_INVOCATION_JOB_STATUS_PARTIALLY_COMPLETED`] for one some of whose
+    /// records could not be, and [`MODEL_INVOCATION_JOB_STATUS_FAILED`] for one that could
+    /// not be run at all.
+    ///
+    /// Decided by the WORK, not by the clock: the submission's validation of the input
+    /// ([`model_invocation_run::read_input_records`]) and the run over its records
+    /// ([`model_invocation_run::run_batch_inference`]) are what set it, so the status a job
+    /// ends in reports what happened to its records.
+    pub terminal_status: &'static str,
+    /// `message` — "if the batch inference job failed, this field contains a message
+    /// describing why the job failed", and `None` for a job that has not failed.
+    pub message: Option<String>,
+    /// `totalRecordCount` — "the total number of records in the batch inference job":
+    /// the records read out of the input object this job was pointed at.
+    ///
+    /// `None` only while nothing is known about that object: an emulator assembled with no
+    /// object store to ask establishes neither its records nor its absence
+    /// ([`model_invocation_run::InputVerdict::Unknown`]), and a count is reported only
+    /// where one was counted.
+    pub total_record_count: Option<i64>,
+    /// `processedRecordCount` — "the number of records that have been processed in the
+    /// batch inference job": [`Self::success_record_count`] and
+    /// [`Self::error_record_count`] together, zero until the job's run materialises.
+    pub processed_record_count: i64,
+    /// `successRecordCount` — "the number of records that were successfully processed in
+    /// the batch inference job": the records the model answered for.
+    pub success_record_count: i64,
+    /// `errorRecordCount` — "the number of records that failed to process in the batch
+    /// inference job": the records the model could not be invoked for.
+    pub error_record_count: i64,
+    /// Whether this job's run — reading its records, invoking the model over each of them
+    /// and storing the results under its output prefix — is still owed.
+    ///
+    /// The run is owed from the submission that validated an input, falls due with the
+    /// status that says the job has begun, and is taken ONCE ([`Self::due_run`]): a run the
+    /// object store did not take is given back, so a later call takes it again, and no
+    /// later call runs a job whose results are already stored.
+    pub run_owed: bool,
     /// When [`Self::status`] is owed its move to
     /// [`MODEL_INVOCATION_JOB_STATUS_VALIDATING`], or `None` once that move has been
     /// materialised.
@@ -2158,6 +2224,92 @@ impl ModelInvocationJobRecord {
         self.completed_due_at = None;
         self.stopped_due_at = Some(now + MODEL_INVOCATION_JOB_STOPPED_AFTER);
         self.last_modified_at = now;
+        // The run it was queued for is being wound down, so the records it would have
+        // processed are not processed and nothing is written for them.
+        self.run_owed = false;
+    }
+
+    /// Whether the job has BEGUN: its status is one the model documents the results of the
+    /// run under — "InProgress – this job has begun. You can start viewing the results in
+    /// the output S3 location", and the terminal statuses that say to view those files.
+    #[must_use]
+    pub fn has_begun(&self) -> bool {
+        matches!(
+            self.status,
+            MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS
+                | MODEL_INVOCATION_JOB_STATUS_COMPLETED
+                | MODEL_INVOCATION_JOB_STATUS_PARTIALLY_COMPLETED
+        )
+    }
+
+    /// The run this job still owes, taken ONCE — or `None` when it owes none yet.
+    ///
+    /// The work is materialised exactly like the status transition that started it: it fell
+    /// due when the clock moved the job into the status that says it has begun, whether or
+    /// not anybody called, so the first operation that finds the job begun takes the run
+    /// ([`model_invocation_run::run_batch_inference`]) and no later call takes it again —
+    /// which is what keeps a read reporting the same counts and leaves what a client
+    /// fetched out of the output location as it fetched it.
+    ///
+    /// A job nothing is known about the input of owes nothing: there are no records to run
+    /// over ([`Self::total_record_count`]).
+    pub fn due_run(&mut self) -> Option<model_invocation_run::DueRun> {
+        if !self.run_owed || !self.has_begun() || self.total_record_count.is_none() {
+            return None;
+        }
+        self.run_owed = false;
+        Some(model_invocation_run::DueRun {
+            arn: self.arn.clone(),
+            region: self.region.clone(),
+            model_id: self.model_id.clone(),
+            invocation_type: self.model_invocation_type,
+            input_uri: model_invocation_run::input_s3_uri(&self.input_data_config).to_string(),
+            output_uri: model_invocation_run::output_s3_uri(&self.output_data_config).to_string(),
+        })
+    }
+
+    /// Write back what the run established, and give the run back when it established
+    /// nothing.
+    ///
+    /// The counts are the run's own tally over the records it read, so what the two reads
+    /// report accounts for the results stored under the output prefix. A run that could not
+    /// be performed at all leaves the job still owing it, so a later call takes it again
+    /// rather than reporting a job that did nothing as finished.
+    ///
+    /// The terminal status this job ends in is decided here; a job the clock has ALREADY
+    /// carried into its terminal status is moved to the one the run decided, so no job
+    /// reports `Completed` with records that failed.
+    pub fn record_run(&mut self, outcome: model_invocation_run::RunOutcome) {
+        match outcome {
+            model_invocation_run::RunOutcome::Ran {
+                success,
+                error,
+                message,
+            } => {
+                self.success_record_count = success;
+                self.error_record_count = error;
+                self.processed_record_count = success.saturating_add(error);
+                self.terminal_status = if error == 0 {
+                    MODEL_INVOCATION_JOB_STATUS_COMPLETED
+                } else if success == 0 {
+                    MODEL_INVOCATION_JOB_STATUS_FAILED
+                } else {
+                    MODEL_INVOCATION_JOB_STATUS_PARTIALLY_COMPLETED
+                };
+                self.message = message;
+            }
+            model_invocation_run::RunOutcome::Failed(message) => {
+                self.terminal_status = MODEL_INVOCATION_JOB_STATUS_FAILED;
+                self.message = Some(message);
+            }
+            model_invocation_run::RunOutcome::Deferred => {
+                self.run_owed = true;
+                return;
+            }
+        }
+        if self.has_begun() && self.completed_due_at.is_none() {
+            self.status = self.terminal_status;
+        }
     }
 
     /// Materialise the status transitions the clock has already made due at `now`.
@@ -2190,7 +2342,11 @@ impl ModelInvocationJobRecord {
             self.last_modified_at = due;
         }
         if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
-            self.status = MODEL_INVOCATION_JOB_STATUS_COMPLETED;
+            // The terminal status is the one the WORK decided ([`Self::terminal_status`]):
+            // a job every record of which was processed completed, one some of whose
+            // records could not be processed completed in part, and one that could not be
+            // run at all failed with the message it failed on.
+            self.status = self.terminal_status;
             self.completed_due_at = None;
             self.ended_at = Some(due);
             self.last_modified_at = due;
@@ -4349,6 +4505,29 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         }
     }
 
+    /// The runs the batch inference jobs of `region` still owe, taken ONCE
+    /// ([`ModelInvocationJobRecord::due_run`]) and at most
+    /// [`model_invocation_run::MAX_RUNS_PER_REQUEST`] of them per call.
+    ///
+    /// A listing reports the four record counts of every job it carries, and those counts
+    /// are the run's own tally — so a listing takes the runs its jobs are owed exactly as a
+    /// read of one job takes that job's, and the two cannot report different counts for one
+    /// job. Jobs of another region are another account-region's resources and are not
+    /// listed, so their runs are not taken here either.
+    ///
+    /// The number taken per call is BOUNDED because a listing settles every job of the
+    /// Region while the work of one run is bounded by its own input: a job whose run this
+    /// call does not take still owes it, so a later call takes it — and the iteration is
+    /// lazy, so a run that is not taken is not marked as taken either.
+    pub fn due_model_invocation_runs(&mut self, region: &str) -> Vec<model_invocation_run::DueRun> {
+        self.model_invocation_jobs
+            .values_mut()
+            .filter(|record| record.region == region)
+            .filter_map(ModelInvocationJobRecord::due_run)
+            .take(model_invocation_run::MAX_RUNS_PER_REQUEST)
+            .collect()
+    }
+
     /// Whether a stored job in `region` is already customizing a model under
     /// `custom_model_name`.
     ///
@@ -5498,8 +5677,10 @@ pub fn model_invocation_job_summary(record: &ModelInvocationJobRecord) -> ModelI
         role_arn: record.role_arn.clone(),
         status: Some(record.status.to_string()),
         // "If the batch inference job failed, this field contains a message describing why
-        // the job failed": no job of this store fails, so there is no message to report.
-        message: None,
+        // the job failed": the sentence its validation or its run failed on
+        // ([`ModelInvocationJobRecord::message`]), and nothing for a job that has not
+        // failed.
+        message: record.message.clone(),
         submit_time: date_time(record.submit_time),
         last_modified_time: Some(date_time(record.last_modified_at)),
         end_time: record.ended_at.map(date_time),
@@ -5509,13 +5690,19 @@ pub fn model_invocation_job_summary(record: &ModelInvocationJobRecord) -> ModelI
         timeout_duration_in_hours: record.timeout_duration_in_hours,
         job_expiration_time: record.job_expiration_time.map(date_time),
         model_invocation_type: Some(record.model_invocation_type.to_string()),
-        // The record counts are counted BY the inference run over the input in S3; this
-        // emulator reads no input and runs no inference, so none of them is reported rather
-        // than reported as a fabricated count.
-        total_record_count: None,
-        processed_record_count: None,
-        success_record_count: None,
-        error_record_count: None,
+        // The record counts are counted BY the job's own work step: the records read out of
+        // the input object the submission was pointed at ([`model_invocation_run`]) and the
+        // tally of the run that invoked the model over them. A job nothing is known about
+        // the input of has no count to report, which is the one case all four are absent in
+        // — never a job that ran.
+        total_record_count: record.total_record_count,
+        processed_record_count: record
+            .total_record_count
+            .map(|_| record.processed_record_count),
+        success_record_count: record
+            .total_record_count
+            .map(|_| record.success_record_count),
+        error_record_count: record.total_record_count.map(|_| record.error_record_count),
     }
 }
 

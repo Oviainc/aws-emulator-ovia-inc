@@ -24,7 +24,9 @@
 //! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::settle_model_invocation_jobs`]):
 //! a listing reports — and `statusEquals` filters on — the status each job holds now, which
 //! is the status a read of that one job would report at the same instant whether or not
-//! anybody listed.
+//! anybody listed. The RUN each of those transitions made due is materialised the same way
+//! ([`crate::state::model_invocation_run::run_batch_inference`]), so the four record counts
+//! a listing reports are the run's own tally and agree with a read of that one job.
 //!
 //! ## Shape of an operation
 //!
@@ -246,11 +248,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
         // The status each job holds NOW is what a listing reports and what `statusEquals`
         // filters on, so the transitions the clock has already made due are materialised
-        // before either happens.
+        // before either happens — and with them the work those transitions made due: a job
+        // the clock has carried into the status that says it has begun has read its records,
+        // invoked the model over them and stored the results under its output prefix, so
+        // the counts this listing reports account for what is stored there
+        // (`crate::state::model_invocation_run::run_batch_inference`). The runs are
+        // collected while the store is locked and performed after the guard is dropped, so
+        // no lock is held across the in-process calls they make, and each is taken ONCE per
+        // job, so a listing reports what the run established without changing it.
+        let dues = {
+            let mut store = state.lock();
+            store.settle_model_invocation_jobs(now);
+            store.due_model_invocation_runs(&region)
+        };
+        for due in dues {
+            let outcome = crate::state::model_invocation_run::run_batch_inference(
+                &*self.engine,
+                ctx,
+                &due,
+            )
+            .await;
+            if let Some(job) = state.lock().model_invocation_jobs.get_mut(&due.arn) {
+                job.record_run(outcome);
+            }
+        }
+
+        let mut store = state.lock();
         store.settle_model_invocation_jobs(now);
 
         let descending = input

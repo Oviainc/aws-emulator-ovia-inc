@@ -9,7 +9,14 @@
 //! `@readonly`, and the one write it makes is the status transition the CLOCK already made
 //! due for that job ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::model_invocation_job`]):
 //! the job was owed it at the due instant even if nobody had called, which is why the
-//! instants this reports are the due ones rather than the instant of the read.
+//! instants this reports are the due ones rather than the instant of the read. The job's own
+//! RUN is materialised the same way and for the same reason: a job the clock has carried
+//! into the status that says it has begun — "InProgress – this job has begun. You can start
+//! viewing the results in the output S3 location" — has read its records, invoked the model
+//! over them and stored the results under its output prefix
+//! ([`crate::state::model_invocation_run::run_batch_inference`]), so this read reports
+//! counts that account for what is stored there. It is taken ONCE per job, so no later read
+//! runs it again or rewrites what a client already fetched.
 //!
 //! ## Shape of an operation
 //!
@@ -218,8 +225,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
+        // The work the job's own clock already made due, taken here and performed before
+        // this read answers: a job the clock has carried into the status that says it has
+        // begun has read its records, invoked the model over them and stored the results
+        // under its output prefix, so a client that lists that prefix straight after
+        // reading the status finds them
+        // (`crate::state::model_invocation_run::run_batch_inference`). It is collected while
+        // the store is locked and performed after the guard is dropped, so no lock is held
+        // across the in-process calls into the object store and the inference surface, and
+        // it is taken ONCE per job, so this read reports what the run established without
+        // changing it for the next caller.
+        let due = {
+            let mut store = state.lock();
+            let Some(job) = store.model_invocation_job(&input.job_identifier, &region, now) else {
+                return Err(
+                    GetModelInvocationJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "no batch inference job answers to {} in this account in {region}",
+                                input.job_identifier
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            job.due_run()
+        };
+        if let Some(due) = due {
+            let outcome = crate::state::model_invocation_run::run_batch_inference(
+                &*self.engine,
+                ctx,
+                &due,
+            )
+            .await;
+            if let Some(job) = state.lock().model_invocation_jobs.get_mut(&due.arn) {
+                job.record_run(outcome);
+            }
+        }
+
+        let mut store = state.lock();
         let Some(job) = store.model_invocation_job(&input.job_identifier, &region, now) else {
             return Err(
                 GetModelInvocationJobErrorModeled::ResourceNotFoundException(
