@@ -51,6 +51,8 @@ mod configuration_sets;
 mod contact_lists;
 #[path = "all/contact_updates.rs"]
 mod contact_updates;
+#[path = "all/dedicated_ip_pool_deletion.rs"]
+mod dedicated_ip_pool_deletion;
 #[path = "all/dedicated_ip_pools.rs"]
 mod dedicated_ip_pools;
 #[path = "all/dedicated_ip_warmup_attributes.rs"]

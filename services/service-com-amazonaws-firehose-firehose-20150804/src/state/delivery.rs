@@ -1302,6 +1302,10 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
             checksum: None,
             // Nor is it assembled from parts: a delivered object is written whole.
             parts: Vec::new(),
+            // And nothing replicated it: S3's own store settles a replication record from
+            // the bucket's replication configuration when it records a write through its
+            // own data plane.
+            replication: None,
         };
         match store.put_object(&object.bucket, &object.key, stored) {
             Some(

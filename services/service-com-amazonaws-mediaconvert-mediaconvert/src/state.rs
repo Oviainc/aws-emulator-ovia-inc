@@ -588,13 +588,21 @@ pub fn optional_free_text(value: Option<String>) -> Option<String> {
 /// Whether a string member the caller SENT carries no characters at all.
 ///
 /// Every member in this service that names a resource — the `Name` of a queue, a preset or
-/// a job template, and the references (`Queue`, `JobTemplate`, `Role`) that point at one —
-/// targets the model's bare `__string`, which states no pattern and no length, so the
+/// a job template, and the references (`Queue`, `JobTemplate`, `Role`, the `JobId` a share
+/// names, the `Arn` of a certificate or of a tagged resource) that point at one — targets
+/// the model's bare `__string`, which states no pattern and no length, so the
 /// boundary validator passes the zero-length value and a value made only of whitespace
 /// alike. Neither carries a resource identity: a key with no characters addresses nothing
 /// a later read can reach, and a reference with none resolves to nothing. ONE test for all
-/// of them, so no create or update path can disagree about which values are identities,
-/// answered with the bad request [`blank_member_message`] words.
+/// of them, so no door that mints or resolves such a member can disagree about which
+/// values are identities, answered with the bad request [`blank_member_message`] words
+/// rather than with a lookup of a value nothing could hold.
+///
+/// A member that identifies something OUTSIDE this service takes the same test but words
+/// its own refusal: `CreateResourceShare$SupportCaseId` names an AWS Support case rather
+/// than a MediaConvert resource, so it is the one caller-sent identifier whose blank value
+/// is refused in the handler's own sentence. [`blank_member_message`] is for the members
+/// that name a resource this service holds.
 ///
 /// This is the only normalisation such a member gets: a value that DOES carry characters
 /// is stored and echoed byte for byte, surrounding whitespace included, because that value

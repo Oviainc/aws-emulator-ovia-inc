@@ -1051,6 +1051,26 @@ pub struct UnfinishedWork {
     pub work: String,
 }
 
+/// The order placed at a site that a change to that site has to wait for, as a
+/// refusal names it.
+///
+/// Produced by
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::site_order_hold`] so every
+/// operation whose contract makes a change to a site wait for an order in progress
+/// reports the same resource and names the same order, the way [`UnfinishedWork`]
+/// does for a delete.
+#[derive(Debug, Clone)]
+pub struct SiteOrderHold {
+    /// The resource the change waits on, as the refusal names it: the modelled
+    /// `ResourceType` [`RESOURCE_TYPE_ORDER`] and the order's own id, together
+    /// because one without the other names nothing. Absent when the stored order
+    /// carries no id this store can name it by.
+    pub resource: Option<(&'static str, String)>,
+    /// How the refusal's message names the order the caller has to let complete or
+    /// cancel.
+    pub order: String,
+}
+
 /// What holds a change to one of a site's two addresses up, if anything.
 ///
 /// Produced by
@@ -3849,8 +3869,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// An order is placed at a site through an Outpost of that site
     /// ([`OrderRecord::site_id`]) and is outstanding until it is finished
     /// ([`OrderRecord::is_outstanding`]), so this is what the service still owes the
-    /// SITE: the fact a change to either of that site's addresses is held for (see
-    /// [`Self::site_address_block`]). Stated beside
+    /// SITE: the fact a change to that site is held for (see
+    /// [`Self::site_order_hold`]). Stated beside
     /// [`Self::outstanding_order_on_outpost`], which is the same question asked of
     /// the other resource an order belongs to. Scoped to `region` for the reason
     /// [`RegionalRecord`] gives; callers settle first (see [`Self::settle_orders`]),
@@ -3858,6 +3878,40 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     pub fn outstanding_order_at_site(&self, region: &str, site_id: &str) -> Option<&OrderRecord> {
         all_in_region(&self.orders, region)
             .find(|record| record.site_id.as_deref() == Some(site_id) && record.is_outstanding())
+    }
+
+    /// The order placed at `site_id` in `region` that a change to that site has to
+    /// wait for, or `None` when no order there is still outstanding.
+    ///
+    /// Several of this service's operations document that a change to a site waits
+    /// for an order in progress at it — a change to either of the site's addresses
+    /// (`UpdateSiteAddress`) and a change to the rack properties of the site
+    /// (`UpdateSiteRackPhysicalProperties`) — so what holds such a change up is
+    /// stated ONCE here: the order still outstanding at the site
+    /// ([`Self::outstanding_order_at_site`]), together with the resource the refusal
+    /// names it by. Each operation then words its own message around
+    /// [`SiteOrderHold::order`], and none of them can disagree about whether an order
+    /// at the site holds a change up.
+    ///
+    /// Callers settle first (see [`Self::settle_orders`]), so the order statuses read
+    /// here are the ones the orders hold at that instant.
+    pub fn site_order_hold(&self, region: &str, site_id: &str) -> Option<SiteOrderHold> {
+        let order = self.outstanding_order_at_site(region, site_id)?;
+        // The order itself is a resource the modelled `ResourceType` names, so the
+        // conflict an order causes names the order. An order record the store holds
+        // is keyed by the id it reports, so the fallback is for a record that names
+        // no order at all: the refusal still states the limit, naming no resource
+        // rather than one it cannot identify.
+        Some(match order.order.order_id.as_deref() {
+            Some(order_id) => SiteOrderHold {
+                resource: Some((RESOURCE_TYPE_ORDER, order_id.to_string())),
+                order: format!("order {order_id}"),
+            },
+            None => SiteOrderHold {
+                resource: None,
+                order: "an order placed at it".to_string(),
+            },
+        })
     }
 
     /// The quote of `outpost_id` an order WAS submitted from, if this region's
@@ -4028,21 +4082,10 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         site_id: &str,
         kind: SiteAddressKind,
     ) -> Option<SiteAddressBlock> {
-        if let Some(order) = self.outstanding_order_at_site(region, site_id) {
-            // The order itself is a resource the modelled `ResourceType` names, so
-            // the conflict an order causes names the order. An order record the
-            // store holds is keyed by the id it reports, so the fallback is for a
-            // record that names no order at all: the refusal still states the limit,
-            // naming no resource rather than one it cannot identify.
-            return Some(match order.order.order_id.as_deref() {
-                Some(order_id) => SiteAddressBlock {
-                    resource: Some((RESOURCE_TYPE_ORDER, order_id.to_string())),
-                    message: site_address_order_conflict(site_id, &format!("order {order_id}")),
-                },
-                None => SiteAddressBlock {
-                    resource: None,
-                    message: site_address_order_conflict(site_id, "an order placed at it"),
-                },
+        if let Some(hold) = self.site_order_hold(region, site_id) {
+            return Some(SiteAddressBlock {
+                resource: hold.resource,
+                message: site_address_order_conflict(site_id, &hold.order),
             });
         }
         if kind != SiteAddressKind::Operating {
@@ -5294,19 +5337,40 @@ pub fn site_address_conflict(site_id: &str, outpost_id: &str) -> String {
     )
 }
 
+/// How this service states that a change to a site is held while an order placed at
+/// that site is still in progress: what is being changed, the site, and the order the
+/// caller has to let complete or cancel.
+///
+/// AWS documents the limit on each operation it applies to but publishes no wording
+/// for the refusal, so the sentence is the emulator's own, worded by the same rule as
+/// [`site_address_conflict`]: what a caller branches on is the `ConflictException`
+/// code (HTTP 409) and the `ResourceId` / `ResourceType` members naming the order
+/// ([`SiteOrderHold::resource`]). Stated once here so every operation that waits on an
+/// order at the site says the same thing about it.
+pub fn site_order_conflict(changed: &str, site_id: &str, order: &str) -> String {
+    format!("the {changed} of site {site_id} cannot be updated while {order} is in progress")
+}
+
 /// How this service states that a site's address — of EITHER type — cannot be
 /// changed while an order placed at that site is still in progress.
 ///
 /// AWS documents the rule — "You can't update a site address if there is an order
 /// in progress. You must wait for the order to complete or cancel the order."
-/// (`UpdateSiteAddress`) — but publishes no wording for the refusal, so the
-/// sentence is the emulator's own, worded by the same rule as
-/// [`site_address_conflict`]: what a caller branches on is the `ConflictException`
-/// code (HTTP 409) and the `ResourceId` / `ResourceType` members naming the order,
-/// while the message names the order ([`SiteAddressBlock::message`]) it has to wait
-/// for or cancel.
+/// (`UpdateSiteAddress`) — and the sentence is worded by [`site_order_conflict`].
 pub fn site_address_order_conflict(site_id: &str, order: &str) -> String {
-    format!("the address of site {site_id} cannot be updated while {order} is in progress")
+    site_order_conflict("address", site_id, order)
+}
+
+/// How this service states that the rack properties of a site cannot be changed
+/// while an order placed at that site is still in progress.
+///
+/// AWS documents the rule — "To update a rack at a site with an order of IN_PROGRESS,
+/// you must wait for the order to complete or cancel the order."
+/// (`UpdateSiteRackPhysicalProperties`) — and the sentence is worded by
+/// [`site_order_conflict`], the same one [`site_address_order_conflict`] uses, because
+/// it is the same limit on another change to the same site.
+pub fn site_rack_properties_order_conflict(site_id: &str, order: &str) -> String {
+    site_order_conflict("rack physical properties", site_id, order)
 }
 
 /// How this service states that a site cannot be deleted while an Outpost still

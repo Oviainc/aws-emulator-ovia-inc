@@ -25,7 +25,7 @@
 //! ([`UploadedPart`]), each addressable by its own part number.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use md5::{Digest, Md5};
 
@@ -37,6 +37,11 @@ pub mod notifications;
 // The request-correlation pair one response carries, which is also what a notification
 // names the call it came of by — see `state/request_ids.rs`.
 pub mod request_ids;
+
+// What a bucket's stored replication configuration DOES when an object version is written
+// or a delete marker is laid — which rules cover a key, where each one copies it, and what
+// the source version then reports — lives in `state/replication.rs`.
+pub mod replication;
 
 /// The Region a general purpose bucket is created in when the request names no
 /// `CreateBucketConfiguration.LocationConstraint`.
@@ -6540,6 +6545,21 @@ pub struct Object {
     /// while the bucket's ACLs are disabled — disabling them takes nothing away, so these
     /// grants are reported again once ACLs affect permissions on the bucket.
     pub acl: Option<Vec<AclGrant>>,
+    /// What replication did with this stored version — see [`ObjectReplication`] — or
+    /// `None` for a version no replication rule covers, which is the state of every object
+    /// in a bucket with no replication configuration.
+    ///
+    /// "If your request involves a bucket that is either a source or a destination in a
+    /// replication rule" the reader reports a `ReplicationStatus`
+    /// (`GetObjectOutput$ReplicationStatus`); for every other object there is nothing to
+    /// report, which is why this is an `Option` and why a reader of an object outside every
+    /// rule reports no status at all.
+    ///
+    /// Settled by the write that stored the version, through
+    /// [`ComAmazonawsS3Amazons3State::replicate_write`] — the one place that performs the
+    /// replication and records its outcome, so the status describes a copy that was really
+    /// made.
+    pub replication: Option<ObjectReplication>,
 }
 
 /// One annotation attached to one stored object version: the payload
@@ -6975,6 +6995,96 @@ impl ObjectRestore {
 /// `Tier` enum's values (`smithy_query(query="shape",shape="Tier")`).
 pub const DEFAULT_RESTORE_TIER: &str = "Standard";
 
+/// The `ReplicationStatus` a SOURCE object version carries once its replication is done:
+/// every rule that covers it copied it to its destination.
+///
+/// One of the values the enum publishes
+/// (`smithy_query(query="shape",shape="com.amazonaws.s3#ReplicationStatus")` reports
+/// `[COMPLETE, PENDING, FAILED, REPLICA, COMPLETED]`).
+pub const REPLICATION_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// The `ReplicationStatus` a source object version carries while the replication its
+/// bucket's configuration calls for has not been reported done yet.
+pub const REPLICATION_STATUS_PENDING: &str = "PENDING";
+
+/// The `ReplicationStatus` a source object version carries when the replication a rule
+/// calls for could not be performed — a destination this emulator cannot write.
+pub const REPLICATION_STATUS_FAILED: &str = "FAILED";
+
+/// The `ReplicationStatus` the COPY carries: "the object in the destination bucket is a
+/// replica" (`HeadObjectOutput$ReplicationStatus`), which is a finished object from the
+/// moment it is written.
+pub const REPLICATION_STATUS_REPLICA: &str = "REPLICA";
+
+/// How long after the write that started it a replication is reported done.
+///
+/// Replication is asynchronous — "Amazon S3 replicates objects asynchronously"
+/// (`PutBucketReplication`'s own documentation), with no published duration — so the span a
+/// source object spends in [`REPLICATION_STATUS_PENDING`] is this emulator's own, chosen
+/// short enough that a caller polling the status sees it settle and long enough that a
+/// caller reading straight after the write still sees the transient state.
+pub const REPLICATION_SETTLES_AFTER: Duration = Duration::from_secs(3);
+
+/// What replication did with one stored object version: the status it settles on, and when
+/// that status is reported.
+///
+/// The copy itself is made by the write that recorded the version
+/// ([`ComAmazonawsS3Amazons3State::replicate_write`]), so this records an outcome rather
+/// than a promise; what the clock still owes is only the moment the source version stops
+/// reporting [`REPLICATION_STATUS_PENDING`] and reports that outcome
+/// ([`Self::status_at`]) — the asynchrony AWS's own replication has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectReplication {
+    /// The status this version settles on: [`REPLICATION_STATUS_COMPLETED`] or
+    /// [`REPLICATION_STATUS_FAILED`] for a source version, and
+    /// [`REPLICATION_STATUS_REPLICA`] for the copy.
+    pub settled: String,
+    /// The instant from which [`Self::status_at`] reports [`Self::settled`]; before it, a
+    /// source version reports [`REPLICATION_STATUS_PENDING`]. The write's own instant for a
+    /// replica, which is finished the moment it exists.
+    pub settles_at: SystemTime,
+}
+
+impl ObjectReplication {
+    /// The outcome `settled` of a SOURCE version written at `at`, reported from
+    /// [`REPLICATION_SETTLES_AFTER`] past that write.
+    pub fn source(settled: &str, at: SystemTime) -> Self {
+        Self {
+            settled: settled.to_string(),
+            settles_at: at + REPLICATION_SETTLES_AFTER,
+        }
+    }
+
+    /// The replica written at `at` — [`REPLICATION_STATUS_REPLICA`] from the moment it is
+    /// stored, because the copy is what the status describes and it is already there.
+    pub fn replica(at: SystemTime) -> Self {
+        Self {
+            settled: REPLICATION_STATUS_REPLICA.to_string(),
+            settles_at: at,
+        }
+    }
+
+    /// The `ReplicationStatus` a reader at `now` reports for this version:
+    /// [`REPLICATION_STATUS_PENDING`] until [`Self::settles_at`], and the settled outcome
+    /// from then on.
+    ///
+    /// A pure function of the clock: a read reports it and writes nothing.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            REPLICATION_STATUS_PENDING
+        } else {
+            &self.settled
+        }
+    }
+
+    /// How many bytes this record retains — the status string kept beside the object, which
+    /// the per-bucket and service-wide budgets count like every other string an object
+    /// holds.
+    pub fn retained_bytes(&self) -> usize {
+        self.settled.len()
+    }
+}
+
 
 impl Object {
     /// A freshly written object of `body`, as a write that names nothing about it beyond its
@@ -7017,6 +7127,9 @@ impl Object {
             checksum: None,
             // Nor is it assembled from parts: one write stored it whole.
             parts: Vec::new(),
+            // Replication is settled by the store once the version is recorded (see
+            // [`ComAmazonawsS3Amazons3State::replicate_write`]), not by the writer.
+            replication: None,
         }
     }
 
@@ -7055,6 +7168,10 @@ impl Object {
                 .restore
                 .as_ref()
                 .map_or(0, ObjectRestore::retained_bytes)
+            + self
+                .replication
+                .as_ref()
+                .map_or(0, ObjectReplication::retained_bytes)
             + [
                 &self.content_type,
                 &self.cache_control,
@@ -7510,6 +7627,57 @@ pub const CHECKSUM_TYPE_COMPOSITE: &str = "COMPOSITE";
 /// checksums.
 pub const FULL_OBJECT_CHECKSUM_ALGORITHMS: [&str; 1] = ["CRC64NVME"];
 
+/// The `ChecksumAlgorithm` values a multipart object may carry a
+/// [`CHECKSUM_TYPE_FULL_OBJECT`] checksum under.
+///
+/// A multipart upload's object-level checksum is settled from its PARTS, so a full-object
+/// value is only available for an algorithm whose part digests combine into the digest of
+/// the whole object — the CRC-based ones. The Amazon S3 User Guide (*Checking object
+/// integrity*) publishes full object checksums for exactly those (`CRC32`, `CRC32C` and
+/// `CRC64NVME`) and composite checksums for the others, which is why a multipart upload
+/// asking for `FULL_OBJECT` under any other algorithm names a pair S3 does not settle (see
+/// [`settle_multipart_checksum_type`]).
+pub const FULL_OBJECT_CAPABLE_CHECKSUM_ALGORITHMS: [&str; 3] = ["CRC32", "CRC32C", "CRC64NVME"];
+
+/// The `ChecksumType` a multipart upload under `algorithm` is settled with when its
+/// initiating request asked for `requested` (`None` when it asked for no type at all), or
+/// `None` when the two name a combination S3 does not settle.
+///
+/// The rule, for every `ChecksumAlgorithm` the model publishes:
+///
+/// * an algorithm whose checksum "is always a full object checksum"
+///   ([`FULL_OBJECT_CHECKSUM_ALGORITHMS`]) settles [`CHECKSUM_TYPE_FULL_OBJECT`], and
+///   admits no other type;
+/// * [`CHECKSUM_TYPE_FULL_OBJECT`] is settled for an algorithm whose parts' checksums
+///   combine into the whole object's ([`FULL_OBJECT_CAPABLE_CHECKSUM_ALGORITHMS`]) when the
+///   request asks for it, and for no other algorithm;
+/// * every other algorithm settles [`CHECKSUM_TYPE_COMPOSITE`] — the composition over the
+///   parts' checksums that "determines how part-level checksums are combined to create an
+///   object-level checksum for multipart objects"
+///   (`CreateMultipartUploadRequest$ChecksumType`).
+///
+/// ONE place for the rule, so the type an initiation reports and records, the type a later
+/// completion composes the value under ([`multipart_checksum`]), and the type a reader of
+/// the upload reports cannot disagree.
+pub fn settle_multipart_checksum_type(
+    algorithm: &str,
+    requested: Option<&str>,
+) -> Option<&'static str> {
+    let always_full_object = FULL_OBJECT_CHECKSUM_ALGORITHMS.contains(&algorithm);
+    let may_be_full_object = FULL_OBJECT_CAPABLE_CHECKSUM_ALGORITHMS.contains(&algorithm);
+    match requested {
+        Some(CHECKSUM_TYPE_FULL_OBJECT) => may_be_full_object.then_some(CHECKSUM_TYPE_FULL_OBJECT),
+        Some(CHECKSUM_TYPE_COMPOSITE) => (!always_full_object).then_some(CHECKSUM_TYPE_COMPOSITE),
+        // The request named no type at all: the one its algorithm settles.
+        None if always_full_object => Some(CHECKSUM_TYPE_FULL_OBJECT),
+        None => Some(CHECKSUM_TYPE_COMPOSITE),
+        // A value outside the two the enum publishes is no type this settles, so it is
+        // refused like any other pair it does not settle rather than folded into "the
+        // request named none", which would settle a type the request never asked for.
+        Some(_) => None,
+    }
+}
+
 /// The RAW digest bytes the `ChecksumAlgorithm` value `algorithm` computes over `data`, or
 /// `None` for a value this emulator has no implementation of.
 ///
@@ -7582,23 +7750,19 @@ pub fn composite_checksum(algorithm: &str, parts: &[&[u8]]) -> Option<String> {
 /// upload named no algorithm, or named one this emulator cannot compute, in which case the
 /// object carries no checksum at all rather than one it did not compute.
 ///
-/// The type is the one the upload settled when it named one, and otherwise the one the
-/// algorithm admits: a composition over the parts' checksums, except for an algorithm whose
-/// checksum "is always a full object checksum" ([`FULL_OBJECT_CHECKSUM_ALGORITHMS`]). The
-/// value follows from the type — a composition over the parts, or the digest of the whole
-/// assembled object — so the two can never describe different computations.
+/// The type is the one [`settle_multipart_checksum_type`] settles for the upload's
+/// algorithm and the type it asked for — the same rule the initiation reported and recorded
+/// — so an upload whose pair S3 does not settle carries no checksum rather than one under a
+/// type it never agreed to. The value follows from the type — a composition over the parts,
+/// or the digest of the whole assembled object — so the two can never describe different
+/// computations.
 pub fn multipart_checksum(
     algorithm: Option<&str>,
     requested_type: Option<&str>,
     parts: &[&[u8]],
 ) -> Option<ObjectChecksum> {
     let algorithm = algorithm?;
-    let checksum_type = match requested_type {
-        Some(CHECKSUM_TYPE_FULL_OBJECT) => CHECKSUM_TYPE_FULL_OBJECT,
-        Some(CHECKSUM_TYPE_COMPOSITE) => CHECKSUM_TYPE_COMPOSITE,
-        _ if FULL_OBJECT_CHECKSUM_ALGORITHMS.contains(&algorithm) => CHECKSUM_TYPE_FULL_OBJECT,
-        _ => CHECKSUM_TYPE_COMPOSITE,
-    };
+    let checksum_type = settle_multipart_checksum_type(algorithm, requested_type)?;
     let value = if checksum_type == CHECKSUM_TYPE_COMPOSITE {
         composite_checksum(algorithm, parts)?
     } else {
@@ -8476,6 +8640,39 @@ impl ComAmazonawsS3Amazons3State {
     /// [`ObjectWrite::Created`] or [`ObjectWrite::Replaced`]; a refusal leaves every
     /// stored object exactly as it was, and mints nothing.
     pub fn put_object(&mut self, bucket: &str, key: &str, object: Object) -> Option<ObjectWrite> {
+        self.record_object(bucket, key, object, None)
+    }
+
+    /// Store the REPLICA `object` at `key` in the bucket named `bucket`, under
+    /// `replicated_version` — the id of the SOURCE version it is a copy of — rather than an
+    /// id of its own.
+    ///
+    /// A replica keeps its source's version id: the copy is the same version of the same
+    /// object in another bucket, which is what lets a reader address it there by the id the
+    /// source reported. Everything else is [`Self::put_object`]'s: the same per-bucket and
+    /// service-wide ceilings bound a replica, so a destination that is full refuses the copy
+    /// rather than growing past them — which is what the source version then reports as a
+    /// replication that did not happen (see [`Self::replicate_write`]).
+    pub fn put_replica(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        object: Object,
+        replicated_version: Option<&str>,
+    ) -> Option<ObjectWrite> {
+        self.record_object(bucket, key, object, replicated_version)
+    }
+
+    /// [`Self::put_object`] and [`Self::put_replica`] in one: `replicated_version` is the
+    /// version id a REPLICA keeps, and `None` asks for the id the bucket's versioning state
+    /// calls for.
+    fn record_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        object: Object,
+        replicated_version: Option<&str>,
+    ) -> Option<ObjectWrite> {
         let held_bucket = self.buckets.get(bucket)?;
         let versioned = held_bucket.versioning_enabled();
         // Whether this write keeps the version it supersedes, which is what decides
@@ -8496,11 +8693,15 @@ impl ComAmazonawsS3Amazons3State {
         }
         // The id is minted before the budgets are measured, so the bytes it retains are
         // counted; a refusal below leaves it unused, which costs nothing but the sequence
-        // number it consumed (ids are opaque, and nothing numbers them).
-        let minted = versioned.then(|| {
-            self.minted_versions = self.minted_versions.saturating_add(1);
-            mint_version_id(bucket, key, self.minted_versions)
-        });
+        // number it consumed (ids are opaque, and nothing numbers them). A REPLICA mints
+        // none: it keeps the id of the source version it copies.
+        let minted = match replicated_version {
+            Some(replicated) => Some(replicated.to_string()),
+            None => versioned.then(|| {
+                self.minted_versions = self.minted_versions.saturating_add(1);
+                mint_version_id(bucket, key, self.minted_versions)
+            }),
+        };
         let incoming = object.retained_bytes() + minted.as_ref().map_or(0, String::len);
         // The same allowance the five other whole-store checks subtract
         // ([`Self::published_allowance`]), so this path hands out no room for published
@@ -8527,6 +8728,163 @@ impl ComAmazonawsS3Amazons3State {
         self.buckets
             .get_mut(bucket)
             .map(|held| held.put_object(key, object, minted))
+    }
+
+    /// Carry out the replication the bucket named `bucket` owes for the version its last
+    /// write stored at `key`, reporting what that version now carries — or `None` when no
+    /// enabled rule of that bucket covers the key, which is the state of every object in a
+    /// bucket with no replication configuration (and so of every object whose reader reports
+    /// no `ReplicationStatus` at all).
+    ///
+    /// What it does, for each destination `state::replication::destinations` names: the
+    /// stored version is copied there byte-identically, under the same key and the same
+    /// version id ([`Self::put_replica`]), where it is a replica. The source version then
+    /// carries [`REPLICATION_STATUS_COMPLETED`] when every one of those copies was made and
+    /// [`REPLICATION_STATUS_FAILED`] when one could not be — a destination this emulator
+    /// does not hold, one whose versioning is not enabled (replication copies object
+    /// versions, so a destination without them cannot hold one), or one already at a
+    /// ceiling. Either way the status is reported from
+    /// [`REPLICATION_SETTLES_AFTER`] past the write ([`ObjectReplication::status_at`]).
+    ///
+    /// Called by the write that recorded the version, AFTER the store accepted it, so a
+    /// refused write replicates nothing. A REPLICA is never replicated again, because the
+    /// copy is written through [`Self::put_replica`] — which records it and replicates
+    /// nothing itself — rather than through the write path that calls this: a configuration
+    /// pointing back at the source therefore cannot copy a replica home.
+    ///
+    /// The WORK one write may do here is bounded, because both of its factors are a
+    /// caller's to choose: how many destinations the stored configuration names and how
+    /// large the object is. At most
+    /// [`MAX_REPLICATION_DESTINATIONS_PER_WRITE`] copies are made and at most
+    /// [`MAX_REPLICATION_BYTES_PER_WRITE`] bytes are copied in one call, and the FIRST copy
+    /// the store refuses ends the fan-out rather than letting every further destination pay
+    /// for a copy that cannot be stored. A write past either ceiling records
+    /// [`REPLICATION_STATUS_FAILED`], which is what the source version then reports: the
+    /// copies past it were not made.
+    pub fn replicate_write(&mut self, bucket: &str, key: &str) -> Option<ObjectReplication> {
+        // The tag set alone, because that is all the SELECTION needs: a bucket with no
+        // configuration — and a key no rule covers — pays no copy of the object at all.
+        let tags = self.bucket(bucket)?.object(key)?.tags.clone();
+        let destinations = replication::destinations(self, bucket, key, &tags);
+        if destinations.is_empty() {
+            return None;
+        }
+        let asked = destinations.len();
+        let source_version = self.bucket(bucket)?.object(key)?.clone();
+        let body_bytes = source_version.body.len();
+
+        // More destinations than one write replicates to is work this emulator does not do:
+        // the copies past the ceiling are not made, and the source version says so.
+        let mut every_copy_made = asked <= MAX_REPLICATION_DESTINATIONS_PER_WRITE;
+        let mut copied_bytes = 0usize;
+        for target in destinations
+            .into_iter()
+            .take(MAX_REPLICATION_DESTINATIONS_PER_WRITE)
+        {
+            // A destination this emulator cannot hold a version in replicates nothing: a
+            // bucket it does not hold, one whose versioning is not enabled, and the SOURCE
+            // bucket itself (a bucket cannot be its own destination, which would replace
+            // the very version being replicated with a replica of it).
+            let writable = self
+                .bucket(&target.bucket)
+                .is_some_and(Bucket::versioning_enabled);
+            if !writable || target.bucket == bucket {
+                every_copy_made = false;
+                continue;
+            }
+            // The byte ceiling is consulted BEFORE the copy is made, so the bytes this one
+            // call copies are bounded whatever the configuration asks for.
+            if copied_bytes.saturating_add(body_bytes) > MAX_REPLICATION_BYTES_PER_WRITE {
+                every_copy_made = false;
+                break;
+            }
+            let replica = replication::replica_of(
+                &source_version,
+                target.storage_class.as_deref(),
+                SystemTime::now(),
+            );
+            let written = self.put_replica(
+                &target.bucket,
+                key,
+                replica,
+                source_version.version_id.as_deref(),
+            );
+            if matches!(
+                written,
+                Some(ObjectWrite::Created) | Some(ObjectWrite::Replaced)
+            ) {
+                copied_bytes = copied_bytes.saturating_add(body_bytes);
+            } else {
+                // A store that cannot hold this copy cannot hold the next one either, so
+                // the fan-out ends here instead of copying a body per remaining
+                // destination only to have each one refused.
+                every_copy_made = false;
+                break;
+            }
+        }
+
+        let settled = if every_copy_made {
+            REPLICATION_STATUS_COMPLETED
+        } else {
+            REPLICATION_STATUS_FAILED
+        };
+        let record = ObjectReplication::source(settled, source_version.last_modified);
+        self.buckets
+            .get_mut(bucket)?
+            .addressed_object_mut(key, source_version.version_id.as_deref())?
+            .replication = Some(record.clone());
+        Some(record)
+    }
+
+    /// Whether the bucket named `bucket` carries a replication configuration at all — the
+    /// ONE question a caller with many keys asks once, instead of asking after each of them
+    /// what a bucket that replicates nothing owes.
+    ///
+    /// Read-only, and cheap: it looks at the stored container rather than at any rule.
+    pub fn replicates_objects(&self, bucket: &str) -> bool {
+        self.bucket(bucket)
+            .and_then(Bucket::replication)
+            .is_some()
+    }
+
+    /// Replicate the DELETE MARKER a delete just laid on `key` in the bucket named
+    /// `bucket`, reporting how many destinations it was laid in.    ///
+    /// "Specifies whether Amazon S3 replicates delete markers"
+    /// (`DeleteMarkerReplication$Status`): a marker goes only to the destinations of the
+    /// covering rules that ask for it, so a rule carrying no `DeleteMarkerReplication` — or
+    /// one whose status is not `Enabled` — leaves its destination unmarked. The marker laid
+    /// in the destination is that bucket's own ([`Self::remove_object`] mints its id there),
+    /// because a delete marker carries no bytes to copy.
+    ///
+    /// Called by the delete that laid the marker. The PERMANENT delete of one version never
+    /// reaches here, which is the published rule: a delete naming a version id is not
+    /// replicated. A batch delete asks [`Self::replicates_objects`] once and calls this only
+    /// for a bucket that has a configuration at all, so a bucket with none pays nothing per
+    /// key; and one call marks at most [`MAX_REPLICATION_DESTINATIONS_PER_WRITE`]
+    /// destinations, the same ceiling a write's fan-out is bounded by.
+    pub fn replicate_delete_marker(&mut self, bucket: &str, key: &str) -> usize {
+        let marked: Vec<String> = replication::destinations(self, bucket, key, &[])
+            .into_iter()
+            .filter(|target| target.delete_markers && target.bucket != bucket)
+            .map(|target| target.bucket)
+            .take(MAX_REPLICATION_DESTINATIONS_PER_WRITE)
+            .collect();
+        let mut laid = 0usize;
+        for destination in marked {
+            if !self
+                .bucket(&destination)
+                .is_some_and(Bucket::versioning_enabled)
+            {
+                continue;
+            }
+            if matches!(
+                self.remove_object(&destination, key),
+                Some(ObjectDeletion::MarkerLaid { .. })
+            ) {
+                laid += 1;
+            }
+        }
+        laid
     }
 
     /// Record `upload` as a new multipart upload in progress in the bucket named
@@ -9393,6 +9751,9 @@ impl ComAmazonawsS3Amazons3State {
                     checksum: None,
                     // Nor parts: a published object is stored whole.
                     parts: Vec::new(),
+                    // And no replication: a published bucket carries no replication
+                    // configuration, so nothing replicates its objects.
+                    replication: None,
                 };
                 let _ = self.put_object(published.name, object.key, stored);
             }
@@ -9983,6 +10344,24 @@ pub const MAX_SERVER_SIDE_ENCRYPTION_RULES: usize = 10;
 /// (`PutBucketReplication`'s own documentation). The lower end is the same sentence: a
 /// configuration naming no rule is not one S3 records.
 pub const MAX_REPLICATION_RULES: usize = 1_000;
+
+/// How many destinations ONE write replicates to, and how many bytes of replicas it copies.
+///
+/// This emulator's own ceilings, not AWS quotas: a stored configuration may name up to
+/// [`MAX_REPLICATION_RULES`] destinations and an object may be as large as
+/// [`MAX_OBJECT_BYTES_PER_BUCKET`], and the work ONE write would do is the PRODUCT of the
+/// two — both of them a caller's to choose. So the fan-out one call performs is bounded
+/// here, in the place that performs it ([`ComAmazonawsS3Amazons3State::replicate_write`]),
+/// rather than by each factor separately: at most this many copies, carrying at most
+/// [`MAX_REPLICATION_BYTES_PER_WRITE`] bytes between them. Past either, the copies are not
+/// made and the source version reports [`REPLICATION_STATUS_FAILED`], which is what
+/// "replication did not happen" says — nothing claims a copy that was not written.
+pub const MAX_REPLICATION_DESTINATIONS_PER_WRITE: usize = 10;
+
+/// See [`MAX_REPLICATION_DESTINATIONS_PER_WRITE`] — the bytes half of the same bound, so a
+/// write of a large object fans out to fewer destinations rather than copying the product of
+/// the two ceilings.
+pub const MAX_REPLICATION_BYTES_PER_WRITE: usize = 4 * MAX_OBJECT_BYTES_PER_BUCKET;
 
 /// How many S3 Intelligent-Tiering configurations one bucket may carry.
 ///
@@ -10593,6 +10972,9 @@ mod tests {
             checksum: None,
             // Nor parts: this object is stored whole.
             parts: Vec::new(),
+            // And no replication: `replicate_write` is what settles one, from the bucket's
+            // own replication configuration.
+            replication: None,
         }
     }
 
