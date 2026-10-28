@@ -285,17 +285,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         );
 
-        // One extra group is taken: its presence is what says another page
-        // exists, and the token resumes exactly where this page stopped.
-        let taken: Vec<crate::state::ActionGroup> = grouped
+        // The groups are what gets paged, and the page walk is the one every
+        // paginated listing of this service performs:
+        // `crate::state::serve_page`. Each group is projected into the modelled
+        // summary afterwards, so the projection runs only for the page served.
+        let (groups, next_token): (Vec<crate::state::ActionGroup>, Option<String>) =
+            crate::state::serve_page(grouped, offset, page_size, selection_fingerprint);
+        let page: Vec<PreviewResultSummary> = groups
             .into_iter()
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .collect();
-        let has_more = taken.len() > page_size;
-        let page: Vec<PreviewResultSummary> = taken
-            .into_iter()
-            .take(page_size)
             .map(|group| PreviewResultSummary {
                 key: group.key,
                 total: RulePreviewTotal {
@@ -304,12 +301,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             })
             .collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_page_token(&crate::state::PageCursor {
-                offset: offset + page.len(),
-                filter_fingerprint: selection_fingerprint,
-            })
-        });
 
         Ok(ListAutomationRulePreviewSummariesOutput {
             preview_result_summaries: Some(page),

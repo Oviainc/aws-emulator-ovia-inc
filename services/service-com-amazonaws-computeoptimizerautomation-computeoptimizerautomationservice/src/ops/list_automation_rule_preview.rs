@@ -266,28 +266,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The selection itself — scope, requested action types, criteria — is
         // `crate::state::previewed_actions`, so this operation and
         // `ListAutomationRulePreviewSummaries` report over exactly the same set
-        // of actions for the same request.
-        let matching: Vec<PreviewResult> = crate::state::previewed_actions(
-            &guard.recommended_actions,
-            scope.as_deref(),
-            &input.recommended_action_types,
-            &criteria,
-        )
-        .skip(offset)
-        .take(page_size.saturating_add(1))
-        .map(crate::state::preview_result_for)
-        .collect();
-
-        // One extra result was taken: its presence is what says another page
-        // exists, and the token resumes exactly where this page stopped.
-        let has_more = matching.len() > page_size;
-        let page: Vec<PreviewResult> = matching.into_iter().take(page_size).collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_page_token(&crate::state::PageCursor {
-                offset: offset + page.len(),
-                filter_fingerprint: selection_fingerprint,
-            })
-        });
+        // of actions for the same request. Paging it is the one page walk every
+        // paginated listing of this service performs:
+        // `crate::state::serve_page`.
+        let (page, next_token): (Vec<PreviewResult>, Option<String>) = crate::state::serve_page(
+            crate::state::previewed_actions(
+                &guard.recommended_actions,
+                scope.as_deref(),
+                &input.recommended_action_types,
+                &criteria,
+            )
+            .map(crate::state::preview_result_for),
+            offset,
+            page_size,
+            selection_fingerprint,
+        );
 
         Ok(ListAutomationRulePreviewOutput {
             preview_results: Some(page),

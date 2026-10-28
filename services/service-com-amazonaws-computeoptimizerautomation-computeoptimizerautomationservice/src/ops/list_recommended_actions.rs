@@ -231,25 +231,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = guard.opt_in_required() {
             return Err(ListRecommendedActionsErrorModeled::OptInRequiredException(refusal).into());
         }
-        let matching: Vec<RecommendedAction> = guard
-            .recommended_actions
-            .iter_in_order()
-            .filter(|action| crate::state::recommended_action_matches_filters(action, &filters))
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .cloned()
-            .collect();
-
-        // One extra action was taken: its presence is what says another page
-        // exists, and the token resumes exactly where this page stopped.
-        let has_more = matching.len() > page_size;
-        let page: Vec<RecommendedAction> = matching.into_iter().take(page_size).collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_page_token(&crate::state::PageCursor {
-                offset: offset + page.len(),
+        // The matching actions are what gets paged, and the page walk is the one
+        // every paginated listing of this service performs:
+        // `crate::state::serve_page`.
+        let (page, next_token): (Vec<RecommendedAction>, Option<String>) =
+            crate::state::serve_page(
+                guard
+                    .recommended_actions
+                    .iter_in_order()
+                    .filter(|action| {
+                        crate::state::recommended_action_matches_filters(action, &filters)
+                    })
+                    .cloned(),
+                offset,
+                page_size,
                 filter_fingerprint,
-            })
-        });
+            );
 
         Ok(ListRecommendedActionsOutput {
             recommended_actions: Some(page),
