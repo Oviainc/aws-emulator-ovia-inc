@@ -1123,13 +1123,16 @@ async fn a_write_past_the_stores_budget_is_refused_and_a_delete_frees_it() {
     .await;
 
     // Items just under the documented 400 KB per-item limit, so the emulator's
-    // per-table budget is reached in a few dozen writes rather than millions.
+    // per-table budget is reached in a few dozen writes rather than millions. Each one
+    // goes to its OWN partition key: the per-partition-key write ceiling is a different
+    // budget (a hot key is throttled, not refused), and what this suite is about is the
+    // store's own size budget.
     let payload = "x".repeat(399 * 1024);
     let item = |index: usize| {
         json!({
             "TableName": "Bulk",
             "Item": {
-                "Part": {"S": "p"},
+                "Part": {"S": format!("p{index}")},
                 "Sort": {"N": index.to_string()},
                 "Blob": {"S": payload},
             },
@@ -1187,7 +1190,7 @@ async fn a_write_past_the_stores_budget_is_refused_and_a_delete_frees_it() {
     ok(
         &router,
         "DeleteItem",
-        json!({"TableName": "Bulk", "Key": {"Part": {"S": "p"}, "Sort": {"N": "0"}}}),
+        json!({"TableName": "Bulk", "Key": {"Part": {"S": "p0"}, "Sort": {"N": "0"}}}),
     )
     .await;
     let (status, retried) = call(&router, "PutItem", &item(index)).await;

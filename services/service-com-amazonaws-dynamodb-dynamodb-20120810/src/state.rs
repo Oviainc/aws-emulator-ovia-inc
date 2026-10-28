@@ -30,12 +30,14 @@ use crate::ops::types::{
     LocalSecondaryIndexInfo,
     PointInTimeRecoveryDescription, Projection,
     ProvisionedThroughput, ProvisionedThroughputDescription, RestoreSummary, S3BucketSource,
+    ProvisionedThroughputExceededException,
     SearchSchemaElement,
     SourceTableDetails,
     OnDemandThroughput,
     SourceTableFeatureDetails, StreamSpecification, Tag,
     TableClassSummary, TableDescription, TableThroughputModeSummary,
     TableWarmThroughputDescription, TimeToLiveDescription, VectorAttributeDefinition,
+    ThrottlingReason,
     VectorIndexDescription,
     VectorIndexInfo,
     WarmThroughput,
@@ -387,6 +389,36 @@ pub const DEFAULT_TABLE_MAX_WRITE_CAPACITY_UNITS: i64 = 40_000;
 /// budget in [`CapacityBudget`] can hold, so a table that has been idle admits a burst
 /// of this many seconds' worth of writes at once and no more.
 pub const BURST_CAPACITY_WINDOW: Duration = Duration::from_secs(300);
+
+/// The write capacity ONE partition key value can consume per second: "a single
+/// partition can support a maximum of 3,000 read capacity units or 1,000 write capacity
+/// units" (DynamoDB Developer Guide, "Designing partition keys to distribute your
+/// workload evenly"), and every item that shares a partition key value lives in one
+/// partition — so this is the ceiling a hot key hits however much capacity its table
+/// has.
+///
+/// It is an INTERNAL limit of the storage layer rather than a table setting, so it
+/// bounds a table in either capacity mode.
+pub const PARTITION_WRITE_UNITS_PER_SECOND: i64 = 1000;
+
+/// Over how long a window the per-partition-key ceiling above is measured.
+///
+/// CHOSEN by this emulator, not documented: the ceiling is stated per second and no
+/// published rule promises a partition-level burst credit (the documented 300-second
+/// credit in [`BURST_CAPACITY_WINDOW`] is a TABLE-level allowance), so the smallest
+/// window the ceiling is stated over is the one enforced. A key is therefore admitted
+/// [`PARTITION_WRITE_UNITS_PER_SECOND`] units of writes in any one second and refused
+/// past that, while a key that has been idle for a second starts again with the whole
+/// ceiling behind it.
+pub const PARTITION_BURST_WINDOW: Duration = Duration::from_secs(1);
+
+/// How many partition key values one table keeps a write budget for at a time.
+///
+/// Admission-control bookkeeping has to be bounded like everything else this store
+/// holds: a budget that has gone a whole [`PARTITION_BURST_WINDOW`] without a write has
+/// refilled to the ceiling and is indistinguishable from a key never written to, so
+/// those entries are dropped once the map reaches this size ([`KeyWriteBudgets`]).
+const MAX_TRACKED_WRITE_KEYS: usize = 4096;
 
 /// One write capacity unit covers a write of up to 1 KB (DynamoDB Developer Guide,
 /// "Read/write capacity mode").
@@ -1788,22 +1820,181 @@ impl CapacityBudget {
     /// A request the budget cannot cover takes NOTHING from it: capacity is consumed by
     /// the work that was done, so a throttled write leaves the budget where it was.
     pub fn take(&mut self, units_per_second: i64, units: f64, now: SystemTime) -> bool {
-        let rate = units_as_f64(units_per_second);
-        let ceiling = rate * BURST_CAPACITY_WINDOW.as_secs_f64();
-        let elapsed = now
-            .duration_since(self.measured_at)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let available = match self.remaining {
-            None => ceiling,
-            Some(remaining) => (remaining + elapsed * rate).min(ceiling),
-        };
+        self.take_within(units_per_second, BURST_CAPACITY_WINDOW, units, now)
+    }
+
+    /// The same, over a stated burst window — what the per-partition-key ceiling is
+    /// measured over ([`PARTITION_BURST_WINDOW`]), so one implementation serves both
+    /// budgets a write is admitted from.
+    pub fn take_within(
+        &mut self,
+        units_per_second: i64,
+        window: Duration,
+        units: f64,
+        now: SystemTime,
+    ) -> bool {
+        let available = self.available(units_per_second, window, now);
         self.measured_at = now;
         let covered = available >= units;
         self.remaining = Some(if covered { available - units } else { available });
         covered
     }
+
+    /// Whether the budget would cover `units` at `now`, WITHOUT taking them: what lets a
+    /// write be held to two budgets at once and debit neither when either refuses it.
+    pub fn covers_within(
+        &self,
+        units_per_second: i64,
+        window: Duration,
+        units: f64,
+        now: SystemTime,
+    ) -> bool {
+        self.available(units_per_second, window, now) >= units
+    }
+
+    /// What has refilled by `now`: the figure last measured plus the rate over the time
+    /// since, held at the ceiling the burst window allows.
+    fn available(&self, units_per_second: i64, window: Duration, now: SystemTime) -> f64 {
+        let rate = units_as_f64(units_per_second);
+        let ceiling = rate * window.as_secs_f64();
+        let elapsed = now
+            .duration_since(self.measured_at)
+            .unwrap_or_default()
+            .as_secs_f64();
+        match self.remaining {
+            None => ceiling,
+            Some(remaining) => (remaining + elapsed * rate).min(ceiling),
+        }
+    }
+
+    /// Whether this budget has gone a whole `window` without being spent from, which
+    /// means it has refilled to the ceiling and holds no more information than a budget
+    /// that was never spent from at all.
+    fn refilled(&self, window: Duration, now: SystemTime) -> bool {
+        self.remaining.is_none()
+            || now
+                .duration_since(self.measured_at)
+                .is_ok_and(|idle| idle >= window)
+    }
 }
+
+/// What is left of the per-partition-key write capacity of one table: one budget per
+/// partition key value that has been written to recently.
+///
+/// Admission-control bookkeeping ONLY — no response reports it — and bounded: entries
+/// that have refilled are dropped once the map reaches [`MAX_TRACKED_WRITE_KEYS`], so a
+/// table that is written across many keys does not accumulate a budget per key it ever
+/// held.
+#[derive(Debug, Clone, Default)]
+pub struct KeyWriteBudgets {
+    budgets: BTreeMap<AttributeValueKey, CapacityBudget>,
+}
+
+impl KeyWriteBudgets {
+    /// Whether the key's own ceiling covers `units` at `now`, without taking them.
+    fn covers(&self, partition: &AttributeValueKey, units: f64, now: SystemTime) -> bool {
+        self.budgets.get(partition).is_none_or(|budget| {
+            budget.covers_within(
+                PARTITION_WRITE_UNITS_PER_SECOND,
+                PARTITION_BURST_WINDOW,
+                units,
+                now,
+            )
+        })
+    }
+
+    /// Take `units` from that key's budget, reporting whether it covered them.
+    ///
+    /// The map is held at [`MAX_TRACKED_WRITE_KEYS`] entries BEFORE a new one is added,
+    /// so the bookkeeping one table carries is a constant of this store and not a
+    /// function of how many keys have been written: the budgets that have refilled go
+    /// first (they hold no more than a key never written to), and if every entry is
+    /// still live the least recently spent from gives way, because it is the closest to
+    /// having refilled.
+    fn take(&mut self, partition: &AttributeValueKey, units: f64, now: SystemTime) -> bool {
+        if self.budgets.len() >= MAX_TRACKED_WRITE_KEYS && !self.budgets.contains_key(partition) {
+            self.budgets
+                .retain(|_, budget| !budget.refilled(PARTITION_BURST_WINDOW, now));
+            while self.budgets.len() >= MAX_TRACKED_WRITE_KEYS {
+                let Some(oldest) = self
+                    .budgets
+                    .iter()
+                    .min_by_key(|(_, budget)| budget.measured_at)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                self.budgets.remove(&oldest);
+            }
+        }
+        self.budgets
+            .entry(partition.clone())
+            .or_insert_with(|| CapacityBudget::new(now))
+            .take_within(
+                PARTITION_WRITE_UNITS_PER_SECOND,
+                PARTITION_BURST_WINDOW,
+                units,
+                now,
+            )
+    }
+}
+
+/// Why the write path refused a write: WHICH of the ceilings a write is admitted from
+/// was the binding one, which is what the throttle reports back to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteThrottle {
+    /// The write capacity the TABLE is provisioned for was exhausted.
+    TableProvisioned,
+    /// The table had capacity left, but the request rate aimed at this one partition
+    /// key value was past the internal partition-level ceiling
+    /// ([`PARTITION_WRITE_UNITS_PER_SECOND`]).
+    KeyRange,
+}
+
+impl WriteThrottle {
+    /// The `ThrottlingReason$reason`: "The throttling reason follows a specific format:
+    /// `ResourceType+OperationType+LimitType`" with the resource `Table`, the operation
+    /// `Write` and the limit type of the ceiling that bound (that member's doc).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::TableProvisioned => "TableWriteProvisionedThroughputExceeded",
+            Self::KeyRange => "TableWriteKeyRangeThroughputExceeded",
+        }
+    }
+
+    /// The sentence DynamoDB states for this refusal: the provisioning one for a table
+    /// that has spent what it is provisioned for, and the hot-key one for a single
+    /// partition key value past the internal ceiling — which is the case that doc points
+    /// a caller at its key design for.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::TableProvisioned => THROUGHPUT_EXCEEDED_MESSAGE,
+            Self::KeyRange => KEY_RANGE_THROUGHPUT_EXCEEDED_MESSAGE,
+        }
+    }
+
+    /// The error code a surface that reports a per-slot failure (`BatchStatementError`)
+    /// carries for it.
+    pub fn code(self) -> &'static str {
+        "ProvisionedThroughputExceeded"
+    }
+}
+
+/// How a write past the capacity its table is provisioned for is reported: the sentence
+/// DynamoDB states for that refusal, naming the table's provisioning and the call that
+/// raises it.
+pub const THROUGHPUT_EXCEEDED_MESSAGE: &str =
+    "The level of configured provisioned throughput for the table was exceeded. Consider \
+     increasing your provisioning level with the UpdateTable API.";
+
+/// How a write past the internal per-partition-key ceiling is reported: the sentence
+/// DynamoDB states when the throughput a single key is offered exceeds the capacity of
+/// the partition holding it, which is the diagnosis that refusal carries.
+pub const KEY_RANGE_THROUGHPUT_EXCEEDED_MESSAGE: &str =
+    "Throughput exceeds the current capacity of your table or index. DynamoDB is \
+     automatically scaling your table or index so please try again shortly. If exceptions \
+     persist, check if you have a hot key.";
+
 
 /// A capacity figure the store holds as an integer, as the arithmetic above takes it.
 fn units_as_f64(units: i64) -> f64 {
@@ -3576,6 +3767,10 @@ pub struct Table {
     /// ([`Table::admit_write`]). Like [`Table::stored_bytes`] it is admission-control
     /// bookkeeping: no response reports it.
     pub write_budget: CapacityBudget,
+    /// What is left of the write capacity of each partition key value recently written
+    /// to ([`Table::admit_item_write`]). Admission-control bookkeeping like
+    /// [`Table::write_budget`]: no response reports it.
+    pub key_write_budgets: KeyWriteBudgets,
     /// This table's contributor insights setting, as the contributor insights
     /// operations wrote and report it ([`ContributorInsights`]). Its indexes carry
     /// their own.
@@ -4579,16 +4774,68 @@ impl Table {
     /// behind it, so what a later caller is told never depends on how much has been
     /// read.
     pub fn admit_write(&mut self, units: f64, now: SystemTime) -> bool {
-        let provisioned = match (
+        let Some(provisioned) = self.provisioned_write_rate() else {
+            return true;
+        };
+        self.write_budget.take(provisioned, units, now)
+    }
+
+    /// Admit one ITEM write — a put, an update or a delete of the item whose partition
+    /// key value is `partition` — against BOTH ceilings a write is held to, reporting
+    /// which one refused it.
+    ///
+    /// Beneath the table's own provisioned capacity sits the storage layer's
+    /// per-partition-key ceiling ([`PARTITION_WRITE_UNITS_PER_SECOND`]): every item that
+    /// shares a partition key value lives in one partition, so a stream of writes aimed
+    /// at one key is bounded by that partition whatever the table is provisioned for,
+    /// while the same rate spread over many keys is not. The table ceiling is checked
+    /// first, so a table that is out of capacity reports its own provisioning rather
+    /// than blaming the key.
+    ///
+    /// Neither budget is debited unless BOTH cover the write: a throttled write does no
+    /// work, so it consumes no capacity anywhere.
+    pub fn admit_item_write(
+        &mut self,
+        partition: &AttributeValueKey,
+        capacity: &WriteCapacity,
+        now: SystemTime,
+    ) -> Result<(), WriteThrottle> {
+        let total = capacity.total();
+        let provisioned = self.provisioned_write_rate();
+        if let Some(provisioned) = provisioned {
+            if !self
+                .write_budget
+                .covers_within(provisioned, BURST_CAPACITY_WINDOW, total, now)
+            {
+                return Err(WriteThrottle::TableProvisioned);
+            }
+        }
+        // The partition holds the TABLE's items: an index entry this write fans out to
+        // is a write to that index's own partitions, so the key's ceiling is measured
+        // against the units the table itself took.
+        if !self.key_write_budgets.covers(partition, capacity.table, now) {
+            return Err(WriteThrottle::KeyRange);
+        }
+        if let Some(provisioned) = provisioned {
+            self.write_budget.take(provisioned, total, now);
+        }
+        self.key_write_budgets
+            .take(partition, capacity.table, now);
+        Ok(())
+    }
+
+    /// The write units per second this table is PROVISIONED for, or `None` for a table
+    /// on-demand (`PAY_PER_REQUEST`), which is provisioned for no capacity to exceed.
+    fn provisioned_write_rate(&self) -> Option<i64> {
+        match (
             self.billing_mode.as_str(),
             self.provisioned_throughput.as_ref(),
         ) {
             ("PROVISIONED", Some(throughput)) if throughput.write_capacity_units > 0 => {
-                throughput.write_capacity_units
+                Some(throughput.write_capacity_units)
             }
-            _ => return true,
-        };
-        self.write_budget.take(provisioned, units, now)
+            _ => None,
+        }
     }
 
     /// The `ItemCollectionKey` of an item: "The partition key value of the item
@@ -5806,6 +6053,26 @@ pub fn table_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("dynamodb", region, &format!("table/{name}"))
 }
 
+/// The modelled `ProvisionedThroughputExceededException` one refused write earns.
+///
+/// It carries the sentence for the ceiling that bound and, in `ThrottlingReasons`, that
+/// ceiling's own reason code with "the Amazon Resource Name (ARN) of the DynamoDB table
+/// or index that experienced the throttling event" (`ThrottlingReason$resource`) — which
+/// is how a caller tells a table that needs more capacity from a key design that needs
+/// fixing.
+pub fn throughput_exceeded(
+    table_arn: &str,
+    throttle: WriteThrottle,
+) -> ProvisionedThroughputExceededException {
+    ProvisionedThroughputExceededException {
+        message: Some(throttle.message().to_string()),
+        throttling_reasons: Some(vec![ThrottlingReason {
+            reason: Some(throttle.reason().to_string()),
+            resource: Some(table_arn.to_string()),
+        }]),
+    }
+}
+
 /// `arn:aws:dynamodb:<region>:<account>:table/<table>/index/<index>` — the form the
 /// `GlobalSecondaryIndexDescription$IndexArn` member carries, and the resource id
 /// Application Auto Scaling names an index scalable target by.
@@ -6862,6 +7129,17 @@ fn reserved_attribute_name(member: &str, word: &str) -> RequestError {
     )
 }
 
+/// The refusal for a function name the expression languages do not have.
+///
+/// The functions are a CLOSED set — "These function names are case-sensitive" and the
+/// `ConditionExpression`/`UpdateExpression` docs list every one of them — so an
+/// identifier called like a function that is not one of them is refused naming the
+/// offending identifier, as the request spelled it, behind the expression member it
+/// travelled in.
+fn unknown_function(member: &str, name: &str) -> RequestError {
+    invalid_expression_member(member, &format!("Invalid function name; function: {name}"))
+}
+
 /// Whether `word`, written out in an expression, is one of DynamoDB's reserved words.
 ///
 /// Matched without regard to case, the way the keywords of the expression languages are
@@ -7220,6 +7498,74 @@ impl<'a> Substitutions<'a> {
                 ))
             })
     }
+
+    /// Hold both substitution tables to the rule that every token they define is
+    /// REFERENCED: each key of `ExpressionAttributeNames`/`ExpressionAttributeValues`
+    /// must be used by at least one of the expression members `expressions` lists, and
+    /// the whole request is refused when one is not.
+    ///
+    /// Both members exist to be substituted INTO — they hold "substitution tokens for
+    /// attribute names in an expression" and "values that can be substituted in an
+    /// expression" (those members' docs) — so a token no expression names states
+    /// nothing, and DynamoDB refuses the request rather than ignoring it. One entry
+    /// point for every operation that takes expression members, so the rule does not
+    /// drift between them.
+    ///
+    /// `expressions` is the request's expression members, each as it was sent; an
+    /// expression this does not tokenize is left to the parser that reads it for real,
+    /// which refuses it with the syntax error the member earns.
+    pub fn check_all_referenced(&self, expressions: &[Option<&str>]) -> Result<(), RequestError> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut values: BTreeSet<String> = BTreeSet::new();
+        for expression in expressions.iter().flatten() {
+            // The member name only decorates a refusal, and the token kinds below are
+            // the same whichever member carried them.
+            let Ok(tokens) = tokenize_expression("Expression", expression) else {
+                // An expression this cannot read tells nothing about which tokens it
+                // references, and the parser that reads it for real refuses it with the
+                // syntax error the member earns — which is the refusal the caller gets.
+                return Ok(());
+            };
+            for token in tokens {
+                match token {
+                    ExprToken::Alias(alias) => {
+                        names.insert(alias);
+                    }
+                    ExprToken::Placeholder(placeholder) => {
+                        values.insert(placeholder);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        check_referenced("ExpressionAttributeNames", self.names, &names)?;
+        check_referenced("ExpressionAttributeValues", self.values, &values)
+    }
+}
+
+/// Refuse one substitution table that defines a key no expression referenced.
+///
+/// The keys are reported in one stable order — the order the map sorts in — so the
+/// same request earns the same message every time, and the refusal names the member
+/// that carried them.
+fn check_referenced<V>(
+    member: &str,
+    supplied: Option<&HashMap<String, V>>,
+    referenced: &BTreeSet<String>,
+) -> Result<(), RequestError> {
+    let unused: BTreeSet<&str> = supplied
+        .into_iter()
+        .flatten()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| !referenced.contains(*key))
+        .collect();
+    if unused.is_empty() {
+        return Ok(());
+    }
+    Err(RequestError::Validation(format!(
+        "Value provided in {member} unused in expressions: keys: {{{}}}",
+        unused.into_iter().collect::<Vec<&str>>().join(", ")
+    )))
 }
 
 /// One step of a document path: an attribute name, or an index into a list.
@@ -8080,25 +8426,31 @@ fn evaluate_condition(node: &ConditionNode, item: &Item) -> Result<bool, Request
         }
         ConditionNode::Not(inner) => Ok(!evaluate_condition(inner, item)?),
         ConditionNode::Compare(left, operator, right) => {
-            let (Some(left), Some(right)) = (resolve_operand(left, item), resolve_operand(right, item))
-            else {
-                // A path that addresses nothing satisfies no comparison, the way a
-                // missing attribute matches no `Expected` comparison either.
-                return Ok(false);
+            let left = resolve_operand(left, item);
+            let right = resolve_operand(right, item);
+            let (Some(left), Some(right)) = (left.as_ref(), right.as_ref()) else {
+                // One side addresses nothing: the item carries no value there, and
+                // nothing is NOT EQUAL to a value it does not hold, so the one
+                // comparator an unheld operand satisfies is the not-equal one — the
+                // attribute need not be present for it, while every other comparator
+                // (equality included) needs both values to compare. With NEITHER side
+                // held there is no value to be unequal to, so nothing holds.
+                return Ok(matches!(operator, CompareOp::NotEqual)
+                    && (left.is_some() || right.is_some()));
             };
             Ok(match operator {
-                CompareOp::Equal => attribute_values_equal(&left, &right),
-                CompareOp::NotEqual => !attribute_values_equal(&left, &right),
-                CompareOp::Less => compare_values(&left, &right) == Some(Ordering::Less),
+                CompareOp::Equal => attribute_values_equal(left, right),
+                CompareOp::NotEqual => !attribute_values_equal(left, right),
+                CompareOp::Less => compare_values(left, right) == Some(Ordering::Less),
                 CompareOp::LessOrEqual => {
                     matches!(
-                        compare_values(&left, &right),
+                        compare_values(left, right),
                         Some(Ordering::Less | Ordering::Equal)
                     )
                 }
-                CompareOp::Greater => compare_values(&left, &right) == Some(Ordering::Greater),
+                CompareOp::Greater => compare_values(left, right) == Some(Ordering::Greater),
                 CompareOp::GreaterOrEqual => matches!(
-                    compare_values(&left, &right),
+                    compare_values(left, right),
                     Some(Ordering::Greater | Ordering::Equal)
                 ),
             })
@@ -8930,12 +9282,7 @@ impl<'a> ExprParser<'a> {
                 self.expect(&ExprToken::Comma)?;
                 ConditionNode::Contains(haystack, self.operand()?)
             }
-            other => {
-                return Err(RequestError::Validation(format!(
-                    "Invalid {}: unknown function {other}",
-                    self.member
-                )))
-            }
+            other => return Err(unknown_function(self.member, other)),
         };
         self.expect(&ExprToken::Close)?;
         Ok(node)
@@ -9037,12 +9384,7 @@ impl<'a> ExprParser<'a> {
                     self.expect(&ExprToken::Comma)?;
                     SetOperand::ListAppend(Box::new(first), Box::new(self.set_operand()?))
                 }
-                other => {
-                    return Err(RequestError::Validation(format!(
-                        "Invalid {}: unknown function {other}",
-                        self.member
-                    )))
-                }
+                other => return Err(unknown_function(self.member, other)),
             };
             self.depth -= 1;
             self.expect(&ExprToken::Close)?;
@@ -9211,9 +9553,13 @@ pub fn legacy_comparison_matches(
         "NULL" => held.is_none(),
         _ => {
             let Some(held) = held else {
-                // Every other operator compares a value, and a missing attribute has
-                // none: "the operation fails" rather than matching.
-                return Ok(false);
+                // Every other operator compares a value, and the item holds none here.
+                // The legacy operators lower onto the expression language one for one
+                // ("Use FilterExpression instead": `NE` is `<>` and `NOT_CONTAINS` is
+                // `NOT contains(...)`), so the NEGATED ones hold for an attribute that
+                // is not there — nothing is not equal to, and does not contain, a value
+                // — while a positive comparison has nothing to compare and fails.
+                return Ok(matches!(operator, "NE" | "NOT_CONTAINS"));
             };
             match operator {
                 "EQ" => attribute_values_equal(held, &operands[0]),

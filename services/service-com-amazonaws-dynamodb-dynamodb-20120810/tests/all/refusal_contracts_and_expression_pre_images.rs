@@ -517,15 +517,16 @@ async fn every_clause_of_one_update_resolves_against_the_pre_image() {
                    "Item": {"pk": {"S": case}, "l": stored()}}),
         )
         .await;
-        let updated = ok(
-            &router,
-            "UpdateItem",
-            json!({"TableName": "PreImage", "Key": {"pk": {"S": case}},
-                   "UpdateExpression": expression,
-                   "ExpressionAttributeValues": {":v": {"S": "X"}},
-                   "ReturnValues": "UPDATED_NEW"}),
-        )
-        .await;
+        // The row whose clauses are all removals references no value token, and a token
+        // no expression references makes the request invalid, so the member is sent only
+        // when the expression uses it.
+        let mut update = json!({"TableName": "PreImage", "Key": {"pk": {"S": case}},
+                                "UpdateExpression": expression,
+                                "ReturnValues": "UPDATED_NEW"});
+        if expression.contains(":v") {
+            update["ExpressionAttributeValues"] = json!({":v": {"S": "X"}});
+        }
+        let updated = ok(&router, "UpdateItem", update).await;
         assert_eq!(
             updated["Attributes"], reported,
             "case {case:?}: expected UPDATED_NEW to report {reported}, got {}",
@@ -941,11 +942,20 @@ async fn a_key_condition_names_the_schema_element_or_the_operator_it_broke() {
         "pk = :p AND sk >= :s",
         "pk = :p AND sk BETWEEN :s AND :s",
     ] {
+        // Only the tokens this condition REFERENCES are defined: an
+        // `ExpressionAttributeValues` entry no expression uses makes the request
+        // invalid, so the one-term condition sends only its own.
+        let values: serde_json::Map<String, Value> =
+            [(":p", json!({"S": "a"})), (":s", json!({"N": "1"}))]
+                .into_iter()
+                .filter(|(token, _)| condition.contains(token))
+                .map(|(token, value)| (token.to_string(), value))
+                .collect();
         ok(
             &router,
             "Query",
             json!({"TableName": "Keys", "KeyConditionExpression": condition,
-                   "ExpressionAttributeValues": {":p": {"S": "a"}, ":s": {"N": "1"}}}),
+                   "ExpressionAttributeValues": values}),
         )
         .await;
     }
