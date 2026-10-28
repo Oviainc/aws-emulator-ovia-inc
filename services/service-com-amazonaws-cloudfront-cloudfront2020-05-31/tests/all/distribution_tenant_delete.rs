@@ -48,7 +48,14 @@ const TENANT_NOT_FOUND_MESSAGE: &str = "The specified distribution tenant doesn'
 
 /// `DELETE /2020-05-31/distribution-tenant/{Id}` with the `If-Match` header `if_match`
 /// (left off entirely when `None`). The operation binds no payload.
-async fn delete_tenant(router: &MultiServiceRouter, id: &str, if_match: Option<&str>) -> Answer {
+///
+/// `pub(crate)` so the sibling suite that asserts how far ONE delete reaches calls the
+/// operation over this one wire path rather than growing a copy of it.
+pub(crate) async fn delete_tenant(
+    router: &MultiServiceRouter,
+    id: &str,
+    if_match: Option<&str>,
+) -> Answer {
     call(
         router,
         "DELETE",
@@ -60,7 +67,10 @@ async fn delete_tenant(router: &MultiServiceRouter, id: &str, if_match: Option<&
 }
 
 /// `GET /2020-05-31/distribution-tenant/{Identifier}`.
-async fn get_tenant(router: &MultiServiceRouter, identifier: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite reads a tenant back — served or refused — through the
+/// same implemented reader.
+pub(crate) async fn get_tenant(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(
         router,
         "GET",
@@ -91,7 +101,10 @@ async fn get_by_domain(router: &MultiServiceRouter, domain: &str) -> Answer {
 
 /// `PUT /2020-05-31/distribution-tenant/{Id}` stating `Enabled` alone — the call the
 /// documentation points a caller at before a delete.
-async fn set_enabled(
+///
+/// `pub(crate)` so a sibling suite disables its tenants through the same call the
+/// documentation names rather than through a second copy of this.
+pub(crate) async fn set_enabled(
     router: &MultiServiceRouter,
     id: &str,
     enabled: bool,

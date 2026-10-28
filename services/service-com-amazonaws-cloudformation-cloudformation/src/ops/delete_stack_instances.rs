@@ -107,8 +107,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::stack_sets::{
-    detailed_status, instance_status, operation_action, operation_status, target_accounts,
-    StoredStackSetOperation,
+    detailed_status, distinct, instance_status, operation_action, operation_id_already_exists,
+    operation_status, refuse_oversized_selection, region_does_not_exist, requested_targets,
+    unknown_target_region, StoredStackSetOperation,
 };
 use crate::state::status;
 
@@ -205,8 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DeleteStackInstances",
             ));
         };
-        let accounts =
-            target_accounts(input.accounts.as_deref(), input.deployment_targets.as_ref())
+        // "You can specify Accounts or DeploymentTargets, but not both": the request's own
+        // shape is judged before any stack set is resolved; what the targeting means for the
+        // stack set named is resolved under the lock below.
+        let targets =
+            requested_targets(input.accounts.as_deref(), input.deployment_targets.as_ref())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "The Amazon Web Services Regions where you want to delete StackSet instances."
         if input.regions.is_empty() {
@@ -214,36 +218,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You must specify at least one value for Regions",
             ));
         }
+        // Every Region named has to be a Region that exists: one AWS does not have could
+        // never carry a stack instance, so the whole request is refused rather than acted on
+        // for the Regions beside it.
+        if let Some(unknown) = unknown_target_region(&input.regions) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                region_does_not_exist(unknown),
+            ));
+        }
         // "Deletes stack instances for the specified accounts, in the specified Amazon Web
         // Services Regions": one instance per account and Region pair, so the PRODUCT of the
-        // two lists is what this request asks the store to walk — and both lists are the
+        // two lists — over their DISTINCT values, since a repeated account or Region names
+        // the same pair — is what this request asks the store to walk, and both lists are the
         // caller's. A product past the ceiling one StackSet's instances are bounded by names
         // more pairs than that StackSet can hold an instance for, so it is refused HERE,
-        // before the store is read at all, and no oversized request drives work under the
+        // before the store is read at all, and again under the lock once the stack set has
+        // resolved what the targeting selects — so no oversized request drives work under the
         // store lock. The model declares no `LimitExceededException` for this operation, so
         // the refusal is a bad request rather than a modelled quota failure.
-        if accounts.len().saturating_mul(input.regions.len())
-            > crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Accounts and Regions select more than the {} stack instances a StackSet can \
-                 hold",
-                crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
-            )));
-        }
-        // The DISTINCT pairs the request selects: a repeated account or Region names the same
-        // account and Region pair, which carries at most ONE instance of a StackSet, so the
-        // walk below costs one lookup per distinct pair however often a request repeats one.
-        // Bounded by the product refused above.
-        let requested: ::std::collections::BTreeSet<(&str, &str)> = accounts
-            .iter()
-            .flat_map(|account| {
-                input
-                    .regions
-                    .iter()
-                    .map(move |target_region| (account.as_str(), target_region.as_str()))
-            })
-            .collect();
+        let regions = distinct(input.regions.clone());
+        refuse_oversized_selection(targets.accounts.len(), regions.len())
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         // "The operation ID also functions as an idempotency token": the caller's when it
@@ -270,6 +265,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
+            // Which accounts this targeting really selects for THIS stack set: the
+            // permission model the stack set carries is what says whether organizational
+            // units are targets of it at all.
+            let accounts = targets
+                .accounts_in(stack_set)
+                .map_err(|refusal| refusal.refuse("DeleteStackInstances"))?;
+            // Re-asserted over what the targeting REALLY selects for this stack set: the
+            // product the walk below covers is this one, not the request's literal list.
+            refuse_oversized_selection(accounts.len(), regions.len())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // The DISTINCT pairs the request selects: a pair carries at most ONE instance of
+            // a StackSet, so the walk below costs one lookup per distinct pair. Bounded by
+            // the product refused just above.
+            let requested: ::std::collections::BTreeSet<(&str, &str)> = accounts
+                .iter()
+                .flat_map(|account| {
+                    regions
+                        .iter()
+                        .map(move |target_region| (account.as_str(), target_region.as_str()))
+                })
+                .collect();
             // "Only one operation can be performed for a stack set at a given time": the
             // refusal names the StackSet it is about and the operation that still holds it.
             if let Some(in_flight) = stack_set.operation_in_flight() {
@@ -293,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DeleteStackInstancesErrorModeled::OperationIdAlreadyExistsException(
                         OperationIdAlreadyExistsException {
-                            message: Some(format!("Operation id {operation_id} already exists")),
+                            message: Some(operation_id_already_exists(&operation_id)),
                         },
                     )
                     .into(),

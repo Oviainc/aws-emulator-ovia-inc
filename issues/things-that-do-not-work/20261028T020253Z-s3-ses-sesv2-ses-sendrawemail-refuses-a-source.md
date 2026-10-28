@@ -1,0 +1,36 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: s3__ses__sesv2.raw-multipart-attachment-arrives-byte-exact
+Issue-Key: ses|SendRawEmail|MessageRejected
+Issue-Commit: a7f4b46fd13e3042ad499c1371bfc738191ffa75
+
+# s3__ses__sesv2: ses SendRawEmail refuses a Source address under a domain identity the emulator itself reports VerifiedForSendingStatus=true, so no raw/attachment mail can be sent or received
+
+> _Note: this issue was identified against the code base at commit `a7f4b46fd13e3042ad499c1371bfc738191ffa75`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+SendRawEmail
+
+## Description
+REOPENS 20261026T065304Z-ses-sendrawemail-stub.md: its fix left the call refused.
+
+Cause 1 of 1: the v1 SendRawEmail source gate does not accept an address whose DOMAIN is a verified domain identity, and refuses it MessageRejected even though the emulator's own SESv2 read reports that domain verified for sending.
+AWS: verifying a domain identity authorises sending from every mailbox in that domain — the sender address itself never has to be verified separately. Smithy (com.amazonaws.ses#SimpleEmailService, awsQuery): SendRawEmail input {Source: Address, Destinations: AddressList, RawMessage required, ConfigurationSetName, FromArn/SourceArn/ReturnPathArn, Tags}, output {MessageId required}; Source is documented as "The identity's email address" — the identity being the address or the domain it belongs to; modeled errors MessageRejected (awsQueryError code MessageRejected, httpError 400), MailFromDomainNotVerifiedException, ConfigurationSetDoesNotExist, ConfigurationSetSendingPausedException, AccountSendingPausedException. The authorising state is exactly what SESv2 GetEmailIdentity reports for the domain: VerifiedForSendingStatus=true with DkimAttributes.Status='SUCCESS' (set up here by sesv2 CreateEmailIdentity on the domain and publishing its Easy-DKIM CNAMEs in the domain's own public hosted zone). In that state AWS answers SendRawEmail 200 with a MessageId and delivers the message.
+Emulator: the setup converges — the emulator's sesv2 GetEmailIdentity on the stand-in domain returns VerifiedForSendingStatus=true and DKIM 'SUCCESS' (otherwise the check would have failed in its verification wait instead). The immediately following ses SendRawEmail with Source=<local-part>@<that verified domain> is refused 400 MessageRejected: "Email address is not verified. The following identities failed the check in region US-WEST-2: <local-part>@<domain>". Fixed text of that message is "Email address is not verified. The following identities failed the check in region " + the upper-cased region + ": " + the identities from the request; the region and address in the recording are request/environment values, not requirements. The emulator therefore contradicts its own identity store: one surface calls the domain verified for sending, the send path calls an address inside it unverified. Hypothesis: the v1 send gate matches the Source string against address-type identities only and never falls back to its parent domain, and/or it reads a v1-local identity store that the SESv2 CreateEmailIdentity handler does not write (the related OPEN issue 20261025T214303Z-ses-identity-verification-is-auto-completed-and-the.md, Cause 3, reports v2-created identities being invisible to v1 reads; that issue does not carry this check's replay key and does not mention the send path's domain fallback).
+Why: domain-identity sending is the normal production configuration — customers verify a domain once and send as many addresses under it. With this gate, no SendRawEmail (and no raw/MIME send at all) is possible from a domain-verified account, so every downstream behaviour this check pins is unreachable: the receipt rule's S3Action never captures anything, and the guarantee that a binary multipart attachment survives inbound delivery byte-for-byte (same SHA-256, same Content-Type application/octet-stream, same filename, same Subject) cannot be observed. A client migrating a working AWS setup gets a hard MessageRejected where AWS accepts the send.
+Fix: the source-identity resolution in the v1 SendRawEmail handler (services/service-com-amazonaws-ses-simpleemailservice/src/ops/send_raw_email.rs) and the identity store it reads: look the Source up as an email identity and, failing that, as its parent domain identity, over the same account identity store that the sesv2 CreateEmailIdentity handler (services/service-com-amazonaws-sesv2-simpleemailservice-v2/src/ops/create_email_identity.rs) writes, and only refuse MessageRejected when neither is verified.
+Traces: s3__ses__sesv2.raw-multipart-attachment-arrives-byte-exact.
+
+## Evidence
+Expected: after sesv2.create_email_identity(EmailIdentity=<domain>) and publishing its DKIM CNAMEs, once sesv2.get_email_identity(EmailIdentity=<domain>) reports VerifiedForSendingStatus=true and DkimAttributes.Status='SUCCESS', ses.send_raw_email(Source='<local>@<domain>', Destinations=['<other-local>@<domain>'], RawMessage={'Data': <multipart/mixed bytes with a text/plain part and an application/octet-stream attachment>}) returns HTTP 200 with a MessageId, and the active receipt rule's S3Action stores the message under the configured prefix.
+Actual: the send is refused. Replay detail: 'botocore.errorfactory.MessageRejected: An error occurred (MessageRejected) when calling the SendRawEmail operation: Email address is not verified. The following identities failed the check in region US-WEST-2: sim2real-attachfrom-b26385700261@sim2real-ses-890273ef1ddc.example.net'. The generated local-part, generated domain and region there are per-run values; the divergence is that a 400 MessageRejected is returned at all for an address inside a domain identity the same emulator reports verified for sending. Because the send is refused, the byte-exactness assertions (stored MIME part's SHA-256 equal to the sent attachment's, Content-Type 'application/octet-stream', unchanged filename, Subject preserved) were never evaluated.
+
+## Steps to Reproduce
+1. Boot the emulator and point boto3 clients 'route53', 'sesv2', 'ses' and 's3' at it.
+2. route53.create_hosted_zone(Name='d1.example.net', CallerReference=<uuid>).
+3. sesv2.create_email_identity(EmailIdentity='d1.example.net'); take DkimAttributes.Tokens and UPSERT each '<token>._domainkey.d1.example.net' CNAME -> '<token>.dkim.amazonses.com' in that zone, plus an MX 'd1.example.net' -> '10 inbound-smtp.<region>.amazonaws.com'.
+4. Poll sesv2.get_email_identity(EmailIdentity='d1.example.net') until VerifiedForSendingStatus is true and DkimAttributes.Status == 'SUCCESS' — the emulator does reach this state.
+5. ses.send_raw_email(Source='sender@d1.example.net', Destinations=['rcpt@d1.example.net'], RawMessage={'Data': <email.mime multipart bytes with an application/octet-stream attachment>}).
+6. Observe ClientError MessageRejected 'Email address is not verified. The following identities failed the check in region <REGION>: sender@d1.example.net' instead of HTTP 200 with a MessageId.
+7. Re-replay s3__ses__sesv2.raw-multipart-attachment-arrives-byte-exact.

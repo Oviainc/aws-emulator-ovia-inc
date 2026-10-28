@@ -324,6 +324,10 @@ pub mod stabilising;
 /// which `ListStackSetOperations` reports summaries of.
 pub mod stack_sets;
 
+/// Rolling one stack-set `UPDATE` out over the stack instances it acts on: the half
+/// `UpdateStackSet` and `UpdateStackInstances` share.
+pub mod stack_set_rollout;
+
 /// The TIMELINE of one stack operation's walk over a stack's resources: when each resource
 /// was scheduled and when it finished, which is what the per-resource `StackEvent`s of that
 /// operation are stamped with.
@@ -5965,6 +5969,16 @@ pub fn drift_operation_does_not_exist() -> &'static str {
 pub fn stack_instance_does_not_exist(account: &str, region: &str) -> String {
     format!("Stack instance in account {account} and Region {region} not found")
 }
+
+/// The refusal for a request that does not name exactly ONE source for the template it
+/// submits: "Conditional: You must specify only one of the following parameters:
+/// TemplateBody, TemplateURL, or set the UsePreviousTemplate to true."
+///
+/// The ONE wording of that condition, shared by every operation whose input carries the
+/// three members (`UpdateStack`, `CreateChangeSet`, `UpdateStackSet`), so the sentence cannot
+/// drift between them.
+pub const ONE_TEMPLATE_SOURCE: &str =
+    "You must specify exactly one of TemplateBody, TemplateURL or UsePreviousTemplate";
 
 /// The `StackStatusReason` a deletion CloudFormation CANCELLED because it would have
 /// removed an exported output value another stack still imports: the export, and the stack

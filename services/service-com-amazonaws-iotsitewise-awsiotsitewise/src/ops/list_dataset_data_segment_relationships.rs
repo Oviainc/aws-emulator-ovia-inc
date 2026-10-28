@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasetDataSegmentRelationships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasetDataSegmentRelationships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasetDataSegmentRelationships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a READ that reports, one page at a time, the data segment
+//! relationships the store holds for the dataset the request names — one per
+//! segment ANOTHER dataset of the same workspace holds whose data came from that
+//! dataset, which is what a curated dataset selecting a slice of a session
+//! dataset leaves behind. Each summary names the dataset that holds the
+//! reference, the dataset the data came from, and the time series and half-open
+//! span the referenced segment covers, all read off the stored segment. Nothing
+//! is written here: two readers of one dataset cannot disagree, and a listing
+//! moves no dataset on.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +160,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasetDataSegmentRelationships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetDataSegmentRelationshipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasetDataSegmentRelationships"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        let _ = ctx;
+
+        // A read: every member reported below is read off a stored segment and the
+        // dataset that holds it, so this listing writes nothing and a later call
+        // reports whatever an association or a disassociation did to the store.
+        let store = state.lock();
+
+        // The dataset this request addresses, scoped the way every other
+        // dataset-addressed operation of this service scopes it: `workspaceName`
+        // names "the workspace that contains the dataset", so a dataset held by
+        // another workspace, or by none at all, is not the dataset this request
+        // names. Resolved BEFORE the page is cut, so an absent dataset is the
+        // modelled not-found refusal rather than an empty page, which would report
+        // absence as success.
+        let dataset = store
+            .datasets
+            .get(&input.dataset_id)
+            .filter(|dataset| dataset.workspace_name.as_deref() == Some(&input.workspace_name))
+            .ok_or_else(|| not_found(&input.dataset_id))?;
+        let source_dataset_id = dataset.id.clone();
+
+        let mut summaries = relationships(&store, &source_dataset_id, &input.workspace_name);
+
+        // A stable total order is what makes `nextToken` resumable, and a
+        // relationship's identity is the dataset holding the reference plus the
+        // referenced segment's identity inside it — its time series and its own
+        // span — so ordering on that key is total.
+        summaries.sort_by(|left, right| relationship_key(left).cmp(&relationship_key(right)));
+
+        // This enumeration's resume point is a relationship's identity, and the page
+        // walk every paginated listing of this service shares takes it from there: it
+        // resumes at the token's relationship, refusing a token whose resume point is
+        // not in this enumeration rather than answering an empty page; it cuts the
+        // page at `maxResults`, defaulting to the size AWS documents for this
+        // operation; and it mints "the token for the next set of results, or null if
+        // there are no additional results" from the relationship that follows the
+        // page.
+        let page = crate::state::page_of(
+            &summaries,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            resume_key,
+        )
+        .ok_or_else(invalid_token)?;
+
+        Ok(ListDatasetDataSegmentRelationshipsOutput {
+            data_segment_relationship_summaries: summaries[page.start..page.end].to_vec(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`: "Default: 50".
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// Every data segment relationship the store holds for `source_dataset_id`
+/// inside `workspace_name`.
+///
+/// What a relationship IS, from the model: a link "between a source session
+/// dataset that contains the data and a curated dataset that references it,
+/// including the time series and timestamp range" — so one exists for each
+/// stored segment whose `sourceDatasetId` is the dataset this request names and
+/// which ANOTHER dataset holds. A dataset's own segments name the dataset itself
+/// as their source and reference nobody's data, which is the same distinction
+/// [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::overlapping_data_segment_association`]
+/// draws between a source dataset's own data and an association of it.
+///
+/// The dataset holding a reference is resolved in the SAME workspace the request
+/// named, for the reason the addressed dataset is: a dataset of another
+/// workspace, or one the store no longer holds at all, is not one this request
+/// can report — the same scoping the search over this store's segments applies.
+/// The holder's TYPE is not asked of it: the one writer of an association
+/// already refuses to store one on anything but a curated dataset, so what a
+/// dataset holds is what states the relationship.
+fn relationships(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    source_dataset_id: &str,
+    workspace_name: &str,
+) -> Vec<DataSegmentRelationshipSummary> {
+    let mut found: Vec<DataSegmentRelationshipSummary> = Vec::new();
+    for (target_dataset_id, segments) in &store.dataset_data_segments {
+        // The dataset's own log holds only its own data where this rule is
+        // concerned: a segment of it sourced from the dataset itself references
+        // nobody, and one sourced from any other dataset is that dataset's
+        // relationship. Skipping the log outright says that once, rather than
+        // leaving it to the per-segment source test below.
+        if target_dataset_id == source_dataset_id {
+            continue;
+        }
+        let held_in_workspace = store
+            .datasets
+            .get(target_dataset_id)
+            .is_some_and(|target| target.workspace_name.as_deref() == Some(workspace_name));
+        if !held_in_workspace {
+            continue;
+        }
+        for segment in segments {
+            if segment.source_dataset_id != source_dataset_id {
+                continue;
+            }
+            found.push(DataSegmentRelationshipSummary {
+                target_dataset_id: target_dataset_id.clone(),
+                source_dataset_id: segment.source_dataset_id.clone(),
+                time_series_id: segment.time_series_id.clone(),
+                start_timestamp: segment.start_timestamp.clone(),
+                end_timestamp: segment.end_timestamp.clone(),
+            });
+        }
+    }
+    found
+}
+
+/// A relationship's identity — the dataset holding the reference, then the
+/// referenced segment's time series and its own half-open span — as the total
+/// order this enumeration is cut into pages on.
+fn relationship_key(
+    summary: &DataSegmentRelationshipSummary,
+) -> (&str, &str, (i64, i32), (i64, i32)) {
+    (
+        summary.target_dataset_id.as_str(),
+        summary.time_series_id.as_str(),
+        crate::state::timestamp_key(&summary.start_timestamp),
+        crate::state::timestamp_key(&summary.end_timestamp),
+    )
+}
+
+/// The same identity as the text a `nextToken` resumes from.
+fn resume_key(summary: &DataSegmentRelationshipSummary) -> String {
+    let (target_dataset_id, time_series_id, start, end) = relationship_key(summary);
+    format!(
+        "{target_dataset_id}|{time_series_id}|{}.{}|{}.{}",
+        start.0, start.1, end.0, end.1
+    )
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+fn invalid_token() -> ListDatasetDataSegmentRelationshipsError {
+    ListDatasetDataSegmentRelationshipsErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: "The nextToken is not a token this operation issued.".to_string(),
+        },
+    )
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the dataset id that resolved to
+/// nothing in the workspace the request named.
+fn not_found(dataset_id: &str) -> ListDatasetDataSegmentRelationshipsError {
+    ListDatasetDataSegmentRelationshipsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+        },
+    )
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListDatasetDataSegmentRelationshipsError {
+    ListDatasetDataSegmentRelationshipsErrorModeled::InternalFailureException(
+        InternalFailureException { message },
+    )
+    .into()
 }
