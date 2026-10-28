@@ -181,3 +181,5 @@ mod router_deletion_supersedes_owed_transitions;
 mod get_router_network_interface;
 #[path = "all/router_tier_bitrate_rule.rs"]
 mod router_tier_bitrate_rule;
+#[path = "all/router_input_stop.rs"]
+mod router_input_stop;

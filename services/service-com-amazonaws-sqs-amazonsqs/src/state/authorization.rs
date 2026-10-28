@@ -76,13 +76,24 @@ pub const ACTION_PREFIX: &str = super::ARN_SERVICE;
 /// Every action name an Amazon SQS policy may name: this service's own action names, which
 /// is the one list the crate keeps ([`super::ACTION_NAMES`], the operations
 /// `smithy_query(query="list_operations")` reports and the set `AddPermission`'s `Actions`
-/// is taken from).
+/// is taken from), MINUS the batch names.
 ///
-/// A statement's `Action` is compared against it, and nothing narrower: how far a grant
-/// REACHES — whether a cross-account principal is served by it — is the evaluator's
+/// A batch action is not a name a policy states: "specifying `SendMessage`,
+/// `DeleteMessage`, or `ChangeMessageVisibility` for `ActionName.n` also grants
+/// permissions for the corresponding batch versions of those actions"
+/// (`AddPermissionRequest$Actions`), which is also how a batch call is AUTHORIZED here
+/// ([`BATCH_ACTIONS`]) — so the batch names name no action a statement can grant or deny,
+/// and a document naming one is refused the way an unknown action is.
+///
+/// A statement's `Action` is compared against this list, and nothing narrower: how far a
+/// grant REACHES — whether a cross-account principal is served by it — is the evaluator's
 /// question at call time, not a reason to refuse the document a caller stores.
-pub fn policy_action_names() -> &'static [&'static str] {
+pub fn policy_action_names() -> Vec<&'static str> {
     super::ACTION_NAMES
+        .iter()
+        .copied()
+        .filter(|name| !BATCH_ACTIONS.iter().any(|(batch, _)| batch == name))
+        .collect()
 }
 
 /// The batch operations and the action each of them is authorized under.
@@ -184,6 +195,11 @@ fn is_account_id(value: &str) -> bool {
 pub struct Caller {
     /// The principal's ARN, as `sts:GetCallerIdentity` reports it — what a refusal names.
     pub arn: String,
+    /// The principal's own ID, as `sts:GetCallerIdentity` reports it under `UserId`: an
+    /// IAM user's `UserId`, or `<role id>:<session name>` for an assumed-role session.
+    /// What identifies the CALLER rather than its account, which is what a message
+    /// records about its sender.
+    pub principal_id: String,
     /// The account the principal belongs to.
     pub account: String,
     /// Every spelling of the principal a resource policy may name IT by: the ARN STS
@@ -346,6 +362,19 @@ pub fn denied<Eng: Send + Sync + 'static, E>(
         .map(crate::scaffolded::Scaffolded::access_denied)
 }
 
+/// Who a message this request sends is FROM, as `ReceiveMessage` reports it under
+/// `SenderId`: the id of the principal the request speaks for ([`Caller::principal_id`]).
+///
+/// Stamped on the message when it is enqueued, so what a consumer reads is the sender of
+/// the send that really arrived rather than anything a later reader recomputes — and two
+/// sends by one principal carry the identical value, because the id is that principal's.
+pub fn sender_id<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    caller(engine, ctx).principal_id
+}
+
 /// The principal this request speaks for, with the documents in force on it.
 pub fn caller<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -372,6 +401,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
             (
                 caller.identity.arn,
                 caller.identity.account,
+                caller.identity.user_id,
                 caller.role_arn,
                 caller.tags,
             )
@@ -381,6 +411,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         None => Ok((
             long_term.arn.clone(),
             long_term.account.clone(),
+            long_term.user_id.clone(),
             None,
             Vec::new(),
         )),
@@ -388,7 +419,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
     // The session credential has expired, so it speaks for nobody: it carries no documents
     // and no principal spelling. The refusal still names what was presented, so a caller
     // reading it can tell an expired credential from an unauthorized one.
-    let Ok((arn, account, role_arn, tags)) = resolved else {
+    let Ok((arn, account, principal_id, role_arn, tags)) = resolved else {
         return Caller {
             arn: format!("an expired session credential ({access_key_id})"),
             ..Caller::default()
@@ -401,6 +432,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         account_principals: vec![account_root_arn(&account), account.clone()],
         account: account.clone(),
         arn,
+        principal_id,
         ..Caller::default()
     };
     let session_tags = tags;
@@ -549,9 +581,9 @@ fn role_arn_of_session(
 /// refused and the attribute is left as it was. A statement is one it can act on when
 ///
 /// * its `Effect` is `Allow` or `Deny` — the only two effects the grammar has;
-/// * it states an `Action` or a `NotAction`, each of whose values names an action of this
-///   service ([`policy_action_names`]) — a statement about no action of this service is
-///   about nothing this queue does;
+/// * it states an `Action` or a `NotAction`, each of whose values NAMES an action of this
+///   service ([`names_an_action`]) — a statement about no action of this service is about
+///   nothing this queue does;
 /// * every principal its `Principal`/`NotPrincipal` names in the `AWS` form exists, where
 ///   this account is the authority on that ([`names_a_principal`]).
 ///
@@ -563,20 +595,59 @@ fn role_arn_of_session(
 pub fn policy_refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     document: &str,
-) -> Option<super::InvalidAttributeValue> {
+) -> Option<PolicyRefusal> {
     let parsed: ::serde_json::Value = ::serde_json::from_str(document).ok()?;
     // A policy document is a JSON OBJECT — `{"Version": …, "Statement": …}`; a value that
     // is some other JSON is not a document at all, so there is nothing for this service to
     // act on in it.
     if !parsed.is_object() {
-        return Some(super::invalid_attribute_value(super::POLICY));
+        return Some(PolicyRefusal::Document(super::invalid_attribute_value(
+            super::POLICY,
+        )));
+    }
+    // An action element is judged first, and its own way: an action name outside the set a
+    // policy may state is a VALUE supplied for this service's action-name parameter, which
+    // is the fault Amazon SQS reports for it — the same refusal `AddPermission` answers
+    // the same name with.
+    for statement in statements(&parsed) {
+        if let Some(named) = unacceptable_action(statement) {
+            return Some(PolicyRefusal::ActionName(super::unknown_action_message(
+                &named,
+            )));
+        }
     }
     let acceptable = statements(&parsed)
         .into_iter()
         .all(|statement| statement_is_acceptable(engine, statement));
     // The refusal names the attribute whose value was not accepted, which is the one
     // wording this service refuses every unacceptable attribute value with.
-    (!acceptable).then(|| super::invalid_attribute_value(super::POLICY))
+    (!acceptable).then(|| PolicyRefusal::Document(super::invalid_attribute_value(super::POLICY)))
+}
+
+/// Why a `Policy` value is not one this service stores. The two kinds answer under
+/// different error codes, which is why they are told apart here rather than in a handler.
+#[derive(Debug)]
+pub enum PolicyRefusal {
+    /// The document states something this service cannot act on at all, so the value
+    /// supplied for the attribute is not one it accepts.
+    Document(super::InvalidAttributeValue),
+    /// One `Action`/`NotAction` value is not an action name a queue policy may state: a
+    /// PARAMETER fault, carrying the message that names it.
+    ActionName(String),
+}
+
+/// The first `Action`/`NotAction` value of `statement` that is no action name a queue
+/// policy may state, or `None` when every one of them is.
+///
+/// An element that is STATED and names nothing at all — an empty list, or a value the
+/// grammar does not admit — is not an action fault: there is no value to name back, so
+/// that statement is refused as a document ([`statement_is_acceptable`]).
+fn unacceptable_action(statement: &::serde_json::Value) -> Option<String> {
+    ["Action", "NotAction"]
+        .into_iter()
+        .filter_map(|element| statement.get(element))
+        .flat_map(|named| string_or_list(Some(named)))
+        .find(|named| !names_an_action(named))
 }
 
 /// Whether ONE statement is one this service can act on. See [`policy_refusal`].
@@ -648,22 +719,24 @@ fn principals(element: Option<&::serde_json::Value>) -> Vec<String> {
     }
 }
 
-/// Whether `named` names an action of this service: the whole-element wildcard, or
-/// `sqs:<name>` where the name — wildcards included, which IAM compares
-/// case-insensitively — covers at least one of [`policy_action_names`].
+/// Whether `named` names an action of this service: `sqs:<name>`, where the name is the
+/// whole-action wildcard or one of [`policy_action_names`], compared the way IAM compares
+/// action names — case-insensitively, so a lower-cased spelling names the same action.
+///
+/// Nothing else is a name a queue policy may state. A PARTIAL wildcard (`sqs:Send*`,
+/// `sqs:*Message`) and a bare `*` name no action of this service: the set of names is
+/// published, and only the whole of it has a spelling (`sqs:*`).
 fn names_an_action(named: &str) -> bool {
-    if named == "*" {
-        return true;
-    }
     let Some((prefix, name)) = named.split_once(':') else {
         return false;
     };
     if !prefix.eq_ignore_ascii_case(ACTION_PREFIX) {
         return false;
     }
-    policy_action_names()
-        .iter()
-        .any(|action| iam::wildcard_match(name, action, false))
+    name == super::ANY_ACTION
+        || policy_action_names()
+            .iter()
+            .any(|action| action.eq_ignore_ascii_case(name))
 }
 
 /// Whether `named` names a principal that exists — or one this account cannot be the
@@ -826,17 +899,26 @@ mod tests {
     fn an_action_element_names_an_action_of_this_service_or_nothing() {
         // (the Action value, whether it names an action of this service)
         let rows: &[(&str, bool)] = &[
-            ("*", true),
             ("sqs:*", true),
             ("sqs:SendMessage", true),
             // IAM compares action names case-insensitively.
             ("sqs:sendmessage", true),
-            ("sqs:Get*", true),
             ("sqs:ListQueueTags", true),
-            // Every action name of this service is one a policy may name: how far a grant
-            // reaches is decided at call time, not when the document is stored.
+            // Every non-batch action name of this service is one a policy may name: how
+            // far a grant reaches is decided at call time, not when the document is
+            // stored.
             ("sqs:CreateQueue", true),
-            ("sqs:SendMessageBatch", true),
+            // A batch action is granted by its single-message sibling, so it is not a
+            // name a policy states.
+            ("sqs:SendMessageBatch", false),
+            ("sqs:DeleteMessageBatch", false),
+            ("sqs:ChangeMessageVisibilityBatch", false),
+            // Only the WHOLE action set has a wildcard spelling; a partial one names no
+            // published action name.
+            ("sqs:Get*", false),
+            ("sqs:Send*", false),
+            ("sqs:*Message", false),
+            ("*", false),
             ("sqs:NotARealAction", false),
             ("sqs:", false),
             ("s3:GetObject", false),

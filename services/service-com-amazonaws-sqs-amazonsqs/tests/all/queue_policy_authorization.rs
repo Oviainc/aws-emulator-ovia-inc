@@ -126,6 +126,21 @@ impl Emulator {
         action: &str,
         parameters: &[(&str, String)],
     ) -> (u16, String) {
+        self.query_as(OWNER_KEY, signing_name, version, action, parameters)
+            .await
+    }
+
+    /// The same, presenting `access_key_id` rather than the account's own credential: the
+    /// seam a suite needs to ask another service what the CALLER of an Amazon SQS request
+    /// is.
+    async fn query_as(
+        &self,
+        access_key_id: &str,
+        signing_name: &str,
+        version: &str,
+        action: &str,
+        parameters: &[(&str, String)],
+    ) -> (u16, String) {
         let mut body = format!("Action={action}&Version={version}");
         for (name, value) in parameters {
             body.push('&');
@@ -138,7 +153,7 @@ impl Emulator {
             .uri("/")
             .header("host", format!("{signing_name}.amazonaws.com"))
             .header("content-type", "application/x-www-form-urlencoded")
-            .header("authorization", authorization(OWNER_KEY, signing_name))
+            .header("authorization", authorization(access_key_id, signing_name))
             .body(Bytes::from(body))
             .expect("a well-formed awsQuery request");
         let response = self.router.dispatch(request).await;
@@ -156,6 +171,21 @@ impl Emulator {
             "case {case:?}: expected {action} to succeed, got {status} {body}"
         );
         body
+    }
+
+    /// The `UserId` STS reports for the principal `access_key_id` speaks for — "details
+    /// about the IAM user or role whose credentials are used to call the operation"
+    /// (`sts:GetCallerIdentity`), asked for with that same credential.
+    pub(super) async fn caller_user_id(&self, case: &str, access_key_id: &str) -> String {
+        let (status, body) = self
+            .query_as(access_key_id, "sts", "2011-06-15", "GetCallerIdentity", &[])
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetCallerIdentity to succeed, got {status} {body}"
+        );
+        xml_element(&body, "UserId")
+            .unwrap_or_else(|| panic!("case {case:?}: GetCallerIdentity answered {body}"))
     }
 
     /// Create a queue and answer its url.
@@ -539,12 +569,15 @@ async fn a_send_is_allowed_only_where_the_policies_in_force_allow_it() {
             allowed: false,
         },
         GrantRow {
-            case: "a grant whose action pattern covers the action",
+            // The one action pattern a queue policy may state is the whole set, and IAM
+            // compares an action name case-insensitively, so the case-folded spelling of
+            // the action names it too.
+            case: "a grant whose action name is case-folded",
             queue_policy: |caller, queue| {
                 Some(policy(json!([{
                     "Effect": "Allow",
                     "Principal": {"AWS": caller},
-                    "Action": "sqs:Send*",
+                    "Action": "sqs:sendmessage",
                     "Resource": queue,
                 }])))
             },
@@ -1175,52 +1208,77 @@ async fn the_owner_is_refused_only_by_an_explicit_deny() {
 }
 
 /// A `Policy` value is judged when it is WRITTEN: a document whose `Action` names something
-/// outside this service's action set, or whose `Principal` names an identity of this account
-/// that does not exist, is refused `InvalidAttributeValue` at 400 and the attribute is left
-/// exactly as it was.
+/// outside the set a queue policy may state is refused as that `ActionName` value, one whose
+/// `Principal` names an identity of this account that does not exist is refused
+/// `InvalidAttributeValue`, both at 400, and the attribute is left exactly as it was.
 #[tokio::test]
 async fn a_policy_document_is_validated_when_it_is_written() {
     let emulator = Emulator::new();
     // A principal that DOES exist, for the rows about a principal.
     let (existing, _) = emulator.user("an existing user", "exists", None, &[]).await;
-    // (case, the document, accepted)
-    let rows: &[(&str, Value, bool)] = &[
+    // (case, the document, the refusal it earns)
+    let rows: &[(&str, Value, Refused)] = &[
         (
             "an action of this service",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:SendMessage", "Resource": "*"}])),
-            true,
+            Refused::NotAtAll,
         ),
         (
             "every action of this service",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:*", "Resource": "*"}])),
-            true,
+            Refused::NotAtAll,
+        ),
+        (
+            // IAM compares action names case-insensitively, so the case-folded spelling
+            // names the same action.
+            "an action of this service, case-folded",
+            policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:sendmessage", "Resource": "*"}])),
+            Refused::NotAtAll,
         ),
         (
             // Every action name of this service is one a policy may name; how far the grant
             // REACHES is the evaluator's question at call time.
             "an account-level action of this service",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:ListQueues", "Resource": "*"}])),
-            true,
+            Refused::NotAtAll,
         ),
         (
             "an action that changes who may reach the queue",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:SetQueueAttributes", "Resource": "*"}])),
-            true,
+            Refused::NotAtAll,
         ),
         (
-            "a batch action, which its single-message sibling also grants",
+            // A batch action is granted by its single-message sibling, so it is not a name
+            // a policy states.
+            "a batch action, which its single-message sibling grants",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:SendMessageBatch", "Resource": "*"}])),
-            true,
+            Refused::ActionName("sqs:SendMessageBatch"),
+        ),
+        (
+            // Only the WHOLE action set has a wildcard spelling.
+            "an action pattern that is not the whole set",
+            policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:Send*", "Resource": "*"}])),
+            Refused::ActionName("sqs:Send*"),
+        ),
+        (
+            "an action pattern wildcarded at its front",
+            policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:*Message", "Resource": "*"}])),
+            Refused::ActionName("sqs:*Message"),
+        ),
+        (
+            "the bare wildcard, which names no action of this service",
+            policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "*", "Resource": "*"}])),
+            Refused::ActionName("*"),
         ),
         (
             "an action no operation of this service has",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:NotARealAction", "Resource": "*"}])),
-            false,
+            Refused::ActionName("sqs:NotARealAction"),
         ),
         (
             "an action of another service",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "*"}])),
-            false,
+            Refused::ActionName("s3:GetObject"),
         ),
         (
             "one bad action among good ones",
@@ -1230,17 +1288,17 @@ async fn a_policy_document_is_validated_when_it_is_written() {
                 "Action": ["sqs:SendMessage", "sqs:Nonsense"],
                 "Resource": "*",
             }])),
-            false,
+            Refused::ActionName("sqs:Nonsense"),
         ),
         (
             "an action named under NotAction",
             policy(json!([{"Effect": "Deny", "Principal": "*", "NotAction": "sqs:Nonsense", "Resource": "*"}])),
-            false,
+            Refused::ActionName("sqs:Nonsense"),
         ),
         (
             "an existing principal of this account",
             policy(json!([{"Effect": "Allow", "Principal": {"AWS": existing.clone()}, "Action": "sqs:SendMessage", "Resource": "*"}])),
-            true,
+            Refused::NotAtAll,
         ),
         (
             "a principal of this account that does not exist",
@@ -1250,7 +1308,7 @@ async fn a_policy_document_is_validated_when_it_is_written() {
                 "Action": "sqs:SendMessage",
                 "Resource": "*",
             }])),
-            false,
+            Refused::Document,
         ),
         (
             "a role of this account that does not exist",
@@ -1260,7 +1318,7 @@ async fn a_policy_document_is_validated_when_it_is_written() {
                 "Action": "sqs:SendMessage",
                 "Resource": "*",
             }])),
-            false,
+            Refused::Document,
         ),
         (
             // Another account's principals are not this account's to judge.
@@ -1271,7 +1329,7 @@ async fn a_policy_document_is_validated_when_it_is_written() {
                 "Action": "sqs:SendMessage",
                 "Resource": "*",
             }])),
-            true,
+            Refused::NotAtAll,
         ),
         (
             "an account root, a bare account id and a service principal",
@@ -1280,44 +1338,45 @@ async fn a_policy_document_is_validated_when_it_is_written() {
                 {"Effect": "Allow", "Principal": {"AWS": "210987654321"}, "Action": "sqs:SendMessage", "Resource": "*"},
                 {"Effect": "Allow", "Principal": {"Service": "events.amazonaws.com"}, "Action": "sqs:SendMessage", "Resource": "*"},
             ])),
-            true,
+            Refused::NotAtAll,
         ),
         (
             // A document stating nothing grants nothing and is accepted, which is what
             // keeps the validation about the statements a document DOES state.
             "a document stating no statement at all",
             json!({"Version": "2012-10-17"}),
-            true,
+            Refused::NotAtAll,
         ),
         (
             // A policy document is an object; a value that is some other JSON is not one.
             "a JSON value that is not an object",
             json!([{"Effect": "Allow", "Principal": "*", "Action": "sqs:SendMessage"}]),
-            false,
+            Refused::Document,
         ),
         (
             // An INEFFECTIVE statement is still one a caller may store: it grants nothing
             // and refuses nothing, so nothing about it is a value this service rejects.
             "a statement that states no effect at all",
             policy(json!([{"Principal": "*", "Action": "sqs:SendMessage", "Resource": "*"}])),
-            true,
+            Refused::NotAtAll,
         ),
         (
             "a statement naming no action at all",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Resource": "*"}])),
-            true,
+            Refused::NotAtAll,
         ),
         (
             // An element that IS stated has to name an action of this service, so one
-            // naming none is refused where leaving it out is not.
+            // naming none is refused where leaving it out is not. There is no value to
+            // name back, so the whole document is what the refusal is about.
             "a statement whose action element names nothing",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": [], "Resource": "*"}])),
-            false,
+            Refused::Document,
         ),
         (
             "a statement whose action element is not a name at all",
             policy(json!([{"Effect": "Allow", "Principal": "*", "Action": {"sqs": "SendMessage"}, "Resource": "*"}])),
-            false,
+            Refused::Document,
         ),
     ];
 
@@ -1332,7 +1391,7 @@ async fn a_policy_document_is_validated_when_it_is_written() {
     }]));
     emulator.set_policy("the held policy", &url, &held).await;
 
-    for (case, document, accepted) in rows {
+    for (case, document, refused) in rows {
         let (status, body) = emulator
             .sqs(
                 OWNER_KEY,
@@ -1340,27 +1399,58 @@ async fn a_policy_document_is_validated_when_it_is_written() {
                 &json!({"QueueUrl": url, "Attributes": {"Policy": document.to_string()}}),
             )
             .await;
-        if *accepted {
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected the document to be stored, got {status} with {body}"
-            );
-            // Put the queue back to the document the next row is judged against.
-            emulator.set_policy(case, &url, &held).await;
-        } else {
-            assert_eq!(
+        match refused {
+            Refused::NotAtAll => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the document to be stored, got {status} with {body}"
+                );
+                // Put the queue back to the document the next row is judged against.
+                emulator.set_policy(case, &url, &held).await;
+                continue;
+            }
+            Refused::Document => assert_eq!(
                 (status, error_code(&body).as_str()),
                 (400, "InvalidAttributeValue"),
                 "case {case:?}: expected a 400 InvalidAttributeValue, got {status} with {body}"
-            );
-            let attributes = emulator.attributes(case, &url).await;
-            assert_eq!(
-                attributes.get("Policy").map(String::as_str),
-                Some(held.to_string().as_str()),
-                "case {case:?}: a refused document must leave the stored one alone"
-            );
+            ),
+            Refused::ActionName(named) => {
+                let expected = format!(
+                    "Value {named} for parameter ActionName is invalid. \
+                     Reason: Please refer to the appropriate WSDL for a list of valid actions."
+                );
+                let message = body
+                    .get("message")
+                    .or_else(|| body.get("Message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert_eq!(
+                    (status, error_code(&body).as_str(), message),
+                    (400, "InvalidParameterValue", expected.as_str()),
+                    "case {case:?}: expected a 400 InvalidParameterValue naming {named}, \
+                     got {status} with {body}"
+                );
+            }
         }
+        let attributes = emulator.attributes(case, &url).await;
+        assert_eq!(
+            attributes.get("Policy").map(String::as_str),
+            Some(held.to_string().as_str()),
+            "case {case:?}: a refused document must leave the stored one alone"
+        );
     }
+}
+
+/// How a row of the write-time validation table is answered.
+#[derive(Debug, Clone, Copy)]
+enum Refused {
+    /// The document is one this service stores.
+    NotAtAll,
+    /// The VALUE supplied for the attribute is not one it accepts.
+    Document,
+    /// One `Action` value is no action name a queue policy may state, and the refusal
+    /// names it.
+    ActionName(&'static str),
 }
 
 /// A stored `Policy` is canonical: a `Principal` naming a bare account id reads back as that

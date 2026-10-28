@@ -1758,25 +1758,37 @@ pub fn page_size(max_results: Option<i32>) -> Result<usize, String> {
     }
 }
 
-/// The marker every pagination token this service mints carries, before its
-/// listing name and resume key. It is what makes a token verifiable: a string
-/// that merely happens to be base64 is not a resume point, and a token issued by
-/// one listing is not accepted by another.
+/// The marker every pagination token this service mints carries, before the
+/// region and listing name it was issued for and its resume key. It is what makes
+/// a token verifiable: a string that merely happens to be base64 is not a resume
+/// point, and a token issued by one listing is not accepted by another.
 const PAGE_TOKEN_PREFIX: &str = "resourcegroups/v1/";
 
 /// Encode a listing's resume point — the key of the last item returned — as the
 /// opaque `NextToken` the model describes (`^[a-zA-Z0-9+/]*={0,2}$`, i.e.
-/// base64). `listing` names the listing the token belongs to.
-pub fn encode_page_token(listing: &str, last_key: &str) -> String {
-    aws_smithy_types::base64::encode(format!("{PAGE_TOKEN_PREFIX}{listing}/{last_key}"))
+/// base64).
+///
+/// A token names the listing it resumes, and a listing of this service is
+/// identified by the REGION the request addressed as well as by `listing`: every
+/// listing here enumerates one region's resources ([`GroupKey`]), so the same
+/// listing name in another region is another listing, whose items this token's
+/// resume key does not place. `region` is therefore carried beside `listing` and
+/// checked by [`decode_page_token`], which is what keeps a resume point from
+/// crossing a region boundary.
+pub fn encode_page_token(region: &str, listing: &str, last_key: &str) -> String {
+    aws_smithy_types::base64::encode(format!(
+        "{PAGE_TOKEN_PREFIX}{region}/{listing}/{last_key}"
+    ))
 }
 
 /// The resume point a `NextToken` carries, or `None` when the token was not
-/// minted by `listing`.
-pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
+/// minted by `listing` in `region`.
+pub fn decode_page_token(region: &str, listing: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(aws_smithy_types::base64::decode(token).ok()?).ok()?;
     decoded
         .strip_prefix(PAGE_TOKEN_PREFIX)?
+        .strip_prefix(region)?
+        .strip_prefix('/')?
         .strip_prefix(listing)?
         .strip_prefix('/')
         .map(str::to_string)

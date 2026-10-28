@@ -21,8 +21,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    ACTION_NAMES, MAX_ACTIONS_PER_STATEMENT, MAX_PERMISSION_LABEL_LENGTH, MAX_POLICY_STATEMENTS,
-    MAX_PRINCIPALS_PER_STATEMENT,
+    authorization::policy_action_names, MAX_ACTIONS_PER_STATEMENT, MAX_PERMISSION_LABEL_LENGTH,
+    MAX_POLICY_STATEMENTS, MAX_PRINCIPALS_PER_STATEMENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -154,8 +154,8 @@ async fn every_shape_of_grant_becomes_one_statement_of_the_queue_policy() {
     );
 
     // The bound is the documented maximum of actions per statement, taken off the
-    // catalog of action names the model declares rather than spelled out again.
-    let at_the_action_bound: Vec<String> = ACTION_NAMES
+    // catalog of action names a policy may state rather than spelled out again.
+    let at_the_action_bound: Vec<String> = policy_action_names()
         .iter()
         .take(MAX_ACTIONS_PER_STATEMENT)
         .map(ToString::to_string)
@@ -447,7 +447,7 @@ async fn a_request_outside_the_documented_rules_is_refused_and_persists_nothing(
     let before = policy_of(&router, &url).await;
 
     let too_long_label = "l".repeat(MAX_PERMISSION_LABEL_LENGTH + 1);
-    let past_the_action_bound: Vec<&str> = ACTION_NAMES
+    let past_the_action_bound: Vec<&str> = policy_action_names()
         .iter()
         .take(MAX_ACTIONS_PER_STATEMENT + 1)
         .copied()
@@ -683,7 +683,7 @@ async fn a_grant_past_the_policy_size_bound_is_refused_as_over_limit() {
     // many actions as one may allow, so a handful of them fills the document.
     let principals = account_numbers(MAX_PRINCIPALS_PER_STATEMENT);
     let principals: Vec<&str> = principals.iter().map(String::as_str).collect();
-    let actions: Vec<&str> = ACTION_NAMES
+    let actions: Vec<&str> = policy_action_names()
         .iter()
         .take(MAX_ACTIONS_PER_STATEMENT)
         .copied()
@@ -842,7 +842,7 @@ async fn an_action_this_service_does_not_have_is_refused_as_an_unknown_action() 
 
     // Names the published set DOES carry are granted — entries the refusals above are
     // near-misses of, plus the wildcard, read from the catalog in the service's state.
-    let accepted: Vec<&str> = ACTION_NAMES
+    let accepted: Vec<&str> = policy_action_names()
         .iter()
         .copied()
         .filter(|action| ["ChangeMessageVisibility", "ReceiveMessage", "SendMessage"].contains(action))

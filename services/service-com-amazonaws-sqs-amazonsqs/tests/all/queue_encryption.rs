@@ -2053,3 +2053,86 @@ fn with_key_id(members: &Value, key_id: &str) -> Value {
     request
 }
 
+/// A receive that found a message to hand over and could not use the key it is sealed
+/// under has made a delivery ATTEMPT on it: `maxReceiveCount` is "the number of times a
+/// message is delivered to the source queue before being moved to the dead-letter queue"
+/// and counts that attempt, so a consumer the key does not permit drives the message to the
+/// queue's dead-letter target rather than being refused the same message for ever.
+///
+/// The rows walk the allowance, so what the attempt count has to reach is a published
+/// number and not one example.
+#[tokio::test]
+async fn a_receive_the_queues_key_refuses_counts_as_a_delivery_attempt() {
+    // (case, the deliveries the RedrivePolicy allows)
+    let rows: &[(&str, i64)] = &[
+        ("one attempt allowed", 1),
+        ("two attempts allowed", 2),
+        ("three attempts allowed", 3),
+    ];
+
+    for (case, allowance) in rows.iter().copied() {
+        let emulator = Emulator::new();
+        // A key that lets a send seal a body and lets NO principal read one back. The
+        // consumer is an assumed-role session rather than the account's own credential,
+        // which the account's own keys do not refuse.
+        let consumer = emulator
+            .assumed_role_key(&format!("undecryptable-consumer-{allowance}"), None)
+            .await;
+        let (_, key_arn) = emulator
+            .create_key(json!({"Policy": key_policy_allowing(&["kms:GenerateDataKey"])}))
+            .await;
+        let dead_letter_name = format!("undecryptable-dlq-{allowance}");
+        let dead_letter_url = emulator.queue(&dead_letter_name, &json!({})).await;
+        let source_url = emulator
+            .queue(
+                &format!("undecryptable-source-{allowance}"),
+                &json!({
+                    "KmsMasterKeyId": key_arn,
+                    "RedrivePolicy": json!({
+                        "deadLetterTargetArn": format!(
+                            "arn:aws:sqs:{REGION}:{}:{dead_letter_name}",
+                            ::engine::emulator_account_id(),
+                        ),
+                        "maxReceiveCount": allowance,
+                    })
+                    .to_string(),
+                }),
+            )
+            .await;
+
+        let body = format!("sealed for {case}");
+        let (status, code) = emulator.send(&consumer, &source_url, &body).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (200, "<no __type>"),
+            "case {case}: the send had to be accepted under a key that generates data keys"
+        );
+
+        // Every attempt the allowance covers is refused by KMS and counted.
+        for attempt in 1..=allowance {
+            let (status, code, bodies) = emulator.receive(&consumer, &source_url).await;
+            assert_eq!(
+                (status, code.as_str(), bodies.as_slice()),
+                (400, "KmsAccessDenied", &[][..]),
+                "case {case}, attempt {attempt}: the body had to be withheld"
+            );
+        }
+
+        // The allowance is spent, so the next poll of the source moves the message instead
+        // of attempting it again, and the dead-letter queue — which is on no customer
+        // managed key — hands it over.
+        let (status, code, bodies) = emulator.receive(&consumer, &source_url).await;
+        assert_eq!(
+            (status, code.as_str(), bodies.as_slice()),
+            (200, "<no __type>", &[][..]),
+            "case {case}: the source queue must hold nothing once the allowance is spent"
+        );
+        let (status, code, bodies) = emulator.receive(&consumer, &dead_letter_url).await;
+        assert_eq!(
+            (status, code.as_str(), bodies.as_slice()),
+            (200, "<no __type>", &[body][..]),
+            "case {case}: the undecryptable message must land in the dead-letter queue"
+        );
+    }
+}
+

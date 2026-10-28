@@ -87,6 +87,9 @@ service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # (`state::provisioner`): a suite that deploys one must have its owning service mounted
 # beside CloudFormation, or the create is refused and the stack fails.
 service-com-amazonaws-ssm-amazonssm = { workspace = true }
+# Amazon EC2, for the `AWS::EC2::VPC` and `AWS::EC2::Subnet` a stack really creates there:
+# the suites that deploy a network read the VPC and its subnets back through EC2's own wire.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

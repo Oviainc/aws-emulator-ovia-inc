@@ -162,12 +162,11 @@ struct EventCase<'a> {
 
 /// A VPC, two subnets in it and a DB subnet group over those subnets, in JSON.
 ///
-/// `AWS::EC2::VPC` and `AWS::EC2::Subnet` are types this emulator provisions nowhere, so
-/// the stack records them from the template alone — each under the `vpc-`/`subnet-`
-/// identifier its type's `Ref` returns — while the `AWS::RDS::DBSubnetGroup` is really
-/// created in Amazon RDS, which refuses the name AWS reserves for the DB subnet group of
-/// the account's default VPC. `Topic` is declared to depend on that group, so the walk
-/// never reaches it.
+/// The VPC and the subnets are really created in Amazon EC2 — each under the
+/// `vpc-`/`subnet-` identifier that service assigned it — while the
+/// `AWS::RDS::DBSubnetGroup` is really created in Amazon RDS, which refuses the name AWS
+/// reserves for the DB subnet group of the account's default VPC. `Topic` is declared to
+/// depend on that group, so the walk never reaches it.
 const NETWORK_TEMPLATE: &str = r#"{"Resources":{
     "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.0.0.0/16"}},
     "SubnetA":{"Type":"AWS::EC2::Subnet","Properties":{
@@ -205,17 +204,20 @@ async fn every_resource_a_stack_operation_acts_on_records_its_own_events() {
             rolled_back: false,
         },
         EventCase {
-            case: "a created resource beside two the stack records from the template alone",
+            case: "a resource created in the service that owns it beside one the stack \
+                   records from the template alone",
             stack_name: "events-mixed",
             template: r#"{"Resources":{
                 "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.0.0.0/16"}},
                 "SubnetA":{"Type":"AWS::EC2::Subnet","Properties":{
                   "VpcId":{"Ref":"Vpc"},"CidrBlock":"10.0.1.0/24"}},
+                "Igw":{"Type":"AWS::EC2::InternetGateway"},
                 "Topic":{"Type":"AWS::SNS::Topic",
                   "Properties":{"TopicName":"events-mixed-topic"}}}}"#,
             resources: vec![
                 expected("Vpc", "AWS::EC2::VPC", "CREATE_COMPLETE"),
                 expected("SubnetA", "AWS::EC2::Subnet", "CREATE_COMPLETE"),
+                expected("Igw", "AWS::EC2::InternetGateway", "CREATE_COMPLETE"),
                 expected("Topic", "AWS::SNS::Topic", "CREATE_COMPLETE"),
             ],
             unreached: &[],
@@ -423,10 +425,12 @@ async fn every_resource_a_stack_operation_acts_on_records_its_own_events() {
 #[tokio::test]
 async fn deleting_a_stack_records_an_event_per_resource_it_really_deletes() {
     let router = router();
-    // Two topics Amazon SNS really holds, and a resource this emulator provisions nowhere:
-    // the deletion asks SNS for the first two and nothing for the third.
+    // Two topics Amazon SNS really holds, a VPC Amazon EC2 really holds, and a resource
+    // this emulator provisions nowhere: the deletion asks SNS for the topics and EC2 for
+    // the VPC, and nothing for the internet gateway.
     let template = r#"{"Resources":{
         "Vpc":{"Type":"AWS::EC2::VPC","Properties":{"CidrBlock":"10.0.0.0/16"}},
+        "Igw":{"Type":"AWS::EC2::InternetGateway"},
         "First":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"events-deleted-1"}},
         "Second":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"events-deleted-2"}}}}"#;
     let (status_code, created) = create_stack(&router, "events-deleted", template, &[]).await;
@@ -477,9 +481,17 @@ async fn deleting_a_stack_records_an_event_per_resource_it_really_deletes() {
              and once through its delete, got {events:?}"
         );
     }
+    // The VPC is one the deletion really asks Amazon EC2 for, so it records the same pair
+    // of transitions a topic does.
     assert!(
-        position(&events, "Vpc", "DELETE_IN_PROGRESS").is_none(),
-        "case \"deleting the stack\": no service holds Vpc, so its deletion asks nothing \
+        position(&events, "Vpc", "DELETE_IN_PROGRESS").is_some()
+            && position(&events, "Vpc", "DELETE_COMPLETE").is_some(),
+        "case \"deleting the stack\": Amazon EC2 holds Vpc, so its deletion records both \
+         events, got {events:?}"
+    );
+    assert!(
+        position(&events, "Igw", "DELETE_IN_PROGRESS").is_none(),
+        "case \"deleting the stack\": no service holds Igw, so its deletion asks nothing \
          and records nothing, got {events:?}"
     );
     let newest = events.first().expect("a deleted stack has events");

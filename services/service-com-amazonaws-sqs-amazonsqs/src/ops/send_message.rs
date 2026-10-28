@@ -503,6 +503,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only a FIFO queue sequences its messages; `SequenceNumber` "applies only to
         // FIFO (first-in-first-out) queues".
         let sequence_number = fifo.then(|| queue.next_sequence_number());
+        // Who this message is FROM, read from the credential that signed this send: it is
+        // recorded on the message, so what a consumer reads under `SenderId` is the sender
+        // of the send that arrived.
+        let sender_id = sqs::authorization::sender_id(&*self.engine, ctx);
 
         queue.messages.push_back(sqs::StoredMessage {
             message_id: message_id.clone(),
@@ -514,6 +518,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             message_deduplication_id: deduplication_id,
             sequence_number: sequence_number.clone(),
             sent_at: now,
+            // The queue this send enqueues the message in is the one it was sent to, so
+            // its retention runs from the same instant.
+            retention_from: now,
+            sender_id,
             available_at: sqs::after(now, delay),
             invisible_until: None,
             receive_count: 0,

@@ -356,10 +356,10 @@ fn assert_minted_router_input_arn(case: &str, arn: &str, id: &str) {
 /// Put the stored router input `arn` into the settled state `state`, the way the state a
 /// router input is in when a restart arrives is reached.
 ///
-/// StopRouterInput is still scaffolded, so the states an input other than a freshly created
-/// one is in are reached through the store rather than through thousands of round trips. The
-/// record is left SETTLED (no transition owed), exactly as a created input is once the clock
-/// has settled it.
+/// StopRouterInput moves an input into `STOPPING` rather than into an arbitrary state, so
+/// the states an input other than a freshly created one is in are reached through the store
+/// rather than through thousands of round trips. The record is left SETTLED (no transition
+/// owed), exactly as a created input is once the clock has settled it.
 ///
 /// `pub(crate)` because the router input start suite reaches the state a start arrives in
 /// the same way (see `tests/all/router_input_start.rs`), as does the update suite (see
