@@ -13082,6 +13082,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
         let (resource_type, location) = if let Some(instance) = self.instances.get(name) {
             (RESOURCE_TYPE_INSTANCE, instance.location.clone())
         } else {
+            // The other resource type the add-on applies to; a name that is
+            // neither names no resource at all.
             let disk = self.disks.get(name)?;
             (RESOURCE_TYPE_DISK, disk.location.clone())
         };
@@ -15246,6 +15248,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
             let hour = enabled_auto_snapshot_hour(&record.add_ons);
             (outcome, RESOURCE_TYPE_INSTANCE, hour)
         } else {
+            // The other resource type add-ons apply to; a name that is neither
+            // names no resource at all.
             let record = self.disks.get_mut(name)?;
             let outcome = body(record, RESOURCE_TYPE_DISK);
             let hour = enabled_auto_snapshot_hour(&record.add_ons);
