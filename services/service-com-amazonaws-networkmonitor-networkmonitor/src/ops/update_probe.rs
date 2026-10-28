@@ -27,6 +27,10 @@
 //! ([`crate::state::Monitor::follow_probe_states`]): a monitor whose every
 //! probe is deactivated has nothing aggregating and is reported `INACTIVE`,
 //! and one that gains a probe in service is owed `PENDING` -> `ACTIVE` again.
+//! The probes are part of the monitor record every read reports, so an update
+//! that stored something new moves the MONITOR's `modifiedAt` as well as the
+//! probe's ([`crate::state::Monitor::follow_probe_write`]), exactly as a create
+//! or an accepted delete of a probe does.
 //!
 //! ## Shape of an operation
 //!
@@ -356,13 +360,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered from the STORED probe, so what the caller is told is what a
         // later `GetProbe` and `GetMonitor` read back.
         let output = output_for(probe);
-        // A monitor aggregates what its probes measure, so switching a probe
-        // off or back on changes what the CONTAINING monitor is reporting too:
-        // the monitor follows the probes it now holds
-        // ([`crate::state::Monitor::follow_probe_states`]) — back to `INACTIVE`
+        // The write landed in a probe the MONITOR holds and every read of the
+        // monitor reports, so an update that stored something new changed the
+        // monitor too and its `modifiedAt` moves with the probe's; a repeat that
+        // stored nothing changed neither record. The monitor's own state then
+        // follows the probes it now holds
+        // ([`crate::state::Monitor::follow_probe_write`]) — back to `INACTIVE`
         // once it has nothing in service, and owed `PENDING` -> `ACTIVE` again
         // the moment it has.
-        monitor.follow_probe_states(now);
+        monitor.follow_probe_write(changed, now);
         Ok(output)
     }
 }
