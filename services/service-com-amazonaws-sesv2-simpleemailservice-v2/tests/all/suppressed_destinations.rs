@@ -35,7 +35,10 @@
 //! address, and refuses the write with a terminal 400 `BadRequestException` while the
 //! account has not been granted production access, leaving every list untouched. Those
 //! tables span both reasons, both kinds of list, the spellings of an address, a
-//! repeated write of one address, and each way a write is refused.
+//! repeated write of one address, and each way a write is refused. A written entry is
+//! also reported by the listing of the list the write targeted — narrowed to the
+//! reason the write supplied — and by no other list's, over rows differing in the list
+//! targeted, the number of addresses written to it and the reasons they carry.
 //!
 //! One further rule, under all of those: an entry's storage key names exactly one
 //! (list, address) pair and carries its own list's prefix and no other's — whatever
@@ -49,7 +52,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::SUPPRESSION_LIST_REASON_VALUES;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
-    encode_tagged_page_token, suppression_key, suppression_list_prefix,
+    encode_tagged_page_token, identity_key, suppression_key, suppression_list_prefix,
     ComAmazonawsSesv2SimpleemailserviceV2State, SuppressedDestinationRecord,
     CONTACTS_PAGE_TOKEN_TAG, MAX_TENANT_NAME_CHARS,
 };
@@ -1967,6 +1970,202 @@ async fn a_suppression_write_the_account_cannot_make_stores_nothing() {
         "case {:?}: expected 200 for the tenant the account holds, got {} {:?}",
         "an existing tenant", accepted.status, accepted.body
     );
+}
+
+/// One row of the write-then-list table: the list every write of the row targets, and
+/// the `(address, reason)` pairs written to it, each reason named by its position in
+/// the modelled `SuppressionListReason` catalog.
+///
+/// Every row targets a different list, so what one row wrote is also the evidence that
+/// no other row's listing reports it.
+struct WriteListCase {
+    name: &'static str,
+    tenant: Option<&'static str>,
+    writes: &'static [(&'static str, usize)],
+}
+
+/// The `(address, reason, stamp)` triples a listing reported, in the order it reported
+/// them.
+fn listed_entries(reply: &Reply) -> Vec<(String, String, f64)> {
+    reply
+        .at(&["SuppressedDestinationSummaries"])
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let text = |member: &str| {
+                        item.get(member)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (
+                        text("EmailAddress"),
+                        text("Reason"),
+                        item.get("LastUpdateTime")
+                            .and_then(Value::as_f64)
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn every_suppression_write_is_reported_by_the_listing_of_the_list_it_targeted() {
+    let (bounce, complaint) = modelled_reasons();
+    let catalog = [bounce, complaint];
+    // The rows differ along what the rule generalises over: which list the writes
+    // target, how many addresses are written to it, which reason each write carries,
+    // and the spelling of an address. The last row writes nothing, so a list of this
+    // account that no write targeted reports no entry.
+    let cases = [
+        WriteListCase {
+            name: "the account-level list, three addresses across both reasons",
+            tenant: None,
+            writes: &[
+                ("account-bounce@example.com", 0),
+                ("account-complaint@example.com", 1),
+                ("Account.Mixed@Example.COM", 0),
+            ],
+        },
+        WriteListCase {
+            name: "a tenant's list, one address per reason",
+            tenant: Some("tenant_one"),
+            writes: &[
+                ("tenant-one-bounce@example.com", 0),
+                ("tenant-one-complaint@example.com", 1),
+            ],
+        },
+        WriteListCase {
+            name: "another tenant's list, a single address",
+            tenant: Some("tenant-two"),
+            writes: &[("tenant-two-complaint@example.com", 1)],
+        },
+        WriteListCase {
+            name: "a tenant's list no write targeted",
+            tenant: Some("tenant_empty"),
+            writes: &[],
+        },
+    ];
+
+    let ses = Ses::new();
+    ses.create_tenants(&["tenant_one", "tenant-two", "tenant_empty"])
+        .await;
+    // The account-wide restriction is not what these rows are about, so this account
+    // holds production access and each write below is permitted.
+    ses.grant_production_access();
+
+    let opened = window() - 1.0;
+    for case in &cases {
+        for (address, reason) in case.writes {
+            let accepted = ses
+                .put_suppressed(address, catalog[*reason], case.tenant)
+                .await;
+            assert_eq!(
+                accepted.status, 200,
+                "case {:?}: expected 200 writing {address:?}, got {} {:?}",
+                case.name, accepted.status, accepted.body
+            );
+        }
+    }
+    let closed = window() + 1.0;
+
+    for case in &cases {
+        // Within one list the entries are ordered by address, so that is the order the
+        // row's own writes are expected back in.
+        let mut expected: Vec<(String, String)> = case
+            .writes
+            .iter()
+            .map(|(address, reason)| ((*address).to_string(), catalog[*reason].to_string()))
+            .collect();
+        expected.sort_by_key(|(address, _)| identity_key(address));
+
+        let reply = ses.list_suppressed(&selection(case.tenant)).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {:?}: expected 200 from the listing of the written list, got {} {:?}",
+            case.name, reply.status, reply.body
+        );
+        let reported = listed_entries(&reply);
+        let pairs: Vec<(String, String)> = reported
+            .iter()
+            .map(|(address, reason, _)| (address.clone(), reason.clone()))
+            .collect();
+        assert_eq!(
+            pairs, expected,
+            "case {:?}: expected the listing to report exactly this list's writes {expected:?}, \
+             got {pairs:?}",
+            case.name
+        );
+        // Each reported entry is stamped with the instant of the write that made it.
+        for (address, _, stamp) in &reported {
+            assert!(
+                *stamp >= opened && *stamp <= closed,
+                "case {:?}: expected {address:?} to carry a LastUpdateTime within \
+                 {opened}..{closed}, got {stamp}",
+                case.name
+            );
+        }
+
+        // Narrowed to one reason, the same listing reports the writes that carried it
+        // and no other — on the same list, which is what shows the reason reported is
+        // the one the write supplied rather than a default.
+        for reason in catalog {
+            let mut query = selection(case.tenant);
+            query.push(("Reason", reason.to_string()));
+            let narrowed = ses.list_suppressed(&query).await;
+            assert_eq!(
+                narrowed.status, 200,
+                "case {:?}: expected 200 listing {reason:?} entries, got {} {:?}",
+                case.name, narrowed.status, narrowed.body
+            );
+            let expected_for_reason: Vec<String> = expected
+                .iter()
+                .filter(|(_, carried)| carried == reason)
+                .map(|(address, _)| address.clone())
+                .collect();
+            let got = listed(&narrowed);
+            assert_eq!(
+                got, expected_for_reason,
+                "case {:?}: expected the {reason:?} listing to report \
+                 {expected_for_reason:?}, got {got:?}",
+                case.name
+            );
+        }
+
+        // And every written address is readable back as the entry of this list alone:
+        // the list the write did not target still misses it.
+        for (address, reason) in case.writes {
+            let served = ses.get_suppressed(address, case.tenant).await;
+            assert_eq!(
+                served.text_at(&["SuppressedDestination", "Reason"]),
+                Some(catalog[*reason].to_string()),
+                "case {:?}: expected {address:?} to read back with the reason its write \
+                 supplied, got {} {:?}",
+                case.name,
+                served.status,
+                served.body
+            );
+            let elsewhere = ses
+                .get_suppressed(address, Some("tenant_empty"))
+                .await
+                .status;
+            let expected_elsewhere = if case.tenant == Some("tenant_empty") {
+                200
+            } else {
+                404
+            };
+            assert_eq!(
+                elsewhere, expected_elsewhere,
+                "case {:?}: expected the list the write did not target to answer \
+                 {expected_elsewhere} for {address:?}, got {elsewhere}",
+                case.name
+            );
+        }
+    }
 }
 
 /// The suppression lists a storage key can belong to: the account-level list (`None`)
