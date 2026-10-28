@@ -34,7 +34,7 @@ use service_com_amazonaws_sqs_amazonsqs::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
-    call, create_ok, emulator_over_engine, fifo_attributes, message_counts, messages, ok,
+    call, create_ok, emulator_over_engine, fifo_attributes, message_counts, messages, ok, REGION,
 };
 
 /// The bounds `ChangeMessageVisibilityRequest$VisibilityTimeout` documents: "Values range:
@@ -60,8 +60,7 @@ fn lapse_visibility(engine: &engine::InMemoryEngine, url: &str) {
     let store = engine.state::<ComAmazonawsSqsAmazonsqsState>();
     let mut store = store.lock();
     let queue = store
-        .queues
-        .get_mut(&name)
+        .queue_mut(REGION, &name)
         .unwrap_or_else(|| panic!("case lapsing {url}: no queue named {name}"));
     for message in &mut queue.messages {
         if message.invisible_until.is_some() {

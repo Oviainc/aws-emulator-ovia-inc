@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{queue_name_from_url, ComAmazonawsSqsAmazonsqsState};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{create_ok, emulator_over_engine, message_counts as counts, messages, ok};
+use super::support::{create_ok, emulator_over_engine, message_counts as counts, messages, ok, REGION};
 
 /// `at` moved `by` into the past, or `at` itself for an instant that far predates the
 /// epoch (unreachable for an instant this emulator minted from the clock).
@@ -47,8 +47,7 @@ fn age_messages(engine: &engine::InMemoryEngine, url: &str, by: Duration) {
     let store = engine.state::<ComAmazonawsSqsAmazonsqsState>();
     let mut store = store.lock();
     let queue = store
-        .queues
-        .get_mut(&name)
+        .queue_mut(REGION, &name)
         .unwrap_or_else(|| panic!("case ageing {url}: no queue named {name}"));
     for message in &mut queue.messages {
         message.sent_at = earlier(message.sent_at, by);

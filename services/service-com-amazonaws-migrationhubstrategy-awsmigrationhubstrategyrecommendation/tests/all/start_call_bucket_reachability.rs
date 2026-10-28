@@ -11,9 +11,8 @@
 //! the `migrationhub-strategy-` prefix the service may be reached under is refused as a
 //! PERMISSIONS failure naming that prefix. The two are opposite instructions to a client —
 //! create or correct the bucket, versus rename it or fix its policy — so one cannot stand
-//! in for the other. A name inside the prefix is a bucket the service provisions for its
-//! own use, so it is accepted whether or not object storage holds it yet, and whatever the
-//! refusals, nothing is minted.
+//! in for the other. Only a bucket the account holds INSIDE the prefix is usable, and
+//! whatever the refusal, nothing is minted.
 //!
 //! The rows span what the rule generalises over: which operation and which member carries
 //! the name, how near the name comes to the prefix, and — the discrimination this suite
@@ -38,7 +37,9 @@ use crate::import_and_assess::{
 /// with `migrationhub-strategy-`", `smithy_query(query="doc",shape="StartAssessmentRequest",
 /// member="s3bucketForAnalysisData")`), spelled out here rather than taken from the crate so
 /// a wrong constant in `src/state.rs` fails this test.
-const REQUIRED_PREFIX: &str = "migrationhub-strategy-";
+///
+/// `pub(crate)` so the suite beside this one holds its names to the same prefix.
+pub(crate) const REQUIRED_PREFIX: &str = "migrationhub-strategy-";
 
 /// The reason code each of the two refusals carries, spelled out for the same reason.
 const PERMISSIONS_REASON: &str = "[S3PermissionsIsIncorrect]";
@@ -48,6 +49,8 @@ const NOT_FOUND_REASON: &str = "[S3BucketNotFound]";
 const CONFORMING_BUCKET: &str = "migrationhub-strategy-analysis";
 /// A second one, so a row probing one member leaves the other conforming and distinct.
 const CONFORMING_REPORT_BUCKET: &str = "migrationhub-strategy-reports";
+/// The import bucket the `StartImportFileTask` rows that probe another member carry.
+const CONFORMING_IMPORT_BUCKET: &str = "migrationhub-strategy-import";
 
 /// A SigV4 credential scope naming S3 in the Region the Strategy Recommendations requests
 /// of `crate::import_and_assess` are signed for, so a bucket this suite creates is the
@@ -73,7 +76,9 @@ fn emulator_with_object_storage() -> MultiServiceRouter {
 
 /// Create `bucket` through S3's own front door, as the account's owner would before naming
 /// it to a start call.
-async fn create_bucket(case: &str, router: &MultiServiceRouter, bucket: &str) {
+///
+/// `pub(crate)` so the suite beside this one gives its account a bucket the same way.
+pub(crate) async fn create_bucket(case: &str, router: &MultiServiceRouter, bucket: &str) {
     let payload = "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
                    <LocationConstraint>eu-west-1</LocationConstraint>\
                    </CreateBucketConfiguration>";
@@ -95,14 +100,16 @@ async fn create_bucket(case: &str, router: &MultiServiceRouter, bucket: &str) {
 
 /// The missing-bucket refusal as the service words it, written out here so a message built
 /// any other way fails: its only variable part is the name the failing member sent.
-fn missing_bucket_message(bucket: &str) -> String {
+///
+/// `pub(crate)` so the suite beside this one holds the refusal to the same wording.
+pub(crate) fn missing_bucket_message(bucket: &str) -> String {
     format!("S3 bucket \"{bucket}\" does not exist or is not accessible [S3BucketNotFound]")
 }
 
 /// What a start call does with the row's bucket name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expected {
-    /// The name is inside the prefix: the start is accepted.
+    /// The account holds a bucket of that name, inside the prefix: the start is accepted.
     Accepted,
     /// The account holds no bucket of that name: the missing-bucket refusal.
     MissingBucket,
@@ -132,12 +139,12 @@ impl Row {
 
     /// What the rule says this row answers.
     fn expected(&self) -> Expected {
-        if self.bucket.starts_with(REQUIRED_PREFIX) {
-            Expected::Accepted
-        } else if self.held {
-            Expected::Permissions
-        } else {
+        if !self.held {
             Expected::MissingBucket
+        } else if self.bucket.starts_with(REQUIRED_PREFIX) {
+            Expected::Accepted
+        } else {
+            Expected::Permissions
         }
     }
 }
@@ -180,13 +187,13 @@ fn rows() -> Vec<Row> {
 }
 
 /// The request a row sends: its own member carries the row's name, every other member a
-/// conforming one.
+/// conforming one the account holds.
 fn request_for(row: &Row) -> Value {
     let mut request = match row.operation {
         "StartAssessment" => json!({"s3bucketForAnalysisData": CONFORMING_BUCKET}),
         "StartImportFileTask" => json!({
             "name": "reachability-probe",
-            "S3Bucket": "migrationhub-strategy-import",
+            "S3Bucket": CONFORMING_IMPORT_BUCKET,
             "s3key": "servers.csv",
         }),
         other => panic!("this table has no case for operation {other:?}"),
@@ -203,7 +210,10 @@ async fn dispatch(row: &Row, router: &MultiServiceRouter, request: Value) -> Ans
     }
 }
 
-async fn import_task_count(router: &MultiServiceRouter) -> usize {
+/// How many import file tasks the account holds, read through the list operation.
+///
+/// `pub(crate)` so the suite beside this one counts them the same way.
+pub(crate) async fn import_task_count(router: &MultiServiceRouter) -> usize {
     let listed: Answer = call(router, "GET", "/list-import-file-task", None).await;
     at(&listed.body, "/taskInfos")
         .as_array()
@@ -214,13 +224,22 @@ async fn import_task_count(router: &MultiServiceRouter) -> usize {
 /// A bucket member is refused by the condition that holds: the missing-bucket message
 /// naming the submitted bucket when the account holds no bucket of that name, the
 /// permissions message naming the prefix when it holds one outside the prefix, and no
-/// refusal at all for a name inside the prefix. A refusal mints nothing.
+/// refusal at all for a bucket it holds inside the prefix. A refusal mints nothing.
 #[tokio::test]
 async fn a_bucket_member_is_refused_by_the_condition_that_holds() {
     for row in rows() {
         let case = row.case();
         // A fresh emulator per row, so "nothing was minted" is about THIS request.
         let router = emulator_with_object_storage();
+        // The members this row is NOT probing name buckets the account holds, so the row is
+        // decided on the name it IS probing.
+        for bucket in [
+            CONFORMING_BUCKET,
+            CONFORMING_REPORT_BUCKET,
+            CONFORMING_IMPORT_BUCKET,
+        ] {
+            create_bucket(&case, &router, bucket).await;
+        }
         if row.held {
             create_bucket(&case, &router, row.bucket).await;
         }
@@ -230,7 +249,8 @@ async fn a_bucket_member_is_refused_by_the_condition_that_holds() {
         if expected == Expected::Accepted {
             assert_eq!(
                 answer.status, 200,
-                "case {case:?}: a name inside the prefix is accepted, got {} with {:?}",
+                "case {case:?}: a bucket the account holds inside the prefix is accepted, \
+                 got {} with {:?}",
                 answer.status, answer.body
             );
             continue;
@@ -297,6 +317,11 @@ async fn a_bucket_member_is_refused_by_the_condition_that_holds() {
 #[tokio::test]
 async fn the_refusal_names_the_bucket_the_failing_member_sent() {
     let router = emulator_with_object_storage();
+    // The account holds the conforming buckets the rows below leave on the members they
+    // are not probing, so each refusal is about the member that failed.
+    for bucket in [CONFORMING_BUCKET, CONFORMING_REPORT_BUCKET] {
+        create_bucket("the conforming buckets", &router, bucket).await;
+    }
 
     // Both bucket members name a bucket the account does not hold: the refusal names the
     // first member the call checks, and never the other member's name.

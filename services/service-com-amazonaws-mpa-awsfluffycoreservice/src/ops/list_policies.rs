@@ -8,11 +8,11 @@
 //! handler only reads it — `@readonly`, and unlike `ListApprovalTeams` it has no
 //! clock-owed change to materialise, because no catalog entry changes with time.
 //!
-//! `NextToken` is the ARN of the last policy the previous page returned, so the next
-//! page is every catalog entry ordered after it: a client paging with any `MaxResults`
-//! sees each policy exactly once. A token that is not one this service issued — an ARN
-//! the catalog does not hold, or anything that is not an ARN at all — earns
-//! `ValidationException` (400).
+//! `NextToken` is this listing's own: it names this listing and the ARN of the last
+//! policy the previous page returned, so the next page is every catalog entry ordered
+//! after it — a client paging with any `MaxResults` sees each policy exactly once. A
+//! token this listing did not hand out — one it cannot read, one another listing issued,
+//! or one naming an ARN the catalog does not hold — earns `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -178,11 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = store.lock();
 
-        // The token is this service's own: the ARN of the last policy the previous page
-        // returned. Anything the catalog does not hold never came from here.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+        // The token is this listing's own: it names THIS listing and the ARN of the last
+        // policy the previous page reported. A token this listing cannot read, or one
+        // naming an ARN the catalog does not hold, never came from here.
+        let after = crate::state::token_key(
+            crate::state::Listing::Policies,
+            input.next_token.as_deref(),
+        )
+        .map_err(ListPoliciesErrorModeled::ValidationException)?;
+        let after = match after {
             None => None,
-            Some(token) if state.policy(token).is_some() => Some(token),
+            Some(key) if state.policy(&key).is_some() => Some(key),
             Some(_) => {
                 return Err(ListPoliciesErrorModeled::ValidationException(
                     crate::state::foreign_next_token(),
@@ -193,21 +199,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // At most one entry past the page is read: enough to know whether more remain,
         // without materialising the whole tail of a catalog that has no fixed size.
-        let mut window: Vec<&crate::state::CatalogPolicy> = match after {
+        let mut window: Vec<&crate::state::CatalogPolicy> = match &after {
             None => state.policies.values().take(page_size + 1).collect(),
-            Some(token) => state
+            Some(key) => state
                 .policies
-                .range::<str, _>((Bound::Excluded(token), Bound::Unbounded))
+                .range::<str, _>((Bound::Excluded(key.as_str()), Bound::Unbounded))
                 .map(|(_, policy)| policy)
                 .take(page_size + 1)
                 .collect(),
         };
         let more_remain = window.len() > page_size;
         window.truncate(page_size);
-        let next_token = window
-            .last()
-            .filter(|_| more_remain)
-            .map(|policy| policy.arn.clone());
+        let next_token = window.last().filter(|_| more_remain).map(|policy| {
+            crate::state::listing_token(crate::state::Listing::Policies, &policy.arn)
+        });
 
         Ok(ListPoliciesOutput {
             policies: Some(window.iter().copied().map(entry).collect()),

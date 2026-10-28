@@ -32,7 +32,7 @@ use service_com_amazonaws_sqs_amazonsqs::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{call, create_ok, emulator_over_engine, error_code, messages, ok};
+use super::support::{call, create_ok, emulator_over_engine, error_code, messages, ok, REGION};
 
 /// The `VisibilityTimeout` the queues below are created with, well inside the documented
 /// range ("an integer from 0 to 43,200"), and long enough that no row's own wall-clock time
@@ -53,8 +53,7 @@ fn age_visibility(engine: &engine::InMemoryEngine, url: &str, by: Duration) {
     let store = engine.state::<ComAmazonawsSqsAmazonsqsState>();
     let mut store = store.lock();
     let queue = store
-        .queues
-        .get_mut(&name)
+        .queue_mut(REGION, &name)
         .unwrap_or_else(|| panic!("case ageing {url}: no queue named {name}"));
     for message in &mut queue.messages {
         if let Some(until) = message.invisible_until {

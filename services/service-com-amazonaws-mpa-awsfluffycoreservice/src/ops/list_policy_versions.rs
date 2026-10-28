@@ -15,11 +15,12 @@
 //! names no account and there is no account boundary to decide here — unlike an
 //! operation whose ARN names an approval team.
 //!
-//! `NextToken` is the version id of the last version the previous page returned, so the
-//! next page is every version of that policy ordered after it: a client paging with any
-//! `MaxResults` sees each version exactly once. A token that is not one this service
-//! issued — a version id the policy does not hold, or anything that is not a version id
-//! at all — earns `ValidationException` (400).
+//! `NextToken` is this listing's own: it names this listing — this operation, for THIS
+//! policy — and the version id of the last version the previous page returned, so the
+//! next page is every version of that policy ordered after it; a client paging with any
+//! `MaxResults` sees each version exactly once. A token this listing did not hand out —
+//! one it cannot read, one another listing (or another policy's versions) issued, or one
+//! naming a version id this policy does not hold — earns `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -204,11 +205,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The token is this service's own: the version id of the last version the
-        // previous page returned. Anything this policy does not hold never came from here.
-        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+        // The token is this listing's own: it names THIS listing — this operation, for
+        // this policy — and the version id of the last version the previous page
+        // reported. A token this listing cannot read, or one naming a version id this
+        // policy does not hold, never came from here.
+        let listing = crate::state::Listing::PolicyVersions {
+            policy_arn: &input.policy_arn,
+        };
+        let after = match crate::state::token_key(listing, input.next_token.as_deref())
+            .map_err(ListPolicyVersionsErrorModeled::ValidationException)?
+        {
             None => None,
-            Some(token) => match token.parse::<i32>() {
+            Some(key) => match key.parse::<i32>() {
                 Ok(version_id) if policy.version(version_id).is_some() => Some(version_id),
                 _ => {
                     return Err(ListPolicyVersionsErrorModeled::ValidationException(
@@ -236,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = window
             .last()
             .filter(|_| more_remain)
-            .map(|version| version.version_id.to_string());
+            .map(|version| crate::state::listing_token(listing, &version.version_id.to_string()));
 
         Ok(ListPolicyVersionsOutput {
             policy_versions: Some(

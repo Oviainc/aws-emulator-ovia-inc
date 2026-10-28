@@ -178,8 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
         let now = ::std::time::SystemTime::now();
+        // A queue url resolves in the region the request addressed: this region's queue of
+        // that name, and nothing another region holds.
+        let region = sqs::request_region(ctx.parts());
 
-        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+        let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(PurgeQueueErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
             )

@@ -226,14 +226,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = store.lock();
         let now = ::std::time::SystemTime::now();
+        // A queue url resolves in the region the request addressed: this region's queue of
+        // that name, and nothing another region holds.
+        let region = sqs::request_region(ctx.parts());
         // Where a handle this queue cannot resolve came from is read before the queue is
         // borrowed for writing: it is a property of the OTHER queues of this store.
         let origins: Vec<sqs::ReceiptHandleOrigin<'_>> = input
             .entries
             .iter()
-            .map(|entry| state.receipt_handle_origin(&input.queue_url, &entry.receipt_handle))
+            .map(|entry| {
+                state.receipt_handle_origin(&region, &input.queue_url, &entry.receipt_handle)
+            })
             .collect();
-        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+        let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(ChangeMessageVisibilityBatchErrorModeled::QueueDoesNotExist(
                 sqs::queue_does_not_exist(),
             )
