@@ -147,13 +147,6 @@ impl From<PutAppsListErrorModeled> for PutAppsListError {
 /// error's own documentation names — so the store cannot grow without limit.
 const MAX_APPS_LISTS: usize = 250;
 
-/// The highest version number `PreviousAppsList` can key an archived `App`
-/// array under: its key is `com.amazonaws.fms#PreviousListVersion`, whose
-/// pattern is `^\d{1,2}$`, so a version number is at most two digits. A list
-/// updated more times than this keeps the 99 versions the map can name and
-/// archives no further ones, rather than emitting a key the model refuses.
-const MAX_PREVIOUS_LIST_VERSION: usize = 99;
-
 /// The `PutAppsList` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -263,19 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 // `PreviousAppsList` is "a map of previous version numbers to
                 // their corresponding App object arrays": the stored array is
-                // the version this write supersedes, and the archive already
-                // holds every version before it — so the version being
-                // superseded is one past what the archive names, the create
-                // being version 1.
-                let mut history = existing.list.previous_apps_list.clone().unwrap_or_default();
-                let superseded_version = history.len() + 1;
-                if superseded_version <= MAX_PREVIOUS_LIST_VERSION {
-                    history.insert(
-                        superseded_version.to_string(),
-                        existing.list.apps_list.clone(),
-                    );
-                }
-                list.previous_apps_list = Some(history);
+                // the version this write supersedes. Which number that is, and
+                // how far the map can name one, is the ONE archival rule both
+                // list writers follow, so it is applied from the store's single
+                // copy of it ([`crate::state::archive_superseded_list_version`])
+                // rather than restated here.
+                list.previous_apps_list = Some(crate::state::archive_superseded_list_version(
+                    existing.list.previous_apps_list.as_ref(),
+                    &existing.list.apps_list,
+                ));
 
                 crate::state::AppsListRecord {
                     list_id,

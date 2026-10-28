@@ -2084,6 +2084,39 @@ impl ComAmazonawsFmsAwsfms20180101State {
     }
 }
 
+/// The highest version number a list's version history can key an archived
+/// array under: the key of `PreviousAppsList` and of `PreviousProtocolsList` is
+/// `com.amazonaws.fms#PreviousListVersion`, whose pattern is `^\d{1,2}$`, so a
+/// version number is at most two digits. A list updated more times than this
+/// keeps the 99 versions the map can name and archives no further ones, rather
+/// than emitting a key the model refuses.
+pub const MAX_PREVIOUS_LIST_VERSION: usize = 99;
+
+/// The version history a list write leaves behind: everything `history` already
+/// archives, plus `superseded` — the array the write replaces — under the
+/// version number that array held.
+///
+/// `PreviousAppsList` and `PreviousProtocolsList` are each "a map of previous
+/// version numbers to their corresponding … arrays": the archive already holds
+/// every version before the stored one, so the version being superseded is one
+/// past what the archive names, the create being version 1. It is archived only
+/// while that number still fits [`MAX_PREVIOUS_LIST_VERSION`].
+///
+/// Generic over the archived element, so the applications-list and the
+/// protocols-list writer share ONE copy of the version-and-cap rule and cannot
+/// disagree about either half of it.
+pub fn archive_superseded_list_version<T: Clone>(
+    history: Option<&HashMap<String, Vec<T>>>,
+    superseded: &[T],
+) -> HashMap<String, Vec<T>> {
+    let mut history = history.cloned().unwrap_or_default();
+    let superseded_version = history.len() + 1;
+    if superseded_version <= MAX_PREVIOUS_LIST_VERSION {
+        history.insert(superseded_version.to_string(), superseded.to_vec());
+    }
+    history
+}
+
 /// Merge `added` into `existing` the way a tag write does: a key already present
 /// takes the new value in place, a key that is new is appended.
 ///

@@ -61,6 +61,12 @@ mod resource_set_membership_last_update_time;
 #[path = "all/pagination_token_decoding.rs"]
 mod pagination_token_decoding;
 
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/previous_list_version_archive.rs"]
+mod previous_list_version_archive;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]
