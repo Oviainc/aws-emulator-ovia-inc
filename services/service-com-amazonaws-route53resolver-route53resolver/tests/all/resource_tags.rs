@@ -17,7 +17,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     call, emulator_with_outposts, error_type, expect_error, ok, rack_outpost, string_member,
-    ACCOUNT, REGION,
+    Emulator, ACCOUNT, REGION,
 };
 
 /// Every resource of this service a tag operation addresses, named by the
@@ -37,7 +37,7 @@ const RESOURCE_KINDS: [&str; 4] = [
 /// Create one resource of `kind` (with `tags` on the create request, when the
 /// create takes any) and answer the `Arn` it reports.
 async fn create_resource(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     kind: &str,
     creator: &str,
     tags: Option<Value>,
@@ -48,15 +48,19 @@ async fn create_resource(
             "ResolverEndpoint",
             {
                 // `SubnetId` is length 1..32, so the subnets are named from the
-                // first characters of the creator id.
+                // first characters of the creator id. They are subnets of the
+                // caller's VPC, so the account's own Amazon EC2 store holds them
+                // before the endpoint is placed in them.
                 let short: String = creator.chars().take(20).collect();
+                let subnets = [format!("sn-{short}-a"), format!("sn-{short}-b")];
+                router.hold_subnets(&subnets);
                 json!({
                     "CreatorRequestId": creator,
                     "Direction": "OUTBOUND",
                     "SecurityGroupIds": ["sg-00000000000000001"],
                     "IpAddresses": [
-                        { "SubnetId": format!("sn-{short}-a"), "Ip": "10.0.0.10" },
-                        { "SubnetId": format!("sn-{short}-b"), "Ip": "10.0.1.10" },
+                        { "SubnetId": subnets[0], "Ip": "10.0.0.10" },
+                        { "SubnetId": subnets[1], "Ip": "10.0.1.10" },
                     ],
                 })
             },

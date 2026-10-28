@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDashboardUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDashboardUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDashboardUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Answers the dashboard URL of ONE Glue resource, dispatched on the kind of resource the
+//! request names: `ResourceType` is "the type of resource for which the dashboard URL is
+//! being requested", and the whole contract of this operation is which of those kinds it
+//! serves a dashboard for.
+//!
+//! * `JOB` is not one of them: the request is refused with the modelled
+//!   `OperationNotSupportedException` BEFORE anything is looked up, so the answer is the
+//!   same whether or not the account holds a job of that name — the refusal is about the
+//!   resource KIND, not about the resource.
+//! * `SESSION` is looked up. This emulator keeps no interactive sessions — `CreateSession`
+//!   is not implemented, so no call can put one into the store — so every `ResourceId`
+//!   addresses a session that does not exist and the read is the modelled
+//!   `EntityNotFoundException` naming it. Handing out a URL for a session nothing created
+//!   would be worse: the URL would address a dashboard of a resource that is not there.
+//!
+//! `RequestOrigin` ("the origin of the request") does not change which kind is served, so
+//! it changes nothing here.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +88,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The one `GlueResourceType` whose resource this operation resolves: of the modelled enum
+/// (`JOB | SESSION`, from `smithy_query shape=GlueResourceType`), the interactive session.
+const SESSION_RESOURCE_TYPE: &str = "SESSION";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +165,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDashboardUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDashboardUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDashboardUrl"))
+        // Neither the engine nor the request metadata decides this answer: the resource
+        // kind does, and the one kind that is looked up is looked up in a store that holds
+        // no sessions (see this module's docs).
+        let _ = (ctx, &self.engine);
+        match input.resource_type.as_str() {
+            // "Interactive sessions": addressed by their `Id`, of which this emulator
+            // holds none, so the id the request named names no session.
+            SESSION_RESOURCE_TYPE => Err(GetDashboardUrlErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::session_not_found(
+                        &input.resource_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into()),
+            // Every other kind of resource — `JOB`, and anything a later model version
+            // adds — has no dashboard this operation serves, which is a refusal about the
+            // kind and not about the resource.
+            unsupported => Err(
+                GetDashboardUrlErrorModeled::OperationNotSupportedException(
+                    OperationNotSupportedException {
+                        message: Some(crate::state::messages::dashboard_url_not_supported(
+                            unsupported,
+                        )),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

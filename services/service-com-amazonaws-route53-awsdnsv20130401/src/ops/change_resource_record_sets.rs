@@ -116,6 +116,17 @@ use crate::state::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// The three values of the modelled `ChangeAction` enum, which is what a change
+/// says it does to the record set it carries: "CREATE: Creates a resource record
+/// set that has the specified values", "DELETE: Deletes an existing resource
+/// record set that has the specified values" and "UPSERT: If a resource set
+/// doesn't exist, Route 53 creates it. If a resource set exists Route 53 updates
+/// it with the values in the request". The two that WRITE a record set are told
+/// from the one that removes it wherever that difference decides something.
+const CHANGE_ACTION_CREATE: &str = "CREATE";
+const CHANGE_ACTION_DELETE: &str = "DELETE";
+const CHANGE_ACTION_UPSERT: &str = "UPSERT";
+
 /// An `InvalidChangeBatch` naming one problem per refused change.
 ///
 /// The shape carries both a `messages` LIST — "This exception contains a list of
@@ -714,19 +725,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // A health check has to exist to be referenced, and this emulator mints
-        // none (CreateHealthCheck is not implemented). Checked AFTER the zone
-        // lookup, so a request against a zone that does not exist answers
-        // NoSuchHostedZone rather than a missing dependency of its changes.
-        if let Some(health_check_id) = input
+        // A `HealthCheckId` on a record set is a REFERENCE to a health check the
+        // account already holds — "include the HealthCheckId element and specify
+        // the ID of the applicable health check" — so a change that WRITES one
+        // resolves it against the health-check store, and only an id that names
+        // none is refused with `NoSuchHealthCheck`. The id of a health check the
+        // account holds is a usable reference.
+        //
+        // Only a change that writes the record set carries a reference to
+        // resolve: the reference is resolved once, when it is written, and a
+        // `DELETE` names the values of a record set that already exists in order
+        // to REMOVE it ("you must specify all the same values that you specified
+        // when you created it"), so it withdraws a reference rather than making
+        // one. That is what keeps a record set deletable after the health check
+        // it names is gone — "Amazon Route 53 does not prevent you from deleting
+        // a health check even if the health check is associated with one or more
+        // resource record sets", which leaves exactly such a record set behind.
+        //
+        // Checked AFTER the zone lookup, so a request against a zone that does
+        // not exist answers NoSuchHostedZone rather than a missing dependency of
+        // its changes, and the FIRST unresolvable id in the batch is the one
+        // named, so a caller referencing several reads back which one was
+        // missing.
+        if let Some(missing) = input
             .change_batch
             .changes
             .iter()
+            .filter(|change| change.action != CHANGE_ACTION_DELETE)
             .filter_map(|change| change.resource_record_set.health_check_id.as_deref())
-            .find(|id| !id.is_empty())
+            .filter(|id| !id.is_empty())
+            .find(|id| !store.health_checks.contains_key(*id))
         {
             return Err(ChangeResourceRecordSetsErrorModeled::NoSuchHealthCheck(
-                no_such_health_check(health_check_id),
+                no_such_health_check(missing),
             )
             .into());
         }
@@ -805,7 +836,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             match action {
-                "CREATE" => {
+                CHANGE_ACTION_CREATE => {
                     if current.is_some() {
                         problems.push(record_set_already_exists_message(
                             &record.name,
@@ -817,13 +848,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         staged.insert(key, Some(record));
                     }
                 }
-                "UPSERT" => {
+                CHANGE_ACTION_UPSERT => {
                     if current.is_none() {
                         record_count += 1;
                     }
                     staged.insert(key, Some(record));
                 }
-                "DELETE" => match &current {
+                CHANGE_ACTION_DELETE => match &current {
                     None => problems.push(format!(
                         "Tried to delete resource record set {} but it was not found",
                         change_label(&record)

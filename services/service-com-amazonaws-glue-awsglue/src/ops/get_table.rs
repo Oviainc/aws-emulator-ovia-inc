@@ -12,7 +12,11 @@
 //! `IsRegisteredWithLakeFormation` as explicit booleans, and
 //! `StorageDescriptor.SortColumns` as an empty list for a table that defines no sort
 //! order (see `crate::state::to_storage_descriptor`). An absent catalog, database or
-//! table is `EntityNotFoundException`.
+//! table is `EntityNotFoundException`. A table of a FEDERATED database is NOT answered
+//! from the catalog: that database "points to an entity outside the Glue Data Catalog", so
+//! the table is held by the source its registration names, and no such source can be
+//! reached from here — which is `FederationSourceRetryableException`
+//! (`crate::state::federated_source_refusal`).
 //!
 //! `TransactionId`, `QueryAsOfTime` and `IncludeStatusDetails` are REFUSED rather than
 //! ignored, and `AttributesToGet` is honoured: `DEFAULT` is the Hive-style definition
@@ -299,6 +303,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
+
+            // A table of a FEDERATED database is held by the source that database points
+            // at, not by the catalog, so the read is answered by that source — and no
+            // such source can be reached from here
+            // (`crate::state::federated_source_refusal`).
+            if let Some(message) = crate::state::federated_source_refusal(database) {
+                return Err(GetTableErrorModeled::FederationSourceRetryableException(
+                    FederationSourceRetryableException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
 
             let Some(entry) = database.tables.get(&crate::state::fold_name(&input.name)) else {
                 return Err(GetTableErrorModeled::EntityNotFoundException(
