@@ -3122,9 +3122,11 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
     /// caller may automate in right now ([`Self::may_initiate_in`], the same
     /// standing the operations that initiate work in an account are judged by).
     ///
-    /// Judged over the account ids the REQUEST carries, which are the accounts
-    /// that call scopes the rule to; a configuration naming no `accountIds`
-    /// names no SPECIFIC account, so such a rule spans the organization itself
+    /// Judged over the account ids of the configuration the RESULTING rule would
+    /// carry — the one a create supplies, or the one an update merges over the
+    /// stored rule — which are the accounts that call makes the rule apply its
+    /// actions in; a configuration naming no `accountIds` names no SPECIFIC
+    /// account, so such a rule spans the organization itself
     /// (which is how a preview without an `organizationScope` is scoped too —
     /// [`preview_account_scope`]) and reaches a member account only for as long
     /// as that account's association lasts. An absent configuration is only

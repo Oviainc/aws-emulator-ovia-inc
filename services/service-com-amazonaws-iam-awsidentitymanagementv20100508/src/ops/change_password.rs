@@ -83,13 +83,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// Why the change was refused, as the reason clause closing this operation's
-/// `AccessDenied` text: the request did not present the password in force for the
-/// calling user, which is what `OldPassword` is for ("the IAM user's current
-/// password"). Stated once, so the refusal and the test that pins it read the same
-/// clause.
-pub const OLD_PASSWORD_NOT_IN_FORCE: &str =
-    "because the old password supplied is not the user's current password";
+/// The whole `AccessDenied` text this operation refuses a request on the strength of
+/// the PASSWORDS it carried with: an `OldPassword` that is not the one in force, or a
+/// `NewPassword` the account's password policy does not admit.
+///
+/// ONE sentence covers both conditions and it is entirely FIXED: it names no principal,
+/// no action, no resource, no reason and no value of any request, account or run.
+/// Saying which of the two conditions failed is exactly what a single wording withholds
+/// — a caller that cannot tell "the password you typed is wrong" from "the password you
+/// chose is too weak" learns nothing about the account's credentials from being refused
+/// — so the two refusals must not be worded apart. Stated once, so both refusal paths
+/// and the tests that pin them read the same sentence.
+pub const PASSWORD_CHANGE_REFUSED: &str = "Either the new password does not conform to the \
+     account password policy or the old password was incorrect.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -233,13 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The key's user, as the account holds it: the name and the ARN every refusal
-        // below is worded from, in the case the account stores rather than any a
-        // request spelled.
-        let Some((user_name, user_arn)) = store
+        // The key's user, as the account holds it: the name the not-found refusal below
+        // is worded from, in the case the account stores rather than any a request
+        // spelled.
+        let Some(user_name) = store
             .users
             .get(&user_key)
-            .map(|user| (user.user_name.clone(), user.arn.clone()))
+            .map(|user| user.user_name.clone())
         else {
             ::tracing::info!(
                 audit = true,
@@ -290,17 +296,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AccessDenied`, because presenting the current password is what entitles a
         // caller to replace it. It is NOT one of the operation's modelled errors —
         // `InvalidUserTypeException` is about the TYPE of the calling user, not about
-        // what that user supplied — so it goes through the crate's authorization
-        // channel, where every other IAM refusal under that code is answered.
+        // what that user supplied — so it is answered through the same error channel
+        // every other IAM refusal under that code is ([`crate::scaffolded`]).
         //
-        // The text is that channel's single wording for the code
-        // ([`crate::state::authorization::not_authorized`]): the principal, the action
-        // and the resource the refusal is about, closed by the reason it went that way.
-        // The principal and the resource are read from the user the ACCOUNT holds — so
-        // the ARN carries the account id and the user's path, and the name is in the
-        // case the account stores rather than any a request spelled — and the reason
-        // names what the request did not present. No value of any one request or run
-        // appears in it, and neither password is echoed.
+        // The text is NOT the authorization channel's wording
+        // ([`crate::state::authorization::not_authorized`]), which reports a decision
+        // made about the caller's identity-based policies and names the principal, the
+        // action and the resource it was made on: this refusal is about the credential
+        // material the request carried, not about what the caller is permitted to do,
+        // and a caller refused this way IS permitted to change its own password. It
+        // carries this operation's own fixed sentence instead ([`PASSWORD_CHANGE_REFUSED`]),
+        // which interpolates nothing at all, so neither password is echoed and nothing
+        // about the account — its id, the user's name, ARN or path — is disclosed to a
+        // request that did not present the password in force.
         if !held.password.verifies(&input.old_password) {
             ::tracing::info!(
                 audit = true,
@@ -310,13 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 user_key = %user_key,
                 "no password was changed"
             );
-            return Err(crate::state::authorization::not_authorized(
-                &user_arn,
-                crate::state::authorization::CHANGE_PASSWORD,
-                &format!("user {user_name}"),
-                OLD_PASSWORD_NOT_IN_FORCE,
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                PASSWORD_CHANGE_REFUSED,
+            ));
         }
 
         // The new password replaces the one in force. The account keeps only the
@@ -328,7 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // arise: it refuses a password that "did not meet the requirements imposed by
         // the account password policy", and no account password policy can exist while
         // `UpdateAccountPasswordPolicy` is unimplemented; `passwordType`'s own length
-        // and alphabet constraints are enforced before this handler runs.
+        // and alphabet constraints are enforced before this handler runs. Once a policy
+        // CAN be in force, a `NewPassword` it does not admit is refused here with
+        // [`PASSWORD_CHANGE_REFUSED`] — the one sentence that covers both that
+        // condition and a stale `OldPassword` without disclosing which failed.
         // `LimitExceededException` is declined too — a change creates no entity, so it
         // reaches no quota — and so is `EntityTemporarilyUnmodifiableException`, which
         // reports "a user name that was deleted and then recreated": every delete and
