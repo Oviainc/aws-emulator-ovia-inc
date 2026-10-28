@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelChangeSet
-//! Stops a change set that is still running: it moves to `CANCELLED`, takes an end time,
-//! and the changes it carried are never applied.
+//! Stops a change set whose request is still open: it moves to `CANCELLED`, takes an end
+//! time, and the changes it carried are never applied. A change set that has already
+//! entered `APPLYING` — the final stage of completing the request — or reached a terminal
+//! status is past cancelling and is refused with `ResourceInUseException`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,8 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // A change set the clock has already carried to `SUCCEEDED` is past
-        // cancelling, so settle before deciding.
+        // The status this cancel is judged against is the one the clock owes
+        // right now — a change set may already have moved on to its applying
+        // stage or ended its run — so settle before deciding.
         store.settle(now);
 
         let Some(record) = store.change_sets.get_mut(&input.change_set_id) else {
@@ -180,9 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Only a change set that is still running can be stopped: one that has
-        // completed is in use by nobody, and its result stands.
-        if !record.is_running() {
+        // A cancel is only served while the request is still open: this
+        // operation documents that it must be sent BEFORE the status changes to
+        // `APPLYING`, the final stage of completing the request. A change set
+        // that has entered that stage is being completed, and one that has
+        // reached a terminal status has its result already — both are past
+        // cancelling, so both get the modelled in-use refusal.
+        if !record.is_cancellable() {
             let status = record.status.clone();
             return Err(CancelChangeSetErrorModeled::ResourceInUseException(
                 crate::state::in_use(format!(

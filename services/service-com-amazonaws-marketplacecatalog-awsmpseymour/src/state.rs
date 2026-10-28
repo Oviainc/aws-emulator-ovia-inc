@@ -723,10 +723,24 @@ pub struct ChangeSetRecord {
 }
 
 impl ChangeSetRecord {
-    /// True while the change set is still running, so its entities are locked
-    /// and it can still be cancelled.
+    /// True while the change set is still running, so the entities its changes
+    /// target are locked: `StartChangeSet` holds the lock "until the change set
+    /// has completed (either succeeded, cancelled, or failed)", which is every
+    /// status before a terminal one.
+    ///
+    /// Running is NOT the same as cancellable — see [`Self::is_cancellable`].
     pub fn is_running(&self) -> bool {
         self.status == STATUS_PREPARING || self.status == STATUS_APPLYING
+    }
+
+    /// True while the change set is still an OPEN request, which is the only
+    /// window `CancelChangeSet` serves: its documentation requires the cancel
+    /// to be "sent before the status of the request changes to `APPLYING`, the
+    /// final stage of completing your change request", so a change set that has
+    /// entered that final stage is past cancelling, as is one that has reached a
+    /// terminal status.
+    pub fn is_cancellable(&self) -> bool {
+        self.status == STATUS_PREPARING
     }
 
     /// The entities this change set acts on, in submission order and without

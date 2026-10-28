@@ -15,6 +15,8 @@
 mod assessment_production;
 #[path = "all/assessments.rs"]
 mod assessments;
+#[path = "all/cancel_change_set_window.rs"]
+mod cancel_change_set_window;
 #[path = "all/change_pair_uniqueness.rs"]
 mod change_pair_uniqueness;
 #[path = "all/change_reference_resolution.rs"]
