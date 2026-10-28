@@ -45,6 +45,15 @@ service-common = { path = "../common" }
 # parser for the format, so a value that is not a media type is refused however it is
 # malformed rather than by a hand-written split on `/`.
 mime = "0.3"
+# Validates a request payload at a deployed stage against the JSON Schema of the `Model`
+# the method declares for its content type — the maintained validator for the format, with
+# draft 4 among its dialects, which is the one `CreateModel$schema` documents a model is
+# written in. It computes over data in process: it evaluates nothing, and the only schema
+# resources it resolves a `$ref` against are the api's own models, because the data plane
+# replaces its resource loader with one that resolves NOTHING
+# (`service::invoke::NoSchemasBeyondTheApi`) — so a stored schema cannot name a file, a
+# host or a URL for this emulator to read.
+boon = "0.6"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

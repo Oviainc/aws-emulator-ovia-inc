@@ -65,7 +65,11 @@ fn arn_in(region: &str, resource: &str) -> String {
 /// Percent-encode a value for one path segment, as an AWS SDK encodes a non-greedy
 /// `@httpLabel`: everything but the RFC 3986 unreserved set, so the `:` and `/` inside
 /// an ARN arrive as one segment.
-fn encode_label(value: &str) -> String {
+///
+/// `pub(crate)` because the certificate suite addresses its resource by ARN too
+/// (`DisassociateCertificate`'s `{Arn}` label), and one encoding rule for the whole test
+/// binary beats a second copy of it.
+pub(crate) fn encode_label(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match byte {

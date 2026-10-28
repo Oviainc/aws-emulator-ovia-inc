@@ -25,11 +25,16 @@
 //! the same way. The recorded high-resolution `Maximum` case is one row.
 //!
 //! Every state this suite asserts is one the evaluation computes from the datapoints a drive
-//! published, so each drive places its datapoint where the clock cannot take it away before
-//! the evaluation it makes due has been read: no drive sits at the oldest window the evaluation
-//! range still holds, each one measures from the window it is made in — so a later drive is
-//! never graded before an earlier one — and the drive that re-breaches after the clearing one
-//! breaches whether or not a new window has begun in between.
+//! published, so no wait here can outlive the data it is waiting on. An alarm grades the data
+//! inside its evaluation range at the instant it evaluates, and that range is a span of whole
+//! period windows: a datapoint leaves it once the clock has moved on far enough, and from then
+//! on the evaluation computes a state the drive no longer implies. A drive therefore places its
+//! datapoint where the clock cannot take it away before the evaluation it makes due has been
+//! read — no drive sits at the oldest window the range still holds, and each measures from the
+//! window it is made in, so a later drive is never graded before an earlier one — and a wait
+//! that has run longer than that stay publishes the same value again ([`REFRESH`]), the way the
+//! series an alarm watches is really published, rather than waiting on for a state nothing asks
+//! for any more.
 
 use serde_json::{json, Value};
 
@@ -47,10 +52,24 @@ const MUTED: &str = "actions-disabled-twin";
 /// How long a wait for a state the evaluation owes, or for a delivery that follows one, keeps
 /// looking. Generous only so a failure is a failure rather than a hang: an evaluation is owed
 /// inside the framework's sub-second window and the delivery follows it.
+///
+/// It is longer than a drive's datapoint stays inside the evaluation range for the shortest
+/// period a row uses, which is why a wait that long keeps the series published ([`REFRESH`]):
+/// otherwise a host slow enough to delay the first evaluation past that stay would turn a
+/// transition the data owed into one that can never arrive.
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How often such a wait looks again.
 const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a wait for a state the published data implies keeps looking before it publishes
+/// that data AGAIN ([`await_both_driven`]).
+///
+/// A datapoint decides an alarm only while it is inside that alarm's evaluation range, which is
+/// a span of period windows the clock keeps moving: the stay is a few windows, so it is shorter
+/// than [`DEADLINE`] for the shortest period a row uses. Shorter than the shortest of those
+/// stays, so the series an alarm grades always holds the value the wait is about.
+const REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long the absence of a delivery is measured over: several evaluation spans, so a
 /// notification the muted alarm would have published has had every chance to arrive.
@@ -143,22 +162,44 @@ impl Row {
         request
     }
 
-    /// Publish `value` into the row's series, stamped `windows_back` whole periods before now.
+    /// Publish `value` into the row's series, stamped `windows_back` whole periods before now,
+    /// and answer the window it published into as a count of whole periods since the epoch.
     ///
     /// The drive waits for enough of the current window to be left for the evaluation it makes
     /// due to be read inside that same window ([`WINDOW_ROOM_SECS`]): the windows are anchored
     /// at multiples of the period, so a drive made as one window ends is graded from the next
     /// one, where its datapoint is a window older than it was placed.
-    async fn publish(&self, emulator: &Emulator, value: f64, windows_back: i64) {
+    ///
+    /// `after`, where given, is a window this drive must not share: the alarms here evaluate
+    /// ONE period, so what decides them is the newest datapoint of the series, and a drive
+    /// landing in a window another value was published into would be graded against the two
+    /// aggregated rather than against its own. Waiting for the clock to leave that window costs
+    /// at most one period, and only a drive that really would collide waits at all.
+    async fn drive(
+        &self,
+        emulator: &Emulator,
+        value: f64,
+        windows_back: i64,
+        after: Option<f64>,
+    ) -> f64 {
         #[allow(clippy::cast_precision_loss)]
         let (period, windows) = (self.period as f64, windows_back as f64);
-        wait_for_period_room(period, WINDOW_ROOM_SECS).await;
-        let age = period * windows;
+        // The stamp decides the window, so the window is read FROM the stamp: a boundary the
+        // clock crosses between the two would otherwise leave the drive reporting a window its
+        // datapoint is not in.
+        let stamp = loop {
+            wait_for_period_room(period, WINDOW_ROOM_SECS).await;
+            let stamp = now_secs() - period * windows;
+            if after.is_none_or(|collides| (stamp / period).floor() > collides) {
+                break stamp;
+            }
+            tokio::time::sleep(LOOK_AGAIN).await;
+        };
         let mut datum = json!({
             "MetricName": self.metric,
             "Dimensions": self.dimensions(),
             "Value": value,
-            "Timestamp": now_secs() - age,
+            "Timestamp": stamp,
         });
         if let Some(resolution) = self.storage_resolution {
             datum["StorageResolution"] = json!(resolution);
@@ -169,6 +210,7 @@ impl Row {
             &json!({"Namespace": self.namespace, "MetricData": [datum]}),
         )
         .await;
+        (stamp / period).floor()
     }
 }
 
@@ -216,17 +258,41 @@ async fn settled_states(emulator: &Emulator) -> (String, String) {
     }
 }
 
-/// Read both twins until each reports `state`, and answer what they last reported.
+/// Read both twins until each reports `state`, publishing `value` into the row's series again
+/// whenever the wait has outlived the stay of the datapoint it is waiting on ([`REFRESH`]).
+/// Answers what the twins last reported, beside the window the LAST publish of the wait went
+/// into — what the drive after it must not share.
 ///
 /// A transition is owed a span after the datapoint that makes it due, so a test waits for the
 /// state rather than assuming it is already there — and it waits by AWAITING, so the service's
 /// own alarm clock gets to run while it does.
-async fn await_both(emulator: &Emulator, state: &str) -> (String, String) {
+///
+/// It re-drives because an alarm grades the data inside its evaluation range at the instant it
+/// evaluates, and that range is a span of period windows the clock keeps moving: a datapoint
+/// leaves it a few windows after it was stamped, and from then on the evaluation computes a
+/// state from a series with nothing in range rather than the state the drive implied. A wait
+/// that outlived its datapoint would be waiting for a state no datapoint still asks for — so
+/// it publishes the value again, which is also what the series an alarm watches really looks
+/// like: something keeps publishing it. Every republish carries the SAME value, so what the
+/// windows aggregate is the same state and no extra transition can come of it.
+async fn await_both_driven(
+    emulator: &Emulator,
+    row: &Row,
+    value: f64,
+    state: &str,
+    published: f64,
+) -> ((String, String), f64) {
     let deadline = std::time::Instant::now() + DEADLINE;
+    let mut refresh_at = std::time::Instant::now() + REFRESH;
+    let mut window = published;
     loop {
         let reported = both_states(emulator).await;
         if (reported.0 == state && reported.1 == state) || std::time::Instant::now() >= deadline {
-            return reported;
+            return (reported, window);
+        }
+        if std::time::Instant::now() >= refresh_at {
+            window = row.drive(emulator, value, 0, None).await;
+            refresh_at = std::time::Instant::now() + REFRESH;
         }
         tokio::time::sleep(LOOK_AGAIN).await;
     }
@@ -518,9 +584,11 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
         // A drive stamped ONE window back is the oldest this suite places: the evaluation range
         // reaches further than that, so the datapoint is still graded after the clock has moved
         // the window it counts back from, and every later drive measures from the window it is
-        // made in, which is never older than this one.
-        row.publish(&emulator, row.breaching, 1).await;
-        let reached = await_both(&emulator, "ALARM").await;
+        // made in, which is never older than this one. The wait keeps that value published for
+        // as long as it looks, so the state it waits for is one the data still implies.
+        let breaching_window = row.drive(&emulator, row.breaching, 1, None).await;
+        let (reached, breaching_window) =
+            await_both_driven(&emulator, row, row.breaching, "ALARM", breaching_window).await;
         assert_eq!(
             reached,
             ("ALARM".to_string(), "ALARM".to_string()),
@@ -586,17 +654,28 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
 
         // … and the NEXT real transition of that alarm is delivered. Driven by data the
         // evaluation grades, so it is the evaluation that moves both twins, not a forced state:
-        // the clearing drive lands in a window newer than the breaching one above, and the
-        // re-breaching drive in the window it is made in, which is that one or a newer still.
-        row.publish(&emulator, row.clearing, 0).await;
-        let cleared = await_both(&emulator, "OK").await;
+        // the clearing drive lands in a window newer than the breaching one, including any
+        // window the wait above kept that value published into, and the re-breaching drive in
+        // the window it is made in, which is that one or a newer still.
+        let clearing_window = row
+            .drive(&emulator, row.clearing, 0, Some(breaching_window))
+            .await;
+        let (cleared, _) =
+            await_both_driven(&emulator, row, row.clearing, "OK", clearing_window).await;
         assert_eq!(
             cleared,
             ("OK".to_string(), "OK".to_string()),
             "case {case:?}: a clearing datapoint must move both twins to OK, got {cleared:?}"
         );
-        row.publish(&emulator, row.re_breaching, 0).await;
-        let again = await_both(&emulator, "ALARM").await;
+        let re_breaching_window = row.drive(&emulator, row.re_breaching, 0, None).await;
+        let (again, _) = await_both_driven(
+            &emulator,
+            row,
+            row.re_breaching,
+            "ALARM",
+            re_breaching_window,
+        )
+        .await;
         assert_eq!(
             again,
             ("ALARM".to_string(), "ALARM".to_string()),

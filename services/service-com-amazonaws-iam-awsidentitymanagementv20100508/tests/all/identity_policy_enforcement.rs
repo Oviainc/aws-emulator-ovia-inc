@@ -23,15 +23,9 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::user_lifecycle::{
-    account_id, assert_access_denied_message, assert_access_denied_message_in_region, call,
-    call_signed_by, call_signed_in_region, element, error_code, router,
+    account_id, assert_access_denied_message, call, call_signed_by, call_signed_in_region, element,
+    error_code, router,
 };
-
-/// The Region IAM's console and its global endpoint live in ("AWS Identity and Access
-/// Management endpoints and quotas", AWS General Reference). IAM is a global service, so
-/// this is the Region a denial's authorization-details URL names whatever Region the
-/// refused request was signed for.
-const IAM_CONSOLE_REGION: &str = "us-east-1";
 
 /// What a row expects the signed call to answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,8 +379,7 @@ async fn identity_policies_decide_every_signed_call() {
                 );
                 // The message is built from the request: the principal that signed it,
                 // the action it named and the resource the decision was made on, plus
-                // which of the two refusals this is and where this one denial's
-                // authorization details are readable.
+                // which of the two refusals this is.
                 let reason = if case.expect == Expect::ExplicitDeny {
                     "with an explicit deny in an identity-based policy".to_string()
                 } else {
@@ -598,20 +591,19 @@ async fn an_unreadable_grant_allows_but_cannot_overturn_an_explicit_deny() {
     }
 }
 
-/// RULE: the console URL a denial points the caller at names the Region IAM's console
-/// lives in — IAM is a GLOBAL service, so that page is the same one whatever Region the
-/// REQUEST was signed for — and nothing else about the message moves with the Region
-/// either.
+/// RULE: a denial's message is built only from the principal, the action and the resource
+/// the decision was made on, so the Region the REQUEST addressed — its SigV4 credential
+/// scope, the only place a request carries one — moves no character of it.
 #[tokio::test]
-async fn a_denials_console_url_names_iams_global_console_region() {
+async fn a_denials_message_does_not_depend_on_the_region_the_request_addressed() {
     let router = router();
     let user_name = "regional";
     // No identity-based policy at all, so every row below is the implicit deny.
     let access_key_id = principal(&router, "regional denial", user_name, &[]).await;
 
     // Rows spanning Regions in three of AWS's geographies, including the one IAM's
-    // global endpoint lives in — so a Region read off the request instead would fail on
-    // every row but the first.
+    // global endpoint lives in — so a message carrying anything drawn from the
+    // request's Region would differ across the rows.
     for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
         let (status, body) =
             call_signed_in_region(&router, Some(&access_key_id), region, "ListGroups", &[]).await;
@@ -619,10 +611,9 @@ async fn a_denials_console_url_names_iams_global_console_region() {
             status, 403,
             "case {region:?}: expected the implicit deny to be refused, got {status}: {body}"
         );
-        assert_access_denied_message_in_region(
+        assert_access_denied_message(
             region,
             &element(&body, "Message"),
-            IAM_CONSOLE_REGION,
             &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
             "iam:ListGroups",
             &format!("arn:aws:iam::{}:group/", account_id()),

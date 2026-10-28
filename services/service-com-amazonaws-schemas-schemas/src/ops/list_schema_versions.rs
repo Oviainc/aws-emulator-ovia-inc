@@ -178,16 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = store.lock();
 
-        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
-            ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::NotFoundException(
-                crate::state::registry_not_found(&input.registry_name),
-            ))
-        })?;
-        let schema = registry.schemas.get(&input.schema_name).ok_or_else(|| {
-            ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::NotFoundException(
-                crate::state::schema_not_found(&input.schema_name),
-            ))
-        })?;
+        // The first two steps of the one read resolution: the registry, and the schema
+        // in it, each answering its own refusal. This listing names no version — it
+        // reports them — so it stops there. See `crate::state::readable_schema`.
+        let (registry, schema) = state
+            .readable_schema(&input.registry_name, &input.schema_name)
+            .map_err(|refusal| {
+                ListSchemaVersionsError::from(ListSchemaVersionsErrorModeled::NotFoundException(
+                    refusal.not_found(),
+                ))
+            })?;
 
         // The members that decide WHICH versions this listing contains. Bound into the
         // `NextToken`, so a token cannot resume a differently-selected listing.

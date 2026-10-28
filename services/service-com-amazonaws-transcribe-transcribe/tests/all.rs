@@ -131,6 +131,8 @@ mod vocabularies;
 mod vocabulary_delete_and_tag_sets;
 #[path = "all/vocabulary_download_content.rs"]
 mod vocabulary_download_content;
+#[path = "all/vocabulary_download_isolation.rs"]
+mod vocabulary_download_isolation;
 #[path = "all/vocabulary_download_uri_state.rs"]
 mod vocabulary_download_uri_state;
 #[path = "all/vocabulary_file_uri.rs"]

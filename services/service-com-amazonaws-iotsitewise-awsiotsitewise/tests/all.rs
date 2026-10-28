@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `computation_model_execution_summary` is declared HERE, beside the note above,
+// rather than in the sorted list or at the END of the file: those are the two
+// stretches every concurrent iotsitewise change puts a declaration of its own in.
+// Fold it into the list once the churn settles.
+#[path = "all/computation_model_execution_summary.rs"]
+mod computation_model_execution_summary;
+
 // `actions` is declared HERE, at the head of the file, rather than in the sorted
 // list or appended after it: both of those are where every concurrent
 // iotsitewise change puts a declaration of its own, and each of three attempts

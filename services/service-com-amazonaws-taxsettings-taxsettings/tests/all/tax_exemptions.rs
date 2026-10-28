@@ -27,8 +27,13 @@
 //!   did not issue is refused;
 //! * reading is a report: it changes neither the exemptions nor anything beside
 //!   them;
-//! * a request naming an exemption type the service does not publish, or a
-//!   jurisdiction that type does not apply in, is refused and stores nothing.
+//! * a submission's `exemptionType` and `authority` are admitted on the
+//!   constraints the model states for them rather than against the collection
+//!   `GetTaxExemptionTypes` publishes, whose wording is this emulator's own: a
+//!   token that names a published entry is recorded as that entry, any other
+//!   token as submitted, and the only refusal left is the blank `Authority$state`
+//!   the model's pattern forbids (`exemption_type_admission.rs` spans that class
+//!   to the modelled bounds).
 //!
 //! The tables below span the classes those rules generalise over — the kinds of
 //! evidence an account is in the family (the caller's own, a stored TRN, stored
@@ -57,8 +62,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::ops::types::{Authority, TaxExemptionType};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    tax_exemption_type_catalog, ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxExemption,
-    EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
+    find_exemption_type, tax_exemption_type_catalog, ComAmazonawsTaxsettingsTaxsettingsState,
+    StoredTaxExemption, EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
     EXEMPTION_STATUS_VALID, MAX_STORED_EXEMPTIONS, TAX_EXEMPTIONS_PAGE_BOUNDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -176,8 +181,10 @@ fn reported_accounts(answer: &Answer) -> Vec<String> {
     accounts
 }
 
-/// The `taxExemptions` the reported map carries for one account.
-fn reported_exemptions(answer: &Answer, account_id: &str) -> Vec<Value> {
+/// The `taxExemptions` the reported map carries for one account. One reader for
+/// every suite that asserts on a recorded exemption, so none of them reads the
+/// map its own way.
+pub(crate) fn reported_exemptions(answer: &Answer, account_id: &str) -> Vec<Value> {
     details_map(answer)
         .get(account_id)
         .and_then(|details| details.get("taxExemptions"))
@@ -1666,27 +1673,29 @@ async fn listing_the_exemptions_changes_nothing() {
     );
 }
 
-/// RULE: an `exemptionType` the service's published catalog does not name is
-/// refused, and nothing is stored for it; a type named by either of the members
-/// that identify a published entry is accepted, whatever its case or padding.
+/// RULE: an `exemptionType` is admitted on the constraints the model states for
+/// the member, not against the wording the published collection happens to
+/// carry, so every token the model admits is recorded; a token that names a
+/// published entry is recorded as that entry, whatever its case or padding, and
+/// any other is recorded as submitted.
 #[tokio::test]
-async fn an_unpublished_exemption_type_is_refused() {
-    // The rows differ along how the value relates to the catalog: a display name,
-    // a description, either re-cased or padded, and values that name no entry.
-    let cases: &[(&str, &str, u16)] = &[
-        ("a display name", "Reseller", 200),
+async fn every_exemption_type_the_model_admits_is_recorded() {
+    // The rows differ along how the value relates to the published collection: a
+    // display name, a description, either re-cased or padded, and tokens that
+    // name no entry of it at all.
+    let cases: &[(&str, &str)] = &[
+        ("a display name", "Reseller"),
         (
             "a description",
             "Purchases for resale, held under a resale certificate",
-            200,
         ),
-        ("a padded, re-cased display name", "  dIRECT pAY pERMIT  ", 200),
-        ("a type the catalog does not publish", "Diplomatic Mission", 400),
-        ("a prefix of a published description", "Purchases for resale", 400),
-        ("a shape name rather than a type", "TaxExemptionType", 400),
+        ("a padded, re-cased display name", "  dIRECT pAY pERMIT  "),
+        ("a type the collection does not publish", "Diplomatic Mission"),
+        ("a prefix of a published description", "Purchases for resale"),
+        ("a shape name rather than a type", "TaxExemptionType"),
     ];
 
-    for (case, exemption_type, expected_status) in cases {
+    for (case, exemption_type) in cases {
         let router = emulator();
         let answer = call(
             &router,
@@ -1700,83 +1709,82 @@ async fn an_unpublished_exemption_type_is_refused() {
         )
         .await;
         assert_eq!(
-            answer.status, *expected_status,
-            "case {case:?}: expected HTTP {expected_status}, got {answer:?}"
+            (answer.status, answer.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: expected the submission to be applied, got {answer:?}"
         );
 
         let listed = call(&router, "ListTaxExemptions", &json!({})).await;
-        if *expected_status == 200 {
-            assert_eq!(
-                reported_accounts(&listed),
-                vec![own_account().to_string()],
-                "case {case:?}: expected the account to hold the exemption, got {listed:?}"
-            );
-        } else {
-            assert!(
-                answer.error_code.contains("ValidationException"),
-                "case {case:?}: expected a ValidationException, got {answer:?}"
-            );
-            assert_eq!(
-                answer.get("errorCode").as_str(),
-                Some("FieldValidationFailed"),
-                "case {case:?}: expected a field violation, got {answer:?}"
-            );
-            assert_eq!(
-                answer.get("fieldList").clone(),
-                json!([{ "name": "EXEMPTION_TYPE" }]),
-                "case {case:?}: expected the refused parameter to be named, got {answer:?}"
-            );
-            assert!(
-                reported_accounts(&listed).is_empty(),
-                "case {case:?}: a refused submission stores nothing, got {listed:?}"
-            );
-        }
+        assert_eq!(
+            reported_accounts(&listed),
+            vec![own_account().to_string()],
+            "case {case:?}: expected the account to hold the exemption, got {listed:?}"
+        );
+        // The type the record is held under: the published entry the token
+        // names, or the token itself for one that names none.
+        let expected_description = find_exemption_type(exemption_type)
+            .map(|(_, description, _)| (*description).to_string())
+            .unwrap_or_else(|| (*exemption_type).to_string());
+        let held = reported_exemptions(&listed, own_account());
+        let reported: Vec<Value> = held
+            .iter()
+            .filter_map(|exemption| {
+                exemption
+                    .get("taxExemptionType")
+                    .and_then(|entry| entry.get("description"))
+                    .cloned()
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![json!(expected_description)],
+            "case {case:?}: expected the exemption held under {expected_description:?}, got \
+             {held:?}"
+        );
     }
 }
 
-/// RULE: an `authority` outside the jurisdictions the published type applies in
-/// is refused, and nothing is stored for it; a jurisdiction a country-wide type
-/// covers is accepted with or without a state.
+/// RULE: an `authority` is admitted on the constraints the model states for
+/// `Authority` — a two-letter country code, and a non-blank state where one is
+/// submitted — rather than against the jurisdictions the published collection
+/// carries, so every jurisdiction the model admits is recorded and reported as
+/// the store holds it; a blank state is refused, naming that parameter, and
+/// stores nothing.
 #[tokio::test]
-async fn an_authority_outside_the_published_jurisdictions_is_refused() {
-    // The rows differ along the jurisdiction: the published country with and
-    // without a state, the same country in another case, another country, and a
-    // state that is all whitespace (the model's non-blank pattern).
+async fn an_authority_the_model_admits_is_recorded() {
+    // The rows differ along the jurisdiction: a country with and without a
+    // state, the country re-cased, a state nothing enumerates, countries outside
+    // the published collection's own, and a state that is all whitespace (the
+    // model's non-blank pattern).
     let cases: &[(&str, Value, u16, &str)] = &[
-        ("the published country", json!({ "country": "US" }), 200, ""),
+        ("a country only", json!({ "country": "US" }), 200, ""),
         (
-            "the published country with a state",
+            "a country with a state",
             json!({ "country": "US", "state": "California" }),
             200,
             "",
         ),
+        ("the country lower-cased", json!({ "country": "us" }), 200, ""),
         (
-            "the published country, lower-cased",
-            json!({ "country": "us" }),
-            200,
-            "",
-        ),
-        (
-            // A country-only jurisdiction applies throughout that country, and
-            // the state a certificate is held in is a fact about the
-            // certificate rather than about the type, so a state the catalog
-            // does not enumerate is accepted and reported as submitted.
-            "a state the published jurisdiction does not enumerate",
+            "a state nothing enumerates",
             json!({ "country": "US", "state": "Guam" }),
             200,
             "",
         ),
         (
-            "a country the type does not apply in",
+            // The jurisdictions the published collection carries are this
+            // emulator's own, so they decide no submission: a country the model
+            // admits is recorded.
+            "another country",
             json!({ "country": "DE" }),
-            400,
-            "AUTHORITY",
+            200,
+            "",
         ),
         (
             "another country with a state",
             json!({ "country": "CA", "state": "Ontario" }),
-            400,
-            "AUTHORITY",
+            200,
+            "",
         ),
         (
             "a blank state",
@@ -1809,6 +1817,24 @@ async fn an_authority_outside_the_published_jurisdictions_is_refused() {
                 reported_accounts(&listed),
                 vec![own_account().to_string()],
                 "case {case:?}: expected the account to hold the exemption, got {listed:?}"
+            );
+            // The jurisdiction is reported as the store holds it: the country
+            // upper-cased, the state trimmed.
+            let mut expected = json!({
+                "country": authority["country"].as_str().unwrap_or_default().to_uppercase(),
+            });
+            if let Some(state) = authority["state"].as_str() {
+                expected["state"] = json!(state.trim());
+            }
+            let held = reported_exemptions(&listed, own_account());
+            let reported: Vec<Value> = held
+                .iter()
+                .filter_map(|exemption| exemption.get("authority").cloned())
+                .collect();
+            assert_eq!(
+                reported,
+                vec![expected.clone()],
+                "case {case:?}: expected the exemption held in {expected}, got {held:?}"
             );
         } else {
             assert!(

@@ -205,12 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 }
             })?;
+        // The schema step of the one resolution, taken on the registry this write
+        // already resolved: a registry that holds no schema of that name refuses the
+        // same way a read of one does. See `crate::state::Registry::schema_mut`.
         let schema = registry
-            .schemas
-            .get_mut(&input.schema_name)
-            .ok_or_else(|| {
+            .schema_mut(&input.schema_name)
+            .map_err(|refusal| {
                 DeleteSchemaVersionError::from(DeleteSchemaVersionErrorModeled::NotFoundException(
-                    crate::state::schema_not_found(&input.schema_name),
+                    refusal.not_found(),
                 ))
             })?;
 

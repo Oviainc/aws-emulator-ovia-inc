@@ -1,18 +1,18 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: apigateway.apigw-request-validator-selects-bad-request-body-vs-parameters-gateway-responses apigateway.deep-apigw-integration-request-validator-modes-validate-only-what-they-declare apigateway.e2e-usage-plan-key-throttle-consequence apigateway.import-documentation-parts-bulk-atomic apigateway.authorizer-deletion-blocked-while-referenced-rejected apigateway.model-invalid-schema-json-rejected apigateway.op-contract-delete-model
+Issue-Trace-Ids: apigateway.apigw-request-validator-selects-bad-request-body-vs-parameters-gateway-responses apigateway.e2e-usage-plan-key-throttle-consequence apigateway.authorizer-deletion-blocked-while-referenced-rejected apigateway.model-invalid-schema-json-rejected apigateway.op-contract-delete-model
 Issue-Shape-Id: com.amazonaws.apigateway#BackplaneControlService
 Issue-Key: apigateway.apigw-request-validator-selects-bad-request-body-vs-parameters-gateway-responses|run#28|AssertionError|assert b_status == 400, (
-Issue-Key: apigateway.deep-apigw-integration-request-validator-modes-validate-only-what-they-declare|_poll#15|Timeout|time.sleep(interval_s)
 Issue-Key: apigateway.e2e-usage-plan-key-throttle-consequence|_get_status#27|Timeout|with urllib.request.urlopen(req, timeout=10) as resp:
-Issue-Key: apigateway.import-documentation-parts-bulk-atomic|_error#19|AssertionError|raise AssertionError("expected a ClientError, but the call SUCCEEDED")
 Issue-Key: apigateway.authorizer-deletion-blocked-while-referenced-rejected|run#16|AssertionError|assert message == expected, f"expected {expected!r}, got {message!r}"
 Issue-Key: apigateway.model-invalid-schema-json-rejected|run#8|AssertionError|assert message == (
 Issue-Key: apigateway.op-contract-delete-model|run#13|AssertionError|assert err.get("Code") == "ConflictException", f"expected ConflictException, got {err.get('Code')!r}"
 Issue-Commit: 3bfaf82953d93db9f40ee26ed0fb0b9c83dbff8e
 
 # API Gateway: 7 net-new root causes — request validators are never enforced at a deployed stage, usage-plan throttle never answers 429, ImportDocumentationParts ignores failOnWarnings, and three refusals diverge in code or message
+
+> _RESOLVED for five of the seven causes (1, 3, 5, 6, 7), whose recorded checks now pass; their keys and trace ids are the ones this report still carries. Causes 2 and 4 are NOT closed and were split out, with their keys, their trace ids and everything the fix established about them, into `issues/things-that-do-not-work/20261027T101902Z-apigateway-2-causes-of-the-request-validator-issue-remain-open.md` — so no key is carried by both reports._
 
 > _Note: this issue was identified against the code base at commit `3bfaf82953d93db9f40ee26ed0fb0b9c83dbff8e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 

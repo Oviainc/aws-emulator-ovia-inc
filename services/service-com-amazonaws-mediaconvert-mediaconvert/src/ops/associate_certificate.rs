@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Associates an AWS Certificate Manager (ACM) Amazon Resource Name (ARN) with AWS
+//! Elemental MediaConvert." What it changes is the account's SET of associated
+//! certificates
+//! ([`crate::state::ComAmazonawsMediaconvertMediaconvertState::certificates`]), which
+//! `DisassociateCertificate` removes an entry from again.
+//!
+//! An `Arn` the account ALREADY has associated is the state the request asks for, so the
+//! repeat adds nothing and answers the same 201 the first association did — as this
+//! service's recorded behaviour for a repeated create does (see
+//! [`crate::state::CreateOutcome`]). The two refusals are the model's own: an `Arn` that is
+//! not an ACM certificate ARN is `BadRequestException` (400), and an association that
+//! would carry the account past [`crate::state::MAX_CERTIFICATES`] certificates is the
+//! quota error, `ServiceQuotaExceededException` (402).
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +155,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateCertificate"))
+        // Nothing in this operation depends on the request's region: the account's
+        // certificate set is keyed by the ARN the caller sent, and the response carries no
+        // members at all.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateCertificateErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `Arn` that carries no characters names no certificate, exactly as a blank
+        // name names no queue, and is refused naming the member it arrived in.
+        if crate::state::carries_no_characters(&input.arn) {
+            return Err(AssociateCertificateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::blank_member_message("Arn")),
+                },
+            )
+            .into());
+        }
+        // A value that is not an ACM certificate ARN is a problem in the request: the
+        // member is "the ARN of the ACM certificate that you want to associate with your
+        // MediaConvert resource".
+        if !crate::state::is_acm_certificate_arn(&input.arn) {
+            return Err(AssociateCertificateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::certificate_arn_message(&input.arn)),
+                },
+            )
+            .into());
+        }
+
+        // The store owns the membership probe and the insert under one borrow, so two
+        // concurrent associations of the same ARN cannot both add it.
+        let outcome = state.lock().associate_certificate(input.arn);
+        match outcome {
+            crate::state::AssociateCertificateOutcome::Associated
+            | crate::state::AssociateCertificateOutcome::AlreadyAssociated => {
+                Ok(AssociateCertificateOutput {})
+            }
+            crate::state::AssociateCertificateOutcome::AtCapacity => {
+                Err(AssociateCertificateErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::certificates_past_cap_message()),
+                    },
+                )
+                .into())
+            }
+        }
     }
 }

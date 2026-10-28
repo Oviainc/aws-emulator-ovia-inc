@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `CreateLocalGatewayRoute` writes into one local gateway route table, what the clock
+// then owes the route, and what the create refuses. Declared beside `prefix_lists` for the
+// reason the note above gives: the sorted neighbourhood and the tail of this file are where
+// every new ec2 suite inserts its lines.
+#[path = "all/create_local_gateway_route.rs"]
+mod create_local_gateway_route;
 // The IAM instance profile an instance runs as: what the associate records, what the two
 // describes report of it, and what the disassociate takes away. Declared beside
 // `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
