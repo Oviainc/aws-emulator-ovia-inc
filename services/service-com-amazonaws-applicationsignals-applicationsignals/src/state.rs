@@ -2007,47 +2007,25 @@ pub fn time_range_refusal(start_time: &DateTime, end_time: &DateTime) -> Option<
 /// One instant as this service states it in a refusal: `EEE MMM dd HH:mm:ss UTC yyyy`
 /// (`Sun Sep 06 02:00:00 UTC 2026`), the `java.util.Date` rendering of a UTC instant.
 ///
-/// The calendar conversion is the LIBRARY's: `DateTime::fmt(Format::DateTime)` renders the
-/// instant as RFC-3339 (`2026-09-06T02:00:00Z`) and this only reorders those already-correct
-/// fields and names the month, so no leap-year or era arithmetic is re-derived here. The
-/// weekday is not part of that rendering, and it needs no calendar either: day zero of the
-/// epoch — 1970-01-01 — was a Thursday, so it is the day count modulo 7.
+/// The WHOLE calendar conversion is `chrono`'s: placing the epoch second on the civil
+/// calendar, naming its weekday and naming its month are all that crate's, so no weekday
+/// cycle, month-abbreviation table or leap-year rule is re-derived here — the same reason
+/// the calendar-month evaluation interval steps its tiles with `checked_add_months`.
 ///
-/// An instant the library cannot render at all is stated as its epoch-second value, so the
-/// message still names the instant the request carried.
+/// The stated form carries WHOLE seconds, so a sub-second part of the instant is dropped
+/// rather than rounded: the message names the second the request fell in.
+///
+/// An instant too far from the epoch for `chrono` to place on the calendar is stated as its
+/// epoch-second value, so the message still names the instant the request carried.
 fn stated_instant(at: &DateTime) -> String {
-    /// Indexed by the epoch day count modulo 7, which is 0 on Thursday 1970-01-01.
-    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    /// The month abbreviations `Date.toString` uses, in month order.
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
+    /// The `java.util.Date` field order, with the month and the weekday named and the
+    /// zone stated as `UTC`.
+    const STATED_FORM: &str = "%a %b %d %H:%M:%S UTC %Y";
 
-    let Ok(rendered) = at.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
+    let Some(placed) = ::chrono::DateTime::from_timestamp(at.secs(), 0) else {
         return at.as_secs_f64().to_string();
     };
-    // `<date>T<time>Z`, where the time may carry a fractional part the `Date` form omits.
-    let Some((date, time)) = rendered.split_once('T') else {
-        return rendered;
-    };
-    let mut fields = date.split('-');
-    let (Some(year), Some(month), Some(day)) = (fields.next(), fields.next(), fields.next())
-    else {
-        return rendered;
-    };
-    let hour_minute_second = time.trim_end_matches('Z');
-    let hour_minute_second = hour_minute_second
-        .split_once('.')
-        .map_or(hour_minute_second, |(whole, _)| whole);
-    let Some(month) = month
-        .parse::<usize>()
-        .ok()
-        .and_then(|month| MONTHS.get(month.wrapping_sub(1)))
-    else {
-        return rendered;
-    };
-    let weekday = WEEKDAYS[at.secs().div_euclid(86_400).rem_euclid(7) as usize];
-    format!("{weekday} {month} {day} {hour_minute_second} UTC {year}")
+    placed.format(STATED_FORM).to_string()
 }
 
 // =============================================================================
