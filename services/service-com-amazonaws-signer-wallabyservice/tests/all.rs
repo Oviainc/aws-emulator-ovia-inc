@@ -61,3 +61,6 @@ mod start_signing_job_platform_workflow;
 
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+#[path = "all/supplied_nothing_refusal_wording.rs"]
+mod supplied_nothing_refusal_wording;

@@ -4122,6 +4122,28 @@ pub fn metadata_table_encryption_refusal(
     })
 }
 
+/// The `InvalidArgument` message the journal table record expiration settings `expiration`
+/// earn, or `None` when there is nothing wrong with them.
+///
+/// "Journal table records must be retained for a minimum of 7 days. To set this value,
+/// specify any whole number from `7` to `2147483647`" (`RecordExpiration$Days`): the model
+/// bounds that member at neither end, so a day count outside the published range reaches a
+/// handler, and a value that is not valid for the parameter carrying it is what
+/// `InvalidArgument` reports. ONE rule for every request that carries a `RecordExpiration`
+/// — the create that settles a configuration's journal table and the update that changes
+/// its record expiration — so the two cannot drift apart on it.
+pub fn metadata_record_expiration_refusal(
+    expiration: &crate::ops::types::RecordExpiration,
+) -> Option<String> {
+    let days = expiration.days?;
+    (!(MIN_METADATA_RECORD_EXPIRATION_DAYS..=MAX_METADATA_RECORD_EXPIRATION_DAYS).contains(&days))
+        .then(|| {
+            format!(
+                "RecordExpiration.Days must be a whole number from {MIN_METADATA_RECORD_EXPIRATION_DAYS} to {MAX_METADATA_RECORD_EXPIRATION_DAYS}, got {days}"
+            )
+        })
+}
+
 /// One table of a bucket's S3 Metadata configuration: its name, and when it falls due to
 /// be in service.
 ///
@@ -5342,6 +5364,34 @@ impl Bucket {
             table_name,
             now,
         );
+        true
+    }
+
+    /// Record `record_expiration` as the journal table record expiration of the bucket's S3
+    /// Metadata configuration — reporting whether the bucket carries a configuration to
+    /// record it on.
+    ///
+    /// What `UpdateBucketMetadataJournalTableConfiguration` does: it "enables or disables
+    /// journal table record expiration for an S3 Metadata configuration on a general purpose
+    /// bucket" (that operation's own documentation), and the only thing its payload carries
+    /// is that setting (`JournalTableConfigurationUpdates` has `RecordExpiration` as its one,
+    /// required member), so the settings the request names replace the ones the configuration
+    /// carried in full. Scoped to that one setting: the journal TABLE itself — which every
+    /// configuration has, so there is none to create or drop — its name and its status, and
+    /// the inventory and annotation tables, are left exactly as they were, the way
+    /// [`Self::update_metadata_inventory_table`] is scoped to the one table it names.
+    ///
+    /// `false` is a bucket carrying NO metadata configuration, in which case nothing is
+    /// written: there is no journal table to expire records of, and the caller answers
+    /// [`NO_SUCH_CONFIGURATION_CODE`].
+    pub fn update_metadata_journal_record_expiration(
+        &mut self,
+        record_expiration: crate::ops::types::RecordExpiration,
+    ) -> bool {
+        let Some(configuration) = self.metadata_configuration.as_mut() else {
+            return false;
+        };
+        configuration.journal_record_expiration = record_expiration;
         true
     }
 
