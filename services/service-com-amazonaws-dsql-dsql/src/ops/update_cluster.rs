@@ -282,11 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
-                    return Err(UpdateClusterErrorModeled::ConflictException(ConflictException {
-                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
-                        resource_id: Some(input.identifier.clone()),
-                        resource_type: Some("cluster".to_string()),
-                    })
+                    return Err(UpdateClusterErrorModeled::ConflictException(
+                        crate::state::ResourceIdentity::cluster(&input.identifier)
+                            .client_token_mismatch(),
+                    )
                     .into());
                 }
                 crate::state::TokenVerdict::Unused => {}

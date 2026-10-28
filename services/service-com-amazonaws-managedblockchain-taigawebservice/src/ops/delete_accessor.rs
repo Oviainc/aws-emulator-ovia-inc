@@ -2,8 +2,9 @@
 
 //! @op DeleteAccessor
 //! Implemented: moves the stored accessor `CreateAccessor` persisted in [`crate::state`]
-//! from `AVAILABLE` to `PENDING_DELETION`, with `DELETED` falling due on the clock, and
-//! refuses an accessor id nothing holds.
+//! from `AVAILABLE` to `PENDING_DELETION`, with `DELETED` falling due on the clock,
+//! refuses an accessor id outside the accessor-id space as malformed, and refuses a
+//! well-formed accessor id nothing holds as not found.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +154,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // accessor belongs to the Region its `CreateAccessor` was signed for, so one of
         // another Region is not this request's to delete.
         let region = crate::state::request_region(ctx);
+
+        // An `AccessorId` outside the accessor-id space is an id this service could never
+        // have issued, so it is a request to FIX rather than a resource to delete: it is
+        // refused with the modelled `InvalidRequestException` (400) before any state is
+        // read, naming the member and the value the request held. A WELL-FORMED id
+        // nothing holds falls through to the `ResourceNotFoundException` below — the two
+        // answers are what tell a caller "you handed me a bad id" (non-retryable, fix the
+        // input) from "that accessor is gone" (nothing left to delete) apart. The rule is
+        // keyed on the INPUT MEMBER, not on the operation reading it, so every operation
+        // that resolves this member refuses through the same wording.
+        if let Some(refusal) =
+            crate::state::malformed_id(crate::state::MEMBER_ACCESSOR_ID, &input.accessor_id)
+        {
+            return Err(DeleteAccessorErrorModeled::InvalidRequestException(refusal).into());
+        }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteAccessorErrorModeled::InternalServiceErrorException(
