@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHsmClientCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHsmClientCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHsmClientCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the HSM client certificates this account holds, in creation order:
+//! the ONE the request's identifier names, or every one when it names none,
+//! narrowed by the request's `TagKeys` / `TagValues` filter and paged through
+//! the service's `MaxRecords` window and `Marker` cursor. An identifier that
+//! names no certificate is refused with `HsmClientCertificateNotFoundFault`
+//! rather than reported as an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -120,11 +118,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeHsmClientCertificatesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeHsmClientCertificates")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeHsmClientCertificates",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeHsmClientCertificatesErrorModeled {
     HsmClientCertificateNotFoundFault(HsmClientCertificateNotFoundFault),
     InvalidTagFault(InvalidTagFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -176,20 +178,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHsmClientCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHsmClientCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHsmClientCertificates"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeHsmClientCertificatesErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: nothing here changes what a later caller sees, and an
+        // HSM client certificate has no status the clock owes a transition on.
+        let store = state.lock();
+
+        // The certificates this request reports: the ONE the identifier names,
+        // or every one the account holds when it names none. ONE lookup decides
+        // both, so the refusal and the selection can never disagree — an
+        // identifier that names nothing is a refusal, not an empty report.
+        let selected: Vec<&HsmClientCertificate> =
+            match input.hsm_client_certificate_identifier.as_deref() {
+                Some(requested) => match store.hsm_client_certificate(requested) {
+                    Some(certificate) => vec![certificate],
+                    None => {
+                        return Err(
+                            DescribeHsmClientCertificatesErrorModeled::HsmClientCertificateNotFoundFault(
+                                HsmClientCertificateNotFoundFault {
+                                    message: Some(
+                                        st::hsm_client_certificate_not_found_message(requested),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                },
+                None => store.hsm_client_certificates.iter().collect(),
+            };
+
+        // Selected by REFERENCE, so only the page is cloned: the work done under
+        // the state lock is proportional to the page, not to the whole store.
+        // The tag filter selects CERTIFICATES — "HSM client certificates that
+        // have either or both of these tag keys associated with them" — so one
+        // matching tag reports the whole record.
+        let matched: Vec<&HsmClientCertificate> = selected
+            .into_iter()
+            .filter(|certificate| {
+                st::tags_match(
+                    certificate.tags.as_deref().unwrap_or_default(),
+                    input.tag_keys.as_deref(),
+                    input.tag_values.as_deref(),
+                )
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeHsmClientCertificatesOutput {
+            hsm_client_certificates: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|certificate| (*certificate).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }

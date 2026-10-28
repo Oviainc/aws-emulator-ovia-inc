@@ -76,6 +76,10 @@ fn source_parameters() -> Vec<(&'static str, &'static str)> {
 
 /// The values the snapshot captured, which a restore that overrides nothing must
 /// report back. `ManualSnapshotRetentionPeriod` is the snapshot's own.
+///
+/// The captured PORT is not here: a cluster still being restored publishes no
+/// connection endpoint at all, so the port it will serve on is asserted once the
+/// restored cluster is serving.
 fn captured_configuration() -> Vec<(&'static str, &'static str)> {
     vec![
         ("NodeType", "ra3.4xlarge"),
@@ -83,7 +87,6 @@ fn captured_configuration() -> Vec<(&'static str, &'static str)> {
         ("MasterUsername", "sourceadmin"),
         ("DBName", "analytics"),
         ("ClusterVersion", "1.0"),
-        ("Port", "8191"),
         ("PubliclyAccessible", "true"),
         ("AllowVersionUpgrade", "false"),
         ("EnhancedVpcRouting", "true"),
@@ -262,14 +265,14 @@ async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier(
         restored.text("ParameterGroupName")
     );
 
-    // Identity-derived values are recomputed for the NEW cluster.
-    let address = restored
-        .text("Address")
-        .expect("case restore: the response carries an endpoint address");
+    // Identity-derived values are recomputed for the NEW cluster. The endpoint
+    // is not among them yet: a cluster still being restored publishes none, so
+    // the hostname it will be reached at is asserted below, once it is serving.
     assert_eq!(
-        address,
-        state::endpoint_address(target, REGION),
-        "case restore {target}: expected the endpoint host of the new identifier, got {address:?}"
+        restored.text("Address"),
+        None,
+        "case restore {target}: expected no endpoint address while restoring, got {:?}",
+        restored.text("Address")
     );
     let namespace = restored
         .text("ClusterNamespaceArn")
@@ -349,6 +352,21 @@ async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier(
         state::RESTORE_STATUS_COMPLETED,
         all_text(&settled.body, "Status")
     );
+    // Serving at last, so the restored cluster publishes its endpoint: the
+    // hostname of the NEW identifier, on the port the snapshot captured
+    // ("Default: The same port as the original cluster").
+    assert_eq!(
+        settled.text("Address").as_deref(),
+        Some(state::endpoint_address(target, REGION).as_str()),
+        "case settled {target}: expected the endpoint host of the new identifier, got {:?}",
+        settled.text("Address")
+    );
+    assert_eq!(
+        settled.text("Port").as_deref(),
+        Some("8191"),
+        "case settled {target}: expected the captured port once serving, got {:?}",
+        settled.text("Port")
+    );
 }
 
 #[tokio::test]
@@ -359,12 +377,6 @@ async fn a_request_member_overrides_the_captured_value() {
     // bound of a range, a flag either way, a node count up and down, a derived
     // form, and the group names the documented exception resets.
     let cases: Vec<OverrideCase> = vec![
-        (
-            "port",
-            "restored-port",
-            vec![("Port", "5455")],
-            vec![("Port", "5455")],
-        ),
         (
             "node type",
             "restored-node-type",
@@ -493,6 +505,36 @@ async fn a_request_member_overrides_the_captured_value() {
             );
         }
     }
+
+    // The PORT a request overrides is part of the connection endpoint, which a
+    // cluster still being restored publishes none of — so the override is
+    // observed once the restored cluster is serving.
+    let ported = restore(&emulator, "restored-port", &[("Port", "5455")]).await;
+    assert_eq!(
+        ported.status, 200,
+        "case port: expected 200, got {} with body {}",
+        ported.status, ported.body
+    );
+    assert_eq!(
+        ported.text("Port"),
+        None,
+        "case port: expected no endpoint port while restoring, got {:?}",
+        ported.text("Port")
+    );
+    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
+    let serving = describe(&emulator, "restored-port").await;
+    assert_eq!(
+        serving.text("Port").as_deref(),
+        Some("5455"),
+        "case port: expected the overriding port once the cluster is serving, got {:?}",
+        serving.text("Port")
+    );
+    assert_eq!(
+        serving.text("Address").as_deref(),
+        Some(state::endpoint_address("restored-port", REGION).as_str()),
+        "case port: expected the endpoint host of the new identifier, got {:?}",
+        serving.text("Address")
+    );
 }
 
 #[tokio::test]
@@ -735,7 +777,7 @@ async fn a_restore_the_service_cannot_perform_is_refused_with_its_modelled_fault
                 ("NumberOfNodes", "0"),
             ],
             400,
-            "ValidationException",
+            "InvalidParameterValue",
         ),
     ];
 

@@ -356,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
 
         if let Some(identifier) = final_identifier {
             let snapshot = st::snapshot_of(
-                &removed.cluster,
+                &removed,
                 &identifier,
                 created_at,
                 final_retention,

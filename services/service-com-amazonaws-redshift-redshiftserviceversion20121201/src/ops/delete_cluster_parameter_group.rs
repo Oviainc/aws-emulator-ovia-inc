@@ -219,29 +219,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "You cannot delete a parameter group if it is associated with a
             // cluster" — the clusters this store holds are the whole of what can
             // be associated with it.
-            let in_use_by: Vec<String> = store
-                .clusters
-                .iter()
-                .filter(|stored| {
-                    stored
-                        .cluster
-                        .cluster_parameter_groups
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|membership| {
-                            membership.parameter_group_name.as_deref() == Some(&name)
-                        })
-                })
-                .filter_map(|stored| stored.cluster.cluster_identifier.clone())
-                .collect();
-            if !in_use_by.is_empty() {
+            let in_use_by_a_cluster = store.clusters.iter().any(|stored| {
+                stored
+                    .cluster
+                    .cluster_parameter_groups
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|membership| membership.parameter_group_name.as_deref() == Some(&name))
+            });
+            if in_use_by_a_cluster {
                 return Err(
                     DeleteClusterParameterGroupErrorModeled::InvalidClusterParameterGroupStateFault(
                         InvalidClusterParameterGroupStateFault {
                             message: Some(format!(
-                                "Cluster parameter group {name} is in use by cluster(s) {}.",
-                                in_use_by.join(", ")
+                                "One or more Clusters are still members of this parameter group {name}, so the group cannot be deleted"
                             )),
                         },
                     )
