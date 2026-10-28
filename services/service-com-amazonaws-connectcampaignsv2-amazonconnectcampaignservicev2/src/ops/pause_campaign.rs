@@ -5,6 +5,10 @@
 //! record `GetCampaignState` reads; an illegal one is refused with
 //! `InvalidCampaignStateException` (HTTP 409).
 //!
+//! The lifecycle rule every campaign action is judged by lives once as
+//! `act_on_campaign` on this service's state, so this handler names its action and
+//! maps the rejection to the error variants its own model declares.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -178,41 +182,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         const ACTION: crate::state::CampaignAction = crate::state::CampaignAction::Pause;
 
-        // A campaign is reachable only through the endpoint of the region it was
-        // created in, so the id is resolved in the region this request was signed for
-        // and a lifecycle write never reaches another region's campaign.
+        // The lifecycle rule itself — resolve the campaign in the region this request
+        // was signed for, judge the action against the state the clock has the
+        // campaign at, write the state it moves to — lives once on the store
+        // (`act_on_campaign`), so this call and the other three lifecycle calls move a
+        // campaign by one rule. What belongs to THIS operation is only the mapping
+        // from a rejection to the error variant its own model declares.
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
-        let Some(campaign) = store.campaign_mut(&region, &input.id) else {
-            return Err(PauseCampaignErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
-                    x_amz_error_type: None,
-                },
-            )
-            .into());
-        };
-        // The state the campaign is at NOW: a campaign whose scheduled run window
-        // has closed is `Completed`, a terminal state no lifecycle action moves out
-        // of, so the refusal names the state the clock left it at rather than the
-        // one the last call wrote.
-        let current = campaign.state_at(::std::time::SystemTime::now());
-        let Some(next) = current.after(ACTION) else {
-            return Err(PauseCampaignErrorModeled::InvalidCampaignStateException(
-                InvalidCampaignStateException {
-                    state: current.as_wire().to_string(),
-                    message: format!(
-                        "A campaign in state {} cannot be {}",
-                        current.as_wire(),
-                        ACTION.verb()
-                    ),
-                    x_amz_error_type: None,
-                },
-            )
-            .into());
-        };
-        campaign.lifecycle_state = next;
-
-        Ok(PauseCampaignOutput)
+        let moved = state.lock().act_on_campaign(
+            crate::state::CampaignRef {
+                region: &region,
+                id: &input.id,
+            },
+            ACTION,
+            ::std::time::SystemTime::now(),
+        );
+        match moved {
+            Ok(_) => Ok(PauseCampaignOutput),
+            Err(rejected) => Err(match rejected {
+                // This region holds no campaign under that id: there is no lifecycle
+                // to move, and nothing was written.
+                crate::state::LifecycleRejected::NotFound => {
+                    PauseCampaignErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: rejected.message(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                }
+                // The action is not legal from the state the campaign is at NOW, which
+                // the refusal names — a campaign whose scheduled run window has closed
+                // is `Completed`, so that is the state reported rather than the one the
+                // last call wrote.
+                crate::state::LifecycleRejected::IllegalAction { state: current, .. } => {
+                    PauseCampaignErrorModeled::InvalidCampaignStateException(
+                        InvalidCampaignStateException {
+                            state: current.as_wire().to_string(),
+                            message: rejected.message(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                }
+            }
+            .into()),
+        }
     }
 }
