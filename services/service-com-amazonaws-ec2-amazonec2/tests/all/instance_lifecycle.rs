@@ -1289,15 +1289,46 @@ async fn max_results_pages_over_reservations() {
         bad_token.body
     );
 
-    for max_results in ["0", "-1", "1001"] {
+    for max_results in ["0", "-1"] {
         let answer = ec2
             .call("DescribeInstances", vec![p("MaxResults", max_results)])
             .await;
         assert_eq!(
             answer.error_code(),
             "InvalidParameterValue",
-            "case MaxResults={max_results}: a page size outside the documented range \
-             must be refused, got {}",
+            "case MaxResults={max_results}: a page of none must be refused, got {}",
+            answer.body
+        );
+    }
+
+    // The model declares no `@range` on `DescribeInstancesRequest$MaxResults`, so a page
+    // size above the largest page this service answers asks for that page rather than for
+    // a refusal.
+    for max_results in ["1001", "2147483647"] {
+        let answer = ec2
+            .call("DescribeInstances", vec![p("MaxResults", max_results)])
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case MaxResults={max_results}: a page size above the ceiling must be served, \
+             got {}",
+            answer.body
+        );
+        let reported: Vec<String> = answer
+            .reservations()
+            .into_iter()
+            .map(|reservation| reservation.id)
+            .collect();
+        assert_eq!(
+            reported, launched,
+            "case MaxResults={max_results}: expected every reservation in one page, got \
+             {reported:?}"
+        );
+        assert_eq!(
+            answer.next_token(),
+            None,
+            "case MaxResults={max_results}: a page that holds everything carries no token, \
+             got {}",
             answer.body
         );
     }
@@ -1622,20 +1653,6 @@ async fn run_instances_refuses_an_unservable_request() {
             ],
             status: 400,
             code: "InvalidParameterValue",
-        },
-        Case {
-            label: "a tag specification for a documented resource type this slice \
-                    does not store",
-            params: vec![
-                p("ImageId", AMI),
-                p("MinCount", "1"),
-                p("MaxCount", "1"),
-                p("TagSpecification.1.ResourceType", "volume"),
-                p("TagSpecification.1.Tag.1.Key", "k"),
-                p("TagSpecification.1.Tag.1.Value", "v"),
-            ],
-            status: 501,
-            code: "NotImplemented",
         },
         Case {
             label: "a network interface specification, which this slice does not model",

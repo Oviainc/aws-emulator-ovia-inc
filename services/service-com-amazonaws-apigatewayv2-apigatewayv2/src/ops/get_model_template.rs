@@ -192,8 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // language, which nothing here can map a payload against, so the request is
         // refused rather than answered with a template nothing generated.
         let content_type = model.content_type.as_deref();
-        let document = Some(model.schema.as_str())
-            .filter(|_| crate::state::is_json_media_type(content_type))
+        let document = crate::state::is_json_media_type(content_type)
+            .then_some(model.schema.as_str())
             .and_then(|schema| ::serde_json::from_str::<::serde_json::Value>(schema).ok())
             .filter(::serde_json::Value::is_object)
             .ok_or_else(|| {

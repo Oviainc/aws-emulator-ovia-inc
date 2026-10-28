@@ -1088,7 +1088,7 @@ async fn a_patch_whose_values_are_invalid_is_refused_and_persists_nothing() {
             "an included product naming another vendor",
             json!({
                 "includedPortalProductArns": [
-                    format!("arn:aws:s3:::example-bucket/portalproducts/prod000012")
+                    "arn:aws:s3:::example-bucket/portalproducts/prod000012".to_string()
                 ]
             }),
         ),

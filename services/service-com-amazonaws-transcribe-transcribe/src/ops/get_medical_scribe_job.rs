@@ -170,28 +170,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // jobs started through it.
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // The lookup materialises the transition the clock already owed this job, so
-        // the status reported here is the one it had at `now`.
-        let Some(record) =
-            store.medical_scribe_job_mut(&region, &input.medical_scribe_job_name, now)
-        else {
-            return Err(GetMedicalScribeJobErrorModeled::BadRequestException(
-                BadRequestException {
-                    // A job this Region never started is this service's
-                    // `BadRequestException`, not the modelled `NotFoundException`:
-                    // the shape its recorded not-found responses carry, the one whose
-                    // documentation covers an entity that "doesn't exist", and the one
-                    // `GetTranscriptionJob` already answers — so a poll-until-done loop
-                    // classifies an unknown job the same way whichever family it is in.
-                    message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
-                },
-            )
-            .into());
+        // The documents this job's reported output locations serve, stored at those
+        // locations the first time a reader finds the job finished, exactly as
+        // `GetTranscriptionJob` does for its own family (which states where they go and
+        // how many there are): into this emulator's own Amazon S3 over the in-process
+        // callback, one small document per distinct location the record reports, taken
+        // once per job. Collected while the store is locked and written after the guard
+        // is dropped, so no lock is held across the call into object storage.
+        let (outputs, job) = {
+            let mut store = state.lock();
+            // The lookup materialises the transition the clock already owed this job, so
+            // the status reported here is the one it had at `now`.
+            let Some(record) =
+                store.medical_scribe_job_mut(&region, &input.medical_scribe_job_name, now)
+            else {
+                return Err(GetMedicalScribeJobErrorModeled::BadRequestException(
+                    BadRequestException {
+                        // A job this Region never started is this service's
+                        // `BadRequestException`, not the modelled `NotFoundException`:
+                        // the shape its recorded not-found responses carry, the one whose
+                        // documentation covers an entity that "doesn't exist", and the one
+                        // `GetTranscriptionJob` already answers — so a poll-until-done loop
+                        // classifies an unknown job the same way whichever family it is in.
+                        message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
+                    },
+                )
+                .into());
+            };
+            (crate::state::due_output_objects(record), record.to_job())
         };
+        if !crate::state::store_job_outputs(ctx, &region, &outputs).await {
+            // A write the object store did not take leaves the job still owing it, so
+            // the documents go back to the record and a later read takes them again.
+            crate::state::return_due_output_objects(state.lock().medical_scribe_job_mut(
+                &region,
+                &input.medical_scribe_job_name,
+                now,
+            ));
+        }
 
         Ok(GetMedicalScribeJobOutput {
-            medical_scribe_job: Some(record.to_job()),
+            medical_scribe_job: Some(job),
         })
     }
 }

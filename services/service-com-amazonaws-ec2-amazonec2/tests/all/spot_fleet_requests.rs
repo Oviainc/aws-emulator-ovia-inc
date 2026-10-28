@@ -1114,12 +1114,13 @@ async fn the_report_is_narrowed_by_id_and_paged_by_max_results() {
         "case {case:?}: a page with nothing after it carries no token: {body}"
     );
 
-    // The page size's published bounds, and one past each.
+    // The page size's published bounds, and one past each: the model declares no `@range`
+    // on this operation's `MaxResults`, so only a page of none is a refusal.
     for (page_size, expected_status) in [
         ("1", 200),
         (MAX_PAGE_SIZE.to_string().as_str(), 200),
         ("0", 400),
-        ("1001", 400),
+        ("1001", 200),
     ] {
         let (status, body) = describe(&router, &[p("MaxResults", page_size)]).await;
         assert_eq!(

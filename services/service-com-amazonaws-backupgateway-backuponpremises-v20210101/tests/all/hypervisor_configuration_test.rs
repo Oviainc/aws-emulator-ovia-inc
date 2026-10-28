@@ -89,7 +89,7 @@ fn message_of(reply: &Reply) -> String {
 fn store_snapshot(engine: &Arc<engine::InMemoryEngine>) -> String {
     format!(
         "{:?}",
-        &*service_state(&**engine)
+        *service_state(&**engine)
             .expect("the in-memory engine must expose this state")
             .lock()
     )

@@ -3,8 +3,8 @@
 //! @op CreateLensShare
 //! IMPLEMENTED: shares one CUSTOM lens with one principal and persists the share in
 //! [`crate::state`], so the invitation it raises is reported by `ListShareInvitations`
-//! and the share itself is the one `DeleteLensShare` revokes by the `ShareId` this
-//! operation answers (`ListLensShares` is still a stub with its own issue). "Lenses
+//! and the share itself is the one `ListLensShares` reports and `DeleteLensShare` revokes
+//! by the `ShareId` this operation answers. "Lenses
 //! provided by Amazon Web Services (Amazon Web Services Official Content) cannot be
 //! shared" and a lens "cannot be … shared with other Amazon Web Services accounts until
 //! it's published with CreateLensVersion" (`ImportLens` doc), so both are refused with

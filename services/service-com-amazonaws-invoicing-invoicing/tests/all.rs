@@ -27,6 +27,8 @@ mod own_account_and_request_derived_refusals;
 mod procurement_portal_error_message_key;
 #[path = "all/procurement_portal_preference_lifecycle.rs"]
 mod procurement_portal_preference_lifecycle;
+#[path = "all/procurement_portal_preference_plane_state.rs"]
+mod procurement_portal_preference_plane_state;
 #[path = "all/procurement_portal_preference_reads.rs"]
 mod procurement_portal_preference_reads;
 #[path = "all/procurement_portal_preference_status.rs"]

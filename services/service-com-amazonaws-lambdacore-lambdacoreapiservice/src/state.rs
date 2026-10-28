@@ -421,10 +421,7 @@ impl ComAmazonawsLambdacoreLambdacoreapiserviceState {
     ) -> Option<(&mut NetworkConnector, Option<i64>)> {
         let parsed = parse_identifier(identifier);
         let name = self.name_of(&parsed.key)?;
-        let forget = match self.connectors.get_mut(&name) {
-            Some(connector) => connector.settle(now),
-            None => return None,
-        };
+        let forget = self.connectors.get_mut(&name)?.settle(now);
         if forget {
             self.forget(&name);
             return None;

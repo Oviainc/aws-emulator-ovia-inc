@@ -33,6 +33,8 @@ mod arn_validation;
 mod client_error_wrappers;
 #[path = "all/definition_path_diagnostics.rs"]
 mod definition_path_diagnostics;
+#[path = "all/definition_state_rules.rs"]
+mod definition_state_rules;
 #[path = "all/definition_validation.rs"]
 mod definition_validation;
 #[path = "all/describe_state_machine_for_execution.rs"]
@@ -43,6 +45,8 @@ mod distributed_map_children;
 mod error_messages;
 #[path = "all/execution_alias_routing.rs"]
 mod execution_alias_routing;
+#[path = "all/execution_data_encryption.rs"]
+mod execution_data_encryption;
 #[path = "all/execution_history.rs"]
 mod execution_history;
 #[path = "all/execution_history_outcomes.rs"]
