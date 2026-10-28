@@ -146,41 +146,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The token is the template id the next page starts at, so anything that is not
-        // an id this service mints was never issued by this operation.
-        if let Some(token) = input.next_token.as_deref() {
-            if !crate::state::is_minted_id(token, crate::state::TEMPLATE_ID_PREFIX) {
-                return Err(ListExperimentTemplatesErrorModeled::ValidationException(
-                    crate::state::invalid_next_token(),
-                )
-                .into());
-            }
-        }
+        // an id this service mints was never issued by this operation. Decoding it is the
+        // shared rule; lifting its refusal into this operation's error enum is the only
+        // part of it that belongs to this operation.
+        let resume_at = crate::state::minted_id_page_resume_point(
+            input.next_token.as_deref(),
+            crate::state::TEMPLATE_ID_PREFIX,
+        )
+        .map_err(ListExperimentTemplatesErrorModeled::ValidationException)?;
 
         let page_size = crate::state::page_size(input.max_results);
         let store = state.lock();
-        let mut experiment_templates =
-            Vec::with_capacity(page_size.min(store.experiment_templates.len()));
-        let mut next_token = None;
-        for (id, record) in &store.experiment_templates {
-            // Resume at the first id at or after the token, so a page is still served
-            // when the template the token named was deleted meanwhile.
-            if input
-                .next_token
-                .as_deref()
-                .is_some_and(|token| id.as_str() < token)
-            {
-                continue;
-            }
-            if experiment_templates.len() >= page_size {
-                next_token = Some(id.clone());
-                break;
-            }
-            experiment_templates.push(record.to_summary());
-        }
+
+        // The page walk itself is the shared one over a collection keyed by minted ids, so
+        // this operation and `ListExperiments` cut their pages and mint their tokens by the
+        // same rule — a page is still served when the template the token named was deleted
+        // meanwhile; what belongs to this operation is the collection it walks, the page
+        // size the caller sized and the summary shape it reports.
+        let page = crate::state::minted_id_page(
+            &store.experiment_templates,
+            resume_at,
+            page_size,
+            crate::state::ExperimentTemplateRecord::to_summary,
+        );
 
         Ok(ListExperimentTemplatesOutput {
-            experiment_templates: Some(experiment_templates),
-            next_token,
+            experiment_templates: Some(page.entries),
+            next_token: page.next_token,
         })
     }
 }

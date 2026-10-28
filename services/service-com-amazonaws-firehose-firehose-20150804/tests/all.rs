@@ -39,6 +39,8 @@ mod destination_delivery;
 mod destination_update;
 #[path = "all/direct_put_source_gate.rs"]
 mod direct_put_source_gate;
+#[path = "all/encryption_conflict_messages.rs"]
+mod encryption_conflict_messages;
 #[path = "all/http_endpoint_delivery.rs"]
 mod http_endpoint_delivery;
 #[path = "all/kms_key_resolution.rs"]

@@ -47,6 +47,8 @@ mod list_actions;
 mod list_experiment_resolved_targets;
 #[path = "all/list_experiment_target_account_configurations.rs"]
 mod list_experiment_target_account_configurations;
+#[path = "all/list_page_walk.rs"]
+mod list_page_walk;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/list_target_account_configurations.rs"]

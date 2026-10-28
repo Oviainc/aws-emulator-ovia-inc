@@ -68,7 +68,10 @@ const CANCEL_OUTCOMES: &[(&str, Outcome)] = &[
 /// Most of these statuses are reached by the scheduler and by the pass itself, which no
 /// request drives, so the stored contact's status is set directly — the one place these
 /// suites touch the store instead of the front door.
-fn put_in_status(engine: &engine::InMemoryEngine, contact_id: &str, status: &str) {
+///
+/// `pub(crate)` so the sibling `owed_transition_spans.rs` suite puts a pass under way the
+/// same way rather than keeping a second copy of this.
+pub(crate) fn put_in_status(engine: &engine::InMemoryEngine, contact_id: &str, status: &str) {
     let state = service_state(engine).expect("this service's state store");
     let mut guard = state.lock();
     guard
