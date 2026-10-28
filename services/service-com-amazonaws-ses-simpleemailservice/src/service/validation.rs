@@ -31,11 +31,10 @@
 //!    so each holds for every member of every operation carrying that constraint;
 //! 4. an enum clause states the admitted VALUE SET and the position —
 //!    `Value at '<path>' failed to satisfy constraint: Member must satisfy enum value set:
-//!    [ … ]`. The set's MEMBERSHIP is the model's; the ORDER it is listed in is this
-//!    service's own listing of that enum's values ([`VALUE_LISTINGS`], [`listed`]), which
-//!    no order the model carries reproduces. The order is a property of the ENUM, not of
-//!    the member or the operation reaching it, so one enum states one ordered set wherever
-//!    it is reached.
+//!    [ … ]`. The set's MEMBERSHIP is the model's; the ORDER it is listed in is ASCENDING
+//!    over the values themselves ([`listed`]), whatever order the model declares them in.
+//!    The order is a property of the SET, not of the member or the operation reaching it,
+//!    so one enum states one ordered set wherever it is reached.
 //!
 //! A violation class this module has no wording for keeps the FRAMEWORK's own clause for
 //! that one violation ([`ViolationKind`] is `#[non_exhaustive]`, so a class can be added
@@ -54,56 +53,25 @@ use smithy_server_runtime::{Refusal, Refused};
 /// out, which the framework answers `MalformedInput` for.
 const VALIDATION_ERROR: &str = "ValidationError";
 
-/// The order this service states an enum's admitted values in, for the enums it is
-/// observed to publish a listing for.
+/// `values` in the order this service states an admitted set in: ASCENDING over the
+/// values themselves.
 ///
-/// An enum clause states a MEMBERSHIP and an ORDER. The membership is the model's, always.
-/// The order is not: this service lists `IdentityType` as `Domain, EmailAddress` while the
-/// model declares it `EmailAddress, Domain`
-/// (`smithy_query(query="shape",shape="IdentityType")`). It is service metadata the public
-/// model does not carry, and the only source for it is what this service's refusals are
-/// recorded stating — so a listing is recorded per enum HERE, beside the one renderer
-/// every enum-constrained member of every operation goes through, rather than in an
-/// operation handler.
-///
-/// A listing is identified by the SET it orders — which is what a violation carries, the
-/// clause having no shape id — and is applied ONLY to an enum whose admitted set it is a
-/// permutation of ([`orders_the_same_set`]). A listing can therefore neither add a value
-/// this model does not declare nor drop one it does, and an enum whose membership changes
-/// in the model stops matching a stale listing and states the model's order instead. An
-/// enum with no recorded listing keeps the order the member schema carries, which is the
-/// model's.
-///
-/// What a membership cannot identify is one enum among several declared over the SAME
-/// values: such a listing would order both. No two listings here may therefore order the
-/// same set, which `no_two_listings_order_the_same_set` holds them to.
-const VALUE_LISTINGS: &[&[&str]] = &[
-    // `IdentityType` (`ListIdentities.IdentityType`), declared `EmailAddress, Domain`.
-    &["Domain", "EmailAddress"],
-];
-
-/// `values` in the order this service lists them, or in the order they arrived — the
-/// model's, off the member schema — when this service publishes no listing for that enum.
+/// An enum clause states a MEMBERSHIP and an ORDER. The membership is the model's,
+/// always. The order is not the model's: this service states `IdentityType` as
+/// `Domain, EmailAddress` where the model declares it `EmailAddress, Domain`
+/// (`smithy_query(query="shape",shape="IdentityType")`), and `TlsPolicy`
+/// (`PutConfigurationSetDeliveryOptions.DeliveryOptions$TlsPolicy`) as
+/// `Optional, Require` where the model declares it `Require, Optional`
+/// (`query="shape",shape="TlsPolicy"`). Both are that enum's values in ascending order,
+/// so the order is derived from the SET each time rather than recorded per enum: it holds
+/// for every enum-constrained member of every operation, including an enum this service's
+/// refusals have never been observed stating and one the model later reorders or extends,
+/// and two enums declared over the same values state one clause instead of claiming each
+/// other's recorded listing.
 fn listed(values: &[String]) -> Vec<String> {
-    match VALUE_LISTINGS
-        .iter()
-        .find(|listing| orders_the_same_set(listing, values))
-    {
-        Some(listing) => listing.iter().map(|value| (*value).to_string()).collect(),
-        None => values.to_vec(),
-    }
-}
-
-/// Whether two value lists hold the same values, in whatever order each holds them.
-fn orders_the_same_set(one: &[&str], other: &[String]) -> bool {
-    if one.len() != other.len() {
-        return false;
-    }
-    let mut one: Vec<&str> = one.to_vec();
-    let mut other: Vec<&str> = other.iter().map(String::as_str).collect();
-    one.sort_unstable();
-    other.sort_unstable();
-    one == other
+    let mut listed = values.to_vec();
+    listed.sort_unstable();
+    listed
 }
 
 /// Whether a clause of this violation's class states the value the member held (rule 3).
@@ -176,7 +144,7 @@ pub fn refusal(refusal: &Refusal) -> Option<Refused> {
 
 #[cfg(test)]
 mod tests {
-    use super::{orders_the_same_set, refusal, VALUE_LISTINGS};
+    use super::refusal;
     use aws_smithy_schema_server::{Violation, ViolationKind};
     use smithy_server_runtime::Refusal;
 
@@ -201,40 +169,50 @@ mod tests {
         );
     }
 
-    /// An enum rejection states the admitted set in this service's listed order and does
-    /// not echo the value it refused.
+    /// An enum rejection states the admitted set in ascending order, whatever order the
+    /// walk handed it, and does not echo the value it refused.
     #[test]
-    fn an_enum_rejection_states_the_listed_set_and_no_value() {
-        let stated = refusal(&Refusal::Invalid(vec![Violation {
-            path: "identityType".to_string(),
-            kind: ViolationKind::EnumValue(vec![
-                "EmailAddress".to_string(),
-                "Domain".to_string(),
-            ]),
-            value: Some("Bogus".to_string()),
-        }]))
-        .expect("a structural refusal is stated");
-        assert_eq!(
-            stated.message,
-            "1 validation error detected: Value at 'identityType' failed to satisfy \
-             constraint: Member must satisfy enum value set: [Domain, EmailAddress]",
-            "case a value outside an enum's set: got {stated:?}"
-        );
-    }
-
-    /// A listing reaches an enum by the SET it orders, so two listings over one set would
-    /// each claim the other's enum: the table may hold at most one listing per membership.
-    #[test]
-    fn no_two_listings_order_the_same_set() {
-        for (index, listing) in VALUE_LISTINGS.iter().enumerate() {
-            let owned: Vec<String> = listing.iter().map(|value| (*value).to_string()).collect();
-            for other in VALUE_LISTINGS.iter().skip(index + 1) {
-                assert!(
-                    !orders_the_same_set(other, &owned),
-                    "case {listing:?}: another listing orders the same set ({other:?}), so \
-                     neither can identify its own enum"
-                );
-            }
+    fn an_enum_rejection_states_the_ascending_set_and_no_value() {
+        // The rows differ along what the rule generalises over: how many values the enum
+        // declares, the member path (a top-level member and a nested one), and whether the
+        // declared order already is the ascending one.
+        for (case, path, declared, stated) in [
+            (
+                "a two-valued enum declared in reverse",
+                "identityType",
+                vec!["EmailAddress", "Domain"],
+                "[Domain, EmailAddress]",
+            ),
+            (
+                "a nested member's two-valued enum declared in reverse",
+                "deliveryOptions.tlsPolicy",
+                vec!["Require", "Optional"],
+                "[Optional, Require]",
+            ),
+            (
+                "a three-valued enum already declared ascending",
+                "notificationType",
+                vec!["Bounce", "Complaint", "Delivery"],
+                "[Bounce, Complaint, Delivery]",
+            ),
+        ] {
+            let refused = refusal(&Refusal::Invalid(vec![Violation {
+                path: path.to_string(),
+                kind: ViolationKind::EnumValue(
+                    declared.iter().map(|value| (*value).to_string()).collect(),
+                ),
+                value: Some("Bogus".to_string()),
+            }]))
+            .expect("a structural refusal is stated");
+            let expected = format!(
+                "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+                 Member must satisfy enum value set: {stated}"
+            );
+            assert_eq!(
+                refused.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                refused.message
+            );
         }
     }
 

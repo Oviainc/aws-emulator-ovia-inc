@@ -134,6 +134,16 @@ pub const MAX_ROLES_PER_ACCOUNT: usize = 1_000;
 /// cannot be increased."
 pub const MAX_ROLES_PER_INSTANCE_PROFILE: usize = 1;
 
+/// How many delegation requests one account may hold. AWS's "IAM and STS quotas"
+/// page publishes no figure for a delegation request, so this bound is the
+/// emulator's own: it is what stops the delegation-request map — and the workflow-id
+/// index beside it — growing without end on repeated filings, and it sits far above
+/// any partner engagement a caller files by hand. A filing past it is refused with
+/// the modelled `LimitExceededException`, whose documentation says "the error message
+/// describes the limit exceeded", exactly as a create past any other of these bounds
+/// is.
+pub const MAX_DELEGATION_REQUESTS_PER_ACCOUNT: usize = 1_000;
+
 /// The maximum session duration, in seconds, a role created without one carries.
 /// `CreateRole$MaxSessionDuration`'s documentation states "if you do not specify a
 /// value for this setting, the default value of one hour is applied", and
@@ -452,6 +462,24 @@ const BASE32_CHARACTERS_PER_WORD: usize = 13;
 /// sit inside `certificateIdType`'s length 24..128
 /// (`smithy_query(query="shape", shape="certificateIdType")`).
 const SIGNING_CERTIFICATE_ID_CHARACTERS: usize = 32;
+
+/// How many characters a minted `DelegationRequestId` carries. AWS publishes no
+/// entity-type prefix for a delegation request, so the whole value is base32
+/// characters, and 32 of them sit inside `delegationRequestIdType`'s length 16..128
+/// and its pattern `^[\w-]+$`
+/// (`smithy_query(query="shape", shape="delegationRequestIdType")`).
+const DELEGATION_REQUEST_ID_CHARACTERS: usize = 32;
+
+/// How long after it was filed a delegation request expires, which is what
+/// `DelegationRequest$ExpirationTime` ("the expiry time of this delegation request")
+/// reports.
+///
+/// The member's documentation points at the request-lifecycle page for "details on the
+/// life time of a delegation request at each state" and states no figure, so the span is
+/// the emulator's own: long enough for the approval workflow the operation describes — a
+/// customer reaching the console through `ConsoleDeepLink` and acting on the request — to
+/// run, and bounded so a filed request does not stand for ever.
+pub const DELEGATION_REQUEST_LIFETIME_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// What every pagination `Marker` this service issues carries, inside the encoded
 /// payload, so a token it did not issue is recognised as foreign rather than read
@@ -1362,6 +1390,24 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// `^[\w-]+$` and the identifier is minted rather than named by a caller, so there
     /// is no case to fold and no [`name_key`] to build.
     pub delegation_requests: BTreeMap<String, DelegationRequest>,
+    /// Which delegation request each `RequestorWorkflowId` was filed under:
+    /// `RequestorWorkflowId` -> the `DelegationRequestId` of the request that carried
+    /// it.
+    ///
+    /// `CreateDelegationRequest$RequestorWorkflowId` is "the unique identifier on the
+    /// partner side that can be used to track the progress of the request. IAM maintains
+    /// a uniqueness check on this workflow id for each request - if a workflow id for an
+    /// existing request is passed, this API call will fail", so the account has to
+    /// remember which workflow ids it has already filed a request under. It is an INDEX
+    /// beside [`Self::delegation_requests`] and not a second copy of the resource:
+    /// `DelegationRequest` declares no member carrying the workflow id
+    /// (`smithy_query(query="shape", shape="DelegationRequest")`), so there is nothing in
+    /// the stored record to scan for it.
+    ///
+    /// Held VERBATIM: `requestorWorkflowIdType`'s pattern admits every printable
+    /// character, the value is the partner's own handle rather than an IAM entity name,
+    /// and AWS distinguishes such a handle by case, so there is no [`name_key`] to build.
+    pub delegation_request_workflow_ids: BTreeMap<String, String>,
     /// The organization this account belongs to, or `None` while it belongs to none.
     ///
     /// `None` is the standalone account this emulator presents until something records
@@ -1399,6 +1445,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// ONE counter for both kinds of job, so no two jobs the account ever records can
     /// share an id whichever generate minted them.
     pub report_job_seq: u64,
+    /// Monotonic counter feeding
+    /// [`next_delegation_request_id`](Self::next_delegation_request_id).
+    pub delegation_request_id_seq: u64,
     /// Monotonic counter feeding
     /// [`next_saml_provider_uuid`](Self::next_saml_provider_uuid).
     pub saml_provider_uuid_seq: u64,
@@ -1485,10 +1534,12 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             account_alias: None,
             account_properties: BTreeMap::new(),
             delegation_requests: BTreeMap::new(),
+            delegation_request_workflow_ids: BTreeMap::new(),
             organization: None,
             organizations_access_reports: BTreeMap::new(),
             service_last_accessed_reports: BTreeMap::new(),
             report_job_seq: 0,
+            delegation_request_id_seq: 0,
             saml_provider_uuid_seq: 0,
             saml_private_key_id_seq: 0,
             user_id_seq: 0,
@@ -1592,6 +1643,24 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_service_last_accessed_job_id(&mut self) -> String {
         self.report_job_seq += 1;
         report_job_id(self.report_job_seq)
+    }
+
+    /// Mint the next delegation request's `DelegationRequestId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is: the
+    /// counter is bijectively mixed into the id, and the id is minted once and then
+    /// stored with the request, so "the unique identifier for the created delegation
+    /// request" (`CreateDelegationRequestResponse$DelegationRequestId`) is the handle
+    /// every later read of that request takes. It carries no entity-type prefix — AWS
+    /// publishes none for a delegation request — so the whole id is
+    /// [`DELEGATION_REQUEST_ID_CHARACTERS`] base32 characters.
+    pub fn next_delegation_request_id(&mut self) -> String {
+        self.delegation_request_id_seq += 1;
+        unique_id_of_length(
+            "",
+            self.delegation_request_id_seq,
+            DELEGATION_REQUEST_ID_CHARACTERS,
+        )
     }
 
     /// Mint the next SAML provider's `SAMLProviderUUID`.
@@ -3066,6 +3135,53 @@ pub fn delegation_request_arn(delegation_request_id: &str) -> String {
         &format!("{DELEGATION_REQUEST_RESOURCE_TYPE}/{delegation_request_id}"),
     )
 }
+
+/// The Region the IAM console lives in, which every console page this crate names is
+/// served from.
+///
+/// IAM is a GLOBAL service: its endpoint `iam.amazonaws.com` is in `us-east-1` ("AWS
+/// Identity and Access Management endpoints and quotas", AWS General Reference), and so
+/// is the console that manages what it holds. A request signed for another Region is
+/// still a request to that one global service, so the page it is pointed at is the same
+/// one — the Region a request named in its SigV4 credential scope is not where the
+/// console view of the resource lives.
+const IAM_CONSOLE_REGION: &str = "us-east-1";
+
+/// The console deep link of a delegation request: the page a partner redirects a
+/// customer to in order to act on the request this emulator holds under
+/// `delegation_request_id`.
+///
+/// "A deep link URL to the Amazon Web Services Management Console for managing the
+/// delegation request" (`CreateDelegationRequestResponse$ConsoleDeepLink`), so it is the
+/// IAM console's own address — its `/iam/home` page in the Region that console is served
+/// from ([`IAM_CONSOLE_REGION`]) — with the request named by the resource type IAM gives
+/// it ([`DELEGATION_REQUEST_RESOURCE_TYPE`]) and the identifier that was minted for it.
+/// Fixed text around those two values, so the link carries nothing of any other request,
+/// and well inside `consoleDeepLinkType`'s length 1..255.
+pub fn delegation_request_console_link(delegation_request_id: &str) -> String {
+    let region = IAM_CONSOLE_REGION;
+    format!(
+        "https://{region}.console.aws.amazon.com/iam/home?region={region}\
+         #/{DELEGATION_REQUEST_RESOURCE_TYPE}/{delegation_request_id}"
+    )
+}
+
+/// How IAM refuses a value supplied for a member its documentation says is an ARN when
+/// that value cannot be read as an ARN at all.
+///
+/// Measured wording, and it quotes NOTHING of the value or the member: the refusal states
+/// only that what arrived is not an ARN. Stated ONCE here so the operations reading a
+/// caller-supplied ARN cannot word that refusal two ways.
+pub const ARN_UNPARSEABLE: &str = "Invalid ARN: Could not be parsed!";
+
+/// How IAM refuses a value that IS a well-formed ARN but names a resource the member
+/// cannot address — a resource of another service, or of another type in the same service
+/// than the one the member's documentation names.
+///
+/// The wording `crate::ops::get_human_readable_summary` was measured answering an
+/// `EntityArn` of the wrong resource type with, shared from here for the same reason
+/// [`ARN_UNPARSEABLE`] is.
+pub const ARN_WRONG_RESOURCE_TYPE: &str = "Invalid resource type in ARN";
 
 /// The message a read of a delegation request the account does not hold is refused
 /// with: the entity type that was looked for, then the identifier the request named —

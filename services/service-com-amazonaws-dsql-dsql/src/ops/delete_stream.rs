@@ -253,10 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A stream that is already deleting answers with the delete in flight; one
-        // in any other status that does not accept a mutation refuses the
-        // deletion.
-        if stream.status != crate::state::STREAM_STATUS_DELETING {
+        // A stream whose deletion is already under way answers with that deletion
+        // ([`crate::state::Stream::deletion_in_flight`]); one in any other status
+        // that does not accept a mutation refuses the deletion.
+        if !stream.deletion_in_flight() {
             if let Some(conflict) = stream.mutation_conflict("be deleted") {
                 return Err(DeleteStreamErrorModeled::ConflictException(conflict).into());
             }

@@ -26,6 +26,9 @@ tracing = { workspace = true }
 # (`src/state.rs`).
 # `db_data_sources`: the shared directory a minted `DbiResourceId` is recorded in, so a
 # monitoring service (Performance Insights) can tell which service owns that id.
+# `audited_operation` / `management_events`: the shared operation wrapper that records each
+# call this front door serves in the account's management-event log, and the log itself —
+# the one store CloudTrail's `LookupEvents` reads (`src/service/management_events.rs`).
 service-common = { path = "../common" }
 # `state::new_request_id`'s digest: a maintained hash, so the per-response request id in
 # an awsQuery `<ErrorResponse>` envelope is shaped by library code rather than by hand.

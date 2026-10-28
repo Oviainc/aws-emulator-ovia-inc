@@ -79,10 +79,10 @@ fn delegation_request_ids() -> Vec<String> {
 /// Seed `request` into the service's OWN store, under the identifier it carries.
 ///
 /// This is the state `CreateDelegationRequest` ("creates an IAM delegation request for
-/// temporary access delegation") will write once that operation is implemented — it is
-/// still a scaffolded 501 with its own stub issue — so the request is written into the
-/// service's own store rather than into a second copy of it, which is where this read
-/// finds it.
+/// temporary access delegation") writes — the suite seeds it directly so a row can fix
+/// every member and every instant a record carries, which a filing cannot (it mints the
+/// identifier and reads the clock). The record goes into the service's own store rather
+/// than into a second copy of it, which is where this read finds it.
 pub(crate) fn seed(engine: &engine::InMemoryEngine, request: &DelegationRequest) {
     let store = state::service_state(engine).expect("the IAM store");
     let id = request

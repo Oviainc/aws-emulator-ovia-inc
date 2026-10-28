@@ -3065,6 +3065,17 @@ impl ExecutionRecord {
         target_resource_addresses(&self.target_resource, resource_type, resource_id)
     }
 
+    /// This execution's status at `now`: the state [`Self::state`] derives, which
+    /// is the one member the modelled status carries.
+    ///
+    /// Here rather than in a handler so the read of ONE execution and the listing
+    /// that holds it report the same state for it.
+    pub fn status(&self, now: SystemTime) -> ExecutionStatus {
+        ExecutionStatus {
+            state: self.state(now).to_string(),
+        }
+    }
+
     /// This execution as the summary a listing reports for it, at `now`.
     ///
     /// Derived here rather than in the handler so every view of one stored
@@ -3078,9 +3089,7 @@ impl ExecutionRecord {
             resolve_to: self.resolve_to.clone(),
             execution_start_time: to_date_time(self.execution_start_time),
             execution_end_time: self.execution_end_time(now).map(to_date_time),
-            execution_status: ExecutionStatus {
-                state: self.state(now).to_string(),
-            },
+            execution_status: self.status(now),
             execution_entity_version: self.execution_entity_version.clone(),
         }
     }
@@ -5882,6 +5891,11 @@ pub const RESOURCE_COMPUTATION_MODEL: &str = "Computation Model";
 /// The resource kind those errors name for one action taken on a target
 /// resource — what `ExecuteAction` records and `DescribeAction` reads back.
 pub const RESOURCE_ACTION: &str = "Action";
+
+/// The resource kind those errors name for one EXECUTION of an action — the run
+/// `ExecuteAction` starts, which `DescribeExecution` reads back and
+/// `ListExecutions` summarises.
+pub const RESOURCE_EXECUTION: &str = "Execution";
 
 /// The resource kind those errors name for an action DEFINITION: one of the
 /// actions a target resource exposes, which an execute addresses by its

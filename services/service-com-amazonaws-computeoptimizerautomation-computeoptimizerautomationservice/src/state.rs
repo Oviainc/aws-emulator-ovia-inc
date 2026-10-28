@@ -3106,6 +3106,37 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
         account_id == caller_account_id() || self.is_associated(account_id)
     }
 
+    /// May an organization rule be scoped to every account `configuration`
+    /// names?
+    ///
+    /// An organization configuration's `accountIds` are "specific Amazon Web
+    /// Services account IDs where the organization rule should be applied"
+    /// (`smithy_query(query="shape",shape="OrganizationConfiguration")`), so a
+    /// rule stored with that configuration automatically applies its recommended
+    /// actions in each of them. Applying actions in another account is exactly
+    /// what an association permits — `AssociateAccounts` "permits the management
+    /// account to create Automation rules that automatically apply actions to
+    /// that account", and after `DisassociateAccounts` the management account
+    /// (or delegated administrator) "cannot create Automation rules for that
+    /// account" — so the accounts a rule may be scoped to are the ones the
+    /// caller may automate in right now ([`Self::may_initiate_in`], the same
+    /// standing the operations that initiate work in an account are judged by).
+    ///
+    /// Judged over the account ids the REQUEST carries, which are the accounts
+    /// that call scopes the rule to; a configuration naming no `accountIds`
+    /// names no SPECIFIC account, so such a rule spans the organization itself
+    /// (which is how a preview without an `organizationScope` is scoped too —
+    /// [`preview_account_scope`]) and reaches a member account only for as long
+    /// as that account's association lasts. An absent configuration is only
+    /// valid for a rule that is not an organization rule at all.
+    pub fn may_scope_rule_to(&self, configuration: Option<&OrganizationConfiguration>) -> bool {
+        configuration
+            .and_then(|configuration| configuration.account_ids.as_deref())
+            .into_iter()
+            .flatten()
+            .all(|account_id| self.may_initiate_in(account_id))
+    }
+
     /// How many of `account_ids` the enrollment store does not hold an entry for
     /// yet — i.e. how much an association of exactly those accounts would GROW
     /// the store. An id already stored costs nothing, whatever its status.

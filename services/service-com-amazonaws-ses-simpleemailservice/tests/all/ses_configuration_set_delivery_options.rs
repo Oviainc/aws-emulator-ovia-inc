@@ -328,11 +328,13 @@ async fn a_policy_outside_the_model_s_value_set_is_refused_and_changes_nothing()
         // The refusal says what was wrong with the request: the member it rejected
         // the value at and the set the value had to come from, so the caller can fix
         // the request from the text alone. The rejected value itself is NOT echoed —
-        // an enum clause states the admitted set instead (`crate::service::validation`
-        // of this crate states that rule for every enum-constrained member).
+        // an enum clause states the admitted set instead, in ascending order
+        // (`Optional, Require`, where the model declares `Require, Optional`:
+        // `crate::service::validation` of this crate states that rule for every
+        // enum-constrained member).
         assert!(
             message.contains("tlsPolicy")
-                && message.contains("Member must satisfy enum value set: [Require, Optional]"),
+                && message.contains("Member must satisfy enum value set: [Optional, Require]"),
             "case put {value:?}: expected a message naming the member and the admitted \
              set, got {message:?}"
         );

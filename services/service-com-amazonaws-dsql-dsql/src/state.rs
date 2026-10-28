@@ -200,6 +200,16 @@ impl Stream {
         )
     }
 
+    /// Whether this stream's deletion is already under way: its status is a leg
+    /// of the deletion chain a caller observes before the stream leaves its
+    /// cluster's record. The stream-side counterpart of
+    /// [`Cluster::deletion_in_flight`], asked by the delete for the same reason;
+    /// a stream's chain has one such leg ([`STREAM_STATUS_DELETING`]), since
+    /// [`STREAM_STATUS_DELETED`] is where the stream is removed.
+    pub fn deletion_in_flight(&self) -> bool {
+        self.status == STREAM_STATUS_DELETING
+    }
+
     /// The modelled refusal a request that MUTATES this stream answers with while
     /// its status does not accept a mutation, or `None` when it does.
     ///
@@ -269,6 +279,21 @@ impl Cluster {
     /// its way out (`DELETING`) is not.
     pub fn accepts_mutation(&self) -> bool {
         self.status == STATUS_ACTIVE || self.status == STATUS_IDLE
+    }
+
+    /// Whether this cluster's deletion is already under way: its status is one of
+    /// the legs the deletion chain reports to a caller before the cluster goes
+    /// away — the peering tear-down of a multi-Region cluster
+    /// ([`STATUS_PENDING_DELETE`]) and the removal itself ([`STATUS_DELETING`]),
+    /// the chain [`ComAmazonawsDsqlDsqlState::owed_after`] drives.
+    ///
+    /// Asked by the delete, which answers a cluster whose deletion is in flight
+    /// with that deletion rather than with the status gate's refusal, whichever
+    /// leg of the chain the call lands in. [`STATUS_DELETED`] is not a leg: it is
+    /// the status at which the cluster leaves the store, so no request observes
+    /// it.
+    pub fn deletion_in_flight(&self) -> bool {
+        self.status == STATUS_PENDING_DELETE || self.status == STATUS_DELETING
     }
 
     /// The modelled refusal a request that MUTATES this cluster answers with

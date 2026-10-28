@@ -25,9 +25,8 @@ use crate::harness::{
     call, element, elements, emulator_over, field, map_entries, settle_verifications, xml_text,
     Field,
 };
-use service_com_amazonaws_ses_simpleemailservice::ops::types::CustomVerificationEmailTemplate;
 use service_com_amazonaws_ses_simpleemailservice::state::{
-    self, MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES,
+    self, CustomVerificationEmailTemplate, MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
@@ -35,8 +34,8 @@ use std::sync::Arc;
 /// A router over an engine the test holds, so the account record and the custom
 /// verification email template store can be seeded beside the calls made over
 /// the wire. This service's model declares no operation that grants production
-/// access, and `CreateCustomVerificationEmailTemplate` is still a scaffold stub
-/// (its own issue), so both are seeded through the store.
+/// access, and `CreateCustomVerificationEmailTemplate` refuses a template whose
+/// sender is not verified yet, so both are seeded through the store.
 fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     (emulator_over(Arc::clone(&engine)), engine)
@@ -49,19 +48,23 @@ fn grant_production_access(engine: &Arc<engine::InMemoryEngine>) {
     store.lock().account.production_access_granted = true;
 }
 
-/// A custom verification email template, as the modelled shape the store holds.
+/// A custom verification email template, as the record the store holds.
 fn template(name: &str, from: &str) -> CustomVerificationEmailTemplate {
     CustomVerificationEmailTemplate {
-        template_name: Some(name.to_string()),
-        from_email_address: Some(from.to_string()),
-        template_subject: Some(format!("Please confirm your address ({name})")),
-        success_redirection_url: Some("https://example.com/verified".to_string()),
-        failure_redirection_url: Some("https://example.com/failed".to_string()),
+        template_name: name.to_string(),
+        from_email_address: from.to_string(),
+        template_subject: format!("Please confirm your address ({name})"),
+        template_content: "<html><body>Please confirm your address.</body></html>".to_string(),
+        success_redirection_url: "https://example.com/verified".to_string(),
+        failure_redirection_url: "https://example.com/failed".to_string(),
     }
 }
 
-/// Record `templates` in the store, the way the creating operation will.
-fn seed_templates(engine: &Arc<engine::InMemoryEngine>, templates: &[CustomVerificationEmailTemplate]) {
+/// Record `templates` in the store, the way the creating operation does.
+fn seed_templates(
+    engine: &Arc<engine::InMemoryEngine>,
+    templates: &[CustomVerificationEmailTemplate],
+) {
     let store = state::service_state(&**engine).expect("this service has a store on the engine");
     let mut store = store.lock();
     for template in templates {

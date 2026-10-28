@@ -198,23 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
-            quotas_state
-                .requests_in_history(&region, input.service_code.as_deref(), now)
-                .into_iter()
-                .filter(|request| {
-                    input
-                        .status
-                        .as_deref()
-                        .is_none_or(|status| request.status == status)
-                })
-                .filter(|request| {
-                    crate::state::requested_at_level(
-                        &request.quota_requested_at_level,
-                        input.quota_requested_at_level.as_deref(),
-                    )
-                })
-                .map(|request| quotas_state.request_view(&request))
-                .collect::<Vec<_>>()
+            let requests =
+                quotas_state.requests_in_history(&region, input.service_code.as_deref(), now);
+            quotas_state.history_view(
+                requests,
+                input.status.as_deref(),
+                input.quota_requested_at_level.as_deref(),
+            )
         };
 
         let page = crate::state::paginate(
