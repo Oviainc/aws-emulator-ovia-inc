@@ -31,6 +31,8 @@ mod delivery_stream_tags;
 mod description_defaults;
 #[path = "all/destination_bucket_preflight.rs"]
 mod destination_bucket_preflight;
+#[path = "all/destination_bucket_resolution.rs"]
+mod destination_bucket_resolution;
 #[path = "all/destination_configuration_echo.rs"]
 mod destination_configuration_echo;
 #[path = "all/destination_delivery.rs"]
