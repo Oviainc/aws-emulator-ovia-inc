@@ -59,6 +59,8 @@ mod hosted_zone_config;
 mod hosted_zone_count;
 #[path = "all/hosted_zone_features.rs"]
 mod hosted_zone_features;
+#[path = "all/hosted_zone_limits.rs"]
+mod hosted_zone_limits;
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
 #[path = "all/hosted_zones_by_name.rs"]
