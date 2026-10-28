@@ -284,6 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // One instant for the whole send, with the verification move the clock
+        // already owes each of this account's identities materialised against
+        // it: the sender gate below reads the status a caller reading the same
+        // identity at this instant is reported.
+        let now = std::time::SystemTime::now();
+        state.settle_identities(now);
+
         // Account-wide pause, then the configuration set's own: each has its own
         // modeled error, and the set must exist before its sending state is read.
         if !state.account.sending_enabled {
@@ -341,7 +348,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // counts against: a send past it is refused rather than accepted, which is
         // also what keeps the send log bounded. A negative `Max24HourSend`
         // "signifies an unlimited quota" (the member's own documentation).
-        let now = std::time::SystemTime::now();
         let quota = state.account.max_24_hour_send;
         let already_sent = state.sent_last_24_hours(now);
         if quota >= 0.0 && already_sent + destinations.len() as f64 > quota {

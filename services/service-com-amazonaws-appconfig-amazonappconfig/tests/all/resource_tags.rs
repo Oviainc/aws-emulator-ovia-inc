@@ -101,8 +101,13 @@ pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -
 }
 
 /// `DELETE /tags/{ResourceArn}?tagKeys=..&tagKeys=..` — `TagKeys` is bound to
-/// `@httpQuery("tagKeys")`, so each key travels as its own query pair.
-async fn untag(router: &MultiServiceRouter, resource_arn: &str, keys: &[&str]) -> Answer {
+/// `@httpQuery("tagKeys")`, so each key travels as its own query pair. `pub(crate)`
+/// because more than one suite drives the untag path through the same front door.
+pub(crate) async fn untag(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    keys: &[&str],
+) -> Answer {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", pct(key)))

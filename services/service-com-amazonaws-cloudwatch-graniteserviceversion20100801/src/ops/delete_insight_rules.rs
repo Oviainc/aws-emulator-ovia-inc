@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInsightRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInsightRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInsightRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -84,9 +75,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `DeleteInsightRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DeleteInsightRules")]
+//
+// `InternalServiceFault` — "Request processing has failed due to some unknown error,
+// exception, or failure." — is widened in through `extra_errors`: this SERVICE models the
+// shape (and other operations declare it), but this operation's own `errors` list omits it,
+// and an unreachable shared store has to be reportable as the server failure it is rather
+// than as a parameter fault the caller could act on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DeleteInsightRules",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteInsightRulesErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     InvalidParameterValueException(InvalidParameterValueException),
     MissingRequiredParameterException(MissingRequiredParameterException),
 }
@@ -142,18 +143,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInsightRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInsightRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInsightRules"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteInsightRulesErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some(
+                    "the CloudWatch Contributor Insights rule store is unavailable".into(),
+                ),
+            })
+        })?;
+
+        // "An array of the rule names to delete." (`DeleteInsightRulesInput$RuleNames`,
+        // required) — an array carrying no entry names no rule to delete, which this service
+        // refuses as a bad value for that parameter. Each entry's modelled 1..128 length and
+        // `^[\x20-\x7E]+$` pattern were enforced before this handler ran and are not
+        // re-checked here.
+        if input.rule_names.is_empty() {
+            return Err(
+                DeleteInsightRulesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::EMPTY_RULE_NAMES.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Permanently deletes the specified Contributor Insights rules."
+        // (`DeleteInsightRules`) — every named rule this service holds goes away with
+        // everything stored under it, so a later read reports no such rule, and a name it
+        // holds no rule for is reported back as one entry of `Failures` rather than failing
+        // the whole request. The walk is `crate::state`'s, beside the one the operations that
+        // enable and disable rules share.
+        let mut store = state.lock();
+        let failures = store.delete_insight_rules(&input.rule_names);
+
+        Ok(DeleteInsightRulesOutput {
+            failures: Some(failures),
+        })
     }
 }

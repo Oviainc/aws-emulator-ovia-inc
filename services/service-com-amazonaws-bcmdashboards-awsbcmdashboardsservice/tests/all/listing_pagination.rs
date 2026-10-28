@@ -14,6 +14,10 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::state::{
+    DASHBOARD_RESOURCE_TYPE, SCHEDULED_REPORT_RESOURCE_TYPE,
+};
+
 use super::dashboard_lifecycle::{call, error_code, managed_dashboard_count, ok_call, router};
 use super::scheduled_report_lifecycle::{source_dashboard, EXECUTION_ROLE_ARN};
 
@@ -25,13 +29,14 @@ enum Resource {
     ScheduledReport,
 }
 
-/// One listing under test: its operation, the output member its page lands in, and the
-/// resource it pages over.
+/// One listing under test: its operation, the output member its page lands in, the
+/// resource it pages over and the ARN resource type that resource's cursors name.
 #[derive(Debug)]
 struct Listing {
     operation: &'static str,
     items_key: &'static str,
     resource: Resource,
+    arn_resource_type: &'static str,
 }
 
 /// Both listings this service serves.
@@ -41,11 +46,13 @@ fn listings() -> Vec<Listing> {
             operation: "ListDashboards",
             items_key: "dashboards",
             resource: Resource::Dashboard,
+            arn_resource_type: DASHBOARD_RESOURCE_TYPE,
         },
         Listing {
             operation: "ListScheduledReports",
             items_key: "scheduledReports",
             resource: Resource::ScheduledReport,
+            arn_resource_type: SCHEDULED_REPORT_RESOURCE_TYPE,
         },
     ]
 }
@@ -324,6 +331,181 @@ async fn both_listings_refuse_the_same_bad_page_requests() {
             page_arns(&resumed, &listing, case).len(),
             1,
             "case {case}: its own cursor must resume the walk: {resumed}"
+        );
+    }
+}
+
+/// The prefix a cursor of this service carries, with the ARN the page resumes at hex
+/// encoded behind it — the form `encode_page_token` mints, spelled here so a token the
+/// service never minted can be handed to a listing.
+const CURSOR_PREFIX: &str = "v1:";
+
+/// A cursor of this service's form whose body is `arn`, well formed or not.
+fn cursor_for(arn: &str) -> String {
+    format!("{CURSOR_PREFIX}{}", hex::encode(arn))
+}
+
+/// A `nextToken` is read as a resume point only when it decodes to an ARN of the resource
+/// the listing walks, as that resource's modelled ARN pattern spells it — anchored, so
+/// every field is judged at its own position. Anything else is refused with
+/// `ValidationException` (400) rather than read as a resume point, which would answer a
+/// silently truncated or empty page with HTTP 200.
+///
+/// Source for the expression: the `DashboardArn` and `ScheduledReportArn` patterns,
+/// `^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:<resource-type>/(\*|[-a-z0-9]+)$`, as
+/// `smithy_query(query="shape",shape="DashboardArn,ScheduledReportArn")` reports them.
+/// The rows differ along its fields one at a time — partition, namespace, region,
+/// account, resource type, resource id and the number of fields — and the table is
+/// driven through BOTH listings, since one decoder serves them both.
+#[tokio::test]
+async fn a_cursor_resumes_only_when_it_names_an_arn_of_the_resource_the_listing_walks() {
+    let router = router();
+    let (dashboard_arn, _) = source_dashboard(&router, "Cursor Pattern Source").await;
+    for index in 1..=3 {
+        create_resource(&router, Resource::Dashboard, index, &dashboard_arn).await;
+        create_resource(&router, Resource::ScheduledReport, index, &dashboard_arn).await;
+    }
+
+    for listing in listings() {
+        let case = listing.operation;
+        let resource = listing.arn_resource_type;
+        let other = if resource == DASHBOARD_RESOURCE_TYPE {
+            SCHEDULED_REPORT_RESOURCE_TYPE
+        } else {
+            DASHBOARD_RESOURCE_TYPE
+        };
+        // An id of this form holds only the characters the pattern's resource segment
+        // admits and sorts after every id this service mints (hex digits, or the managed
+        // catalog's `managed-` prefix), so a cursor naming it is a resume point past the
+        // last stored record.
+        let past_every_record = format!("arn:aws:bcm-dashboards::000000000000:{resource}/zzzzzzzz");
+
+        // (row, the ARN the cursor's body decodes to, whether the pattern admits it)
+        let rows: Vec<(&str, String, bool)> = vec![
+            ("the minted form", past_every_record.clone(), true),
+            (
+                "a partition suffix, which `aws[-a-z0-9]*` admits",
+                format!("arn:aws-cn:bcm-dashboards::000000000000:{resource}/zzzz"),
+                true,
+            ),
+            (
+                "the wildcard resource id the pattern admits",
+                format!("arn:aws:bcm-dashboards::000000000000:{resource}/*"),
+                true,
+            ),
+            (
+                "an account of letters",
+                format!("arn:aws:bcm-dashboards::nope:{resource}/zz"),
+                false,
+            ),
+            (
+                "an account of eleven digits",
+                format!("arn:aws:bcm-dashboards::00000000000:{resource}/zz"),
+                false,
+            ),
+            (
+                "an account of thirteen digits",
+                format!("arn:aws:bcm-dashboards::0000000000000:{resource}/zz"),
+                false,
+            ),
+            (
+                "a region, which these ARNs do not carry",
+                format!("arn:aws:bcm-dashboards:us-east-1:000000000000:{resource}/zz"),
+                false,
+            ),
+            (
+                "another vendor's ARN namespace",
+                format!("arn:aws:cloudwatch::000000000000:{resource}/zz"),
+                false,
+            ),
+            (
+                "a partition that does not open with aws",
+                format!("arn:azure:bcm-dashboards::000000000000:{resource}/zz"),
+                false,
+            ),
+            (
+                "no resource id at all",
+                format!("arn:aws:bcm-dashboards::000000000000:{resource}/"),
+                false,
+            ),
+            (
+                "an uppercase resource id",
+                format!("arn:aws:bcm-dashboards::000000000000:{resource}/ZZ"),
+                false,
+            ),
+            (
+                "text after the resource id",
+                format!("arn:aws:bcm-dashboards::000000000000:{resource}/zz and more"),
+                false,
+            ),
+            (
+                "the resource segment carried in a seventh field",
+                format!("arn:aws:bcm-dashboards::000000000000:{other}/aa:{resource}/zz"),
+                false,
+            ),
+            (
+                "a field of its own before the ARN",
+                format!("resume:arn:aws:bcm-dashboards::000000000000:{resource}/zz"),
+                false,
+            ),
+            (
+                "the other resource type of this service",
+                format!("arn:aws:bcm-dashboards::000000000000:{other}/zz"),
+                false,
+            ),
+        ];
+
+        for (label, arn, admitted) in &rows {
+            let token = cursor_for(arn);
+            let (status, body) =
+                call(&router, listing.operation, &json!({"nextToken": token})).await;
+            if *admitted {
+                assert_eq!(
+                    status, 200,
+                    "case {case} {label}: the pattern admits {arn:?}, so it resumes the walk, got {status}: {body}"
+                );
+            } else {
+                assert_eq!(
+                    status, 400,
+                    "case {case} {label}: {arn:?} is no ARN of this listing's resource, so it must be refused, got {status}: {body}"
+                );
+                assert!(
+                    error_code(&body).contains("ValidationException"),
+                    "case {case} {label}: expected ValidationException, got {}",
+                    error_code(&body)
+                );
+                let message = body["message"].as_str().unwrap_or("<no message>");
+                let expected = format!(
+                    "Member must be a nextToken returned by a previous {case} call: nextToken"
+                );
+                assert_eq!(
+                    message, expected,
+                    "case {case} {label}: expected {expected:?}, got {message:?}"
+                );
+            }
+        }
+
+        // An admitted cursor is a RESUME POINT, not a page of its own: one naming an ARN
+        // past every stored record ends the walk, and one naming a stored ARN resumes at
+        // exactly that record — so the refusals above rejected the ARN each token carried
+        // and not the hand-built form.
+        let ended = fetch_page(&router, &listing, Some(5), Some(&cursor_for(&past_every_record))).await;
+        assert!(
+            page_arns(&ended, &listing, case).is_empty() && ended.get("nextToken").is_none(),
+            "case {case}: a cursor past every stored record is an empty last page: {ended}"
+        );
+
+        let every = fetch_page(&router, &listing, Some(100), None).await;
+        let stored = page_arns(&every, &listing, case);
+        let second = stored
+            .get(1)
+            .unwrap_or_else(|| panic!("case {case}: expected at least two stored records: {every}"))
+            .clone();
+        let resumed = fetch_page(&router, &listing, Some(1), Some(&cursor_for(&second))).await;
+        assert_eq!(
+            page_arns(&resumed, &listing, case),
+            vec![second.clone()],
+            "case {case}: a cursor naming the stored ARN {second:?} resumes at that record: {resumed}"
         );
     }
 }

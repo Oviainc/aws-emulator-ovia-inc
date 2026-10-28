@@ -190,20 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // order — which is what a pagination cursor needs to resume exactly once.
         ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        let Some(page) = crate::state::paginate(
+        let page = match crate::state::paginate(
             ordered,
             crate::state::LISTING_CONFIGURATION_PROFILES,
             input.next_token.as_deref(),
             input.max_results,
-        ) else {
-            return Err(ListConfigurationProfilesErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::next_token_not_issued()),
-                    reason: None,
-                    details: None,
-                },
-            )
-            .into());
+        ) {
+            Ok(page) => page,
+            Err(message) => {
+                return Err(ListConfigurationProfilesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into())
+            }
         };
 
         Ok(ListConfigurationProfilesOutput {

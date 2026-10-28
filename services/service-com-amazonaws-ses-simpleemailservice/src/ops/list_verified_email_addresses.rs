@@ -132,7 +132,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ListVerifiedEmailAddresses",
             ));
         };
-        let state = state.lock();
+        let mut state = state.lock();
+
+        // The verification move the clock already owes each identity,
+        // materialised against one instant before the list is read: the move was
+        // due whether or not anybody asked, and this listing reports only the
+        // addresses whose verification has gone through.
+        state.settle_identities(std::time::SystemTime::now());
 
         // Reporting only, out of the ONE identity list every identity operation
         // reads and writes: this listing is the email-address view of it, so an

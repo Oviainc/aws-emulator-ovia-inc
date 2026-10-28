@@ -39,6 +39,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::ephemeris_catalog::program_track_ephemeris;
 use crate::scheduling_loop::{
     create_mission_profile, harness_with_engine, list_pages, send, Reply, ABSENT_UUID,
     AFTER_SETTLE, REGION,
@@ -117,23 +118,46 @@ async fn append_version(router: &MultiServiceRouter, contact_id: &str, body: Val
     })
 }
 
+/// The ephemeris of each form a `ProgramTrackSettings` member may name, stored on the
+/// router under test.
+///
+/// A program track references an ephemeris BY ID and a stored reference has to resolve, so
+/// the overrides this suite chains onto a contact name ephemerides this account holds.
+struct ProgramTracks {
+    az_el: String,
+    oem: String,
+    tle: String,
+}
+
+impl ProgramTracks {
+    /// One ephemeris per member, each of the form that member requires, through
+    /// `CreateEphemeris`.
+    async fn create(router: &MultiServiceRouter) -> Self {
+        Self {
+            az_el: program_track_ephemeris(router, "azEl").await,
+            oem: program_track_ephemeris(router, "oem").await,
+            tle: program_track_ephemeris(router, "tle").await,
+        }
+    }
+}
+
 /// The bodies this suite chains onto one contact, differing along which members an update
 /// names and which `ProgramTrackSettings` member its overrides select
 /// (`smithy_query(query="shape", shape="ProgramTrackSettings")`).
-fn update_bodies() -> Vec<Value> {
+fn update_bodies(tracks: &ProgramTracks) -> Vec<Value> {
     vec![
         json!({"satelliteArn": satellite_arn("22222222-2222-4222-8222-222222222222")}),
         json!({"trackingOverrides": {"programTrackSettings": {
-            "azEl": {"ephemerisId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+            "azEl": {"ephemerisId": tracks.az_el},
         }}}),
         json!({
             "satelliteArn": satellite_arn("33333333-3333-4333-8333-333333333333"),
             "trackingOverrides": {"programTrackSettings": {
-                "oem": {"ephemerisId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"},
+                "oem": {"ephemerisId": tracks.oem},
             }},
         }),
         json!({"trackingOverrides": {"programTrackSettings": {
-            "tle": {"ephemerisId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"},
+            "tle": {"ephemerisId": tracks.tle},
         }}}),
         json!({"satelliteArn": satellite_arn("44444444-4444-4444-8444-444444444444")}),
         json!({"trackingOverrides": {}}),
@@ -195,6 +219,7 @@ async fn every_version_the_store_holds_is_listed_oldest_first() {
     let profile_arn =
         create_mission_profile(&router, "version listing", 180, Some(60), Some(30)).await;
     let contact_id = reserve_contact(&router, &profile_arn).await;
+    let tracks = ProgramTracks::create(&router).await;
 
     // Rows of growing history: the reservation's version alone, then one more version per
     // update chained onto the same contact. Each row reads the whole history back, so the
@@ -203,7 +228,7 @@ async fn every_version_the_store_holds_is_listed_oldest_first() {
     let mut case = "reserved only".to_string();
     for (index, body) in [None]
         .into_iter()
-        .chain(update_bodies().into_iter().map(Some))
+        .chain(update_bodies(&tracks).into_iter().map(Some))
         .enumerate()
     {
         if let Some(body) = body {
@@ -288,7 +313,9 @@ async fn the_history_pages_the_same_way_at_every_page_size() {
     let (router, _engine) = harness_with_engine();
     let profile_arn = create_mission_profile(&router, "version paging", 180, None, None).await;
     let contact_id = reserve_contact(&router, &profile_arn).await;
-    for body in update_bodies() {
+    let tracks = ProgramTracks::create(&router).await;
+    let bodies = update_bodies(&tracks);
+    for body in bodies.clone() {
         append_version(&router, &contact_id, body).await;
     }
     std::thread::sleep(AFTER_SETTLE);
@@ -298,7 +325,7 @@ async fn the_history_pages_the_same_way_at_every_page_size() {
     let expected = version_ids(&whole, "maxResults=None");
     assert_eq!(
         expected.len(),
-        update_bodies().len() + 1,
+        bodies.len() + 1,
         "case maxResults=None: the reservation's version plus one per update, got {expected:?}"
     );
     assert_eq!(
@@ -352,7 +379,8 @@ async fn a_token_this_listing_did_not_issue_for_this_contact_is_refused() {
     let profile_arn = create_mission_profile(&router, "version tokens", 180, None, None).await;
     let first_contact = reserve_contact(&router, &profile_arn).await;
     let second_contact = reserve_contact_in_slot(&router, &profile_arn, 1).await;
-    for body in update_bodies() {
+    let tracks = ProgramTracks::create(&router).await;
+    for body in update_bodies(&tracks) {
         append_version(&router, &first_contact, body.clone()).await;
         append_version(&router, &second_contact, body).await;
     }

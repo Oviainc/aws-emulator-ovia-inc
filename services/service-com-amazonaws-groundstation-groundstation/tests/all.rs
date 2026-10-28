@@ -81,6 +81,8 @@ mod minute_usage;
 mod mission_profile_deletion;
 #[path = "all/not_found_messages.rs"]
 mod not_found_messages;
+#[path = "all/program_track_reference_integrity.rs"]
+mod program_track_reference_integrity;
 #[path = "all/recording_bucket_refusal_message.rs"]
 mod recording_bucket_refusal_message;
 #[path = "all/request_validation.rs"]

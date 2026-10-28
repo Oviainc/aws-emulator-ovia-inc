@@ -23,16 +23,17 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_supportapp_supportapp::state::{
-    derived_slack_workspace_name, ACCOUNT_TYPE, MAX_SLACK_WORKSPACE_CONFIGURATIONS,
+    derived_slack_workspace_name, ACCOUNT_TYPE_MANAGEMENT, MAX_SLACK_WORKSPACE_CONFIGURATIONS,
 };
 
 use crate::slack_channel_configurations::{role_arn, Emulator};
 
 /// The values `AccountType` accepts
-/// (`smithy_query(query="shape", shape="AccountType")`). The emulator presents a
-/// single account, which is therefore the management account of its own organization,
-/// so `ACCOUNT_TYPE` is the value this service reports; the set is here to pin that
-/// the reported value is one the model declares.
+/// (`smithy_query(query="shape", shape="AccountType")`). The harness puts the account in
+/// an organization it manages, so a registration here reports
+/// `ACCOUNT_TYPE_MANAGEMENT`; the set is here to pin that the reported value is one the
+/// model declares, and the rule behind the value is covered in
+/// [`crate::organization_membership`].
 const ACCOUNT_TYPE_VALUES: [&str; 2] = ["management", "member"];
 
 /// `accountAlias` is `len 1..30, pattern ^[\w\- ]+$`
@@ -281,14 +282,14 @@ async fn registering_a_workspace_reports_it_and_is_bounded_by_the_documented_quo
             let account_type = reply.string("accountType");
             assert_eq!(
                 account_type.as_deref(),
-                Some(ACCOUNT_TYPE),
-                "case {label:?} attempt {attempt}: expected accountType {ACCOUNT_TYPE:?}, \
-                 got {account_type:?}"
+                Some(ACCOUNT_TYPE_MANAGEMENT),
+                "case {label:?} attempt {attempt}: expected accountType \
+                 {ACCOUNT_TYPE_MANAGEMENT:?}, got {account_type:?}"
             );
             assert!(
-                ACCOUNT_TYPE_VALUES.contains(&ACCOUNT_TYPE),
+                ACCOUNT_TYPE_VALUES.contains(&ACCOUNT_TYPE_MANAGEMENT),
                 "the reported accountType must be one the model declares, got \
-                 {ACCOUNT_TYPE:?} outside {ACCOUNT_TYPE_VALUES:?}"
+                 {ACCOUNT_TYPE_MANAGEMENT:?} outside {ACCOUNT_TYPE_VALUES:?}"
             );
             // A registered workspace has a name, which this operation reports, and the
             // registration recorded it, so both attempts report the same one. The rule

@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &state.scheduled_reports,
             input.next_token.as_deref(),
             input.max_results,
-            crate::state::SCHEDULED_REPORT_ARN_SEGMENT,
+            crate::state::SCHEDULED_REPORT_RESOURCE_TYPE,
             |record| state.scheduled_report_summary(record),
         )
         .map_err(|refusal| {

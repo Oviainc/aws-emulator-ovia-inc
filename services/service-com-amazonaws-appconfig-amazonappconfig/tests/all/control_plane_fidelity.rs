@@ -503,7 +503,7 @@ async fn a_not_found_message_is_the_template_of_the_kind_that_was_looked_up() {
             "a resource ARN that addresses nothing",
             format!("/tags/{}", pct(UNKNOWN_RESOURCE_ARN)),
             format!(
-                "Resource with Arn {UNKNOWN_RESOURCE_ARN} could not be found for account \
+                "Resource with ARN {UNKNOWN_RESOURCE_ARN} could not be found for account \
                  {account}."
             ),
         ),

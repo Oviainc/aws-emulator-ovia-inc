@@ -38,6 +38,9 @@ mod insight_impact_graph;
 #[path = "all/insight_summaries.rs"]
 mod insight_summaries;
 
+#[path = "all/malformed_retrieval_token_message.rs"]
+mod malformed_retrieval_token_message;
+
 #[path = "all/query_surface_selection.rs"]
 mod query_surface_selection;
 

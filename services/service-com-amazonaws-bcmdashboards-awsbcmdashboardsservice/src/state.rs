@@ -114,11 +114,6 @@ pub const EXECUTION_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(60);
 /// rejected instead of being read as a resume point.
 const PAGE_TOKEN_PREFIX: &str = "v1:";
 
-/// The ARN resource-type segment a `ListDashboards` cursor names.
-pub const DASHBOARD_ARN_SEGMENT: &str = ":dashboard/";
-
-/// The ARN resource-type segment a `ListScheduledReports` cursor names.
-pub const SCHEDULED_REPORT_ARN_SEGMENT: &str = ":scheduled-report/";
 
 /// The most dashboards this emulator stores for the account before `CreateDashboard`
 /// answers its modelled `ServiceQuotaExceededException`.
@@ -874,12 +869,13 @@ impl Default for ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
 const ARN_NAMESPACE: &str = "bcm-dashboards";
 
 /// The ARN resource-type segment of a dashboard ARN, as `DashboardArn`'s pattern
-/// declares it.
-const DASHBOARD_RESOURCE_TYPE: &str = "dashboard";
+/// declares it. Also the resource type a `ListDashboards` cursor's ARN names.
+pub const DASHBOARD_RESOURCE_TYPE: &str = "dashboard";
 
 /// The ARN resource-type segment of a scheduled-report ARN, as `ScheduledReportArn`'s
-/// pattern declares it.
-const SCHEDULED_REPORT_RESOURCE_TYPE: &str = "scheduled-report";
+/// pattern declares it. Also the resource type a `ListScheduledReports` cursor's ARN
+/// names.
+pub const SCHEDULED_REPORT_RESOURCE_TYPE: &str = "scheduled-report";
 
 /// Advance `counter` and render its new value as a resource id: 32 lowercase hex
 /// characters, which satisfies both the `[-a-z0-9]+` resource segment the ARN patterns
@@ -1577,24 +1573,85 @@ pub fn encode_page_token(arn: &str) -> String {
     format!("{PAGE_TOKEN_PREFIX}{}", hex::encode(arn))
 }
 
+/// The `@length` bounds a resource ARN of this service carries: `DashboardArn` and
+/// `ScheduledReportArn` both declare 20..2048
+/// (`smithy_query(query="shape",shape="DashboardArn,ScheduledReportArn")`).
+const RESOURCE_ARN_LENGTH: ::std::ops::RangeInclusive<usize> = 20..=2048;
+
+/// The literal first field of every ARN.
+const ARN_PREFIX_FIELD: &str = "arn";
+
+/// The fixed opening of the partition field, which the ARN patterns spell
+/// `aws[-a-z0-9]*`: the literal `aws` followed by a run of [`is_arn_label`]'s characters.
+const ARN_PARTITION_PREFIX: &str = "aws";
+
+/// How many digits an account field holds, as the ARN patterns' `[0-9]{12}` spells it.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The resource id that stands for every resource of a type, which the ARN patterns admit
+/// beside a concrete id (`(\*|[-a-z0-9]+)`).
+const ARN_RESOURCE_WILDCARD: &str = "*";
+
+/// Whether `label` is a (possibly empty) run of the characters `[-a-z0-9]`, the one class
+/// this service's ARN patterns admit in a partition's suffix and in a resource id.
+fn is_arn_label(label: &str) -> bool {
+    label
+        .chars()
+        .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
+}
+
+/// Whether `arn` is an ARN of this service's `resource_type` resource, judged by that
+/// resource's whole modelled ARN pattern — `DashboardArn`'s
+/// `^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:dashboard/(\*|[-a-z0-9]+)$` and
+/// `ScheduledReportArn`'s, which differ only in the resource type
+/// (`smithy_query(query="shape",shape="DashboardArn,ScheduledReportArn")`).
+///
+/// The expression is anchored at both ends, so the check is positional: six
+/// colon-separated fields (a resource id of these patterns carries no colon of its own),
+/// each judged against the pattern's requirement for THAT field — the literal `arn`, a
+/// partition opening with `aws`, this service's ARN namespace, an empty region, twelve
+/// digits of account, and the resource type followed by `/` and one resource id. A value
+/// that satisfies the segments in some other arrangement is not an ARN of this resource.
+pub fn names_resource_arn(arn: &str, resource_type: &str) -> bool {
+    if !RESOURCE_ARN_LENGTH.contains(&arn.len()) {
+        return false;
+    }
+    let fields: Vec<&str> = arn.split(':').collect();
+    let &[prefix, partition, namespace, region, account, resource] = fields.as_slice() else {
+        return false;
+    };
+    prefix == ARN_PREFIX_FIELD
+        && partition
+            .strip_prefix(ARN_PARTITION_PREFIX)
+            .is_some_and(is_arn_label)
+        && namespace == ARN_NAMESPACE
+        && region.is_empty()
+        && account.len() == ACCOUNT_ID_DIGITS
+        && account.chars().all(|digit| digit.is_ascii_digit())
+        && resource
+            .strip_prefix(resource_type)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|resource_id| {
+                resource_id == ARN_RESOURCE_WILDCARD
+                    || (!resource_id.is_empty() && is_arn_label(resource_id))
+            })
+}
+
 /// The ARN a `nextToken` resumes at, or `None` when the token is not one this
-/// service minted for a listing over `arn_segment`'s resource type (the caller
+/// service minted for a listing over `resource_type`'s resource (the caller
 /// answers that with a `ValidationException`).
 ///
 /// A cursor this service minted always names an ARN of the resource the listing
-/// walks. It is checked against the fixed segments of that resource's ARN pattern
-/// (`^arn:aws[-a-z0-9]*:bcm-dashboards::[0-9]{12}:<resource>/...`), so a token that
-/// decodes to anything else — including a cursor minted by a listing over the other
-/// resource type — is rejected rather than read as a resume point past every stored
-/// record.
-pub fn decode_page_token(token: &str, arn_segment: &str) -> Option<String> {
+/// walks. It is checked against that resource's whole ARN pattern
+/// ([`names_resource_arn`]), so a token that decodes to anything else — a cursor minted
+/// by a listing over the other resource type, or a hand-written body that merely carries
+/// the pattern's segments somewhere in it — is rejected rather than read as a resume
+/// point past every stored record.
+pub fn decode_page_token(token: &str, resource_type: &str) -> Option<String> {
     let body = token.strip_prefix(PAGE_TOKEN_PREFIX)?;
     let bytes = hex::decode(body).ok()?;
     let arn = String::from_utf8(bytes).ok()?;
-    let names_the_resource = arn.starts_with("arn:aws")
-        && arn.contains(":bcm-dashboards::")
-        && arn.contains(arn_segment);
-    names_the_resource.then_some(arn)
+    names_resource_arn(&arn, resource_type).then_some(arn)
 }
 
 /// One page of a listing over an ARN-keyed resource map: the records of the page,
@@ -1639,8 +1696,8 @@ impl ListingRefusal {
 ///
 /// Every listing this service serves pages the same way, so the rule lives here once
 /// rather than once per list handler: a `next_token` is the ARN to resume at, decoded
-/// for the resource type `arn_segment` names and refused when it is not a cursor this
-/// service minted for that type; `max_results` is the page size, refused when it is not
+/// for the resource `resource_type` names and refused when it is not a cursor this
+/// service minted for that resource; `max_results` is the page size, refused when it is not
 /// at least one (a zero-item page that still carried a cursor would be a client loop
 /// that never terminates); the walk starts at the cursor's ARN inclusive, or at the
 /// first stored record, takes at most a page of records and projects each one with
@@ -1653,13 +1710,13 @@ pub fn listing_page<'records, R, T>(
     records: &'records BTreeMap<String, R>,
     next_token: Option<&str>,
     max_results: i32,
-    arn_segment: &str,
+    resource_type: &str,
     mut project: impl FnMut(&'records R) -> T,
 ) -> Result<ListingPage<T>, ListingRefusal> {
     let resume_from = match next_token {
         None => None,
         Some(token) => Some(
-            decode_page_token(token, arn_segment).ok_or(ListingRefusal::UninterpretableToken)?,
+            decode_page_token(token, resource_type).ok_or(ListingRefusal::UninterpretableToken)?,
         ),
     };
     let page_size = match usize::try_from(max_results) {

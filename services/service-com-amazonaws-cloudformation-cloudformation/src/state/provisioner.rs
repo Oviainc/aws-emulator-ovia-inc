@@ -30,6 +30,10 @@
 //! * `AWS::KinesisFirehose::DeliveryStream`'s properties ARE `CreateDeliveryStream`'s own
 //!   members, so the evaluated property document is the request, passed through verbatim
 //!   with the one member CloudFormation decides (the name) set on the way out;
+//! * `AWS::Glue::Job`'s are `CreateJob`'s own members the same way, with its tags the map
+//!   that call takes; the `JobUpdate` that call's sibling `UpdateJob` "completely
+//!   overwrites" a job definition with is that same document less the job's name, so one
+//!   declaration serves this type's create and its in-place update alike;
 //! * `AWS::CloudWatch::MetricStream`'s are `PutMetricStream`'s own members the same way,
 //!   and that one call is documented "Creates or updates a metric stream" — so it is also
 //!   this type's UPDATE, the one arm here that can apply a changed declaration to a
@@ -434,6 +438,13 @@ const RDS_DB_CLUSTER_PARAMETER_GROUP: &str = "AWS::RDS::DBClusterParameterGroup"
 /// call of this type's arm carries both, read off the resource's own declaration.
 const EKS_ACCESS_ENTRY: &str = "AWS::EKS::AccessEntry";
 
+/// `AWS::Glue::Job`: "Ref returns the job name" — the `Name` the declaration states, which
+/// is what `CreateJob` creates the job under and what every AWS Glue operation on a job
+/// definition (`GetJob`, `UpdateJob`, `StartJobRun`, `DeleteJob`) addresses it by. That is
+/// the physical id the naming rules already compute for a type whose published return
+/// values `super::template` carries no entry for, so the type needs none there.
+const GLUE_JOB: &str = "AWS::Glue::Job";
+
 /// The code a refusal carries where the change a deployment asks for is one this emulator
 /// has not written the owning API call for. It is the same code the scaffold's own 501
 /// answers under (`smithy.framework#NotImplemented`), and not a code any AWS service
@@ -486,6 +497,7 @@ pub(super) enum Provisioner {
     Wafv2RuleGroup,
     Wafv2IpSet,
     Wafv2RegexPatternSet,
+    GlueJob,
     GrafanaWorkspace,
     GuardDutyDetector,
     KmsKey,
@@ -567,6 +579,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         WAFV2_RULE_GROUP => Some(Provisioner::Wafv2RuleGroup),
         WAFV2_IP_SET => Some(Provisioner::Wafv2IpSet),
         WAFV2_REGEX_PATTERN_SET => Some(Provisioner::Wafv2RegexPatternSet),
+        GLUE_JOB => Some(Provisioner::GlueJob),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         KMS_KEY => Some(Provisioner::KmsKey),
@@ -715,6 +728,11 @@ impl Provisioner {
                 )
                 .await
             }
+            // An `AWS::Glue::Job`'s properties ARE `CreateJob`'s own members, so the
+            // declared document is the request, with the one member CloudFormation decides
+            // (the job's name) set on the way out and the tag MAP that call takes merged
+            // from the declaration's own and the stack's.
+            Self::GlueJob => create_glue_job(ctx, region, resource, propagated).await,
             // `AWS::Grafana::Workspace` publishes no `Tags` property either, so the type
             // is not taggable and no stack tags are propagated to it.
             Self::GrafanaWorkspace => create_workspace(ctx, region, resource).await,
@@ -1170,6 +1188,13 @@ impl Provisioner {
                 )
                 .await
             }
+            // `UpdateJob` takes the `JobUpdate` that "completely overwrites" the previous
+            // job definition, and every property of `AWS::Glue::Job` but its name is a
+            // member of that shape — so a changed declaration is applied to the job the
+            // stack created rather than replacing it ([`update_glue_job`]).
+            Self::GlueJob => update_glue_job(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -1315,6 +1340,7 @@ impl Provisioner {
             Self::Wafv2RegexPatternSet => {
                 delete_wafv2_entity(ctx, region, resource, WAFV2_REGEX_PATTERN_SET_CALLS).await
             }
+            Self::GlueJob => delete_glue_job(ctx, region, physical_resource_id).await,
             Self::GrafanaWorkspace => {
                 delete_workspace(ctx, region, physical_resource_id).await
             }
@@ -1559,6 +1585,7 @@ impl Provisioner {
             Self::Wafv2RegexPatternSet => {
                 describe_wafv2_entity(ctx, region, resource, WAFV2_REGEX_PATTERN_SET_CALLS).await
             }
+            Self::GlueJob => describe_glue_job(ctx, region, physical_resource_id).await,
             Self::GrafanaWorkspace => {
                 describe_workspace(ctx, region, physical_resource_id).await
             }
@@ -9011,6 +9038,18 @@ const GRAFANA_WORKSPACES_URI: &str = "/workspaces";
 /// `DescribeWorkspace`).
 const GRAFANA_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
+/// The URI that addresses ONE workspace: the `workspaceId` `@httpLabel` `DeleteWorkspace`
+/// and `DescribeWorkspace` bind, percent-encoded as a non-greedy label is sent — the same
+/// discipline [`mq_broker_uri`] applies to the broker id, so an identifier carrying `/`,
+/// `.` or `%` addresses a workspace under this collection rather than some other path of
+/// that service.
+fn grafana_workspace_uri(workspace_id: &str) -> String {
+    format!(
+        "{GRAFANA_WORKSPACES_URI}/{}",
+        percent_encoded(workspace_id)
+    )
+}
+
 /// The `AWS::Grafana::Workspace` properties `CreateWorkspace` takes whose value goes
 /// through unchanged under the member named beside it, as (property, member) pairs.
 ///
@@ -9155,7 +9194,7 @@ async fn delete_workspace(
         GRAFANA_SIGNING_NAME,
         region,
         "DELETE",
-        &format!("{GRAFANA_WORKSPACES_URI}/{physical_resource_id}"),
+        &grafana_workspace_uri(physical_resource_id),
         None,
     )
     .await
@@ -9566,7 +9605,7 @@ async fn describe_workspace(
         GRAFANA_SIGNING_NAME,
         region,
         "GET",
-        &format!("{GRAFANA_WORKSPACES_URI}/{physical_resource_id}"),
+        &grafana_workspace_uri(physical_resource_id),
         None,
     )
     .await
@@ -17937,6 +17976,159 @@ fn backup_declared_tags(resource: &StoredResource, property: &str) -> Value {
         tags.insert("Tags".to_string(), declared.clone());
     }
     Value::Object(tags)
+}
+
+// ---------------------------------------------------------------------------
+// AWS Glue: AWS::Glue::Job
+// ---------------------------------------------------------------------------
+
+/// AWS Glue's signing name and `X-Amz-Target` prefix, from its model (`sigv4Name: glue`,
+/// service shape `AWSGlue`), which speaks `awsJson1_1`.
+const GLUE_SIGNING_NAME: &str = "glue";
+const GLUE_TARGET_PREFIX: &str = "AWSGlue";
+
+/// The error code AWS Glue answers for a name it holds no entity under
+/// (`EntityNotFoundException`, the modelled refusal of `GetJob`).
+const GLUE_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
+
+/// The one `AWS::Glue::Job` property that is not a member of `JobUpdate`: the job's NAME,
+/// which is its identity — `UpdateJob` takes it as the request's own `JobName` — so a
+/// declaration that changes it asks for a different job rather than for a change to this
+/// one.
+const GLUE_JOB_NAME_PROPERTY: &str = "Name";
+
+/// The `AWS::Glue::Job` property that is no member of `JobUpdate` either: a job's tags are
+/// AWS Glue's own `TagResource`/`UntagResource`, not part of the definition that call
+/// overwrites.
+const GLUE_JOB_TAGS_PROPERTY: &str = "Tags";
+
+/// Create the job definition an `AWS::Glue::Job` declares, so a client that deployed the
+/// stack and then calls `glue GetJob` (or `StartJobRun`, or `UpdateJob`) with the name the
+/// stack publishes reads the job back rather than an `EntityNotFoundException`.
+///
+/// The type's properties ARE `CreateJob`'s own members — `Role`, `Command`, `GlueVersion`,
+/// `DefaultArguments`, `Connections`, `ExecutionProperty`, `NotificationProperty`,
+/// `WorkerType`, `NumberOfWorkers`, `MaxCapacity`, `MaxRetries`, `Timeout`,
+/// `SecurityConfiguration`, `ExecutionClass`, `JobMode`, `JobRunQueuingEnabled`,
+/// `MaintenanceWindow`, `Description`, `LogUri`, `AllocatedCapacity` and
+/// `NonOverridableArguments` are named identically on both sides (AWS's resource reference
+/// for the type against `CreateJobRequest`) — so the resolved property document IS the
+/// request, with the one member CloudFormation decides set on the way out: "Ref returns the
+/// job name", which is this resource's physical id and the identifier every AWS Glue
+/// operation addresses a job definition by.
+///
+/// `Tags` is the one member not carried verbatim: the job carries the tags the declaration
+/// asks for beside the ones CloudFormation gives the resource ([`tags_of`]), as the tag MAP
+/// `CreateJob`'s own `TagsMap` member takes — whichever of the two spellings the
+/// declaration wrote them in.
+///
+/// That tag set reaches AWS Glue on the CREATE alone. A job's tags are that service's own
+/// `TagResource`/`UntagResource` rather than part of the definition an update overwrites, so
+/// this type has no [`Provisioner::retag`] arm and a later deployment that changes only the
+/// tags leaves the job carrying the set it was created with — the state a type with no
+/// re-tagging arm is documented to be in. Writing one waits on that service's own untagging
+/// call, which is still one of this emulator's scaffold stubs: an arm built on it could only
+/// fail the deployment it is meant to carry.
+async fn create_glue_job(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    request.insert(
+        GLUE_JOB_NAME_PROPERTY.to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if tags.is_empty() {
+        request.remove(GLUE_JOB_TAGS_PROPERTY);
+    } else {
+        request.insert(GLUE_JOB_TAGS_PROPERTY.to_string(), Value::Object(tags));
+    }
+    call_glue(ctx, region, "CreateJob", &Value::Object(request)).await?;
+    // `CreateJob` answers with the name it stored, which is the physical id the stack
+    // already computed, and the type publishes no `Fn::GetAtt` attribute — so there is
+    // nothing the owning service decided for this resource beyond the job now existing.
+    Ok(Created::default())
+}
+
+/// Apply a changed `AWS::Glue::Job` declaration to the job the stack created.
+///
+/// `UpdateJob` takes the whole definition — "the previous job definition is completely
+/// overwritten by this information" (`JobUpdate`) — and every property of the type but its
+/// name and its tags is a member of that shape, so the declaration this deployment states
+/// IS the `JobUpdate`, against the `JobName` the resource is held under.
+async fn update_glue_job(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Created, Refusal> {
+    let mut update = declared.as_object().cloned().unwrap_or_else(Map::new);
+    update.remove(GLUE_JOB_NAME_PROPERTY);
+    update.remove(GLUE_JOB_TAGS_PROPERTY);
+    let request = serde_json::json!({
+        "JobName": resource.physical_resource_id,
+        "JobUpdate": Value::Object(update),
+    });
+    call_glue(ctx, region, "UpdateJob", &request).await?;
+    Ok(Created::default())
+}
+
+/// Delete the job definition a stack created, addressed by its NAME — this resource's
+/// physical id.
+///
+/// `DeleteJob` models no not-found error at all ("if the job definition is not found, no
+/// exception is thrown"), so a job AWS Glue no longer holds is already in the state the
+/// delete asks for and the call says so itself.
+async fn delete_glue_job(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "JobName": physical_resource_id });
+    call_glue(ctx, region, "DeleteJob", &request).await?;
+    Ok(())
+}
+
+/// The job definition as AWS Glue reports it, for drift detection: the `Job` document its
+/// own read answers with, whose members are spelled exactly as the type's properties are.
+/// A name it no longer holds a job under (`EntityNotFoundException`, judged on the CODE and
+/// never on a message that carries the request's own name) was deleted.
+async fn describe_glue_job(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "JobName": physical_resource_id });
+    match call_glue(ctx, region, "GetJob", &request).await {
+        Ok(answer) => Ok(Some(reported_member(&answer, "Job"))),
+        Err(refusal) if refusal.code == GLUE_ENTITY_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Call one AWS Glue operation on the awsJson1_1 wire its model declares.
+async fn call_glue(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    operation: &str,
+    request: &Value,
+) -> Result<Value, Refusal> {
+    call_json_rpc(
+        ctx,
+        GLUE_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{GLUE_TARGET_PREFIX}.{operation}"),
+        request,
+    )
+    .await
 }
 
 /// One scalar member of an answered document as its text, or `None` where the answer does

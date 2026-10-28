@@ -75,6 +75,8 @@ mod scraper_listing;
 mod scraper_logging_configuration_deletion;
 #[path = "all/scraper_logging_configuration_describe.rs"]
 mod scraper_logging_configuration_describe;
+#[path = "all/scraper_logging_configuration_update.rs"]
+mod scraper_logging_configuration_update;
 #[path = "all/scraper_update.rs"]
 mod scraper_update;
 #[path = "all/state_roundtrip.rs"]

@@ -182,15 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // `MaxResults` is modelled `range 1..100`, so the boundary validator has already
-        // refused anything outside it; an absent one pages at the documented default
-        // (`ListRumMetricsDestinationsRequest$MaxResults`: "The default is 50. The
-        // maximum that you can specify is 100.").
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The page-size rule is the service's, not this operation's: every
+        // `MaxResultsInteger`-paged listing applies the same one
+        // ([`crate::state::page_size`]).
+        let page_size = crate::state::page_size(input.max_results);
 
         // May this caller read THIS app monitor's metric destinations? Decided per call,
         // like every other operation's, with the monitor and the policy in force read
@@ -270,15 +265,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The page this operation returns when the request names no `MaxResults`.
-/// From the model: `ListRumMetricsDestinationsRequest$MaxResults` documents "The default
-/// is 50."
-const DEFAULT_PAGE_SIZE: usize = 50;
-
-/// The largest page this operation returns: `MaxResults`' modelled maximum
-/// (`MaxResultsInteger`, range 1..100).
-const MAX_PAGE_SIZE: usize = 100;
 
 /// The marker every token this operation issues carries, so a token the service did not
 /// issue — or one another list issued — is recognisable rather than being read as some

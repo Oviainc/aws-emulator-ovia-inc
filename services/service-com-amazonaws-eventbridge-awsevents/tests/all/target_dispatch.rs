@@ -135,7 +135,11 @@ async fn rpc(
     (status, parsed)
 }
 
-async fn events(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn events(
+    emulator: &Emulator,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     rpc(emulator, "events", "AWSEvents", "1.1", operation, body).await
 }
 

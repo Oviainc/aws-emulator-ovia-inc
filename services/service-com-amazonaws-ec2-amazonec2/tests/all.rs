@@ -398,6 +398,9 @@ mod ipam_lifecycle;
 // Deleting the association between an IPAM and a Regional Internet Registry.
 #[path = "all/ipam_internet_registry_associations.rs"]
 mod ipam_internet_registry_associations;
+// Reporting the associations between an IPAM and a Regional Internet Registry.
+#[path = "all/ipam_internet_registry_association_reports.rs"]
+mod ipam_internet_registry_association_reports;
 #[path = "all/ipam_policies.rs"]
 mod ipam_policies;
 #[path = "all/ipam_pools.rs"]

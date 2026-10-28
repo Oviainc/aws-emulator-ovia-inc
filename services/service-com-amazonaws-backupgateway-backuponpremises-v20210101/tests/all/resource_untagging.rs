@@ -229,10 +229,13 @@ const ROWS: &[Row] = &[
         expected: &[("Env", "upper")],
     },
     Row {
+        // The non-empty value carries no space: the modelled `Tag` doc states "Spaces are
+        // not allowed in tag values", so a value with one is never stored to remove a key
+        // beside. A KEY may carry spaces, which the row above covers.
         case: "a key is removed whatever its value, including an empty one",
-        initial: &[("empty", ""), ("full", "a value with spaces")],
+        initial: &[("empty", ""), ("full", "a-non-empty_value:1")],
         remove: &["empty"],
-        expected: &[("full", "a value with spaces")],
+        expected: &[("full", "a-non-empty_value:1")],
     },
     Row {
         case: "a 128-character key, the modelled TagKey maximum",

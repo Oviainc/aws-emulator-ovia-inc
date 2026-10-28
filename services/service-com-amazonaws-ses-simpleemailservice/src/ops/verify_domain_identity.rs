@@ -4,7 +4,9 @@
 //!
 //! Adds a domain to this account's identity list, idempotently, and answers with
 //! the TXT token stored on that identity — the same token
-//! `GetIdentityVerificationAttributes` reports for it.
+//! `GetIdentityVerificationAttributes` reports for it. The call only ASKS for the
+//! verification — the customer has yet to publish that token — so the record
+//! starts out pending ([`crate::state::IDENTITY_VERIFICATION_SPAN`]).
 //!
 //! ## Shape of an operation
 //!

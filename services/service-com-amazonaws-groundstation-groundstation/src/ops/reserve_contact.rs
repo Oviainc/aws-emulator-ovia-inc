@@ -235,6 +235,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // What the reservation points the antenna at is resolved before anything is
+        // stored: a program track is flown from an ephemeris of this account, so one
+        // naming an ephemeris this account does not hold — or one of another form than
+        // the member naming it requires — is refused rather than reserved, exactly as
+        // `UpdateContact` refuses it for a later version of a contact.
+        match guard.program_track_fault(input.tracking_overrides.as_ref()) {
+            None => {}
+            Some(crate::state::ProgramTrackFault::Absent(error)) => {
+                return Err(ReserveContactErrorModeled::ResourceNotFoundException(error).into());
+            }
+            Some(crate::state::ProgramTrackFault::WrongType(error)) => {
+                return Err(ReserveContactErrorModeled::InvalidParameterException(error).into());
+            }
+        }
+
         // The antenna this pass is placed on. A reservation holds an antenna for its
         // window and an antenna serves one pass at a time, so the scheduler places the
         // contact on the first antenna of the ground station nothing else holds for that

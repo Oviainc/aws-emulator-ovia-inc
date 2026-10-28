@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIpamInternetRegistryAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIpamInternetRegistryAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIpamInternetRegistryAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the account's IPAM internet registry associations out of
+//! [`crate::state`] — the whole store by default, or the subset the request's
+//! `IpamInternetRegistryAssociationIds` and `Filters` select, one `MaxResults`-sized page at
+//! a time (all of them, with no continuation token, when the request names no page size:
+//! "if not specified, all available results are returned"). A reporting operation: the only
+//! write it makes is to materialise the state transitions the clock has ALREADY made due (an
+//! association's `delete-in-progress` -> `delete-complete`), which were owed at the same
+//! instant whether or not anybody called.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +74,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +143,315 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIpamInternetRegistryAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIpamInternetRegistryAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIpamInternetRegistryAssociations"))
+        // `ctx` carries request metadata only; this operation reads none of it — an
+        // association reports the Region of the IPAM it belongs to
+        // (`IpamInternetRegistryAssociation$IpamRegion`), so the store is not per-Region. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+        use state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget,
+        };
+
+        // "The token for the next page of results"
+        // (`DescribeIpamInternetRegistryAssociationsRequest$NextToken`) — anything else is
+        // refused rather than read as an id, and it is refused before any other member is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // "The IDs of the internet registry associations to describe"
+        // (`DescribeIpamInternetRegistryAssociationsRequest$IpamInternetRegistryAssociationIds`)
+        // is a plain `ValueStringList` with no modelled `@length`, and every id named is
+        // looked up, so the count is capped the way every other describe in this crate caps
+        // its own id list — before any work proportional to it.
+        let requested: &[String] = input
+            .ipam_internet_registry_association_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request names {} {kind} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested.len(),
+                kind = state::RESOURCE_TYPE_IPAM_INTERNET_REGISTRY_ASSOCIATION,
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored associations and the model
+        // bounds none of them (`Filters` is a plain `FilterList`), so the request-controlled
+        // factors are capped here, before any work proportional to them is done — and their
+        // PRODUCT is charged to one [`MatchBudget`] below, which is the bound the per-factor
+        // caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not resolve is refused whether or not any
+        // association would have matched it, so an unsupported filter can never read as "no
+        // results". Each filter's values are parsed into their wildcard patterns ONCE here,
+        // not once per candidate.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "Checks whether you have the required permissions for the operation, without
+        // actually making the request"
+        // (`DescribeIpamInternetRegistryAssociationsRequest$DryRun`). Every caller of this
+        // emulator is permitted, so a dry run reports that outcome and reads nothing. It sits
+        // AFTER every parameter has been validated: the flag asks whether the request WOULD
+        // have succeeded, so one that would have been refused is refused with that reason
+        // instead.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call every
+        // other describe in this crate makes: an association a delete answered as
+        // `delete-in-progress` is `delete-complete` once its due instant has passed, whether
+        // or not anybody called, so applying it here changes nothing a later caller would not
+        // have seen anyway.
+        store.materialize_due_transitions();
+
+        // An id that names no association of the account is an error, not an absent row: a
+        // malformed one before an unknown one, through the crate's one resolver for this
+        // resource. The ids are held as a SET, so resolving them is one lookup each rather
+        // than a walk of the whole store per id.
+        let wanted_ids: ::std::collections::BTreeSet<&str> =
+            requested.iter().map(String::as_str).collect();
+        for id in &wanted_ids {
+            state::require_known_ipam_internet_registry_association(&store, id)?;
+        }
+
+        // Everything the account holds, narrowed to the ids named, with every filter then
+        // holding ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`). Every comparison is charged to ONE budget, so the PRODUCT of stored
+        // associations, filters, values, held values and value length is bounded however the
+        // caller combines them — which is also what bounds how long this holds the state
+        // lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<IpamInternetRegistryAssociation> = Vec::new();
+        for record in store.ipam_internet_registry_associations.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let association = &record.view;
+            if !wanted_ids.is_empty()
+                && !association
+                    .ipam_internet_registry_association_id
+                    .as_deref()
+                    .is_some_and(|id| wanted_ids.contains(id))
+            {
+                continue;
+            }
+            if state::matches_every_filter(&selectors, &mut budget, &|name| {
+                filter_values(association, name)
+            }) {
+                selected.push(association.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `IpamInternetRegistryAssociationId` order, which the cursor names a
+        // position in. The store is an ordered map, so its iteration order already satisfies
+        // this sort; doing it here establishes the invariant the cursor depends on at the
+        // point of use rather than inheriting it from the container `crate::state` happens to
+        // hold.
+        selected.sort_by(|left, right| {
+            left.ipam_internet_registry_association_id
+                .cmp(&right.ipam_internet_registry_association_id)
+        });
+
+        // "The maximum number of results to return in a single call. If not specified, all
+        // available results are returned"
+        // (`DescribeIpamInternetRegistryAssociationsRequest$MaxResults`): a request naming no
+        // page size is not paged at all, which is the `None` [`state::page_from_cursor`] takes
+        // — and with it the answer carries no token, because there is no next page to ask for.
+        // The model's `range 5..1000` has already refused anything outside it, so the only
+        // value that cannot convert is one the boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .map(|max_results| max_results.min(MAX_PAGE_SIZE));
+
+        // The page and "the token to use to retrieve the next page of results"
+        // (`DescribeIpamInternetRegistryAssociationsResult$NextToken`) both come from the
+        // crate's one pager: a cursor naming the last association of the page just answered,
+        // resumed strictly after it, with a token only when a further association follows.
+        let (page, next_token) = state::page_from_cursor(
+            &selected,
+            start_at.as_deref(),
+            limit,
+            state::PageTokenRule::WhenAnotherItemFollows,
+            |association| {
+                association
+                    .ipam_internet_registry_association_id
+                    .as_deref()
+                    .unwrap_or_default()
+            },
+        );
+
+        Ok(DescribeIpamInternetRegistryAssociationsOutput {
+            ipam_internet_registry_associations: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// The filter names this operation resolves.
+///
+/// `DescribeIpamInternetRegistryAssociationsRequest$Filters` documents no list of its own —
+/// "One or more filters to apply to the results" is all of it
+/// (`smithy_query(query="doc",shape="DescribeIpamInternetRegistryAssociationsRequest",member="Filters")`)
+/// — so the names are the ones EC2's filtering convention gives: each member of the resource
+/// the operation reports, spelled in kebab-case. This list is therefore derived mechanically
+/// from the `IpamInternetRegistryAssociation` shape
+/// (`smithy_query(query="shape",shape="IpamInternetRegistryAssociation")`), one entry per
+/// member, plus the `tag-key` / `tag-value` / `tag:<key>` set every EC2 describe accepts.
+/// Every entry must be answered by [`filter_values`].
+const ASSOCIATION_FILTERS: [&str; 13] = [
+    "child-request-xml",
+    "description",
+    "ipam-id",
+    "ipam-internet-registry-association-arn",
+    "ipam-internet-registry-association-id",
+    "ipam-region",
+    "organization-handle",
+    "owner-id",
+    "rir",
+    "state",
+    "state-message",
+    "tag-key",
+    "tag-value",
+];
+
+/// Is `name` a filter this operation resolves? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
+/// tag, so it is as unresolvable as any other misspelling.
+///
+/// The tag filter's prefix is "use the tag key in the filter name and the tag value as the
+/// filter value", read from the crate's one definition of that spelling
+/// ([`crate::state::TAG_FILTER_PREFIX`]), so it cannot drift between the describes that
+/// answer it.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || ASSOCIATION_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this association.
+///
+/// A filter naming an attribute this association does not carry compares against NO values,
+/// so it selects nothing — the same answer AWS gives for, say, `description` on an
+/// association created without one.
+fn filter_values<'a>(
+    association: &'a IpamInternetRegistryAssociation,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(state::TAG_FILTER_PREFIX) {
+        return association
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "child-request-xml" => text(association.child_request_xml.as_deref()),
+        "description" => text(association.description.as_deref()),
+        "ipam-id" => text(association.ipam_id.as_deref()),
+        "ipam-internet-registry-association-arn" => {
+            text(association.ipam_internet_registry_association_arn.as_deref())
+        }
+        "ipam-internet-registry-association-id" => {
+            text(association.ipam_internet_registry_association_id.as_deref())
+        }
+        "ipam-region" => text(association.ipam_region.as_deref()),
+        "organization-handle" => text(association.organization_handle.as_deref()),
+        "owner-id" => text(association.owner_id.as_deref()),
+        "rir" => text(association.rir.as_deref()),
+        "state" => text(association.state.as_deref()),
+        "state-message" => text(association.state_message.as_deref()),
+        "tag-key" => association
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "tag-value" => association
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // unresolvable name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+// The AND/OR evaluation of the whole `Filters` member is
+// `crate::state::matches_every_filter`, the one place this crate defines it: "if you specify
+// multiple filters, the filters are joined with an AND" (`Filter`), and within one filter
+// "if you specify multiple values for a filter, the values are joined with an OR"
+// (`Filter$Values`), each value matched case-sensitively with EC2's `*`/`?` wildcards and
+// every comparison charged to the call's one `crate::state::MatchBudget`. Only the
+// per-operation lookup differs, which is `filter_values` above.

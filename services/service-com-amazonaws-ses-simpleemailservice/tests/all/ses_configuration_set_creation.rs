@@ -21,7 +21,9 @@
 //!   outside the rule, and a name already held, keep their own refusals at the
 //!   ceiling too.
 
-use crate::harness::{call, element, elements, emulator, emulator_over, field, xml_text, Field};
+use crate::harness::{
+    call, element, elements, emulator, emulator_over, field, settle_verifications, xml_text, Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::state::{
     service_state, MAX_CONFIGURATION_SETS, MAX_CONFIGURATION_SET_NAME,
 };
@@ -267,6 +269,11 @@ async fn a_second_create_of_one_name_is_a_conflict_not_a_replacement() {
         status, 200,
         "case verify example.com: expected 200, got {status} with {body}"
     );
+    // The request only ASKS for the domain's verification; a tracking domain has
+    // to be under one this account has verified, so the store is settled past the
+    // span the clock owes that record — this suite is about what a second create
+    // does to a stored set.
+    settle_verifications(&engine);
 
     // Each row is a set whose stored record carries something a replacement
     // would lose: a tracking-options association, a paused sending state, or

@@ -15,6 +15,8 @@
 mod catalogue_published_urls;
 #[path = "all/create_deployment_status_sequence.rs"]
 mod create_deployment_status_sequence;
+#[path = "all/create_deployment_store_ceiling_preflight.rs"]
+mod create_deployment_store_ceiling_preflight;
 #[path = "all/create_deployment_validation.rs"]
 mod create_deployment_validation;
 #[path = "all/delete_deployment_status_sequence.rs"]

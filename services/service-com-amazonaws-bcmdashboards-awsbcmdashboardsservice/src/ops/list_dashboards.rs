@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &state.dashboards,
             input.next_token.as_deref(),
             input.max_results,
-            crate::state::DASHBOARD_ARN_SEGMENT,
+            crate::state::DASHBOARD_RESOURCE_TYPE,
             crate::state::Dashboard::reference,
         )
         .map_err(|refusal| {

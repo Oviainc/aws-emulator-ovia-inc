@@ -527,12 +527,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Answered by reading the stored configuration back out of the record, so a
-        // later `GetFunction` reports exactly what this call persisted.
+        // later `GetFunction` reports exactly what this call persisted. The update's
+        // subject is the FUNCTION, so the ARN it reports is the function's own unqualified
+        // one and a version this call published is named by `Version` alone (see
+        // `FunctionRecord::unqualified_configuration`).
         let Some(config) = record.config_of(&reported_version).cloned() else {
             return Err(service_error("The updated function could not be read back"));
         };
         Ok(function_configuration(
-            record.configuration(&reported_version, &config),
+            record.unqualified_configuration(&reported_version, &config),
         ))
     }
 }

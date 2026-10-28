@@ -164,7 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "GetIdentityVerificationAttributes",
             ));
         };
-        let state = state.lock();
+        let mut state = state.lock();
+
+        // One instant for the whole report, with the verification move the clock
+        // already owes each identity materialised against it: the move was due
+        // whether or not anybody asked, so every identity this report names is
+        // reported as of the same instant.
+        let now = std::time::SystemTime::now();
+        state.settle_identities(now);
 
         // Only identities that are actually in the list get an entry: an identity
         // that was never verified is ABSENT from the map rather than reported with

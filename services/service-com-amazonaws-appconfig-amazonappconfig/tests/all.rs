@@ -89,6 +89,8 @@ mod list_hosted_configuration_versions;
 mod pattern_refusal_quoting;
 #[path = "all/refusal_message_templates.rs"]
 mod refusal_message_templates;
+#[path = "all/request_derived_refusal_templates.rs"]
+mod request_derived_refusal_templates;
 #[path = "all/resource_deletes.rs"]
 mod resource_deletes;
 #[path = "all/resource_tags.rs"]

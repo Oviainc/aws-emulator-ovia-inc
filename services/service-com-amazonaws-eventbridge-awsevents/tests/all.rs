@@ -51,6 +51,8 @@ mod implicit_default_bus;
 mod input_validation;
 #[path = "all/kinesis_target_delivery.rs"]
 mod kinesis_target_delivery;
+#[path = "all/kinesis_target_stream_consumption.rs"]
+mod kinesis_target_stream_consumption;
 #[path = "all/missing_resource_wording.rs"]
 mod missing_resource_wording;
 #[path = "all/or_relationship_branches.rs"]

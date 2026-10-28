@@ -8,13 +8,17 @@
 //! `CreateSlackChannelConfiguration` enforces: until a workspace is registered, a
 //! channel configuration in it is a `ConflictException`.
 //!
-//! The emulator presents exactly ONE account (`engine::emulator_account_id`), which is
-//! therefore the management account of its own organization, so the two
-//! organization-membership conflicts this operation's `ConflictException` documents
-//! (an account that belongs to no organization, and a member account whose management
-//! account has not registered the workspace yet) cannot arise here; `accountType`
-//! reports `crate::state::ACCOUNT_TYPE` for that reason. The documented workspace
-//! quota is enforced instead — see [`crate::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS`].
+//! This is an Organizations-scoped call — "To call this API, your account must be part
+//! of an organization in Organizations" — so the account's membership is settled before
+//! the registry is touched, by reading the Organizations control plane's own store
+//! through the shared engine ([`crate::state::caller_account_type`]): an account that
+//! belongs to no organization is the first condition this operation's
+//! `ConflictException` enumerates, so the call is refused with it and nothing is
+//! registered. When an organization does hold the account, `accountType` reports the
+//! role that organization's own record gives it — `management` for the account that
+//! manages it, `member` for one of its other member accounts. The documented workspace
+//! quota bounds the registry past that — see
+//! [`crate::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS`].
 //!
 //! `teamName` is the name the Slack workspace carries in Slack. A registered workspace
 //! has one, and this operation and `ListSlackWorkspaceConfigurations` both report it, so
@@ -202,6 +206,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // An Organizations-scoped call, so the account's membership in an organization
+        // is settled first — before this service's own registry is reached, and with no
+        // guard of it held. An account in no organization is the condition this
+        // operation's `ConflictException` names, and the refusal registers nothing; a
+        // store that cannot be read at all is this service's own server error, not a
+        // conflict the caller can resolve.
+        let account_type = crate::state::caller_account_type(&*self.engine)
+            .map_err(|_| {
+                RegisterSlackWorkspaceForOrganizationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the Organizations store is unavailable".to_string()),
+                    },
+                )
+            })?
+            .ok_or_else(|| {
+                RegisterSlackWorkspaceForOrganizationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::account_not_in_organization_message(
+                            Self::NAME,
+                        )),
+                    },
+                )
+            })?;
+
         let mut store = state.lock();
         // Registering a workspace the account already holds changes nothing: a `teamId`
         // identifies a workspace, and the conflicts this operation documents are about
@@ -250,7 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(RegisterSlackWorkspaceForOrganizationOutput {
             team_id: Some(record.team_id.clone()),
             team_name: Some(record.team_name.clone()),
-            account_type: Some(crate::state::ACCOUNT_TYPE.to_string()),
+            // The role the organization's own record gives this account, not a fixed
+            // value: `management` when it manages that organization, `member` when it is
+            // one of its other member accounts.
+            account_type: Some(account_type.to_string()),
         })
     }
 }

@@ -24,17 +24,28 @@
 //! * a configuration set name is admitted exactly when it meets the documented
 //!   naming rule.
 
-use crate::harness::{call, element, emulator, field, xml_text, Field};
+use crate::harness::{
+    call, element, emulator, emulator_and_engine, field, settle_verifications, xml_text, Field,
+};
 use smithy_server_runtime::MultiServiceRouter;
+use std::sync::Arc;
 
 /// `VerifyDomainIdentity`, so a tracking domain under it is one SES would
-/// redirect through.
-async fn verify_domain(router: &MultiServiceRouter, domain: &str) {
+/// redirect through — carried through to a VERIFIED domain, because the request
+/// only asks for the verification and these cases are about the association
+/// rather than about the span the record stays pending for
+/// (`settle_verifications`).
+async fn verify_domain(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    domain: &str,
+) {
     let (status, body) = call(router, "VerifyDomainIdentity", &[field("Domain", domain)]).await;
     assert_eq!(
         status, 200,
         "case verify {domain}: expected 200, got {status} with {body}"
     );
+    settle_verifications(engine);
 }
 
 /// `CreateConfigurationSet`.
@@ -153,8 +164,8 @@ fn no_such_association(name: &str) -> (Option<String>, Option<String>) {
 /// already holds a verified domain identity: the fixture every case about
 /// MODIFYING an association starts from.
 async fn router_with_tracked_set(name: &str) -> MultiServiceRouter {
-    let router = emulator();
-    verify_domain(&router, "example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_domain(&router, &engine, "example.com").await;
     let (status, body) = create_configuration_set(&router, name).await;
     assert_eq!(
         status, 200,
@@ -200,8 +211,8 @@ async fn an_update_stores_the_domain_every_accepted_form_names() {
 
 #[tokio::test]
 async fn a_write_naming_a_set_the_account_does_not_hold_is_refused() {
-    let router = emulator();
-    verify_domain(&router, "example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_domain(&router, &engine, "example.com").await;
     // The name varies along everything the rule admits — length, case,
     // separators — and none of these sets was ever created.
     let cases = [
@@ -338,8 +349,8 @@ async fn a_domain_ses_would_not_redirect_through_is_refused() {
 
 #[tokio::test]
 async fn an_association_must_exist_before_an_update_modifies_it() {
-    let router = emulator();
-    verify_domain(&router, "example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_domain(&router, &engine, "example.com").await;
     let (status, body) = create_configuration_set(&router, "fresh-set").await;
     assert_eq!(
         status, 200,
@@ -474,8 +485,8 @@ async fn a_configuration_set_name_is_admitted_exactly_when_the_rule_admits_it() 
 
 #[tokio::test]
 async fn a_delete_removes_the_association_whatever_form_the_stored_domain_took() {
-    let router = emulator();
-    verify_domain(&router, "example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_domain(&router, &engine, "example.com").await;
     // Every form the write rule admits, so the delete is exercised over the
     // whole class of stored domains rather than one of them: one label under the
     // verified apex, several labels, a label carrying digits and dashes, the apex
@@ -546,8 +557,8 @@ async fn a_delete_removes_the_association_whatever_form_the_stored_domain_took()
 
 #[tokio::test]
 async fn a_delete_on_a_set_carrying_no_association_is_refused() {
-    let router = emulator();
-    verify_domain(&router, "example.com").await;
+    let (router, engine) = emulator_and_engine();
+    verify_domain(&router, &engine, "example.com").await;
     // The names vary along everything the naming rule admits — length, case,
     // separators — and each of these sets was created WITHOUT tracking options.
     let cases = [

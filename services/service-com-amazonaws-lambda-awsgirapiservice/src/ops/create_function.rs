@@ -425,9 +425,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To create a function, you need a deployment package and an execution role."
         // The function RUNS AS the role the request names, so that role is resolved
-        // against this account's IAM before anything is written: a role IAM does not hold,
-        // or one whose trust policy does not let this service assume it, is the modelled
-        // 400 and no function is stored. This is awaited with no store guard held.
+        // before anything is written: a role this emulator's own IAM does not hold, or
+        // one whose trust policy does not let this service assume it, is the modelled 400
+        // and no function is stored.
+        //
+        // The question is put to the emulator's OWN IAM, over the emulator's OWN
+        // in-process transport: `crate::state::execution_role_is_unassumable` asks through
+        // `service_common::iam_role`, whose client is built from
+        // `ctx.callback().http_client()` and the callback's credentials
+        // (`service_common::iam_client`). Nothing here opens a socket, resolves a host or
+        // reads an ambient credential: the request's role string selects which record of
+        // this process's IAM state is looked up, and the region only says which emulated
+        // region is addressed. An emulator with no IAM mounted refuses nothing, so a
+        // missing answer never becomes a refusal. It is awaited with no store guard held.
         if crate::state::execution_role_is_unassumable(ctx, &region, &input.role).await {
             return Err(invalid_parameter(
                 crate::state::ROLE_NOT_ASSUMABLE_MESSAGE.to_string(),
@@ -655,7 +665,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .config_of(&reported_version)
             .unwrap_or(&stored.config)
             .clone();
-        Ok(stored.configuration(&reported_version, &config))
+        // The create's subject is the FUNCTION, so what it reports as `FunctionArn` is the
+        // function's own unqualified ARN; a version this call published is named by
+        // `Version` alone (see `FunctionRecord::unqualified_configuration`).
+        Ok(stored.unqualified_configuration(&reported_version, &config))
     }
 }
 

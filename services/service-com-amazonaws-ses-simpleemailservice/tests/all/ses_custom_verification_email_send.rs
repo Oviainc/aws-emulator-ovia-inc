@@ -21,7 +21,10 @@
 //!   address — is refused with the error modelled for that cause, and leaves the
 //!   identity list and the send log alone.
 
-use crate::harness::{call, element, elements, emulator_over, field, map_entries, xml_text, Field};
+use crate::harness::{
+    call, element, elements, emulator_over, field, map_entries, settle_verifications, xml_text,
+    Field,
+};
 use service_com_amazonaws_ses_simpleemailservice::ops::types::CustomVerificationEmailTemplate;
 use service_com_amazonaws_ses_simpleemailservice::state::{
     self, MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES,
@@ -158,6 +161,10 @@ async fn the_production_access_gate_refuses_every_request_before_anything_it_nam
         &[field("EmailAddress", "verification@example.com")],
     )
     .await;
+    // The request only ASKS for the verification, and a template's own sender has
+    // to be a verified identity: the store is settled past the span the clock
+    // owes that record, because these cases are about the send and not the span.
+    settle_verifications(&engine);
     ok(
         &router,
         "CreateConfigurationSet",
@@ -263,12 +270,17 @@ async fn a_granted_account_sends_the_named_template_and_records_the_address() {
         &[field("EmailAddress", "verification@example.com")],
     )
     .await;
+    // The request only ASKS for the verification, and a template's own sender has
+    // to be a verified identity: the store is settled past the span the clock
+    // owes that record, because these cases are about the send and not the span.
+    settle_verifications(&engine);
     ok(
         &router,
         "VerifyDomainIdentity",
         &[field("Domain", "example.net")],
     )
     .await;
+    settle_verifications(&engine);
     ok(
         &router,
         "CreateConfigurationSet",
@@ -347,8 +359,9 @@ async fn a_granted_account_sends_the_named_template_and_records_the_address() {
         let reported = verification_status(&router, key).await;
         assert_eq!(
             reported.as_deref(),
-            Some("Success"),
-            "case {case:?}: expected the stored verification status for {key:?}, got {reported:?}"
+            Some("Pending"),
+            "case {case:?}: the send only ASKS {key:?} to confirm, so it reads pending, got \
+             {reported:?}"
         );
         // The accepted message is in the send log the quota is derived from: one
         // recipient, so one more than before.
@@ -380,6 +393,10 @@ async fn a_granted_account_refuses_each_cause_the_request_carries_with_its_own_e
         &[field("EmailAddress", "verification@example.com")],
     )
     .await;
+    // The request only ASKS for the verification, and a template's own sender has
+    // to be a verified identity: the store is settled past the span the clock
+    // owes that record, because these cases are about the send and not the span.
+    settle_verifications(&engine);
     let before = identities(&router).await;
 
     // One row per cause this operation models an error for, each named by a
@@ -469,6 +486,10 @@ async fn the_custom_verification_email_template_store_is_bounded() {
         &[field("EmailAddress", "verification@example.com")],
     )
     .await;
+    // The request only ASKS for the verification, and a template's own sender has
+    // to be a verified identity: the store is settled past the span the clock
+    // owes that record, because these cases are about the send and not the span.
+    settle_verifications(&engine);
 
     // The store is at its ceiling, so a further NEW template is not recorded —
     // while replacing one of the names already stored is, since it adds nothing.
@@ -534,6 +555,10 @@ async fn both_sends_word_an_illegal_address_the_same_way() {
         &[field("EmailAddress", "verification@example.com")],
     )
     .await;
+    // The request only ASKS for the verification, and a template's own sender has
+    // to be a verified identity: the store is settled past the span the clock
+    // owes that record, because these cases are about the send and not the span.
+    settle_verifications(&engine);
 
     // The two operations that take a caller-supplied address read it the same way
     // and report it the same way: the refusal comes from the one shared wording,
