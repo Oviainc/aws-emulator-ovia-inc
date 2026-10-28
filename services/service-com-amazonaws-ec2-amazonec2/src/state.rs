@@ -1112,6 +1112,16 @@
 //! [`ComAmazonawsEc2Amazonec2State::vpc_available_at`], and
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it.
 //!
+//! A resource discovery can also be associated with a FURTHER IPAM — "IPAM aggregates the
+//! resource CIDRs discovered by the associated resource discovery"
+//! ([`IpamResourceDiscoveryAssociation`]) — which is one more record in that same
+//! association store, written by
+//! [`ComAmazonawsEc2Amazonec2State::insert_ipam_resource_discovery_association`], the one
+//! writer of a caller-made association. It too is answered in a non-terminal state, so its
+//! own due instant lives in
+//! [`ComAmazonawsEc2Amazonec2State::ipam_resource_discovery_association_complete_at`] — the
+//! IPAM's entry above covers only the default association that came up with it.
+//!
 //! ## Capacity Reservations
 //!
 //! [`ComAmazonawsEc2Amazonec2State::capacity_reservations`] holds the account's Capacity
@@ -3359,6 +3369,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// as the modelled [`IpamResourceDiscoveryAssociation`] shape itself. Starts with the
     /// association of each IPAM's own default resource discovery ([`Self::insert_ipam`]).
     pub ipam_resource_discovery_associations: BTreeMap<String, IpamResourceDiscoveryAssociation>,
+    /// When each CALLER-MADE resource discovery association's `associate-in-progress` ->
+    /// `associate-complete` transition falls due, for the associations that have one.
+    ///
+    /// The association counterpart of [`Self::ipam_scope_create_complete_at`], on the same
+    /// clock and for the same reason: `AssociateIpamResourceDiscovery` answers an association
+    /// in the non-terminal `associate-in-progress` state, so the clock owes it
+    /// `associate-complete` [`TRANSITION_DELAY`] later whether or not anybody calls again.
+    /// The DEFAULT association of an IPAM is not listed here: it is completed by the one
+    /// entry [`Self::ipam_create_complete_at`] holds for the IPAM it came up with.
+    pub ipam_resource_discovery_association_complete_at: BTreeMap<String, Instant>,
+    /// An `AssociateIpamResourceDiscovery` `ClientToken` and the association it minted, so a
+    /// repeat of the same request answers with that association instead of making a second
+    /// one.
+    pub ipam_resource_discovery_association_client_tokens: HashMap<String, String>,
     /// A `CreateIpam` `ClientToken` and the IPAM it minted, so a repeat of the same request
     /// answers with that IPAM instead of creating a second one.
     pub ipam_client_tokens: HashMap<String, String>,
@@ -3980,6 +4004,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_create_complete_at: BTreeMap::new(),
             ipam_resource_discoveries: BTreeMap::new(),
             ipam_resource_discovery_associations: BTreeMap::new(),
+            ipam_resource_discovery_association_complete_at: BTreeMap::new(),
+            ipam_resource_discovery_association_client_tokens: HashMap::new(),
             ipam_client_tokens: HashMap::new(),
             instance_event_tag_registrations: BTreeMap::new(),
             route_server_endpoints: BTreeMap::new(),
@@ -6942,6 +6968,29 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this scope any more.
             false
         });
+        // A resource discovery association `AssociateIpamResourceDiscovery` answered as
+        // `associate-in-progress` reaches `associate-complete` once its due instant has
+        // passed, whether or not anybody called — the same contract as the scope above. The
+        // DEFAULT association of an IPAM is not listed here: `complete_ipam_creation` moves
+        // it with the IPAM it came up with.
+        let ipam_associations = &mut self.ipam_resource_discovery_associations;
+        self.ipam_resource_discovery_association_complete_at
+            .retain(|association_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(association) = ipam_associations.get_mut(association_id) {
+                    if association.state.as_deref()
+                        == Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS)
+                    {
+                        association.state =
+                            Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_COMPLETE.to_string());
+                    }
+                }
+                // The transition is applied once; nothing is owed on this association any
+                // more.
+                false
+            });
         // A Verified Access endpoint `CreateVerifiedAccessEndpoint` answered as `pending`
         // reaches `active` once its due instant has passed, whether or not anybody called —
         // the same contract as a `pending` VPC's move above, and the reason the endpoint's
@@ -28522,24 +28571,19 @@ impl ComAmazonawsEc2Amazonec2State {
         let association_id = self.next_id(IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_PREFIX);
         self.ipam_resource_discovery_associations.insert(
             association_id.clone(),
-            IpamResourceDiscoveryAssociation {
-                owner_id: Some(owner_id.clone()),
-                ipam_resource_discovery_association_id: Some(association_id.clone()),
-                ipam_resource_discovery_association_arn: Some(ipam_resource_arn(
-                    RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY_ASSOCIATION,
-                    &association_id,
-                )),
-                ipam_resource_discovery_id: Some(resource_discovery_id.clone()),
-                ipam_id: Some(ipam_id.clone()),
-                ipam_arn: Some(ipam_arn.clone()),
-                ipam_region: Some(spec.region.clone()),
-                is_default: Some(true),
-                resource_discovery_status: Some(
-                    IPAM_RESOURCE_DISCOVERY_STATUS_ACTIVE.to_string(),
-                ),
-                state: Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS.to_string()),
-                tags: Some(Vec::new()),
-            },
+            ipam_resource_discovery_association_view(
+                &association_id,
+                IpamResourceDiscoveryLink {
+                    ipam_id: &ipam_id,
+                    ipam_arn: Some(ipam_arn.clone()),
+                    ipam_region: Some(spec.region.clone()),
+                    discovery_id: &resource_discovery_id,
+                    owner_id: Some(owner_id.clone()),
+                },
+                true,
+                // The tags of the request are the IPAM's; nothing tagged this association.
+                Vec::new(),
+            ),
         );
 
         let ipam = Ipam {
@@ -28663,6 +28707,245 @@ impl ComAmazonawsEc2Amazonec2State {
             }
         }
     }
+
+    /// Whether another resource discovery association fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// The same contract as [`Self::has_ipam_scope_capacity`]: nothing in this emulator
+    /// reclaims an association, so a writer asks first and refuses when it answers `false`.
+    pub fn has_ipam_resource_discovery_association_capacity(&self) -> bool {
+        self.ipam_resource_discovery_associations.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// The association this store holds between the IPAM `ipam_id` names and the resource
+    /// discovery `discovery_id` names, if it holds one.
+    ///
+    /// One IPAM-and-discovery PAIR holds at most one association — an association is the link
+    /// between exactly those two resources, so a second link between the same pair would say
+    /// nothing the first does not. The ONE definition of that question, so the writer below
+    /// and every operation that asks it read the same pair.
+    pub fn ipam_resource_discovery_association(
+        &self,
+        ipam_id: &str,
+        discovery_id: &str,
+    ) -> Option<&IpamResourceDiscoveryAssociation> {
+        self.ipam_resource_discovery_associations
+            .values()
+            .find(|association| {
+                association.ipam_id.as_deref() == Some(ipam_id)
+                    && association.ipam_resource_discovery_id.as_deref() == Some(discovery_id)
+            })
+    }
+
+    /// Store the association a caller asked for between the IPAM `ipam_id` names and the
+    /// resource discovery `discovery_id` names, and answer the
+    /// `IpamResourceDiscoveryAssociationId` it was given — or `None` when the store is at its
+    /// ceiling, or when either resource is not held, and nothing was stored.
+    ///
+    /// The ONE way a CALLER-MADE association is stored, the counterpart of
+    /// [`Self::insert_created_ipam_scope`] for the link between an IPAM and a discovery: the
+    /// id and the ARN are minted here, "the IPAM ARN" and "the IPAM home Region"
+    /// (`IpamResourceDiscoveryAssociation$IpamArn` / `$IpamRegion`) are taken from the stored
+    /// IPAM and "the Amazon Web Services account ID of the resource discovery owner"
+    /// (`$OwnerId`) from the stored discovery, so an association can never report a resource
+    /// this store does not hold. The association is answered in the non-terminal
+    /// `associate-in-progress` state, so the clock owes it
+    /// [`IPAM_ASSOCIATION_STATE_ASSOCIATE_COMPLETE`] one [`TRANSITION_DELAY`] later
+    /// ([`Self::ipam_resource_discovery_association_complete_at`], applied by
+    /// [`Self::materialize_due_transitions`]); `client_token` names the association from here
+    /// on so a replay of the same request answers it instead of making a second one; the
+    /// IPAM's own count of the associations against it is recounted; and every caller-chosen
+    /// byte the record retains is charged to the store's byte budget.
+    pub fn insert_ipam_resource_discovery_association(
+        &mut self,
+        ipam_id: &str,
+        discovery_id: &str,
+        client_token: Option<&str>,
+        tags: Vec<Tag>,
+    ) -> Option<String> {
+        if !self.has_ipam_resource_discovery_association_capacity() {
+            return None;
+        }
+        let ipam = self.ipams.get(ipam_id)?;
+        let ipam_arn = ipam.ipam_arn.clone();
+        let ipam_region = ipam.ipam_region.clone();
+        let owner_id = self
+            .ipam_resource_discoveries
+            .get(discovery_id)?
+            .owner_id
+            .clone();
+        let retained = tag_list_bytes(&tags)
+            + client_token.unwrap_or_default().len()
+            + STORED_RECORD_OVERHEAD_BYTES;
+        let association_id = self.next_id(IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_PREFIX);
+        self.ipam_resource_discovery_associations.insert(
+            association_id.clone(),
+            ipam_resource_discovery_association_view(
+                &association_id,
+                IpamResourceDiscoveryLink {
+                    ipam_id,
+                    ipam_arn,
+                    ipam_region,
+                    discovery_id,
+                    owner_id,
+                },
+                // "When you create an IPAM, a default resource discovery is created for your
+                // IPAM and it's associated with your IPAM"
+                // (`IpamResourceDiscoveryAssociation$IsDefault`): only that one association
+                // is a default one, so one a caller asked for is not.
+                false,
+                tags,
+            ),
+        );
+        self.add_stored_bytes(retained);
+        self.ipam_resource_discovery_association_complete_at
+            .insert(association_id.clone(), Instant::now() + TRANSITION_DELAY);
+        if let Some(token) = client_token {
+            self.ipam_resource_discovery_association_client_tokens
+                .insert(token.to_string(), association_id.clone());
+        }
+        self.recount_ipam_resource_discovery_associations(ipam_id);
+        Some(association_id)
+    }
+
+    /// Set the IPAM's `ResourceDiscoveryAssociationCount` to the number of associations this
+    /// store now holds against it.
+    ///
+    /// "The IPAM's resource discovery association count"
+    /// (`Ipam$ResourceDiscoveryAssociationCount`) is DERIVED from the associations
+    /// themselves, so it is recounted from them rather than incremented — the same contract
+    /// [`Self::recount_ipam_scopes`] has for an IPAM's scope count.
+    fn recount_ipam_resource_discovery_associations(&mut self, ipam_id: &str) {
+        let associations = self
+            .ipam_resource_discovery_associations
+            .values()
+            .filter(|association| association.ipam_id.as_deref() == Some(ipam_id))
+            .count();
+        if let Some(ipam) = self.ipams.get_mut(ipam_id) {
+            ipam.resource_discovery_association_count = i32::try_from(associations).ok();
+        }
+    }
+}
+
+/// What one resource discovery association LINKS, read off the two stored resources it names:
+/// the IPAM (its id, its ARN and its home Region) and the resource discovery (its id and the
+/// account that owns it).
+///
+/// Carried as one value so [`ipam_resource_discovery_association_view`] takes the two sides of
+/// the link rather than five loose members, and so neither writer can pass the ARN of one IPAM
+/// beside the id of another.
+struct IpamResourceDiscoveryLink<'facts> {
+    /// "The IPAM ID" (`IpamResourceDiscoveryAssociation$IpamId`).
+    ipam_id: &'facts str,
+    /// "The IPAM ARN" (`$IpamArn`), as the stored IPAM reports it.
+    ipam_arn: Option<String>,
+    /// "The IPAM home Region" (`$IpamRegion`), as the stored IPAM reports it.
+    ipam_region: Option<String>,
+    /// "The resource discovery ID" (`$IpamResourceDiscoveryId`).
+    discovery_id: &'facts str,
+    /// "The Amazon Web Services account ID of the resource discovery owner" (`$OwnerId`), as
+    /// the stored discovery reports it.
+    owner_id: Option<String>,
+}
+
+/// One resource discovery association as the model shapes it, built from the facts of the two
+/// resources it links.
+///
+/// The ONE constructor of that shape, called by both of its writers —
+/// [`ComAmazonawsEc2Amazonec2State::insert_ipam`] for the default association an IPAM comes up
+/// with and
+/// [`ComAmazonawsEc2Amazonec2State::insert_ipam_resource_discovery_association`] for one a
+/// caller asked for — so the two cannot drift apart over a member one of them sets and the
+/// other forgets. The ARN is derived from the id here rather than passed in, and every
+/// association starts in the non-terminal state of an association being made
+/// ([`IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS`]) with the discovery's results readable
+/// ("`active` - Connection or permissions required to read the results of the resource
+/// discovery are intact", `$ResourceDiscoveryStatus`), which is true of every discovery this
+/// store holds.
+fn ipam_resource_discovery_association_view(
+    association_id: &str,
+    link: IpamResourceDiscoveryLink<'_>,
+    is_default: bool,
+    tags: Vec<Tag>,
+) -> IpamResourceDiscoveryAssociation {
+    IpamResourceDiscoveryAssociation {
+        owner_id: link.owner_id,
+        ipam_resource_discovery_association_id: Some(association_id.to_string()),
+        ipam_resource_discovery_association_arn: Some(ipam_resource_arn(
+            RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY_ASSOCIATION,
+            association_id,
+        )),
+        ipam_resource_discovery_id: Some(link.discovery_id.to_string()),
+        ipam_id: Some(link.ipam_id.to_string()),
+        ipam_arn: link.ipam_arn,
+        ipam_region: link.ipam_region,
+        is_default: Some(is_default),
+        resource_discovery_status: Some(IPAM_RESOURCE_DISCOVERY_STATUS_ACTIVE.to_string()),
+        state: Some(IPAM_ASSOCIATION_STATE_ASSOCIATE_IN_PROGRESS.to_string()),
+        tags: Some(tags),
+    }
+}
+
+/// `InvalidIpamResourceDiscoveryId.Malformed` (HTTP 400): the request named something that is
+/// not an IPAM resource discovery id at all, so there is nothing to look up — the counterpart
+/// of [`INVALID_IPAM_ID_MALFORMED`] for the discovery.
+pub const INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED: &str =
+    "InvalidIpamResourceDiscoveryId.Malformed";
+
+/// `InvalidIpamResourceDiscoveryId.NotFound` (HTTP 400): the request named a well-formed IPAM
+/// resource discovery id this account holds no discovery for — the code AWS answers an
+/// `AssociateIpamResourceDiscovery` naming an unknown discovery with, as the recorded wire
+/// corpus behind this operation's stub issue shows.
+pub const INVALID_IPAM_RESOURCE_DISCOVERY_ID_NOT_FOUND: &str =
+    "InvalidIpamResourceDiscoveryId.NotFound";
+
+/// Whether `id` is a well-formed IPAM resource discovery id — one this service could have
+/// ISSUED.
+///
+/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
+/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
+/// ([`IPAM_RESOURCE_DISCOVERY_ID_PREFIX`]). An ASSOCIATION id is therefore not one:
+/// `ipam-res-disco-assoc-…` leaves a suffix that is no run of hex digits, so the two
+/// resources of that shared prefix cannot be confused.
+pub fn ipam_resource_discovery_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(IPAM_RESOURCE_DISCOVERY_ID_PREFIX, id)
+}
+
+/// Refuse something that is not an IPAM resource discovery id at all: HTTP 400
+/// `InvalidIpamResourceDiscoveryId.Malformed`, worded the way this crate words a malformed id
+/// of an IPAM resource ([`invalid_ipam_policy_id_malformed`]) and built from the request's own
+/// value.
+pub fn invalid_ipam_resource_discovery_id_malformed<E>(id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED,
+        400,
+        format!("The {RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY} ID '{id}' is malformed"),
+    )
+}
+
+/// Refuse a well-formed IPAM resource discovery id this account holds no discovery for: HTTP
+/// 400 `InvalidIpamResourceDiscoveryId.NotFound`, worded by the one writer of that refusal
+/// ([`id_not_found`]).
+pub fn invalid_ipam_resource_discovery_id_not_found<E>(id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_IPAM_RESOURCE_DISCOVERY_ID_NOT_FOUND,
+        &format!("{RESOURCE_TYPE_IPAM_RESOURCE_DISCOVERY} ID"),
+        id,
+    )
+}
+
+/// Refuse an `IpamResourceDiscoveryId` whose FORM is not one this service issues: HTTP 400
+/// `InvalidIpamResourceDiscoveryId.Malformed`.
+///
+/// The first of the two questions an operation taking a discovery id asks, and the one that is
+/// asked BEFORE `DryRun`: "not an id of this kind" is a fact about the request itself, while
+/// "no such discovery" is a fact about the account — the order
+/// [`require_well_formed_id`] documents for every other resource of this module.
+pub fn require_well_formed_ipam_resource_discovery_id<E>(id: &str) -> Result<(), Scaffolded<E>> {
+    if ipam_resource_discovery_id_is_well_formed(id) {
+        return Ok(());
+    }
+    Err(invalid_ipam_resource_discovery_id_malformed(id))
 }
 
 // =============================================================================
