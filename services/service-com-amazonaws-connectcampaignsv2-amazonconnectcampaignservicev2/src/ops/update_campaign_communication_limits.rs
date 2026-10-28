@@ -199,46 +199,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // One guard spans the lookup and the write, so a concurrent delete cannot
-        // leave this config on a record that is no longer in the store.
-        // A campaign is reachable only through the endpoint of the region it was
-        // created in, so the id is resolved in the region this request was signed for
-        // and the write never reaches another region's campaign.
+        // The configuration-change rule itself — resolve the campaign in the region
+        // this request was signed for, and refuse one the clock has in a state that
+        // takes no further configuration change — lives once on the store
+        // (`configurable_campaign`), so this call and every sibling configuration call
+        // judge a campaign by one rule and refuse it with one sentence. One guard spans
+        // that lookup and the write below, so a concurrent delete cannot leave this
+        // config on a record that is no longer in the store. What belongs to THIS
+        // operation is its own write and the mapping from a rejection to the error
+        // variant its own model declares.
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        let Some(campaign) = store.campaign_mut(&region, &input.id) else {
-            return Err(
-                UpdateCampaignCommunicationLimitsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
-                        x_amz_error_type: None,
-                    },
-                )
-                .into(),
-            );
+        let campaign = match store.configurable_campaign(
+            crate::state::CampaignRef {
+                region: &region,
+                id: &input.id,
+            },
+            ::std::time::SystemTime::now(),
+        ) {
+            Ok(campaign) => campaign,
+            Err(rejected) => {
+                return Err(match rejected {
+                    // This region holds no campaign under that id: there is no
+                    // override to replace, and nothing was written.
+                    crate::state::ConfigurationRejected::NotFound => {
+                        UpdateCampaignCommunicationLimitsErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: rejected.message(),
+                                x_amz_error_type: None,
+                            },
+                        )
+                    }
+                    // The campaign is at a state that takes no further configuration
+                    // change, which the refusal names — a campaign whose scheduled run
+                    // window has closed is `Completed`, so that is the state reported
+                    // rather than the one the last lifecycle call wrote.
+                    crate::state::ConfigurationRejected::NotConfigurable { state: current } => {
+                        UpdateCampaignCommunicationLimitsErrorModeled::InvalidCampaignStateException(
+                            InvalidCampaignStateException {
+                                state: current.as_wire().to_string(),
+                                message: rejected.message(),
+                                x_amz_error_type: None,
+                            },
+                        )
+                    }
+                }
+                .into());
+            }
         };
-
-        // A campaign in a terminal lifecycle state takes no further configuration
-        // change (see `CampaignState::accepts_configuration_change`), which is what
-        // this operation's `InvalidCampaignStateException` reports. The state is the
-        // one the campaign is at NOW: a campaign whose scheduled run window has
-        // closed has finished, so it is past being reconfigured.
-        let current = campaign.state_at(::std::time::SystemTime::now());
-        if !current.accepts_configuration_change() {
-            return Err(
-                UpdateCampaignCommunicationLimitsErrorModeled::InvalidCampaignStateException(
-                    InvalidCampaignStateException {
-                        state: current.as_wire().to_string(),
-                        message: format!(
-                            "A campaign in state {} cannot be reconfigured",
-                            current.as_wire()
-                        ),
-                        x_amz_error_type: None,
-                    },
-                )
-                .into(),
-            );
-        }
 
         // The whole of the operation's effect: the campaign's communication limits
         // override is now the config the request carried, replacing whatever it held.

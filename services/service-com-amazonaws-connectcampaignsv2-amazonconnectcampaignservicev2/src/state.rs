@@ -1544,6 +1544,39 @@ impl LifecycleRejected {
     }
 }
 
+/// Why the store refused a configuration change to a campaign, as
+/// [`ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State::configurable_campaign`]
+/// reports it. Nothing is written in either case.
+///
+/// [`Self::message`] carries the sentence the refusal is worded with, so every
+/// campaign-configuration operation refuses alike while each maps the rejection to the
+/// error variant its own model declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigurationRejected {
+    /// The region holds no campaign under that id, so there is no configuration to
+    /// change. The caller answers this with the modelled `ResourceNotFoundException`
+    /// (HTTP 404).
+    NotFound,
+    /// The campaign is at `state` at the instant the call was judged and that state
+    /// takes no further configuration change (see
+    /// [`CampaignState::accepts_configuration_change`]). The caller answers this with
+    /// the modelled `InvalidCampaignStateException` (HTTP 409), whose `state` member
+    /// carries `state.as_wire()`.
+    NotConfigurable { state: CampaignState },
+}
+
+impl ConfigurationRejected {
+    /// The sentence this refusal is reported with.
+    pub fn message(self) -> String {
+        match self {
+            Self::NotFound => CAMPAIGN_NOT_FOUND_MESSAGE.to_string(),
+            Self::NotConfigurable { state } => {
+                format!("A campaign in state {} cannot be reconfigured", state.as_wire())
+            }
+        }
+    }
+}
+
 /// The records of ONE region: everything a client talking to that region's endpoint
 /// can see or change.
 ///
@@ -1809,6 +1842,44 @@ impl ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State {
         };
         stored.lifecycle_state = next;
         Ok(next)
+    }
+
+    /// The campaign `campaign` names, for a handler about to change its
+    /// CONFIGURATION — or the refusal that handler answers instead, judged against the
+    /// state the campaign is at `now`.
+    ///
+    /// The one place the configuration-change rule of this service lives, so
+    /// `UpdateCampaignSource`, `UpdateCampaignSchedule`,
+    /// `UpdateCampaignFlowAssociation`, the communication-limits, communication-time
+    /// and entry-limits updates and their deletions cannot disagree about it: the id is
+    /// resolved in the region the request was signed for (a campaign is reachable only
+    /// through the endpoint of the region it was created in, so a configuration write
+    /// never reaches another region's campaign), and the state judged is the
+    /// CLOCK-derived one ([`StoredCampaign::state_at`] — a campaign whose scheduled run
+    /// window has closed is `Completed`, which takes no further configuration change)
+    /// rather than the one the last lifecycle call wrote.
+    ///
+    /// A refusal ([`ConfigurationRejected`]) hands back no record, so nothing is
+    /// written, and names the state it judged so the caller's refusal can report it.
+    /// What belongs to the CALLING operation is only its own write and the mapping from
+    /// a rejection to the error variant its model declares.
+    ///
+    /// The lookup, the check and the write happen under the one lock the caller holds,
+    /// so a concurrent delete of the campaign cannot leave a configuration change on a
+    /// record no longer in the store.
+    pub fn configurable_campaign(
+        &mut self,
+        campaign: CampaignRef<'_>,
+        now: SystemTime,
+    ) -> Result<&mut StoredCampaign, ConfigurationRejected> {
+        let Some(stored) = self.campaign_mut(campaign.region, campaign.id) else {
+            return Err(ConfigurationRejected::NotFound);
+        };
+        let current = stored.state_at(now);
+        if !current.accepts_configuration_change() {
+            return Err(ConfigurationRejected::NotConfigurable { state: current });
+        }
+        Ok(stored)
     }
 
     /// Remove the campaign `region` stores under `id`, returning it when it was there.
