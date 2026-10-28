@@ -15,11 +15,16 @@
 //! minted form (a character flipped inside the minted alphabet and width, a
 //! width either side of it, a digit outside the alphabet, another service's id
 //! form, prose, the longest value the model allows), which operation was called,
-//! and therefore which parameter the outer clause names.
+//! and therefore which parameter the outer clause names; and, for the cause
+//! clause, along the characters the value carries (JSON metacharacters, a
+//! newline, non-ASCII text, the clause separator itself) and along whether the
+//! request carried a member the refusal is not about.
+
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_xray_awsxray::state::RETRIEVAL_STATUS_CANCELLED;
+use service_com_amazonaws_xray_awsxray::state::{retrieval_token_check, RETRIEVAL_STATUS_CANCELLED};
 
 use super::xray_wire::{root_document, trace_id, Xray};
 
@@ -159,6 +164,100 @@ async fn a_malformed_retrieval_token_is_named_in_both_clauses_of_the_refusal() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn the_cause_clause_is_one_phrase_whatever_the_value_or_the_other_members() {
+    let xray = Xray::new();
+
+    // The minted width and alphabet, upper-cased, over a check half that is
+    // deliberately NOT the one the mint derives for that identifying half — so
+    // the value is one this service could not have issued however it is cased.
+    let identity = "0123456789abcdef";
+    let miscased =
+        format!("{identity}{}", flip_digit(&retrieval_token_check(identity), 0)).to_uppercase();
+
+    // Rows differ in the CHARACTERS the value carries rather than only in how it
+    // misses the minted form: the submitted value is echoed into the sentence
+    // verbatim, and `RetrievalToken` is modelled `@length` 0..1020 with no
+    // `@pattern` (`smithy_query(query="shape",shape="RetrievalToken")`), so each
+    // of these reaches the handler rather than the request layer.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a value carrying JSON metacharacters",
+            "not\"a\\token".to_string(),
+        ),
+        ("a value carrying a newline", "first\nsecond".to_string()),
+        ("a value of non-ASCII text", "\u{30c8}\u{30fc}\u{30af}\u{30f3}".to_string()),
+        ("a value of spaces alone", "   ".to_string()),
+        ("the clause separator inside the value", "a passed: b".to_string()),
+        (
+            "the minted width and alphabet upper-cased, carrying no check",
+            miscased,
+        ),
+    ];
+
+    // Every cause clause the matrix below produced: the rule is that there is
+    // exactly ONE, whatever the operation and whatever the value.
+    let mut causes: BTreeSet<String> = BTreeSet::new();
+
+    for (case, token) in &rows {
+        for (operation, path, member) in TOKEN_READERS {
+            let expected = format!("Invalid {member} {token} passed: {DECODER_CLAUSE}");
+            let refused = xray.call(path, &body(path, token)).await;
+            assert_eq!(
+                (refused.status, refused.error_type.as_deref()),
+                (400, Some("InvalidRequestException")),
+                "case {case:?} on {operation}: expected 400 InvalidRequestException, got {refused:?}"
+            );
+            let said = refused.message().unwrap_or_default().to_string();
+            assert_eq!(
+                said, expected,
+                "case {case:?} on {operation}: expected {expected:?}, got {said:?}"
+            );
+            // Split from the END, so a value that itself contains the separator
+            // still yields the sentence's trailing cause clause.
+            let (_, cause) = said.rsplit_once(" passed: ").unwrap_or_else(|| {
+                panic!("case {case:?} on {operation}: expected two clauses, got {said:?}")
+            });
+            causes.insert(cause.to_string());
+
+            // Nothing in the sentence is derived per call: the same refusal
+            // asked for twice is the same sentence.
+            let again = xray.call(path, &body(path, token)).await;
+            assert_eq!(
+                again.message().unwrap_or_default(),
+                said,
+                "case {case:?} on {operation}: the refusal must not vary between calls, got {again:?}"
+            );
+
+            // A member the refusal is not about cannot change it: the two
+            // readers that model `NextToken`
+            // (`smithy_query(query="operation",operation="ListRetrievedTraces,
+            // GetRetrievedTracesGraph")`) judge the token before any paging.
+            if path != "/CancelTraceRetrieval" {
+                let mut paging = body(path, token);
+                paging["NextToken"] = json!("0");
+                let paged = xray.call(path, &paging).await;
+                assert_eq!(
+                    (paged.status, paged.error_type.as_deref()),
+                    (400, Some("InvalidRequestException")),
+                    "case {case:?} on {operation}: an unrelated member must not change the class of the refusal, got {paged:?}"
+                );
+                assert_eq!(
+                    paged.message().unwrap_or_default(),
+                    said,
+                    "case {case:?} on {operation}: an unrelated member must not change the refusal, got {paged:?}"
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        causes.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec![DECODER_CLAUSE],
+        "the cause clause must be one fixed phrase across every operation and value, got {causes:?}"
+    );
 }
 
 #[tokio::test]
