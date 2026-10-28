@@ -1777,12 +1777,17 @@ impl CustomLineItemRecord {
 
     /// Is this item in effect in no billing period at all — in none of its generations
     /// — so that nothing of it is left for a read to report?
+    ///
+    /// Which is exactly: no generation of it is a version of it anywhere — the rule
+    /// [`Self::versions`] reports by ([`CustomLineItemVersion::applies_anywhere`]), asked
+    /// of the live generation's own billing periods rather than of a projection of it, so
+    /// the two answers cannot disagree about an item a write emptied.
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
             && self
                 .superseded_versions
                 .iter()
-                .all(|version| version.spans.is_empty())
+                .all(|version| !version.applies_anywhere())
     }
 
     /// Take the billing periods `removed` names out of this item, and report what that
@@ -1810,6 +1815,11 @@ impl CustomLineItemRecord {
             }
         }
         if outcome == PeriodsRemoval::Changed {
+            // A generation this removal left no billing period to is not a version of
+            // the item in any period, so there is nothing for a read to report it for —
+            // the rule the write path that supersedes a generation enforces too
+            // ([`ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]).
+            superseded.retain(CustomLineItemVersion::applies_anywhere);
             self.spans = spans;
             self.superseded_versions = superseded;
         }
@@ -1839,11 +1849,21 @@ impl CustomLineItemRecord {
         }
     }
 
-    /// Every generation of this item, OLDEST FIRST: the ones later writes superseded,
-    /// frozen as they stood, and then the one in effect now.
+    /// Every generation of this item that is a VERSION of it somewhere, OLDEST FIRST:
+    /// the ones later writes superseded, frozen as they stood, and then the one in
+    /// effect now.
+    ///
+    /// A generation applying in no billing period at all is a version of the item in
+    /// none of them ([`CustomLineItemVersion::applies_anywhere`]), so it is not among
+    /// these: a read of the history reports the same generations a read scoped to a
+    /// billing period can find ([`Self::effective_in`]). A write drops the generations
+    /// it empties, but the generation in effect NOW is projected from the record itself
+    /// and so outlives a write that took its last billing period while an earlier
+    /// generation still applies — the one case the rule has to hold here.
     pub fn versions(&self) -> Vec<CustomLineItemVersion> {
         let mut versions = self.superseded_versions.clone();
         versions.push(self.current_version());
+        versions.retain(CustomLineItemVersion::applies_anywhere);
         versions
     }
 
@@ -1921,6 +1941,16 @@ impl CustomLineItemVersion {
     /// [`billing_period_range_covers`].
     pub fn covers(&self, billing_period: &str) -> bool {
         self.spans.iter().any(|span| span.covers(billing_period))
+    }
+
+    /// Does this generation apply in at least one billing period — is it a VERSION of
+    /// the item anywhere?
+    ///
+    /// A generation is a version of the item in the billing periods it applies in, so a
+    /// write that leaves it none leaves no version of the item to report: no read
+    /// reports such a generation and no write keeps one.
+    pub fn applies_anywhere(&self) -> bool {
+        !self.spans.is_empty()
     }
 
     /// `StartBillingPeriod`: the billing period this generation is in effect FROM,
@@ -2767,8 +2797,8 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             }
             // A generation this write left no billing period to is not a version of the
             // item in any period, so there is nothing for a read to report it for.
-            kept.retain(|version| !version.spans.is_empty());
-            if !replaced.spans.is_empty() {
+            kept.retain(CustomLineItemVersion::applies_anywhere);
+            if replaced.applies_anywhere() {
                 kept.push(replaced);
                 updated.version_start_time_millis = now;
             }

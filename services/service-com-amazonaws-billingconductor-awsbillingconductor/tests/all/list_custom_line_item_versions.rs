@@ -149,6 +149,20 @@ impl Emulator {
         );
     }
 
+    /// `DeleteCustomLineItem` on `arn` with whatever other members `request` carries,
+    /// which this case requires to succeed.
+    async fn delete_ok(&self, case: &str, arn: &str, request: Value) {
+        let mut body = json!({ "Arn": arn });
+        for (member, value) in object(&request) {
+            body[member] = value;
+        }
+        let (status, response) = self.send("POST", "/delete-custom-line-item", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete to answer HTTP 200, got {status} with {response}"
+        );
+    }
+
     /// `BatchAssociateResourcesToCustomLineItem`, which this case requires to succeed.
     async fn associate_ok(&self, case: &str, target: &str, resources: &[String]) {
         let (status, response) = self
@@ -545,6 +559,152 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
                  starting at {start_time} after {previous_start_time}"
             );
             previous_start_time = start_time;
+        }
+    }
+}
+
+/// One row of the emptied-generation table: the case, the range the create names, the
+/// update bodies to apply in order, the `BillingPeriodRange` of the delete that follows
+/// (absent where the row makes its history with writes only), and the span of every
+/// version expected afterwards, oldest first.
+type EmptiedRow = (&'static str, Value, Vec<Value>, Option<Value>, Vec<Span>);
+
+/// THE RULE on a generation left applying nowhere: a generation is a version of the item
+/// in the billing periods it applies in, so a write that takes its last billing period
+/// away leaves no version of the item for a read to report — whichever write took it (an
+/// update superseding the generation, a delete bounded to a range) and whichever
+/// generation it was (one an earlier write froze, or the one in effect now). What a
+/// version read reports and what a read scoped to a billing period reports are therefore
+/// the same generations.
+///
+/// The rows span what the rule generalises over: which write empties the generation
+/// (update, delete), which generation it empties (the frozen one, the live one, both and
+/// neither), whether the delete's range has an exclusive end, whether it falls at a
+/// generation's start, inside it or across two of them, how many generations the item has
+/// when the delete lands, and how a month is spelled.
+#[tokio::test]
+async fn a_generation_left_in_no_billing_period_is_no_version_of_the_item() {
+    let rows: Vec<EmptiedRow> = vec![
+        (
+            "a delete takes the frozen generation's only billing period",
+            period_range(&period(-1), None),
+            vec![json!({ "BillingPeriodRange": period_range(&period(0), None) })],
+            Some(period_range(&period(-1), Some(&period(0)))),
+            vec![(period(0), None)],
+        ),
+        (
+            "a delete with no end takes the live generation's billing periods",
+            period_range(&period(-1), None),
+            vec![json!({ "BillingPeriodRange": period_range(&period(0), None) })],
+            Some(period_range(&period(0), None)),
+            vec![(period(-1), Some(period(0)))],
+        ),
+        (
+            "a delete across both generations leaves only what follows it",
+            period_range(&period(-1), None),
+            vec![json!({ "BillingPeriodRange": period_range(&period(0), None) })],
+            Some(period_range(&period(-1), Some(&period(1)))),
+            vec![(period(1), None)],
+        ),
+        (
+            "a delete inside the live generation empties neither",
+            period_range(&period(-1), None),
+            vec![json!({ "BillingPeriodRange": period_range(&period(0), None) })],
+            Some(period_range(&period(0), Some(&period(1)))),
+            vec![(period(-1), Some(period(0))), (period(1), None)],
+        ),
+        (
+            "a delete on an item with one generation leaves the periods after it",
+            period_range(&period(-1), None),
+            vec![],
+            Some(period_range(&period(-1), Some(&period(0)))),
+            vec![(period(0), None)],
+        ),
+        (
+            "a delete of billing periods the item never applied in changes no history",
+            period_range(&period(0), None),
+            vec![],
+            Some(period_range(&period(-1), Some(&period(0)))),
+            vec![(period(0), None)],
+        ),
+        (
+            "a delete whose month is spelled without its leading zero",
+            period_range(&period(-1), None),
+            vec![json!({ "BillingPeriodRange": period_range(&period(0), None) })],
+            Some(period_range(
+                &one_digit_month(&period(-1)),
+                Some(&one_digit_month(&period(0))),
+            )),
+            vec![(period(0), None)],
+        ),
+        (
+            "an update superseding the whole earlier generation",
+            period_range(&period(-1), None),
+            vec![
+                json!({ "BillingPeriodRange": period_range(&period(0), None) }),
+                json!({ "BillingPeriodRange": period_range(&period(-1), None) }),
+            ],
+            None,
+            vec![(period(-1), None)],
+        ),
+    ];
+
+    for (case, create, updates, deleted, expected) in rows {
+        let (emulator, _, item) = fixture(json!({ "BillingPeriodRange": create })).await;
+        for update in &updates {
+            emulator.update_ok(case, &item, update.clone()).await;
+        }
+        if let Some(range) = deleted {
+            emulator
+                .delete_ok(case, &item, json!({ "BillingPeriodRange": range }))
+                .await;
+        }
+
+        let reported = emulator.versions_ok(case, &item, json!({})).await;
+        let actual = spans(&reported);
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "case {case:?}: expected {} versions, got {actual:?}",
+            expected.len()
+        );
+        for (index, ((start, end), (expected_start, expected_end))) in
+            actual.iter().zip(expected.iter()).enumerate()
+        {
+            assert!(
+                same_period(start.as_deref(), Some(expected_start.as_str())),
+                "case {case:?}: expected version {index} to start in {expected_start:?}, got \
+                 {start:?}"
+            );
+            assert!(
+                same_period(end.as_deref(), expected_end.as_deref()),
+                "case {case:?}: expected version {index} to end at {expected_end:?}, got {end:?}"
+            );
+        }
+
+        // Every reported version applies in at least one billing period: its range
+        // covers one (an exclusive end at its inclusive start would cover none), and the
+        // read scoped to the period it starts in reports the item for that period too.
+        for (index, (start, end)) in actual.iter().enumerate() {
+            let bounds = (
+                start.as_deref().and_then(period_key),
+                end.as_deref().and_then(period_key),
+            );
+            if let (Some(start_key), Some(end_key)) = bounds {
+                assert!(
+                    end_key > start_key,
+                    "case {case:?}: expected version {index} to end after it starts, got \
+                     {start:?} and {end:?}"
+                );
+            }
+            let Some(start) = start.as_deref() else {
+                panic!("case {case:?}: expected version {index} to name a StartBillingPeriod");
+            };
+            assert!(
+                emulator.item(case, &item, start).await.is_some(),
+                "case {case:?}: expected the item read for {start:?} to report the item version \
+                 {index} applies there, got no item"
+            );
         }
     }
 }

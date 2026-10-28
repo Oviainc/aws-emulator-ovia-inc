@@ -153,8 +153,10 @@ fn end_billing_period(
 /// `CustomLineItemBillingPeriodRange` a write carries, whose members spell both out —
 /// so both of its bounds are read as INCLUSIVE and an absent bound as open. A
 /// generation is selected when its own half-open span shares at least one billing
-/// period with that span; a generation superseded inside its own start period applies
-/// in no billing period at all and so is selected by no filter.
+/// period with that span. Every generation reaching this filter applies in some billing
+/// period, because a generation that applies in none is a version of the item nowhere
+/// and is not reported at all
+/// ([`crate::state::CustomLineItemRecord::versions`]).
 fn in_filter(
     start_billing_period: &str,
     end_billing_period: Option<&str>,
