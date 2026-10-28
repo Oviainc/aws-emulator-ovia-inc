@@ -47,6 +47,8 @@ mod run_report_agreement;
 mod run_stop;
 #[path = "all/run_task_instances.rs"]
 mod run_task_instances;
+#[path = "all/run_version_task_graph.rs"]
+mod run_version_task_graph;
 #[path = "all/scheduled_workflow_runs.rs"]
 mod scheduled_workflow_runs;
 #[path = "all/state_roundtrip.rs"]

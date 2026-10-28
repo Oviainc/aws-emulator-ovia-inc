@@ -212,7 +212,10 @@ async fn assert_readers_agree(
 }
 
 /// The `WorkflowVersion` a workflow currently reports.
-async fn current_version(router: &MultiServiceRouter, arn: &str, case: &str) -> String {
+///
+/// `pub(crate)` so another suite whose rule is about WHICH version a run executes reads
+/// it through the same call rather than keeping a second copy of it.
+pub(crate) async fn current_version(router: &MultiServiceRouter, arn: &str, case: &str) -> String {
     let (status, fetched) = call(router, "GetWorkflow", json!({"WorkflowArn": arn})).await;
     assert_eq!(
         status, 200,
