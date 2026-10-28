@@ -292,6 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .input_attachments
                 .as_deref()
                 .unwrap_or(&stored.input_attachments),
+            channel_security_groups: input
+                .channel_security_groups
+                .as_deref()
+                .unwrap_or(&stored.channel_security_groups),
         });
         if !problems.is_empty() {
             return Err(unprocessable(problems));

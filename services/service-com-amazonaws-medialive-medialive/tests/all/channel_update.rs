@@ -262,17 +262,20 @@ async fn an_update_replaces_only_the_members_the_request_names() {
         let id = idle_channel(&router, case, baseline_body()).await;
         let (_, before) = describe(&router, &id).await;
 
-        // Every `inputId` the patch names has to resolve to an input of this
-        // account, so the patch is pointed at inputs the account really holds
-        // before it is submitted — and an attachment list is then expected back
-        // exactly as it was SUBMITTED. Every other member is expected as the row
-        // spells it, which is not always what the request carried (a maintenance
-        // patch names one member and leaves the others alone).
-        let patch = crate::support::resolved_channel_attachments(&router, patch).await;
+        // Every id the patch names has to resolve to a resource of this account,
+        // so the patch is pointed at the inputs and input security groups the
+        // account really holds before it is submitted — and a reference list is
+        // then expected back exactly as it was SUBMITTED. Every other member is
+        // expected as the row spells it, which is not always what the request
+        // carried (a maintenance patch names one member and leaves the others
+        // alone).
+        let patch = crate::support::resolved_channel_references(&router, patch).await;
         let changes: Vec<(&str, Value)> = changes
             .into_iter()
             .map(|(member, expected)| match (member, patch.get(member)) {
-                ("inputAttachments", Some(submitted)) => (member, submitted.clone()),
+                ("inputAttachments" | "channelSecurityGroups", Some(submitted)) => {
+                    (member, submitted.clone())
+                }
                 _ => (member, expected),
             })
             .collect();
@@ -673,7 +676,7 @@ async fn an_update_this_emulator_cannot_store_is_refused() {
         // input of this account, so the patch is resolved before it is
         // submitted and the list expected back is the one submitted.
         let patch =
-            crate::support::resolved_channel_attachments(&router, json!({ member: entries })).await;
+            crate::support::resolved_channel_references(&router, json!({ member: entries })).await;
         let entries = patch[member].clone();
         let (status, body) = update_channel(&router, &id, patch).await;
         if accepted {

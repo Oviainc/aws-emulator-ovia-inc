@@ -15,10 +15,13 @@
 //!   encodes through (`EncoderSettings` is "Encoder Settings"), so a request that
 //!   declares none describes no channel this service could run;
 //! * every id the configuration names has to resolve to a resource this account
-//!   holds — an `InputAttachment`'s `InputId` is "The ID of the input", and an id
-//!   no input of this account answers to would leave the channel claiming an
-//!   attachment to an input no read of the account can show (and the input-side
-//!   derivation of the channels attached to an input matching nothing).
+//!   holds — an `InputAttachment`'s `InputId` is "The ID of the input" and a
+//!   `ChannelSecurityGroups` entry is one of the "IDs for all the Input Security
+//!   Groups attached to the channel", and an id no such resource of this account
+//!   answers to would leave the channel claiming a resource no read of the
+//!   account can show (and the resource-side derivation of the channels using it
+//!   — [`super::ComAmazonawsMedialiveMedialiveState::channels_using_security_group`]
+//!   — matching nothing).
 //!
 //! Each problem found is reported as ONE
 //! `UnprocessableEntityException$ValidationErrors` entry ("A collection of
@@ -44,6 +47,9 @@ pub struct ChannelConfiguration<'a> {
     pub encoder_settings: Option<&'a EncoderSettings>,
     /// `InputAttachments` — "List of input attachments for channel".
     pub input_attachments: &'a [InputAttachment],
+    /// `ChannelSecurityGroups` — "A list of IDs for all the Input Security
+    /// Groups attached to the channel".
+    pub channel_security_groups: &'a [String],
 }
 
 /// The member a channel's encoder settings arrive in, as the wire spells it.
@@ -56,15 +62,24 @@ const INPUT_ATTACHMENTS: &str = "inputAttachments";
 /// id this account holds no such resource for.
 const INPUT: &str = "input";
 
+/// The member a channel's input security groups arrive in, as the wire spells
+/// it.
+const CHANNEL_SECURITY_GROUPS: &str = "channelSecurityGroups";
+
+/// What a `ChannelSecurityGroups` entry names, worded as the input side words
+/// the same reference ([`super::ComAmazonawsMedialiveMedialiveState::input_configuration_error`]).
+const INPUT_SECURITY_GROUP: &str = "input security group";
+
 impl ComAmazonawsMedialiveMedialiveState {
     /// Every problem `configuration` carries, in the order the configuration
     /// declares its members and its entries — empty for a configuration this
     /// service can run, which is the only one a write stores.
     ///
-    /// A reference is resolved through [`Self::live_input`], the same lookup
-    /// every mutation of an input goes through: an input whose delete this
-    /// service has accepted is no longer a resource of this account a new
-    /// attachment can name.
+    /// A reference is resolved through the same lookup every other write that
+    /// references the resource goes through — [`Self::live_input`] for an
+    /// attachment, [`Self::live_input_security_group`] for a channel security
+    /// group — so a resource whose delete this service has accepted is no longer
+    /// one of this account a new reference can name.
     pub fn channel_configuration_problems(
         &self,
         configuration: &ChannelConfiguration<'_>,
@@ -94,6 +109,25 @@ impl ComAmazonawsMedialiveMedialiveState {
                     &unknown_reference_message(INPUT_ATTACHMENTS, INPUT, id),
                 )),
                 Some(_) => {}
+            }
+        }
+
+        for (index, group) in configuration.channel_security_groups.iter().enumerate() {
+            let path = format!("{CHANNEL_SECURITY_GROUPS}/{index}");
+            if group.is_empty() {
+                problems.push(validation_problem(
+                    &path,
+                    &missing_reference_id_message(CHANNEL_SECURITY_GROUPS),
+                ));
+            } else if self.live_input_security_group(group).is_none() {
+                problems.push(validation_problem(
+                    &path,
+                    &unknown_reference_message(
+                        CHANNEL_SECURITY_GROUPS,
+                        INPUT_SECURITY_GROUP,
+                        group,
+                    ),
+                ));
             }
         }
 

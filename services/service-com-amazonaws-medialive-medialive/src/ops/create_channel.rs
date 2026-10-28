@@ -264,6 +264,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let problems = state.channel_configuration_problems(&crate::state::ChannelConfiguration {
             encoder_settings: input.encoder_settings.as_ref(),
             input_attachments: input.input_attachments.as_deref().unwrap_or_default(),
+            channel_security_groups: input
+                .channel_security_groups
+                .as_deref()
+                .unwrap_or_default(),
         });
         if !problems.is_empty() {
             return Err(unprocessable(problems));

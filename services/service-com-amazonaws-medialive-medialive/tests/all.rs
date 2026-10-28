@@ -62,6 +62,9 @@ mod channel_placement_groups;
 #[path = "all/channel_schedule.rs"]
 mod channel_schedule;
 
+#[path = "all/channel_security_group_resolution.rs"]
+mod channel_security_group_resolution;
+
 #[path = "all/channel_thumbnails.rs"]
 mod channel_thumbnails;
 
