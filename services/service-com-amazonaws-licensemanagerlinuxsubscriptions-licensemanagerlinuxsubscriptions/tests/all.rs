@@ -27,6 +27,8 @@ mod provider_status_transition;
 mod resource_tags;
 #[path = "all/service_settings_status.rs"]
 mod service_settings_status;
+#[path = "all/shared_discovery_report.rs"]
+mod shared_discovery_report;
 #[path = "all/shared_harness.rs"]
 mod shared_harness;
 #[path = "all/shared_tag_merge.rs"]

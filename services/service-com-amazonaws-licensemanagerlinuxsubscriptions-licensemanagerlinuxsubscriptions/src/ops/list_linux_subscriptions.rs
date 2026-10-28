@@ -169,14 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // had nobody called at all. Nothing is recorded for an account that did not enable
         // discovery, and a pass over an unchanged inventory records what is already there.
         //
-        // A request CONTINUING a walk carries the cursor the previous page minted, which is
-        // a position in the list that page reported, so no pass runs for it: a refresh
-        // between two pages of one walk could move a record across the cursor and make the
-        // walk skip or repeat it. A walk therefore reports the inventory of the pass its
-        // first page ran.
-        if input.next_token.is_none() {
-            crate::state::discovery::refresh_discovered_instances(&*self.engine, ctx).await;
-        }
+        // WHETHER this request runs a pass is the discovery module's decision, not this
+        // handler's: the request's cursor is what it takes it on.
+        crate::state::discovery::materialize_for_report(
+            &*self.engine,
+            ctx,
+            input.next_token.as_deref(),
+        )
+        .await;
 
         // A pure read of the store: the page is aggregated from the instances discovery
         // has recorded, and nothing here writes.
@@ -185,12 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .discovered_subscriptions()
             .into_iter()
             .filter(|subscription| {
-                // Several filters select what satisfies all of them; `Subscription` is
-                // the only name this list accepts, and it addresses the subscription's
-                // own name.
-                filters.iter().all(|filter| {
-                    crate::state::filter_selects(filter, std::slice::from_ref(&subscription.name))
-                })
+                // What is this list's OWN is the member a filter addresses: `Subscription`
+                // is the only name it accepts, and it addresses the subscription's own
+                // name. How several filters combine is the shared rule.
+                crate::state::filters_select(&filters, |_name| vec![subscription.name.clone()])
             })
             .collect();
 

@@ -68,7 +68,7 @@ pub const DISCOVERY_DISABLED: &str = "Disabled";
 
 /// The `LinuxSubscriptionsDiscovery` value of an account that asked for its Linux
 /// subscriptions to be discovered — the other value of the same modelled enum, and the one
-/// a discovery pass runs for ([`discovery::refresh_discovered_instances`]).
+/// a discovery pass runs for ([`discovery::materialize_for_report`]).
 pub const DISCOVERY_ENABLED: &str = "Enabled";
 
 /// The `Status` a settled change to the Linux subscriptions service settings reports
@@ -222,7 +222,7 @@ pub const INSTANCE_STATUS_RUNNING: &str = "running";
 ///
 /// Discovery reads the account's EC2 inventory in the configured source Regions; nothing
 /// in THIS service's API registers an instance, so the store below is written only by a
-/// discovery pass ([`discovery::refresh_discovered_instances`]). Both
+/// discovery pass ([`discovery::materialize_for_report`]). Both
 /// `ListLinuxSubscriptionInstances` (which reports these records) and
 /// `ListLinuxSubscriptions` (which aggregates them into subscriptions) project it, so
 /// the two lists can never disagree about what was discovered.
@@ -1005,6 +1005,27 @@ pub fn filter_selects(filter: &Filter, member_values: &[String]) -> bool {
         // `Equal`, and the equality an absent operator means.
         _ => equals,
     }
+}
+
+/// Does one resource satisfy EVERY filter a `Filters`-driven list was given?
+///
+/// `Filters` selects the results "that match one or more sets of key-value pairs that you
+/// specify", so several filters select what satisfies ALL of them — and an empty
+/// `Filters` selects every resource, because there is nothing left for one to fail. This
+/// is the whole of how filters COMBINE, held here once, so no list can grow its own answer
+/// to it.
+///
+/// `member_values` is the only part a list states for itself: what the member a
+/// `Filter$Name` addresses holds on the resource being considered — one value for a scalar
+/// member, every value for a list member, and none for a member the resource leaves unset
+/// (which [`filter_selects`] then selects nothing on, whatever the operator). Only a name
+/// the list documents reaches it, because [`validate_filters`] has already refused the
+/// others.
+pub fn filters_select(filters: &[Filter], member_values: impl Fn(&str) -> Vec<String>) -> bool {
+    filters.iter().all(|filter| {
+        let name = filter.name.as_deref().unwrap_or_default();
+        filter_selects(filter, &member_values(name))
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

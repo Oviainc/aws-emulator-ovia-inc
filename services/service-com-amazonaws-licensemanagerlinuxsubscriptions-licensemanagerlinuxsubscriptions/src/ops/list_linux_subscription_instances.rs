@@ -171,11 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same discovery pass the sibling list materializes: both report from the ONE
         // store of discovered instances, so neither can be shown an inventory the other was
-        // not. As there, a request continuing a walk runs no pass: its cursor is a position
-        // in the list the previous page reported.
-        if input.next_token.is_none() {
-            crate::state::discovery::refresh_discovered_instances(&*self.engine, ctx).await;
-        }
+        // not — which is why the decision about whether THIS request runs a pass is taken
+        // once, in the discovery module, from the request's cursor.
+        crate::state::discovery::materialize_for_report(
+            &*self.engine,
+            ctx,
+            input.next_token.as_deref(),
+        )
+        .await;
 
         // A pure read of the store: the page is built from the records discovery has
         // written, and nothing here writes.
@@ -184,11 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .discovered_instances_in_order()
             .into_iter()
             .filter(|record| {
-                // Several filters select what satisfies all of them.
-                filters.iter().all(|filter| {
-                    let name = filter.name.as_deref().unwrap_or_default();
-                    crate::state::filter_selects(filter, &filtered_member(record, name))
-                })
+                // What is this list's OWN is the member each filter name addresses; how
+                // several filters combine is the shared rule.
+                crate::state::filters_select(&filters, |name| filtered_member(record, name))
             })
             .collect();
 

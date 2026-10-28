@@ -30,6 +30,11 @@
 //! same answer a caller would have been shown had nobody called at all. Re-running it over
 //! an unchanged inventory records the same records with the same
 //! `Instance$LastUpdatedTime`, so a read never changes what a later caller sees.
+//!
+//! WHICH reports run a pass is this module's own rule, stated once in
+//! [`materialize_for_report`]: every report reads the one store a pass fills, so a report
+//! cannot decide for itself without two of them disagreeing about the inventory they
+//! answer from.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -144,7 +149,33 @@ fn ec2(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> ::aws
     ::aws_sdk_ec2::Client::from_conf(config)
 }
 
+/// Materialize, for ONE report of discovered data, the discovery pass the account's
+/// settings ask for — and decide whether that report runs one at all.
+///
+/// `next_token` is the cursor the reporting request carried. A request CONTINUING a walk
+/// carries the cursor the previous page minted, which is a position in the list THAT page
+/// reported, so no pass runs for it: a refresh between two pages of one walk could move a
+/// record across the cursor and make the walk skip or repeat it. A walk therefore reports
+/// the inventory of the pass its first page ran.
+///
+/// The gate lives HERE rather than in the reports, because every operation that reports
+/// discovered data reports from the one store this pass fills: were each to decide for
+/// itself, two of them could be shown inventories of different instants.
+pub async fn materialize_for_report<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    next_token: Option<&str>,
+) {
+    if next_token.is_some() {
+        return;
+    }
+    refresh_discovered_instances(engine, ctx).await;
+}
+
 /// Run the discovery pass this account's settings ask for, and record what it found.
+///
+/// Reached only through [`materialize_for_report`], which owns the one rule about WHEN a
+/// report runs a pass.
 ///
 /// What the store holds afterwards is what the account's CURRENT settings say is discovered:
 /// the inventory of the source Regions they name while `LinuxSubscriptionsDiscovery` is
@@ -157,7 +188,7 @@ fn ec2(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> ::aws
 /// One hop per configured source Region (the modelled `SourceRegions` list bounds that at
 /// 100 entries), plus the AMI hops the instances found there need, all bounded by the
 /// constants above — and the store's lock is never held across any of them.
-pub async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
+async fn refresh_discovered_instances<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
 ) {
