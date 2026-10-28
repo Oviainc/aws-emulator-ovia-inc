@@ -87,6 +87,16 @@ pub const LIST_INSTANCE_PROFILES: &str = "iam:ListInstanceProfiles";
 /// `iam:ListPoliciesGrantingServiceAccess`.
 pub const LIST_POLICIES_GRANTING_SERVICE_ACCESS: &str = "iam:ListPoliciesGrantingServiceAccess";
 
+/// `iam:GenerateServiceLastAccessedDetails`.
+pub const GENERATE_SERVICE_LAST_ACCESSED_DETAILS: &str = "iam:GenerateServiceLastAccessedDetails";
+
+/// `iam:GetServiceLastAccessedDetails`.
+pub const GET_SERVICE_LAST_ACCESSED_DETAILS: &str = "iam:GetServiceLastAccessedDetails";
+
+/// `iam:GetServiceLastAccessedDetailsWithEntities`.
+pub const GET_SERVICE_LAST_ACCESSED_DETAILS_WITH_ENTITIES: &str =
+    "iam:GetServiceLastAccessedDetailsWithEntities";
+
 /// `iam:ListOpenIDConnectProviders`.
 pub const LIST_OPEN_ID_CONNECT_PROVIDERS: &str = "iam:ListOpenIDConnectProviders";
 
