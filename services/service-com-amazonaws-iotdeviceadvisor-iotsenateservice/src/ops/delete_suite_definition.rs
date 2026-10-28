@@ -139,17 +139,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteSuiteDefinitionErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
-            })
-        })?;
         let region = crate::state::request_region(ctx.parts());
+        let id = input.suite_definition_id;
+        // The definition the request NAMED, so every path out of this handler leaves one
+        // audit record for the attempt whether or not the store holds it.
+        let mut arn = crate::state::arn(&region, &format!("suitedefinition/{id}"));
+        let mut trail = crate::state::AuditedCall::attempt(Self::NAME, ctx.parts(), &region, &arn);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            trail.refused(DeleteSuiteDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+                },
+            ))
+        })?;
         let mut store = state.lock();
 
-        let id = input.suite_definition_id;
         let mut outcome = "absent";
-        let mut arn = crate::state::arn(&region, &format!("suitedefinition/{id}"));
         if let Some(removed) = store.definitions.remove(&id) {
             arn = removed.arn;
             store.tags.remove(&arn);
@@ -168,7 +174,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.runs.retain(|_, run| run.suite_definition_id != id);
             outcome = "deleted";
         }
-        crate::state::audit(Self::NAME, ctx.parts(), &region, &arn, outcome);
+        trail.acted_on(&arn);
+        trail.ended(outcome);
 
         Ok(DeleteSuiteDefinitionOutput {})
     }
