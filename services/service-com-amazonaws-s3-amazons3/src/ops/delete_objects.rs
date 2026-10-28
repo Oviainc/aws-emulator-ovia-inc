@@ -13,6 +13,12 @@
 //! this emulator does not hold refuses the whole request with `NoSuchBucket` (404), a code
 //! this model declares no shape for — see `crate::scaffolded`.
 //!
+//! Each identifier performs exactly what a `DeleteObject` for it would, S3 OBJECT LOCK
+//! included: an identifier that would permanently remove a version a legal hold or a
+//! running retention period protects is that key's own 403 `AccessDenied` entry
+//! ([`crate::state::Bucket::object_lock_delete_refusal`] carries the rule) and the version
+//! stays stored.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -323,8 +329,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
         // `MAX_REPLICATION_RULES` rules, so asking per key what a bucket carrying no
         // configuration owes would multiply the two for nothing.
         let replicates = store.replicates_objects(&input.bucket);
+        // Whether this request asks to bypass governance-mode restrictions, and the one
+        // instant every Object Lock judgement in the batch is made at — so two identifiers
+        // of one request cannot disagree about whether a period is still running.
+        let bypass_requested = input.bypass_governance_retention == Some(true);
+        let now = ::std::time::SystemTime::now();
         for identifier in identifiers {
             let key = identifier.key.as_str();
+            // S3 OBJECT LOCK protects the version an identifier would permanently remove —
+            // the one its `VersionId` names, or the `null` version a simple delete takes
+            // away on a bucket that keeps no history — so the lock is read before anything
+            // is taken away. A refused identifier is THIS key's failure, reported beside
+            // the keys that did delete, the way every other per-key refusal here is.
+            if let Some(message) = store.bucket(&input.bucket).and_then(|bucket| {
+                let object = match identifier.version_id.as_deref() {
+                    Some(version_id) => bucket
+                        .stored_version(key, version_id)
+                        .and_then(crate::state::StoredVersion::as_object)?,
+                    None => bucket.permanently_deleted_version(key)?,
+                };
+                bucket.object_lock_delete_refusal(
+                    &input.bucket,
+                    key,
+                    object,
+                    now,
+                    bypass_requested,
+                )
+            }) {
+                errors.push(Error {
+                    key: Some(key.to_string()),
+                    version_id: identifier.version_id.clone(),
+                    code: Some(crate::state::ACCESS_DENIED_CODE.to_string()),
+                    message: Some(message),
+                });
+                continue;
+            }
             match identifier.version_id.as_deref() {
                 // "optionally, version IDs if you want to delete a specific version of the
                 // object from a versioning-enabled bucket" — the permanent delete, which

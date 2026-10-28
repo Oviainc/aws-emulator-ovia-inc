@@ -5006,6 +5006,121 @@ impl Bucket {
         self.object_lock_rule = default_retention;
     }
 
+    /// Why S3 refuses a request that would permanently remove the stored version `object`
+    /// of `key` — `bucket` being this bucket's own name, which the authorization decision
+    /// names the object by — judged at `at`, or `None` when nothing bars it.
+    /// `bypass_requested` is whether the request asked to bypass governance-mode
+    /// restrictions; what is answered is the `<Message>` the 403 [`ACCESS_DENIED_CODE`]
+    /// carries.
+    ///
+    /// S3 Object Lock is a WORM protection, and what it protects is the VERSION: "if you
+    /// try to delete objects protected by … retention and the retention period has not
+    /// expired, the operation fails" (Amazon S3 User Guide, *S3 Object Lock*). So a
+    /// permanent delete is refused while
+    ///
+    /// * a legal hold is on the version — judged FIRST and independently of anything the
+    ///   request asks for, because a legal hold "provides the same protection as a
+    ///   retention period" while having "no expiration date" and is lifted only by
+    ///   `PutObjectLegalHold`, never by the governance bypass, which asks about
+    ///   "Governance-mode restrictions"
+    ///   (`DeleteObjectRequest$BypassGovernanceRetention`) and nothing else; or
+    /// * the version's retention period is still running
+    ///   ([`ObjectRetention::in_force_at`]) — unless it is a [`GOVERNANCE_RETENTION_MODE`]
+    ///   one, the request asked to bypass it, and the caller may perform
+    ///   [`BYPASS_GOVERNANCE_RETENTION_ACTION`]
+    ///   ([`Self::governance_bypass_denied`]), since the header alone is not the privilege.
+    ///
+    /// The two are refused with the two sentences S3 words them in: the lock itself bars the
+    /// call ([`OBJECT_LOCK_ACCESS_DENIED_MESSAGE`]), while a caller the policy denies the
+    /// override to is refused the OVERRIDE, which is an authorization decision about that
+    /// action ([`explicit_resource_policy_denial`]) and leaves the retention standing.
+    ///
+    /// An expired retention protects nothing, which is what lets the same delete succeed
+    /// once the period has lapsed. A version carrying neither is refused nothing here.
+    pub fn object_lock_delete_refusal(
+        &self,
+        bucket: &str,
+        key: &str,
+        object: &Object,
+        at: SystemTime,
+        bypass_requested: bool,
+    ) -> Option<String> {
+        if object.legal_hold == Some(true) {
+            return Some(OBJECT_LOCK_ACCESS_DENIED_MESSAGE.to_string());
+        }
+        let retention = object
+            .retention
+            .as_ref()
+            .filter(|retention| retention.in_force_at(at))?;
+        if !bypass_requested || retention.mode != GOVERNANCE_RETENTION_MODE {
+            return Some(OBJECT_LOCK_ACCESS_DENIED_MESSAGE.to_string());
+        }
+        self.governance_bypass_denied(bucket, key).then(|| {
+            explicit_resource_policy_denial(
+                BYPASS_GOVERNANCE_RETENTION_ACTION,
+                &object_arn(bucket, key),
+            )
+        })
+    }
+
+    /// Whether the caller may NOT lift the governance-mode retention on the object `key` of
+    /// the bucket named `bucket`.
+    ///
+    /// The bypass a request asks for is a PRIVILEGED override rather than a self-service
+    /// one: "to override or remove governance-mode retention settings you must have the
+    /// `s3:BypassGovernanceRetention` permission" (Amazon S3 User Guide, *S3 Object Lock*),
+    /// so every operation whose `BypassGovernanceRetention` member can lift a retention asks
+    /// this before honouring it — the delete of a retained version
+    /// ([`Self::object_lock_delete_refusal`]) and the retention write that would weaken one.
+    pub fn governance_bypass_denied(&self, bucket: &str, key: &str) -> bool {
+        self.caller_is_denied(BYPASS_GOVERNANCE_RETENTION_ACTION, &object_arn(bucket, key))
+    }
+
+    /// Whether this bucket's own policy REFUSES the calling principal `action` on
+    /// `resource`.
+    ///
+    /// Decided by the tree's one evaluation of IAM policy documents
+    /// ([`policy_decision_for_anonymous`] asks it for the caller that presents no
+    /// credential), for the principal a credentialed request here speaks for
+    /// ([`caller_principal_arn`]) together with the spellings that name its whole account —
+    /// a statement denying the account refuses each of its principals.
+    ///
+    /// Only a DENY is reported, because this emulator serves one account and the caller is
+    /// that account: a document that says nothing about the request leaves the bucket's own
+    /// owner able to act on it, which is how every other object operation here treats it.
+    /// A bucket carrying no policy denies nothing.
+    fn caller_is_denied(&self, action: &str, resource: &str) -> bool {
+        let Some(policy) = self.policy.as_deref() else {
+            return false;
+        };
+        let caller = caller_principal_arn();
+        let mut principals = vec![caller.clone()];
+        principals.extend(::service_common::iam_authorization::account_principals(
+            &caller,
+        ));
+        ::service_common::iam_authorization::resource_decision(
+            policy,
+            &::service_common::iam_authorization::Request::new(action, resource, &principals),
+        ) == ::service_common::iam_authorization::Decision::Denied
+    }
+
+    /// The object a delete that names NO `versionId` would remove PERMANENTLY, or `None`
+    /// when such a delete takes nothing away.
+    ///
+    /// Which one it is follows [`Self::remove_object`]: on a versioning-ENABLED bucket the
+    /// delete "inserts a delete marker, which becomes the current version of the object"
+    /// and every stored version stays, so nothing is removed at all; on any other bucket it
+    /// takes the `null` version away — the one entry carrying no minted id — which is a
+    /// permanent removal like the one a `versionId` asks for, and so is subject to the same
+    /// Object Lock protection ([`Self::object_lock_delete_refusal`]).
+    pub fn permanently_deleted_version(&self, key: &str) -> Option<&Object> {
+        if self.versioning_enabled() {
+            return None;
+        }
+        let position = self.null_version_position(key)?;
+        self.versions.get(key)?.get(position)?.as_object()
+    }
+
     /// The bucket's Transfer Acceleration state — a `BucketAccelerateStatus` value — or
     /// `None` while no state has ever been set on it, which is what makes a read report no
     /// state value at all rather than a default. See [`Self::accelerate`].
@@ -6906,6 +7021,48 @@ impl ObjectRetention {
     }
 }
 
+/// The IAM action that LIFTING a governance-mode retention is authorized under: "to
+/// override or remove governance-mode retention settings you must have the
+/// `s3:BypassGovernanceRetention` permission" (Amazon S3 User Guide, *S3 Object Lock*),
+/// which is what a request carrying `x-amz-bypass-governance-retention` asks the service to
+/// do.
+pub const BYPASS_GOVERNANCE_RETENTION_ACTION: &str = "s3:BypassGovernanceRetention";
+
+/// How S3 words the 403 [`ACCESS_DENIED_CODE`] of a request a policy in force EXPLICITLY
+/// DENIES the caller: who was refused, which IAM `action` on which `resource`, and that it
+/// was an explicit deny in the resource's own policy that refused it.
+///
+/// The same sentence shape every authorization refusal of this crate is worded in
+/// ([`block_public_access_denial`] states the guardrail half of it), with the reason clause
+/// IAM publishes for this decision rather than for an absent grant
+/// (`service_common::iam_authorization::not_authorized_by_resource_policy` states that
+/// other one). Every value in it comes from the request and from this emulator's own
+/// identity — the principal is the caller ([`caller_principal_arn`]), the action is the one
+/// the policy denied and the resource is the one the request addressed — so nothing in it
+/// is a recorded value.
+pub fn explicit_resource_policy_denial(action: &str, resource: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: {action} on resource: \"{resource}\" with an \
+         explicit deny in a resource-based policy",
+        caller_principal_arn()
+    )
+}
+
+/// The Object Lock state a read of one stored object version REPORTS: the three
+/// `x-amz-object-lock-*` headers `GetObject` and `HeadObject` both declare, as
+/// [`Object::reported_object_lock`] renders them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReportedObjectLock {
+    /// `ObjectLockMode` — an [`ObjectRetention::mode`] value, for a version carrying a
+    /// retention.
+    pub mode: Option<String>,
+    /// `ObjectLockRetainUntilDate` — the instant that retention runs to.
+    pub retain_until: Option<SystemTime>,
+    /// `ObjectLockLegalHoldStatus` — [`LEGAL_HOLD_ON_STATUS`] or [`LEGAL_HOLD_OFF_STATUS`]
+    /// for a version a legal hold has been applied to, and nothing for one that never has.
+    pub legal_hold_status: Option<String>,
+}
+
 /// The one value the `ObjectLockEnabled` enum publishes
 /// (`smithy_query(query="shape",shape="ObjectLockEnabled")`, whose values
 /// [`crate::ops::types::OBJECT_LOCK_ENABLED_VALUES`] carries): "indicates whether this
@@ -7365,6 +7522,37 @@ impl Object {
             .iter()
             .map(|(key, value)| key.len() + value.len())
             .sum()
+    }
+
+    /// The Object Lock state a read of this stored version reports — see
+    /// [`ReportedObjectLock`].
+    ///
+    /// "The Object Lock mode, if any, that's in effect for this object" and "the date and
+    /// time when the Object Lock retention period expires"
+    /// (`GetObjectOutput$ObjectLockMode` / `$ObjectLockRetainUntilDate`) are the retention
+    /// `PutObjectRetention` placed on THIS version, reported as the record stands — the
+    /// same record `GetObjectRetention` reports, so the readers of one retention cannot
+    /// disagree about it. The legal hold status "is not returned if the specified version
+    /// of this object has never had a legal hold applied"
+    /// (`GetObjectOutput$ObjectLockLegalHoldStatus`), so a version nobody has placed one on
+    /// reports nothing rather than [`LEGAL_HOLD_OFF_STATUS`].
+    ///
+    /// ONE place, so `GetObject` and `HeadObject` report one version's lock identically.
+    pub fn reported_object_lock(&self) -> ReportedObjectLock {
+        ReportedObjectLock {
+            mode: self
+                .retention
+                .as_ref()
+                .map(|retention| retention.mode.clone()),
+            retain_until: self.retention.as_ref().map(|retention| retention.retain_until),
+            legal_hold_status: self.legal_hold.map(|held| {
+                if held {
+                    LEGAL_HOLD_ON_STATUS.to_string()
+                } else {
+                    LEGAL_HOLD_OFF_STATUS.to_string()
+                }
+            }),
+        }
     }
 
     /// Whether this object's bytes are ARCHIVED at `instant` — in a storage class that
@@ -10310,9 +10498,11 @@ pub const KMS_SSE_ALGORITHMS: [&str; 2] = ["aws:kms", "aws:kms:dsse"];
 /// to report "there is none". The code is named for the subresource the request addressed,
 /// as every row of that family is.
 pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE: &str = "NoSuchObjectLockConfiguration";
-/// See [`NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE`].
+/// See [`NO_SUCH_OBJECT_LOCK_CONFIGURATION_CODE`] — the sentence S3 sends beside it,
+/// verbatim, article and all: "The specified object does not have a ObjectLock
+/// configuration". Fixed text, naming neither the bucket, the key nor the version.
 pub const NO_SUCH_OBJECT_LOCK_CONFIGURATION_MESSAGE: &str =
-    "The specified object does not have an ObjectLock configuration";
+    "The specified object does not have a ObjectLock configuration";
 
 /// The `<Message>` S3 sends beside the 403 `AccessDenied` of a call an Object Lock
 /// retention bars: "Access Denied because object protected by object lock."

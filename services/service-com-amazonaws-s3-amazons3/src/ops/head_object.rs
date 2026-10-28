@@ -538,6 +538,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|_| input.checksum_mode.is_some()),
         );
 
+        // The Object Lock state this HEAD reports, rendered off the version's own record by
+        // the renderer `GetObject` reports it through — see the three members below.
+        let lock = object.reported_object_lock();
+
         Ok(HeadObjectOutput {
             e_tag: Some(object.etag.clone()),
             // "The size of the body in bytes" (`HeadObjectOutput$ContentLength`) — of the
@@ -615,14 +619,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .replication
                 .as_ref()
                 .map(|replication| replication.status_at(now).to_string()),
+            // The OBJECT LOCK state of this version: "the Object Lock mode, if any, that's
+            // in effect for this object" and the date it runs to
+            // (`HeadObjectOutput$ObjectLockMode` / `$ObjectLockRetainUntilDate`), plus the
+            // legal hold status, which "is not returned if the specified version of this
+            // object has never had a legal hold applied". Read through the one renderer
+            // `GetObject` reports them through, so a HEAD and a GET of one version cannot
+            // disagree about its lock.
+            object_lock_mode: lock.mode,
+            object_lock_retain_until_date: lock.retain_until.map(::aws_smithy_types::DateTime::from),
+            object_lock_legal_hold_status: lock.legal_hold_status,
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
             // (`DeleteMarker`, which a delete records none of), it is in an
             // S3 Intelligent-Tiering archive tier (`ArchiveStatus`, which no stored object
             // here is: a restore is asked for on a storage CLASS), metadata could not be
             // decoded (`MissingMeta`), a customer-provided key encrypted it
-            // (`SSECustomer*`, which `PutObject` refuses), it is locked (`ObjectLock*`) or
-            // the bucket is Requester Pays (`RequestCharged`).
+            // (`SSECustomer*`, which `PutObject` refuses) or the bucket is Requester Pays
+            // (`RequestCharged`).
             checksum_crc32: reported.crc32,
             checksum_crc32_c: reported.crc32c,
             checksum_crc64_nvme: reported.crc64nvme,

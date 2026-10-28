@@ -16,8 +16,9 @@
 //! `GOVERNANCE` where `COMPLIANCE` is in force protects the version less than it is
 //! protected now, and such a call is refused with HTTP 403 `AccessDenied` unless the
 //! retention in force is a governance one AND the request asks to bypass it
-//! (`x-amz-bypass-governance-retention`). Lengthening a period, or replacing an expired
-//! retention, needs nothing.
+//! (`x-amz-bypass-governance-retention`) AND the caller may perform that privileged
+//! override ([`crate::state::Bucket::governance_bypass_denied`]). Lengthening a period, or
+//! replacing an expired retention, needs nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -358,14 +359,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Only a GOVERNANCE retention has a bypass: it is "Governance-mode
             // restrictions" the header asks to bypass
             // (`PutObjectRetentionRequest$BypassGovernanceRetention`), so a compliance-mode
-            // period is not weakened by anyone, header or no header.
-            let bypassed = input.bypass_governance_retention == Some(true)
+            // period is not weakened by anyone, header or no header. And the bypass is a
+            // PRIVILEGED override rather than a self-service one, so the header alone is
+            // not enough: the caller must be allowed to perform it
+            // ([`crate::state::Bucket::governance_bypass_denied`] decides that, the way the
+            // delete of a retained version decides it) — and a caller the policy denies it
+            // to is refused the OVERRIDE, which is worded as the authorization decision it
+            // is rather than as the lock barring the call.
+            let asked_to_bypass = input.bypass_governance_retention == Some(true)
                 && in_force.mode == crate::state::GOVERNANCE_RETENTION_MODE;
-            if weakens && !bypassed {
+            let bypass_denied =
+                asked_to_bypass && bucket.governance_bypass_denied(&input.bucket, &input.key);
+            if weakens && !(asked_to_bypass && !bypass_denied) {
+                let message = if bypass_denied {
+                    crate::state::explicit_resource_policy_denial(
+                        crate::state::BYPASS_GOVERNANCE_RETENTION_ACTION,
+                        &crate::state::object_arn(&input.bucket, &input.key),
+                    )
+                } else {
+                    crate::state::OBJECT_LOCK_ACCESS_DENIED_MESSAGE.to_string()
+                };
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     ACCESS_DENIED_CODE,
                     ACCESS_DENIED_STATUS,
-                    crate::state::OBJECT_LOCK_ACCESS_DENIED_MESSAGE,
+                    message,
                 ));
             }
         }

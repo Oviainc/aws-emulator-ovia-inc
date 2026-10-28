@@ -562,6 +562,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|_| input.checksum_mode.is_some()),
         );
 
+        // The Object Lock state this read reports, rendered once off the version's own
+        // record — see the three members below.
+        let lock = object.reported_object_lock();
+
         Ok(GetObjectOutput {
             // `Content-Length` is the length of the body actually being returned, which for
             // a part- or range-scoped read is the span's own length rather than the object's.
@@ -655,6 +659,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .replication
                 .as_ref()
                 .map(|replication| replication.status_at(now).to_string()),
+            // The OBJECT LOCK state of this version: the retention `PutObjectRetention`
+            // placed on it and the legal hold `PutObjectLegalHold` applied to it, read
+            // through the one renderer `HeadObject` reports them through
+            // ([`crate::state::Object::reported_object_lock`]), so a GET and a HEAD of one
+            // version cannot disagree about its lock. A version carrying neither reports
+            // none of the three headers.
+            object_lock_mode: lock.mode,
+            object_lock_retain_until_date: lock.retain_until.map(::aws_smithy_types::DateTime::from),
+            object_lock_legal_hold_status: lock.legal_hold_status,
             // Everything else describes a feature no stored object here has, so none of
             // it is reported rather than being invented: `DeleteMarker` needs a delete
             // marker (a delete records none, so no read can be of one), `ArchiveStatus`

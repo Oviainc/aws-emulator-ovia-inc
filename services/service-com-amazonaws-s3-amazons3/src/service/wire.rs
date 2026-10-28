@@ -898,6 +898,46 @@ fn with_partial_content_status(response: Response) -> Response {
 /// [`with_partial_content_status`].
 const PARTIAL_CONTENT_STATUS: u16 = 206;
 
+/// The response headers this model binds to a TIMESTAMP whose `timestampFormat` is
+/// `date-time`, which is the format each of them has to go out in.
+///
+/// `smithy_query(query="shape",shape="ObjectLockRetainUntilDate",
+/// model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`
+/// reports `timestampFormat: date-time` on the shape `GetObject`'s and `HeadObject`'s
+/// `x-amz-object-lock-retain-until-date` member targets, and S3 answers that header as an
+/// ISO8601 date-time accordingly. Every other timestamp header of this service's responses
+/// (`Last-Modified`, `x-amz-abort-date`) targets a shape carrying no such trait, and so goes
+/// out in HTTP's own date format.
+const DATE_TIME_TIMESTAMP_HEADERS: [&str; 1] = ["x-amz-object-lock-retain-until-date"];
+
+/// `response` with every header of [`DATE_TIME_TIMESTAMP_HEADERS`] re-rendered in the
+/// `date-time` format the model binds it with.
+///
+/// The rule lives here, once, for the same reason [`with_partial_content_status`] does: the
+/// framework's header serializer renders a bound timestamp in HTTP's date format unless the
+/// MEMBER itself carries the format trait, and in this model the trait is on the member's
+/// TARGET shape — so no handler and no shape declaration can state it, and a header left in
+/// the other format is one no client reads as the date the API publishes. Only a header the
+/// response actually carries is touched, and a value that does not read back as a date is
+/// left exactly as it is rather than dropped.
+fn with_date_time_timestamp_headers(mut response: Response) -> Response {
+    for name in DATE_TIME_TIMESTAMP_HEADERS {
+        let Some(rendered) = response.headers().get(name).map(str::to_string) else {
+            continue;
+        };
+        let Ok(instant) =
+            DateTime::from_str(&rendered, aws_smithy_types::date_time::Format::HttpDate)
+        else {
+            continue;
+        };
+        let Ok(published) = instant.fmt(aws_smithy_types::date_time::Format::DateTime) else {
+            continue;
+        };
+        let _ = response.headers_mut().try_insert(name, published);
+    }
+    response
+}
+
 /// The header naming the request a response answers: "`x-amz-request-id`: A value created
 /// by Amazon S3 that uniquely identifies the request" (Amazon S3 API Reference, *Common
 /// Response Headers*), which every S3 response carries — it is what a client's
@@ -1116,9 +1156,12 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // A member the model marks `@xmlAttribute` has been written as an element; it
         // belongs on its parent's start tag, where the API publishes it and where a
         // namespace-aware parser can read it. And a response that reports a
-        // `Content-Range` carries PART of the object, which HTTP answers with 206.
+        // `Content-Range` carries PART of the object, which HTTP answers with 206. A
+        // timestamp header the model binds in the `date-time` format is re-rendered in it.
         Ok(with_request_correlation(
-            with_partial_content_status(with_attribute_members(response)),
+            with_date_time_timestamp_headers(with_partial_content_status(with_attribute_members(
+                response,
+            ))),
             correlation,
         ))
     }

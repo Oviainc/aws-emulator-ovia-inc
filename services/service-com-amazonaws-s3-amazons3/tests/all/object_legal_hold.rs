@@ -86,7 +86,11 @@ pub(crate) async fn lock_enabled_bucket(router: &MultiServiceRouter, name: &str)
 
 /// `PUT /<bucket>/<key>?legal-hold` — `PutObjectLegalHold`, with whatever extra query
 /// parameters and headers the case carries and `payload` as the `LegalHold` container.
-async fn put_object_legal_hold(
+///
+/// `pub(crate)`, like [`lock_enabled_bucket`] above: the Object Lock ENFORCEMENT suite
+/// ([`super::object_lock_enforcement`]) places the holds it then tries to delete under
+/// through this one helper rather than forking a second copy of it.
+pub(crate) async fn put_object_legal_hold(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -127,7 +131,10 @@ async fn get_object_legal_hold(
 ///
 /// An empty container (no `Status` at all) names no configuration to apply, which is one of
 /// the refusal rows below.
-fn legal_hold_payload(status: Option<&str>) -> String {
+///
+/// `pub(crate)` for the same reason as the request helper above: one spelling of this
+/// container across the suites that place a legal hold.
+pub(crate) fn legal_hold_payload(status: Option<&str>) -> String {
     let mut body = String::from("<LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
     if let Some(status) = status {
         body.push_str(&format!("<Status>{status}</Status>"));

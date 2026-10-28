@@ -10,6 +10,12 @@
 //! marker, which becomes the current version of the object", and "to permanently delete an
 //! object in a versioned bucket, you must include the object's versionId in the request".
 //!
+//! A delete that really would remove a stored version is subject to S3 OBJECT LOCK: while a
+//! legal hold is on that version, or its retention period is still running, the delete is
+//! refused with 403 `AccessDenied` and the version stays stored
+//! ([`crate::state::Bucket::object_lock_delete_refusal`] carries the rule, the governance
+//! bypass among it).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -366,6 +372,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
         })?;
         let mut store = state.lock();
 
+        // Whether this delete asks to bypass governance-mode restrictions, and the instant
+        // every Object Lock judgement below is made at — one instant for the whole call, so
+        // a retention cannot be in force for one half of it and lapsed for the other.
+        let bypass_requested = input.bypass_governance_retention == Some(true);
+        let now = ::std::time::SystemTime::now();
+
         // "To permanently delete an object in a versioned bucket, you must include the
         // object's versionId in the request" — so a delete that names one removes exactly
         // that stored version, and the newest version left becomes the key's current one.
@@ -384,6 +396,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
                     crate::state::INVALID_VERSION_ID_MESSAGE,
                 ));
             }
+            // S3 OBJECT LOCK protects the VERSION this delete names, so the lock is read
+            // off that version before anything is taken away: a legal hold on it, or a
+            // retention period still running over it, refuses the permanent delete with 403
+            // `AccessDenied` and leaves the version stored
+            // ([`crate::state::Bucket::object_lock_delete_refusal`] carries the rule, the
+            // governance bypass and the privilege it needs among it, and words each
+            // refusal). A version carrying no lock, or one whose period has lapsed, is
+            // refused nothing.
+            if let Some(message) = store.bucket(&input.bucket).and_then(|bucket| {
+                let object = bucket
+                    .stored_version(&input.key, version_id)
+                    .and_then(crate::state::StoredVersion::as_object)?;
+                bucket.object_lock_delete_refusal(
+                    &input.bucket,
+                    &input.key,
+                    object,
+                    now,
+                    bypass_requested,
+                )
+            }) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::ACCESS_DENIED_CODE,
+                    crate::state::ACCESS_DENIED_STATUS,
+                    message,
+                ));
+            }
+
             // "Indicates whether the specified object version that was permanently deleted
             // was (true) or was not (false) a delete marker before deletion"
             // (`DeleteObjectOutput$DeleteMarker`) — read off the stored version BEFORE it
@@ -438,6 +477,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObject<Eng>
         // inserts a delete marker, which becomes the current version of the object", so
         // the version it hides stays stored and addressable by its id and a read without a
         // `versionId` answers `NoSuchKey` afterwards.
+        // Such a delete removes a version PERMANENTLY only on a bucket that keeps no
+        // version history, where it takes the `null` version away
+        // ([`crate::state::Bucket::permanently_deleted_version`] names the version it
+        // would remove); Object Lock protects that removal exactly as it protects the one a
+        // `versionId` asks for. A delete that only lays a delete marker takes nothing away,
+        // so no lock bars it.
+        if let Some(message) = store.bucket(&input.bucket).and_then(|bucket| {
+            let object = bucket.permanently_deleted_version(&input.key)?;
+            bucket.object_lock_delete_refusal(
+                &input.bucket,
+                &input.key,
+                object,
+                now,
+                bypass_requested,
+            )
+        }) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+
         let Some(outcome) = store.remove_object(&input.bucket, &input.key) else {
             return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };

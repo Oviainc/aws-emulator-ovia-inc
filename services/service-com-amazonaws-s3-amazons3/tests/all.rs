@@ -163,6 +163,8 @@ mod object_listing_and_deletion;
 mod object_listing_encoding;
 #[path = "all/object_listing_v1.rs"]
 mod object_listing_v1;
+#[path = "all/object_lock_enforcement.rs"]
+mod object_lock_enforcement;
 #[path = "all/object_partial_reads.rs"]
 mod object_partial_reads;
 #[path = "all/object_replication.rs"]
