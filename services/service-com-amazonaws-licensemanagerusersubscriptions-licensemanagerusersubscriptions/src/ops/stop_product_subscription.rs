@@ -3,8 +3,11 @@
 //! @op StopProductSubscription
 //!
 //! Ends one user's product subscription: resolves the stored product user by
-//! `ProductUserArn` or by the `(Username, IdentityProvider, Product)` triple it was
-//! subscribed with, records in [`crate::state`] that the subscription has ended, and
+//! `ProductUserArn` or by the `(Username, IdentityProvider, Product, Domain)` identity it
+//! was subscribed with — `Domain`, "the domain name of the Active Directory that contains
+//! the user", is part of which user that is, so the same user name in another domain is
+//! another user, exactly as `StartProductSubscription` reads it — records in
+//! [`crate::state`] that the subscription has ended, and
 //! returns the `ProductUserSummary` for it — `UNSUBSCRIBED`, with the
 //! `SubscriptionEndDate` of this call.
 //!
@@ -15,10 +18,11 @@
 //! then does it stop being reported. What the end takes away at once is what made the
 //! subscription LIVE: it is no longer taggable, and it resolves for no operation that acts
 //! on a subscription, so a second stop of the same user is a `ResourceNotFoundException`
-//! while its triple stays occupied against a re-subscribe.
+//! while its identity stays occupied against a re-subscribe.
 //!
 //! Two refusals this operation does not word itself, because they are the service's:
-//! a request naming neither `ProductUserArn` nor the full triple is refused by LISTING the
+//! a request naming neither `ProductUserArn` nor the members that identify a subscription
+//! is refused by LISTING the
 //! members it must name (`crate::state::members_must_be_provided`), and an identity
 //! provider that is not registered for the requested product makes this call fail CLOSED
 //! with `UnauthorizedException` — ending a user's subscription is a user-plane call, and

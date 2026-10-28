@@ -218,19 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A filter the caller DID supply whose entries name nothing in this catalog
         // therefore selects nothing — unlike an absent or empty filter, which selects
         // everything.
-        let application_filter: Option<Vec<String>> = input
-            .benefit_application_identifiers
-            .as_ref()
-            .and_then(|wanted| {
-                (!wanted.is_empty()).then(|| {
-                    wanted
-                        .iter()
-                        .filter_map(|identifier| {
-                            store.resolve_application_id(&input.catalog, identifier)
-                        })
-                        .collect()
-                })
-            });
+        let application_filter = crate::state::supplied_filter(
+            input.benefit_application_identifiers.as_ref(),
+            |identifier| store.resolve_application_id(&input.catalog, identifier),
+        );
 
         // The catalog itself: present, since the lookup above found it and nothing since
         // could have removed it (the store is locked for the whole body).
@@ -242,17 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let benefit_filter: Option<Vec<String>> =
-            input.benefit_identifiers.as_ref().and_then(|wanted| {
-                (!wanted.is_empty()).then(|| {
-                    wanted
-                        .iter()
-                        .filter_map(|identifier| {
-                            catalog.resolve_benefit_id(&input.catalog, identifier)
-                        })
-                        .collect()
-                })
-            });
+        let benefit_filter = crate::state::supplied_filter(
+            input.benefit_identifiers.as_ref(),
+            |identifier| catalog.resolve_benefit_id(&input.catalog, identifier),
+        );
 
         // A `NextToken` only resumes this listing when it is a cursor this service issued
         // for THIS catalog's allocations and the allocation it names is still stored — see

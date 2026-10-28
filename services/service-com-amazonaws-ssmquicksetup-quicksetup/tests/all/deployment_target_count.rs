@@ -6,8 +6,8 @@
 //! The rule under test: how many account-and-Region deployments one configuration
 //! definition fans out to is the SIZE of the target set it is deployed to — the cross
 //! product of the accounts its `TargetAccounts` names (the account this emulator serves
-//! when it names none) and the Regions its `TargetRegions` names (the manager's own
-//! Region when it names none), each list read with its padding trimmed, its empty
+//! when it names none) and the Regions its `TargetRegions` names, each list read with
+//! its padding trimmed, its empty
 //! entries dropped and its repeats dropped once. One number: the bound admits exactly
 //! the parameter sets whose deployed set fits within `MAX_DEPLOYMENT_TARGETS`, deploys
 //! exactly that many configurations when it admits them, and states exactly that number
@@ -26,7 +26,7 @@ use service_com_amazonaws_ssmquicksetup_quicksetup::state::MAX_DEPLOYMENT_TARGET
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for: the Region a created manager owns, and so
-/// the Region a definition naming no `TargetRegions` deploys in.
+/// the only Region whose endpoint serves it.
 const REGION: &str = "us-west-2";
 
 /// A configuration type the service publishes (`ListQuickSetupTypes`), so every create
@@ -291,8 +291,8 @@ fn cases() -> Vec<FanOutCase> {
     // longer list than that: the bound, not the cap, is what each row exercises.
     vec![
         (
-            "no target list but the organizational units: the local account in the manager's Region",
-            json!({ "TargetOrganizationalUnits": "ou-1" }),
+            "one Region and the organizational units: the local account in that Region",
+            json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": regions(1) }),
             1,
         ),
         (
@@ -301,8 +301,8 @@ fn cases() -> Vec<FanOutCase> {
             1,
         ),
         (
-            "three accounts, no Region named",
-            json!({ "TargetAccounts": accounts(3) }),
+            "three accounts in one Region",
+            json!({ "TargetAccounts": accounts(3), "TargetRegions": regions(1) }),
             3,
         ),
         (
@@ -365,8 +365,11 @@ fn cases() -> Vec<FanOutCase> {
             MAX_DEPLOYMENT_TARGETS + 1,
         ),
         (
-            "one account past the bound, with no Region named",
-            json!({ "TargetAccounts": accounts(MAX_DEPLOYMENT_TARGETS + 1) }),
+            "one account past the bound, in one Region",
+            json!({
+                "TargetAccounts": accounts(MAX_DEPLOYMENT_TARGETS + 1),
+                "TargetRegions": regions(1),
+            }),
             MAX_DEPLOYMENT_TARGETS + 1,
         ),
         (

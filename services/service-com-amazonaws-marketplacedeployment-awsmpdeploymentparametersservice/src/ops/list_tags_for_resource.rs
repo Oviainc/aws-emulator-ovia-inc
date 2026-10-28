@@ -14,7 +14,11 @@
 //!
 //! Resolving the label is the sequence every operation that addresses a deployment
 //! parameter by a caller-supplied `resourceArn` runs, written once as
-//! `crate::state::with_tagged_parameter`; what follows is what that sequence decides,
+//! `crate::state::with_tagged_parameter` — the REPORTING view of that sequence,
+//! which leaves the instant the record reports as last written where the last write
+//! left it, since reporting a record is not writing it (the writing view,
+//! `crate::state::write_tagged_parameter`, is what the two tagging writes take);
+//! what follows is what that sequence decides,
 //! and this handler adds only the reporting of the resolved record's tag map.
 //!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a

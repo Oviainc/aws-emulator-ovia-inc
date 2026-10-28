@@ -168,20 +168,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read reports what the store holds AT this instant and leaves it exactly as it
         // was: a stream whose removal has already fallen due is held by nobody, so it
         // counts towards neither figure without this call pruning anything.
-        let (open_shard_count, on_demand_stream_count) = {
+        let (shard_limit, open_shard_count, on_demand_stream_count) = {
             let store = state.lock();
+            let (shard_limit, open_shard_count) = store.shard_quota_in(now, &region);
             (
-                store.open_shards_held_in(now, &region),
+                shard_limit,
+                open_shard_count,
                 store.on_demand_streams_held_in(now, &region),
             )
         };
 
         Ok(DescribeLimitsOutput {
-            // "The maximum number of shards" — the ceiling this emulator authorizes for an
-            // account and region, which is the one every operation that opens a shard
-            // (`CreateStream`, `UpdateShardCount`, `SplitShard`, `MergeShards`) is refused
-            // past, so the quota reported here is the quota that is actually enforced.
-            shard_limit: i32::try_from(crate::state::MAX_SHARDS_PER_REGION).unwrap_or(i32::MAX),
+            // "The maximum number of shards" — the quota this emulator authorizes for an
+            // account and region, read from the ONE place every operation that lays down a
+            // shard (`CreateStream`, `UpdateShardCount`, `SplitShard`, `MergeShards`) is
+            // refused past, so the quota reported here is the quota that is enforced and a
+            // request for `ShardLimit - OpenShardCount` more shards is served.
+            shard_limit,
             // "The number of open shards": the region's usage against that quota.
             open_shard_count,
             // "Indicates the number of data streams with the on-demand capacity mode".

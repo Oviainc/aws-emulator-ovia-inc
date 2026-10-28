@@ -274,11 +274,12 @@ async fn listed_manager_arns(
 }
 
 /// One row of the listing table: the case, the Region every create in it is signed for,
-/// and one (`Name`, `TargetRegions`) pair per manager created through that endpoint.
+/// and one (`Name`, `TargetRegions`) pair per manager created through that endpoint. A
+/// definition names the Regions it deploys into, so every row names them.
 type ListingRow = (
     &'static str,
     &'static str,
-    Vec<(&'static str, Option<&'static str>)>,
+    Vec<(&'static str, &'static str)>,
 );
 
 /// A listing reports exactly what the signed Region holds.
@@ -295,14 +296,14 @@ async fn a_listing_reports_only_what_the_signed_region_holds() {
         (
             "one manager, deployed where it was created",
             "us-west-2",
-            vec![("west", None)],
+            vec![("west", "us-west-2")],
         ),
         (
             "two managers, one of them deployed into other Regions",
             "eu-west-1",
             vec![
-                ("euro-a", Some("eu-west-1")),
-                ("euro-b", Some("eu-central-1,ap-south-1")),
+                ("euro-a", "eu-west-1"),
+                ("euro-b", "eu-central-1,ap-south-1"),
             ],
         ),
         ("a Region no create was signed for", "ap-southeast-2", vec![]),
@@ -312,21 +313,18 @@ async fn a_listing_reports_only_what_the_signed_region_holds() {
     ];
 
     // What each Region must then list: the ARNs it minted, and one configuration per
-    // Region each of its definitions targets (the manager's own when it targets none).
+    // Region each of its definitions targets.
     let mut expected: Vec<(&str, &str, BTreeSet<String>, usize)> = Vec::new();
     for (case, region, managers) in &rows {
         let mut arns: BTreeSet<String> = BTreeSet::new();
         let mut configurations = 0_usize;
-        for (name, targets) in managers {
-            let parameters = match targets {
-                Some(target_regions) => json!({
-                    "TargetOrganizationalUnits": TARGET_OU,
-                    "TargetRegions": target_regions,
-                }),
-                None => json!({ "TargetOrganizationalUnits": TARGET_OU }),
-            };
+        for (name, target_regions) in managers {
+            let parameters = json!({
+                "TargetOrganizationalUnits": TARGET_OU,
+                "TargetRegions": target_regions,
+            });
             let arn = create_ok(&router, case, region, name, &parameters).await;
-            configurations += targets.map_or(1, |target_regions| target_regions.split(',').count());
+            configurations += target_regions.split(',').count();
             assert!(
                 arns.insert(arn.clone()),
                 "case {case}: every create mints a distinct ARN, got {arn:?} twice"
@@ -375,7 +373,7 @@ async fn a_listing_reports_only_what_the_signed_region_holds() {
 type DeploymentRow = (
     &'static str,
     &'static str,
-    Option<&'static str>,
+    &'static str,
     Vec<&'static str>,
 );
 
@@ -389,21 +387,21 @@ type DeploymentRow = (
 async fn a_configuration_is_served_by_the_region_that_created_its_manager() {
     let rows: Vec<DeploymentRow> = vec![
         (
-            "no target Regions: deployed where the manager lives",
+            "deployed into the Region the manager lives in",
             "us-west-2",
-            None,
+            "us-west-2",
             vec!["us-west-2"],
         ),
         (
             "deployed into one other Region only",
             "eu-west-1",
-            Some("us-east-1"),
+            "us-east-1",
             vec!["us-east-1"],
         ),
         (
             "deployed into three Regions, one of them the manager's own",
             "ap-south-1",
-            Some("ap-south-1,eu-central-1,us-east-2"),
+            "ap-south-1,eu-central-1,us-east-2",
             vec!["ap-south-1", "eu-central-1", "us-east-2"],
         ),
     ];
@@ -412,13 +410,10 @@ async fn a_configuration_is_served_by_the_region_that_created_its_manager() {
         // One store per row, so an empty answer from another Region's endpoint can only
         // mean that endpoint serves none of this row's resources.
         let router = emulator();
-        let parameters = match targets {
-            Some(target_regions) => json!({
-                "TargetOrganizationalUnits": TARGET_OU,
-                "TargetRegions": target_regions,
-            }),
-            None => json!({ "TargetOrganizationalUnits": TARGET_OU }),
-        };
+        let parameters = json!({
+            "TargetOrganizationalUnits": TARGET_OU,
+            "TargetRegions": targets,
+        });
         let manager_arn = create_ok(&router, case, home, "deployed-elsewhere", &parameters).await;
 
         let (status, answer) =
@@ -507,11 +502,17 @@ struct Fixture {
     configuration_id: String,
 }
 
-/// One manager in `region` with one definition and one deployed configuration.
+/// One manager in `region` with one definition and one deployed configuration, deployed
+/// into the Region that serves it.
 async fn fixture(router: &MultiServiceRouter, region: &'static str, name: &'static str) -> Fixture {
-    let manager_arn =
-        create_ok(router, region, region, name, &json!({ "TargetOrganizationalUnits": TARGET_OU }))
-            .await;
+    let manager_arn = create_ok(
+        router,
+        region,
+        region,
+        name,
+        &json!({ "TargetOrganizationalUnits": TARGET_OU, "TargetRegions": region }),
+    )
+    .await;
     let (status, manager) = get_manager(router, region, &manager_arn).await;
     assert_eq!(
         status, 200,
@@ -528,7 +529,7 @@ async fn fixture(router: &MultiServiceRouter, region: &'static str, name: &'stat
     assert_eq!(
         listed.len(),
         1,
-        "case {region}: a definition naming no target deploys exactly once, got {listed:?}"
+        "case {region}: a definition naming one Region deploys exactly once, got {listed:?}"
     );
     let configuration_id = listed[0]["Id"]
         .as_str()

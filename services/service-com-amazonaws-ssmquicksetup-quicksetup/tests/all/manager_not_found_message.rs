@@ -254,12 +254,16 @@ fn assert_not_found(case: &str, arn: &str, status: u16, answer: &Value) {
 async fn create_manager(router: &MultiServiceRouter, case: &str) -> String {
     // `Type` must name a configuration type this service publishes; no case here is
     // about the type, so every create uses the catalog's first entry. Its parameters
-    // name somewhere to deploy to, which every accepted definition must.
+    // name somewhere to deploy to and the Region to deploy into, which every accepted
+    // definition must.
     let body = json!({
         "Name": "not-found-message",
         "ConfigurationDefinitions": [{
             "Type": QUICK_SETUP_TYPE_CATALOG[0].type_,
-            "Parameters": { "TargetOrganizationalUnits": "ou-1" },
+            "Parameters": {
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": "us-east-1",
+            },
         }],
     });
     let (status, answer) = call(router, "POST", "/configurationManager", Some(&body)).await;

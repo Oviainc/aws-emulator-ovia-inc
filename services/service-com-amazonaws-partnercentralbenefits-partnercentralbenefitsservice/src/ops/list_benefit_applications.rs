@@ -236,27 +236,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A filter the caller DID supply whose entries name no benefit of this catalog
         // therefore selects nothing — unlike an absent or empty filter, which selects
         // everything.
-        let benefit_filter: Option<Vec<String>> =
-            input.benefit_identifiers.as_ref().and_then(|wanted| {
-                (!wanted.is_empty()).then(|| {
-                    wanted
-                        .iter()
-                        .filter_map(|identifier| {
-                            catalog.resolve_benefit_id(&input.catalog, identifier)
-                        })
-                        .collect()
-                })
-            });
+        let benefit_filter = crate::state::supplied_filter(
+            input.benefit_identifiers.as_ref(),
+            |identifier| catalog.resolve_benefit_id(&input.catalog, identifier),
+        );
         // `AssociatedResources` is `@deprecated` ("This field is no longer used") in
         // favour of `AssociatedResourceArns`, but a client may still send it, so the ARNs
-        // it carries filter alongside the newer member's.
-        let mut resource_arns: Vec<String> = input.associated_resource_arns.unwrap_or_default();
-        resource_arns.extend(
-            input
-                .associated_resources
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|resource| resource.resource_arn),
+        // it carries filter alongside the newer member's. An application records the ARNs
+        // of the resources associated with it, so only an entry's `ResourceArn` names one
+        // of them: an entry carrying only the other, optional members resolves to nothing,
+        // and the same rule as above then makes the filter the caller supplied select
+        // nothing rather than everything.
+        let resource_filter = crate::state::union_filters(
+            crate::state::supplied_filter(input.associated_resource_arns.as_ref(), |arn| {
+                Some(arn.clone())
+            }),
+            crate::state::supplied_filter(input.associated_resources.as_ref(), |resource| {
+                resource.resource_arn.clone()
+            }),
         );
 
         // The applications are keyed by id in a `BTreeMap`, so this walk is in one stable
@@ -284,7 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.stages.as_ref(),
                         application.stage().as_slice(),
                     )
-                    && application.matches_resource_arns(&resource_arns)
+                    && resource_filter
+                        .as_ref()
+                        .is_none_or(|arns| application.matches_resource_arns(arns))
             })
             .take(page_size.saturating_add(1))
             .collect();
