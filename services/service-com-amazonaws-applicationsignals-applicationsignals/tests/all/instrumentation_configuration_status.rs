@@ -194,6 +194,7 @@ pub(crate) fn create_request(
         "InstrumentationType": kind,
         "Location": { "CodeLocation": {
             "Language": "Java",
+            "ClassName": "Checkout",
             "FilePath": file_path,
             "LineNumber": 42
         }},

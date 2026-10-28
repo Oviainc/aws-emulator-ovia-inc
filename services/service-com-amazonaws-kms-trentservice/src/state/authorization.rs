@@ -196,6 +196,31 @@ pub fn authorize(
         ));
     }
 
+    // WHICH document has to change is what AWS's two implicit-deny sentences say, and the
+    // key policy decides which one applies: a policy that does not allow the action for
+    // this caller or its account withholds it outright, and no identity policy can widen a
+    // key policy that grants nothing — while a policy that DELEGATES to the account leaves
+    // the principal's own identity policies as the permission it is missing. The key
+    // policy delegates only when the statement that allows the account APPLIES to this
+    // request, so a delegation gated on a condition the request does not satisfy is no
+    // delegation and the key policy is the document that withheld the action.
+    let delegates_to_account = || {
+        !caller.account.is_empty()
+            && iam::resource_decision(
+                &key.policy,
+                &iam::Request::new(&action, &key.arn, &caller.account)
+                    .with_context(&principal_context)
+                    .with_published_keys(&published),
+            ) == Decision::Allowed
+    };
+    let no_allow_message = |delegates: bool| {
+        if delegates {
+            no_identity_policy_message(&caller.arn, &action, &key.arn)
+        } else {
+            no_resource_policy_message(&caller.arn, &action, &key.arn)
+        }
+    };
+
     // A grant permits exactly the operations it lists, on the one key it covers, under
     // its own encryption-context constraints. The grants in force are those the request's
     // tokens name — and, for a request that presents none, those ISSUED to the caller:
@@ -206,7 +231,7 @@ pub fn authorize(
             .iter()
             .any(|grant| grant.permits(&key.key_id, operation, context))
             .then_some(())
-            .ok_or_else(|| no_identity_policy_message(&caller.arn, &action, &key.arn));
+            .ok_or_else(|| no_allow_message(delegates_to_account()));
     }
     let by_grant = state
         .grants_for_key(region, &key.key_id)
@@ -221,27 +246,11 @@ pub fn authorize(
     if iam::resource_decision(&key.policy, &granting) == Decision::Allowed {
         return Ok(());
     }
-    let delegates = !caller.account.is_empty()
-        && iam::resource_decision(
-            &key.policy,
-            &iam::Request::new(&action, &key.arn, &caller.account)
-                .with_context(&principal_context)
-                .with_published_keys(&published),
-        ) == Decision::Allowed;
+    let delegates = delegates_to_account();
     if delegates && (caller.identity_is_unbounded() || identity_said == Decision::Allowed) {
         return Ok(());
     }
-
-    // WHICH document has to change is what AWS's two implicit-deny sentences say, and the
-    // key policy decides which one applies: a policy that does not allow the action for
-    // this caller or its account withholds it outright, and no identity policy can widen a
-    // key policy that grants nothing — while a policy that DELEGATES to the account leaves
-    // the principal's own identity policies as the permission it is missing.
-    Err(if delegates {
-        no_identity_policy_message(&caller.arn, &action, &key.arn)
-    } else {
-        no_resource_policy_message(&caller.arn, &action, &key.arn)
-    })
+    Err(no_allow_message(delegates))
 }
 
 /// Whether the authorities in force let `caller` perform an ACCOUNT-LEVEL
@@ -350,6 +359,11 @@ fn condition_context(caller: &Caller) -> Vec<(String, String)> {
 /// which action, on which resource, and that no identity-based policy allows the action.
 /// Every value in it comes from the request and the caller's credential.
 ///
+/// This is the sentence for a key whose policy DELEGATES the action to the caller's
+/// account, where the missing permission is the principal's own; a key policy that allows
+/// the action to neither the caller nor its account is withholding it itself and is
+/// refused with [`no_resource_policy_message`] instead.
+///
 /// One function for the whole service, so no two operations word the same refusal
 /// differently.
 #[must_use]
@@ -365,14 +379,13 @@ pub fn no_identity_policy_message(principal: &str, action: &str, resource: &str)
 /// action — the sentence for a key whose policy does not allow the action for this caller
 /// or for its account at all, which is the document that has to change.
 ///
-/// One function for the whole service, so no two operations word the same refusal
-/// differently.
+/// The sentence itself is the tree's one spelling of it
+/// ([`iam::not_authorized_by_resource_policy`]), so this service cannot drift from the
+/// other services that answer the same refusal class; this wrapper keeps the key's ARN and
+/// the `kms:` action the only things a caller here has to supply.
 #[must_use]
 pub fn no_resource_policy_message(principal: &str, action: &str, resource: &str) -> String {
-    format!(
-        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
-         because no resource-based policy allows the {action} action"
-    )
+    iam::not_authorized_by_resource_policy(principal, action, resource)
 }
 
 /// How AWS words an authorization failure a document explicitly denied, naming which kind

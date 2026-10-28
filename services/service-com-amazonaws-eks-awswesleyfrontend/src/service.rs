@@ -21,8 +21,10 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: it claims a tag request the model's own tag contract
+//!   refuses, so that refusal is stated in the error code the called operation
+//!   declares (see [`tag_contract`]). Every other request resolves through the
+//!   generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -40,6 +42,8 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod tag_contract;
+
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -52,6 +56,12 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Answers a `TagResource` / `UntagResource` request the model's own tag
+    /// contract refuses, in the error channel those two operations declare (see
+    /// [`tag_contract`]). Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of one of its own
+    /// operations.
+    refused_tag_request: tag_contract::RefusedTagRequest,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +71,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            refused_tag_request: tag_contract::RefusedTagRequest::new(),
         }
     }
 }
@@ -91,8 +102,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // EDITED HERE: a tag request the model's own tag contract refuses is claimed
+        // so that the refusal is stated in the error code the CALLED operation
+        // declares. `TagResource` and `UntagResource` declare `BadRequestException`
+        // and nothing else, where the rest of this service declares
+        // `InvalidParameterException` — the code `override_refusal` below picks. That
+        // seam is per SERVICE and cannot tell the two apart, so the choice is made
+        // here, before dispatch, which is the only place the operation is known.
+        // Every other request keeps the generated routing table as its only source.
+        // See [`tag_contract`] for the whole argument and for the refusal this
+        // answers instead.
+        let protocol = self.entry.protocol();
+        let key = protocol.routing_key(req).ok()?;
+        tag_contract::refusal_for(key, protocol, req)
+            .map(|_| &self.refused_tag_request as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -108,18 +132,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `^[0-9A-Za-z][A-Za-z0-9\-_]*$` pattern or its 1..100 length answers
         // 400 `InvalidParameterException`, as the real service does.
         //
-        // The seam is per SERVICE, not per operation, so the two tag operations —
-        // the only ones here that model `BadRequestException` instead — are also
-        // worded this way; the status is 400 either way, which is what a client
-        // branches on first. The framework's message already names the member and
-        // the constraint it broke, so it is kept verbatim.
+        // The seam is per SERVICE, not per operation, so it cannot word the two tag
+        // operations — the only ones here that model `BadRequestException` instead —
+        // in their own channel. Those two are claimed BEFORE dispatch by
+        // `override_operation` above, so a refusal of theirs never reaches this seam;
+        // everything that does reach it declares `InvalidParameterException`. The
+        // framework's message already names the member and the constraint it broke,
+        // so it is kept verbatim.
         //
         // Wording the refusal per OPERATION is not reachable from here:
         // `Refusal` (vendor/smithy-server-runtime/src/pre_dispatch.rs) carries
         // only the violations, no operation identity, and a refusal is raised
         // before any operation is named. So this picks the code the majority of
-        // this service's operations declare rather than guessing at the member
-        // paths in the violations.
+        // this service's operations declare, and the minority that declares another
+        // one is answered before dispatch instead (see [`tag_contract`]) rather than
+        // guessed at from the member paths in the violations.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "InvalidParameterException".to_string(),

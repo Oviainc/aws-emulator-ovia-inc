@@ -3,14 +3,25 @@
 //! @op CreateCluster
 //!
 //! Inserts a new cluster into this service's store and reports it back in the
-//! `creating` status, with its connection endpoint and creation time, and with
+//! `creating` status, with its creation time and with
 //! every `Cluster` member the service derives from the configuration the request
 //! asked for (see `crate::state::populate_derived_members`): where the cluster
-//! is, what it is, and what is scheduled for it. The admin
+//! is, what it is, and what is scheduled for it. A cluster that is still being
+//! provisioned publishes NO connection endpoint — its address and port appear
+//! only once it is available (see `crate::state::StoredCluster::publish_endpoint`).
+//! The admin
 //! password is stored on the record but never placed on the `Cluster` shape, so
 //! it cannot reach the wire — a password change still being applied is reported
 //! as the masked `PendingModifiedValues$MasterUserPassword`. A second create with
 //! the same identifier is refused with `ClusterAlreadyExistsFault`.
+//!
+//! Every value the request carries is checked BEFORE anything is provisioned: the
+//! node count against the cluster type it has to describe, the maintenance window
+//! against its documented form and minimum length, the retention periods against
+//! their published ranges and the maintenance track against the published
+//! catalog — a value outside its constraint is refused with `InvalidParameterValue`
+//! (the modelled `InvalidClusterTrackFault` for the track), so no invalid cluster
+//! is ever stored.
 //!
 //! The groups the request names the cluster into are resolved against the store
 //! BEFORE the cluster is allocated: an unknown `ClusterSubnetGroupName` answers
@@ -448,8 +459,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
         let (cluster_type, number_of_nodes) =
             match st::resolve_cluster_shape(input.cluster_type.as_deref(), input.number_of_nodes, None) {
                 Ok(shape) => shape,
-                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+                Err(message) => {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message))
+                }
             };
+
+        // The weekly maintenance window the request asks for, checked against
+        // its documented form and its documented minimum length BEFORE anything
+        // is provisioned, under the one rule every operation that takes a window
+        // shares.
+        if let Some(window) = input.preferred_maintenance_window.as_deref() {
+            if let Err(message) = st::check_maintenance_window(window) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message));
+            }
+        }
 
         let automated_retention = input
             .automated_snapshot_retention_period
@@ -590,7 +613,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
                         CreateClusterErrorModeled::ClusterParameterGroupNotFoundFault(
                             ClusterParameterGroupNotFoundFault {
                                 message: Some(format!(
-                                    "Cluster parameter group not found: {requested}"
+                                    "ClusterParameterGroup not found: {requested}"
                                 )),
                             },
                         )
@@ -604,6 +627,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
 
         let hsm_requested = input.hsm_client_certificate_identifier.is_some()
             || input.hsm_configuration_identifier.is_some();
+        // Where the cluster is, decided before the record is built: the
+        // Availability Zone the request asked for or the account's default one,
+        // and the VPC its subnet group's subnets are in. The connection endpoint
+        // is derived from both, so neither can be decided twice.
+        let availability_zone = input
+            .availability_zone
+            .clone()
+            .unwrap_or_else(|| st::default_availability_zone(&identifier, &region));
+        let vpc_id = subnet_group
+            .as_ref()
+            .and_then(|group| group.vpc_id.clone())
+            .unwrap_or_else(|| {
+                st::derived_vpc_id(
+                    subnet_group
+                        .as_ref()
+                        .and_then(|group| group.cluster_subnet_group_name.as_deref())
+                        .unwrap_or(st::DEFAULT_CLUSTER_SUBNET_GROUP),
+                )
+            });
+        // The endpoint the cluster will serve on once it is up. A cluster
+        // reported `creating` publishes NONE — its address and port appear only
+        // when it becomes available — so the record below carries no endpoint
+        // and the store keeps this one until the provisioning transition
+        // publishes it.
+        let endpoint = st::cluster_endpoint(
+            &identifier,
+            &region,
+            input.port.unwrap_or(st::DEFAULT_PORT),
+            &vpc_id,
+            &availability_zone,
+        );
         let mut cluster = Cluster {
             cluster_identifier: Some(identifier.clone()),
             node_type: Some(input.node_type.clone()),
@@ -618,11 +672,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
                     .clone()
                     .unwrap_or_else(|| st::DEFAULT_DB_NAME.to_string()),
             ),
-            endpoint: Some(Endpoint {
-                address: Some(st::endpoint_address(&identifier, &region)),
-                port: Some(input.port.unwrap_or(st::DEFAULT_PORT)),
-                vpc_endpoints: None,
-            }),
+            endpoint: None,
             cluster_create_time: Some(created_at),
             automated_snapshot_retention_period: Some(automated_retention),
             manual_snapshot_retention_period: Some(manual_retention),
@@ -661,19 +711,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             cluster_subnet_group_name: subnet_group
                 .as_ref()
                 .and_then(|group| group.cluster_subnet_group_name.clone()),
-            vpc_id: subnet_group.as_ref().and_then(|group| group.vpc_id.clone()),
+            vpc_id: Some(vpc_id.clone()),
             // The admin password the request carries is applied while the
             // cluster comes up, so it is the one change this create reports as
             // pending — as the MASK, never the password.
             pending_modified_values: Some(st::pending_master_user_password(
                 input.master_user_password.as_deref(),
             )),
-            availability_zone: Some(
-                input
-                    .availability_zone
-                    .clone()
-                    .unwrap_or_else(|| st::default_availability_zone(&identifier, &region)),
-            ),
+            availability_zone: Some(availability_zone.clone()),
             preferred_maintenance_window: Some(
                 input
                     .preferred_maintenance_window
@@ -764,6 +809,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             // shape models no password member, so it cannot reach the wire.
             master_user_password: input.master_user_password.clone(),
             available_at: started + st::PROVISIONING_SPAN,
+            endpoint,
         });
 
         Ok((

@@ -320,6 +320,11 @@ pub const HOSTED_ZONE_LIMIT_MAX_RRSETS: &str = "MAX_RRSETS_BY_ZONE";
 /// (`HostedZoneLimitType` enum).
 pub const HOSTED_ZONE_LIMIT_MAX_VPCS_ASSOCIATED: &str = "MAX_VPCS_ASSOCIATED_BY_ZONE";
 
+/// The `ReusableDelegationSetLimitType` naming one reusable delegation set's
+/// hosted-zone quota (`ReusableDelegationSetLimitType` enum, whose only value
+/// this is).
+pub const REUSABLE_DELEGATION_SET_LIMIT_MAX_ZONES: &str = "MAX_ZONES_BY_REUSABLE_DELEGATION_SET";
+
 /// The `TagResourceType` naming a hosted zone (`TagResourceType` enum).
 pub const TAG_RESOURCE_TYPE_HOSTED_ZONE: &str = "hostedzone";
 /// The `TagResourceType` naming a health check (`TagResourceType` enum).
@@ -1910,6 +1915,30 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             ACCOUNT_LIMIT_MAX_TRAFFIC_POLICY_INSTANCES => (
                 MAX_TRAFFIC_POLICY_INSTANCES,
                 self.traffic_policy_instances.len(),
+            ),
+            _ => return None,
+        };
+        Some((count_as_i64(limit), count_as_i64(count)))
+    }
+
+    /// The per-set quota for one `ReusableDelegationSetLimitType` and how much
+    /// of it the reusable delegation set `id` holds right now, as
+    /// `(limit value, current count)`. `None` for a value outside
+    /// `ReusableDelegationSetLimitType`.
+    ///
+    /// `id` is the BARE set id. The count is COUNTED off the zones on every
+    /// call, for the same reason [`Self::account_limit_usage`] counts: a zone
+    /// created in the set or deleted from it moves the count by itself, so no
+    /// read has to be told about it and none can disagree with the zones
+    /// `ListHostedZones` reports for that set. The quota is the same constant
+    /// `CreateHostedZone` refuses at, so a count that has reached the reported
+    /// limit is exactly the point at which the next create in that set is
+    /// refused.
+    pub fn delegation_set_limit_usage(&self, id: &str, limit_type: &str) -> Option<(i64, i64)> {
+        let (limit, count) = match limit_type {
+            REUSABLE_DELEGATION_SET_LIMIT_MAX_ZONES => (
+                MAX_HOSTED_ZONES_PER_DELEGATION_SET,
+                self.zones_in_delegation_set(id),
             ),
             _ => return None,
         };

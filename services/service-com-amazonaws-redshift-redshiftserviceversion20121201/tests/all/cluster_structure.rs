@@ -330,6 +330,61 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             group.body
         );
     }
+
+    // Once every row's cluster is serving it publishes its connection endpoint:
+    // the hostname that carries its own name, the port it listens on and the VPC
+    // interface endpoint it is reached through, whose network interface is in the
+    // cluster's own Availability Zone.
+    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
+    for (index, case) in cases.iter().enumerate() {
+        let name = case.case;
+        let identifier = format!("structure-{index:02}");
+        let serving = emulator
+            .call("DescribeClusters", &[("ClusterIdentifier", &identifier)])
+            .await;
+        let address = serving
+            .text("Address")
+            .unwrap_or_else(|| panic!("case {name}: expected an endpoint address once serving, got {}", serving.body));
+        assert!(
+            address.starts_with(&format!("{identifier}."))
+                && address.ends_with(".redshift.amazonaws.com"),
+            "case {name}: expected a Redshift endpoint host for the identifier, got {address:?}"
+        );
+        assert_eq!(
+            serving.text("Port").as_deref(),
+            Some(state::DEFAULT_PORT.to_string().as_str()),
+            "case {name}: expected the default port, got {:?}",
+            serving.text("Port")
+        );
+        let endpoint_id = serving
+            .text("VpcEndpointId")
+            .unwrap_or_else(|| panic!("case {name}: expected a VpcEndpointId, got {}", serving.body));
+        assert!(
+            endpoint_id.starts_with("vpce-"),
+            "case {name}: expected a VPC endpoint id, got {endpoint_id:?}"
+        );
+        let interface_id = serving
+            .text("NetworkInterfaceId")
+            .unwrap_or_else(|| panic!("case {name}: expected a NetworkInterfaceId"));
+        let subnet_id = serving
+            .text("SubnetId")
+            .unwrap_or_else(|| panic!("case {name}: expected a SubnetId"));
+        assert!(
+            interface_id.starts_with("eni-") && subnet_id.starts_with("subnet-"),
+            "case {name}: expected an eni/subnet pair, got {interface_id:?} / {subnet_id:?}"
+        );
+        let zones = all_text(&serving.body, "AvailabilityZone");
+        assert!(
+            zones.len() == 2 && zones[0] == zones[1],
+            "case {name}: expected the endpoint interface to be in the cluster's zone, got {zones:?}"
+        );
+        let reported_vpcs = all_text(&serving.body, "VpcId");
+        let vpc_id = state::derived_vpc_id(&case.subnet_group);
+        assert!(
+            reported_vpcs.len() == 2 && reported_vpcs.iter().all(|reported| *reported == vpc_id),
+            "case {name}: expected the endpoint to be in the cluster's VPC {vpc_id:?}, got {reported_vpcs:?}"
+        );
+    }
 }
 
 /// Assert the whole rule on one reported cluster: the row's own expectations,
@@ -427,29 +482,26 @@ fn assert_structure(answer: &Answer, case: &Case, identifier: &str) {
         "case {name}: expected a numeric ClusterRevisionNumber, got {revision:?}"
     );
 
-    // The managed VPC endpoint the cluster is reached through, with its network
-    // interface in the cluster's own Availability Zone.
-    let endpoint_id = answer
-        .text("VpcEndpointId")
-        .unwrap_or_else(|| panic!("case {name}: expected a VpcEndpointId, got {}", answer.body));
-    assert!(
-        endpoint_id.starts_with("vpce-"),
-        "case {name}: expected a VPC endpoint id, got {endpoint_id:?}"
+    // The managed VPC endpoint the cluster is reached through is part of the
+    // connection endpoint, and a cluster still being provisioned publishes
+    // NONE of it: the whole endpoint appears only once the cluster is serving,
+    // which the loop above asserts past the provisioning span.
+    assert_eq!(
+        answer.text("VpcEndpointId"),
+        None,
+        "case {name}: expected no VPC endpoint while the cluster is creating, got {:?}",
+        answer.text("VpcEndpointId")
     );
-    let interface_id = answer
-        .text("NetworkInterfaceId")
-        .unwrap_or_else(|| panic!("case {name}: expected a NetworkInterfaceId"));
-    let subnet_id = answer
-        .text("SubnetId")
-        .unwrap_or_else(|| panic!("case {name}: expected a SubnetId"));
-    assert!(
-        interface_id.starts_with("eni-") && subnet_id.starts_with("subnet-"),
-        "case {name}: expected an eni/subnet pair, got {interface_id:?} / {subnet_id:?}"
+    assert_eq!(
+        answer.text("Address"),
+        None,
+        "case {name}: expected no endpoint address while the cluster is creating, got {:?}",
+        answer.text("Address")
     );
     let zones = all_text(&answer.body, "AvailabilityZone");
     assert!(
-        zones.len() == 2 && zones[0] == zones[1],
-        "case {name}: expected the endpoint interface to be in the cluster's zone, got {zones:?}"
+        zones.len() == 1,
+        "case {name}: expected only the cluster's own zone while it is creating, got {zones:?}"
     );
 
     // The retired AQUA configuration: the automatic configuration status, with

@@ -33,6 +33,8 @@ mod attachment_routing_policy_label_removal;
 mod connect_peer_association_lifecycle;
 #[path = "all/connect_peer_delete.rs"]
 mod connect_peer_delete;
+#[path = "all/connect_peer_delete_cascade.rs"]
+mod connect_peer_delete_cascade;
 #[path = "all/connect_peer_lifecycle.rs"]
 mod connect_peer_lifecycle;
 #[path = "all/connection_lifecycle.rs"]

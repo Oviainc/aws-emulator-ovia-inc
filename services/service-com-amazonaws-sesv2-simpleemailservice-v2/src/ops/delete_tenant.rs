@@ -161,23 +161,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // error, so a tenant still holding resource associations is removed exactly like
         // one holding none. The only refusal left is a name the account does not hold,
         // reported with the wording every operation that reads a tenant by name uses.
-        if store.tenants.remove(&tenant_name).is_none() {
+        // What goes with the record, and what outlives it, is
+        // [`crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::delete_tenant`]'s.
+        if store.delete_tenant(&tenant_name).is_none() {
             return Err(DeleteTenantErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::tenant_not_found(&tenant_name)),
             })
             .into());
         }
-
-        // "When you delete a tenant, its associations with resources are removed, but
-        // the resources themselves are not deleted": the rows holding this tenant's
-        // associations go with it — so neither the tenant's own view nor the resource's
-        // names an association that no longer exists, and neither the association
-        // ceiling nor a later association of the same pair is held by a tenant that is
-        // gone. The resource records themselves are untouched, and so is every
-        // association another tenant holds, including one on the same resource.
-        store
-            .tenant_resource_associations
-            .retain(|_, association| association.tenant_name != tenant_name);
 
         // `DeleteTenantResponse` carries no members: the removal is observed through the
         // tenant reads and listings that no longer resolve the name.

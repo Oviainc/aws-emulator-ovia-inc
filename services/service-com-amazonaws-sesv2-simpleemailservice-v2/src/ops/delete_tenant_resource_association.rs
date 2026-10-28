@@ -187,14 +187,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both inputs are resolved BEFORE anything is removed, so a refusal leaves the
         // association table exactly as it was. The tenant is resolved first, as this
         // surface's create does.
-        if !store.tenants.contains_key(&tenant_name) {
+        let Some(tenant) = store.tenants.get(&tenant_name) else {
             return Err(DeleteTenantResourceAssociationErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::requested_tenant_not_found(&tenant_name)),
                 },
             )
             .into());
-        }
+        };
+        let tenant_id = tenant.tenant_id.clone();
 
         // "The resource you attempted to access doesn't exist": an association names a
         // resource, so an ARN resolving to no record the account holds is reported as
@@ -211,12 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The resource itself is not deleted, only its association with the specific
         // tenant is removed": the resource and the tenant both stay, and so does every
         // other association either of them holds — the one record keyed by this pair is
-        // what goes. Removal is idempotent: a pair holding no association is already in
-        // the state the call asks for, so it answers the empty 200 rather than a
-        // refusal.
-        store
+        // what goes, and only while it is one THIS tenant record holds; a row left
+        // behind by a deleted tenant of the same name is not this tenant's to remove.
+        // Removal is idempotent: a pair holding no association of this tenant's is
+        // already in the state the call asks for, so it answers the empty 200 rather
+        // than a refusal.
+        let key = (resource_arn, tenant_name);
+        if store
             .tenant_resource_associations
-            .remove(&(resource_arn, tenant_name));
+            .get(&key)
+            .is_some_and(|record| record.tenant_id == tenant_id)
+        {
+            store.tenant_resource_associations.remove(&key);
+        }
 
         // The response carries no members: the removal is observed through the listings
         // that read the table just written.

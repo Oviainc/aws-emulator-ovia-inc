@@ -2400,6 +2400,11 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         "AWS::RDS::DBInstance" | "AWS::RDS::DBCluster" => {
             rules(63, Characters::LowercaseAlphanumeric)
         }
+        // Amazon Redshift `CreateCluster.ClusterIdentifier`: "Must contain from 1 to 63
+        // alphanumeric characters or hyphens", "Alphabetic characters must be lowercase",
+        // "Cannot end with a hyphen or contain two consecutive hyphens" (that member's own
+        // doc) — Redshift's model carries no `@length` for it.
+        REDSHIFT_CLUSTER => rules(63, Characters::LowercaseAlphanumeric),
         // Amazon EC2 `CreateSecurityGroup.GroupName`: "Up to 255 characters in length"
         // (Amazon EC2 API reference) — EC2's model carries no `@length` for it.
         EC2_SECURITY_GROUP => rules(255, Characters::AsGenerated),
@@ -2739,6 +2744,11 @@ fn declared_name_property(resource_type: &str) -> Option<&'static str> {
         // `DomainName`, so neither `DomainNameName` nor `Name` finds it.
         APIGATEWAYV2_DOMAIN_NAME => Some("DomainName"),
         ECR_PUBLIC_REPOSITORY => Some("RepositoryName"),
+        // Amazon Redshift's `CreateCluster` takes a `ClusterIdentifier` — "You use this
+        // identifier to refer to the cluster for any subsequent cluster operations" — so
+        // the type publishes `ClusterIdentifier`; the type's last segment is `Cluster`, so
+        // neither `ClusterName` nor `Name` finds it.
+        REDSHIFT_CLUSTER => Some("ClusterIdentifier"),
         // Amazon Cognito's `CreateGroup` takes `GroupName`, so the type publishes
         // `GroupName` — the type's last segment is `UserPoolGroup`, so neither
         // `UserPoolGroupName` nor `Name` finds it.
@@ -4343,6 +4353,15 @@ const MSK_CLUSTER_ARN_ORDINAL: u32 = 1;
 /// The same for an Amazon SQS queue: the SQS model carries
 /// `awsService.cloudFormationName: SQS`.
 pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
+
+/// The provisioned-cluster type of Amazon Redshift: the Redshift model carries
+/// `awsService.cloudFormationName: Redshift`.
+///
+/// "Ref returns the name of the cluster" — a cluster's `ClusterIdentifier` — so this
+/// resource's identity is CloudFormation's to compute, under that property
+/// ([`declared_name_property`]) and Amazon Redshift's own rules for it
+/// ([`naming_rules`]).
+pub const REDSHIFT_CLUSTER: &str = "AWS::Redshift::Cluster";
 
 /// The two resource types that carry a QUEUE's access policy: the one that applies a
 /// document to a list of queues, and the one that belongs to a single queue.

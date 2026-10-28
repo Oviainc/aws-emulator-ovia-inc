@@ -186,12 +186,8 @@ fn error_cases() -> Vec<ErrorCase> {
         },
         ErrorCase {
             case: "a scaffolded operation, which answers the 501 channel",
-            action: "CreateIntegration",
-            params: params(&[
-                ("IntegrationName", "zero-etl-1"),
-                ("SourceArn", INTEGRATION_SOURCE_ARN),
-                ("TargetArn", INTEGRATION_TARGET_ARN),
-            ]),
+            action: "DescribeDataShares",
+            params: Vec::new(),
             status: 501,
             code: "NotImplemented",
         },

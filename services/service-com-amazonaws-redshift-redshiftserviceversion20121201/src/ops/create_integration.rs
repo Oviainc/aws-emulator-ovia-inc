@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the zero-ETL integration the request asks for and reports it back in
+//! the `creating` status, under the ARN this service mints for it
+//! (`crate::state::integration_arn`). The TARGET is resolved against this
+//! service's store before anything is recorded — a `TargetArn` naming no
+//! cluster namespace this account holds answers `IntegrationTargetNotFoundFault`,
+//! and a target cluster that is not available answers `InvalidClusterStateFault`
+//! — so a refused create leaves no integration behind. The SOURCE is a resource
+//! of another service (the model's own pattern admits an Amazon S3 or DynamoDB
+//! ARN), so it is stored exactly as the request carried it. A second create
+//! under one `IntegrationName` is refused with `IntegrationAlreadyExistsFault`.
+//! The integration becomes `active` a `crate::state::PROVISIONING_SPAN` after
+//! this call.
 //!
 //! ## Shape of an operation
 //!
@@ -135,7 +139,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateIntegrationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateIntegration")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateIntegration",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateIntegrationErrorModeled {
     IntegrationAlreadyExistsFault(IntegrationAlreadyExistsFault),
@@ -147,6 +154,7 @@ pub enum CreateIntegrationErrorModeled {
     InvalidTagFault(InvalidTagFault),
     TagLimitExceededFault(TagLimitExceededFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -200,18 +208,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIntegration"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateIntegrationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = st::request_region(ctx);
+        let started = ::std::time::Instant::now();
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        // The request's own tag list is capped BEFORE the store is locked and
+        // before any per-element work, so a request carrying more entries than
+        // one resource may hold is refused on its length alone.
+        let tags = input.tag_list.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateIntegrationErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(st::tag_quota_message(tags.len())),
+                },
+            )
+            .into());
+        }
+        if let Err(message) = st::check_tags(&tags) {
+            return Err(CreateIntegrationErrorModeled::InvalidTagFault(
+                InvalidTagFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // Identity before capacity: a request that would create nothing keeps
+        // the more specific fault even when the store is at its bound.
+        if store.integration_named(&input.integration_name).is_some() {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationAlreadyExistsFault(
+                    IntegrationAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cannot create the integration because an integration with the name {} already exists.",
+                            input.integration_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.integrations.len() >= st::INTEGRATION_QUOTA {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationQuotaExceededFault(
+                    IntegrationQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of integrations ({}).",
+                            st::INTEGRATION_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The TARGET is a namespace of this account's own control plane, so the
+        // ARN is resolved against the store: a target that names no namespace
+        // this account holds is no target at all, and a cluster that is not
+        // available cannot take the data an integration would replicate into it.
+        let Some(target) = store.cluster_with_namespace_arn(&input.target_arn) else {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationTargetNotFoundFault(
+                    IntegrationTargetNotFoundFault {
+                        message: Some(format!(
+                            "Integration target not found: {}",
+                            input.target_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if target.cluster.cluster_status.as_deref() != Some(st::STATUS_AVAILABLE) {
+            return Err(CreateIntegrationErrorModeled::InvalidClusterStateFault(
+                InvalidClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {} is not in the available state.",
+                        target
+                            .cluster
+                            .cluster_identifier
+                            .clone()
+                            .unwrap_or_default()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record every later `DescribeIntegrations` reports verbatim: the
+        // ARN this service minted, the names and ARNs the request carried, the
+        // encryption key and context it named — a source in another service is
+        // taken at its word, since this store holds no record of one — and the
+        // tags it carried. `Errors` is an EMPTY list: an integration nothing has
+        // failed on reports no error.
+        let integration = CreateIntegrationOutput {
+            integration_arn: Some(st::integration_arn(&input.integration_name, &region)),
+            integration_name: Some(input.integration_name.clone()),
+            source_arn: Some(input.source_arn.clone()),
+            target_arn: Some(input.target_arn.clone()),
+            status: Some(st::INTEGRATION_STATUS_CREATING.to_string()),
+            errors: Some(Vec::new()),
+            create_time: Some(created_at),
+            description: input.description.clone(),
+            kms_key_id: input.kms_key_id.clone(),
+            additional_encryption_context: input.additional_encryption_context.clone(),
+            tags: Some(tags),
+        };
+        store.integrations.push(st::StoredIntegration {
+            integration: integration.clone(),
+            active_at: started + st::PROVISIONING_SPAN,
+        });
+
+        Ok(integration)
     }
 }

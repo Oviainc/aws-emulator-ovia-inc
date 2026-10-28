@@ -159,6 +159,7 @@ async fn create_instrumentation(
             "SignalType": "SNAPSHOT",
             "Location": { "CodeLocation": {
                 "Language": "Java",
+                "ClassName": "Checkout",
                 "FilePath": "src/checkout/Checkout.java",
                 "LineNumber": line_number
             }},

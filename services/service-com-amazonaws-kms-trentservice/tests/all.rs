@@ -87,6 +87,8 @@ mod multi_region_primary;
 mod multi_region_primary_serialization;
 #[path = "all/multi_region_rotation_sharing.rs"]
 mod multi_region_rotation_sharing;
+#[path = "all/no_allow_refusal_clause.rs"]
+mod no_allow_refusal_clause;
 #[path = "all/public_key.rs"]
 mod public_key;
 #[path = "all/random_bytes.rs"]

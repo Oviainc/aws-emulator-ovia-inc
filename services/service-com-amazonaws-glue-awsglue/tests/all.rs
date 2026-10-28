@@ -191,5 +191,7 @@ mod workflow_run_listing;
 mod workflow_run_properties;
 #[path = "all/workflow_runs.rs"]
 mod workflow_runs;
+#[path = "all/workflow_updates.rs"]
+mod workflow_updates;
 #[path = "all/workflows.rs"]
 mod workflows;

@@ -28,7 +28,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The model-derived catalog the table spans, so it cannot drift from the model.
 use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::BUDGET_TYPE_VALUES;
 
-use super::budget_lifecycle::{call, caller_account, router, same};
+use super::budget_lifecycle::{call, caller_account, limit_amount_for, router, same};
 use super::budget_read_projection::COST_TYPE_DEFAULTS;
 
 /// The one `BudgetType` whose budget HAS cost types.
@@ -44,7 +44,9 @@ const COST_TYPES_BUDGET_TYPE: &str = "COST";
 fn budget(name: &str, budget_type: &str) -> Value {
     json!({
         "BudgetName": name,
-        "BudgetLimit": {"Amount": "5", "Unit": "USD"},
+        // The amount a budget of this type may carry ([`limit_amount_for`]): this table
+        // is about which budgets hold cost types, not about the limit.
+        "BudgetLimit": {"Amount": limit_amount_for(budget_type, "5"), "Unit": "USD"},
         "TimeUnit": "MONTHLY",
         "BudgetType": budget_type
     })

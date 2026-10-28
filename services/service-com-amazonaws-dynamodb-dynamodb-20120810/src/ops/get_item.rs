@@ -218,6 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
+        // Every token the request DEFINES must be one an expression uses: an
+        // `ExpressionAttributeNames` entry no projection references makes the whole
+        // request invalid.
+        crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None)
+            .check_all_referenced(&[input.projection_expression.as_deref()])
+            .map_err(lift)?;
         if let Some(expression) = input.projection_expression.as_deref() {
             // The member is VALIDATED whether or not projecting is served: whether the
             // expression is one this service's language accepts — a bare reserved

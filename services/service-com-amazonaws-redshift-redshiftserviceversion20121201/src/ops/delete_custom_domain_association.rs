@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomDomainAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomDomainAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomDomainAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the custom domain association from the cluster the request names,
+//! which is what makes the deletion observable: a later `DescribeClusters`
+//! reports no domain, certificate or expiry for that cluster and a later
+//! `DescribeCustomDomainAssociations` reports the association no longer. The
+//! cluster is resolved against this service's store first
+//! (`ClusterNotFoundFault` for an identifier naming none), and a cluster
+//! carrying no association under the requested domain name answers
+//! `CustomDomainAssociationNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -102,13 +102,17 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteCustomDomainAssoci
 // here — hence the `DeleteCustomDomainAssociationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteCustomDomainAssociation")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteCustomDomainAssociation",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteCustomDomainAssociationErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     CustomCnameAssociationFault(CustomCnameAssociationFault),
     CustomDomainAssociationNotFoundFault(CustomDomainAssociationNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -160,20 +164,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomDomainAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomDomainAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomDomainAssociation"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteCustomDomainAssociationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(
+                DeleteCustomDomainAssociationErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!(
+                            "Cluster {} not found.",
+                            input.cluster_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        if store.clusters[position].cluster.custom_domain_name.as_deref()
+            != Some(input.custom_domain_name.as_str())
+        {
+            return Err(
+                DeleteCustomDomainAssociationErrorModeled::CustomDomainAssociationNotFoundFault(
+                    CustomDomainAssociationNotFoundFault {
+                        message: Some(st::custom_domain_association_not_found_message(
+                            &input.custom_domain_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // All three members of the association leave the record together: the
+        // certificate and its expiry describe the domain name, so none of them
+        // outlives it.
+        let cluster = &mut store.clusters[position].cluster;
+        cluster.custom_domain_name = None;
+        cluster.custom_domain_certificate_arn = None;
+        cluster.custom_domain_certificate_expiry_date = None;
+
+        Ok(DeleteCustomDomainAssociationOutput)
     }
 }

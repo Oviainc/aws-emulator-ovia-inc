@@ -16537,18 +16537,26 @@ pub const MAX_SECURITY_GROUP_RULES: usize =
 /// per-direction rule quota (EC2 API error codes, "RulesPerSecurityGroupLimitExceeded").
 pub const RULES_PER_SECURITY_GROUP_LIMIT_EXCEEDED: &str = "RulesPerSecurityGroupLimitExceeded";
 
+/// The message EC2 refuses an over-quota authorize with, in full.
+///
+/// Entirely FIXED text with no variable part: the rules-per-security-group quota is
+/// adjustable per account (Service Quotas, service code `vpc`), so the value in force is a
+/// property of the account rather than of the refusal, and the service does not name it
+/// here. A number interpolated into this message would be a value a caller could parse and
+/// depend on, and it would differ from account to account for the same refusal.
+pub const RULES_PER_SECURITY_GROUP_LIMIT_EXCEEDED_MESSAGE: &str =
+    "The maximum number of rules per security group has been reached.";
+
 /// Refuse an authorize that would take a security group past
 /// [`MAX_SECURITY_GROUP_RULES_PER_DIRECTION`] rules in one direction: HTTP 400
 /// `RulesPerSecurityGroupLimitExceeded`. A quota, not something the request got wrong, so it
-/// carries the quota code an SDK classifies as one.
+/// carries the quota code an SDK classifies as one, with the service's fixed message
+/// ([`RULES_PER_SECURITY_GROUP_LIMIT_EXCEEDED_MESSAGE`]).
 pub fn rules_per_security_group_limit_exceeded<E>() -> Scaffolded<E> {
     Scaffolded::service_error(
         RULES_PER_SECURITY_GROUP_LIMIT_EXCEEDED,
         400,
-        format!(
-            "The maximum number of rules per security group has been reached \
-             ({MAX_SECURITY_GROUP_RULES_PER_DIRECTION})"
-        ),
+        RULES_PER_SECURITY_GROUP_LIMIT_EXCEEDED_MESSAGE,
     )
 }
 
@@ -38775,6 +38783,160 @@ pub const DEFAULT_FLOW_LOG_FORMAT: &str = "${version} ${account-id} ${interface-
                                            ${srcaddr} ${dstaddr} ${srcport} ${dstport} \
                                            ${protocol} ${packets} ${bytes} ${start} \
                                            ${end} ${action} ${log-status}";
+
+/// The field ids a flow log record may name — the vocabulary a `LogFormat` draws its
+/// `${field-id}` tokens from.
+///
+/// "For more information about the available fields, see Flow log records in the Amazon VPC
+/// User Guide or Transit Gateway Flow Log records in the Amazon Web Services Transit Gateway
+/// Guide" (`CreateFlowLogsRequest$LogFormat`): the vocabulary is published PROSE, not a
+/// model shape — the member is a plain `String` — so it is written out here, as the union of
+/// the two published tables. The first block is the Amazon VPC User Guide's available
+/// fields, in the order it lists them (the first fourteen are also the default format,
+/// [`DEFAULT_FLOW_LOG_FORMAT`]); the second is the fields only a transit gateway record has,
+/// from the Transit Gateway Guide's table.
+///
+/// One catalog for both, because `LogFormat` is validated the same way whatever resource
+/// type the create monitors.
+pub const FLOW_LOG_RECORD_FIELDS: [&str; 58] = [
+    // Amazon VPC User Guide, "Flow log records" — available fields.
+    "version",
+    "account-id",
+    "interface-id",
+    "srcaddr",
+    "dstaddr",
+    "srcport",
+    "dstport",
+    "protocol",
+    "packets",
+    "bytes",
+    "start",
+    "end",
+    "action",
+    "log-status",
+    "vpc-id",
+    "subnet-id",
+    "instance-id",
+    "tcp-flags",
+    "type",
+    "pkt-srcaddr",
+    "pkt-dstaddr",
+    "region",
+    "az-id",
+    "sublocation-type",
+    "sublocation-id",
+    "pkt-src-aws-service",
+    "pkt-dst-aws-service",
+    "flow-direction",
+    "traffic-path",
+    "ecs-cluster-arn",
+    "ecs-cluster-name",
+    "ecs-container-instance-arn",
+    "ecs-container-instance-id",
+    "ecs-container-id",
+    "ecs-second-container-id",
+    "ecs-service-name",
+    "ecs-task-definition-arn",
+    "ecs-task-arn",
+    "ecs-task-id",
+    "reject-reason",
+    // Amazon Web Services Transit Gateway Guide, "Flow log records" — the fields a transit
+    // gateway record adds.
+    "resource-type",
+    "tgw-id",
+    "tgw-attachment-id",
+    "tgw-src-vpc-account-id",
+    "tgw-dst-vpc-account-id",
+    "tgw-src-vpc-id",
+    "tgw-dst-vpc-id",
+    "tgw-src-subnet-id",
+    "tgw-dst-subnet-id",
+    "tgw-src-eni",
+    "tgw-dst-eni",
+    "tgw-src-az-id",
+    "tgw-dst-az-id",
+    "tgw-pair-details",
+    "packets-lost-no-route",
+    "packets-lost-blackhole",
+    "packets-lost-mtu-exceeded",
+    "packets-lost-ttl-expired",
+];
+
+/// What separates a field id from the tag key it reads, in a record field that reports a tag
+/// of the monitored resource ("The tag configuration associated with the Flow Logs Amazon
+/// EC2 Tags feature fields in your custom log format" —
+/// `CreateFlowLogsRequest$TagFieldSpecifications`).
+///
+/// A tag field's token ends in a tag KEY the caller chose, so no published table can
+/// enumerate those tokens and [`FLOW_LOG_RECORD_FIELDS`] does not try: a token carrying this
+/// separator names a tag rather than a field of the record, and is read as one.
+const FLOW_LOG_TAG_FIELD_SEPARATOR: char = ':';
+
+/// The `${field-id}` tokens of `log_format`, in the order the format names them.
+///
+/// "Specify the fields using the `${field-id}` format, separated by spaces"
+/// (`CreateFlowLogsRequest$LogFormat`): a token is what one `${` and the next `}` enclose,
+/// and the text between two tokens is separator rather than a field. An unterminated `${`
+/// opens no token, so nothing after it is read as one.
+pub fn flow_log_format_fields(log_format: &str) -> Vec<&str> {
+    let mut fields: Vec<&str> = Vec::new();
+    let mut rest = log_format;
+    while let Some((_, opened)) = rest.split_once("${") {
+        let Some((field, tail)) = opened.split_once('}') else {
+            break;
+        };
+        fields.push(field);
+        rest = tail;
+    }
+    fields
+}
+
+/// The `${field-id}` tokens of `log_format` that name no field a flow log record has, each
+/// listed once and in the order the format names them.
+///
+/// A token is recognised when it names an entry of [`FLOW_LOG_RECORD_FIELDS`], or when it
+/// reads a tag of the monitored resource ([`FLOW_LOG_TAG_FIELD_SEPARATOR`], whose tag key is
+/// the caller's and so is not in any published table). Every other token names a field that
+/// does not exist, and the create that carries it is refused with
+/// [`unknown_flow_log_fields`].
+pub fn unknown_flow_log_format_fields(log_format: &str) -> Vec<&str> {
+    let mut unknown: Vec<&str> = Vec::new();
+    for field in flow_log_format_fields(log_format) {
+        let recognised = FLOW_LOG_RECORD_FIELDS.contains(&field)
+            || field.contains(FLOW_LOG_TAG_FIELD_SEPARATOR);
+        if !recognised && !unknown.contains(&field) {
+            unknown.push(field);
+        }
+    }
+    unknown
+}
+
+/// Refuse a `CreateFlowLogs` whose `LogFormat` names fields a flow log record does not have:
+/// HTTP 400 [`INVALID_PARAMETER`].
+///
+/// The format is a layout of PUBLISHED fields — "For more information about the available
+/// fields, see Flow log records" (`CreateFlowLogsRequest$LogFormat`) — so a token outside
+/// that vocabulary names nothing the service could write, and the whole call is refused
+/// before any flow log is stored rather than one being created that could never deliver the
+/// records it promises.
+///
+/// The message names every unrecognised token, each quoted and spelled as the request
+/// spelled it, in the order the format named them; `unknown` is never empty, because a
+/// format whose every token is a field is not refused at all.
+pub fn unknown_flow_log_fields<E>(unknown: &[&str]) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!(
+            "Unknown fields provided: {fields}",
+            fields = unknown
+                .iter()
+                .map(|field| format!("'{field}'"))
+                .collect::<Vec<String>>()
+                .join(", "),
+        ),
+    )
+}
 
 /// The status a stored flow log reports: "The status of the flow log (`ACTIVE`)"
 /// (`FlowLog$FlowLogStatus`) — the one value the member documents, and the status AWS
