@@ -117,6 +117,8 @@ mod state_roundtrip;
 mod suppressed_destinations;
 #[path = "all/tenant_deletion.rs"]
 mod tenant_deletion;
+#[path = "all/tenant_deletion_reputation_entity.rs"]
+mod tenant_deletion_reputation_entity;
 #[path = "all/tenant_duplicate_name_refusal.rs"]
 mod tenant_duplicate_name_refusal;
 #[path = "all/tenant_resource_association_removal.rs"]
