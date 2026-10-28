@@ -3,8 +3,10 @@
 //! @op DisassociateLink
 //! Removes the association between a stored device and a stored link and reports the
 //! removed association as `DELETING`; an unknown global network, device or link is a 404,
-//! and so is a pair that is not associated. This is the ONLY file to touch for this
-//! operation.
+//! and so is a pair that is not associated; a pair a stored tie still stands on — a
+//! customer gateway association or a Connect peer association of either kind carried over
+//! it — is refused with the dependency `ValidationException` (400). This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -203,6 +205,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ValidationException {
                     message: format!(
                         "customer gateway {customer_gateway_arn} must be disassociated before device {} is disassociated from link {}",
+                        input.device_id, input.link_id
+                    ),
+                    reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                    fields: None,
+                },
+            )
+            .into());
+        }
+
+        // The two Connect peer association kinds this service stores stand on the same
+        // device/link tie: each is made only over a link the device it names is already
+        // associated with (`AssociateTransitGatewayConnectPeer`, `AssociateConnectPeer`), so
+        // untying the pair would leave the peering carried over a link its device no longer
+        // reaches it on — the state those associates refuse to create. The caller untangles
+        // it from the peering end, so the refusal names the peer still carried over the pair.
+        let blocking_peering: Option<String> = store
+            .transit_gateway_connect_peer_associations
+            .values()
+            .find(|association| {
+                association.global_network_id == input.global_network_id
+                    && association.device_id == input.device_id
+                    && association.link_id.as_deref() == Some(input.link_id.as_str())
+            })
+            .map(|association| {
+                format!(
+                    "transit gateway Connect peer {}",
+                    association.transit_gateway_connect_peer_arn
+                )
+            })
+            .or_else(|| {
+                store
+                    .connect_peer_associations
+                    .values()
+                    .find(|association| {
+                        association.global_network_id == input.global_network_id
+                            && association.device_id == input.device_id
+                            && association.link_id.as_deref() == Some(input.link_id.as_str())
+                    })
+                    .map(|association| format!("Connect peer {}", association.connect_peer_id))
+            });
+        if let Some(peering) = blocking_peering {
+            return Err(DisassociateLinkErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "{peering} must be disassociated before device {} is disassociated from link {}",
                         input.device_id, input.link_id
                     ),
                     reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
