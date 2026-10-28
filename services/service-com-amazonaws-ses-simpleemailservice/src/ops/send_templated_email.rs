@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendTemplatedEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendTemplatedEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendTemplatedEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Composes a message from one of this account's email templates and accepts it
+//! for sending: checks it the way SES does — the recipient set, the account's and
+//! the named configuration set's sending state, the sending identity, and only
+//! then the template the request names — appends it to this account's send log,
+//! and answers with the id it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -190,6 +187,22 @@ impl From<SendTemplatedEmailErrorModeled> for SendTemplatedEmailError {
     }
 }
 
+/// The number of recipients one message may address, from this operation's own
+/// documentation: "The Destination parameter can include up to 50 recipients,
+/// across the To:, CC: and BCC: fields." The same ceiling every send of this
+/// service documents, so the number itself lives in one place
+/// ([`crate::state::MAX_RECIPIENTS`]).
+const MAX_RECIPIENTS: usize = crate::state::MAX_RECIPIENTS;
+
+/// Refuse the message, as `MessageRejected` (HTTP 400): "Indicates that the
+/// action failed, and the message could not be sent."
+fn rejected(message: String) -> SendTemplatedEmailError {
+    SendTemplatedEmailErrorModeled::MessageRejected(MessageRejected {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `SendTemplatedEmail` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -226,18 +239,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendTemplatedEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendTemplatedEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendTemplatedEmail"))
+        // `ctx` carries the request metadata the identity gate reports: SES
+        // identities are per-Region, so the Region this send is scoped to is part
+        // of the refusal naming an unverified sender.
+        let region = crate::state::region_from_request(ctx.parts());
+        let source = crate::state::addr_spec(&input.source).to_string();
+        let destinations = crate::state::destination_recipients(&input.destination);
+
+        // "The Destination parameter must include at least one recipient email
+        // address. The recipient address can be a To: address, a CC: address, or a
+        // BCC: address."
+        if destinations.is_empty() {
+            return Err(rejected(
+                "Destination must include at least one recipient address, across the \
+                 ToAddresses, CcAddresses and BccAddresses fields"
+                    .to_string(),
+            ));
+        }
+        if destinations.len() > MAX_RECIPIENTS {
+            return Err(rejected(format!(
+                "Destination may include at most {MAX_RECIPIENTS} recipients across the \
+                 ToAddresses, CcAddresses and BccAddresses fields, got {}",
+                destinations.len()
+            )));
+        }
+        // "If a recipient email address is invalid (that is, it is not in the
+        // format UserName@[SubDomain.]Domain.TopLevelDomain), the entire message
+        // is rejected, even if the message contains other recipients that are
+        // valid."
+        if let Some(invalid) = destinations
+            .iter()
+            .find(|address| !crate::state::is_email_address(crate::state::addr_spec(address)))
+        {
+            return Err(rejected(crate::state::illegal_address_message(invalid)));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all. Every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendTemplatedEmail",
+            ));
+        };
+        let mut state = state.lock();
+
+        // One instant for the whole send, with the verification move the clock
+        // already owes each of this account's identities materialised against
+        // it: the sender gate below reads the status a caller reading the same
+        // identity at this instant is reported.
+        let now = std::time::SystemTime::now();
+        state.settle_identities(now);
+
+        // Account-wide pause, then the configuration set's own: each has its own
+        // modeled error, and the set must exist before its sending state is read.
+        if !state.account.sending_enabled {
+            return Err(
+                SendTemplatedEmailErrorModeled::AccountSendingPausedException(
+                    AccountSendingPausedException {
+                        message: Some(
+                            "Email sending is disabled for this account. Enable it with \
+                             UpdateAccountSendingEnabled."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(configuration_set_name) = input.configuration_set_name.as_deref() {
+            let Some(configuration_set) = state.configuration_sets.get(configuration_set_name)
+            else {
+                return Err(
+                    SendTemplatedEmailErrorModeled::ConfigurationSetDoesNotExistException(
+                        ConfigurationSetDoesNotExistException {
+                            configuration_set_name: Some(configuration_set_name.to_string()),
+                            message: Some(format!(
+                                "Configuration set <{configuration_set_name}> does not exist."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if !configuration_set.sending_enabled {
+                return Err(
+                    SendTemplatedEmailErrorModeled::ConfigurationSetSendingPausedException(
+                        ConfigurationSetSendingPausedException {
+                            configuration_set_name: Some(configuration_set_name.to_string()),
+                            message: Some(format!(
+                                "Email sending is disabled for configuration set \
+                                 <{configuration_set_name}>."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The message must be sent from a verified email address or domain" —
+        // the same gate, read the same way, as every other send of this service.
+        // It is reached BEFORE the template the request names is resolved: the
+        // sending identity is what SES authorises the call on, and the template is
+        // part of the message that call would compose, so an account that may not
+        // send at all is told so whichever template it named.
+        if !state.is_verified_sender(&source) {
+            return Err(rejected(crate::state::unverified_identities_message(
+                &region,
+                &[source.as_str()],
+            )));
+        }
+
+        // "The call must refer to an existing email template. You can create email
+        // templates using the CreateTemplate operation." — a name this account's
+        // template store does not hold is the modelled absence, reported in the
+        // same words as every other operation that resolves a template by name.
+        let Some(template) = state.templates.get(&input.template) else {
+            return Err(
+                SendTemplatedEmailErrorModeled::TemplateDoesNotExistException(
+                    TemplateDoesNotExistException {
+                        template_name: Some(input.template.clone()),
+                        message: Some(format!("Template {} does not exist.", input.template)),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The parts the message is composed from, taken while the stored template
+        // is still borrowed: the log keeps a bounded prefix of each, as it does
+        // for a send that carries its own message.
+        let subject = crate::state::logged_text(template.subject_part.as_deref());
+        let body = crate::state::logged_text(
+            template
+                .text_part
+                .as_deref()
+                .or(template.html_part.as_deref()),
+        );
+
+        // The account's own 24-hour quota, which every recipient of this message
+        // counts against: a send past it is refused rather than accepted, which is
+        // also what keeps the send log bounded. A negative `Max24HourSend`
+        // "signifies an unlimited quota" (the member's own documentation).
+        let quota = state.account.max_24_hour_send;
+        let already_sent = state.sent_last_24_hours(now);
+        if quota >= 0.0 && already_sent + destinations.len() as f64 > quota {
+            return Err(rejected(crate::state::daily_quota_exceeded_message(
+                quota,
+                already_sent,
+            )));
+        }
+
+        // The message is accepted: mint its id, log it, and answer with the id
+        // that was stored — never one computed from the request. The replacement
+        // values the request carried are the caller's own, and a template this
+        // send could not render is still an ACCEPTED message: "because it already
+        // accepted the message, Amazon SES doesn't return a message stating that
+        // it was unable to send the email."
+        let message_id = state.new_message_id();
+        state.log_sent_message(crate::state::SentMessage {
+            message_id: message_id.clone(),
+            source,
+            destinations,
+            subject,
+            body,
+            configuration_set: input.configuration_set_name.clone(),
+            tags: input
+                .tags
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|tag| (tag.name.clone(), tag.value.clone()))
+                .collect(),
+            sent_at: now,
+        });
+
+        Ok(SendTemplatedEmailOutput { message_id })
     }
 }

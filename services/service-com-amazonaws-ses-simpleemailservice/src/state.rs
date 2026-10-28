@@ -2747,6 +2747,26 @@ fn is_letters_digits_name(name: &str, max: usize) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
 
+/// Every recipient of a `Destination`, To: then CC: then BCC:, in request order.
+///
+/// They are flattened because SES treats them as one recipient set: the
+/// [`MAX_RECIPIENTS`] ceiling is "across the To:, CC: and BCC: fields", and each
+/// one counts once against the sending quota. One reading here, so every
+/// operation that carries a `Destination` — `SendEmail` and `SendTemplatedEmail`
+/// — resolves the same recipient set out of it.
+pub fn destination_recipients(destination: &crate::ops::types::Destination) -> Vec<String> {
+    [
+        destination.to_addresses.as_ref(),
+        destination.cc_addresses.as_ref(),
+        destination.bcc_addresses.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flatten()
+    .cloned()
+    .collect()
+}
+
 /// `text` as a log entry keeps it: at most [`MAX_LOGGED_TEXT`] characters, and
 /// `None` for a text that is not there.
 ///

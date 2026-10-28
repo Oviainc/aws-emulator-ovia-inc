@@ -178,24 +178,6 @@ impl From<SendEmailErrorModeled> for SendEmailError {
 /// ([`crate::state::MAX_RECIPIENTS`]).
 const MAX_RECIPIENTS: usize = crate::state::MAX_RECIPIENTS;
 
-/// Every recipient of a destination, To: then CC: then BCC:, in request order.
-///
-/// They are flattened because SES treats them as one recipient set: the
-/// 50-recipient ceiling is "across the To:, CC: and BCC: fields", and each one
-/// counts once against the sending quota.
-fn recipients(destination: &Destination) -> Vec<String> {
-    [
-        destination.to_addresses.as_ref(),
-        destination.cc_addresses.as_ref(),
-        destination.bcc_addresses.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .flatten()
-    .cloned()
-    .collect()
-}
-
 /// Refuse the message, as `MessageRejected` (HTTP 400): "Indicates that the
 /// action failed, and the message could not be sent."
 fn rejected(message: String) -> SendEmailError {
@@ -246,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the refusal naming an unverified sender.
         let region = crate::state::region_from_request(ctx.parts());
         let source = crate::state::addr_spec(&input.source).to_string();
-        let destinations = recipients(&input.destination);
+        let destinations = crate::state::destination_recipients(&input.destination);
 
         // "The message must include at least one recipient email address. The
         // recipient address can be a To: address, a CC: address, or a BCC:
