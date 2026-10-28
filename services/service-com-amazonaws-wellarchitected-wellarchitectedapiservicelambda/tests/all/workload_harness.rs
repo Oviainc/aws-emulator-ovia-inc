@@ -418,6 +418,12 @@ impl Client {
         .await
     }
 
+    /// `GetProfileTemplate`: `GET /profileTemplate`. The input declares no member, so the
+    /// request carries nothing at all.
+    pub(crate) async fn get_profile_template(&self) -> Answer {
+        self.send("GET", "/profileTemplate", None).await
+    }
+
     /// `CreateProfile`: `POST /profiles`.
     pub(crate) async fn create_profile(&self, body: Value) -> Answer {
         self.send("POST", "/profiles", Some(body)).await

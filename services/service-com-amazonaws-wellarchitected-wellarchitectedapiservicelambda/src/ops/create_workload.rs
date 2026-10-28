@@ -575,10 +575,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             lens_review_records: lens_reviews,
             // The profiles the workload is reviewed against: the associations the
             // request's `ProfileArns` resolved to above, each pinned at the version its
-            // profile is at. Which lens questions a profile PRIORITISES is decided by the
-            // profile template this emulator does not carry
-            // (`crate::state::DEFAULT_QUESTION_TYPE`), so an association changes what the
-            // workload reports under `Profiles` and not its question types.
+            // profile is at. Which lens questions a profile PRIORITISES needs a mapping of
+            // the published profile template's choices onto a lens's questions that nothing
+            // publishes (`crate::state::DEFAULT_QUESTION_TYPE`), so an association changes
+            // what the workload reports under `Profiles` and not its question types.
             profiles,
         };
         let workload_arn = record.workload_arn.clone();

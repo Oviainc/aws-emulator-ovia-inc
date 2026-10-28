@@ -296,9 +296,10 @@ fn lens_review_summary(
         // (`WorkloadRecord::profiles_projection`), so a listed review cannot disagree with
         // either about which profile the workload is reviewed against. The risk counts
         // restricted to the questions a profile prioritises are NOT projected: which
-        // questions those are is decided by the profile template this emulator does not
-        // carry (`GetProfileTemplate` is a stub with its own issue), so no question of any
-        // workload is prioritized.
+        // questions those are needs a mapping of the published profile template's choices
+        // onto a lens's questions that nothing publishes
+        // (`crate::state::DEFAULT_QUESTION_TYPE`), so no question of any workload is
+        // prioritized.
         profiles: workload.profiles_projection(),
         prioritized_risk_counts: None,
     }

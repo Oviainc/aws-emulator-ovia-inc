@@ -101,8 +101,15 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 pub mod official_lenses;
+pub mod profile_template;
 pub mod recommendation_catalog;
 pub mod trusted_advisor_checks;
+
+pub use profile_template::{
+    profile_template, profile_template_published_at, profile_template_question,
+    ProfileTemplateChoiceEntry, ProfileTemplateQuestionEntry, PROFILE_TEMPLATE_NAME,
+    PROFILE_TEMPLATE_QUESTIONS, PROFILE_TEMPLATE_REVISION,
+};
 
 pub use recommendation_catalog::{
     recommendation_content, RecommendationContent, RECOMMENDATION_CATALOG,
@@ -1071,11 +1078,11 @@ pub const LENS_REVIEW_RESOURCE_TYPE: &str = "LENS_REVIEW";
 ///
 /// The enum publishes exactly `PRIORITIZED` and `NON_PRIORITIZED`
 /// (`smithy_query(query="shape", shape="QuestionType")`), and a question is prioritized
-/// because a PROFILE associated with the workload prioritises it. WHICH lens questions a
-/// profile prioritises is decided by the profile TEMPLATE's questions, which this emulator
-/// does not carry (`GetProfileTemplate` is a stub with its own issue), so a profile
-/// associated with a workload prioritises no question of it and every question of every
-/// workload reports this type.
+/// because a PROFILE associated with the workload prioritises it. WHICH lens question a
+/// profile's answer prioritises is a MAPPING from the published profile template's choices
+/// onto a lens's questions, and neither the Smithy model nor the service docs publish one,
+/// so a profile associated with a workload prioritises no question of it and every question
+/// of every workload reports this type.
 pub const DEFAULT_QUESTION_TYPE: &str = "NON_PRIORITIZED";
 
 /// The `QuestionType` a question is prioritized with, the counterpart of
@@ -2473,9 +2480,10 @@ impl WorkloadRecord {
                         )),
                         // The risk counts restricted to the questions a PROFILE
                         // prioritises are not projected for a pillar: which questions
-                        // those are is decided by the profile template this emulator does
-                        // not carry (see [`DEFAULT_QUESTION_TYPE`]), so no question of any
-                        // workload is prioritized.
+                        // those are needs a mapping of the published profile template's
+                        // choices onto a lens's questions that nothing publishes (see
+                        // [`DEFAULT_QUESTION_TYPE`]), so no question of any workload is
+                        // prioritized.
                         prioritized_risk_counts: None,
                         pillar_id: Some(pillar_id),
                         pillar_name,
@@ -4665,10 +4673,13 @@ pub const MAX_PROFILES: usize = 1_000;
 ///
 /// In the real service the questions come from the ONE profile template the service
 /// publishes (`GetProfileTemplate`), so their number is fixed by that template rather
-/// than by the request. This emulator carries no such template — `GetProfileTemplate` is
-/// a stub with its own issue — so this is the ceiling that keeps a stored profile's
-/// question map bounded, answered with the modelled `ServiceQuotaExceededException` for
-/// the reason [`MAX_PROFILES`] gives.
+/// than by the request. A request here may answer a question
+/// [`PROFILE_TEMPLATE_QUESTIONS`] does not publish — nothing refuses one, and such an
+/// answer is recorded with no published text to report
+/// ([`ProfileRecord::profile_questions`]) — so this is the ceiling that keeps a stored
+/// profile's question map bounded, answered with the modelled
+/// `ServiceQuotaExceededException` for the reason [`MAX_PROFILES`] gives. It sits well
+/// above the number of questions the template asks.
 pub const MAX_QUESTIONS_PER_PROFILE: usize = 100;
 
 /// The modelled input member a profile-question finding names
@@ -4848,21 +4859,27 @@ impl ProfileRecord {
     /// and `MaxSelectedChoices` describe the question itself, and the service reads them
     /// off the profile TEMPLATE it publishes (the same members on
     /// `ProfileTemplateQuestion` — `smithy_query(query="shape",
-    /// shape="ProfileTemplateQuestion")`). This emulator carries no profile template —
-    /// `GetProfileTemplate` is a stub with its own issue — so they are reported ABSENT
-    /// rather than invented, and what is reported is exactly what the profile records:
-    /// the question and the choices selected for it.
+    /// shape="ProfileTemplateQuestion")`), so they are read off this emulator's published
+    /// template ([`profile_template_question`]) rather than restated here: what the
+    /// profile itself records is the question it answers and the choices selected for it.
+    /// A question the template does not publish has no published text, so for it those
+    /// members are reported ABSENT rather than invented.
     pub fn profile_questions(&self) -> Vec<ProfileQuestion> {
         self.questions
             .iter()
-            .map(|(question_id, selected)| ProfileQuestion {
-                question_id: Some(question_id.clone()),
-                selected_choice_ids: Some(selected.iter().cloned().collect()),
-                question_title: None,
-                question_description: None,
-                question_choices: None,
-                min_selected_choices: None,
-                max_selected_choices: None,
+            .map(|(question_id, selected)| {
+                let published = profile_template_question(question_id);
+                ProfileQuestion {
+                    question_id: Some(question_id.clone()),
+                    selected_choice_ids: Some(selected.iter().cloned().collect()),
+                    question_title: published.map(|question| question.title.to_string()),
+                    question_description: published
+                        .map(|question| question.description.to_string()),
+                    question_choices: published
+                        .map(ProfileTemplateQuestionEntry::choice_catalog),
+                    min_selected_choices: published.map(|question| question.min_selected_choices),
+                    max_selected_choices: published.map(|question| question.max_selected_choices),
+                }
             })
             .collect()
     }

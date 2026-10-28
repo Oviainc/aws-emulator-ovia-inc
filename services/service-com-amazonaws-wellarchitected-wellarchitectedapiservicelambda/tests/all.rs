@@ -386,3 +386,9 @@ mod lens_share_listing;
 // check suite falls beside the per-account suite it extends, in a crowded run of this list.
 #[path = "all/check_summaries.rs"]
 mod check_summaries;
+
+// Appended at the end of this list rather than inserted among the `profile_*` suites, for
+// the reason the notes above give: an insertion into this list's sorted middle is what
+// repeatedly refused to merge.
+#[path = "all/profile_template.rs"]
+mod profile_template;

@@ -578,14 +578,16 @@ async fn an_undecodable_next_token_cannot_be_parsed() {
 async fn a_scaffolded_operation_still_answers_501_for_a_valid_request() {
     let client = Client::new();
     for (case, method, path, body) in [
-        // `GetProfileTemplate` — the profile question template — is still a scaffold with
-        // its own issue. The rows this one replaced name operations since implemented:
-        // `ListProfileNotifications` (`super::profile_notifications`) and `ListNotifications`
-        // (`super::lens_notifications`).
+        // `GetLensReviewReport` — the report of one lens review of a workload — is still a
+        // scaffold with its own issue. The rows this one replaced name operations since
+        // implemented: `ListProfileNotifications` (`super::profile_notifications`),
+        // `ListNotifications` (`super::lens_notifications`) and `GetProfileTemplate`
+        // (`super::profile_template`). The request is well formed — a 32-hex `WorkloadId`
+        // and a published `LensAlias` — so nothing refuses it before the handler runs.
         (
-            "GetProfileTemplate",
+            "GetLensReviewReport",
             "GET",
-            "/profileTemplate".to_string(),
+            format!("/workloads/{}/lensReviews/wellarchitected/report", "0".repeat(32)),
             None,
         ),
     ] {

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfileTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProfileTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProfileTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the ONE profile template this service publishes — the catalog of
+//! profile questions a client reads to discover the `QuestionId`s and `ChoiceId`s a
+//! profile's answers name — from [`crate::state::profile_template`]. A pure READ: the
+//! template is published content no caller revises, so nothing this operation does
+//! changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +107,14 @@ impl From<GetProfileTemplateErrorModeled> for GetProfileTemplateError {
 /// crate names no concrete engine type: a migrated service that needs state picks a
 /// concrete engine where it mounts the service, not here.
 pub struct GetProfileTemplate<Eng> {
+    /// The shared engine, as every operation of this service is constructed with.
+    ///
+    /// Not read HERE: the profile template is content the SERVICE publishes — one per
+    /// service, the same for every caller, revised by none — so the response is projected
+    /// from the published catalog ([`crate::state::profile_template`]) and there is no
+    /// per-account state to read or write. The field stays because the generated
+    /// `EmulatedService::new` hands the engine to every operation alike.
+    #[allow(dead_code)]
     engine: ::std::sync::Arc<Eng>,
 }
 
@@ -137,21 +141,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _input: Self::Input,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProfileTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProfileTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProfileTemplate"))
+        // `GetProfileTemplateInput` declares no member, so there is nothing about the
+        // REQUEST that could select a template: the service publishes exactly one, every
+        // caller reads the same one, and the modelled `ResourceNotFoundException` cannot
+        // arise because the template is content this emulator always carries. It is built
+        // in the one place that projects it (`crate::state::profile_template`), which is
+        // also where a profile's answers read the text of the question they answer, so the
+        // template a client discovers and the questions a profile reports cannot disagree.
+        Ok(GetProfileTemplateOutput {
+            profile_template: Some(crate::state::profile_template()),
+        })
     }
 }

@@ -216,14 +216,18 @@ impl OfficialLens {
 /// that is not a date answers the epoch rather than panicking, and a test pins every
 /// version in the catalog against the day it names so an unparsable one cannot pass
 /// unnoticed.
-fn midnight_utc(day: &str) -> SystemTime {
+///
+/// Shared with the other published content whose revision is named by a day — the profile
+/// template's ([`super::profile_template::PROFILE_TEMPLATE_REVISION`]) — so one place
+/// decides what instant a published revision reports.
+pub(super) fn midnight_utc(day: &str) -> SystemTime {
     let parsed = ::aws_smithy_types::DateTime::from_str(
         &format!("{day}T00:00:00Z"),
         ::aws_smithy_types::date_time::Format::DateTime,
     );
     debug_assert!(
         parsed.is_ok(),
-        "a lens version must name a calendar day: {day:?}"
+        "a published revision must name a calendar day: {day:?}"
     );
     parsed
         .ok()
