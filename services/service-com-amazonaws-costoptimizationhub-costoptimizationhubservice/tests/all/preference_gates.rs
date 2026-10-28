@@ -41,45 +41,25 @@ use cost_optimization_hub::state::{
 };
 
 use crate::cost_optimization_hub::{
-    call, error_code, fields, management_account_router, ok, router, DISCOUNT_VISIBILITY_ALL,
-    FIELD_VALIDATION_SUMMARY,
+    assert_stated_rule_refusal, call, error_code, fields, management_account_router, ok,
+    preferences_record, router, DISCOUNT_VISIBILITY_ALL, FIELD_VALIDATION_SUMMARY,
 };
 
-/// Assert one refused `UpdatePreferences`: HTTP 400 `ValidationException` whose
-/// `message` states the rule rather than carrying the fixed summary a
-/// constraint-walk refusal carries, with `fields` attributing it to `member`.
+/// Assert one refused `UpdatePreferences`: HTTP 400 and the stated-rule refusal
+/// the shared harness defines, attributed to `member`.
 async fn refused(router: &MultiServiceRouter, case: &str, request: &Value, member: &str) {
     let (status, payload) = call(router, "UpdatePreferences", request).await;
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} with {payload}"
     );
-    let code = error_code(&payload);
-    assert_eq!(
-        code, "ValidationException",
-        "case {case:?}: expected ValidationException, got {code:?} in {payload}"
-    );
-    let message = payload["message"].as_str().unwrap_or_default();
-    assert!(
-        !message.is_empty() && message != FIELD_VALIDATION_SUMMARY,
-        "case {case:?}: expected a message stating the rule, distinguishable from the \
-         field-validation summary, got {message:?} in {payload}"
-    );
-    let named: Vec<String> = fields(&payload)
-        .into_iter()
-        .map(|(field_name, _)| field_name)
-        .collect();
-    assert_eq!(
-        named,
-        vec![member.to_string()],
-        "case {case:?}: expected the refusal to name {member}, got {payload}"
-    );
+    assert_stated_rule_refusal(&payload, case, member);
 }
 
 /// The preferences a read reports, so a case can assert a refused write changed
 /// nothing.
 async fn read(router: &MultiServiceRouter) -> Value {
-    ok(router, "GetPreferences", &json!({})).await
+    preferences_record(router).await
 }
 
 // ---------------------------------------------------------------------------

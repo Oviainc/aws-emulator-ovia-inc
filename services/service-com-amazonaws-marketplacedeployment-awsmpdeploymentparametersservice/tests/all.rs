@@ -41,6 +41,8 @@ mod resource_arn_classification;
 mod resource_arn_validation;
 #[path = "all/response_request_id.rs"]
 mod response_request_id;
+#[path = "all/sensitive_member_is_a_modelled_path.rs"]
+mod sensitive_member_is_a_modelled_path;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]
