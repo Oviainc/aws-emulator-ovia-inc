@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBasePathMappings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBasePathMappings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBasePathMappings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBasePathMappings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBasePathMappingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBasePathMappings"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // A report of an existing collection, so this takes a shared read of the store and
+        // writes nothing: a listing must not change what a later caller sees.
+        let store = state.lock();
+
+        // The mappings are records OF a custom domain name, so the domain name the URI
+        // addresses is resolved first, by the two members `GetDomainName` and
+        // `GetBasePathMapping` resolve one by: a pair no stored record answers to holds no
+        // mappings and is refused as the missing domain name it is rather than served an
+        // empty page.
+        let domain_key =
+            crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
+        let domain = store.domain_names.get(&domain_key).ok_or_else(|| {
+            GetBasePathMappingsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+            })
+        })?;
+
+        // Creation order is the stable sequence a `position` cursor walks; `page_of`
+        // applies the documented default and maximum page size and refuses a cursor naming
+        // no mapping of this domain name.
+        let ordered = domain.base_paths_in_creation_order();
+        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+            .map_err(|message| {
+                GetBasePathMappingsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        // Each listed mapping is rendered by the one `BasePathMapping` body this crate
+        // owns, so a listed mapping and its own `GetBasePathMapping` read cannot report a
+        // record differently. Every base path on the page came OUT of this very map, so one
+        // that no longer resolves would mean the ordered sequence and the records disagree:
+        // that is the server-side inconsistency rather than a page quietly one item short.
+        let mut items = Vec::with_capacity(page.ids.len());
+        for base_path in &page.ids {
+            let mapping = domain
+                .base_path_mappings
+                .get(base_path)
+                .ok_or_else(crate::state::state_unavailable)?;
+            items.push(CreateBasePathMappingOutput::from(mapping));
+        }
+        Ok(GetBasePathMappingsOutput {
+            // Always reported, and empty for a domain name that carries no mapping: "the
+            // current page of elements from this collection" is an answer a client can
+            // read.
+            items: Some(items),
+            position: page.next_position,
+        })
     }
 }

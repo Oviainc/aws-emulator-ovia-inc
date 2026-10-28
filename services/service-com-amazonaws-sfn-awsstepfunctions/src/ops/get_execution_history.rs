@@ -13,6 +13,12 @@
 //! detail is reported only where the stored record carries the values that detail is
 //! made of.
 //!
+//! A request that asks for the execution's data (`includeExecutionData`, "the default
+//! is true") reports data a state machine on a customer managed KMS key sealed under
+//! that key, so the caller's `kms:Decrypt` grant on it is decided first —
+//! `crate::state::encryption`, which answers the modelled `KmsAccessDeniedException`
+//! for a caller the key's policy does not allow.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -215,6 +221,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = crate::state::now();
+        // "You can select whether execution data (input or output of a history event)
+        // is returned. The default is true."
+        let with_data = input.include_execution_data.unwrap_or(true);
+        // The data of an execution of a state machine encrypted with a CUSTOMER
+        // MANAGED KMS key is handed out only to a caller that key permits, so the
+        // caller's `kms:Decrypt` grant on it is decided before any of it is read. A
+        // request that asks for no execution data decrypts nothing, so it needs no
+        // grant. The decision is made with no store of this service locked.
+        if with_data {
+            if let Some(why) = crate::state::encryption::execution_read_denied(
+                &*self.engine,
+                ctx,
+                &endpoint_region,
+                &input.execution_arn,
+            ) {
+                return Err(GetExecutionHistoryErrorModeled::KmsAccessDeniedException(
+                    KmsAccessDeniedException { message: Some(why) },
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
         // The one write a report may make: the events an outcome the clock already
         // made due writes were owed at that instant, whether or not anybody read the
@@ -253,7 +281,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You can select whether execution data (input or output of a history event)
         // is returned. The default is true."
-        let with_data = input.include_execution_data.unwrap_or(true);
         // "Lists events in descending order of their timeStamp": the stored history is
         // in the order the events happened, which is ascending, so the reverse order
         // is that same list read from the end.

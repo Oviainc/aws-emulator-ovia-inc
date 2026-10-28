@@ -123,7 +123,7 @@ use crate::ops::types::{
     AccountJiraConfigurationOutput, AgentProfileSummary, AgentRecommendationGenerationSummary,
     AgentRecommendationSummary, AggregationConfiguration, Choice, ChoiceAnswer, ConflictException,
     ContextContent, ContextSummary, GetGlobalSettingsOutput, GoalSummary, JiraConfiguration,
-    JiraSelectedQuestionConfiguration, LensReview, LensSummary,
+    JiraSelectedQuestionConfiguration, LensReview, LensShareSummary, LensSummary,
     Milestone, MilestoneSummary, PillarReviewSummary, Profile, ProfileQuestion,
     ProfileShareSummary, ProfileSummary, Progress, ResourceNotFoundException, ReviewTemplate,
     ReviewTemplateAnswer, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
@@ -4294,6 +4294,24 @@ pub struct LensShareRecord {
 }
 
 impl LensShareRecord {
+    /// The `LensShareSummary` projection `ListLensShares` pages over.
+    ///
+    /// `LensShareSummary` declares exactly `ShareId`, `SharedWith`, `Status` and
+    /// `StatusMessage` (`smithy_query(query="shape", shape="LensShareSummary")`) — no
+    /// permission, because a lens share grants none, and no lens member, because the
+    /// summary describes the share within the lens the request already named.
+    pub fn to_summary(&self) -> LensShareSummary {
+        LensShareSummary {
+            share_id: Some(self.share_id.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            status: Some(self.status.clone()),
+            // "Optional message to compliment the Status field"
+            // (`LensShareSummary$StatusMessage` doc): a share that is simply waiting on its
+            // invitation has nothing to add to its status.
+            status_message: self.status_message.clone(),
+        }
+    }
+
     /// The `ShareInvitationSummary` projection `ListShareInvitations` pages over: this
     /// share seen as the invitation its recipient was offered.
     ///

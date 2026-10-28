@@ -77,6 +77,8 @@ mod insight_rule_state;
 mod insight_rules;
 #[path = "all/list_metric_streams.rs"]
 mod list_metric_streams;
+#[path = "all/list_tags_for_resource_reads.rs"]
+mod list_tags_for_resource_reads;
 #[path = "all/log_alarms.rs"]
 mod log_alarms;
 #[path = "all/managed_insight_rule_catalog.rs"]
