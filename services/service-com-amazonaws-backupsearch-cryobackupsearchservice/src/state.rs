@@ -1165,8 +1165,13 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
 /// The records `order` names, NEWEST-CREATED FIRST.
 ///
 /// `order` holds identifiers in creation order and is only ever appended to, so walking
-/// it backwards is exactly newest-first and is stable across calls; an identifier the
-/// map no longer holds is skipped rather than reported as a gap.
+/// it backwards is exactly newest-first and the records it reports keep their relative
+/// order across calls; an identifier the map no longer holds is skipped rather than
+/// reported as a gap.
+///
+/// A record appended to `order` lands at the FRONT of what this reports and pushes every
+/// older entry one place later, so a listing that pages this sequence anchors its page
+/// token at the back of it ([`PageAnchor::NewestFirst`]) rather than at the front.
 ///
 /// ONE helper behind BOTH job listings of this service
 /// ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::jobs_newest_first`] and
@@ -1266,7 +1271,10 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// single-page read is "the latest search job".
     ///
     /// `job_order` holds the identifiers in creation order and is only ever appended to,
-    /// so walking it backwards is exactly newest-first and is stable across calls.
+    /// so walking it backwards is exactly newest-first and two calls report the same jobs
+    /// in the same relative order. A job started in between lands at the HEAD of what
+    /// this reports, which is why `ListSearchJobs` anchors its page token at the other
+    /// end of the sequence ([`PageAnchor::NewestFirst`]).
     /// `job_order` and `search_jobs` are written together, so an identifier in the order
     /// always resolves.
     pub fn jobs_newest_first(&self) -> impl Iterator<Item = &SearchJob> {
@@ -1803,77 +1811,155 @@ pub fn timestamp(instant: SystemTime) -> DateTime {
     DateTime::from_millis(millis)
 }
 
-/// A `NextToken` for the page that resumes at `offset` of the sequence `context` names.
+/// A `NextToken` for the page that resumes at `position` of the sequence `context` names.
 ///
-/// The context is part of the token because an offset alone says nothing about WHICH
+/// The context is part of the token because a position alone says nothing about WHICH
 /// sequence it indexes: a token issued for one `ByStatus` filter (or one search job's
 /// results) would otherwise silently resume a different sequence at that position and
 /// answer 200 with a page that skips or repeats entries.
-pub fn encode_next_token(context: &str, offset: usize) -> String {
-    format!("{offset}@{context}")
+///
+/// Which END of the sequence the position is counted from is [`PageAnchor`]'s decision,
+/// and is what keeps the number resumable after the store changed under the token.
+pub fn encode_next_token(context: &str, position: usize) -> String {
+    format!("{position}@{context}")
 }
 
-/// Where a `NextToken` resumes, as an offset into the sequence `context` names — the
+/// Which end of a listing's held sequence a `NextToken` counts its resume position from.
+///
+/// A token is resumable only while the number inside it still names the same place in the
+/// sequence it was issued over, and the only change a held sequence of this service
+/// undergoes between two pages of one walk is a record being APPENDED to the creation
+/// order the sequence is built from — nothing is removed and nothing is reordered. So the
+/// position has to be counted from the end that appending does not move, which depends on
+/// the order the listing REPORTS its records in: a walk whose cursor is anchored at the
+/// moving end repeats the entries a new record pushed past the cursor and never reports
+/// that record either.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageAnchor {
+    /// The listing reports its held sequence in the order it is appended to, so a new
+    /// record lands AFTER every position already handed out and a position counted from
+    /// the front keeps naming the same entry.
+    CreationOrder,
+    /// The listing reports the REVERSE of the sequence that is appended to, so a new
+    /// record lands at the front and pushes every older entry one place later; a position
+    /// counted from the BACK — the number of entries still unreported behind it — is the
+    /// one an append leaves alone.
+    NewestFirst,
+}
+
+impl PageAnchor {
+    /// The number a token carries for a page of a sequence of `len` entries that examined
+    /// everything up to `end`: the resume position, counted from this anchor's end.
+    fn position(self, len: usize, end: usize) -> usize {
+        match self {
+            PageAnchor::CreationOrder => end,
+            PageAnchor::NewestFirst => len.saturating_sub(end),
+        }
+    }
+
+    /// Where a token carrying `position` resumes, as an offset into a sequence of `len`
+    /// entries in the order the listing reports them — the inverse of
+    /// [`position`](Self::position), and `None` for a position outside such a sequence.
+    fn offset(self, len: usize, position: usize) -> Option<usize> {
+        match self {
+            PageAnchor::CreationOrder => (position <= len).then_some(position),
+            PageAnchor::NewestFirst => len.checked_sub(position),
+        }
+    }
+}
+
+/// Where one page of a listing starts, and which end of that listing's sequence the token
+/// for the page after it counts from.
+///
+/// Carried from [`decode_next_token`] to [`page_matching`] so the two cannot disagree
+/// about the anchor — a token decoded against one end and issued against the other would
+/// resume somewhere nobody asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageCursor {
+    /// The offset the page starts at, in the sequence as the listing reports it.
+    offset: usize,
+    anchor: PageAnchor,
+}
+
+impl PageCursor {
+    /// The cursor the FIRST page of a listing anchored at `anchor` starts from.
+    pub fn start(anchor: PageAnchor) -> Self {
+        Self { offset: 0, anchor }
+    }
+
+    /// Where this page starts in the sequence as the listing reports it.
+    pub fn offset(self) -> usize {
+        self.offset
+    }
+}
+
+/// Where a `NextToken` resumes, as a cursor into the sequence `context` names — the
 /// sequence of records this store HOLDS for that listing, in the order the listing
 /// reports them, before any of the request's filters narrow it ([`page_matching`]).
 ///
-/// `len` is the length of that held sequence and never of a filtered view of it. A held
-/// sequence of this service is only ever appended to, while which of its records a filter
-/// keeps can change after a token was issued, because a record's own status moves on with
-/// no caller involved; so an offset this service handed out stays inside the sequence it
-/// indexes for as long as the store holds those records.
+/// `len` is the length of that held sequence and never of a filtered view of it, and
+/// `anchor` is the end of it the token counts from ([`PageAnchor`]). Which of its records
+/// a filter keeps can change after a token was issued, because a record's own status moves
+/// on with no caller involved; a position in the held sequence, counted from the end
+/// appending does not move, keeps naming the same record for as long as the store holds
+/// it.
 ///
 /// `Err` is the caller's problem: a token this service did not issue, one issued for a
-/// different sequence, or one that points past the end of what it is paging over.
+/// different sequence, or one that points outside what it is paging over.
 pub fn decode_next_token(
     token: Option<&str>,
     context: &str,
     len: usize,
-) -> Result<usize, String> {
+    anchor: PageAnchor,
+) -> Result<PageCursor, String> {
     let Some(token) = token else {
-        return Ok(0);
+        return Ok(PageCursor::start(anchor));
     };
     let malformed =
         || format!("NextToken '{token}' is not a pagination token this service issued");
-    let (offset, token_context) = token.split_once('@').ok_or_else(malformed)?;
+    let (position, token_context) = token.split_once('@').ok_or_else(malformed)?;
     if token_context != context {
         return Err(format!(
             "NextToken '{token}' was issued for a different request and cannot resume this one"
         ));
     }
-    let offset: usize = offset.parse().map_err(|_| malformed())?;
-    if offset > len {
-        return Err(format!(
-            "NextToken '{token}' resumes past the end of the results"
-        ));
-    }
-    Ok(offset)
+    let position: usize = position.parse().map_err(|_| malformed())?;
+    let offset = anchor.offset(len, position).ok_or_else(|| {
+        format!("NextToken '{token}' resumes past the end of the results")
+    })?;
+    Ok(PageCursor { offset, anchor })
 }
 
-/// One page of `items` starting at `offset`, with the token that resumes after it — the
+/// One page of `items` starting at `cursor`, with the token that resumes after it — the
 /// whole sequence, which is what a listing carrying no filter pages. The paging rule
 /// itself is [`page_matching`]'s.
 pub fn page<T: Clone>(
     items: &[T],
-    offset: usize,
+    cursor: PageCursor,
     max_results: usize,
     context: &str,
 ) -> (Vec<T>, Option<String>) {
-    page_matching(items, offset, max_results, context, |_| true)
+    page_matching(items, cursor, max_results, context, |_| true)
 }
 
-/// One page of the entries of `items` that `admits` keeps, starting at `offset`, with the
-/// token that resumes after it. The token carries `context`, the sequence it indexes.
+/// One page of the entries of `items` that `admits` keeps, starting at `cursor`, with the
+/// token that resumes after it. The token carries `context`, the sequence it indexes, and
+/// counts its position from the end `cursor`'s anchor names.
 ///
-/// `offset` is a position in `items` — the sequence the store HOLDS — and not in the
-/// shorter subsequence a request's filter leaves of it, and the token this returns
-/// resumes after the last entry the page examined rather than after the last one it
-/// carried. That is what keeps every token this service issues resumable: a filter's
-/// membership can change between two calls of one paginating walk, since a record's
-/// status advances on its own, so a position in the filtered subsequence can fall outside
-/// it by the time the next page is asked for, while a position in the held sequence
-/// cannot. A filter that now keeps fewer entries simply answers a shorter page — down to
-/// an empty last one — instead of turning a token the service issued into a refusal.
+/// The cursor is a position in `items` — the sequence the store HOLDS, in the order the
+/// listing reports it — and not in the shorter subsequence a request's filter leaves of
+/// it, and the token this returns resumes after the last entry the page examined rather
+/// than after the last one it carried. That is what keeps every token this service issues
+/// resumable: a filter's membership can change between two calls of one paginating walk,
+/// since a record's status advances on its own, so a position in the filtered subsequence
+/// can fall outside it by the time the next page is asked for, while a position in the
+/// held sequence cannot. A filter that now keeps fewer entries simply answers a shorter
+/// page — down to an empty last one — instead of turning a token the service issued into
+/// a refusal. A record APPENDED to the held sequence while the walk is in flight does not
+/// move that position either, because the token counts from the end appending leaves
+/// alone ([`PageAnchor`]): the walk reports every record the store held throughout it
+/// exactly once, and a record created after the walk began is reported by the next walk,
+/// which starts at the sequence's new head.
 ///
 /// A page carries a `NextToken` whenever it is FULL — it holds as many entries as the
 /// requested page size — because a full page is all this call was asked for and says
@@ -1883,20 +1969,21 @@ pub fn page<T: Clone>(
 /// is the empty one.
 pub fn page_matching<T: Clone>(
     items: &[T],
-    offset: usize,
+    cursor: PageCursor,
     max_results: usize,
     context: &str,
     admits: impl Fn(&T) -> bool,
 ) -> (Vec<T>, Option<String>) {
     let mut page = Vec::new();
-    let mut end = offset.min(items.len());
+    let mut end = cursor.offset().min(items.len());
     while end < items.len() && page.len() < max_results {
         if admits(&items[end]) {
             page.push(items[end].clone());
         }
         end += 1;
     }
-    let next = (page.len() == max_results).then(|| encode_next_token(context, end));
+    let next = (page.len() == max_results)
+        .then(|| encode_next_token(context, cursor.anchor.position(items.len(), end)));
     (page, next)
 }
 

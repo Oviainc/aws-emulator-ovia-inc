@@ -188,15 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let context = crate::state::results_page_context(&input.search_job_identifier);
-        let offset = crate::state::decode_next_token(
+        // A job's recorded matches are reported in the order the scan recorded them and
+        // that order is only appended to, so the token's position counts from the front
+        // (see `crate::state::PageAnchor`).
+        let cursor = crate::state::decode_next_token(
             input.next_token.as_deref(),
             &context,
             job.results.len(),
+            crate::state::PageAnchor::CreationOrder,
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
         let (results, next_token) = crate::state::page(
             &job.results,
-            offset,
+            cursor,
             crate::state::page_size(input.max_results),
             &context,
         );

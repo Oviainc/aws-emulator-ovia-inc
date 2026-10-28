@@ -178,15 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let context = crate::state::jobs_page_context(input.by_status.as_deref());
-        let offset = crate::state::decode_next_token(
+        // The token counts its position from the OLD end of that newest-first sequence: a
+        // job started while a client is between two pages of one walk is prepended to it,
+        // and a position counted from the new end would name a different job after that
+        // append — the walk would serve the entries it pushed past the cursor a second
+        // time (see `crate::state::PageAnchor`).
+        let cursor = crate::state::decode_next_token(
             input.next_token.as_deref(),
             &context,
             summaries.len(),
+            crate::state::PageAnchor::NewestFirst,
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
         let (search_jobs, next_token) = crate::state::page_matching(
             &summaries,
-            offset,
+            cursor,
             crate::state::page_size(input.max_results),
             &context,
             |summary| {

@@ -208,12 +208,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.status.as_deref(),
             input.search_job_identifier.as_deref(),
         );
-        let offset =
-            crate::state::decode_next_token(input.next_token.as_deref(), &context, listed.len())
-                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        // The token counts its position from the OLD end of that newest-first sequence,
+        // exactly as `ListSearchJobs` does: an export job started while a client is
+        // between two pages of one walk is prepended to it, and a position counted from
+        // the new end would name a different export job after that append (see
+        // `crate::state::PageAnchor`).
+        let cursor = crate::state::decode_next_token(
+            input.next_token.as_deref(),
+            &context,
+            listed.len(),
+            crate::state::PageAnchor::NewestFirst,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
         let (page, next_token) = crate::state::page_matching(
             &listed,
-            offset,
+            cursor,
             crate::state::page_size(input.max_results),
             &context,
             |(summary, search_job_identifier)| {

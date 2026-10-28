@@ -35,6 +35,8 @@ mod job_identifier_syntax;
 mod owed_status_due_instants;
 #[path = "all/page_token_under_a_changing_filter.rs"]
 mod page_token_under_a_changing_filter;
+#[path = "all/page_token_under_a_growing_sequence.rs"]
+mod page_token_under_a_growing_sequence;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/search_job_item_results.rs"]
