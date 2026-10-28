@@ -37,18 +37,38 @@
 //!    evaluation of IAM policy documents against `(action, resource)`, so IAM and every
 //!    other service handed the same documents decide alike.
 //!
-//! ## What the decision knows about the request
+//! ## What the decision knows about the caller, the target and the request
 //!
-//! A statement may be written to depend on WHO is calling, or on WHICH resource is
-//! addressed, rather than only on what is asked: through a `Condition` clause over a key
-//! of the signing principal or of the target, or through a policy VARIABLE in its
-//! `Resource` element, which the shared evaluation substitutes from the request's
-//! condition context. Since the signing principal is resolved here before anything is
-//! decided, and the target is named by the call, that context is built from both
-//! ([`request_context`]) and passed with the request, so one document attached to many
-//! users scopes itself to each of them, a clause over a principal tag is decided from the
-//! tags the user holds at the instant of the call, and a clause over a tag of the
-//! addressed resource is decided from the tags that resource holds then.
+//! A statement may be written to depend on WHO is calling, on the TARGET it is called on,
+//! or on what the request itself writes, rather than only on the action asked for: through
+//! a `Condition` clause over a condition key, or through a policy VARIABLE in its
+//! `Resource` element, which the shared evaluation substitutes from the request's condition
+//! context. That context is assembled here ([`request_context`]), out of the four things
+//! IAM itself fills it from:
+//!
+//! * the SIGNING principal, resolved here before anything is decided — its friendly name,
+//!   its unique id and its tags (`aws:PrincipalTag/<key>`), read at the instant of the
+//!   call, so retagging the user changes what the same unchanged request decides;
+//! * the TARGET the request addresses, by the ARN the decision is made against — its tags,
+//!   under both spellings IAM publishes them as (`aws:ResourceTag/<key>` and the
+//!   service-specific `iam:ResourceTag/<key>`), so an ABAC statement comparing a resource
+//!   tag with a principal tag is decided from the two entities' stored tags;
+//! * the REQUEST, for a call that writes tags: the tags it writes
+//!   (`aws:RequestTag/<key>`) and the set of keys it writes (`aws:TagKeys`), which the
+//!   `Tag*`, `Untag*` and `Create*` call sites hand the gate ([`WrittenTags`]);
+//! * the CLOCK, which is what a date clause is decided against (`aws:CurrentTime`, and the
+//!   same instant as epoch seconds in `aws:EpochTime`).
+//!
+//! Each of those keys is DECLARED to the evaluation
+//! ([`::service_common::iam_authorization::Request::with_published_keys`]) where this gate
+//! can answer for it — the resource-tag families only for a target whose tag set the
+//! account holds — beside the keys a request reaching this decision structurally cannot
+//! carry ([`PUBLISHED_ABSENT_KEYS`]). For a declared key the gate can answer whether the
+//! request carries a value, including answering that it carries none, so IAM's documented
+//! absent-key rule decides the clause: a positive comparison over such a key does not
+//! hold, while the `IfExists` spelling, a negated comparison and `Null: {key: true}` do. A
+//! clause over any OTHER key is left undecided, which withholds a grant and keeps a
+//! refusal.
 //!
 //! ## The callers that are not IAM users
 //!
@@ -69,7 +89,7 @@
 
 use ::service_common::iam_authorization::{self as iam, Decision};
 
-use crate::ops::types::{DelegationRequest, User};
+use crate::ops::types::{DelegationRequest, Tag, User};
 use crate::scaffolded::AccessDenied;
 
 use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies};
@@ -149,6 +169,45 @@ pub const LIST_INSTANCE_PROFILE_TAGS: &str = "iam:ListInstanceProfileTags";
 
 /// `iam:TagPolicy`.
 pub const TAG_POLICY: &str = "iam:TagPolicy";
+
+/// `iam:CreateUser`.
+pub const CREATE_USER: &str = "iam:CreateUser";
+
+/// `iam:CreateRole`.
+pub const CREATE_ROLE: &str = "iam:CreateRole";
+
+/// `iam:CreatePolicy`.
+pub const CREATE_POLICY: &str = "iam:CreatePolicy";
+
+/// `iam:CreateInstanceProfile`.
+pub const CREATE_INSTANCE_PROFILE: &str = "iam:CreateInstanceProfile";
+
+/// `iam:TagUser`.
+pub const TAG_USER: &str = "iam:TagUser";
+
+/// `iam:UntagUser`.
+pub const UNTAG_USER: &str = "iam:UntagUser";
+
+/// `iam:TagRole`.
+pub const TAG_ROLE: &str = "iam:TagRole";
+
+/// `iam:UntagRole`.
+pub const UNTAG_ROLE: &str = "iam:UntagRole";
+
+/// `iam:TagInstanceProfile`.
+pub const TAG_INSTANCE_PROFILE: &str = "iam:TagInstanceProfile";
+
+/// `iam:TagOpenIDConnectProvider`.
+pub const TAG_OPEN_ID_CONNECT_PROVIDER: &str = "iam:TagOpenIDConnectProvider";
+
+/// `iam:UntagOpenIDConnectProvider`.
+pub const UNTAG_OPEN_ID_CONNECT_PROVIDER: &str = "iam:UntagOpenIDConnectProvider";
+
+/// `iam:TagSAMLProvider`.
+pub const TAG_SAML_PROVIDER: &str = "iam:TagSAMLProvider";
+
+/// `iam:UntagSAMLProvider`.
+pub const UNTAG_SAML_PROVIDER: &str = "iam:UntagSAMLProvider";
 
 /// `iam:UntagPolicy`.
 pub const UNTAG_POLICY: &str = "iam:UntagPolicy";
@@ -273,50 +332,146 @@ const PUBLISHED_PRINCIPAL_KEYS: &[&str] = &[USER_NAME_KEY, USER_ID_KEY, PRINCIPA
 /// over one of its tags be decided at all.
 const PUBLISHED_RESOURCE_TAG_KEYS: &[&str] = &[IAM_RESOURCE_TAG_PREFIX, AWS_RESOURCE_TAG_PREFIX];
 
-/// The condition context a request signed by `user` carries: what IAM knows about the
-/// SIGNING principal at the instant of the call, which is where a policy variable's value
-/// and an `aws:PrincipalTag/` clause's value both come from.
+/// The prefix the condition key of ONE tag the REQUEST writes is spelled with:
+/// "`aws:RequestTag/tag-key` — the tag key-value pair that is passed in the request", so a
+/// grant can be conditioned on the value a tagging call is about to store.
+const REQUEST_TAG_PREFIX: &str = "aws:RequestTag/";
+
+/// The condition key carrying the SET of tag keys the request writes: "`aws:TagKeys` — the
+/// tag keys that are passed in the request". Multi-valued, so a clause over it is decided
+/// under one of IAM's set qualifiers.
+const TAG_KEYS_KEY: &str = "aws:TagKeys";
+
+/// The condition key carrying the instant the request is being decided at:
+/// "`aws:CurrentTime` — the date and time of the request", which is what a date clause
+/// compares against.
+const CURRENT_TIME_KEY: &str = "aws:CurrentTime";
+
+/// The same instant in epoch seconds: "`aws:EpochTime` — the date and time of the request
+/// in epoch or Unix time".
+const EPOCH_TIME_KEY: &str = "aws:EpochTime";
+
+/// The keys every request to this gate models about ITSELF: the tags it writes and the
+/// instant it is decided at.
 ///
-/// The tags are the ones the principal holds NOW — nothing in the request carries them — so
-/// retagging the user changes what the same unchanged request decides, and untagging it
-/// takes the value away again.
-fn principal_context(user: &User) -> Vec<(String, String)> {
+/// Published for every call, because each is answered from the call itself — a request
+/// that writes no tag carries no `aws:RequestTag/` and no `aws:TagKeys` value, which is
+/// exactly what a clause over one of them is then decided from, and the clock always has
+/// an answer.
+const PUBLISHED_REQUEST_KEYS: &[&str] = &[
+    REQUEST_TAG_PREFIX,
+    TAG_KEYS_KEY,
+    CURRENT_TIME_KEY,
+    EPOCH_TIME_KEY,
+];
+
+/// The condition keys a request that reaches THIS decision structurally cannot carry, so
+/// that a clause over one of them is decided from its absence rather than left undecided.
+///
+/// A call this gate judges was signed with an IAM user's long-term access key, which
+/// carries no multi-factor claim ("this key is not present when the request is made using
+/// long-term credentials") and no session's issue time or source identity; this emulator
+/// holds no organization, so no principal of it is in one; and nothing reaches it through
+/// a VPC endpoint, which is what the `aws:SourceVpce` family of keys describes.
+///
+/// Every OTHER key stays undeclared, and a clause over one of those is left UNDECIDED by
+/// the evaluation — fail-closed in both directions — because for those absence from the
+/// context means this emulator does not model the key rather than that the request carries
+/// no value for it: a real signed request does carry `aws:PrincipalArn`,
+/// `aws:RequestedRegion`, `aws:SecureTransport` and their peers, and this gate must not
+/// decide a clause over them from their absence here.
+const PUBLISHED_ABSENT_KEYS: &[&str] = &[
+    "aws:MultiFactorAuthPresent",
+    "aws:MultiFactorAuthAge",
+    "aws:TokenIssueTime",
+    "aws:SourceIdentity",
+    "aws:FederatedProvider",
+    "aws:PrincipalOrgID",
+    "aws:PrincipalOrgPaths",
+    "aws:SourceVpce",
+    "aws:SourceVpc",
+    "aws:VpcSourceIp",
+];
+
+/// The tags a request WRITES, which is where `aws:RequestTag/<key>` and `aws:TagKeys` come
+/// from.
+///
+/// The two forms a tagging call takes are the two IAM declares: a `Tag*` call writes
+/// key-value pairs, and an `Untag*` call names keys alone — "`aws:TagKeys` … the tag keys
+/// that are passed in the request", which both forms carry, while only the first carries
+/// values. Every other operation writes no tags.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum WrittenTags<'a> {
+    /// A request that writes no tags at all, which is every operation but the tagging
+    /// ones.
+    #[default]
+    None,
+    /// A `Tag*` call: the key-value pairs it stores.
+    Pairs(&'a [Tag]),
+    /// An `Untag*` call: the keys it removes, which carry no value.
+    Keys(&'a [String]),
+}
+
+impl WrittenTags<'_> {
+    /// The `(key, value)` context entries these tags contribute: one `aws:RequestTag/<key>`
+    /// per pair written, and one `aws:TagKeys` value per key written, whichever form the
+    /// call takes.
+    fn context(self) -> Vec<(String, String)> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Pairs(tags) => tags
+                .iter()
+                .flat_map(|tag| {
+                    [
+                        (format!("{REQUEST_TAG_PREFIX}{}", tag.key), tag.value.clone()),
+                        (TAG_KEYS_KEY.to_string(), tag.key.clone()),
+                    ]
+                })
+                .collect(),
+            Self::Keys(keys) => keys
+                .iter()
+                .map(|key| (TAG_KEYS_KEY.to_string(), key.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// The condition context a request signed by `user` against `resource` carries, and the
+/// keys it declares it models: everything IAM knows about the call at the instant it is
+/// decided, which is where a policy variable's value and a `Condition` clause's value both
+/// come from (see the module docs).
+///
+/// The keys it fills are the caller's own ([`PUBLISHED_PRINCIPAL_KEYS`]), the target's
+/// ([`PUBLISHED_RESOURCE_TAG_KEYS`], both spellings of the one tag set), the request's own
+/// tags and the clock's ([`PUBLISHED_REQUEST_KEYS`]). The resource-tag families are
+/// DECLARED only for a resource whose tag set the account knows in full; for an ARN naming
+/// nothing it holds, a clause over one of its tags stays undecided, which is the
+/// fail-closed reading the shared evaluation gives every key this emulator cannot answer
+/// for. The keys no such request carries at all are declared beside them
+/// ([`PUBLISHED_ABSENT_KEYS`]).
+///
+/// The principal's and the target's tags are the ones they hold NOW — nothing in the
+/// request carries them — so retagging either side changes what the same unchanged request
+/// decides, and untagging it takes the value away again.
+fn request_context(
+    store: &IamState,
+    user: &User,
+    resource: &str,
+    written: WrittenTags<'_>,
+) -> (Vec<(String, String)>, Vec<&'static str>) {
     let mut context = vec![
         (USER_NAME_KEY.to_string(), user.user_name.clone()),
         (USER_ID_KEY.to_string(), user.user_id.clone()),
     ];
+    let mut published = PUBLISHED_PRINCIPAL_KEYS.to_vec();
     for tag in user.tags.iter().flatten() {
         context.push((
             format!("{PRINCIPAL_TAG_PREFIX}{}", tag.key),
             tag.value.clone(),
         ));
     }
-    context
-}
-
-/// The condition context ONE request carries, and the keys it declares it models: what
-/// IAM knows about the signing principal ([`principal_context`]) together with what it
-/// knows about the RESOURCE the request is taken on.
-///
-/// A statement may be written to depend on the target rather than on the caller — an
-/// attribute-based grant comparing a tag of the resource to a tag of the principal is the
-/// canonical case — so the tags the addressed resource holds at the instant of the call
-/// are part of the request the decision is made about, under both spellings of the
-/// resource-tag key family. They are read from the store
-/// ([`IamState::resource_tags`](super::ComAmazonawsIamAwsidentitymanagementv20100508State::resource_tags)),
-/// so retagging either side changes what the same unchanged request decides.
-///
-/// The two families are DECLARED only for a resource whose tag set the account knows in
-/// full; for an ARN naming nothing it holds, a clause over one of its tags stays
-/// undecided, which is the fail-closed reading the shared evaluation gives every key this
-/// emulator cannot answer for.
-fn request_context(
-    store: &IamState,
-    principal: &[(String, String)],
-    resource: &str,
-) -> (Vec<(String, String)>, Vec<&'static str>) {
-    let mut context = principal.to_vec();
-    let mut published = PUBLISHED_PRINCIPAL_KEYS.to_vec();
+    // The tags of the entity the request addresses, under both spellings of the key: one
+    // tag, two names for it. Declared only where that tag set is the account's to read.
     if let Some(tags) = store.resource_tags(resource) {
         for tag in tags {
             for prefix in PUBLISHED_RESOURCE_TAG_KEYS {
@@ -325,6 +480,15 @@ fn request_context(
         }
         published.extend_from_slice(PUBLISHED_RESOURCE_TAG_KEYS);
     }
+    context.extend(written.context());
+    let now = super::now();
+    // The instant the call is decided at, in the two spellings IAM publishes it under.
+    if let Ok(stated) = now.fmt(::aws_smithy_types::date_time::Format::DateTime) {
+        context.push((CURRENT_TIME_KEY.to_string(), stated));
+    }
+    context.push((EPOCH_TIME_KEY.to_string(), now.secs().to_string()));
+    published.extend_from_slice(PUBLISHED_REQUEST_KEYS);
+    published.extend_from_slice(PUBLISHED_ABSENT_KEYS);
     (context, published)
 }
 
@@ -363,6 +527,25 @@ pub fn authorize_named(
     resource: &str,
     named_as: &str,
 ) -> Result<(), AccessDenied> {
+    authorize_written(store, ctx, action, resource, named_as, WrittenTags::None)
+}
+
+/// [`authorize_named`] for a call that WRITES tags, which hands the gate the tags it
+/// writes so the clauses over them can be decided.
+///
+/// A `Tag*`/`Untag*` call's own input is part of the request IAM decides: `aws:RequestTag/`
+/// and `aws:TagKeys` are read from it (see the module docs), so a grant conditioned on the
+/// value about to be stored, or on the set of keys about to be written, applies to exactly
+/// the combinations it names — and the refusal of any other leaves the target's tags
+/// untouched, because the decision is made before the write.
+pub fn authorize_written(
+    store: &IamState,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+    named_as: &str,
+    written: WrittenTags<'_>,
+) -> Result<(), AccessDenied> {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
     // A credential this account holds no IAM user for carries no identity-based
     // policies, so there is nothing to judge it on (see the module docs).
@@ -370,17 +553,17 @@ pub fn authorize_named(
         return Ok(());
     };
     let SigningPrincipal {
+        user,
         arn: principal,
         policies,
-        context,
     } = signer;
+    let (context, published) = request_context(store, user, resource, written);
 
     let principals = [principal.clone()];
     // What the policies in force are decided against BESIDES the action and the resource:
-    // the keys that describe the signing principal and the resource the call is taken on,
-    // which a statement reads either through a `Condition` clause or through a policy
-    // variable in its `Resource` element.
-    let (context, published) = request_context(store, &context, resource);
+    // the keys that describe the caller, the target and the request itself, which a
+    // statement reads either through a `Condition` clause or through a policy variable in
+    // its `Resource` element.
     let request = iam::Request::new(action, resource, &principals)
         .with_context(&context)
         .with_published_keys(&published);
@@ -539,8 +722,7 @@ fn authorization_id(
 
 /// The `AccessDenied` text AWS words a call it will not perform for its caller with:
 /// what the refusal is about — the principal that signed the request, the action it
-/// asked for and the resource it asked for it on — closed by `reason`, which says why,
-/// and nothing further.
+/// asked for and the resource it asked for it on — closed by `reason`, which says why.
 ///
 /// ONE wording for the code, so a refusal an operation reaches for a reason of its own
 /// is worded exactly as the policy decision above is, differing only in that reason.
@@ -601,19 +783,20 @@ pub fn delegation_permission_check(
         return PERMISSION_CHECK_ALLOWED;
     };
     let SigningPrincipal {
+        user,
         arn: principal,
         policies,
-        context,
     } = signer;
 
     let principals = [principal];
     let documents = iam::prepare_documents(&policies.documents);
     let mut short_of_an_ask = false;
     for (action, resource) in &asks {
-        // The same question [`authorize_named`] asks, so it is asked with the same
-        // knowledge of the caller and of the resource each ask names
-        // ([`request_context`]).
-        let (ask_context, published) = request_context(store, &context, resource);
+        // The same question [`authorize_written`] asks, so it is asked with the same
+        // knowledge of the caller, of the ask's own target and of the clock (see
+        // [`request_context`]). A permission check writes no tags, so the ask carries
+        // none either.
+        let (ask_context, published) = request_context(store, user, resource, WrittenTags::None);
         let request = iam::Request::new(action, resource, &principals)
             .with_context(&ask_context)
             .with_published_keys(&published);
@@ -645,30 +828,32 @@ pub fn delegation_permission_check(
 }
 
 /// What a signed request is judged on, resolved once from the access key it carries:
-/// the principal it speaks for, the identity-based documents in force on that principal,
-/// and the condition context the request carries about it.
+/// the IAM user it speaks for and the identity-based documents in force on that user.
 #[derive(Debug)]
-struct SigningPrincipal {
-    /// The ARN of the IAM user the signing access key belongs to — what a refusal names
-    /// as the caller, and the principal a resource-based statement would name.
+struct SigningPrincipal<'a> {
+    /// The stored IAM user the signing access key belongs to — what the condition keys
+    /// describing the caller are read from ([`request_context`]).
+    user: &'a User,
+    /// The ARN of that user — what a refusal names as the caller, and the principal a
+    /// resource-based statement would name.
     arn: String,
     /// The identity-based documents in force on it, and the attachments whose documents
     /// the account does not hold.
     policies: PrincipalPolicies,
-    /// The condition keys the request carries about that principal
-    /// ([`principal_context`]).
-    context: Vec<(String, String)>,
 }
 
 /// The IAM user the access key id `access_key_id` belongs to, or `None` when the account
 /// holds no user for that key.
-fn signing_principal(store: &IamState, access_key_id: &str) -> Option<SigningPrincipal> {
+fn signing_principal<'a>(
+    store: &'a IamState,
+    access_key_id: &str,
+) -> Option<SigningPrincipal<'a>> {
     let record = store.access_keys.get(access_key_id)?;
     let user = store.users.get(&record.user_key)?;
     let policies = store.principal_policies(&user.arn)?;
     Some(SigningPrincipal {
+        user,
         arn: user.arn.clone(),
         policies,
-        context: principal_context(user),
     })
 }

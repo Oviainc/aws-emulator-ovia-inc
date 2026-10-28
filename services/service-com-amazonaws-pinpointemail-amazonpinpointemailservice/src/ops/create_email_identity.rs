@@ -199,6 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // single record (so it is still listed once) rather than replacing it, which would
         // throw away the DKIM tokens the customer has already put in DNS.
         let now = ::std::time::SystemTime::now();
+        let existed = store.identities.contains_key(&input.email_identity);
         let record = store
             .identities
             .entry(input.email_identity.clone())
@@ -211,11 +212,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(tags) = input.tags {
             record.tags = tags;
         }
+        let published = crate::state::registry_record(record);
 
-        Ok(CreateEmailIdentityOutput {
+        let output = CreateEmailIdentityOutput {
             identity_type: Some(record.identity_type.clone()),
             verified_for_sending_status: record.verified_for_sending,
             dkim_attributes: record.dkim.clone(),
-        })
+        };
+        // Published to the account's identity registry as well as to this service's own
+        // table, so every other API over the account's email identities reports the
+        // identity from the moment this call returns. The registry lock is taken while
+        // this service's store is held, which is this service's lock order.
+        if let Some(registry) = crate::state::identity_registry(&*self.engine) {
+            if registry.lock().publish(published).is_some() {
+                if let Some(held) = store.identities.get_mut(&input.email_identity) {
+                    held.registered = true;
+                }
+            } else {
+                // The registry refused the publication, which is the account at the
+                // identity quota counted over every API that records one. A create the
+                // account has no room for is refused with the error this handler
+                // already refuses its own ceiling with, and the record it would have
+                // added — one the other APIs would never see — is taken back out.
+                if !existed {
+                    store.identities.remove(&input.email_identity);
+                }
+                return Err(CreateEmailIdentityErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} email identities",
+                            ::service_common::ses_identities::MAX_REGISTERED_IDENTITIES
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(output)
     }
 }

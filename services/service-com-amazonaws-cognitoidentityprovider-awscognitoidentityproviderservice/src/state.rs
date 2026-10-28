@@ -258,6 +258,14 @@ pub const USERNAME_CLIENT_NOT_FOUND_MESSAGE: &str = "Username/client id combinat
 /// refusal is the same sentence for every key.
 pub const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
 
+/// The message the refusal of a sign-in by a user Amazon Cognito is waiting on a
+/// new password from carries ([`UserStatus::ResetRequired`]).
+///
+/// One fixed sentence, naming no username: every operation that reports that
+/// state — the sign-in operations and the refresh-token exchange — reports it
+/// the same way.
+pub const PASSWORD_RESET_REQUIRED_MESSAGE: &str = "Password reset required for the user";
+
 /// The message a passkey operation's `ResourceNotFoundException` carries for a
 /// `CredentialId` the signed-in user holds no registered passkey for. Like
 /// [`DEVICE_NOT_FOUND_MESSAGE`] it names nothing the request asked for, so the
@@ -6052,6 +6060,20 @@ pub enum RecoveryDestination {
 /// The `RecoveryOptionNameType` value that "prevents self-service account
 /// recovery" (`RecoveryOptionType` in this service's model).
 pub const RECOVERY_ADMIN_ONLY: &str = "admin_only";
+
+/// The message a password reset is refused with where the pool reserves account
+/// recovery to administrators ([`RecoveryDestination::AdminOnly`]): no
+/// password-reset message is sent at all, so no reset can be begun through the
+/// API that sends one.
+pub const ADMIN_ONLY_RECOVERY_MESSAGE: &str = "Contact administrator to reset password.";
+
+/// The message a password reset is refused with where the user holds no verified
+/// address a reset message could go to ([`RecoveryDestination::None`]): "if
+/// neither a verified phone number nor a verified email exists, Amazon Cognito
+/// responds with an InvalidParameterException error" (`ForgotPassword` in this
+/// service's model).
+pub const NO_RECOVERY_DESTINATION_MESSAGE: &str =
+    "Cannot reset password for the user as there is no registered/verified email or phone_number";
 
 /// The recovery mechanisms a pool that configures none gets, in priority order:
 /// Amazon Cognito's default account recovery is the verified email address,

@@ -310,15 +310,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // falls due (`state::verify_identity`). `None` means the account is
         // already at its identity limit, so the message is refused instead and
         // nothing is logged.
-        if state
+        let Some(recorded) = state
             .verify_identity(&address, crate::state::IdentityType::EmailAddress)
-            .is_none()
-        {
+            .cloned()
+        else {
             return Err(rejected(format!(
                 "this account already holds the maximum of {} verified identities; delete one \
                  before verifying {address}",
                 crate::state::MAX_IDENTITIES
             )));
+        };
+        // Published to the account's identity registry as well, so the v2 surface
+        // reports the identity this call recorded. The registry lock is taken while
+        // this service's store is held, which is this service's lock order.
+        if let Some(registry) = crate::state::identity_registry(&*self.engine) {
+            let published = registry
+                .lock()
+                .publish(crate::state::registry_record(&recorded))
+                .cloned();
+            if let Some(published) = published {
+                if let Some(held) = state.identities.get_mut(&address) {
+                    held.registered = true;
+                    held.verification_token = published.verification_token;
+                }
+            }
         }
 
         // The message is accepted: mint its id, log it, and answer with the id
