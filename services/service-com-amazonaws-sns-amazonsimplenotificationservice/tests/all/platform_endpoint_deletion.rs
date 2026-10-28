@@ -22,8 +22,9 @@
 //! Every call goes over the wire through the router the emulator serves in production,
 //! so nothing but persisted state carries information between calls. The endpoint
 //! records themselves are seeded straight into that state — the way the SMS sandbox
-//! suite seeds its store — because the call that registers one,
-//! `CreatePlatformEndpoint`, is a scaffold stub with an issue of its own.
+//! suite seeds its store — so a row fixes the record's id, attributes, region and
+//! account directly; the registration call that mints one is covered by
+//! `platform_endpoint_registration_lifecycle`.
 
 use std::time::{Duration, SystemTime};
 
