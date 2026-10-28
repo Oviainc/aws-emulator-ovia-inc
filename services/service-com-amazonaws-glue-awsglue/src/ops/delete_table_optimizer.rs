@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTableOptimizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTableOptimizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTableOptimizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Removes the optimizer of one `TableOptimizerType` from the table the request
+//! addresses, so the `GetTableOptimizer` that follows reports the miss again and a further
+//! `CreateTableOptimizer` of that type is accepted.
+//!
+//! The optimizer is addressed exactly as the read addresses it (see
+//! [`crate::ops::get_table_optimizer`]), so each step of that address is resolved in turn
+//! and a miss at any of them is the operation's modelled `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +150,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTableOptimizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTableOptimizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTableOptimizer"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteTableOptimizerErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(Some(&input.catalog_id));
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the caller may address this catalog at all is decided BEFORE the entity
+        // lookup (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) =
+            crate::state::foreign_catalog_refusal(&catalog_id, &region, Self::NAME)
+        {
+            return Err(DeleteTableOptimizerErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(DeleteTableOptimizerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(DeleteTableOptimizerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        if table.optimizers.remove(&input.r#type).is_none() {
+            return Err(DeleteTableOptimizerErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_optimizer_not_found(
+                        &input.table_name,
+                        &input.r#type,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        ::tracing::info!(
+            operation = "DeleteTableOptimizer",
+            catalog_id = %catalog_id,
+            database = %input.database_name,
+            table = %table.name,
+            optimizer_type = %input.r#type,
+            "removed a table optimizer"
+        );
+
+        Ok(DeleteTableOptimizerOutput {})
     }
 }

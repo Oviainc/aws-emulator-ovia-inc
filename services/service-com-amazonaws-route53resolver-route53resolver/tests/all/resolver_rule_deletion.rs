@@ -21,14 +21,19 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, expect_error, ok, string_member};
+use super::harness::{call, emulator, expect_error, ok, string_member, Emulator};
 
 /// Create a Resolver endpoint a FORWARD rule can route its queries through, and
 /// return its `Id`.
 ///
+/// The endpoint's addresses are placed in subnets of the caller's VPC, which
+/// `CreateResolverEndpoint` resolves against the account's own Amazon EC2 store,
+/// so the subnets this names are registered there first.
+///
 /// `pub` because [`super::resolver_rule_error_bodies`] drives the same slice and
 /// so needs the same fixtures.
-pub async fn outbound_endpoint(router: &MultiServiceRouter, creator: &str) -> String {
+pub async fn outbound_endpoint(router: &Emulator, creator: &str) -> String {
+    router.hold_subnets(["subnet-00000000000000001", "subnet-00000000000000002"]);
     let created = ok(
         router,
         "CreateResolverEndpoint",

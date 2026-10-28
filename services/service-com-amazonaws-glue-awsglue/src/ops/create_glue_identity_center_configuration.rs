@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlueIdentityCenterConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlueIdentityCenterConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGlueIdentityCenterConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Registers the Glue application of this account with the Identity Center instance the
+//! request names, and reports the `ApplicationArn` it minted for it.
+//!
+//! The configuration is an account SINGLETON (see
+//! [`crate::ops::get_glue_identity_center_configuration`]), so this create SERIALIZES
+//! against itself: whichever call takes the store's guard first registers the
+//! configuration, and every later one finds it already there and is refused with
+//! `AlreadyExistsException` rather than replacing it. The registration is read back
+//! through `GetGlueIdentityCenterConfiguration` and removed by
+//! `DeleteGlueIdentityCenterConfiguration`, which returns the account to the
+//! not-configured state.
+//!
+//! `InstanceArn` has to be the ARN of an Identity Center INSTANCE
+//! ([`crate::state::identity_center_instance_id`]), because the application this create
+//! mints is a resource of that instance and carries its id; a value naming no instance is
+//! refused with `InvalidInputException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +163,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlueIdentityCenterConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlueIdentityCenterConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlueIdentityCenterConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateGlueIdentityCenterConfigurationErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue Identity Center store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The instance the application is registered with has to be an Identity Center
+        // instance: the minted `ApplicationArn` is a resource of that instance and carries
+        // its id, so a value naming none registers the application nowhere.
+        if crate::state::identity_center_instance_id(&input.instance_arn).is_none() {
+            return Err(
+                CreateGlueIdentityCenterConfigurationErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            crate::state::messages::malformed_identity_center_instance_arn(
+                                &input.instance_arn,
+                            ),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The duplicate check and the write happen under ONE hold of the store's guard, so
+        // two creates racing each other cannot both see an unconfigured account: exactly
+        // one registers the configuration and the other is refused.
+        let mut store = state.lock();
+        if store.identity_center_configuration.is_some() {
+            return Err(
+                CreateGlueIdentityCenterConfigurationErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(
+                            crate::state::messages::IDENTITY_CENTER_CONFIGURATION_ALREADY_EXISTS
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let configuration = crate::state::IdentityCenterConfigurationEntry::new(
+            &input.instance_arn,
+            input.scopes.as_ref(),
+            input.user_background_sessions_enabled,
+        );
+        let application_arn = configuration.application_arn.clone();
+        store.identity_center_configuration = Some(configuration);
+        ::tracing::info!(
+            operation = "CreateGlueIdentityCenterConfiguration",
+            instance_arn = %input.instance_arn,
+            "registered the Glue Identity Center configuration of this account"
+        );
+
+        // "The Amazon Resource Name (ARN) of the Identity Center application that was
+        // created" — the application this create minted, which every later read of the
+        // configuration reports.
+        Ok(CreateGlueIdentityCenterConfigurationOutput {
+            application_arn: Some(application_arn),
+        })
     }
 }
