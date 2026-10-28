@@ -25,6 +25,8 @@ mod account_suppression_attributes;
 mod account_vdm_attributes;
 #[path = "all/boundary_validation_message.rs"]
 mod boundary_validation_message;
+#[path = "all/configuration_set_event_destination_ceiling.rs"]
+mod configuration_set_event_destination_ceiling;
 #[path = "all/configuration_set_event_destination_deletion.rs"]
 mod configuration_set_event_destination_deletion;
 #[path = "all/configuration_set_event_destinations.rs"]

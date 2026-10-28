@@ -19,8 +19,9 @@
 //! every other row.
 //!
 //! The store's WRITERS are `CreateStackSet`, which creates a StackSet but no instance of one,
-//! and `CreateStackInstances`, still a scaffold with its own stub issue, so the records below
-//! are seeded straight into the store through
+//! and `CreateStackInstances`, `UpdateStackSet`, `UpdateStackInstances` and
+//! `DeleteStackInstances`, which write the instances of one; the records below span instance
+//! shapes no single call sequence produces, so they are seeded straight into the store through
 //! `state::ComAmazonawsCloudformationCloudformationState::record_stack_set` — the same device
 //! `hook_result_invocations.rs` and `extension_registry.rs` use for records whose writers are
 //! not available. Every READ goes through the real request path (form-encoded body in, XML

@@ -2105,24 +2105,14 @@ pub fn configured_actions(actions: Option<&[String]>) -> Option<Vec<String>> {
 
 /// The Region segment of `value` when it is an ARN that names a Region, else `None`.
 ///
-/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, the resource taken
-/// last so a resource containing `:` stays whole. A value that is not an ARN names no Region,
-/// and neither does an ARN whose Region segment is EMPTY: a resource that is not Region-scoped
-/// is named that way, which is why the action values this operation documents include
+/// Read through the ONE ARN parse (`service_common::arn`), so this service and every other
+/// read the same form. A value that is not a well-formed ARN names no Region, and neither does
+/// an ARN whose Region field is EMPTY: a resource that is not Region-scoped is named that way,
+/// which is why the action values this operation documents include
 /// `arn:aws:ssm-incidents::<account-id>:responseplan/<response-plan-name>`
 /// (`PutMetricAlarmInput$AlarmActions`).
 fn arn_region(value: &str) -> Option<&str> {
-    let mut segments = value.splitn(6, ':');
-    if segments.next() != Some("arn") {
-        return None;
-    }
-    // Partition and service, neither of which decides the Region.
-    segments.next()?;
-    segments.next()?;
-    let region = segments.next()?;
-    // The account and resource segments: a value carrying fewer than six is not an ARN.
-    segments.next()?;
-    segments.next()?;
+    let region = ::service_common::arn::parse(value)?.region;
     (!region.is_empty()).then_some(region)
 }
 
@@ -2145,6 +2135,62 @@ pub fn foreign_action_region_error(
         .filter_map(|action| arn_region(action))
         .find(|named| *named != region)
         .map(|named| format!("Invalid region {named} specified. Only {region} is supported."))
+}
+
+/// Which part of this endpoint's scope an ARN falls outside of ([`foreign_arn_scope`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignArnScope {
+    /// The ARN names another Region, or another AWS partition: either way the resource it
+    /// names is in another location than the one serving the request.
+    Location,
+    /// The ARN names another account.
+    Account,
+}
+
+/// Which part of the scope of a resource this endpoint holds in `region` the ARN `value` falls
+/// outside of, or `None` when it names a resource inside that scope.
+///
+/// A resource configured to use another AWS resource reaches it with this account's own
+/// credentials, in the location the configuration itself lives in, so an ARN naming another
+/// account — or another Region or partition, when the resource it names is Region-scoped —
+/// names something the configuration could never reach. What it is judged against is what this
+/// emulator itself hands out: the partition every ARN it mints carries ([`serving_partition`]),
+/// the Region the request is served in, and this account's own id. An ARN naming no Region
+/// (`arn:aws:iam::<account>:role/…`, a resource that is not Region-scoped) is judged on its
+/// partition and account alone.
+///
+/// A value that is no well-formed ARN is not judged here: it names no account or Region to
+/// compare, so its own member's form rule decides it. The WORDS of a refusal are the caller's,
+/// because they name the resource being configured.
+pub fn foreign_arn_scope(value: &str, region: &str) -> Option<ForeignArnScope> {
+    let named = ::service_common::arn::parse(value)?;
+    let serving = serving_partition();
+    if (!serving.is_empty() && named.partition != serving)
+        || (!named.region.is_empty() && named.region != region)
+    {
+        return Some(ForeignArnScope::Location);
+    }
+    (named.account != ::emulator_server::emulator_account_id())
+        .then_some(ForeignArnScope::Account)
+}
+
+/// The partition every ARN this emulator mints carries.
+///
+/// Read ONCE off the ARN builder the whole emulator mints with (`engine`'s) and through the one
+/// ARN parse (`service_common::arn`), so what a request is judged against is exactly what the
+/// service hands out and nothing here reads the ARN form a second time. A partition is not
+/// Region- or service-specific, so any ARN the builder renders carries the same one.
+fn serving_partition() -> &'static str {
+    static PARTITION: ::std::sync::OnceLock<String> = ::std::sync::OnceLock::new();
+    PARTITION.get_or_init(|| {
+        let minted = ::engine::emulator_arn("cloudwatch", "", "scope");
+        ::service_common::arn::parse(&minted)
+            .map(|arn| arn.partition.to_owned())
+            // The builder renders every field that parse requires, so this cannot miss; an
+            // unreadable reference leaves the partition UNJUDGED rather than making every ARN
+            // foreign, so a change to the builder could never turn into a wall of refusals.
+            .unwrap_or_default()
+    })
 }
 
 /// The largest number of history items retained per alarm. Reaching it evicts the OLDEST,

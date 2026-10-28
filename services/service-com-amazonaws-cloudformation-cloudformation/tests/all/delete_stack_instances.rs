@@ -666,10 +666,15 @@ fn a_product_of(stack_set_name: &str, accounts: usize, regions: usize) -> Vec<(S
         ));
     }
     for index in 0..regions {
-        members.push(member(
-            &format!("Regions.member.{}", index + 1),
-            &format!("us-test-{}", index + 1),
-        ));
+        // Each Region is an entry of the published catalog
+        // (`emulator_telemetry::policy::KNOWN_REGIONS`, "every AWS region the wire may
+        // carry"), which is what a `RegionList` entry is held to: the selections below are
+        // then judged on their SIZE rather than refused for naming a Region AWS does not
+        // have.
+        let region = ::emulator_telemetry::policy::KNOWN_REGIONS
+            .get(index)
+            .expect("the Region catalog holds at least as many Regions as a case asks for");
+        members.push(member(&format!("Regions.member.{}", index + 1), region));
     }
     members
 }
