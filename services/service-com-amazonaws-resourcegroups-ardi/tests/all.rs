@@ -63,6 +63,8 @@ mod tag_character_class;
 mod tag_sync_tasks;
 #[path = "all/ungroup_after_configuration_change.rs"]
 mod ungroup_after_configuration_change;
+#[path = "all/ungroup_reported_removals.rs"]
+mod ungroup_reported_removals;
 #[path = "all/ungroup_resources.rs"]
 mod ungroup_resources;
 #[path = "all/update_group_query.rs"]

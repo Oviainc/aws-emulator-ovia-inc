@@ -3,9 +3,10 @@
 //! @op UngroupResources
 //!
 //! Drops each ARN in `ResourceArns` from the static memberships of the group `Group`
-//! names, in [`crate::state`], and reports the resources the group no longer holds in
-//! `Succeeded`. Removing an ARN the group does not hold is a no-op, so a repeated call
-//! reports the same outcome and changes nothing.
+//! names, in [`crate::state`], and reports the resources THIS call removed in
+//! `Succeeded`. Removing an ARN the group does not hold removes nothing, so that ARN
+//! is reported in neither `Succeeded` nor `Failed`; a repeated call therefore changes
+//! nothing and reports no removal.
 //!
 //! Only a group the store records as populated through a static grouping, or one whose
 //! service configuration still declares one of the supported configuration types
@@ -245,22 +246,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MAX_RESOURCE_ARNS` and nothing else: each request entry is looked up by
         // BINARY SEARCH over the group's memberships, which the record keeps sorted
         // by ARN.
-        let removed_count = input
-            .resource_arns
-            .iter()
-            .filter(|arn| group.remove_member(arn))
-            .count();
-        // Reported from the memberships the group now holds, not from the request:
-        // an ARN appears in `Succeeded` because the group no longer holds it, which
-        // makes a removal IDEMPOTENT — an ARN that was never a member is already in
-        // the state the request asked for, so it succeeds too, and no action is
-        // recorded against it because none was performed.
-        let succeeded: Vec<String> = input
-            .resource_arns
-            .iter()
-            .filter(|arn| !group.holds_member(arn))
-            .cloned()
-            .collect();
+        //
+        // Reported from what this call DID, not from the state it left behind: an
+        // ARN comes back in `Succeeded` because the group HELD it and this call
+        // dropped it, which is what `remove_member` reports. An ARN the group does
+        // not hold removes nothing — no membership is lost and no ungrouping is
+        // recorded against it — so it is reported in neither list, exactly as the
+        // sibling tag removal reports only the keys the stored map LOST. A removal
+        // stays idempotent: repeating the call leaves the same group behind and
+        // reports no removal, and an ARN one request repeats is reported once, by
+        // the single lookup that found it.
+        let mut succeeded: Vec<String> = Vec::new();
+        for arn in &input.resource_arns {
+            if group.remove_member(arn) {
+                succeeded.push(arn.clone());
+            }
+        }
         let members_left = group.members.len();
         // Everything below is owned, so the store lock is released before the record
         // is formatted: the critical section covers the state change only.
@@ -275,16 +276,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region = ?region,
             group = ?key.name,
             members_requested = input.resource_arns.len(),
-            members_removed = removed_count,
-            members_now_absent = succeeded.len(),
+            members_removed = succeeded.len(),
             members_remaining = members_left,
             outcome = "ungrouped",
             "resources removed from a resource group",
         );
         Ok(UngroupResourcesOutput {
             succeeded: Some(succeeded),
-            // Nothing was refused, and a static membership this emulator removes is
-            // dropped immediately — so neither list has an entry.
+            // A removal this emulator accepts is applied in full and immediately: no
+            // named resource is refused, so nothing failed to be removed, and none
+            // is left half-removed, so nothing is pending either.
             failed: Some(Vec::new()),
             pending: Some(Vec::new()),
         })

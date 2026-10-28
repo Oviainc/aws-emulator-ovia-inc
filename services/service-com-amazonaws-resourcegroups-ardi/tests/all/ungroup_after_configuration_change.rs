@@ -180,9 +180,9 @@ async fn memberships_stay_removable_after_the_configuration_that_served_them_is_
 
         let named = &held[..case.ungroup];
         let expected_remaining = sorted(&held[case.ungroup..]);
-        // Twice over: the removal is idempotent, so the repeated call answers what
-        // the first did and leaves the same group behind — including once the group
-        // holds nothing at all.
+        // Twice over: the removal is idempotent, so the repeated call leaves the same
+        // group behind — and reports no removal, since the first call made them all —
+        // including once the group holds nothing at all.
         for round in ["first call", "repeated call"] {
             let case_round = format!("{label} ({round})");
             let (status, answered) = emulator
@@ -198,8 +198,15 @@ async fn memberships_stay_removable_after_the_configuration_that_served_them_is_
             );
             assert_eq!(
                 succeeded(&case_round, &answered),
-                sorted(named),
-                "case {case_round:?}: expected every named ARN in Succeeded, got {answered}",
+                if round == "first call" {
+                    sorted(named)
+                } else {
+                    // The first call dropped every named membership, so the repeated
+                    // one removes nothing and reports no removal.
+                    Vec::new()
+                },
+                "case {case_round:?}: expected Succeeded to be the memberships this call \
+                 dropped, got {answered}",
             );
             for empty in ["Failed", "Pending"] {
                 let list = answered[empty].as_array();

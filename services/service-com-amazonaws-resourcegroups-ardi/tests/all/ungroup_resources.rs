@@ -11,9 +11,10 @@
 //!
 //! * a call drops exactly the resources its `ResourceArns` names from the addressed
 //!   group's static memberships, leaves every other membership of that group and of
-//!   every other group alone, and reports the resources the group no longer holds in
-//!   `Succeeded` — so removing a resource the group does not hold is a no-op that
-//!   still succeeds, and a repeated call answers the same;
+//!   every other group alone, and reports in `Succeeded` exactly the memberships THIS
+//!   call dropped — so a resource the group does not hold is reported in neither
+//!   `Succeeded` nor `Failed`, and a repeated call removes nothing and reports
+//!   nothing;
 //! * a removal that happened becomes that resource's last grouping action
 //!   (`UNGROUP`, `SUCCESS`), replacing the record its grouping left, while a
 //!   resource the call did not remove keeps the record it had;
@@ -116,7 +117,13 @@ pub(crate) async fn listed_members(emulator: &Emulator, case: &str, name: &str) 
 }
 
 /// The `Succeeded` list of an answer, sorted.
+///
+/// A call that removed nothing reports no ARN, which the wire carries either as an
+/// empty list or as no member at all — both read here as no ARN.
 pub(crate) fn succeeded(case: &str, answered: &Value) -> Vec<String> {
+    if answered["Succeeded"].is_null() {
+        return Vec::new();
+    }
     sorted(
         answered["Succeeded"]
             .as_array()
@@ -204,21 +211,33 @@ fn ungroup_cases() -> Vec<UngroupCase> {
     ]
 }
 
-/// The rule: a call drops exactly the resources it names, reports the resources the
-/// group no longer holds in `Succeeded`, and is idempotent — repeating it answers
-/// the same and leaves the same group behind.
+/// The rule: a call drops exactly the resources it names, reports in `Succeeded`
+/// exactly the memberships it dropped, and is idempotent — repeating it leaves the
+/// same group behind and reports no removal, because there is none left to make.
 #[tokio::test]
-async fn ungrouping_drops_exactly_the_named_resources_and_reports_them_as_succeeded() {
+async fn ungrouping_drops_exactly_the_named_resources_and_reports_the_removals_it_made() {
     for case in ungroup_cases() {
         let label = case.label.as_str();
         let name = "ungroup-probe";
         let emulator = Emulator::new();
         group_with_members(&emulator, name, &case.grouped).await;
 
-        let expected_succeeded = sorted(&case.ungroup);
         let expected_remaining = sorted(&case.remaining);
-        // Twice over: a removal is idempotent, so the second call answers exactly
-        // what the first did and the group is the same afterwards.
+        // What the FIRST call must report: the memberships the group loses, which is
+        // the row's own grouped-minus-remaining difference and not the request list.
+        // The repeated call removes nothing, so it reports nothing.
+        let expected_succeeded = |round: &str| -> Vec<String> {
+            if round == "first call" {
+                sorted(&case.grouped)
+                    .into_iter()
+                    .filter(|arn| !expected_remaining.contains(arn))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        // Twice over: a removal is idempotent, so the second call leaves the same
+        // group behind — and reports no removal, since the first call made them all.
         for round in ["first call", "repeated call"] {
             let case_round = format!("{label} ({round})");
             let (status, answered) = emulator
@@ -231,10 +250,12 @@ async fn ungrouping_drops_exactly_the_named_resources_and_reports_them_as_succee
                 status, 200,
                 "case {case_round:?}: expected 200, got {status} {answered}",
             );
+            let expected = expected_succeeded(round);
             assert_eq!(
                 succeeded(&case_round, &answered),
-                expected_succeeded,
-                "case {case_round:?}: expected every named ARN in Succeeded, got {answered}",
+                expected,
+                "case {case_round:?}: expected Succeeded to be the memberships this call \
+                 dropped, {expected:?}, got {answered}",
             );
             for empty in ["Failed", "Pending"] {
                 let list = answered[empty].as_array();
