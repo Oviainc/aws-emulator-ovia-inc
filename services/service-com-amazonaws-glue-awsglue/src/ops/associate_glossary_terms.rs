@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateGlossaryTerms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateGlossaryTerms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateGlossaryTerms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Merges the request's `GlossaryTermIdentifiers` into the glossary term set of the asset
+//! its `AssetIdentifier` names ([`crate::state::AssetEntry::glossary_terms`]), so a later
+//! `GetAsset` of that identifier reports every term any association put on it. The
+//! identifier is resolved the way every operation that addresses an asset resolves one
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::asset`]), and an identifier this account
+//! holds no asset under is refused with the modelled `EntityNotFoundException` rather than
+//! creating anything.
+//!
+//! Three things this association does NOT do:
+//!
+//! * It does not resolve the term ids against the glossary term namespace. The
+//!   association is to the ID: the behaviour recorded for a term deleted after being
+//!   associated is that the term's own reader misses while the asset still names the id,
+//!   so the two surfaces are not cross-locked and the association stores what the request
+//!   sent.
+//! * It does not replace the asset's set. A term the asset already carries keeps its
+//!   place, which is why the same association sent twice — a retry under one
+//!   `ClientToken`, say — leaves exactly one entry and reports the same set: the merge is
+//!   idempotent in itself, so no token has to be recorded for it.
+//! * It never reports a lost race on its own account. The whole merge happens under the
+//!   one state lock, so simultaneous associations against one asset SERIALIZE and each is
+//!   served; the modelled `ConcurrentModificationException` is what a store that could not
+//!   serialize them would answer, and this one always can.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +181,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateGlossaryTerms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateGlossaryTermsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateGlossaryTerms"))
+        // Assets live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(AssociateGlossaryTermsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue asset store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The identifier of the item within the iterable form. Required when
+        // iterableFormName is specified" (`ItemIdentifier`), and the form name is what says
+        // the association targets "an item within the iterable form rather than the asset
+        // itself" (`IterableFormName`): the two name ONE target together, so a request
+        // carrying one without the other names no target at all and is refused with the
+        // modelled `InvalidInputException` rather than being read as an association to the
+        // asset.
+        match (
+            input.iterable_form_name.as_deref(),
+            input.item_identifier.as_deref(),
+        ) {
+            (Some(_), None) => {
+                return Err(AssociateGlossaryTermsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            "ItemIdentifier is required when IterableFormName is specified"
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            (None, Some(_)) => {
+                return Err(AssociateGlossaryTermsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            "IterableFormName is required when ItemIdentifier is specified"
+                                .to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            _ => {}
+        }
+
+        let mut store = state.lock();
+
+        // The asset the association targets has to be one this account holds, and it is
+        // resolved ONCE, mutably, under the lock the merge happens under — so the record
+        // the refusal was decided against is the record the merge writes to.
+        let Some(asset) = store.asset_mut(&input.asset_identifier) else {
+            return Err(AssociateGlossaryTermsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // The same miss the asset's own reader answers, worded the one way the
+                    // catalog's asset surface words it
+                    // (`crate::state::asset_not_found_message`), with the identifier that
+                    // resolved to nothing as its variable part.
+                    message: Some(crate::state::asset_not_found_message(
+                        &input.asset_identifier,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // An association that names an ITEM targets that item inside one of the asset's
+        // iterable forms. Nothing writes an iterable form onto an asset — the model binds
+        // no operation that stores one, so every asset this store holds carries none — so
+        // such a request names an entity that does not exist and is refused with the same
+        // modelled miss the asset's own resolution answers with. Wording for this slice is
+        // pinned by no recording or doc, so it is derived from the request: it names the
+        // iterable form and the asset it was looked for on.
+        if let Some(iterable_form_name) = input.iterable_form_name.as_deref() {
+            return Err(AssociateGlossaryTermsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Iterable form {iterable_form_name} not found on asset {}",
+                        input.asset_identifier
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let Some(associated) = asset.associate_glossary_terms(&input.glossary_term_identifiers)
+        else {
+            // The list that reports an asset's terms is bounded by the model, so an asset
+            // cannot come to hold more than that many: the association is refused with the
+            // closest client error this operation models rather than stored and reported
+            // outside the modelled bound.
+            return Err(AssociateGlossaryTermsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "An asset cannot be associated with more than {} glossary terms",
+                        crate::state::MAX_ASSET_GLOSSARY_TERMS
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        ::tracing::info!(
+            operation = "AssociateGlossaryTerms",
+            asset = %input.asset_identifier,
+            requested = input.glossary_term_identifiers.len(),
+            associated = associated.len(),
+            "associated Glue glossary terms with an asset"
+        );
+
+        // The association reports the asset it wrote to and the terms that asset carries
+        // now, read off the record, so a later `GetAsset` of the same identifier reports
+        // the same set. The two item members are echoed as the request sent them, which for
+        // an association to the asset itself is nothing at all.
+        Ok(AssociateGlossaryTermsOutput {
+            asset_identifier: Some(input.asset_identifier.clone()),
+            iterable_form_name: input.iterable_form_name.clone(),
+            item_identifier: input.item_identifier.clone(),
+            glossary_terms: Some(associated),
+        })
     }
 }

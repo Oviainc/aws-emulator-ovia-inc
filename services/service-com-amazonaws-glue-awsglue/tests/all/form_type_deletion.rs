@@ -9,13 +9,15 @@
 //! The rule under test: a delete removes the ONE form type its `Identifier` resolves to —
 //! a form type's identifier being the name it was registered under, which is also the `Id`
 //! its put reports — so a later read of that form type misses while every other form type
-//! is untouched; it is served whether or not an asset type still references the form type,
-//! leaving that asset type's `Forms` entry exactly as the asset type's own put wrote it;
-//! and it reports no miss, because the operation models no not-found error
-//! (`smithy_query operation=DeleteFormType` lists `AccessDeniedException`,
-//! `ConcurrentModificationException`, `ConflictException`, `InternalServiceException`,
-//! `InvalidInputException` and `ThrottlingException` and no `EntityNotFoundException`,
-//! unlike `GetFormType`).
+//! is untouched; it is REFUSED with the modelled `ConflictException` while any asset type
+//! in the store still references the form type ("A form type cannot be deleted if it is
+//! still referenced by an asset type", `smithy_query operation=DeleteFormType`), naming
+//! every such asset type and removing nothing, and that guard is live, so the identical
+//! delete is served once those asset types are gone; and it reports no miss, because the
+//! operation models no not-found error (`smithy_query operation=DeleteFormType` lists
+//! `AccessDeniedException`, `ConcurrentModificationException`, `ConflictException`,
+//! `InternalServiceException`, `InvalidInputException` and `ThrottlingException` and no
+//! `EntityNotFoundException`, unlike `GetFormType`).
 //!
 //! The suites are tables whose rows differ along what the rule generalises over: the form
 //! and length of the form type's name, the size of its stored schema, how an identifier
@@ -24,7 +26,7 @@
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, emulator, error_code, error_message, ok};
+use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID};
 
 /// The longest `Name` the model accepts: "len 1..128" on `FormTypeName`
 /// (`smithy_query operation=PutFormType`), whose pattern `^[A-Z]\w*$` is what the rows
@@ -228,28 +230,30 @@ async fn deleting_a_form_type_removes_only_the_one_it_names() {
 // A form type an asset type still references
 // ---------------------------------------------------------------------------
 
-/// A delete is served for a form type an ASSET TYPE still references, and leaves that
-/// reference alone: the asset type still reports the `Forms` entry its put wrote, naming the
-/// identifier the put sent, while a read of the form type itself misses.
+/// A delete is REFUSED for a form type an ASSET TYPE still references: HTTP 400
+/// `ConflictException` whose `Message` names the form type and every asset type that still
+/// holds a reference to it, nothing is removed, and the identical delete is served once
+/// those asset types are gone — the guard is a live reference check, not a latch.
 ///
-/// The rows differ along how many forms the asset type holds, whether two of its entries
-/// share the deleted form type, and whether the asset type keeps a reference to a form type
-/// that survives the delete.
+/// The rows differ along how many forms the referencing asset type holds, whether two of
+/// its entries share the deleted form type, how many asset types reference it, and whether
+/// the asset types keep a reference to a form type the delete never names.
 #[tokio::test]
-async fn deleting_a_referenced_form_type_is_served_and_leaves_the_reference() {
+async fn deleting_a_referenced_form_type_is_refused_until_the_reference_is_gone() {
     let router = emulator();
 
-    /// One asset type holding a reference to the form type the delete removes.
+    /// One row: the asset types holding a reference to the form type the delete names.
     struct Row {
         case: &'static str,
-        /// The form type this row's delete removes.
+        /// The form type this row's delete names.
         doomed_name: &'static str,
-        /// A second form type the delete must leave alone.
+        /// A second form type no delete names, which must be left alone throughout.
         survivor_name: &'static str,
-        asset_type: &'static str,
-        /// How many further entries the asset type holds, all naming the survivor.
+        /// Every asset type that references the doomed form type.
+        asset_types: &'static [&'static str],
+        /// How many further entries each asset type holds, all naming the survivor.
         extra_entries: usize,
-        /// Whether a second entry of the asset type names the deleted form type too.
+        /// Whether a second entry of each asset type names the doomed form type too.
         duplicate_entry: bool,
     }
 
@@ -258,7 +262,7 @@ async fn deleting_a_referenced_form_type_is_served_and_leaves_the_reference() {
             case: "the one form of a single-form asset type",
             doomed_name: "SoloForm",
             survivor_name: "SoloSurvivor",
-            asset_type: "SoloAsset",
+            asset_types: &["SoloAsset"],
             extra_entries: 0,
             duplicate_entry: false,
         },
@@ -266,7 +270,7 @@ async fn deleting_a_referenced_form_type_is_served_and_leaves_the_reference() {
             case: "one of two forms",
             doomed_name: "NamedForm",
             survivor_name: "NamedSurvivor",
-            asset_type: "NamedAsset",
+            asset_types: &["NamedAsset"],
             extra_entries: 1,
             duplicate_entry: false,
         },
@@ -274,17 +278,26 @@ async fn deleting_a_referenced_form_type_is_served_and_leaves_the_reference() {
             case: "one of four forms",
             doomed_name: "SharedForm",
             survivor_name: "SharedSurvivor",
-            asset_type: "SharedAsset",
+            asset_types: &["SharedAsset"],
             extra_entries: 3,
             duplicate_entry: false,
         },
         Row {
-            case: "two entries referencing the one deleted form type",
+            case: "two entries of one asset type referencing the form type",
             doomed_name: "TwiceForm",
             survivor_name: "TwiceSurvivor",
-            asset_type: "TwiceAsset",
+            asset_types: &["TwiceAsset"],
             extra_entries: 1,
             duplicate_entry: true,
+        },
+        Row {
+            case: "three asset types referencing the one form type",
+            doomed_name: "CommonForm",
+            survivor_name: "CommonSurvivor",
+            // Named so the dependency list below is in this namespace's own (name) order.
+            asset_types: &["CommonAssetA", "CommonAssetB", "CommonAssetC"],
+            extra_entries: 1,
+            duplicate_entry: false,
         },
     ];
 
@@ -295,6 +308,7 @@ async fn deleting_a_referenced_form_type_is_served_and_leaves_the_reference() {
             &format!("structure {} {{ a: String }}", row.doomed_name),
         )
         .await;
+        let doomed_schema = format!("structure {} {{ a: String }}", row.doomed_name);
         let survivor_schema = format!("structure {} {{ b: String }}", row.survivor_name);
         let survivor_id = put_form_type(&router, row.survivor_name, &survivor_schema).await;
 
@@ -313,45 +327,68 @@ async fn deleting_a_referenced_form_type_is_served_and_leaves_the_reference() {
             entries.push((name, survivor_id.as_str()));
         }
 
-        let put = ok(
-            &router,
-            "PutAssetType",
-            &json!({ "Name": row.asset_type, "Forms": forms(&entries) }),
-        )
-        .await;
-        let before = put
-            .get("Forms")
-            .cloned()
-            .unwrap_or_else(|| panic!("case {}: PutAssetType must report Forms", row.case));
+        let mut forms_before: Vec<Value> = Vec::new();
+        for asset_type in row.asset_types {
+            let put = ok(
+                &router,
+                "PutAssetType",
+                &json!({ "Name": asset_type, "Forms": forms(&entries) }),
+            )
+            .await;
+            forms_before.push(
+                put.get("Forms")
+                    .cloned()
+                    .unwrap_or_else(|| panic!("case {}: PutAssetType must report Forms", row.case)),
+            );
+        }
 
+        // The delete is refused while the references stand, and refused the same way
+        // however often it is retried: it is not a state change a second call could get
+        // past.
+        for attempt in ["the first attempt", "a retry of the refused delete"] {
+            assert_refuses_on_dependencies(&router, row.case, attempt, &doomed_id, row.asset_types)
+                .await;
+        }
+
+        // Nothing was removed: the form type is still readable with the schema its put
+        // stored, and every asset type still reports the `Forms` its put wrote.
+        assert_eq!(
+            read_schema(&router, &doomed_id).await,
+            doomed_schema,
+            "case {}: a refused delete must leave the form type readable",
+            row.case
+        );
+        for (asset_type, before) in row.asset_types.iter().zip(forms_before.iter()) {
+            let read = ok(
+                &router,
+                "GetAssetType",
+                &json!({ "Identifier": asset_type }),
+            )
+            .await;
+            assert_eq!(
+                read.get("Forms"),
+                Some(before),
+                "case {}: a refused delete must rewrite no asset type, got {read}",
+                row.case
+            );
+        }
+
+        // The guard is LIVE: with the referencing asset types gone the identical delete is
+        // served, and the form type then misses.
+        for asset_type in row.asset_types {
+            ok(
+                &router,
+                "DeleteAssetType",
+                &json!({ "Identifier": asset_type }),
+            )
+            .await;
+        }
         delete(&router, row.case, &doomed_id).await;
-
-        // The form type is gone...
         assert_read_misses(&router, row.case, &doomed_id).await;
+        assert_read_misses(&router, row.case, row.doomed_name).await;
 
-        // ...and the asset type still reports every reference its put wrote, the dangling
-        // one included, so the delete rewrote no asset type.
-        let read = ok(
-            &router,
-            "GetAssetType",
-            &json!({ "Identifier": row.asset_type }),
-        )
-        .await;
-        assert_eq!(
-            read.get("Forms"),
-            Some(&before),
-            "case {}: the asset type's forms must survive the delete unchanged, got {read}",
-            row.case
-        );
-        assert_eq!(
-            read["Forms"]["primary"]["FormTypeIdentifier"].as_str(),
-            Some(doomed_id.as_str()),
-            "case {}: the dangling reference must still name the identifier the put sent, \
-             got {read}",
-            row.case
-        );
-
-        // The form type the asset type's other entries name was not touched either.
+        // The form type the asset types' other entries named was never the delete's
+        // target and is untouched throughout.
         assert_eq!(
             read_schema(&router, &survivor_id).await,
             survivor_schema,
@@ -359,6 +396,52 @@ async fn deleting_a_referenced_form_type_is_served_and_leaves_the_reference() {
             row.case
         );
     }
+}
+
+/// The whole `Message` the dependency refusal carries: a JSON document holding the
+/// sentence, which names the form type from the request and then one catalog type
+/// reference per asset type that still references it — the kind, the asset namespace of
+/// the account the catalog belongs to, and the asset type's own name.
+fn dependency_refusal_message(form_type_name: &str, asset_types: &[&str]) -> String {
+    let dependencies = asset_types
+        .iter()
+        .map(|asset_type| format!("gluetype glueAsset#glue_{ACCOUNT_ID}#{asset_type}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"{{"Message":"Form type {form_type_name} cannot be deleted because of the following dependencies: {dependencies}"}}"#
+    )
+}
+
+/// Assert one delete is refused on its dependencies: HTTP 400, `ConflictException`, and
+/// the dependency wording naming exactly `asset_types`.
+async fn assert_refuses_on_dependencies(
+    router: &MultiServiceRouter,
+    case: &str,
+    attempt: &str,
+    identifier: &str,
+    asset_types: &[&str],
+) {
+    let (status, body) = call(
+        router,
+        "DeleteFormType",
+        &json!({ "Identifier": identifier }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case} ({attempt}): expected 400 deleting the referenced {identifier:?}, got \
+         {status} with {body}"
+    );
+    assert!(
+        error_code(&body).contains("ConflictException"),
+        "case {case} ({attempt}): expected ConflictException for {identifier:?}, got {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        dependency_refusal_message(identifier, asset_types),
+        "case {case} ({attempt}): unexpected dependency wording for {identifier:?}, got {body}"
+    );
 }
 
 /// A NEW reference to a deleted form type is a different matter from one that already
