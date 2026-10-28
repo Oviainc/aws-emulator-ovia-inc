@@ -256,6 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `EnableSso` (still scaffolded) is what turns this on.
             sso_enabled: false,
             desired_number_of_domain_controllers: None,
+            // Domain controllers are a Managed Microsoft AD resource (see
+            // `crate::state::DOMAIN_CONTROLLER_DIRECTORY_TYPES`), so a Simple AD
+            // directory has none for `DescribeDomainControllers` to report.
+            domain_controllers: ::std::collections::BTreeMap::new(),
             tags,
             primary_region,
             // `AddRegion` (still scaffolded) is what replicates a directory to another
