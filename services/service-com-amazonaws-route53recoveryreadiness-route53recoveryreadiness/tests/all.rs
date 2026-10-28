@@ -48,6 +48,8 @@ mod recovery_group_update;
 mod resource_set_type_catalog;
 #[path = "all/resource_set_update.rs"]
 mod resource_set_update;
+#[path = "all/scope_membership_shared_rule.rs"]
+mod scope_membership_shared_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_limits.rs"]

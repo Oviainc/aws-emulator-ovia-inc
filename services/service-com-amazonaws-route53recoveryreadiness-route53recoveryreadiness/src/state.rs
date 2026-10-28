@@ -824,22 +824,15 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
     /// that contain them. So a check belongs to a container exactly when one of the
     /// resources it watches is scoped to that container or to something nested inside
     /// it — the rule a cell's and a recovery group's summary both follow, which is why
-    /// they share this one implementation and differ only in the scope set.
+    /// they share this one implementation and differ only in the scope set. Whether a set
+    /// is one of those is [`set_in_scopes`].
     fn readiness_check_names_in_scopes(&self, scopes: &BTreeSet<String>) -> BTreeSet<String> {
         self.readiness_checks
             .values()
             .filter(|check| {
                 self.resource_sets
                     .get(&check.resource_set_name)
-                    .is_some_and(|set| {
-                        set.resources.iter().any(|resource| {
-                            resource
-                                .readiness_scopes
-                                .iter()
-                                .flatten()
-                                .any(|scope| scopes.contains(scope))
-                        })
-                    })
+                    .is_some_and(|set| set_in_scopes(set, scopes))
             })
             .map(|check| check.name.clone())
             .collect()
@@ -849,20 +842,12 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
     ///
     /// A resource names the scopes that contain it and its SET carries the type the
     /// readiness rules apply to, so this is what a container holds, by type: the same
-    /// resource-to-scope match [`Self::readiness_check_names_in_scopes`] makes, read for
+    /// [`set_in_scopes`] match [`Self::readiness_check_names_in_scopes`] makes, read for
     /// the type rather than for the watching check.
     fn resource_types_in_scopes(&self, scopes: &BTreeSet<String>) -> BTreeSet<String> {
         self.resource_sets
             .values()
-            .filter(|set| {
-                set.resources.iter().any(|resource| {
-                    resource
-                        .readiness_scopes
-                        .iter()
-                        .flatten()
-                        .any(|scope| scopes.contains(scope))
-                })
-            })
+            .filter(|set| set_in_scopes(set, scopes))
             .map(|set| set.resource_set_type.clone())
             .collect()
     }
@@ -982,6 +967,27 @@ impl ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState {
 
         audit.assessed_at
     }
+}
+
+/// Whether `set` holds a resource contained by one of `scopes`.
+///
+/// A resource set's entries each name the readiness scopes that contain them, so the
+/// set is held by a container exactly when one of its entries names one of that
+/// container's scopes. THE one place that rule is written: every criterion that asks
+/// "is this resource set in scope" — the checks a container's readiness summary names
+/// ([`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::readiness_check_names_in_scopes`])
+/// and the types a container holds
+/// ([`ComAmazonawsRoute53recoveryreadinessRoute53recoveryreadinessState::resource_types_in_scopes`])
+/// — calls it, so a change to what "in scope" means cannot land in one criterion and
+/// leave the other reporting the old rule over the same store.
+fn set_in_scopes(set: &ResourceSetRecord, scopes: &BTreeSet<String>) -> bool {
+    set.resources.iter().any(|resource| {
+        resource
+            .readiness_scopes
+            .iter()
+            .flatten()
+            .any(|scope| scopes.contains(scope))
+    })
 }
 
 /// The ARN of the resource set named `name`:
