@@ -177,9 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; tagging a provider depends on nothing in
-        // it — IAM is global, and the provider is named by the ARN in the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The provider itself
+        // is named by the ARN in the request — IAM is global, so no region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagSAMLProviderErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -227,6 +227,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is stored, and before the store is consulted for the provider, so
+        // a caller that may not change a provider's tags learns that it may not rather
+        // than whether the account holds that provider. The tags this call WRITES are
+        // handed to the gate, because they are part of the request a statement may be
+        // conditioned on (`aws:RequestTag/<key>`, `aws:TagKeys`). Nothing is written when
+        // it refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::TAG_SAML_PROVIDER,
+            &input.saml_provider_arn,
+            &format!("saml-provider {}", input.saml_provider_arn),
+            crate::state::authorization::WrittenTags::Pairs(&input.tags),
+        )?;
 
         // The write is addressed exactly as a read of the same ARN is, so it reaches the
         // one record `GetSAMLProvider` reports; an ARN the account holds no provider

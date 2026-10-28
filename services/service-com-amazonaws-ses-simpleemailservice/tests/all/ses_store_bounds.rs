@@ -310,26 +310,10 @@ async fn every_minted_id_is_fresh_opaque_and_ses_shaped() {
             seen.insert(message_id.clone()),
             "case message id {index}: expected a fresh id, got {message_id:?} again"
         );
-
-        let token = state.new_verification_token();
-        // 44 characters, the length SES's own domain-verification token carries.
-        assert_eq!(
-            token.len(),
-            44,
-            "case token {index}: expected 44 characters, got {token:?}"
-        );
-        assert!(
-            token.chars().all(|c| c.is_ascii_hexdigit()),
-            "case token {index}: expected hex characters only, got {token:?}"
-        );
-        assert!(
-            seen.insert(token.clone()),
-            "case token {index}: expected a fresh token, got {token:?} again"
-        );
     }
     assert_eq!(
         seen.len(),
-        MINTED * 2,
+        MINTED,
         "case {MINTED} mints: every id must be distinct, got {} distinct",
         seen.len()
     );

@@ -4,7 +4,8 @@
 //!
 //! IMPLEMENTED: the tag keys named here are dropped from the persisted user in this
 //! service's state (`crate::state`), and what remains is read back by `GetUser` and
-//! `ListUserTags`.
+//! `ListUserTags` — after the calling principal's identity-based policies are checked for
+//! the action, against a request context carrying the keys this call removes.
 //!
 //! A 501 from an operation in this service means "nobody has written it yet", never
 //! "the emulator is broken".
@@ -161,9 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; untagging a user depends on nothing in
-        // it — IAM is global, and the user is named in the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The user itself is
+        // named in the request — IAM is global, so no region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagUserErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -179,6 +180,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // by case", so the user is found under the case-folded name whatever case the
         // request spelled it in — the same lookup `TagUser` and `GetUser` make.
         let key = crate::state::name_key(&input.user_name);
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is removed, and before the store is consulted for the user, so a
+        // caller that may not change a user's tags learns that it may not rather than
+        // whether the account holds that user. The keys this call REMOVES are handed to
+        // the gate, because `aws:TagKeys` is part of the request an `Untag*` statement may
+        // be conditioned on; an `Untag*` call writes no tag VALUES, so it carries no
+        // `aws:RequestTag/`. Nothing is removed when it refuses.
+        let held = store.users.get(&key);
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::UNTAG_USER,
+            &resource,
+            &format!("user {}", input.user_name),
+            crate::state::authorization::WrittenTags::Keys(&input.tag_keys),
+        )?;
+
         let Some(user) = store.users.get_mut(&key) else {
             return Err(UntagUserErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

@@ -25,6 +25,8 @@ mod admin_group_listing;
 mod admin_provider_links;
 #[path = "all/admin_remove_user_from_group.rs"]
 mod admin_remove_user_from_group;
+#[path = "all/admin_reset_user_password.rs"]
+mod admin_reset_user_password;
 #[path = "all/admin_respond_to_auth_challenge.rs"]
 mod admin_respond_to_auth_challenge;
 #[path = "all/admin_set_user_settings.rs"]

@@ -695,6 +695,21 @@ impl StoredApplication {
             .is_some_and(|pending| pending.removes() && now >= pending.due_at)
     }
 
+    /// Whether the change the clock owes this application can leave it deriving a
+    /// DIFFERENT set of resources once that change is materialised at `now`.
+    ///
+    /// The SAP HANA databases of an application are DERIVED from its credentials and its
+    /// SAP HANA connection ([`Self::databases`]), and the settings an update settles
+    /// rewrite both — so a database the application stops deriving stops existing at that
+    /// instant, exactly as every resource of a registration does when the registration
+    /// ends. [`RegionState::settle`] asks this before materialising the change, because
+    /// what is held ON such a database has to go with it ([`RegionState::forget_resource`]).
+    pub fn derived_resources_change_due(&self, now: SystemTime) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            now >= pending.due_at && matches!(pending.change, PendingChange::Settings(_))
+        })
+    }
+
     /// The Amazon EC2 instances this application runs on, each once, in the order the
     /// registration named them.
     ///
@@ -2512,9 +2527,42 @@ impl RegionState {
     ///
     /// Every handler calls this first, so each one reports the same thing about a
     /// resource at the same instant.
+    ///
+    /// The work is LINEAR in what this partition holds, whatever a caller does: each
+    /// application is settled once, an application whose settling change can rewrite the
+    /// resources derived from it has those enumerated twice, and the ARNs that stopped
+    /// existing are then resolved against ONE enumeration of the partition's remaining
+    /// resources rather than one per ARN. So the whole pass costs at most a few
+    /// enumerations of the applications this Region holds ([`MAX_APPLICATIONS`]) and the
+    /// resources each registration gives rise to, and never their product, however many
+    /// changes fall due in the same instant.
     pub fn settle(&mut self, now: SystemTime) {
+        // The ARNs of resources that have STOPPED existing at `now`, gathered by both
+        // passes below and resolved ONCE at the end: what is held on each of them is
+        // forgotten there, so neither pass pays to re-resolve an ARN and the whole
+        // cleanup costs one enumeration of this partition's resources, and only when
+        // something was destroyed at all.
+        let mut destroyed: Vec<String> = Vec::new();
+
+        // A change that settles can DESTROY a resource derived from a registration
+        // without ending the registration: the databases of an application are derived
+        // from its credentials and its SAP HANA connection
+        // ([`StoredApplication::databases`]), both of which the settings an update
+        // settles rewrite, so a database the application stops deriving stops existing at
+        // that instant. Which ARNs those are is read off the ONE enumeration of a
+        // registration's resources ([`StoredApplication::resource_arns`]), diffed across
+        // the change — and only for an application whose settling change can rewrite that
+        // set, so every other settle costs what it always did.
         for application in self.applications.values_mut() {
+            let region = arn_region(&application.arn).to_string();
+            let before = application
+                .derived_resources_change_due(now)
+                .then(|| application.resource_arns(&region));
             application.settle(now);
+            if let Some(before) = before {
+                let after = application.resource_arns(&region);
+                destroyed.extend(before.into_iter().filter(|arn| !after.contains(arn)));
+            }
         }
         // A deregistration whose removal has fallen due is COMPLETE: from that instant
         // the application stops resolving, whether or not anybody called, and what was
@@ -2544,14 +2592,28 @@ impl RegionState {
             .collect();
         for (id, arns) in completed {
             self.applications.remove(&id);
-            for arn in arns {
-                self.tags_by_arn.remove(&arn);
-                // A resource permission is held ON a resource, so it cannot outlive
-                // that resource either: once the ARN names nothing, the grants keyed
-                // by it are gone and no policy is rendered from them.
-                self.resource_permissions.remove(&arn);
-            }
+            destroyed.extend(arns);
             self.forget_configuration_checks_for(&id);
+        }
+        if !destroyed.is_empty() {
+            // The ARNs this partition STILL holds, enumerated once: the same enumeration
+            // [`Self::holds_resource`] resolves an ARN through, so a destroyed ARN is one
+            // no call that takes an ARN resolves any more. It is asked of the set rather
+            // than of the resolver per ARN because an ARN can be named by more than one
+            // registration (`RegisterApplication$DatabaseArn` and
+            // `UpdateApplicationSettings$DatabaseArn` take any ARN), so a database another
+            // registration still names must keep what is held on it — and one pass over
+            // this partition answers that for every destroyed ARN at once.
+            let live: BTreeSet<String> = self
+                .applications
+                .values()
+                .flat_map(|application| application.resource_arns(arn_region(&application.arn)))
+                .collect();
+            for arn in &destroyed {
+                if !live.contains(arn) {
+                    self.forget_resource(arn);
+                }
+            }
         }
         for operation in self.operations.values_mut() {
             operation.settle(now);
@@ -2584,6 +2646,25 @@ impl RegionState {
                 run.settle(now, evaluated);
             }
         }
+    }
+
+    /// Forget everything this Region holds ON the resource `arn` names, because that
+    /// resource has stopped existing.
+    ///
+    /// Tags and resource permissions are held PER RESOURCE, keyed by exactly the ARN the
+    /// resource is reported under, so neither can outlive the resource it was attached to:
+    /// once the ARN names nothing, no tag set is held for it and no policy is rendered
+    /// from grants keyed by it. The ARNs of this service are a pure function of the ids
+    /// they embed, so a resource later derived under the SAME ARN is a new resource that
+    /// carries neither — which is what this guarantees. It is also what lets the partition
+    /// be reclaimed once nothing observable is left in it ([`Self::is_empty`]).
+    ///
+    /// The ONE place that cleanup lives, so the two ways a resource stops existing — a
+    /// registration that ends, and a settling change that stops deriving one of its
+    /// resources — cannot disagree about what goes with it.
+    fn forget_resource(&mut self, arn: &str) {
+        self.tags_by_arn.remove(arn);
+        self.resource_permissions.remove(arn);
     }
 
     /// Whether this Region holds nothing at all — the state an unused partition is in,

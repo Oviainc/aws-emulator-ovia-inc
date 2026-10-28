@@ -242,7 +242,9 @@ pub(crate) const HARNESS_REGION: &str = "us-east-1";
 /// Which of the two a given refusal carries is what `tests/all/access_denied_message_wording.rs`
 /// is the table for; every other suite asserts the part it set up — the principal, the
 /// action, the resource and the reason — and that a continuation, where there is one, is
-/// exactly that pointer and carries one id in both of its slots.
+/// exactly that pointer and carries one id in both of its slots. The id is answered back
+/// for a caller comparing two refusals, and is empty for a refusal that ends at the
+/// reason.
 pub(crate) fn assert_access_denied_message(
     case: &str,
     actual: &str,
@@ -250,7 +252,7 @@ pub(crate) fn assert_access_denied_message(
     action: &str,
     named_as: &str,
     reason: &str,
-) {
+) -> String {
     let expected = format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
          {reason}"
@@ -261,11 +263,13 @@ pub(crate) fn assert_access_denied_message(
              resource and to close with the reason {expected:?}, got {actual:?}"
         );
     };
+    let pointed_at = authorization_details_id(rest);
     assert!(
-        rest.is_empty() || authorization_details_id(rest).is_some(),
+        rest.is_empty() || pointed_at.is_some(),
         "case {case:?}: expected the refusal to end at the reason or to continue with the \
          authorization-details pointer, got {rest:?} after it"
     );
+    pointed_at.unwrap_or_default().to_string()
 }
 
 /// The fixed text of the clause a refusal that withheld a grant continues with, up to the

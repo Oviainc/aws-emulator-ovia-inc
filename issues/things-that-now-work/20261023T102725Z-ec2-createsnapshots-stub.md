@@ -37,27 +37,33 @@ Replay any of the blocked units above and observe it fail on that refusal
 
 Implemented: `CreateSnapshots` makes ONE snapshot of every EBS volume the named instance
 holds an attachment of, stores each as the modelled `Snapshot` shape
-(`state::SnapshotRecord`, in the new `state/snapshots.rs`) and answers the set read back out
-of the store. The scaffold header line is gone. The volumes come from the account's volume
-store through `VolumeRecord::attachments_at`, so this call and `DescribeVolumes` cannot
-disagree about which volumes an instance has; the instance's ROOT volume is the attachment at
-the device its AMI publishes, which is what `ExcludeBootVolume` drops and what
+(`state::SnapshotRecord`, in `state/snapshots.rs`) and answers the set read back out of the
+store. The scaffold header line is gone. The volumes come from the account's volume store
+through `VolumeRecord::attachments_at`, so this call and `DescribeVolumes` cannot disagree
+about which volumes an instance has; the instance's ROOT volume is the attachment at the
+device its launch put the root volume at, which is what `ExcludeBootVolume` drops and what
 `ExcludeDataVolumeIds` may not name. Each snapshot is handed back `pending` with no progress
 and reaches `completed` on the clock, never on a call. `DryRun` reports whether the request
 would have worked without writing, and the store's record and byte ceilings are asked for the
 whole set before anything is minted.
 
-Launching an EBS-backed instance now creates that root volume
+EVERY launch now gives its instance exactly one EBS root volume
 (`state::ComAmazonawsEc2Amazonec2State::mint_launched_root_volume`, called from the one place
-every launch path stores an instance), restored from the AMI's root block device mapping — the
-size, type, encryption state and source snapshot are the image's, and `DescribeVolumes`
-reports it as the instance's. Without it no instance of this emulator has a volume, so the
-rule above would never produce a snapshot through the public API.
+every launch path stores an instance). Its device, size, type and encryption state come from
+the AMI's root block device mapping when the account can see that AMI, and otherwise from the
+crate's default EBS-backed Linux image — the ONE resolution of that device,
+`state::ComAmazonawsEc2Amazonec2State::launched_root_device`, which `CreateSnapshots` reads
+for the boot volume too. Without it an instance launched from an AMI the published catalog
+does not hold had no volume at all, so the rule above produced an empty set for it and no
+describe of volumes could account for the instance.
 
-Covered end to end by `tests/all/create_snapshots.rs`.
+Covered end to end by `tests/all/create_snapshots.rs`, whose last table spans the AMI a launch
+names: the published Linux image, the published Windows one (another root device, a bigger
+root volume) and an id no image of the account has.
 
-Still diverging, on causes this issue does not own: the recorded
-`ec2-create-snapshots-from-instance` launch names an AMI the published catalog does not hold,
-so that instance has no root volume to snapshot (`RunInstances` not resolving its `ImageId`
-is its own defect), and the two recorded refusals match on status and error code but not yet
-on AWS's message text, which the corpus withholds.
+Still diverging, on a cause this issue does not own: the recorded refusal of an unresolvable
+instance id matches AWS on status (400) and error code (`InvalidInstanceID.Malformed`) but not
+on the message text, which the corpus withholds — nine wordings drawn from EC2's recorded
+message templates for that code were tried against the replay and none is the recorded one.
+The replayed units also still stop on the `DescribeSnapshots`, `DeleteSnapshot`, `CreateImage`
+and `CreateImageUsageReport` stubs, each its own issue.

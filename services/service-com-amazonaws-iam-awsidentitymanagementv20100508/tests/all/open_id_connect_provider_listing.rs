@@ -584,7 +584,7 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                 } else {
                     format!("because no identity-based policy allows the {LIST_ACTION} action")
                 };
-                assert_access_denied_message(
+                let first = assert_access_denied_message(
                     case_name,
                     &element(&body, "Message"),
                     &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
@@ -598,9 +598,10 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                 );
 
                 // A refusal is not a one-shot: the same call is refused the same way
-                // again, and still reports nothing. Every part of the message is a fact
-                // of the request and of the documents in force, so the second denial
-                // reads identically.
+                // again, and still reports nothing. Every part of the message is a fact of
+                // the request and of the documents in force — the authorization id a
+                // withheld call is pointed at under is a function of the request too — so
+                // the second denial reads identically.
                 let (again_status, again) =
                     call_signed_by(&router, Some(&access_key_id), "ListOpenIDConnectProviders", &[])
                         .await;
@@ -609,7 +610,7 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                     "case {case_name:?}: the second call must be refused too, got \
                      {again_status}: {again}"
                 );
-                assert_access_denied_message(
+                let second = assert_access_denied_message(
                     case_name,
                     &element(&again, "Message"),
                     &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
@@ -618,8 +619,7 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                     &reason,
                 );
                 assert_eq!(
-                    element(&again, "Message"),
-                    element(&body, "Message"),
+                    second, first,
                     "case {case_name:?}: the same refused call must be worded alike every \
                      time, got {again}"
                 );

@@ -10,6 +10,16 @@
 //! per-account send counters and
 //! the account-level attributes. Nothing here is per-request scratch — the whole
 //! struct lives in the one shared engine (see [`service_state`]).
+//!
+//! The email-identity table here is this surface's VIEW of one account-wide set of
+//! email identities, which lives in the shared engine as
+//! [`::service_common::ses_identities::SesIdentityDirectory`] and which the classic
+//! SES surface publishes to and reads as well: an identity belongs to the account
+//! rather than to the API that created it. What a record here adds to that set is what
+//! THIS API adds to an identity — its DKIM configuration, its tags, its default
+//! configuration set, its certificate associations — and [`reconcile_identities`] is
+//! where the two are brought back into agreement, on every operation this service
+//! serves.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1406,6 +1416,17 @@ pub enum SesStatus {
     Pending,
     /// The process completed successfully.
     Success,
+    /// Verification failed.
+    ///
+    /// Nothing in this service moves an identity here — its own verification either
+    /// completes or stays `PENDING` — but the account's identity registry can carry
+    /// the state for an identity the other SES surface holds, and an identity this
+    /// service adopts from the registry is reported in the state the account holds it
+    /// in rather than in a state it is not in.
+    Failed,
+    /// Verification failed for a reason that may clear on its own; carried for the
+    /// same reason as [`Self::Failed`].
+    TemporaryFailure,
 }
 
 impl SesStatus {
@@ -1415,6 +1436,8 @@ impl SesStatus {
             Self::NotStarted => "NOT_STARTED",
             Self::Pending => "PENDING",
             Self::Success => "SUCCESS",
+            Self::Failed => "FAILED",
+            Self::TemporaryFailure => "TEMPORARY_FAILURE",
         }
     }
 }
@@ -1719,6 +1742,23 @@ pub struct EmailIdentityRecord {
     /// only one certificate association". Ordered, so
     /// `ListEmailIdentityCertificates` enumerates and pages deterministically.
     pub certificates: BTreeMap<String, IdentityCertificateRecord>,
+    /// Whether the account's identity registry
+    /// ([`::service_common::ses_identities::SesIdentityDirectory`]) already carries
+    /// this identity.
+    ///
+    /// The registry is the account's SET of identities, which the classic SES surface
+    /// publishes to and reads as well, so this flag is what tells an identity DELETED
+    /// through that surface — registered here, gone from the registry — from one this
+    /// service has created but not published yet ([`reconcile_identities`]).
+    pub registered: bool,
+    /// Whether a verification move is OWED to this identity at all.
+    ///
+    /// True for an identity this service started verifying: the move to `SUCCESS` is
+    /// owed [`VERIFICATION_SETTLE`] after the create. False only for an identity
+    /// ADOPTED from the account's identity registry in a state the registry owes no
+    /// move to — a verification that failed, was never started, or cannot complete —
+    /// so a read of it here does not complete a verification nothing was waiting on.
+    pub verification_move_owed: bool,
 }
 
 impl EmailIdentityRecord {
@@ -1751,7 +1791,65 @@ impl EmailIdentityRecord {
             next_check_due_at: now,
             last_success_at: None,
             certificates: BTreeMap::new(),
+            // Published to the account registry by the operation that created the
+            // identity, so the classic SES surface answers for it from the moment
+            // that call returns.
+            registered: false,
+            // "Starts the process of verifying an email identity": the move to
+            // `SUCCESS` is owed from here.
+            verification_move_owed: true,
         }
+    }
+
+    /// An identity of this account that the registry holds and this service does not,
+    /// as this service's own record of it.
+    ///
+    /// The account holds the identity in the verification state the registry carries,
+    /// so the record is adopted in THAT state rather than started afresh in `PENDING`:
+    /// the identity was recorded through the other SES surface, and both surfaces
+    /// report one state for it. Everything this service's own API adds — tags, a
+    /// default configuration set, a custom MAIL FROM configuration, certificate
+    /// associations — starts where `CreateEmailIdentity` starts it, since none of it
+    /// has been asked for.
+    pub fn adopted(
+        record: &::service_common::ses_identities::SesIdentityRecord,
+        now: SystemTime,
+    ) -> Self {
+        use ::service_common::ses_identities::SesIdentityKind;
+
+        let kind = match record.kind {
+            SesIdentityKind::EmailAddress => IdentityKind::EmailAddress,
+            SesIdentityKind::Domain => IdentityKind::Domain,
+        };
+        // The DKIM configuration `CreateEmailIdentity` gives an identity whose request
+        // carries no `DkimSigningAttributes`: Easy DKIM for a domain, nothing for an
+        // address.
+        let dkim = match kind {
+            IdentityKind::Domain => DkimState::easy_dkim(&identity_key(&record.name), None),
+            IdentityKind::EmailAddress => DkimState::not_started(),
+        };
+        let mut adopted = Self::new(&record.name, kind, dkim, now);
+        adopted.registered = true;
+        adopted.verification_status = adopted_status(record.verification);
+        // The registry carries the instant the account owes this identity its move,
+        // and carries NONE when it owes it none at all: such an identity keeps the
+        // state the account holds it in rather than being completed by the next read
+        // ([`Self::verification_move_owed`]).
+        match record.verification_due {
+            Some(due) => adopted.verification_due_at = due,
+            None => adopted.verification_move_owed = false,
+        }
+        if adopted.verification_status == SesStatus::Success {
+            // The same three facts this service's own settle writes when a
+            // verification completes, so an adopted identity reads like one that
+            // completed here.
+            adopted.verified_for_sending = true;
+            adopted.last_success_at = Some(now);
+            if adopted.dkim.status == SesStatus::Pending {
+                adopted.dkim.status = SesStatus::Success;
+            }
+        }
+        adopted
     }
 
     /// The modelled `DkimAttributes` view of this record.
@@ -1811,6 +1909,7 @@ impl EmailIdentityRecord {
                 .unwrap_or(now);
         }
         if self.verification_status == SesStatus::Pending
+            && self.verification_move_owed
             && now >= self.verification_due_at
             && self.verification_can_complete()
         {
@@ -4081,12 +4180,12 @@ pub fn email_identity_not_found(identity: &str) -> String {
 /// domain in. The local part of an address belongs to the receiving mailbox, so it
 /// is kept exactly as supplied, as is the whole value on the record, which is what
 /// every response reports.
+///
+/// The comparison itself is `service_common::ses_identities`', which the account's
+/// identity registry keys by, so this surface and the registry cannot disagree about
+/// which records are one identity of the account.
 pub fn identity_key(identity: &str) -> String {
-    let identity = addr_spec(identity);
-    match identity.rsplit_once('@') {
-        Some((local, domain)) => format!("{local}@{}", domain_key(domain)),
-        None => domain_key(identity),
-    }
+    ::service_common::ses_identities::identity_key(identity)
 }
 
 /// The key a domain name is compared under.
@@ -4293,10 +4392,138 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// no store at all; a handler answers that with the scaffold's 501, never with a
 /// fresh engine and never with a modelled error that would read as a real service
 /// state (a throttle an SDK retries, say).
+///
+/// Every call RECONCILES this service's identity table against the account's identity
+/// registry first ([`reconcile_identities`]), so an operation served here answers for
+/// every identity the account holds — including the ones recorded through the classic
+/// SES surface — and for none it has deleted.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsSesv2SimpleemailserviceV2State>> {
+    let engine = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
+    let state = engine.state::<ComAmazonawsSesv2SimpleemailserviceV2State>();
+    let registry = engine.state::<::service_common::ses_identities::SesIdentityDirectory>();
+    reconcile_identities(&state, &registry, SystemTime::now());
+    Some(state)
+}
+
+/// The account's identity registry in the shared engine, which this service and the
+/// classic SES surface both publish to and read: call it with a handler's
+/// `&*self.engine`.
+///
+/// An operation that CREATES or DELETES an email identity publishes the change here,
+/// so the other surface answers for it from the moment the call returns. Take this
+/// lock while holding this service's own store, never the other way round, so two
+/// callers on different surfaces cannot wait on each other.
+pub fn identity_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::ses_identities::SesIdentityDirectory>> {
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
-        .map(::engine::InMemoryEngine::state::<ComAmazonawsSesv2SimpleemailserviceV2State>)
+        .map(::engine::InMemoryEngine::state::<
+            ::service_common::ses_identities::SesIdentityDirectory,
+        >)
+}
+
+/// Bring this service's identity table and the account's identity registry back into
+/// agreement at `now`, so every API over the account's identities answers for ONE set
+/// of them.
+///
+/// The reconciliation itself is the registry's
+/// ([`::service_common::ses_identities::SesIdentityDirectory::reconcile`]), written
+/// once there rather than per surface; what this service contributes is its
+/// [`::service_common::ses_identities::AccountIdentityRecord`] impl below.
+fn reconcile_identities(
+    state: &::engine::ServiceState<ComAmazonawsSesv2SimpleemailserviceV2State>,
+    registry: &::engine::ServiceState<::service_common::ses_identities::SesIdentityDirectory>,
+    now: SystemTime,
+) {
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    registry.reconcile(&mut state.identities, now);
+}
+
+impl ::service_common::ses_identities::AccountIdentityRecord for EmailIdentityRecord {
+    /// This service's table is keyed by [`identity_key`], the way its own operations
+    /// look an identity up.
+    fn table_key(name: &str) -> String {
+        identity_key(name)
+    }
+
+    fn identity_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    fn mark_registered(
+        &mut self,
+        published: &::service_common::ses_identities::SesIdentityRecord,
+    ) {
+        // The TXT verification token the registry holds for a domain identity is not
+        // one this surface's model carries, so there is nothing of it to keep here.
+        let _ = published;
+        self.registered = true;
+    }
+
+    fn published(&self) -> ::service_common::ses_identities::SesIdentityRecord {
+        registry_record(self)
+    }
+
+    fn adopt(
+        published: &::service_common::ses_identities::SesIdentityRecord,
+        now: SystemTime,
+    ) -> Self {
+        Self::adopted(published, now)
+    }
+}
+
+/// How the account registry carries the identity `record`: the identity as it was
+/// created, its class, and the verification this service holds for it.
+pub fn registry_record(
+    record: &EmailIdentityRecord,
+) -> ::service_common::ses_identities::SesIdentityRecord {
+    use ::service_common::ses_identities::{SesIdentityKind, SesIdentityRecord, SesVerificationState};
+
+    SesIdentityRecord {
+        name: record.name.clone(),
+        kind: match record.identity_kind {
+            IdentityKind::EmailAddress => SesIdentityKind::EmailAddress,
+            IdentityKind::Domain => SesIdentityKind::Domain,
+        },
+        verification: match record.verification_status {
+            SesStatus::Pending => SesVerificationState::Pending,
+            SesStatus::Success => SesVerificationState::Success,
+            SesStatus::NotStarted => SesVerificationState::NotStarted,
+            SesStatus::Failed => SesVerificationState::Failed,
+            SesStatus::TemporaryFailure => SesVerificationState::TemporaryFailure,
+        },
+        // A verification nothing owes a move to — one that can never complete, or one
+        // adopted in a state the account owes none to — carries no due instant, so no
+        // reader of the registry completes a verification nothing was waiting on.
+        verification_due: (record.verification_status == SesStatus::Pending
+            && record.verification_move_owed
+            && record.verification_can_complete())
+            .then_some(record.verification_due_at),
+        // The TXT value a domain identity's owner publishes is the registry's own: no
+        // operation of this surface reports it, and the registry mints it once so the
+        // classic surface answers one stable value for the identity.
+        verification_token: None,
+    }
+}
+
+/// This service's spelling of a registry verification state.
+fn adopted_status(state: ::service_common::ses_identities::SesVerificationState) -> SesStatus {
+    use ::service_common::ses_identities::SesVerificationState;
+
+    match state {
+        SesVerificationState::Pending => SesStatus::Pending,
+        SesVerificationState::Success => SesStatus::Success,
+        SesVerificationState::NotStarted => SesStatus::NotStarted,
+        SesVerificationState::Failed => SesStatus::Failed,
+        SesVerificationState::TemporaryFailure => SesStatus::TemporaryFailure,
+    }
 }
