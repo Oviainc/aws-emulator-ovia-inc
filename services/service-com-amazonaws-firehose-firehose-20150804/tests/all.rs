@@ -55,5 +55,7 @@ mod refusal_messages;
 mod state_roundtrip;
 #[path = "all/stream_encryption.rs"]
 mod stream_encryption;
+#[path = "all/stream_not_found_message.rs"]
+mod stream_not_found_message;
 #[path = "all/tag_key_pattern.rs"]
 mod tag_key_pattern;
