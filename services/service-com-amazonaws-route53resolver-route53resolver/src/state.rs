@@ -15,6 +15,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+// The account's own Amazon EC2 inventory, which `unresolvable_subnet_id`
+// resolves a `SubnetId` against: a VPC subnet lives in that service's store, so
+// it is read through its own accessors.
+use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 // The account's own AWS Outposts inventory, which `account_holds_outpost`
 // resolves an `OutpostArn` against: the Outposts live in that service's store,
 // so they are read through its own accessors.
@@ -718,6 +722,54 @@ pub fn account_holds_outpost<Eng: Send + Sync + 'static>(
     };
     let store = state.lock();
     store.outpost(region, &outpost_id).is_some()
+}
+
+/// The `InvalidParameterException` an endpoint write answers for a `SubnetId`
+/// that names no subnet of the account.
+///
+/// The sentence names the subnet by the id the request supplied, verbatim, so
+/// the caller is told which value could not be resolved. The parameter at fault
+/// is the subnet id the sentence already carries, so no `FieldName` is added
+/// beside it.
+pub fn subnet_not_found(subnet_id: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: format!("The subnet ID '{subnet_id}' does not exist"),
+        field_name: None,
+    }
+}
+
+/// The first id in `subnet_ids`, in request order, that names no subnet of the
+/// account, or `None` when the account holds every one of them.
+///
+/// A Resolver endpoint's IP addresses are placed IN subnets of the caller's VPC:
+/// which subnets exist is a fact of the account's own Amazon EC2 inventory — the
+/// one `DescribeSubnets` answers from — and not a value this service's caller
+/// supplies, so this is the one place that resolution happens, exactly as
+/// [`account_holds_outpost`] resolves an `OutpostArn`. The subnets live in that
+/// service's own store and are read through its own accessors, so one subnet is
+/// never described by two services differently.
+///
+/// The ids are tested in the order the request lists them, so the member the
+/// caller wrote first is the one it is told about.
+///
+/// LOCKING. The Amazon EC2 store lock is taken for this one pass and released
+/// before returning; a handler calls this with no lock of its own held, so the
+/// two stores are never held at once. Amazon EC2 never reaches this service, so
+/// no cycle exists.
+pub fn unresolvable_subnet_id<'a, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    subnet_ids: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let Some(state) = ec2::service_state(engine) else {
+        // No Amazon EC2 store on this engine is no subnet inventory to resolve
+        // against, so no id can be shown to name nothing.
+        return None;
+    };
+    let store = state.lock();
+    subnet_ids
+        .into_iter()
+        .find(|subnet_id| !store.subnets.contains_key(*subnet_id))
+        .map(str::to_string)
 }
 
 /// The `InvalidRequestException` the rule write path answers for a rule that
@@ -4321,6 +4373,13 @@ pub struct Page<T> {
     /// The cursor that resumes where this page stopped, or `None` on the last
     /// page.
     pub next_token: Option<String>,
+    /// The page size this page was actually cut to: the `MaxResults` the request
+    /// asked for, or the documented default when it named none.
+    ///
+    /// It comes from the ONE place the page size is decided ([`paginate_up_to`]),
+    /// so an operation whose response models `MaxResults` echoes the size it
+    /// really applied rather than a second reading of the request.
+    pub max_results: i32,
 }
 
 /// The checksum carried inside a pagination cursor.
@@ -4403,5 +4462,9 @@ pub fn paginate_up_to<T>(
     } else {
         None
     };
-    Some(Page { items, next_token })
+    Some(Page {
+        items,
+        next_token,
+        max_results: i32::try_from(page_size).unwrap_or(largest_page),
+    })
 }
