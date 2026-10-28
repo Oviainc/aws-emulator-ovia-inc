@@ -290,15 +290,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             }
-            // A handle this queue currently holds names the message this entry deletes. A
-            // handle whose message a delete has ALREADY removed names a deletion this
-            // queue has performed, so this entry asks for nothing more and succeeds —
-            // which is what makes two entries naming the SAME handle both successful.
-            // Anything else — a superseded handle, a handle of another queue or of an
-            // incarnation that is gone, or a value no receive ever minted — fails for
-            // THAT ENTRY alone, under the code the handle earns.
-            match queue.handles.get(&entry.receipt_handle).cloned() {
-                Some(message_id) => {
+            // A handle this queue holds, or one a later receive of a message it still
+            // holds superseded, names the message this entry deletes. A handle whose
+            // message a delete has ALREADY removed names a deletion this queue has
+            // performed, so this entry asks for nothing more and succeeds — which is what
+            // makes two entries naming the SAME handle both successful. On a FIFO queue a
+            // superseded handle's lease has moved on, and fails for THAT ENTRY alone. So
+            // does anything else — a handle of another queue or of an incarnation that is
+            // gone, or a value no receive ever minted — under the code the handle earns.
+            match queue.message_id_for_handle(&entry.receipt_handle) {
+                Ok(message_id) => {
                     // The message goes for good, so the lapsing visibility timeout
                     // cannot bring it back; every other handle minted for it goes with
                     // it.
@@ -307,12 +308,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         id: entry.id.clone(),
                     });
                 }
-                None if queue.deleted_handle(&entry.receipt_handle) => {
+                Err(_) if queue.deleted_handle(&entry.receipt_handle) => {
                     successful.push(DeleteMessageBatchResultEntry {
                         id: entry.id.clone(),
                     });
                 }
-                None => {
+                Err(sqs::ReceiptHandleRefusal::Expired) => {
+                    failed.push(BatchResultErrorEntry {
+                        id: entry.id.clone(),
+                        // The caller supplied the handle, so the fault is the sender's.
+                        sender_fault: true,
+                        code: crate::scaffolded::INVALID_PARAMETER_VALUE.to_string(),
+                        message: Some(sqs::receipt_handle_expired_message(&entry.receipt_handle)),
+                    });
+                }
+                Err(_) => {
                     let (code, message) = sqs::unresolvable_receipt_handle_batch_failure(origin);
                     failed.push(BatchResultErrorEntry {
                         id: entry.id.clone(),
