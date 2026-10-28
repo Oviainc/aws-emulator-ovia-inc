@@ -43,6 +43,8 @@ mod list_rule_groups;
 mod logging_configuration;
 #[path = "all/logging_destination_names.rs"]
 mod logging_destination_names;
+#[path = "all/logging_redacted_fields.rs"]
+mod logging_redacted_fields;
 #[path = "all/managed_products.rs"]
 mod managed_products;
 #[path = "all/managed_products_by_vendor.rs"]
