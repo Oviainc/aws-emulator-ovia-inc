@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/clock_driven_timeout_is_materialised.rs"]
+mod clock_driven_timeout_is_materialised;
 #[path = "all/command_execution_concurrency.rs"]
 mod command_execution_concurrency;
 #[path = "all/command_execution_validation.rs"]

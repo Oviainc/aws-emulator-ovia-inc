@@ -183,6 +183,10 @@ async fn every_started_command_is_persisted_as_a_queued_execution_of_its_thing()
     let emulator = Emulator::new();
 
     // (case, thing name, parameters, executionTimeoutSeconds)
+    //
+    // A row's timeout stays armed for the whole row: the reads below materialise a
+    // deadline that has already passed, so a timeout of a second or two would
+    // legitimately finish the execution part-way through the row's own assertions.
     let cases: Vec<(&str, &str, Option<Value>, Option<i64>)> = vec![
         ("no parameters", "laser-1", None, None),
         (
@@ -209,7 +213,7 @@ async fn every_started_command_is_persisted_as_a_queued_execution_of_its_thing()
             Some(json!({"firmware": {"BIN": "aGVsbG8="}})),
             Some(300),
         ),
-        ("a timeout only", "laser-5", None, Some(1)),
+        ("a timeout only", "laser-5", None, Some(900)),
     ];
 
     for (case, thing_name, parameters, timeout) in cases {

@@ -4,17 +4,20 @@
 //!
 //! Reports the persisted execution `jobId` names on the thing — with `$next`
 //! resolving to the thing's next pending execution and `executionNumber`
-//! selecting one — and writes nothing. `includeJobDocument` defaults to TRUE
-//! here, as the member documents ("Unless set to false, the response contains the
-//! job document. The default is true").
+//! selecting one. The one thing it writes is the `TIMED_OUT` transition the CLOCK
+//! has already made due on the thing's executions
+//! ([`service_common::iot_job_executions::JobExecutionStore::time_out_due_executions`]),
+//! which was owed at each execution's own deadline whether or not anybody called.
+//! `includeJobDocument` defaults to TRUE here, as the member documents ("Unless set
+//! to false, the response contains the job document. The default is true").
 //!
 //! A FINISHED execution is refused rather than reported: an execution in a terminal
 //! status answers the model's `TerminalStateException` (410), which is what
 //! distinguishes "this execution finished" from the 404 `ResourceNotFoundException`
 //! of a thing/job pair that has no execution at all. `InvalidRequestException` (400)
 //! is still not produced here: the request combinations the real service refuses are
-//! filed as their own issue along with the rest of the long tail (clock-driven
-//! `TIMED_OUT`, certificate validation, throttling).
+//! filed as their own issue along with the rest of the long tail (certificate
+//! validation, throttling).
 //!
 //! ## Shape of an operation
 //!
@@ -172,7 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let state = state.lock();
+        let mut state = state.lock();
+        let now = crate::state::now_epoch_seconds();
+
+        // A timer the job or the device armed moves an execution to `TIMED_OUT` by
+        // itself, so the transitions the clock has already made due are recorded
+        // before anything is read: each was owed at its own deadline whether or not
+        // this call happened, and the status this read reports — and refuses on
+        // below — must be the one every later reader of the shared store sees.
+        state.time_out_due_executions(&input.thing_name, now);
 
         // ONE lookup, so a job the store does not hold has exactly one answer:
         // 404. `$next` resolves to the thing's next pending execution.
@@ -212,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 execution: Some(crate::state::to_job_execution(
                     record,
                     include_job_document,
-                    crate::state::now_epoch_seconds(),
+                    now,
                 )),
             },
             Self::OUTPUT_SCHEMA,

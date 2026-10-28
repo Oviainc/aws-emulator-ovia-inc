@@ -10,6 +10,12 @@
 //! `execution` is JSON `null` — the response document always carries the modelled
 //! member (see [`super::types::ResponseDocument`]).
 //!
+//! "Pending" is read at the CURRENT instant: the `TIMED_OUT` transition the clock has
+//! already made due on the thing's executions is materialised first
+//! ([`service_common::iot_job_executions::JobExecutionStore::time_out_due_executions`]),
+//! so an execution whose step or in-progress timer expired is terminal and is never
+//! handed out or re-armed — the queued execution behind it is the one started.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -206,6 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
+        let now = crate::state::now_epoch_seconds();
+
+        // A timer the job or the device armed moves an execution to `TIMED_OUT` by
+        // itself, so the transitions the clock has already made due are recorded
+        // before the queue is read: each was owed at its own deadline whether or not
+        // this call happened, and a terminal execution is not pending — so it is
+        // neither handed to the device nor started afresh by a poll that arrives
+        // after its deadline.
+        state.time_out_due_executions(&input.thing_name, now);
+
         // Pending is "IN_PROGRESS or QUEUED", as this operation documents; an
         // already-started execution is resumed before a queued one is started.
         let Some(index) = state.next_pending_index(&input.thing_name) else {
@@ -218,7 +234,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let now = crate::state::now_epoch_seconds();
         let execution = {
             let Some(record) = state.record_mut(&input.thing_name, index) else {
                 return Err(

@@ -9,6 +9,13 @@
 //! that would carry the execution BACKWARD through its lifecycle with 409
 //! `InvalidStateTransitionException`.
 //!
+//! The stored status the two refusals are decided from is read at the CURRENT
+//! instant: the `TIMED_OUT` transition the clock has already made due is materialised
+//! first
+//! ([`service_common::iot_job_executions::JobExecutionStore::time_out_due_executions`]),
+//! so a device reporting after its own deadline is refused as having finished rather
+//! than overwriting the status the deadline already decided.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -235,6 +242,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
+        let now = crate::state::now_epoch_seconds();
+
+        // A timer the job or the device armed moves an execution to `TIMED_OUT` by
+        // itself, so the transitions the clock has already made due are recorded
+        // before the execution is looked up: each was owed at its own deadline
+        // whether or not this call happened, so a device that reports after its
+        // deadline finds a FINISHED execution — refused below as a conflict — rather
+        // than a live one it can still carry to a status of its own choosing.
+        state.time_out_due_executions(&input.thing_name, now);
+
         let Some(index) =
             state.execution_index(&input.thing_name, &input.job_id, input.execution_number)
         else {
@@ -249,7 +266,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let now = crate::state::now_epoch_seconds();
         let Some(record) = state.record_mut(&input.thing_name, index) else {
             return Err(unavailable());
         };

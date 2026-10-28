@@ -227,12 +227,16 @@ async fn a_device_admits_only_the_published_number_of_concurrent_command_executi
     let emulator = Emulator::new();
 
     // (case, device, burst size, executionTimeoutSeconds asked for)
+    //
+    // A row's timeout stays armed for the whole row: the reads below materialise a
+    // deadline that has already passed, so a timeout of a second or two would
+    // legitimately finish the execution part-way through the row's own assertions.
     let rows: [(&str, &str, usize, Option<i64>); 5] = [
         ("a burst half again past the limit", "laser-burst", LIMIT + LIMIT / 2, Some(3_600)),
         ("a burst exactly at the limit", "laser_at-limit", LIMIT, None),
         ("a burst well under the limit", "plant:laser:7", LIMIT / 3, None),
         ("a burst one past the limit", "laser-one-past", LIMIT + 1, None),
-        ("a single start", "laser-single", 1, Some(1)),
+        ("a single start", "laser-single", 1, Some(600)),
     ];
 
     for (case, thing, burst, timeout_seconds) in rows {

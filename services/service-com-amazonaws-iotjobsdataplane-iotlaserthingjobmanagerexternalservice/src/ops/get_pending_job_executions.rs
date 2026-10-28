@@ -4,7 +4,14 @@
 //!
 //! Partitions the thing's persisted executions that are not in a terminal status
 //! on `status`: `QUEUED` into `queuedJobs`, `IN_PROGRESS` into `inProgressJobs`,
-//! oldest-queued first. Reports only; it writes nothing.
+//! oldest-queued first.
+//!
+//! It reports; the one thing it writes is the `TIMED_OUT` transition the CLOCK has
+//! already made due on the thing's executions
+//! ([`service_common::iot_job_executions::JobExecutionStore::time_out_due_executions`]),
+//! which was owed at each execution's own deadline whether or not anybody called —
+//! so an execution whose timer expired is terminal, and therefore in neither list,
+//! for this read alone.
 //!
 //! ## Shape of an operation
 //!
@@ -158,7 +165,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let state = state.lock();
+        let mut state = state.lock();
+
+        // A timer the job or the device armed moves an execution to `TIMED_OUT` by
+        // itself, so the transitions the clock has already made due are recorded
+        // before anything is partitioned: each was owed at its own deadline whether
+        // or not this call happened, an execution that has reached a terminal status
+        // belongs in neither pending list, and every later reader of the shared
+        // store — this service's other operations and the IoT control plane — sees
+        // the same status.
+        state.time_out_due_executions(&input.thing_name, crate::state::now_epoch_seconds());
 
         // A thing with no executions has two EMPTY lists, not a 404: the
         // operation reports the thing's pending jobs, and "none" is an answer.
