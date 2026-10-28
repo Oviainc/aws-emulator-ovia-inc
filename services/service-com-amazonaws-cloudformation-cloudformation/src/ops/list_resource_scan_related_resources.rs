@@ -79,45 +79,19 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::resource_scans::{
-    DEFAULT_RELATED_MAX_RESULTS, MAX_REQUESTED_RESOURCES, MAX_RESULTS_CEILING,
-};
+use crate::state::resource_scans::{DEFAULT_RELATED_MAX_RESULTS, MAX_REQUESTED_RESOURCES};
 
-/// One resource the scan found, as the modelled `ScannedResource`: "a scanned resource
-/// returned by `ListResourceScanResources` or `ListResourceScanRelatedResources`", every
-/// member read off the row the scan took.
-fn scanned_resource(found: &crate::state::resource_scans::FoundResource) -> ScannedResource {
-    ScannedResource {
-        resource_type: Some(found.resource_type.clone()),
-        resource_identifier: Some(
-            found
-                .resource_identifier
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        ),
-        // "The response indicates whether each returned resource is already managed by
-        // CloudFormation": whether the row records the stack that manages it.
-        managed_by_stack: Some(found.is_managed_by_stack()),
-    }
-}
-
-/// How many related resources this response carries: `MaxResults` is what "the number of
-/// available results exceeds" before a `NextToken` is issued, and "by default the
-/// ListResourceScanRelatedResources API action will return up to 100 results in each response.
-/// The maximum value is 100."
+/// How many related resources this response carries: this read's documented default is "by
+/// default the ListResourceScanRelatedResources API action will return up to 100 results in each
+/// response", and the rest of the rule is the one every read of a scan follows
+/// ([`crate::state::resource_scans::page_size`]).
 ///
-/// The model's own `@range(min: 1, max: 100)` on `MaxResults` is refused before this handler
-/// runs, so what reaches here is either absent or inside that range; the documented ceiling is
-/// applied all the same, so this operation's published maximum does not depend on a constraint
-/// stated elsewhere. The default and the ceiling are the same published number but two separate
-/// sentences of the member's documentation, so they are two constants.
+/// The model's own `@range(min: 1, max: 100)` on this operation's `MaxResults` is refused before
+/// this handler runs, so what reaches here is either absent or inside that range; the documented
+/// ceiling is applied all the same, so this operation's published maximum does not depend on a
+/// constraint stated elsewhere.
 fn page_size(max_results: Option<i32>) -> usize {
-    max_results
-        .and_then(|asked_for| usize::try_from(asked_for).ok())
-        .filter(|asked_for| *asked_for >= 1)
-        .unwrap_or(DEFAULT_RELATED_MAX_RESULTS)
-        .min(MAX_RESULTS_CEILING)
+    crate::state::resource_scans::page_size(max_results, DEFAULT_RELATED_MAX_RESULTS)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -263,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let related: Vec<ScannedResource> = scan
             .related_resources(&requested)
             .into_iter()
-            .map(scanned_resource)
+            .map(scans::scanned_resource)
             .collect();
 
         // `@paginated(inputToken: NextToken, outputToken: NextToken,

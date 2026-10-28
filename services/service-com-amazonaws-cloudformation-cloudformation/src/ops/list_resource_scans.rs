@@ -68,7 +68,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::resource_scans::{
-    StoredResourceScan, DEFAULT_MAX_RESULTS, DEFAULT_SCAN_TYPE_FILTER, MAX_RESULTS_CEILING,
+    StoredResourceScan, DEFAULT_MAX_RESULTS, DEFAULT_SCAN_TYPE_FILTER,
 };
 
 /// One stored scan as the modelled `ResourceScanSummary`: "a summary of the resource scan",
@@ -87,25 +87,11 @@ fn resource_scan_summary(stored: &StoredResourceScan) -> ResourceScanSummary {
     }
 }
 
-/// How many summaries this response carries: `MaxResults` is what "the number of available
-/// results exceeds" before a `NextToken` is issued, whose "default value is 10" and whose
-/// "maximum value is 100".
-///
-/// A maximum ABOVE the published ceiling is held to it rather than refused: the model puts no
-/// range on `ResourceScannerMaxResults`, so the published ceiling is the whole of the rule.
-/// A value that is no maximum at all (zero, or a negative one) names no page a response could
-/// carry, so this operation's documented default is what serves it.
-///
-/// The ceiling applied here is the operation's own published 100, which happens to equal
-/// [`crate::state::PAGE_SIZE`] — the bound `crate::state::paginate_at_most` puts on any page.
-/// Both are applied, so a later change to that service-wide page size cannot quietly move
-/// this operation's documented maximum.
+/// How many summaries this response carries: this read's documented default is the "default
+/// value is 10" of its own `MaxResults`, and the rest of the rule is the one every read of a
+/// scan follows ([`crate::state::resource_scans::page_size`]).
 fn page_size(max_results: Option<i32>) -> usize {
-    max_results
-        .and_then(|asked_for| usize::try_from(asked_for).ok())
-        .filter(|asked_for| *asked_for >= 1)
-        .unwrap_or(DEFAULT_MAX_RESULTS)
-        .min(MAX_RESULTS_CEILING)
+    crate::state::resource_scans::page_size(max_results, DEFAULT_MAX_RESULTS)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

@@ -105,6 +105,11 @@ pub const MAX_RESULTS_CEILING: usize = 100;
 /// in each response. The maximum value is 100."
 pub const DEFAULT_RELATED_MAX_RESULTS: usize = 100;
 
+/// How many scanned resources one response carries when the request names no `MaxResults`:
+/// "By default the ListResourceScanResources API action will return at most 100 results in
+/// each response. The maximum value is 100."
+pub const DEFAULT_SCANNED_MAX_RESULTS: usize = 100;
+
 /// How many resources one `ListResourceScanRelatedResources` request may ask about: "Up to 100
 /// resources can be provided" (`ListResourceScanRelatedResourcesInput$Resources`), a bound the
 /// model carries no `@length` for.
@@ -123,6 +128,29 @@ pub const PERCENTAGE_COMPLETE: f64 = 100.0;
 
 /// `PercentageCompleted` of a scan that has only just started.
 pub const PERCENTAGE_STARTED: f64 = 0.0;
+
+/// How many items one response of a resource-scan read carries, from the `MaxResults` the
+/// request named and that read's own documented default.
+///
+/// `MaxResults` is what "the number of available results exceeds" before a `NextToken` is
+/// issued, and each of these reads publishes a default and the same ceiling
+/// ([`MAX_RESULTS_CEILING`]) in its member's documentation. The model puts no range on
+/// `ResourceScannerMaxResults`, so the published ceiling is the whole of the rule for a maximum
+/// ABOVE it — it is held to the ceiling rather than refused — and a value that is no maximum at
+/// all (zero, or a negative one) names no page a response could carry, so the read's own
+/// documented default serves it.
+///
+/// One spelling of that rule for every read of a scan, since they differ only in which default
+/// they fall back to; the ceiling is applied here as well as by
+/// [`crate::state::paginate_at_most`], so a later change to the service-wide page size cannot
+/// quietly move these operations' documented maximum.
+pub fn page_size(max_results: Option<i32>, default: usize) -> usize {
+    max_results
+        .and_then(|asked_for| usize::try_from(asked_for).ok())
+        .filter(|asked_for| *asked_for >= 1)
+        .unwrap_or(default)
+        .min(MAX_RESULTS_CEILING)
+}
 
 /// The wildcard a resource-type filter may end with: "To scan all resource types within a
 /// service, you can use a wildcard, represented by an asterisk (`*`). You can place an
@@ -156,6 +184,13 @@ pub struct FoundResource {
     /// ([`primary_identifier`]) when the row is taken, so a read reports it rather than
     /// recomputing it.
     pub resource_identifier: BTreeMap<String, String>,
+    /// The tags the resource carries in the service that owns it: the ones its own
+    /// declaration asked for, plus the stack-level tags CloudFormation propagates to the
+    /// resources it creates and the ones it records itself
+    /// ([`crate::state::provisioning::StackProvenance::tags_for`]) — the set a request's
+    /// `TagKey` and `TagValue` select on. Taken from the resource when the row is taken, like
+    /// every other member of a row, so a read reports it rather than recomputing it.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl FoundResource {
@@ -181,6 +216,111 @@ impl FoundResource {
     pub fn is_managed_by_stack(&self) -> bool {
         !self.stack_id.is_empty()
     }
+
+    /// Whether this row carries `resource_identifier` as one of its primary identifiers:
+    /// `ListResourceScanResourcesInput$ResourceIdentifier` selects the resources that "have
+    /// the specified resource identifier (or one of them in the case where the resource has
+    /// multiple identifiers)", so it is matched against the VALUES of the row's identifier
+    /// rather than against the member names they are the values of.
+    pub fn has_identifier(&self, resource_identifier: &str) -> bool {
+        self.resource_identifier
+            .values()
+            .any(|held| held == resource_identifier)
+    }
+
+    /// Whether this row's type begins with `prefix`:
+    /// `ListResourceScanResourcesInput$ResourceTypePrefix` selects the resources "of any of
+    /// the resource types with the specified prefix".
+    pub fn has_type_prefix(&self, prefix: &str) -> bool {
+        self.resource_type.starts_with(prefix)
+    }
+
+    /// Whether this row carries a tag whose key is `tag_key`:
+    /// `ListResourceScanResourcesInput$TagKey` selects the resources that "have a matching tag
+    /// key".
+    pub fn has_tag_key(&self, tag_key: &str) -> bool {
+        self.tags.contains_key(tag_key)
+    }
+
+    /// Whether this row carries a tag whose value is `tag_value`:
+    /// `ListResourceScanResourcesInput$TagValue` selects the resources that "have a matching
+    /// tag value".
+    pub fn has_tag_value(&self, tag_value: &str) -> bool {
+        self.tags.values().any(|held| held == tag_value)
+    }
+}
+
+/// The filters one `ListResourceScanResources` request narrows a scan's resources by: "the
+/// results can be filtered by resource identifier, resource type prefix, tag key, and tag
+/// value".
+///
+/// A filter the request left out narrows nothing, and a resource is reported only when EVERY
+/// filter it did name admits it — "only resources that match all specified filters are
+/// returned".
+#[derive(Debug, Clone, Default)]
+pub struct ResourceFilters<'a> {
+    /// `ResourceIdentifier` ([`FoundResource::has_identifier`]).
+    pub resource_identifier: Option<&'a str>,
+    /// `ResourceTypePrefix` ([`FoundResource::has_type_prefix`]).
+    pub resource_type_prefix: Option<&'a str>,
+    /// `TagKey` ([`FoundResource::has_tag_key`]).
+    pub tag_key: Option<&'a str>,
+    /// `TagValue` ([`FoundResource::has_tag_value`]).
+    pub tag_value: Option<&'a str>,
+}
+
+impl ResourceFilters<'_> {
+    /// Whether every filter this request named admits `found`.
+    pub fn admit(&self, found: &FoundResource) -> bool {
+        self.resource_identifier
+            .is_none_or(|identifier| found.has_identifier(identifier))
+            && self
+                .resource_type_prefix
+                .is_none_or(|prefix| found.has_type_prefix(prefix))
+            && self.tag_key.is_none_or(|key| found.has_tag_key(key))
+            && self.tag_value.is_none_or(|value| found.has_tag_value(value))
+    }
+}
+
+/// One resource a scan found, as the modelled `ScannedResource`: "a scanned resource returned
+/// by `ListResourceScanResources` or `ListResourceScanRelatedResources`", every member read
+/// off the row the scan took.
+///
+/// Both reads report the same shape from the same rows, so both build it here.
+pub fn scanned_resource(found: &FoundResource) -> crate::ops::types::ScannedResource {
+    crate::ops::types::ScannedResource {
+        resource_type: Some(found.resource_type.clone()),
+        resource_identifier: Some(
+            found
+                .resource_identifier
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        // "The response indicates whether each returned resource is already managed by
+        // CloudFormation": whether the row records the stack that manages it.
+        managed_by_stack: Some(found.is_managed_by_stack()),
+    }
+}
+
+/// The tags a resource a scan read carries in the service that owns it.
+///
+/// CloudFormation does not only create a stack's resources, it TAGS them: the stack-level
+/// tags are "propagated to the resources that CloudFormation creates in the stack" and
+/// CloudFormation records its own beside them, while the resource's declaration is the more
+/// specific statement about that one resource — which is exactly the set a deployment sends
+/// the owning service ([`crate::state::provisioner::tags_of`]), so a scan reads the resource's
+/// tags through the same rule rather than through a second account of it.
+pub fn resource_tags(
+    resource: &crate::state::StoredResource,
+    provenance: &crate::state::provisioning::StackProvenance,
+) -> BTreeMap<String, String> {
+    crate::state::provisioner::tags_of(
+        &resource.properties,
+        &provenance.tags_for(&resource.logical_id),
+    )
+    .into_iter()
+    .collect()
 }
 
 /// The primary identifier of one resource a scan read, as `ScannedResource$ResourceIdentifier`
@@ -386,6 +526,16 @@ impl StoredResourceScan {
     /// running and one whose results have expired.
     pub fn types_are_available(&self) -> bool {
         matches!(self.status.as_str(), status::COMPLETE | status::FAILED)
+    }
+
+    /// The resources this scan LISTED that `filters` admits, in the order the scan found
+    /// them: "list of up to MaxResults resources in the specified resource scan that match all
+    /// of the specified filters".
+    pub fn filtered_resources(&self, filters: &ResourceFilters<'_>) -> Vec<&FoundResource> {
+        self.resources
+            .iter()
+            .filter(|found| filters.admit(found))
+            .collect()
     }
 
     /// The resources this scan listed that are RELATED to the ones `requested` addresses,

@@ -73,7 +73,7 @@ const SIX_RESOURCES: &str = r#"{"Resources":{
 /// resource outside CloudFormation, which is an ARN for `AWS::SNS::Topic` ("Ref returns the
 /// topic ARN") and the resource's own name for the other three. `AWS::Logs::LogGroup` is here
 /// as an entry no case of this suite's rule was written against.
-fn identifier_key(resource_type: &str) -> &'static str {
+pub(crate) fn identifier_key(resource_type: &str) -> &'static str {
     match resource_type {
         "AWS::SNS::Topic" => "TopicArn",
         "AWS::S3::Bucket" => "BucketName",
@@ -86,15 +86,15 @@ fn identifier_key(resource_type: &str) -> &'static str {
 /// One resource a scan listed: the type and primary-identifier pair a request addresses it by,
 /// which is also what a response reports it as.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Scanned {
-    resource_type: String,
-    key: String,
-    value: String,
+pub(crate) struct Scanned {
+    pub(crate) resource_type: String,
+    pub(crate) key: String,
+    pub(crate) value: String,
 }
 
 /// Every resource one stack deployed, keyed by the logical id its template declares it under,
 /// read back through `ListStackResources` so the identifier values are the service's own.
-async fn stack_catalogue(
+pub(crate) async fn stack_catalogue(
     router: &MultiServiceRouter,
     stack: &str,
 ) -> BTreeMap<String, Scanned> {
@@ -133,7 +133,7 @@ async fn stack_catalogue(
 
 /// Start a scan of this account and Region and wait past the instant its conclusion is due, so
 /// the scan it answers the id of has a result to read.
-async fn completed_scan(router: &MultiServiceRouter) -> String {
+pub(crate) async fn completed_scan(router: &MultiServiceRouter) -> String {
     let (status, body) = call(router, "StartResourceScan", &[]).await;
     assert_eq!(
         status, 200,
@@ -163,7 +163,7 @@ async fn scanned_account(
 
 /// The request members that address `resources`, one `ScannedResourceIdentifier` each in the
 /// awsQuery flattened form.
-fn requested_members(resources: &[Scanned]) -> Vec<(String, String)> {
+pub(crate) fn requested_members(resources: &[Scanned]) -> Vec<(String, String)> {
     resources
         .iter()
         .enumerate()
@@ -189,8 +189,15 @@ fn requested_members(resources: &[Scanned]) -> Vec<(String, String)> {
 
 /// The resources one response reports, sorted: each as its type, its one primary-identifier
 /// pair and what it says about being managed by a stack.
-fn reported(case: &str, body: &str) -> Vec<(String, String, String, String)> {
-    let mut rows: Vec<(String, String, String, String)> = list_members(body, "RelatedResources")
+///
+/// `items` is the response member the rows arrive under, so the suites that read a scan's rows
+/// (`RelatedResources` here, `Resources` for `ListResourceScanResources`) read them the one way.
+pub(crate) fn reported_rows(
+    case: &str,
+    body: &str,
+    items: &str,
+) -> Vec<(String, String, String, String)> {
+    let mut rows: Vec<(String, String, String, String)> = list_members(body, items)
         .iter()
         .map(|entry| {
             (
@@ -209,9 +216,14 @@ fn reported(case: &str, body: &str) -> Vec<(String, String, String, String)> {
     rows
 }
 
+/// [`reported_rows`] over this operation's own `RelatedResources` member.
+fn reported(case: &str, body: &str) -> Vec<(String, String, String, String)> {
+    reported_rows(case, body, "RelatedResources")
+}
+
 /// The rows `expected` logical ids must come back as: every related resource of this emulator's
 /// scans is one a stack manages, so each reports `true`.
-fn expected_rows(
+pub(crate) fn expected_rows(
     catalogue: &BTreeMap<String, Scanned>,
     expected: &[&str],
 ) -> Vec<(String, String, String, String)> {
@@ -235,7 +247,7 @@ fn expected_rows(
 
 /// The id of a scan this suite SEEDS, in the ARN form the model documents, built from an
 /// index so a case can name the record it reads.
-fn seeded_scan_id(index: usize) -> String {
+pub(crate) fn seeded_scan_id(index: usize) -> String {
     scans::resource_scan_arn(REGION, &format!("00000000-0000-4000-8000-{index:012}"))
 }
 
@@ -244,7 +256,7 @@ fn seeded_scan_id(index: usize) -> String {
 /// Seeded through the store's one writing entry point, the device `resource_scans.rs` uses for
 /// records a bound's worth of wire calls cannot produce: a case that must read a scan while it
 /// is still running, or exactly as its conclusion falls due, cannot then race the clock.
-fn in_flight(resource_scan_id: String, due_in: Duration) -> scans::StoredResourceScan {
+pub(crate) fn in_flight(resource_scan_id: String, due_in: Duration) -> scans::StoredResourceScan {
     let now = SystemTime::now();
     scans::StoredResourceScan {
         resource_scan_id,
@@ -269,7 +281,7 @@ fn in_flight(resource_scan_id: String, due_in: Duration) -> scans::StoredResourc
 }
 
 /// One resource of the fixture, as a request addresses it.
-fn addressing(catalogue: &BTreeMap<String, Scanned>, logical_id: &str) -> Scanned {
+pub(crate) fn addressing(catalogue: &BTreeMap<String, Scanned>, logical_id: &str) -> Scanned {
     catalogue
         .get(logical_id)
         .unwrap_or_else(|| panic!("the fixture holds no resource {logical_id:?}"))

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceScanResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceScanResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceScanResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the resources ONE resource scan found, narrowed by the filters the request names: a
+//! scan's rows are the point-in-time read it took of this account and Region
+//! ([`crate::state::resource_scans`]), so the answer is computed from that record rather than
+//! from the request, and each row is reported as the `ScannedResource` it is.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +86,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::resource_scans::DEFAULT_SCANNED_MAX_RESULTS;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -161,18 +157,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceScanResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceScanResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceScanResources"))
+        use crate::state::resource_scans as scans;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no scan to read, so this answers 501
+            // rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListResourceScanResources",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a transition the clock had
+        // already made due — the scan's own conclusion, which was owed at the same instant
+        // whether or not anybody read it.
+        store.settle(now);
+
+        let scan = store
+            .resolve_resource_scan(&region, &input.resource_scan_id)
+            .ok_or_else(|| {
+                ListResourceScanResourcesErrorModeled::ResourceScanNotFoundException(
+                    ResourceScanNotFoundException {
+                        message: Some(scans::NOT_FOUND.to_string()),
+                    },
+                )
+            })?;
+
+        // A scan that is still running has no result to list: its rows are what it finds, and
+        // it has not finished finding them — the modelled `ResourceScanInProgressException`,
+        // the same set `DescribeResourceScan` withholds its counts for.
+        if scan.is_in_flight() {
+            return Err(
+                ListResourceScanResourcesErrorModeled::ResourceScanInProgressException(
+                    ResourceScanInProgressException {
+                        message: Some(scans::SCAN_IN_PROGRESS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The results can be filtered by resource identifier, resource type prefix, tag key,
+        // and tag value. Only resources that match all specified filters are returned."
+        let filters = scans::ResourceFilters {
+            resource_identifier: input.resource_identifier.as_deref(),
+            resource_type_prefix: input.resource_type_prefix.as_deref(),
+            tag_key: input.tag_key.as_deref(),
+            tag_value: input.tag_value.as_deref(),
+        };
+        let listed: Vec<ScannedResource> = scan
+            .filtered_resources(&filters)
+            .into_iter()
+            .map(scans::scanned_resource)
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Resources,
+        // pageSize: MaxResults)`: one response carries one page, as large as the request asked
+        // for and no larger than the documented ceiling ("by default the
+        // ListResourceScanResources API action will return at most 100 results in each
+        // response. The maximum value is 100"), plus the token that resumes just past it.
+        let (resources, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::ScannedResources,
+            listed,
+            input.next_token.as_deref(),
+            Some(scans::page_size(
+                input.max_results,
+                DEFAULT_SCANNED_MAX_RESULTS,
+            )),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListResourceScanResourcesOutput {
+            // Always present, as an empty element for a scan whose rows the filters admit none
+            // of: a client reading the list sees the same shape either way.
+            resources: Some(resources),
+            next_token,
+        })
     }
 }

@@ -4531,6 +4531,9 @@ impl ComAmazonawsCloudformationCloudformationState {
     pub fn scannable_resources(&self, region: &str) -> Vec<resource_scans::FoundResource> {
         self.live_stacks(region)
             .flat_map(|stack| {
+                // The stack is what TAGGED the resources it deployed, so the tags on each row
+                // are read through the stack's own provenance.
+                let provenance = stack.provenance();
                 stack
                     .resources
                     .iter()
@@ -4545,7 +4548,9 @@ impl ComAmazonawsCloudformationCloudformationState {
                         resource_identifier: resource_scans::primary_identifier(
                             &deployed.resource,
                         ),
+                        tags: resource_scans::resource_tags(&deployed.resource, &provenance),
                     })
+                    .collect::<Vec<resource_scans::FoundResource>>()
             })
             .collect()
     }
@@ -6168,6 +6173,8 @@ pub enum PageOf {
     StackInstanceResourceDrifts,
     /// `ListResourceScanRelatedResources`'s `RelatedResources`.
     RelatedResources,
+    /// `ListResourceScanResources`'s `Resources`.
+    ScannedResources,
 }
 
 impl PageOf {
@@ -6198,6 +6205,7 @@ impl PageOf {
             Self::Imports => "imports",
             Self::StackInstanceResourceDrifts => "stack-instance-resource-drifts",
             Self::RelatedResources => "related-resources",
+            Self::ScannedResources => "scanned-resources",
         }
     }
 }

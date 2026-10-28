@@ -169,6 +169,8 @@ mod requested_rollback;
 mod resource_scan_lifecycle;
 #[path = "all/resource_scan_related_resources.rs"]
 mod resource_scan_related_resources;
+#[path = "all/resource_scan_resources.rs"]
+mod resource_scan_resources;
 #[path = "all/resource_scans.rs"]
 mod resource_scans;
 #[path = "all/resource_signals.rs"]

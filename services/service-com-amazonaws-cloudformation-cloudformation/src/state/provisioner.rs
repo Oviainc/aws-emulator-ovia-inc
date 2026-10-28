@@ -6783,7 +6783,10 @@ async fn describe_queue_policy(
 /// are CloudFormation's to set, so a declaration spelling one of them does not displace it.
 /// The result is ORDERED (declared first, in declaration order), so the same declaration
 /// builds the same request however the maps behind it happen to iterate.
-fn tags_of(properties: &Value, propagated: &[(String, String)]) -> Vec<(String, String)> {
+pub(super) fn tags_of(
+    properties: &Value,
+    propagated: &[(String, String)],
+) -> Vec<(String, String)> {
     let mut tags = declared_tags(properties);
     for (key, value) in propagated {
         if key.is_empty() {
