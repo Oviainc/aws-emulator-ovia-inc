@@ -20,10 +20,10 @@
 //!    graph of the definition it runs, which `run_execution_outcome.rs` covers.
 //!
 //! 2. An optional member is reported only when the stored run HOLDS a value for it: a run
-//!    started with no (or an empty) `OverrideParameters` map, and a run holding no task
-//!    instance, omit those members rather than answering an empty map or an empty list —
-//!    the same rule `GetTaskInstance` applies to the `Xcom` of an instance that exchanged
-//!    no cross-task data.
+//!    started with no (or an empty) `OverrideParameters` map, and a run of a version whose
+//!    definition declares no task, omit those members rather than answering an empty map or
+//!    an empty list — the same rule `GetTaskInstance` applies to the `Xcom` of an instance
+//!    that exchanged no cross-task data.
 //!
 //! The first suite drives the schedule from SEEDED clock fields, so every state of the
 //! lifecycle (including the intermediate `QUEUED`) is asserted deterministically rather

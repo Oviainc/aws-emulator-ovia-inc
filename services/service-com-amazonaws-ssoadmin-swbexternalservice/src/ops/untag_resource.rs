@@ -181,57 +181,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the resources held inside it with it).
         store.on_request(&region, ::std::time::SystemTime::now());
 
-        // `InstanceArn` is optional on this operation, but when a caller sends one it
-        // names the instance the resource is expected to live under: an ARN this account
-        // holds no instance for can hold no resource either.
-        if input
-            .instance_arn
-            .as_deref()
-            .is_some_and(|instance_arn| store.instance(instance_arn).is_none())
-        {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::instance_not_found_message(
-                        input.instance_arn.as_deref().unwrap_or_default(),
-                    )),
-                    // The model's `ResourceNotFoundExceptionReason` enum carries only KMS
-                    // key states, none of which this refusal is.
-                    reason: None,
-                },
-            )
-            .into());
-        }
-
-        // Never created, already deleted, gone with its instance, or held under another
-        // instance than the one the request named — the same answer either way: there is
-        // no such resource to untag.
-        //
-        // The instance that HOLDS it decides whether this write is available at all: an
-        // instance still being created serves only its own describe and delete ("While the
-        // instance is in the CREATE_IN_PROGRESS state, you can call only DescribeInstance
-        // and DeleteInstance operations"), so a tag write on it, or on anything under it,
-        // is the conflict with the `CreateInstance` still in flight.
-        let holder = store
-            .taggable_resource_instance(&input.resource_arn)
-            .map(str::to_string);
-        if let Some(holder) = holder.filter(|arn| store.instance_creation_in_progress(arn)) {
-            return Err(
-                UntagResourceErrorModeled::ConflictException(ConflictException {
-                    message: Some(crate::state::instance_creation_in_progress_message(&holder)),
-                })
-                .into(),
-            );
-        }
-
+        // The resource a tag request names — and whether its holding instance is far
+        // enough along to take a write at all — is resolved by the ONE rule the whole tag
+        // surface shares (`crate::state::...::tag_target_mut`); this handler only maps the
+        // refusal it answers onto the errors THIS operation models.
         let stored = store
-            .taggable_resource_tags_mut(input.instance_arn.as_deref(), &input.resource_arn)
-            .ok_or_else(|| {
-                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(crate::state::taggable_resource_not_found_message(
-                        &input.resource_arn,
-                    )),
-                    reason: None,
-                })
+            .tag_target_mut(input.instance_arn.as_deref(), &input.resource_arn)
+            .map_err(|refusal| match refusal {
+                crate::state::TagWriteRefusal::NotFound(message) => {
+                    UntagResourceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                            // The model's `ResourceNotFoundExceptionReason` enum carries
+                            // only KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                }
+                crate::state::TagWriteRefusal::Conflict(message) => {
+                    UntagResourceErrorModeled::ConflictException(ConflictException {
+                        message: Some(message),
+                    })
+                }
             })?;
 
         // A removal crosses no ceiling: it only ever leaves the resource carrying fewer
