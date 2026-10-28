@@ -166,29 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request is signed for and no other's.
         let region = crate::state::request_region(ctx.parts());
 
-        // A `NextToken` this service did not mint resolves to no cursor at all;
-        // answering the first page instead would silently restart the walk.
-        let resume_after = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_page_token(token) {
-                Some(identifier) => Some(identifier),
-                None => {
-                    // The token's SYNTAX satisfied `NextToken`'s `@pattern` (the gate in
-                    // `crate::service` refuses one that does not, as a parameter value
-                    // fault) — it is simply not a cursor this service issued, which is
-                    // the OTHER fault class `ValidationExceptionReason` names.
-                    return Err(ListRulesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some("NextToken is not a valid page token".to_string()),
-                            reason: Some(
-                                crate::state::VALIDATION_REASON_INVALID_PAGE_TOKEN.to_string(),
-                            ),
-                        },
-                    )
-                    .into())
-                }
-            },
-            None => None,
-        };
         // No `MaxResults` means "as many as the page can hold"; the model bounds that
         // member at 1000, so an unnamed page size can never exceed it either.
         let page_size = input
@@ -201,6 +178,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // A `NextToken` this endpoint did not hand out resolves to no cursor at all:
+        // only a cursor of THIS Region's walk, naming a position the store really
+        // minted, says where to resume. Answering the first page instead would
+        // silently restart the walk, and resuming after a position never handed out
+        // would answer a page missing every rule that sorts at or before it.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match store.page_cursor(&region, token) {
+                Some(identifier) => Some(identifier),
+                None => {
+                    // The token's SYNTAX satisfied `NextToken`'s `@pattern` (the gate in
+                    // `crate::service` refuses one that does not, as a parameter value
+                    // fault) — it is simply not a cursor this endpoint issued, which is
+                    // the OTHER fault class `ValidationExceptionReason` names.
+                    return Err(ListRulesErrorModeled::ValidationException(
+                        crate::state::invalid_page_token(),
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
         // A transition the clock has already made due — `pending` -> `available`, and an
         // unlock delay that has run out — was owed at this instant whether or not anybody
         // called, so this Region's rules are settled BEFORE any of them is matched against
@@ -232,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if rules.len() >= page_size {
                 // One more rule matches than fits: hand back a cursor at the last rule
                 // this page reported, so the next call resumes right after it.
-                next_token = last_reported.map(|id| crate::state::encode_page_token(id));
+                next_token = last_reported.map(|id| crate::state::encode_page_token(&region, id));
                 break;
             }
             rules.push(rule.to_summary());

@@ -5,8 +5,10 @@
 //! Recycle Bin's control plane is a collection of retention rules addressed by an
 //! 11-character identifier, so the store is one ordered map of rules plus an ARN
 //! index. The ordering is load-bearing: `ListRules` pages through the map in key
-//! order, and its `NextToken` is the last identifier it returned, so a page boundary
-//! stays stable while rules are added or removed.
+//! order, and its `NextToken` is a cursor naming the last identifier it returned, so a
+//! page boundary stays stable while rules are added or removed. A cursor is honoured
+//! only by the endpoint that issued it and only for a position it really handed out
+//! ([`ComAmazonawsRbinAmazonrecyclebinState::page_cursor`]).
 //!
 //! A retention rule is a REGIONAL resource — it exists only in the Region it was
 //! created in — so every rule carries that Region ([`Rule::region`]) and every
@@ -538,6 +540,19 @@ pub const VALIDATION_REASON_INVALID_PARAMETER_VALUE: &str = "INVALID_PARAMETER_V
 /// service never issued — the other fault class that enum names. A token that fails
 /// `NextToken`'s own `@pattern` is a parameter value fault, not this one.
 pub const VALIDATION_REASON_INVALID_PAGE_TOKEN: &str = "INVALID_PAGE_TOKEN";
+
+/// The modelled 400 for a `NextToken` this endpoint did not issue.
+///
+/// Composed here, beside the cursor codec it is the refusal of, so a pager cannot word
+/// this fault class its own way. The message states the member and nothing of the
+/// token: a page cursor is opaque, so there is nothing about the submitted value a
+/// caller can act on.
+pub fn invalid_page_token() -> ValidationException {
+    ValidationException {
+        message: Some("NextToken is not a valid page token".to_string()),
+        reason: Some(VALIDATION_REASON_INVALID_PAGE_TOKEN.to_string()),
+    }
+}
 
 /// `ConflictExceptionReason`'s sole value.
 /// Source: smithy_query(query="shape", shape="ConflictExceptionReason").
@@ -1142,11 +1157,44 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
         }
     }
 
+    /// Whether `identifier` is one this store has already MINTED.
+    ///
+    /// [`Self::mint_identifier`] renders a seed that only ever rises, and
+    /// [`base62_identifier`] renders every seed as the same number of digits in
+    /// ascending-byte order, so the renderings this store has handed out are exactly the
+    /// identifiers up to and including the rendering of its current seed. An
+    /// identifier-shaped value above that watermark names no position this store has
+    /// ever reached — nothing could have been minted there — whether or not a rule still
+    /// holds it today.
+    pub fn has_minted_identifier(&self, identifier: &str) -> bool {
+        is_rule_identifier(identifier)
+            && identifier <= base62_identifier(self.next_identifier_seed).as_str()
+    }
+
+    /// The position `token` resumes a page of `region` at, or `None` when this endpoint
+    /// did not issue it.
+    ///
+    /// A cursor is honoured only when it is one of THIS endpoint's own: it has to decode
+    /// to the cursor form [`encode_page_token`] renders, to have been issued by the
+    /// Region this request is signed for, and to name a position this store has actually
+    /// minted ([`Self::has_minted_identifier`]). Anything else is no cursor at all — a
+    /// value a client invented that merely satisfies `NextToken`'s `@pattern`, or a
+    /// cursor another Region's endpoint issued — and resuming "after" a position never
+    /// handed out would answer a page that silently drops every rule sorting at or
+    /// before it (an empty one, for a value sorting above them all), so the caller
+    /// refuses it with [`invalid_page_token`] instead.
+    pub fn page_cursor(&self, region: &str, token: &str) -> Option<String> {
+        let cursor = parse_page_token(token)?;
+        (cursor.region == region && self.has_minted_identifier(&cursor.identifier))
+            .then_some(cursor.identifier)
+    }
+
     /// The rules of `region` to walk for a page, starting after `after` when a
     /// `NextToken` named one.
     ///
     /// Region-scoped like every other resolver: a regional reader pages through the
-    /// rules its own Region holds, and a cursor it issued names a rule of that Region.
+    /// rules its own Region holds, and `after` is a cursor [`Self::page_cursor`] has
+    /// resolved, so it names a position that Region's endpoint itself handed out.
     pub fn page_from<'a>(
         &'a self,
         region: &'a str,
@@ -1198,23 +1246,56 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// Encode a page cursor: the base64 of the last identifier the page returned.
+/// What a page cursor carries: the Region whose endpoint issued it, and the identifier
+/// of the last rule that page reported.
+///
+/// The Region is part of the cursor because a retention rule — and so a page of rules —
+/// exists in one Region: a position one endpoint handed out is no position of another's
+/// walk, so a cursor states which endpoint's walk it belongs to and any other endpoint
+/// refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageCursor {
+    region: String,
+    identifier: String,
+}
+
+/// What separates a cursor's two parts. A Region is read off the SigV4 credential
+/// scope, whose fields are themselves `/`-separated ([`request_region`]), so a Region
+/// string holds no `/` and the LAST one in the payload opens the identifier.
+const PAGE_CURSOR_SEPARATOR: char = '/';
+
+/// Encode a page cursor: the base64 of the issuing Region and the last identifier the
+/// page returned.
 ///
 /// Base64 is what makes the token opaque to a client, and its alphabet is exactly
 /// the `NextToken` pattern `^[A-Za-z0-9+/=]{1,2048}$`.
-pub fn encode_page_token(identifier: &str) -> String {
-    ::aws_smithy_types::base64::encode(identifier)
+pub fn encode_page_token(region: &str, identifier: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!(
+        "{region}{PAGE_CURSOR_SEPARATOR}{identifier}"
+    ))
 }
 
-/// Decode a page cursor back to the identifier the previous page stopped at.
+/// Decode a token back to the cursor it carries, or `None` when it is not base64 of
+/// anything [`encode_page_token`] renders.
 ///
-/// `None` for any token this service did not emit — it is base64 of something that
-/// is not a rule identifier — so the caller can refuse it as an invalid page token
-/// rather than silently returning the first page.
-pub fn decode_page_token(token: &str) -> Option<String> {
+/// A payload that parses is still only a well-formed cursor: whether this endpoint
+/// issued it is [`ComAmazonawsRbinAmazonrecyclebinState::page_cursor`]'s question,
+/// since answering it needs the Region the request is signed for and the store's own
+/// minting watermark.
+fn parse_page_token(token: &str) -> Option<PageCursor> {
     let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
-    let identifier = String::from_utf8(bytes).ok()?;
-    is_rule_identifier(&identifier).then_some(identifier)
+    let payload = String::from_utf8(bytes).ok()?;
+    let (region, identifier) = payload.rsplit_once(PAGE_CURSOR_SEPARATOR)?;
+    (!region.is_empty() && is_rule_identifier(identifier)).then(|| PageCursor {
+        region: region.to_string(),
+        identifier: identifier.to_string(),
+    })
+}
+
+/// The identifier a page cursor names, for a reader that already knows which Region's
+/// walk the cursor belongs to. `None` when `token` carries no cursor at all.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    Some(parse_page_token(token)?.identifier)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
