@@ -135,9 +135,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This call names its target by log group name alone, so nothing here is read off
-        // the request metadata `ctx` carries.
-        let _ = ctx;
+        // This call names its target by log group name alone; the Region the request was
+        // signed for is what scopes the lookup for the resource kinds that are keyed by it.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsLogGroupError::from(
@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Lists the tags for the specified log group": there are no tags to list until that
         // group exists.
-        let Some(tags) = store.resource_tags(&resource) else {
+        let Some(tags) = store.resource_tags(&region, &resource) else {
             return Err(ListTagsLogGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(resource.kind())),

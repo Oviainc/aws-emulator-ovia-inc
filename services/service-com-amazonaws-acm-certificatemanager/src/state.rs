@@ -269,6 +269,22 @@ pub const CERTIFICATE_VALIDITY: Duration = Duration::from_secs(395 * 24 * 60 * 6
 /// certificate ACM issues, which a certificate carries only once it has been issued.
 pub const ISSUED_KEY_USAGES: &[&str] = &["DIGITAL_SIGNATURE", "KEY_ENCIPHERMENT"];
 
+/// The `KeyUsageName` a certificate whose Key Usage extension is ABSENT is reported and
+/// selected under: the sentinel that enum declares beside the single purposes
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#KeyUsageName")`). An X.509
+/// certificate carrying no Key Usage extension restricts its key to no purpose at all,
+/// so every purpose is open to it, which is the value that sentinel names.
+pub const KEY_USAGE_ANY: &str = "ANY";
+
+/// The key usages of a certificate that carries NO Key Usage extension: the
+/// [`KEY_USAGE_ANY`] sentinel alone, which is the value that absence has.
+///
+/// The single place that sentinel is minted, so every reader of a certificate whose
+/// X.509 extensions have been read agrees about it.
+pub fn no_key_usage() -> Vec<String> {
+    vec![KEY_USAGE_ANY.to_string()]
+}
+
 /// The key purposes of the X.509 Extended Key Usage extension of a TLS certificate ACM
 /// issues — server and client authentication — each as the object identifier RFC 5280
 /// section 4.2.1.12 assigns it, with the same lifecycle as [`ISSUED_KEY_USAGES`].
@@ -290,7 +306,11 @@ pub const ISSUED_EXTENDED_KEY_USAGE_OIDS: &[&str] =
 pub struct ExtendedKeyUsageRecord {
     /// An `ExtendedKeyUsageName` value.
     pub name: String,
-    /// The dotted-decimal object identifier of the key purpose.
+    /// The dotted-decimal object identifier of the key purpose, and the EMPTY string
+    /// for the [`EXTENDED_KEY_USAGE_NONE`] sentinel, which is the ABSENCE of the
+    /// extension rather than a purpose an extension carries: `ExtendedKeyUsage$OID` is
+    /// "an object identifier (OID) for the extension value", and there is no extension
+    /// value to identify.
     pub oid: String,
 }
 
@@ -316,6 +336,29 @@ pub const EXTENDED_KEY_USAGE_OIDS: &[(&str, &str)] = &[
 /// The `ExtendedKeyUsageName` a key purpose outside [`EXTENDED_KEY_USAGE_OIDS`] is
 /// reported under, the value that enum declares for exactly that.
 pub const EXTENDED_KEY_USAGE_CUSTOM: &str = "CUSTOM";
+
+/// The `ExtendedKeyUsageName` a certificate whose Extended Key Usage extension is
+/// ABSENT is reported and selected under: the sentinel that enum declares beside the
+/// real purposes (`smithy_query(query="shape",
+/// shape="com.amazonaws.acm#ExtendedKeyUsageName")`), which is what "this certificate
+/// asserts no key purpose" is named by — so a reader can tell it apart from a record
+/// whose purposes are not known yet, and the `extendedKeyUsage` filters can select it.
+pub const EXTENDED_KEY_USAGE_NONE: &str = "NONE";
+
+/// The key purposes of a certificate that carries NO Extended Key Usage extension:
+/// the [`EXTENDED_KEY_USAGE_NONE`] sentinel alone, which is the value that absence has,
+/// under the empty identifier — the sentinel stands for an extension the certificate
+/// does not carry, so there is no extension value for an identifier to name.
+///
+/// The single place that sentinel is minted, so every reader of a certificate whose
+/// X.509 extensions have been read — its detail, its listing summary, its search
+/// result and the filters each of those selects on — agrees about it.
+pub fn no_extended_key_usage() -> Vec<ExtendedKeyUsageRecord> {
+    vec![ExtendedKeyUsageRecord {
+        name: EXTENDED_KEY_USAGE_NONE.to_string(),
+        oid: String::new(),
+    }]
+}
 
 /// The key purpose `oid` names, as ACM publishes it: the identifier itself beside the
 /// name [`EXTENDED_KEY_USAGE_OIDS`] pairs it with, or [`EXTENDED_KEY_USAGE_CUSTOM`]

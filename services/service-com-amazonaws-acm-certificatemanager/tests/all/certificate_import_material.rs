@@ -255,7 +255,7 @@ async fn a_chain_is_stored_as_sent_and_decides_nothing() {
             Some("ISSUED"),
             "case {case:?}: an imported certificate is already issued, got {status:?} in {detail}"
         );
-        let expected_issuer = format!("CN={}", signer.common_name);
+        let expected_issuer = signer.common_name.clone();
         let issuer = detail["Issuer"].as_str().unwrap_or_default();
         assert_eq!(
             issuer, expected_issuer,

@@ -2983,6 +2983,32 @@ impl ManifestFamily {
     }
 }
 
+/// How many manifests a request carries per family, in [`ManifestFamily::ALL`] order —
+/// the array [`manifest_set_violation`] reads.
+///
+/// Declared here, beside `ManifestFamily::ALL`, because the array's POSITIONS are what
+/// carry the family: the counts are placed by mapping over `ALL` itself, so the order of
+/// the array can only ever be the order that enum declares, and a family added to it is a
+/// non-exhaustive `match` here rather than a count silently read as another family's.
+/// `CreateOriginEndpoint` and `UpdateOriginEndpoint` both write the whole manifest set and
+/// both count it through here. A family the request left out carries no manifest, which is
+/// the same count as an empty list.
+pub fn manifest_counts<Hls, LowLatencyHls, Dash, Mss>(
+    hls_manifests: Option<&[Hls]>,
+    low_latency_hls_manifests: Option<&[LowLatencyHls]>,
+    dash_manifests: Option<&[Dash]>,
+    mss_manifests: Option<&[Mss]>,
+) -> [usize; ManifestFamily::ALL.len()] {
+    ManifestFamily::ALL.map(|family| match family {
+        ManifestFamily::Hls => hls_manifests.map_or(0, <[Hls]>::len),
+        ManifestFamily::LowLatencyHls => {
+            low_latency_hls_manifests.map_or(0, <[LowLatencyHls]>::len)
+        }
+        ManifestFamily::Dash => dash_manifests.map_or(0, <[Dash]>::len),
+        ManifestFamily::Mss => mss_manifests.map_or(0, <[Mss]>::len),
+    })
+}
+
 /// The `ValidationExceptionType` that names the refusal of `family` on a `container`
 /// endpoint, or `None` when that container serves that family.
 ///
@@ -3032,7 +3058,8 @@ pub enum ManifestSetOn {
 /// container type.
 ///
 /// `counts` is how many manifests the request carries per family, in
-/// [`ManifestFamily::ALL`] order. `None` means the set is acceptable. This is the same
+/// [`ManifestFamily::ALL`] order, as [`manifest_counts`] — the one builder of that array —
+/// emits it. `None` means the set is acceptable. This is the same
 /// rule for `CreateOriginEndpoint` and `UpdateOriginEndpoint`: both carry the whole
 /// manifest set and the same required `ContainerType`, so an endpoint's stored manifest
 /// count stays inside the range whichever operation last wrote it.

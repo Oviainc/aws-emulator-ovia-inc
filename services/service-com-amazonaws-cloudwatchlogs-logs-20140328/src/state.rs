@@ -57,7 +57,8 @@
 //! The account's deliveries — each "a connection between a logical delivery source and a
 //! logical delivery destination", which `CreateDelivery` creates and `DescribeDeliveries`
 //! reports — live in [`ComAmazonawsCloudwatchlogsLogs20140328State::deliveries`], each one
-//! a [`DeliveryRecord`].
+//! a [`DeliveryRecord`], keyed by the Region it was created in and its own id
+//! ([`RegionalKey`]).
 //!
 //! The account's storage tier policy lives here too
 //! ([`ComAmazonawsCloudwatchlogsLogs20140328State::storage_tier_policy`]): it is "the
@@ -67,7 +68,8 @@
 //! delivery destination", which `PutDeliveryDestination` creates or updates and
 //! `GetDeliveryDestination` reports — live in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::delivery_destinations`], each one a
-//! [`DeliveryDestinationRecord`], keyed by the name that identifies one. A destination's
+//! [`DeliveryDestinationRecord`], keyed by the Region it was created in and the name that
+//! identifies one within it ([`RegionalKey`]). A destination's
 //! delivery destination policy lives on that destination
 //! ([`DeliveryDestinationRecord::policy`]), because `PutDeliveryDestinationPolicy` "assigns
 //! an IAM policy to the destination" and nothing but the destination names one: one
@@ -77,7 +79,8 @@
 //! is actually sending the logs", which `PutDeliverySource` creates or updates and
 //! `GetDeliverySource` reports — live in
 //! [`ComAmazonawsCloudwatchlogsLogs20140328State::delivery_sources`], each one a
-//! [`DeliverySourceRecord`], keyed by the name that identifies one.
+//! [`DeliverySourceRecord`], keyed by the Region it was created in and the name that
+//! identifies one within it ([`RegionalKey`]).
 //!
 //! The account's logical destinations — each "a cross-account destination that receives
 //! subscription log events", which `PutDestination` creates or updates and
@@ -1026,14 +1029,15 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// creates gets an id no earlier create used. See [`mint_export_task_id`].
     pub next_export_task_seq: u64,
     /// Every delivery of this account — the resource `CreateDelivery` creates and
-    /// `DescribeDeliveries` reports — keyed by `Delivery$id`. A `BTreeMap` so
-    /// `DescribeDeliveries` enumerates in delivery-id order without re-sorting, which is
-    /// also what makes its pagination cursor stable.
+    /// `DescribeDeliveries` reports — keyed by the Region it was created in and its
+    /// `Delivery$id` ([`RegionalKey`]). A `BTreeMap` so `DescribeDeliveries` enumerates one
+    /// Region's deliveries in delivery-id order without re-sorting, which is also what makes
+    /// its pagination cursor stable.
     ///
     /// A delivery is an account-level resource rather than a log group's: its source and
     /// its destination are both named by their own resources, so it lives here and not on
     /// [`LogGroupRecord`].
-    pub deliveries: BTreeMap<String, DeliveryRecord>,
+    pub deliveries: BTreeMap<RegionalKey, DeliveryRecord>,
     /// Monotonic counter behind the `Delivery$id`s `CreateDelivery` mints, so every delivery
     /// it creates gets an id no earlier create used — including after the delivery holding an
     /// id has been deleted. See [`mint_delivery_id`].
@@ -1046,28 +1050,30 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     pub storage_tier_policy: Option<StorageTierPolicyRecord>,
     /// Every delivery destination of this account — the resource `PutDeliveryDestination`
     /// creates or updates and `GetDeliveryDestination` / `DescribeDeliveryDestinations`
-    /// report — keyed by `DeliveryDestination$name`, which is the only thing that
-    /// identifies one ("This name must be unique for all delivery destinations in your
-    /// account"). A `BTreeMap` so `DescribeDeliveryDestinations` enumerates in
+    /// report — keyed by the Region it was created in and its `DeliveryDestination$name`
+    /// ([`RegionalKey`]): the name is what identifies one within a Region ("This name must be
+    /// unique for all delivery destinations in your account"). A `BTreeMap` so
+    /// `DescribeDeliveryDestinations` enumerates one Region's destinations in
     /// destination-name order without re-sorting, which is also what makes its pagination
     /// cursor stable.
     ///
     /// A delivery destination is a LOGICAL object naming a resource of another service (or
     /// another log group), so it lives here rather than on [`LogGroupRecord`]: deleting the
     /// log group it points at does not delete the destination.
-    pub delivery_destinations: BTreeMap<String, DeliveryDestinationRecord>,
+    pub delivery_destinations: BTreeMap<RegionalKey, DeliveryDestinationRecord>,
     /// Every delivery source of this account — the resource `PutDeliverySource` creates or
-    /// updates and `GetDeliverySource` / `DescribeDeliverySources` report — keyed by
-    /// `DeliverySource$name`, which is the only thing that identifies one ("This name must be
-    /// unique for all delivery sources in your account"). A `BTreeMap` so
-    /// `DescribeDeliverySources` enumerates in source-name order without re-sorting, which is
-    /// also what makes its pagination cursor stable.
+    /// updates and `GetDeliverySource` / `DescribeDeliverySources` report — keyed by the
+    /// Region it was created in and its `DeliverySource$name` ([`RegionalKey`]): the name is
+    /// what identifies one within a Region ("This name must be unique for all delivery
+    /// sources in your account"). A `BTreeMap` so `DescribeDeliverySources` enumerates one
+    /// Region's sources in source-name order without re-sorting, which is also what makes its
+    /// pagination cursor stable.
     ///
     /// A delivery source is a LOGICAL object naming the resource of another service that
     /// sends the logs, so it lives here rather than on [`LogGroupRecord`]: no log group owns
     /// one, and a delivery pairs it with a destination by the name it is stored under
     /// ([`DeliveryRecord::delivery_source_name`]).
-    pub delivery_sources: BTreeMap<String, DeliverySourceRecord>,
+    pub delivery_sources: BTreeMap<RegionalKey, DeliverySourceRecord>,
     /// Every logical destination of this account — the resource `PutDestination` creates or
     /// updates, `DescribeDestinations` reports and `DeleteDestination` removes — keyed by
     /// `Destination$destinationName`, the one member every other destination operation
@@ -1266,39 +1272,129 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         seq
     }
 
-    /// The tags assigned to the resource a tagging operation named, or `None` when the
-    /// account holds no such resource.
+    /// The delivery source `region`'s endpoint holds under `name`, if any.
+    ///
+    /// A delivery source belongs to the Region it was created in ([`RegionalKey`]), so a name
+    /// another Region holds a source under names none here.
+    pub fn delivery_source(&self, region: &str, name: &str) -> Option<&DeliverySourceRecord> {
+        self.delivery_sources.get(&RegionalKey::new(region, name))
+    }
+
+    /// The delivery sources `region`'s endpoint holds, in source-name order — the
+    /// enumeration `DescribeDeliverySources` reports and pages.
+    pub fn delivery_sources_in<'store>(
+        &'store self,
+        region: &str,
+    ) -> impl Iterator<Item = &'store DeliverySourceRecord> {
+        let region = region.to_string();
+        self.delivery_sources
+            .iter()
+            .filter(move |(key, _record)| key.region == region)
+            .map(|(_key, record)| record)
+    }
+
+    /// The delivery destination `region`'s endpoint holds under `name`, if any. See
+    /// [`Self::delivery_source`]: a destination belongs to the Region it was created in too.
+    pub fn delivery_destination(
+        &self,
+        region: &str,
+        name: &str,
+    ) -> Option<&DeliveryDestinationRecord> {
+        self.delivery_destinations
+            .get(&RegionalKey::new(region, name))
+    }
+
+    /// The same delivery destination, to write — what assigning or removing its delivery
+    /// destination policy reaches.
+    pub fn delivery_destination_mut(
+        &mut self,
+        region: &str,
+        name: &str,
+    ) -> Option<&mut DeliveryDestinationRecord> {
+        self.delivery_destinations
+            .get_mut(&RegionalKey::new(region, name))
+    }
+
+    /// The delivery destinations `region`'s endpoint holds, in destination-name order — the
+    /// enumeration `DescribeDeliveryDestinations` reports and pages.
+    pub fn delivery_destinations_in<'store>(
+        &'store self,
+        region: &str,
+    ) -> impl Iterator<Item = &'store DeliveryDestinationRecord> {
+        let region = region.to_string();
+        self.delivery_destinations
+            .iter()
+            .filter(move |(key, _record)| key.region == region)
+            .map(|(_key, record)| record)
+    }
+
+    /// The delivery `region`'s endpoint holds under `id`, if any. See
+    /// [`Self::delivery_source`]: a delivery belongs to the Region it was created in too.
+    pub fn delivery(&self, region: &str, id: &str) -> Option<&DeliveryRecord> {
+        self.deliveries.get(&RegionalKey::new(region, id))
+    }
+
+    /// The same delivery, to write — what `UpdateDeliveryConfiguration` reaches.
+    pub fn delivery_mut(&mut self, region: &str, id: &str) -> Option<&mut DeliveryRecord> {
+        self.deliveries.get_mut(&RegionalKey::new(region, id))
+    }
+
+    /// The deliveries `region`'s endpoint holds, in delivery-id order — the enumeration
+    /// `DescribeDeliveries` reports and pages, and what answers whether a source or a
+    /// destination of that Region is still in use.
+    pub fn deliveries_in<'store>(
+        &'store self,
+        region: &str,
+    ) -> impl Iterator<Item = &'store DeliveryRecord> {
+        let region = region.to_string();
+        self.deliveries
+            .iter()
+            .filter(move |(key, _record)| key.region == region)
+            .map(|(_key, record)| record)
+    }
+
+    /// The tags assigned to the resource a tagging operation named, or `None` when
+    /// `region`'s endpoint holds no such resource.
     ///
     /// One resource holds ONE tag set, on the resource's own record, so every operation
     /// that reads or writes tags — and every reporter of the resource itself, such as
     /// `ListLogGroups`'s `logGroupTags` filter — sees the same map.
-    pub fn resource_tags(&self, resource: &TaggedResource) -> Option<&BTreeMap<String, String>> {
+    pub fn resource_tags(
+        &self,
+        region: &str,
+        resource: &TaggedResource,
+    ) -> Option<&BTreeMap<String, String>> {
         match resource {
             TaggedResource::LogGroup(name) => self.log_groups.get(name).map(|group| &group.tags),
-            TaggedResource::Delivery(id) => self.deliveries.get(id).map(|delivery| &delivery.tags),
+            TaggedResource::Delivery(id) => {
+                self.delivery(region, id).map(|delivery| &delivery.tags)
+            }
             TaggedResource::Destination(name) => self
                 .destinations
                 .get(name)
                 .map(|destination| &destination.tags),
-            TaggedResource::DeliverySource(name) => self
-                .delivery_sources
-                .get(name)
-                .map(|source| &source.tags),
+            TaggedResource::DeliverySource(name) => {
+                self.delivery_source(region, name).map(|source| &source.tags)
+            }
             TaggedResource::DeliveryDestination(name) => self
-                .delivery_destinations
-                .get(name)
+                .delivery_destination(region, name)
                 .map(|destination| &destination.tags),
         }
     }
 
-    /// The delivery destination this account holds under `arn`, if any.
+    /// The delivery destination `region`'s endpoint holds under `arn`, if any.
     ///
-    /// A destination is keyed by the name that identifies one, but a delivery names its
-    /// destination by ARN (`CreateDelivery$deliveryDestinationArn`), so the lookup a delivery
-    /// needs is by the ARN each stored destination carries.
-    pub fn delivery_destination_by_arn(&self, arn: &str) -> Option<&DeliveryDestinationRecord> {
-        self.delivery_destinations
-            .values()
+    /// A destination is keyed by the Region it was created in and the name that identifies
+    /// one there, but a delivery names its destination by ARN
+    /// (`CreateDelivery$deliveryDestinationArn`), so the lookup a delivery needs is by the ARN
+    /// each stored destination carries — among the destinations of the Region the delivery is
+    /// being made in, which is the only Region's resources that endpoint serves.
+    pub fn delivery_destination_by_arn(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&DeliveryDestinationRecord> {
+        self.delivery_destinations_in(region)
             .find(|destination| destination.arn == arn)
     }
 
@@ -1330,6 +1426,7 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     /// The same tag set, to write. See [`Self::resource_tags`].
     pub fn resource_tags_mut(
         &mut self,
+        region: &str,
         resource: &TaggedResource,
     ) -> Option<&mut BTreeMap<String, String>> {
         match resource {
@@ -1337,8 +1434,7 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
                 self.log_groups.get_mut(name).map(|group| &mut group.tags)
             }
             TaggedResource::Delivery(id) => self
-                .deliveries
-                .get_mut(id)
+                .delivery_mut(region, id)
                 .map(|delivery| &mut delivery.tags),
             TaggedResource::Destination(name) => self
                 .destinations
@@ -1346,11 +1442,10 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
                 .map(|destination| &mut destination.tags),
             TaggedResource::DeliverySource(name) => self
                 .delivery_sources
-                .get_mut(name)
+                .get_mut(&RegionalKey::new(region, name))
                 .map(|source| &mut source.tags),
             TaggedResource::DeliveryDestination(name) => self
-                .delivery_destinations
-                .get_mut(name)
+                .delivery_destination_mut(region, name)
                 .map(|destination| &mut destination.tags),
         }
     }
@@ -2087,13 +2182,44 @@ pub fn mint_export_task_id(seq: u64) -> String {
     mint_uuid_from_seq(seq)
 }
 
+/// What identifies one vended-log delivery resource in this store: the Region it lives in,
+/// and the name — or the id — it is known by within that Region.
+///
+/// A delivery source, a delivery destination and a delivery are REGIONAL resources: each is
+/// created through one Region's endpoint, its ARN carries that Region
+/// ([`delivery_source_arn`], [`delivery_destination_arn`], [`delivery_arn`]), and the
+/// uniqueness each operation documents for a name ("This name must be unique for all delivery
+/// sources in your account") holds within that Region — so the same name in two Regions is two
+/// separate resources, and an endpoint resolves only the resources of its own Region. The
+/// Region comes first in the ordering, so one Region's resources enumerate in name order and a
+/// reporting operation's page token stays a position in that order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RegionalKey {
+    /// The Region the resource was created in — the one the creating request's credential
+    /// scope named ([`request_region`]).
+    pub region: String,
+    /// What identifies the resource within that Region: a delivery source's or destination's
+    /// name, or a delivery's id.
+    pub name: String,
+}
+
+impl RegionalKey {
+    /// The key of the resource `name` names in `region`.
+    pub fn new(region: &str, name: &str) -> Self {
+        Self {
+            region: region.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
 /// One delivery — "a connection between a logical delivery source and a logical delivery
 /// destination" — as it is stored. Every member of the model's `Delivery` shape is
 /// reported from this record, so `DescribeDeliveries` answers from state alone.
 #[derive(Debug, Clone)]
 pub struct DeliveryRecord {
     /// `Delivery$id` — "The unique ID that identifies this delivery in your account."
-    /// Also the key the store enumerates by.
+    /// Also the name half of the key the store holds this delivery under ([`RegionalKey`]).
     pub id: String,
     /// `Delivery$arn` — "The Amazon Resource Name (ARN) that uniquely identifies this
     /// delivery", as [`delivery_arn`] builds it.
@@ -2196,11 +2322,11 @@ pub fn mint_delivery_id(seq: u64) -> String {
     format!("{seq:016x}")
 }
 
-/// THE EMULATOR'S OWN CEILING on the deliveries one account holds, not a quota cited from
-/// AWS: each delivery keeps its configuration and tag set in memory for as long as the
-/// process runs and nothing expires one, so `CreateDelivery` refuses to create more than this
-/// many with the `ServiceQuotaExceededException` it models ("This request exceeds a service
-/// quota") rather than growing without bound on request.
+/// THE EMULATOR'S OWN CEILING on the deliveries this store holds, across every Region, not a
+/// quota cited from AWS: each delivery keeps its configuration and tag set in memory for as
+/// long as the process runs and nothing expires one, so `CreateDelivery` refuses to create more
+/// than this many with the `ServiceQuotaExceededException` it models ("This request exceeds a
+/// service quota") rather than growing without bound on request.
 pub const MAX_DELIVERIES: usize = 1_000;
 
 /// The refusal CloudWatch Logs answers a delivery operation with when the `id` it names is
@@ -2285,11 +2411,11 @@ pub const TRACE_DELIVERY_DESTINATION_TYPE: &str = "XRAY";
 /// `destinationResourceArn` must name a log group.
 const CLOUDWATCH_LOGS_VENDOR: &str = "logs";
 
-/// THE EMULATOR'S OWN CEILING on the delivery destinations one account holds, not a quota
-/// cited from AWS: each destination keeps its configuration and tag set in memory for as
-/// long as the process runs and nothing expires one, so `PutDeliveryDestination` refuses to
-/// CREATE more than this many with the `ServiceQuotaExceededException` it models ("This
-/// request exceeds a service quota") rather than growing without bound on request. A put
+/// THE EMULATOR'S OWN CEILING on the delivery destinations this store holds, across every
+/// Region, not a quota cited from AWS: each destination keeps its configuration and tag set in
+/// memory for as long as the process runs and nothing expires one, so `PutDeliveryDestination`
+/// refuses to CREATE more than this many with the `ServiceQuotaExceededException` it models
+/// ("This request exceeds a service quota") rather than growing without bound on request. A put
 /// that UPDATES a destination already stored is never refused by it: it adds nothing.
 pub const MAX_DELIVERY_DESTINATIONS: usize = 1_000;
 
@@ -2339,9 +2465,9 @@ pub fn check_destination_resource_arn(arn: &str) -> Result<&'static str, String>
 /// `GetDeliveryDestination` answers from state alone.
 #[derive(Debug, Clone)]
 pub struct DeliveryDestinationRecord {
-    /// `DeliveryDestination$name` — "The name of this delivery destination." Also the key
-    /// the store enumerates by, because the name "must be unique for all delivery
-    /// destinations in your account".
+    /// `DeliveryDestination$name` — "The name of this delivery destination." Also the name
+    /// half of the key the store holds it under ([`RegionalKey`]), because the name "must be
+    /// unique for all delivery destinations in your account".
     pub name: String,
     /// `DeliveryDestination$arn` — "The Amazon Resource Name (ARN) that uniquely identifies
     /// this delivery destination", as [`delivery_destination_arn`] builds it.
@@ -2439,12 +2565,12 @@ pub fn delivery_destination_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("logs", region, &format!("delivery-destination:{name}"))
 }
 
-/// THE EMULATOR'S OWN CEILING on the delivery sources one account holds, not a quota cited
-/// from AWS: each source keeps its configuration and tag set in memory for as long as the
-/// process runs and nothing expires one, so `PutDeliverySource` refuses to CREATE more than
-/// this many with the `ServiceQuotaExceededException` it models ("This request exceeds a
-/// service quota") rather than growing without bound on request. A put that UPDATES a source
-/// already stored is never refused by it: it adds nothing.
+/// THE EMULATOR'S OWN CEILING on the delivery sources this store holds, across every Region,
+/// not a quota cited from AWS: each source keeps its configuration and tag set in memory for as
+/// long as the process runs and nothing expires one, so `PutDeliverySource` refuses to CREATE
+/// more than this many with the `ServiceQuotaExceededException` it models ("This request
+/// exceeds a service quota") rather than growing without bound on request. A put that UPDATES a
+/// source already stored is never refused by it: it adds nothing.
 pub const MAX_DELIVERY_SOURCES: usize = 1_000;
 
 /// One delivery source — "a logical object that represents the resource that is actually
@@ -2452,9 +2578,9 @@ pub const MAX_DELIVERY_SOURCES: usize = 1_000;
 /// reported from this record, so `GetDeliverySource` answers from state alone.
 #[derive(Debug, Clone)]
 pub struct DeliverySourceRecord {
-    /// `DeliverySource$name` — "The unique name of the delivery source." Also the key the
-    /// store enumerates by, because the name "must be unique for all delivery sources in your
-    /// account".
+    /// `DeliverySource$name` — "The unique name of the delivery source." Also the name half
+    /// of the key the store holds it under ([`RegionalKey`]), because the name "must be unique
+    /// for all delivery sources in your account".
     pub name: String,
     /// `DeliverySource$arn` — "The Amazon Resource Name (ARN) that uniquely identifies this
     /// delivery source", as [`delivery_source_arn`] builds it.
@@ -6504,11 +6630,13 @@ pub enum TaggedResource {
     LogGroup(String),
     /// One logical destination, by the `Destination$destinationName` it is created under.
     Destination(String),
-    /// One delivery, by the `Delivery$id` the store is keyed by.
+    /// One delivery, by the `Delivery$id` it was minted with in the Region that holds it.
     Delivery(String),
-    /// One delivery source, by the `DeliverySource$name` the store is keyed by.
+    /// One delivery source, by the `DeliverySource$name` it was created under in the Region
+    /// that holds it.
     DeliverySource(String),
-    /// One delivery destination, by the `DeliveryDestination$name` the store is keyed by.
+    /// One delivery destination, by the `DeliveryDestination$name` it was created under in the
+    /// Region that holds it.
     DeliveryDestination(String),
 }
 

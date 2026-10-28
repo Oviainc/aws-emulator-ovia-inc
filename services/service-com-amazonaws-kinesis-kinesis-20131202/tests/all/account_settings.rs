@@ -50,7 +50,7 @@ const COMMITMENT: &str = "MinimumThroughputBillingCommitment";
 
 /// How close two instants have to be to count as the same epoch-seconds timestamp, which a
 /// `Timestamp` travels as on the wire.
-const TIMESTAMP_TOLERANCE: f64 = 1.0;
+pub(crate) const TIMESTAMP_TOLERANCE: f64 = 1.0;
 
 /// One row of the transition table: the statuses a sequence of updates asks for, in order,
 /// and what the commitment carries once the last of them is stored.
@@ -164,7 +164,7 @@ async fn described_in(emulator: &Emulator, case: &str, region: &str) -> Value {
 }
 
 /// The commitment `DescribeAccountSettings` reports in the default test region.
-async fn described(emulator: &Emulator, case: &str) -> Value {
+pub(crate) async fn described(emulator: &Emulator, case: &str) -> Value {
     described_in(emulator, case, REGION).await
 }
 
@@ -176,7 +176,7 @@ fn commitment_of(case: &str, operation: &str, response: &Value) -> Value {
 }
 
 /// The `Status` a reported commitment carries.
-fn status_of(commitment: &Value) -> String {
+pub(crate) fn status_of(commitment: &Value) -> String {
     commitment
         .get("Status")
         .and_then(Value::as_str)
@@ -186,12 +186,12 @@ fn status_of(commitment: &Value) -> String {
 
 /// The epoch seconds a reported commitment carries under `member`, `None` when it carries
 /// none.
-fn instant_of(commitment: &Value, member: &str) -> Option<f64> {
+pub(crate) fn instant_of(commitment: &Value, member: &str) -> Option<f64> {
     commitment.get(member).and_then(Value::as_f64)
 }
 
 /// Epoch seconds at `at`, the unit a `Timestamp` travels as on the wire.
-fn epoch_seconds(at: SystemTime) -> f64 {
+pub(crate) fn epoch_seconds(at: SystemTime) -> f64 {
     at.duration_since(SystemTime::UNIX_EPOCH)
         .map(|since| since.as_secs_f64())
         .unwrap_or_default()

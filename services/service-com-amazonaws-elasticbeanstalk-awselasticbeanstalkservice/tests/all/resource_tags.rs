@@ -27,7 +27,7 @@ use crate::lifecycle::{account, Answer, Emulator, PAST_DUE, TEST_REGION};
 /// not promise. Each element's text is read with the XML entities resolved, so a tag
 /// carrying `&`, `<`, `>`, `"` or `'` is compared against what was sent and an
 /// envelope that failed to escape one is caught rather than silently reparsed.
-fn listed_tags(answer: &Answer) -> Vec<(String, String)> {
+pub(crate) fn listed_tags(answer: &Answer) -> Vec<(String, String)> {
     let keys = answer.values_at("ResourceTags/member/Key");
     let values = answer.values_at("ResourceTags/member/Value");
     assert_eq!(
@@ -48,7 +48,7 @@ fn listed_tags(answer: &Answer) -> Vec<(String, String)> {
 /// `text` with the five predefined XML entities resolved. The harness reads the raw
 /// slice between two tags, so this is what turns an escaped element back into the
 /// value the caller supplied.
-fn xml_unescaped(text: &str) -> String {
+pub(crate) fn xml_unescaped(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -59,7 +59,7 @@ fn xml_unescaped(text: &str) -> String {
 }
 
 /// `tags` sorted the same way, for comparison with [`listed_tags`].
-fn expected_tags(tags: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn expected_tags(tags: &[(String, String)]) -> Vec<(String, String)> {
     let mut pairs = tags.to_vec();
     pairs.sort();
     pairs
@@ -68,7 +68,7 @@ fn expected_tags(tags: &[(String, String)]) -> Vec<(String, String)> {
 /// The awsQuery form parameters that apply `tags` at creation
 /// (`Tags.member.<n>.Key` / `Tags.member.<n>.Value`: the `Tags` list's member is
 /// unnamed in the model, so it serializes as `member`).
-fn tag_params(tags: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn tag_params(tags: &[(String, String)]) -> Vec<(String, String)> {
     let mut params = Vec::with_capacity(tags.len() * 2);
     for (index, (key, value)) in tags.iter().enumerate() {
         let position = index + 1;
@@ -79,7 +79,7 @@ fn tag_params(tags: &[(String, String)]) -> Vec<(String, String)> {
 }
 
 /// Borrow an owned parameter list for [`Emulator::call`].
-fn as_params(params: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn as_params(params: &[(String, String)]) -> Vec<(&str, &str)> {
     params
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
@@ -87,7 +87,7 @@ fn as_params(params: &[(String, String)]) -> Vec<(&str, &str)> {
 }
 
 /// A tag pair, as the table rows write them.
-fn tag(key: &str, value: &str) -> (String, String) {
+pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -131,7 +131,12 @@ fn row_in(
 /// Ask for `arn`'s tags and assert they are exactly `tags`, that the answer echoes
 /// the ARN asked about, and that asking twice answers the same — a read must not
 /// change what the next caller sees.
-async fn assert_tags(emulator: &Emulator, case: &str, arn: &str, tags: &[(String, String)]) {
+pub(crate) async fn assert_tags(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+    tags: &[(String, String)],
+) {
     let listed = emulator
         .call("ListTagsForResource", &[("ResourceArn", arn)])
         .await;
@@ -583,7 +588,7 @@ async fn an_arn_that_names_no_taggable_resource_is_refused() {
             "ResourceNotFoundException",
         ),
         (
-            "a custom platform version, which no implemented operation creates",
+            "a custom platform version this account never created",
             format!("{eb}:platform/custom-platform/1.0.3"),
             "ResourceNotFoundException",
         ),

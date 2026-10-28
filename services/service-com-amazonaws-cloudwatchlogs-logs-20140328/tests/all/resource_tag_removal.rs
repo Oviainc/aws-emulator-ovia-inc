@@ -30,7 +30,7 @@ use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     delivery_arn, log_group_arn, ComAmazonawsCloudwatchlogsLogs20140328State, DeliveryRecord,
-    MAX_TAGS_PER_RESOURCE,
+    RegionalKey, MAX_TAGS_PER_RESOURCE,
 };
 
 use crate::harness::{Logs, REGION};
@@ -299,7 +299,7 @@ async fn a_removal_touches_only_the_resource_its_arn_names() {
             .state::<ComAmazonawsCloudwatchlogsLogs20140328State>();
         let mut store = state.lock();
         store.deliveries.insert(
-            delivery_id.to_string(),
+            RegionalKey::new(REGION, delivery_id),
             DeliveryRecord::new(
                 delivery_id,
                 REGION,

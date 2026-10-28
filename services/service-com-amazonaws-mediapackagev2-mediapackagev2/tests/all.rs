@@ -94,3 +94,5 @@ mod quota_refusal_form;
 mod no_op_write_commits_nothing;
 #[path = "all/shared_entity_tag_precondition.rs"]
 mod shared_entity_tag_precondition;
+#[path = "all/shared_manifest_count_builder.rs"]
+mod shared_manifest_count_builder;

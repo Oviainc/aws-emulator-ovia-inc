@@ -178,9 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This call names its target by log group name alone, so nothing here is read off
-        // the request metadata `ctx` carries.
-        let _ = ctx;
+        // This call names its target by log group name alone; the Region the request was
+        // signed for is what scopes the lookup for the resource kinds that are keyed by it.
+        let region = crate::state::request_region(ctx.parts());
 
         // "The key-value pairs to use for the tags" are the caller's own, and the reserved
         // namespace is not: a request naming a key in it is "a parameter specified
@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Adds or updates the specified tags for the specified log group": there is no tag
         // set to add to until that group exists.
-        let Some(stored) = store.resource_tags_mut(&resource) else {
+        let Some(stored) = store.resource_tags_mut(&region, &resource) else {
             return Err(TagLogGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(resource.kind())),

@@ -164,9 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; a delivery source is identified by its own
-        // name and by nothing about the request.
-        let _ = ctx;
+        // A delivery source is a regional resource, so the source this delete addresses is the
+        // one the Region the request was signed for holds under that name.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteDeliverySourceError::from(
@@ -179,10 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // A name this account holds no delivery source under names no source, which is the
+        // A name this Region holds no delivery source under names no source, which is the
         // modelled not-found refusal — so deleting the same source twice refuses the second
-        // time.
-        if !store.delivery_sources.contains_key(&input.name) {
+        // time, and so does a delete addressed to a Region that holds none under the name.
+        if store.delivery_source(&region, &input.name).is_none() {
             return Err(
                 DeleteDeliverySourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -196,12 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "You can't delete a delivery source if any current deliveries are associated with
         // it": a delivery names its source by the name it is stored under, so the deliveries
-        // the store holds are what answers that. The refusal is the error class's fixed
+        // this Region holds are what answers that. The refusal is the error class's fixed
         // in-use text, which names no delivery — the caller finds every delivery that
         // references this source through DescribeDeliveries.
         if store
-            .deliveries
-            .values()
+            .deliveries_in(&region)
             .any(|delivery| delivery.delivery_source_name == input.name)
         {
             return Err(DeleteDeliverySourceErrorModeled::ConflictException(
@@ -213,7 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        store.delivery_sources.remove(&input.name);
+        store
+            .delivery_sources
+            .remove(&crate::state::RegionalKey::new(&region, &input.name));
 
         Ok(DeleteDeliverySourceOutput)
     }

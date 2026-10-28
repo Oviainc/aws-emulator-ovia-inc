@@ -481,14 +481,22 @@ async fn gateway_lifecycle_round_trips_through_the_store() {
         "case get: LastSeenTime must be a timestamp, got {:?}",
         fetched.body
     );
-    for absent in ["/Gateway/HypervisorId", "/Gateway/MaintenanceStartTime"] {
-        assert!(
-            fetched.body.pointer(absent).is_none(),
-            "case get {absent}: a gateway with no hypervisor and no maintenance window \
-             must omit it, got {:?}",
-            fetched.body
-        );
-    }
+    assert!(
+        fetched.body.pointer("/Gateway/HypervisorId").is_none(),
+        "case get /Gateway/HypervisorId: a gateway associated with no hypervisor must omit \
+         it, got {:?}",
+        fetched.body
+    );
+    // An activated gateway always has a maintenance window, so a gateway no
+    // `PutMaintenanceStartTime` has touched reports the one its activation assigned
+    // (see the `default_maintenance_window` suite for the rule over a table of creates).
+    assert_eq!(
+        fetched.body.pointer("/Gateway/MaintenanceStartTime"),
+        Some(&crate::default_maintenance_window::default_window()),
+        "case get /Gateway/MaintenanceStartTime: a gateway must report the window its \
+         activation assigned, got {:?}",
+        fetched.body
+    );
 
     let listed = call(&router, "ListGateways", &json!({})).await;
     assert_eq!(

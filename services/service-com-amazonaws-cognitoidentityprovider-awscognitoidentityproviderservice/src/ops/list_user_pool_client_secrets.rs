@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUserPoolClientSecrets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUserPoolClientSecrets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUserPoolClientSecrets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the client secrets an app client of a user pool holds, rendered from the
+//! STORED secrets and never carrying a secret's value.
 //!
 //! ## Shape of an operation
 //!
@@ -164,20 +157,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUserPoolClientSecrets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUserPoolClientSecretsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUserPoolClientSecrets"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let guard = state.lock();
+
+        // The request names both the pool and the app client of it whose secrets are
+        // listed, so a `ClientId` that names a client of ANOTHER pool is as absent as
+        // one no create minted.
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let client = pool
+            .clients
+            .get(&input.client_id)
+            .ok_or_else(|| client_not_found(&input.client_id))?;
+
+        // Rendered from the STORED secrets, in the order the app client holds them
+        // (oldest first): this read changes nothing. No descriptor carries a value —
+        // "for security reasons, the response never reveals the actual secret value in
+        // ClientSecretValue" (this operation in this service's model) — and an app
+        // client that holds no secret is reported with a PRESENT, empty list.
+        let client_secrets: Vec<ClientSecretDescriptorType> = client
+            .client_secrets
+            .iter()
+            .map(crate::state::ClientSecret::to_client_secret_descriptor_type)
+            .collect();
+
+        // "The response does not include pagination tokens as there are only 2 secrets
+        // at any given time and we return both with every ListUserPoolClientSecrets
+        // call" (this operation in this service's model): every call serves the whole
+        // set an app client holds, so no call issues a token and a `NextToken` a caller
+        // presents names no narrower page of it.
+        Ok(ListUserPoolClientSecretsOutput {
+            client_secrets: Some(client_secrets),
+            next_token: None,
+        })
     }
 }
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> ListUserPoolClientSecretsError {
+    ListUserPoolClientSecretsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
+/// holds no app client for.
+fn client_not_found(client_id: &str) -> ListUserPoolClientSecretsError {
+    ListUserPoolClientSecretsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListUserPoolClientSecretsError {
+    ListUserPoolClientSecretsErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

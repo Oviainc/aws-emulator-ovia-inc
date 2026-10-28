@@ -26,9 +26,7 @@
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. S3 answers every one of them with one of its OWN
 //!   error codes (see `s3_refusal`), never the framework's generic
-//!   `ValidationException`, because a client branches on the S3 code — and a request
-//!   whose SIGNATURE did not verify is refused in AWS's own words (see
-//!   `signature_refusal`).
+//!   `ValidationException`, because a client branches on the S3 code.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. S3's SELECT data plane is the one such request
 //!   this service words itself: no routing-table entry claims `?select`, and S3
@@ -47,188 +45,36 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The one refusal this service answers in its OWN envelope
+//!
+//! An AUTHENTICATION refusal is the exception, and it is why this file implements
+//! [`smithy_server_runtime::ErasedServiceDefinition`] over the generated entry rather than
+//! handing the entry back bare: every model-derived datum is delegated to the entry
+//! unchanged, and the one method that is not is `refusal_response`, the renderer the
+//! framework calls for a caller authentication refused. The `override_refusal` seam cannot
+//! word that one, because the answer it returns is a code and a sentence — and S3's
+//! authentication refusals differ from the framework's rendering in two further ways that a
+//! client reads: the STATUS (a presigned URL whose query string cannot be used is a `400`,
+//! not a `403`) and the ELEMENTS (a signature mismatch carries the SigV4 signing
+//! diagnostics beside its code and message). [`sigv4`] holds that rule; a refusal it
+//! declines to word still renders through the entry's own protocol-correct default.
 
+pub mod sigv4;
 pub mod wire;
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable, Refusal, Refused,
+    ServerHttpProtocol, Service, ServiceIdentity,
 };
-use std::cell::RefCell;
 use std::sync::Arc;
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use aws_smithy_schema_server::protocol::ServerProtocol;
+use aws_smithy_schema_server::ProtocolError;
 
 use wire::UnwrappedXmlRestXml;
-
-/// The error code AWS answers a request whose access key id DOES resolve but whose
-/// signature does not verify under that credential's secret: the credential was found, so
-/// the caller is known; what failed is the signature.
-const SIGNATURE_MISMATCH_CODE: &str = "SignatureDoesNotMatch";
-
-/// How the SigV4 signing layer words that refusal for this service — the fixed sentence it
-/// produces for this one condition, which tells the caller to look at the key and the
-/// signing method rather than at the request.
-const SIGNATURE_MISMATCH_MESSAGE: &str =
-    "The request signature we calculated does not match the signature you provided. Check \
-     your key and signing method.";
-
-thread_local! {
-    /// The credential the request this service is serving presented, for the length of that
-    /// one request.
-    ///
-    /// Not state: a request-scoped note, needed because the two seams that decide an
-    /// authentication refusal see different halves of it. [`Service::can_handle`] is handed
-    /// the request and records it here; [`Service::override_refusal`] is handed only the
-    /// STRUCTURAL refusal — `Refusal::Unauthenticated`, which says that authentication
-    /// refused the caller and nothing about WHICH condition refused it — and has to tell a
-    /// signature that did not verify from the conditions AWS words differently. The
-    /// framework calls both within one synchronous stretch of the one dispatch, on the
-    /// thread that dispatch is running on, so the value a refusal reads is the one the claim
-    /// of that same request recorded.
-    static PRESENTED_CREDENTIAL: RefCell<Option<PresentedCredential>> =
-        const { RefCell::new(None) };
-}
-
-/// What a refusal needs to know about the credential a request presented.
-struct PresentedCredential {
-    /// The access key id it named, however it travelled ([`presented_access_key_id`]).
-    access_key_id: String,
-    /// Whether it is a PRESIGNED request whose validity window has already passed
-    /// ([`presigned_window_passed`]).
-    presigned_window_passed: bool,
-}
-
-/// Record the credential `parts` presented as the one this thread is serving.
-fn remember_presented_credential(parts: &http::request::Parts) {
-    let presented = PresentedCredential {
-        access_key_id: presented_access_key_id(parts),
-        presigned_window_passed: presigned_window_passed(parts),
-    };
-    PRESENTED_CREDENTIAL.with(|recorded| {
-        *recorded.borrow_mut() = Some(presented);
-    });
-}
-
-/// The access key id `parts` presented, however it travelled.
-///
-/// A signed request carries it in the `Credential` field of its `Authorization` header, and
-/// a PRESIGNED one in the `X-Amz-Credential` query parameter instead —
-/// "`X-Amz-Credential`: … `<your-access-key-id>/<date>/<AWS Region>/<AWS
-/// service>/aws4_request`" (AWS General Reference, *Authenticating requests: using query
-/// parameters*) — so both forms are read, and the key id is the scope's first element in
-/// either.
-fn presented_access_key_id(parts: &http::request::Parts) -> String {
-    if parts.headers.contains_key(http::header::AUTHORIZATION) {
-        return ::engine::extract_akid(&parts.headers);
-    }
-    presigned_parameter(parts, PRESIGNED_CREDENTIAL_PARAMETER)
-        .and_then(|scope| {
-            scope
-                .split('/')
-                .next()
-                .filter(|key_id| !key_id.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
-}
-
-/// The value of the presigned query parameter `name`, percent-decoded — a presigned URL
-/// encodes the separators of the values it carries.
-fn presigned_parameter(parts: &http::request::Parts, name: &str) -> Option<String> {
-    let decode = |text: &str| {
-        ::percent_encoding::percent_decode_str(text)
-            .decode_utf8_lossy()
-            .into_owned()
-    };
-    parts
-        .uri
-        .query()
-        .unwrap_or_default()
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(parameter, _)| decode(parameter) == name)
-        .map(|(_, value)| decode(value))
-}
-
-/// Whether `parts` is a PRESIGNED request whose validity window has already passed.
-///
-/// A presigned URL carries the instant it was signed at (`X-Amz-Date`) and how long it is
-/// valid for (`X-Amz-Expires`, in seconds, at most [`MAX_PRESIGNED_EXPIRES_SECS`]), and AWS
-/// refuses one past that window for the EXPIRY — not for the signature, which is intact.
-/// The framework's authentication refuses both conditions through the same structural
-/// refusal, so this is what keeps an expired URL from being re-worded as a signature
-/// mismatch. A request that is not presigned, or whose window cannot be read, is not an
-/// expired one.
-fn presigned_window_passed(parts: &http::request::Parts) -> bool {
-    let signed_at = presigned_parameter(parts, PRESIGNED_DATE_PARAMETER)
-        .as_deref()
-        .and_then(amz_instant);
-    let expires_secs = presigned_parameter(parts, PRESIGNED_EXPIRES_PARAMETER)
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let (Some(signed_at), Some(expires_secs)) = (signed_at, expires_secs) else {
-        return false;
-    };
-    if expires_secs > MAX_PRESIGNED_EXPIRES_SECS {
-        return true;
-    }
-    signed_at
-        .checked_add(::std::time::Duration::from_secs(expires_secs))
-        .is_none_or(|valid_until| valid_until < ::std::time::SystemTime::now())
-}
-
-/// The instant the SigV4 stamp `YYYYMMDDTHHMMSSZ` names.
-///
-/// Parsed by the library's own RFC 3339 reader rather than by any calendar arithmetic
-/// written here: SigV4's basic form differs from RFC 3339 only in the separators it omits,
-/// so they are put back and the timestamp type reads it. `None` for anything that is not
-/// that form, which is why the digit check precedes the split.
-fn amz_instant(stamp: &str) -> Option<::std::time::SystemTime> {
-    let (date, time) = stamp.strip_suffix('Z')?.split_once('T')?;
-    if date.len() != 8 || time.len() != 6 {
-        return None;
-    }
-    if !date.chars().chain(time.chars()).all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let rfc3339 = format!(
-        "{}-{}-{}T{}:{}:{}Z",
-        &date[..4],
-        &date[4..6],
-        &date[6..],
-        &time[..2],
-        &time[2..4],
-        &time[4..]
-    );
-    let parsed = ::aws_smithy_types::DateTime::from_str(
-        &rfc3339,
-        ::aws_smithy_types::date_time::Format::DateTime,
-    )
-    .ok()?;
-    ::std::time::SystemTime::try_from(parsed).ok()
-}
-
-/// The query parameter a presigned URL carries its credential scope in.
-const PRESIGNED_CREDENTIAL_PARAMETER: &str = "X-Amz-Credential";
-
-/// The query parameter a presigned URL carries its signing instant in.
-const PRESIGNED_DATE_PARAMETER: &str = "X-Amz-Date";
-
-/// The query parameter a presigned URL carries its validity, in seconds, in.
-const PRESIGNED_EXPIRES_PARAMETER: &str = "X-Amz-Expires";
-
-/// The longest validity AWS accepts for a presigned URL: seven days (AWS General Reference,
-/// *Authenticating requests: using query parameters* — "the maximum expiration time is one
-/// week"). A URL asking for more is outside the window from the moment it is made.
-const MAX_PRESIGNED_EXPIRES_SECS: u64 = 7 * 24 * 60 * 60;
-
-/// The credential recorded by [`remember_presented_credential`] for the request this thread
-/// is serving, TAKEN: the note is request-scoped, so reading it is what ends it. A later
-/// refusal on this thread that was not preceded by this service's own claim then reads no
-/// credential at all rather than the previous request's.
-fn presented_credential() -> Option<PresentedCredential> {
-    PRESENTED_CREDENTIAL.with(|presented| presented.borrow_mut().take())
-}
 
 /// The first URI path segments another emulated service that SHARES S3's `s3` SigV4
 /// signing name owns, and which S3 must therefore not claim.
@@ -746,30 +592,35 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             .is_some_and(|state| state.lock().holds_vended_session(access_key_id))
     }
 
-    /// How this service words a request whose SIGNATURE did not verify, or `None` for an
-    /// authentication refusal that is not that one.
+    /// How this service answers the AUTHENTICATION refusal of the request it is serving, or
+    /// `None` for a refusal this service does not word — which keeps the framework's own.
     ///
     /// The framework's structural refusal says only that authentication refused the caller,
-    /// so which refusal it is follows from what the request presented. A key id this
-    /// emulator ISSUED resolves to a principal, so the only thing left for authentication to
-    /// have refused is the signature computed under that credential's secret — the condition
-    /// AWS answers with [`SIGNATURE_MISMATCH_CODE`] and the fixed sentence above, which a
-    /// CLI, an SDK and a signing runbook all match on.
+    /// so which refusal it is follows from what the REQUEST presented, which [`sigv4`] read
+    /// once for this request and answers from. Rendered through THIS service's own protocol,
+    /// in the same channel every other refusal of this service goes out in, so the envelope
+    /// a client parses — the bare `<Error>` root with its `<Code>`, `<Message>` and
+    /// request-correlation elements, and the matching `x-amz-request-id` / `x-amz-id-2`
+    /// headers — is the one it already reads; the one difference is the elements S3 carries
+    /// INSIDE it for a signature mismatch, and the status it answers an unusable
+    /// query string with.
     ///
-    /// Two cases keep the framework's own wording, because neither is a signature that did
-    /// not verify: a key id that resolves to nothing (the credential was refused, not the
-    /// signature), and a presigned URL whose validity window has passed — AWS refuses that
-    /// one for the EXPIRY, with its signature intact.
-    fn signature_refusal(&self) -> Option<Refused> {
-        let presented = presented_credential()?;
-        if presented.presigned_window_passed {
-            return None;
-        }
-        self.issued_credential(&presented.access_key_id)
-            .then(|| Refused {
-                code: SIGNATURE_MISMATCH_CODE.to_string(),
-                message: SIGNATURE_MISMATCH_MESSAGE.to_string(),
-            })
+    /// `None` also on the serializer failure fixed text cannot actually provoke, which
+    /// leaves the framework's own refusal to answer rather than panicking in the request
+    /// path.
+    fn authentication_refusal_response(&self) -> Option<RtResponse> {
+        let presented = sigv4::presented()?;
+        let refusal = sigv4::refusal_for(&presented, &|access_key_id| {
+            self.issued_credential(access_key_id)
+        })?;
+        self.protocol
+            .serialize_error(
+                &refusal,
+                &sigv4::REFUSAL_SCHEMA,
+                refusal.code,
+                refusal.status,
+            )
+            .ok()
     }
 
     /// The refusal S3 answers a request against a resource it does not serve at all:
@@ -806,11 +657,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
-    fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
+    fn definition(&self) -> &dyn ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
-        // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
-        &self.entry
+        // table, and the default error renderers — lives in the generated entry, which
+        // the implementation below delegates every one of them to, UNCHANGED. The one
+        // exception is the renderer for an AUTHENTICATION refusal, which S3 answers with
+        // its own status and its own elements; see this file's header and [`sigv4`]. Do
+        // not edit the entry.
+        self
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
@@ -859,19 +713,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // judgement, exactly as for the SigV4 query form.
             None => carries_legacy_presigned_credential(&parts.uri),
         };
-        if claimed {
-            // The credential this request presented, kept for the length of the request so
-            // an authentication refusal can be worded for the condition that refused it;
-            // see [`PRESENTED_CREDENTIAL`].
-            remember_presented_credential(parts);
-        }
         claimed
     }
 
     fn override_operation(
         &self,
-        req: &aws_smithy_runtime_api::http::Request,
+        req: &RtRequest,
     ) -> Option<&dyn ErasedOperation> {
+        // What this request presented to authentication, kept for the length of the
+        // request so a refusal of it can be worded for the condition that refused it (see
+        // [`sigv4`]). Recorded HERE because this is the seam the framework reaches with the
+        // whole request — its body included, which is what the payload half of a canonical
+        // request is built from — and it reaches it BEFORE it authenticates, for the one
+        // service that claimed the request.
+        sigv4::remember(req);
         // A VIRTUAL-HOSTED-STYLE request names its bucket in the host, so its path is the
         // key alone — `GET /key-name` — which the model's routing table cannot name: every
         // route of this service begins with the `{Bucket}` label, so the key would be read
@@ -913,10 +768,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // reports one code.
         match refusal {
             Refusal::Invalid(violations) => violations.first().map(s3_refusal),
-            // A caller whose SIGNATURE did not verify is told so in AWS's own words
-            // ([`Self::signature_refusal`]); every other authentication refusal, and any
-            // refusal kind added later, keeps the framework's wording.
-            Refusal::Unauthenticated => self.signature_refusal(),
+            // An AUTHENTICATION refusal is worded in
+            // [`Self::authentication_refusal_response`] instead, which this seam cannot
+            // reach: S3's answer to one differs from the framework's rendering in its
+            // STATUS and in the ELEMENTS it carries, and neither travels on a [`Refused`].
+            // Declining here leaves the framework's own code and message for the renderer
+            // to fall back on, which is what a refusal this service does not word keeps.
             _ => None,
         }
     }
@@ -964,8 +821,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_framework_error(
         &self,
-        error: &aws_smithy_schema_server::ProtocolError,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
+        error: &ProtocolError,
+    ) -> Option<RtResponse> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
         // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
@@ -974,5 +831,49 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// The model-derived half of this service, DELEGATED to the generated entry — every datum
+/// baked at codegen is read off it, so nothing here can drift from the model — with the one
+/// renderer this service owns.
+///
+/// `refusal_response` is that renderer, and it is the reason this file implements the trait
+/// at all rather than handing the entry back bare: it is the only place an AUTHENTICATION
+/// refusal's STATUS and ELEMENTS can be chosen, and S3 chooses both (see the file header and
+/// [`sigv4`]). Everything else is the entry's.
+impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for EmulatedService<Eng> {
+    fn identity(&self) -> &ServiceIdentity {
+        self.entry.identity()
+    }
+
+    fn protocol(&self) -> &dyn ServerHttpProtocol {
+        self.entry.protocol()
+    }
+
+    fn routing_table(&self) -> &OperationRoutingTable {
+        self.entry.routing_table()
+    }
+
+    fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
+        self.entry.routing_error_response(req)
+    }
+
+    fn framework_error_response(&self, error: ProtocolError) -> RtResponse {
+        self.entry.framework_error_response(error)
+    }
+
+    fn refusal_response(&self, error: ProtocolError, chosen: Option<Refused>) -> RtResponse {
+        // The ONE refusal the framework renders through here is the authentication one: a
+        // caller it refused before any handler ran, which this service words itself.
+        // Anything else — and an authentication refusal this service declines to word — falls
+        // through to the ENTRY's renderer, `chosen` included, so a wording chosen through
+        // `override_refusal` is never dropped on the way past.
+        if matches!(error, ProtocolError::Unauthenticated { .. }) {
+            if let Some(response) = self.authentication_refusal_response() {
+                return response;
+            }
+        }
+        self.entry.refusal_response(error, chosen)
     }
 }

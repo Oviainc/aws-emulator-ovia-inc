@@ -81,6 +81,12 @@ mod method_integration;
 mod method_response;
 #[path = "all/patch_updates.rs"]
 mod patch_updates;
+// A REST API's own resource policy on the `execute-api` data plane: which requests to a
+// deployed stage the document admits, and the `403` the `execute-api:Invoke` authorization
+// sentence refuses the rest with — the gate a PRIVATE api pinned to one of its interface VPC
+// endpoints is reached through.
+#[path = "all/private_api_resource_policy.rs"]
+mod private_api_resource_policy;
 #[path = "all/query_value_coercion.rs"]
 mod query_value_coercion;
 #[path = "all/request_validator_lifecycle.rs"]
