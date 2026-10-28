@@ -320,7 +320,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(kms_key_identifier)
             };
         }
-        // `RoleArn` is a required member of this request, so every update sets it.
+        // `RoleArn` is a required member of this request, so every update sets it. What
+        // the pipe DOES under it is decided from this record on every poller pass
+        // (`crate::state::execution_role`), so the next cycle's source poll and target
+        // delivery are authorized by the role this update stored and not by the one the
+        // pipe was created with — there is no execution context captured at create time
+        // to rebind.
         pipe.role_arn = input.role_arn.clone();
 
         // The desired state the request named, or the one the pipe already had: an

@@ -288,23 +288,58 @@ pub(crate) async fn receive_now(router: &MultiServiceRouter, url: &str) -> Vec<S
         .collect()
 }
 
-/// `ApproximateNumberOfMessages` of the queue at `url`.
-async fn visible(router: &MultiServiceRouter, url: &str) -> i64 {
+/// The sum of the queue attributes `attributes` names at the queue `url`, each read as the
+/// count it reports.
+///
+/// `pub(crate)` and taking the names, so a suite asking a different question of the same
+/// queue — how many records it HOLDS, which is the ones waiting on it plus the ones a
+/// consumer took and did not delete — asks it through this one read
+/// (`tests/all/pipe_execution_role.rs`).
+pub(crate) async fn counted(router: &MultiServiceRouter, url: &str, attributes: &[&str]) -> i64 {
     let (status, body) = sqs(
         router,
         "GetQueueAttributes",
-        &json!({ "QueueUrl": url, "AttributeNames": ["ApproximateNumberOfMessages"] }),
+        &json!({ "QueueUrl": url, "AttributeNames": attributes }),
     )
     .await;
     assert_eq!(
         status, 200,
         "case attributes {url}: GetQueueAttributes answered {status} {body}"
     );
-    body["Attributes"]["ApproximateNumberOfMessages"]
-        .as_str()
-        .unwrap_or_default()
-        .parse()
-        .unwrap_or(-1)
+    attributes
+        .iter()
+        .map(|attribute| {
+            body["Attributes"][attribute]
+                .as_str()
+                .unwrap_or_default()
+                .parse()
+                .unwrap_or(-1)
+        })
+        .sum()
+}
+
+/// `ApproximateNumberOfMessages` of the queue at `url`.
+async fn visible(router: &MultiServiceRouter, url: &str) -> i64 {
+    counted(router, url, &["ApproximateNumberOfMessages"]).await
+}
+
+/// Wait until the attributes `attributes` names at the queue `url` sum to `want`, answering
+/// what they summed to last.
+pub(crate) async fn wait_for_counted(
+    router: &MultiServiceRouter,
+    url: &str,
+    attributes: &[&str],
+    want: i64,
+    budget: Duration,
+) -> i64 {
+    let deadline = Instant::now() + budget;
+    loop {
+        let seen = counted(router, url, attributes).await;
+        if seen == want || Instant::now() >= deadline {
+            return seen;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
 }
 
 /// Wait until the queue at `url` reports `want` visible messages, answering what it
@@ -315,14 +350,14 @@ async fn wait_for_visible(
     want: i64,
     budget: Duration,
 ) -> i64 {
-    let deadline = Instant::now() + budget;
-    loop {
-        let seen = visible(router, url).await;
-        if seen == want || Instant::now() >= deadline {
-            return seen;
-        }
-        tokio::time::sleep(LOOK_AGAIN).await;
-    }
+    wait_for_counted(
+        router,
+        url,
+        &["ApproximateNumberOfMessages"],
+        want,
+        budget,
+    )
+    .await
 }
 
 /// `CreatePipe`, answered as the lifecycle harness reads a reply.
