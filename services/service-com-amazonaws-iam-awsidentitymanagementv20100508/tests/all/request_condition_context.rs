@@ -31,13 +31,13 @@ use crate::policy_simulation::{reported, simulate, ALLOWED, EXPLICIT_DENY, IMPLI
 use crate::user_lifecycle::{account_id, call, call_signed_by, element, elements, error_code, router};
 
 /// The ARN of an IAM user of this account.
-fn user_arn(user_name: &str) -> String {
+pub(crate) fn user_arn(user_name: &str) -> String {
     format!("arn:aws:iam::{}:user/{user_name}", account_id())
 }
 
 /// Create a user carrying `tags`, answering nothing: the fixture's own writes are made with
 /// the emulator's own credentials, which carry no identity-based policies.
-async fn create_user(
+pub(crate) async fn create_user(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,
@@ -67,7 +67,7 @@ async fn create_user(
 
 /// Mint an access key for `user_name`, answering the id a request signs with to speak for
 /// it.
-async fn access_key(router: &MultiServiceRouter, case: &str, user_name: &str) -> String {
+pub(crate) async fn access_key(router: &MultiServiceRouter, case: &str, user_name: &str) -> String {
     let (status, body) = call(router, "CreateAccessKey", &[("UserName", user_name)]).await;
     assert_eq!(
         status, 200,
@@ -78,7 +78,7 @@ async fn access_key(router: &MultiServiceRouter, case: &str, user_name: &str) ->
 }
 
 /// Put the inline policy `policy_name` on `user_name`.
-async fn put_policy(
+pub(crate) async fn put_policy(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,
@@ -104,7 +104,7 @@ async fn put_policy(
 
 /// The tags the account holds for `user_name`, read with the fixture's own credentials so
 /// the read is never the thing under test.
-async fn held_tags(
+pub(crate) async fn held_tags(
     router: &MultiServiceRouter,
     case: &str,
     user_name: &str,

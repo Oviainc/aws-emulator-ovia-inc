@@ -203,6 +203,9 @@ pub const UNTAG_ROLE: &str = "iam:UntagRole";
 /// `iam:TagInstanceProfile`.
 pub const TAG_INSTANCE_PROFILE: &str = "iam:TagInstanceProfile";
 
+/// `iam:UntagInstanceProfile`.
+pub const UNTAG_INSTANCE_PROFILE: &str = "iam:UntagInstanceProfile";
+
 /// `iam:TagOpenIDConnectProvider`.
 pub const TAG_OPEN_ID_CONNECT_PROVIDER: &str = "iam:TagOpenIDConnectProvider";
 
