@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccessPolicyDetail, AccountSettingsDetail, CapacityDetails, CapacityLimits, CollectionDetail,
+    AccessPolicyDetail, AccessPolicySummary, AccountSettingsDetail, CapacityDetails, CapacityLimits,
+    CollectionDetail,
     CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
     CollectionGroupErrorDetail, CollectionGroupStorageConfiguration, CollectionSummary,
     CreateCollectionDetail, CreateCollectionGroupDetail, CreateVpcEndpointDetail, CurrentCapacity,
@@ -1273,23 +1274,34 @@ fn policy_document_entries(
     }
 }
 
-/// One stored security policy as a listing sees it: the summary it reports, the
-/// `PolicyName` that is its place in the listing's order, and the resources its rules
-/// name. Built by [`SecurityPolicyRecord::listing_entry`] under the state lock and used
-/// after it is released.
+/// One stored policy as a listing sees it: the summary it reports, the `PolicyName` that
+/// is its place in the listing's order, and the resources its rules name. Built under the
+/// state lock ([`SecurityPolicyRecord::listing_entry`],
+/// [`AccessPolicyRecord::listing_entry`]) and used after it is released.
+///
+/// Generic over the summary shape because a policy listing is ONE rule whatever policy
+/// resource it enumerates: the policies of the one `type` the request names, ordered by
+/// `PolicyName`, narrowed by the `resource` filter and cut into pages. Only the modelled
+/// summary differs between them.
 #[derive(Debug, Clone)]
-pub struct SecurityPolicyListingEntry {
-    /// The `SecurityPolicySummary` the listing reports for this policy.
-    pub summary: SecurityPolicySummary,
+pub struct PolicyListingEntry<Summary> {
+    /// The modelled summary the listing reports for this policy.
+    pub summary: Summary,
     /// The `PolicyName`, which is this listing's page cursor.
     pub name: String,
     /// The resources the policy's rules name; see [`policy_document_resources`].
     pub resources: Vec<String>,
 }
 
-/// A security policy listing is of ONE `type` (the member is required), inside which the
+/// What `ListSecurityPolicies` pages over.
+pub type SecurityPolicyListingEntry = PolicyListingEntry<SecurityPolicySummary>;
+
+/// What `ListAccessPolicies` pages over.
+pub type AccessPolicyListingEntry = PolicyListingEntry<AccessPolicySummary>;
+
+/// A policy listing is of ONE `type` (the member is required), inside which the
 /// `PolicyName` is unique — so the name is this entry's place in that listing's order.
-impl Paged for SecurityPolicyListingEntry {
+impl<Summary> Paged for PolicyListingEntry<Summary> {
     fn page_cursor(&self) -> &str {
         &self.name
     }
@@ -1312,10 +1324,10 @@ impl Paged for SecurityPolicyListingEntry {
 /// work this one request performs, charged per comparison by
 /// [`resource_overlap_work`] — is capped by [`MAX_RESOURCE_FILTER_WORK`], which trips into
 /// the same refusal rather than running on.
-pub fn resource_filtered(
-    candidates: Vec<SecurityPolicyListingEntry>,
+pub fn resource_filtered<Summary>(
+    candidates: Vec<PolicyListingEntry<Summary>>,
     filter: &[String],
-) -> Result<Vec<SecurityPolicyListingEntry>, String> {
+) -> Result<Vec<PolicyListingEntry<Summary>>, String> {
     if filter.len() > MAX_RESOURCE_FILTER_ENTRIES {
         return Err(format!(
             "resource must name at most {MAX_RESOURCE_FILTER_ENTRIES} resources, got {}",
@@ -1600,6 +1612,35 @@ impl AccessPolicyRecord {
             policy: Some(self.policy.clone()),
             created_date: Some(self.created_date),
             last_modified_date: Some(self.last_modified_date),
+        }
+    }
+
+    /// The `AccessPolicySummary` body for this record — the shape `ListAccessPolicies`
+    /// pages over. It is `AccessPolicyDetail` without the policy document itself, so a
+    /// listing and a read cannot disagree about the members they share.
+    pub fn summary(&self) -> AccessPolicySummary {
+        AccessPolicySummary {
+            r#type: Some(self.kind.clone()),
+            name: Some(self.name.clone()),
+            policy_version: Some(self.policy_version.clone()),
+            description: self.description.clone(),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
+        }
+    }
+
+    /// What a listing needs of this record, COPIED OUT of the store, on the same terms as
+    /// [`SecurityPolicyRecord::listing_entry`]: taking the copy is the whole of the
+    /// listing's work under the state lock, so the `resource` filter's pattern matching
+    /// runs outside it.
+    ///
+    /// Bounded by construction: the store holds at most [`MAX_ACCESS_POLICIES`] records and
+    /// a document contributes at most [`MAX_POLICY_RESOURCES`] entries.
+    pub fn listing_entry(&self) -> AccessPolicyListingEntry {
+        AccessPolicyListingEntry {
+            summary: self.summary(),
+            name: self.name.clone(),
+            resources: policy_document_resources(&self.policy),
         }
     }
 
