@@ -252,3 +252,5 @@ mod delete_domain_name_access_association;
 mod base_path_mapping_collection;
 #[path = "all/test_invoke_method_data_plane_parity.rs"]
 mod test_invoke_method_data_plane_parity;
+#[path = "all/request_validator_precedes_the_integration.rs"]
+mod request_validator_precedes_the_integration;
