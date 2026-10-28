@@ -230,18 +230,16 @@ pub(crate) fn element(body: &str, tag: &str) -> String {
 ///
 /// A signed request names it in its SigV4 credential scope, and an unsigned one names no
 /// Region at all, which is served as the Region IAM's global endpoint is in — the same
-/// one. So a refusal's message names this Region whichever way a case presented its
-/// request.
+/// one.
 pub(crate) const HARNESS_REGION: &str = "us-east-1";
 
-/// The fixed path segment an `AccessDenied` message carries its authorization id
-/// after, in the console URL half of its closing sentence.
-const AUTHORIZATION_DETAILS_PATH: &str = "#/authorization-details/";
-
 /// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
-/// call, whose authorization-details URL names [`HARNESS_REGION`] — the Region IAM's
-/// global console lives in, and so the one every denial names. See
-/// [`assert_access_denied_message_in_region`], which takes that Region per call.
+/// call: one sentence naming the principal that signed it, the action it asked for and
+/// the resource the decision was made on, closed by `reason` (an explicit deny, or no
+/// policy allowing the action) and nothing further.
+///
+/// Every character of the message is a fact of the request and of the documents in force,
+/// so the whole of it is compared exactly — there is no part a case cannot predict.
 pub(crate) fn assert_access_denied_message(
     case: &str,
     actual: &str,
@@ -250,65 +248,14 @@ pub(crate) fn assert_access_denied_message(
     named_as: &str,
     reason: &str,
 ) {
-    assert_access_denied_message_in_region(
-        case,
-        actual,
-        HARNESS_REGION,
-        principal,
-        action,
-        named_as,
-        reason,
-    );
-}
-
-/// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
-/// call: the clause naming the principal, the action and the resource the decision was
-/// made on, then `reason` (an explicit deny, or no policy allowing the action), then the
-/// sentence pointing the caller at that one denial's authorization details — in the IAM
-/// console for `region`, and through the `GetRequestAuthorizationDetails` API.
-///
-/// `region` is the Region the message must NAME, which is the one IAM's global console
-/// lives in rather than the Region the request was signed for — a suite that varies the
-/// signing Region passes the same value on every row
-/// (`tests/all/identity_policy_enforcement.rs`).
-///
-/// The authorization id is minted per refused request, so it is not a value a case can
-/// predict: it is read back out of `actual` and asserted to be ONE id, spelled in the
-/// alphabet `GetRequestAuthorizationDetails$authorizationId` admits, carried in both of
-/// the places the sentence names it. Every other character of the message is compared
-/// exactly.
-pub(crate) fn assert_access_denied_message_in_region(
-    case: &str,
-    actual: &str,
-    region: &str,
-    principal: &str,
-    action: &str,
-    named_as: &str,
-    reason: &str,
-) {
-    let authorization_id = actual
-        .split_once(AUTHORIZATION_DETAILS_PATH)
-        .map(|(_, after)| after.split(' ').next().unwrap_or_default().to_string())
-        .unwrap_or_default();
-    assert!(
-        !authorization_id.is_empty()
-            && authorization_id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase()),
-        "case {case:?}: expected the refusal to hand the caller an authorization id spelled \
-         in lowercase alphanumerics, got {actual:?}"
-    );
     let expected = format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
-         {reason}. Go to https://{region}.console.aws.amazon.com/iam/home\
-         ?region={region}{AUTHORIZATION_DETAILS_PATH}{authorization_id} for complete \
-         details, or call the GetRequestAuthorizationDetails API with the following \
-         authorization id: {authorization_id}"
+         {reason}"
     );
     assert_eq!(
         actual, expected,
-        "case {case:?}: expected the refusal to name the principal, the action, the resource \
-         and this denial's authorization id, got {actual:?}"
+        "case {case:?}: expected the refusal to name the principal, the action and the \
+         resource, and to end at the reason, got {actual:?}"
     );
 }
 
