@@ -7,6 +7,14 @@
 //! settings and the instances Linux subscription discovery has found. The lookup / list
 //! / filter / pagination helpers live here too, so the operation handlers in `ops/` all
 //! resolve a resource the same way instead of each growing its own copy.
+//!
+//! The instances are DISCOVERED rather than registered through this service's API, so what
+//! writes them is the discovery pass in [`discovery`], which reads the account's EC2
+//! inventory in the configured source Regions.
+
+/// The discovery pass that fills the discovered-instance store from the account's EC2
+/// inventory, through the service that owns instances and AMIs.
+pub mod discovery;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -57,6 +65,11 @@ pub const TOKEN_VALIDATION_DELAY: Duration = Duration::from_millis(500);
 /// The `LinuxSubscriptionsDiscovery` value an account that never called
 /// `UpdateServiceSettings` reports (`LinuxSubscriptionsDiscovery`: Disabled | Enabled).
 pub const DISCOVERY_DISABLED: &str = "Disabled";
+
+/// The `LinuxSubscriptionsDiscovery` value of an account that asked for its Linux
+/// subscriptions to be discovered — the other value of the same modelled enum, and the one
+/// a discovery pass runs for ([`discovery::refresh_discovered_instances`]).
+pub const DISCOVERY_ENABLED: &str = "Enabled";
 
 /// The `Status` a settled change to the Linux subscriptions service settings reports
 /// (`Status`: Completed | Failed | InProgress | Successful — `smithy_query(query="shape",
@@ -209,7 +222,8 @@ pub const INSTANCE_STATUS_RUNNING: &str = "running";
 ///
 /// Discovery reads the account's EC2 inventory in the configured source Regions; nothing
 /// in THIS service's API registers an instance, so the store below is written only by a
-/// discovery. Both `ListLinuxSubscriptionInstances` (which reports these records) and
+/// discovery pass ([`discovery::refresh_discovered_instances`]). Both
+/// `ListLinuxSubscriptionInstances` (which reports these records) and
 /// `ListLinuxSubscriptions` (which aggregates them into subscriptions) project it, so
 /// the two lists can never disagree about what was discovered.
 #[derive(Debug, Clone, Default)]
@@ -416,6 +430,79 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         self.discovered_instances.values().cloned().collect()
     }
 
+    /// Record what one COMPLETE discovery pass found in `region`: `found` becomes
+    /// everything this account has discovered THERE, so an instance the Region no longer
+    /// holds stops being reported while what was discovered in every other Region is left
+    /// alone — each Region's inventory is read by its own pass. A pass that did not read
+    /// that whole inventory records through [`Self::merge_discovery_pass`] instead.
+    ///
+    /// `Instance$LastUpdatedTime` is "the time in which the last discovery updated the
+    /// instance details", so it is written only for an instance this pass discovered for
+    /// the first time or whose details it found CHANGED: a pass over an unchanged inventory
+    /// leaves every record exactly as it was, which is what makes two reads of a list agree.
+    pub fn record_discovery_pass(
+        &mut self,
+        region: &str,
+        found: Vec<DiscoveredInstanceRecord>,
+        now: SystemTime,
+    ) {
+        let timestamped = self.timestamped(found, now);
+        self.discovered_instances
+            .retain(|_, record| record.region != region);
+        for record in timestamped {
+            self.discovered_instances
+                .insert(record.instance_id.clone(), record);
+        }
+    }
+
+    /// Record what a pass found WITHOUT deciding what a Region holds: `found` is merged in,
+    /// and a record this pass did not reach is left alone.
+    ///
+    /// What a pass that stopped before the end of a Region's inventory records: it did not
+    /// establish that the instances it did not reach are gone, so an earlier pass's records
+    /// for them stay the best evidence there is — the same treatment a Region EC2 could not
+    /// be asked about at all gets.
+    pub fn merge_discovery_pass(&mut self, found: Vec<DiscoveredInstanceRecord>, now: SystemTime) {
+        for record in self.timestamped(found, now) {
+            self.discovered_instances
+                .insert(record.instance_id.clone(), record);
+        }
+    }
+
+    /// `found`, each record carrying the `Instance$LastUpdatedTime` it is to be stored
+    /// with: `now` for one this pass discovered for the first time or found CHANGED, and
+    /// the stored one for a record whose details the pass found exactly as they were.
+    fn timestamped(
+        &self,
+        found: Vec<DiscoveredInstanceRecord>,
+        now: SystemTime,
+    ) -> Vec<DiscoveredInstanceRecord> {
+        found
+            .into_iter()
+            .map(|mut record| {
+                record.last_updated_time = match self.discovered_instances.get(&record.instance_id)
+                {
+                    Some(stored) if details_unchanged(stored, &record) => {
+                        stored.last_updated_time.clone()
+                    }
+                    _ => Some(iso8601(now)),
+                };
+                record
+            })
+            .collect()
+    }
+
+    /// Drop what was discovered in a Region this account no longer discovers.
+    ///
+    /// `discovered_regions` are the source Regions the settings name, so discovery holds
+    /// data for exactly those: a Region taken out of `SourceRegions` is one nothing reads
+    /// any more, and the instances a previous pass found there stop being reported rather
+    /// than staying in the store as an inventory nothing refreshes.
+    pub fn retain_discovered_regions(&mut self, discovered_regions: &[&str]) {
+        self.discovered_instances
+            .retain(|_, record| discovered_regions.contains(&record.region.as_str()));
+    }
+
     /// The discovered subscriptions: one `Subscription` per distinct (name, type) pair
     /// the discovered instances carry, each counting the instances using it that are
     /// running (`Subscription$InstanceCount`). A subscription that was discovered but has
@@ -469,6 +556,31 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         self.provider_order.retain(|stored| stored != arn);
         Some(record)
     }
+}
+
+/// Whether a pass found the same details for an instance as the ones already stored for
+/// it — every member except `Instance$LastUpdatedTime`, which reports WHEN the details last
+/// changed and so cannot be part of deciding whether they did.
+///
+/// Stated member by member rather than by comparing whole records, so which member is part
+/// of "the instance details" is written down here instead of being implied by blanking one
+/// of them.
+fn details_unchanged(stored: &DiscoveredInstanceRecord, found: &DiscoveredInstanceRecord) -> bool {
+    stored.instance_id == found.instance_id
+        && stored.account_id == found.account_id
+        && stored.ami_id == found.ami_id
+        && stored.instance_type == found.instance_type
+        && stored.status == found.status
+        && stored.region == found.region
+        && stored.usage_operation == found.usage_operation
+        && stored.product_codes == found.product_codes
+        && stored.subscription_name == found.subscription_name
+        && stored.subscription_type == found.subscription_type
+        && stored.os_version == found.os_version
+        && stored.subscription_provider_create_time == found.subscription_provider_create_time
+        && stored.subscription_provider_update_time == found.subscription_provider_update_time
+        && stored.dual_subscription == found.dual_subscription
+        && stored.registered_with_subscription_provider == found.registered_with_subscription_provider
 }
 
 /// Why a registration was not taken.

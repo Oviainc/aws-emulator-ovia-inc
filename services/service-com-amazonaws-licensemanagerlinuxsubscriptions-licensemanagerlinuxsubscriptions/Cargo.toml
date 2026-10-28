@@ -30,6 +30,13 @@ aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
 # `jwt`: the shared reading of a compact JWS, which the provider access token held in that
 # secret is — the one reading of a token in this tree, bound included.
 service-common = { path = "../common" }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): Linux subscription discovery reads the account's EC2
+# instance inventory and the AMIs those instances were launched from, which are EC2's
+# resources, so `src/state/discovery.rs` asks the service that owns them instead of keeping
+# an inventory of its own. Only the generated client is needed — the emulator supplies the
+# transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -39,6 +46,11 @@ sha2 = { workspace = true }
 # The registration suites mount Secrets Manager beside this service on one engine, because
 # `RegisterSubscriptionProvider` reads the secret its `SecretArn` names by calling it.
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+# The EC2 service, mounted beside this one in the discovery suite: that the instances a
+# client launched are the ones the two discovery lists report can only be driven end to end
+# with the owner of instances and AMIs on the same engine. DEV-ONLY for this crate's own
+# suites; `src/` names no other service's crate.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

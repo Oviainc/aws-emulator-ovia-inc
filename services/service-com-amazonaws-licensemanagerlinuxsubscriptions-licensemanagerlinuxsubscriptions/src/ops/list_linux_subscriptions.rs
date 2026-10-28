@@ -4,8 +4,12 @@
 //!
 //! Reports the Linux subscriptions discovery has found for this account, aggregated from
 //! the discovered instances held in `crate::state`: one `Subscription` per distinct
-//! (name, type) pair, counting the instances using it that are running. A pure read —
-//! nothing here writes.
+//! (name, type) pair, counting the instances using it that are running.
+//!
+//! The report MATERIALIZES the discovery pass the account's settings ask for
+//! (`crate::state::discovery`) before it aggregates: discovery reads the EC2 inventory of
+//! the configured source Regions whether or not anybody calls, so what this answers is the
+//! inventory of the instant it ran — never something this call decided.
 //!
 //! ## Shape of an operation
 //!
@@ -148,7 +152,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListLinuxSubscriptionsErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the service state is unavailable".to_string()),
@@ -159,8 +162,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filters = input.filters.clone().unwrap_or_default();
         crate::state::validate_filters(&filters, FILTER_NAMES).map_err(into_error)?;
 
-        // A pure read: the page is aggregated from the instances already in state, and
-        // nothing is written.
+        // Discovery is what fills the store this list aggregates, and it runs whether or
+        // not anybody calls: the pass this report materializes asks the owner of instances
+        // what the account's inventory holds in the configured source Regions at the
+        // instant it runs, so what is reported below is what a caller would have been shown
+        // had nobody called at all. Nothing is recorded for an account that did not enable
+        // discovery, and a pass over an unchanged inventory records what is already there.
+        //
+        // A request CONTINUING a walk carries the cursor the previous page minted, which is
+        // a position in the list that page reported, so no pass runs for it: a refresh
+        // between two pages of one walk could move a record across the cursor and make the
+        // walk skip or repeat it. A walk therefore reports the inventory of the pass its
+        // first page ran.
+        if input.next_token.is_none() {
+            crate::state::discovery::refresh_discovered_instances(&*self.engine, ctx).await;
+        }
+
+        // A pure read of the store: the page is aggregated from the instances discovery
+        // has recorded, and nothing here writes.
         let state = state.lock();
         let selected: Vec<crate::state::DiscoveredSubscription> = state
             .discovered_subscriptions()
