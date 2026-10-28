@@ -267,29 +267,23 @@ fn judge_against_store(
 
     // `AttachPoint$arn` "identifies an attach point by full ARN", and the pattern
     // that member carries is an Interconnect CONNECTION ARN: the attach point is a
-    // connection of the account, resolved against the store the way every
-    // ARN-addressed operation here resolves one — in full, so an ARN whose Region or
-    // account is not the stored one names no resource this account holds, and inside
-    // the scope the request addressed, so a connection created through another
-    // Region's endpoint is one this endpoint holds nothing for. An ARN that resolves
-    // to nothing has no attach point behind it, so there is nothing to make
-    // the connection onto. The same rule the create path applies, so what a
-    // Connection may be attached to does not depend on how it came to exist.
-    if let AttachPoint::Arn(arn) = &input.attach_point {
-        if store.connection_in_by_arn(region, arn).is_none() {
-            return Err(
-                AcceptConnectionProposalErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::attach_point_not_valid_message(
-                            arn,
-                            &connection.environment_id,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-    }
+    // connection of the account, judged by the one rule both writers of a
+    // connection's attach point apply to that member
+    // (`crate::state::judge_attach_point_arn`) — the ARN resolved in full, so one
+    // whose Region or account is not the stored one names no resource this account
+    // holds, inside the scope the request addressed, so a connection created through
+    // another Region's endpoint is one this endpoint holds nothing for, and with the
+    // connectivity behind it still there, so a connection whose teardown has already
+    // been called is no longer an attach point. An ARN that resolves to nothing has
+    // no attach point behind it, so there is nothing to make the connection onto. The
+    // same rule the create path applies, so what a Connection may be attached to does
+    // not depend on how it came to exist.
+    crate::state::judge_attach_point_arn::<AcceptConnectionProposalError>(
+        store,
+        region,
+        &input.attach_point,
+        &connection.environment_id,
+    )?;
 
     Ok(StoreVerdict::Accept {
         connection_id: connection.id.clone(),

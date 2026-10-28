@@ -446,6 +446,30 @@ impl ComAmazonawsInterconnectInterconnectState {
             .filter(|stored| visible_in(stored, region) && holds_arn(stored, arn))
     }
 
+    /// The connection `arn` names as an ATTACH POINT in `region`, which is the only
+    /// connection a new Connection is ever provisioned onto by ARN.
+    ///
+    /// Two filters, both of them rules this crate already applies elsewhere. The ARN
+    /// resolves the resource the way every ARN-addressed operation here does
+    /// ([`Self::connection_in_by_arn`]): in full, and inside the scope the request
+    /// addressed. And the connectivity behind it has to still be there: an attach
+    /// point is a handle whose whole subject is the connectivity the new Connection is
+    /// provisioned onto, so from the moment a `DeleteConnection` is made on the
+    /// connection behind it the handle names nothing ([`is_deleted_or_deleting`]) —
+    /// the same filter [`Self::proposal_in`] applies to the other handle of that kind,
+    /// and the same readiness rule the union's gateway member is held to, where a
+    /// gateway being torn down is no longer a valid attach point
+    /// ([`direct_connect`]). The record itself stays readable by its identifier and by
+    /// its ARN, which is how a caller polling the delete sees the teardown.
+    pub fn attach_point_connection_in(
+        &self,
+        region: &str,
+        arn: &str,
+    ) -> Option<&StoredConnection> {
+        self.connection_in_by_arn(region, arn)
+            .filter(|stored| !is_deleted_or_deleting(&stored.connection.state))
+    }
+
     /// [`Self::connection_in_by_arn`] for the operations that MUTATE the record they
     /// resolve, resolving the same resource under the same rule.
     pub fn connection_in_by_arn_mut(
@@ -559,6 +583,42 @@ pub fn attach_point_not_valid_message(identifier: &str, environment_id: &str) ->
         "{REFUSAL_ENVELOPE}{identifier} is not an attach point valid for environment \
          {environment_id}"
     )
+}
+
+/// Judge the `arn` member of the `attach_point` a request selected for a connection on
+/// `environment_id`, answering `Ok(())` when the connection may be provisioned onto it.
+///
+/// The ONE rule both writers of a connection's attach point apply to that member (the
+/// create that allocates the first attach point and the acceptance that associates one),
+/// so what a Connection may be attached to does not depend on which operation carried it:
+/// the ARN has to name a connection this store holds as an attach point
+/// ([`ComAmazonawsInterconnectInterconnectState::attach_point_connection_in`]), and one
+/// that does not is the not-found refusal
+/// [`direct_connect::AttachPointRefusal::not_an_attach_point`] — the same refusal, worded
+/// the same way, an identifier the account holds nothing for at all gets, so what refuses
+/// the request never reports what the store does hold for that ARN.
+///
+/// The union's two members are therefore judged through ONE refusal channel: this answers
+/// the `arn` member against the store under the caller's lock, and
+/// [`direct_connect::judge_attach_point`] answers `directConnectGateway` — a resource of
+/// the service that owns those gateways — off that lock, under the same readiness rule.
+/// Each answers `Ok(())` for the member the other owns.
+pub fn judge_attach_point_arn<E: direct_connect::AttachPointRefusal>(
+    store: &ComAmazonawsInterconnectInterconnectState,
+    region: &str,
+    attach_point: &AttachPoint,
+    environment_id: &str,
+) -> Result<(), E> {
+    let AttachPoint::Arn(arn) = attach_point else {
+        return Ok(());
+    };
+    if store.attach_point_connection_in(region, arn).is_some() {
+        return Ok(());
+    }
+    Err(E::not_an_attach_point(attach_point_not_valid_message(
+        arn,
+        environment_id,
+    )))
 }
 
 /// The `@length` the model gives `RemoteOwnerAccount`, the target of the ONLY member
