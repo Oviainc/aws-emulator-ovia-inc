@@ -29,6 +29,8 @@ mod baseline_session_minting;
 mod clock_due_order;
 #[path = "all/clock_owed_order.rs"]
 mod clock_owed_order;
+#[path = "all/create_tag_ceiling.rs"]
+mod create_tag_ceiling;
 #[path = "all/identity_source_approval_portal.rs"]
 mod identity_source_approval_portal;
 #[path = "all/identity_source_deletion.rs"]

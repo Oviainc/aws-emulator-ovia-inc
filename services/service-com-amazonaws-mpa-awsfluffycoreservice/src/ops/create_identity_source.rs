@@ -298,22 +298,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `TagResource` reports with `TooManyTagsException`. Create is the other path that
         // writes tags, so it holds the same ceiling and no resource is stored already past
         // it; `CreateIdentitySource` does not declare `TooManyTagsException`, so the
-        // request is refused with the `ValidationException` (400) it does declare.
-        let tag_count = input
-            .tags
-            .as_ref()
-            .map_or(0, ::std::collections::HashMap::len);
-        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(CreateIdentitySourceErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "Tags names {tag_count} tags, more than the maximum of {} tags allowed \
-                         per resource.",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    ),
-                },
-            )
-            .into());
+        // request is refused with the `ValidationException` (400) it does declare. The
+        // rule itself lives once, beside the other tag rules in `crate::state`.
+        if let Some(refusal) = crate::state::tags_past_resource_ceiling(input.tags.as_ref()) {
+            return Err(CreateIdentitySourceErrorModeled::ValidationException(refusal).into());
         }
 
         // A tag key in the namespace reserved for Amazon Web Services belongs to AWS,

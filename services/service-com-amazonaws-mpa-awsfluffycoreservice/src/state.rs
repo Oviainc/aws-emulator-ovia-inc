@@ -799,6 +799,31 @@ pub fn reserved_tag_key() -> ValidationException {
     }
 }
 
+/// The refusal a create request whose `Tags` carries more than [`MAX_TAGS_PER_RESOURCE`]
+/// tags earns, or `None` when the request stays within the ceiling.
+///
+/// Create is the path that writes a resource's tags before the resource exists, so the
+/// count it holds against the ceiling is the request's own `Tags` — and because the
+/// refusal is decided before anything is stored, no resource is ever stored already past
+/// it. A create does not declare the `TooManyTagsException` `TagResource` reports the same
+/// ceiling with, so the refusal is the `ValidationException` (400) a create does declare,
+/// which each create lifts into its own error type.
+///
+/// The message names the member, how many tags the request carried and the ceiling, and no
+/// value the request carried: a `TagKey` and a `TagValue` are `@sensitive`.
+#[must_use]
+pub fn tags_past_resource_ceiling(
+    tags: Option<&::std::collections::HashMap<String, String>>,
+) -> Option<ValidationException> {
+    let tag_count = tags.map_or(0, ::std::collections::HashMap::len);
+    (tag_count > MAX_TAGS_PER_RESOURCE).then(|| ValidationException {
+        message: format!(
+            "Tags names {tag_count} tags, more than the maximum of \
+             {MAX_TAGS_PER_RESOURCE} tags allowed per resource."
+        ),
+    })
+}
+
 /// The refusal a `Policies` reference that names no policy version this service holds
 /// earns.
 ///
