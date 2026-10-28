@@ -174,6 +174,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service acting, so a caller whose identity-based policies do not allow the
+        // action is refused and nothing is created. `ctx` carries the credential the
+        // request presented, which is who is judged
+        // ([`crate::service::authorization`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.acme_endpoint_arn,
+        )
+        .map_err(CreateAcmeExternalAccountBindingErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator (the engine IS the shared store);
             // this operation models a server fault, so that is the honest answer.
@@ -197,9 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never reported as a resource this account happens not to hold.
         if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
             return Err(validation_exception(
-                crate::service::cross_account_arn_refusal(
-                    crate::state::ACME_ENDPOINT_RESOURCE_TYPE,
-                ),
+                crate::service::cross_account_arn_refusal(),
             ));
         }
 

@@ -1073,7 +1073,10 @@ async fn a_channel_name_is_unique_within_a_region() {
         "ResourceNotFoundException",
         "case {case}: expected ResourceNotFoundException, got {response}"
     );
-    let says = format!("channel {} not found", channel_arn(REGION, case));
+    let says = format!(
+        "Channel {case} under account {} not found.",
+        engine::EMULATOR_ACCOUNT_ID
+    );
     assert!(
         error_message(&response).contains(&says),
         "case {case}: expected the message to name {says:?}, got {response}"
