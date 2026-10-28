@@ -826,14 +826,19 @@ async fn a_page_is_cut_from_the_filtered_set() {
     );
 }
 
-/// A page size outside what this service serves is refused at the boundary, and each
-/// accepted bound answers a page.
+/// A page of none is refused at the boundary; every other page size the model leaves
+/// unbounded above answers a page, the ceiling and anything past it included.
 #[tokio::test]
 async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
     let (router, engine) = super::ec2_query::emulator();
     seed(&engine);
 
-    let accepted = [1_i64, i64::try_from(MAX_PAGE_SIZE).unwrap_or(1)];
+    let accepted = [
+        1_i64,
+        i64::try_from(MAX_PAGE_SIZE).unwrap_or(1),
+        i64::try_from(MAX_PAGE_SIZE).unwrap_or(1) + 1,
+        i64::from(i32::MAX),
+    ];
     for max_results in accepted {
         let case = format!("MaxResults={max_results}");
         let (status, body) = describe(&router, &max_results_param(max_results)).await;
@@ -843,12 +848,7 @@ async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
         );
     }
 
-    let refused = [
-        0_i64,
-        -1,
-        i64::try_from(MAX_PAGE_SIZE).unwrap_or(1) + 1,
-        i64::from(i32::MAX),
-    ];
+    let refused = [0_i64, -1];
     for max_results in refused {
         let case = format!("MaxResults={max_results}");
         let (status, body) = describe(&router, &max_results_param(max_results)).await;

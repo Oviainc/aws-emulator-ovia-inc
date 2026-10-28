@@ -79,6 +79,15 @@ mod client_vpn_routes;
 // gives: the sorted neighbourhood is where every new ec2 suite inserts its two lines.
 #[path = "all/reserved_instances_modifications.rs"]
 mod reserved_instances_modifications;
+// Where a paged describe bounds its page size and where it does not: a `MaxResults` the
+// model leaves unbounded above is served, not refused. Declared beside the suites above
+// rather than in sorted position, for the reason this file's header note gives.
+#[path = "all/unranged_max_results.rs"]
+mod unranged_max_results;
+// What `RunInstances` does with a `TagSpecifications` entry, per resource type. Declared
+// beside the suites above for the same reason.
+#[path = "all/run_instances_tag_specifications.rs"]
+mod run_instances_tag_specifications;
 // The virtual private gateway slice: create, read back, delete. Declared here rather than in
 // sorted position for the reason given above — the sorted neighbourhood is the contended
 // region of this file, and this suite lost several serialized squash merges to it.

@@ -152,22 +152,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The maximum number of results to return in a single call" (`MaxResults`). The
         // model declares no `@range` on the member — it targets a plain `Integer` — and this
-        // operation documents no bound of its own either, so the handler is the only place a
-        // page size can be bounded, and the bound is this service's own largest page
-        // ([`crate::state::MAX_PAGE_SIZE`]): an unbounded page is how a caller asks for the
-        // whole store in one answer.
+        // operation documents no bound of its own either, so the only bound on the page size
+        // is the largest page this operation serves ([`crate::state::MAX_PAGE_SIZE`]): a
+        // value above it is not refused, it is served as that page with a `NextToken` for
+        // the rest (the clamp below). A page of NONE is not a page, so zero and below is
+        // still refused.
         if input.max_results.is_some_and(|max_results| max_results < 1) {
             return Err(Scaffolded::invalid_parameter_value(format!(
                 "Invalid value '{}' for MaxResults. It must be at least 1",
-                input.max_results.unwrap_or_default()
-            )));
-        }
-        if input
-            .max_results
-            .is_some_and(|max_results| usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE)
-        {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for MaxResults. It must be at most {MAX_PAGE_SIZE}",
                 input.max_results.unwrap_or_default()
             )));
         }

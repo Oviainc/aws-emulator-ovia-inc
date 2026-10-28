@@ -1448,14 +1448,18 @@ async fn a_page_is_cut_from_the_filtered_set() {
     );
 }
 
-/// `MaxResults` is accepted at the bounds of the page sizes this service serves and
-/// refused past them — the model declares no range, so the handler is what enforces it.
+/// A `MaxResults` the model leaves unbounded above is SERVED, not refused: the page this
+/// service answers is at most the largest it serves, and a size above that asks for that
+/// page rather than for a refusal. A page of none is still refused.
 #[tokio::test]
-async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
+async fn max_results_above_the_page_this_service_serves_is_still_served() {
     let (router, engine) = super::ec2_query::emulator();
-    seed(&engine);
+    let _seeded = seed(&engine);
 
-    let cases = [(0, 400), (1, 200), (1000, 200), (1001, 400)];
+    // Rows: a page of none (refused), the smallest page, the largest page this service
+    // serves, one past it, and a page size far above it — the model declaring no `@range`
+    // on `DescribeImagesRequest$MaxResults`, nothing above the ceiling is a refusal.
+    let cases = [(0, 400), (1, 200), (1000, 200), (1001, 200), (100_000, 200)];
     for (max_results, expected_status) in cases {
         let (status, body) = describe(&router, &[param("MaxResults", max_results.to_string())]).await;
         assert_eq!(
@@ -1468,6 +1472,23 @@ async fn max_results_is_accepted_at_its_bounds_and_refused_past_them() {
                 error_code(&body),
                 "InvalidParameterValue",
                 "case MaxResults={max_results}: expected InvalidParameterValue, got {body}"
+            );
+            continue;
+        }
+        // A page size at or above the ceiling reports every image the store holds, and
+        // carries no token: there is nothing left to page to.
+        if max_results >= 1000 {
+            let reported = elements(&body, "imageId");
+            let every = described_ids(&router, "no page size", &[]).await;
+            assert_eq!(
+                reported, every,
+                "case MaxResults={max_results}: expected every visible image {every:?}, got \
+                 {reported:?}"
+            );
+            assert!(
+                elements(&body, "nextToken").is_empty(),
+                "case MaxResults={max_results}: a page that holds everything carries no \
+                 token, got {body}"
             );
         }
     }
