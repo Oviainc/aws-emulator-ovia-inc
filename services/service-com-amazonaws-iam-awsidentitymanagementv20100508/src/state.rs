@@ -1003,12 +1003,12 @@ pub struct OpenIdConnectProviderRecord {
 /// shape="SAMLProviderListEntry")`) — so the record holds the members
 /// `GetSAMLProvider` reports, and that read is what defines them.
 ///
-/// The uploaded PRIVATE KEY MATERIAL is deliberately not among them, for the reason
-/// [`LoginProfileRecord`] does not hold a password: `SAMLPrivateKey` reports only a key
-/// id and the instant the key was uploaded (`smithy_query(query="shape",
-/// shape="SAMLPrivateKey")`), the model marks `CreateSAMLProvider$AddPrivateKey`
-/// sensitive, and no operation here decrypts an assertion, so nothing could ever read
-/// the key back.
+/// The uploaded PRIVATE KEY MATERIAL is deliberately not among them: `SAMLPrivateKey`
+/// reports only a key id and the instant the key was uploaded
+/// (`smithy_query(query="shape", shape="SAMLPrivateKey")`), the model marks
+/// `CreateSAMLProvider$AddPrivateKey` sensitive, and no operation here decrypts an
+/// assertion or checks a key against one presented later, so nothing reads the key
+/// material at all.
 #[derive(Debug, Clone)]
 pub struct SamlProviderRecord {
     /// "The unique identifier assigned to the SAML provider"
@@ -1047,18 +1047,111 @@ pub struct SamlProviderRecord {
     pub tags: Option<Vec<Tag>>,
 }
 
+/// How many bytes of salt a held password verifier carries, so two users that chose
+/// the same password are not held under the same digest. Sixteen bytes is the width
+/// of the two mixed counter words [`PasswordVerifier::new`] draws it from.
+const PASSWORD_SALT_BYTES: usize = 16;
+
+/// How many bytes a verifier's digest is: the output width of the SHA-256 the salt
+/// and the password are hashed with.
+const PASSWORD_DIGEST_BYTES: usize = 32;
+
+/// A console password as the account HOLDS it: a salt and the digest of that salt and
+/// the password, never the password.
+///
+/// A verifier exists because one operation has to ASK about a password the account
+/// accepted earlier — `ChangePassword` "changes the password of the IAM user who is
+/// calling this operation" and takes that user's "current password"
+/// (`ChangePassword$OldPassword`), so the account must be able to answer whether a
+/// password a later request presents is the one it already accepted. This answers
+/// exactly that question ([`Self::verifies`]) and no other: the password cannot be
+/// read back out of a digest, no modelled shape carries one (`LoginProfile` reports
+/// only `UserName`, `CreateDate` and `PasswordResetRequired`), and the model marks
+/// every password member sensitive, so nothing may ever hand one out.
+///
+/// It is an equality oracle for one in-memory account and nothing more: the salt is
+/// drawn from a counter rather than from entropy, and the digest is a single hash pass
+/// rather than a password-stretching function, because no store here outlives the
+/// process and no caller can read either value. Nobody should read it as a scheme for
+/// storing credentials.
+#[derive(Clone)]
+pub struct PasswordVerifier {
+    /// The salt this password was hashed with, minted once with the verifier.
+    salt: [u8; PASSWORD_SALT_BYTES],
+    /// SHA-256 of the salt followed by the password's bytes.
+    digest: [u8; PASSWORD_DIGEST_BYTES],
+}
+
+/// What a verifier shows when the account's state is formatted: that a password is
+/// held, and nothing of the material it was derived from. Written out rather than
+/// derived, so no formatter of the state a verifier lives in can print the salt or the
+/// digest.
+impl ::std::fmt::Debug for PasswordVerifier {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.write_str("PasswordVerifier")
+    }
+}
+
+impl PasswordVerifier {
+    /// The verifier for `password`, salted from `salt_seq` — a value a caller draws
+    /// from [`ComAmazonawsIamAwsidentitymanagementv20100508State::hold_password`], so
+    /// each held password gets its own salt.
+    pub fn new(salt_seq: u64, password: &str) -> Self {
+        let mut salt = [0u8; PASSWORD_SALT_BYTES];
+        for (word, bytes) in salt.chunks_mut(::std::mem::size_of::<u64>()).enumerate() {
+            let mixed = splitmix64(salt_seq ^ (word as u64).rotate_left(32)).to_be_bytes();
+            // Byte by byte, so the chunk and the word agreeing in length is a property
+            // of the loop rather than a condition that could fault.
+            for (byte, mixed) in bytes.iter_mut().zip(mixed) {
+                *byte = mixed;
+            }
+        }
+        let digest = Self::digest(&salt, password);
+        Self { salt, digest }
+    }
+
+    /// Whether `password` is the password this verifier was built from.
+    ///
+    /// The comparison folds every byte before answering, so it takes the same work
+    /// however many leading bytes happen to agree.
+    pub fn verifies(&self, password: &str) -> bool {
+        let candidate = Self::digest(&self.salt, password);
+        candidate
+            .iter()
+            .zip(self.digest.iter())
+            .fold(0u8, |differing, (left, right)| differing | (left ^ right))
+            == 0
+    }
+
+    /// SHA-256 of `salt` followed by `password`.
+    fn digest(salt: &[u8; PASSWORD_SALT_BYTES], password: &str) -> [u8; PASSWORD_DIGEST_BYTES] {
+        let mut hasher = <::sha2::Sha256 as ::sha2::Digest>::new();
+        ::sha2::Digest::update(&mut hasher, salt);
+        ::sha2::Digest::update(&mut hasher, password.as_bytes());
+        let hashed = ::sha2::Digest::finalize(hasher);
+        let mut digest = [0u8; PASSWORD_DIGEST_BYTES];
+        // Byte by byte rather than a slice copy, so the lengths agreeing is a property
+        // of the loop and not a condition that could fault.
+        for (byte, hashed) in digest.iter_mut().zip(hashed) {
+            *byte = hashed;
+        }
+        digest
+    }
+}
+
 /// One IAM user's login profile: the console password `CreateLoginProfile`
 /// created, as the account holds it.
 ///
-/// The PASSWORD itself is deliberately not among its members. `LoginProfile` (the
-/// only shape any operation reports a login profile through) carries just
-/// `UserName`, `CreateDate` and `PasswordResetRequired`
-/// (`smithy_query(query="shape", shape="LoginProfile")`), the model marks
-/// `CreateLoginProfile$Password` sensitive, and this emulator serves no console
-/// sign-in, so nothing can ever read the password back: holding it would be
-/// keeping a secret no caller may be given. The owning user's NAME is not copied
-/// in either, for the same reason [`AccessKeyRecord`] does not copy it — it is
-/// read from the user the record's key names, so the name lives in one place.
+/// The password is held as a [`PasswordVerifier`] and never as itself: the only
+/// thing any operation asks of it is whether a password presented later is the one
+/// the account accepted, which a verifier answers without keeping the secret. No
+/// shape reports it — `LoginProfile` (the only shape any operation reports a login
+/// profile through) carries just `UserName`, `CreateDate` and
+/// `PasswordResetRequired` (`smithy_query(query="shape", shape="LoginProfile")`) —
+/// and the model marks `CreateLoginProfile$Password` sensitive. The owning user's
+/// NAME is not copied in either, for the same reason [`AccessKeyRecord`] does not
+/// copy it — it is read from the user the record's key names, so the name lives in
+/// one place.
 #[derive(Debug, Clone)]
 pub struct LoginProfileRecord {
     /// The instant the password was created, reported unchanged by every later
@@ -1066,8 +1159,11 @@ pub struct LoginProfileRecord {
     /// (`GetLoginProfile`).
     pub create_date: ::aws_smithy_types::DateTime,
     /// Whether "the user is required to set a new password on next sign-in"
-    /// (`CreateLoginProfile$PasswordResetRequired`), as the create asked.
+    /// (`CreateLoginProfile$PasswordResetRequired`), as the last write left it.
     pub password_reset_required: bool,
+    /// The verifier of the password in force: the one the create set, or the one a
+    /// later `UpdateLoginProfile` or `ChangePassword` replaced it with.
+    pub password: PasswordVerifier,
 }
 
 /// One Organizations service-last-accessed report job the account has asked for, keyed in
@@ -1471,6 +1567,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// Monotonic counter feeding
     /// [`next_signing_certificate_id`](Self::next_signing_certificate_id).
     pub signing_certificate_id_seq: u64,
+    /// Monotonic counter feeding [`hold_password`](Self::hold_password), so every
+    /// password the account holds a verifier for carries its own salt.
+    pub password_salt_seq: u64,
 }
 
 impl Default for ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -1549,6 +1648,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             instance_profile_id_seq: 0,
             server_certificate_id_seq: 0,
             signing_certificate_id_seq: 0,
+            password_salt_seq: 0,
         }
     }
 }
@@ -1714,6 +1814,18 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             self.signing_certificate_id_seq,
             SIGNING_CERTIFICATE_ID_CHARACTERS,
         )
+    }
+
+    /// How the account holds `password`: the [`PasswordVerifier`] for it, under a salt
+    /// no other held password shares.
+    ///
+    /// Every write that sets a console password goes through here — the create, the
+    /// administrative update and the user's own change — so there is one definition of
+    /// what the account keeps of a password, and the check `ChangePassword` makes is a
+    /// check against whatever the last of those writes left.
+    pub fn hold_password(&mut self, password: &str) -> PasswordVerifier {
+        self.password_salt_seq += 1;
+        PasswordVerifier::new(self.password_salt_seq, password)
     }
 
     /// Whether `account_id` manages the organization `organization_id` — the question an

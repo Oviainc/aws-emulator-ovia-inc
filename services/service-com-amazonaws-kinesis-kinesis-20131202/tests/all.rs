@@ -67,5 +67,7 @@ mod stream_lifecycle;
 mod stream_not_active_refusal;
 #[path = "all/stream_removal.rs"]
 mod stream_removal;
+#[path = "all/stream_tag_removal.rs"]
+mod stream_tag_removal;
 #[path = "all/stream_tags.rs"]
 mod stream_tags;

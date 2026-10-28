@@ -341,9 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(PutSubscriptionFilterErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(
-                        crate::state::SUBSCRIPTION_FILTER_LIMIT_EXCEEDED.to_string(),
-                    ),
+                    message: Some(crate::state::LIMIT_EXCEEDED_MESSAGE.to_string()),
                 },
             )
             .into());
