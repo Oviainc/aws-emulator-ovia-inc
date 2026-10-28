@@ -355,6 +355,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(store_unavailable());
         };
 
+        // `CreateKey` names no KMS key — it mints one — so no key policy is in force:
+        // its permission is the caller's own ("Required permissions: kms:CreateKey (IAM
+        // policy)"), and a principal whose identity policies do not allow it is refused
+        // before any key is minted.
+        crate::state::authorization::check_account_action(&*self.engine, ctx, Self::NAME)?;
+
         // "The KeySpec and CustomerMasterKeySpec parameters work the same way. Only
         // the names differ."
         // (`smithy_query(query="doc",shape="CreateKeyRequest",member="CustomerMasterKeySpec")`)

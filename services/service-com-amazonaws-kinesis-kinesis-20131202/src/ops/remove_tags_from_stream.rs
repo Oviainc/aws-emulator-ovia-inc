@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTagsFromStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTagsFromStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTagsFromStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! UNASSIGNS the tag keys its request names from the stored stream it addresses: a key the
+//! stream carries is deleted, a key it does not carry is ignored, and every other tag stays
+//! as it was. The stream is resolved from the request's `StreamName` / `StreamARN` pair by
+//! the one lookup every stream operation shares ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resolve_stream_mut`]),
+//! inside the region the request was signed for, and the write lands in the same stored tag
+//! map `AddTagsToStream` writes and `ListTagsForStream` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -113,7 +111,14 @@ impl ::aws_smithy_schema::serde::SerializableStruct for RemoveTagsFromStreamOutp
 // here — hence the `RemoveTagsFromStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#RemoveTagsFromStream")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#RemoveTagsFromStream",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it
+    // ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum RemoveTagsFromStreamErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -121,6 +126,7 @@ pub enum RemoveTagsFromStreamErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,6 +152,92 @@ impl From<RemoveTagsFromStreamErrorModeled> for RemoveTagsFromStreamError {
 /// concrete engine where it mounts the service, not here.
 pub struct RemoveTagsFromStream<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the stream lives in, and how the call
+/// ended. No stream name, no ARN and no tag key: a log sink needs none of them to attribute
+/// the change, and a tag key is caller data.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "RemoveTagsFromStream",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region, worded exactly as the reads and the assignment word it: one
+/// rule, one phrasing, for every operation that addresses a stream.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    input: &RemoveTagsFromStreamInput,
+) -> RemoveTagsFromStreamError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            RemoveTagsFromStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            RemoveTagsFromStreamErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            RemoveTagsFromStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::stream_not_found_message(stream_identifier(
+                    input,
+                ))),
+            })
+        }
+    }
+    .into()
+}
+
+/// The identifier the request addressed the stream by, which is what a refusal names.
+fn stream_identifier(input: &RemoveTagsFromStreamInput) -> &str {
+    input
+        .stream_name
+        .as_deref()
+        .or(input.stream_arn.as_deref())
+        .unwrap_or_default()
+}
+
+/// Unassign the request's tag keys from the stream it names, or answer the modelled refusal
+/// that stands in the way. The whole write lives here so the caller holds the store's lock
+/// for exactly this long.
+fn unassign_tags(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &RemoveTagsFromStreamInput,
+) -> Result<(), RemoveTagsFromStreamError> {
+    // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+    // carries one and a request naming only that member names no stream.
+    let stream = store
+        .resolve_stream_mut(
+            now,
+            region,
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        )
+        .map_err(|failure| lookup_refusal(failure, input))?;
+
+    // A stream's tags are control-plane metadata of the stream itself, not of the shards its
+    // create is provisioning: the stored tag set exists for as long as the stream does, so
+    // this write is served for a stream in any lifecycle status — the same as the
+    // `AddTagsToStream` that assigns into that very set. Nothing here reads or moves the
+    // stream's status.
+    //
+    // No ceiling is checked: a removal only ever leaves the stream carrying fewer tags, and
+    // "If you specify a tag that does not exist, it is ignored" makes a key nothing carries
+    // a served request rather than a refusal.
+    stream.unassign_tags(input.tag_keys.iter().map(String::as_str));
+    Ok(())
 }
 
 impl<Eng> RemoveTagsFromStream<Eng> {
@@ -174,18 +266,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTagsFromStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsFromStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTagsFromStream"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose streams this request
+        // addresses, since a stream name "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            RemoveTagsFromStreamError::from(
+                RemoveTagsFromStreamErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let outcome = unassign_tags(&mut store, &region, now, &input);
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            if outcome.is_ok() { "untagged" } else { "refused" },
+        );
+        // `RemoveTagsFromStream` models no output members, so a served request answers the
+        // modelled empty body.
+        outcome.map(|()| RemoveTagsFromStreamOutput)
     }
 }

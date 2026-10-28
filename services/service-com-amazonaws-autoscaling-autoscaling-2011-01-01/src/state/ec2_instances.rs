@@ -197,8 +197,12 @@ pub fn launch<Eng: Send + Sync + 'static>(
             )),
             state_transition_reason: None,
             state_reason: None,
+            // Nobody has asked to reboot an instance the group has just launched, and
+            // nobody has sent it a diagnostic interrupt either.
             queued_reboots: 0,
             last_reboot_queued_at: None,
+            diagnostic_interrupts: 0,
+            last_diagnostic_interrupt_at: None,
             launch_time,
             // One instance per reservation, so it is that reservation's first.
             ami_launch_index: 0,

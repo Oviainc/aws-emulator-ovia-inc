@@ -21,6 +21,8 @@ mod applied_policies_and_status_narratives;
 mod describe_scaling_plans_selector_bounds;
 #[path = "all/describe_scaling_plans_version_member.rs"]
 mod describe_scaling_plans_version_member;
+#[path = "all/documented_entry_count_wording.rs"]
+mod documented_entry_count_wording;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/forecast_data.rs"]

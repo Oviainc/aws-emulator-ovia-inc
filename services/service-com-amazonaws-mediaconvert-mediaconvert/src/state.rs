@@ -3336,6 +3336,8 @@ pub struct JobsQueryRecord {
     /// Reported once the query is [`JOBS_QUERY_STATUS_COMPLETE`].
     pub matched: Vec<String>,
     /// The cursor for the batch after this page, or `None` when this page is the last.
+    /// The other half of the page [`Self::reported_page`] reports, so it is readable on
+    /// exactly the same terms as [`Self::matched`].
     pub result_next_token: Option<String>,
 }
 
@@ -3356,6 +3358,19 @@ impl JobsQueryRecord {
                 .terms
                 .iter()
                 .any(|term| job.matches_filter(&term.key, &term.value))
+    }
+
+    /// The result page this query reports — the ids it matched and the cursor for the
+    /// batch after them — or `None` while it has not completed.
+    ///
+    /// The two halves are ONE page, so they are reported together or not at all: a query
+    /// that has not reached [`JOBS_QUERY_STATUS_COMPLETE`] reports only its status, and a
+    /// caller polling it is never handed a cursor for the batch after a page it has not
+    /// been shown. Reading the page through this one accessor is what keeps the halves
+    /// from diverging.
+    pub fn reported_page(&self) -> Option<(&[String], Option<&str>)> {
+        (self.status == JOBS_QUERY_STATUS_COMPLETE)
+            .then_some((self.matched.as_slice(), self.result_next_token.as_deref()))
     }
 }
 

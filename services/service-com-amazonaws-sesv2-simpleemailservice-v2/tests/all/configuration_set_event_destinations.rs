@@ -97,7 +97,10 @@ pub(crate) async fn reported_destinations(ses: &Ses, set: &str) -> Vec<Value> {
 }
 
 /// The reported destination named `name`, or `None` when the set reports none.
-async fn reported_destination(ses: &Ses, set: &str, name: &str) -> Option<Value> {
+///
+/// Shared with the sibling suites of this test target, so every case reads one stored
+/// destination the same way.
+pub(crate) async fn reported_destination(ses: &Ses, set: &str, name: &str) -> Option<Value> {
     reported_destinations(ses, set)
         .await
         .into_iter()
@@ -136,7 +139,10 @@ fn member(destination: &Value, name: &str) -> Value {
 /// Every value of the `EventType` enum, from
 /// `smithy_query(query="shape",shape="EventType")`: the full set a destination may
 /// match on.
-const EVENT_TYPES: &[&str] = &[
+///
+/// Shared with the sibling suites of this test target, so the model's order is stated
+/// once.
+pub(crate) const EVENT_TYPES: &[&str] = &[
     "SEND",
     "REJECT",
     "BOUNCE",

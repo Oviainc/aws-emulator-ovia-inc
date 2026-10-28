@@ -273,12 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Password must be specified unless the request is made with an AssumeRoot session",
             ));
         };
-        // The password is accepted and then DROPPED here, the one place the value is
-        // consumed: no shape reports it back (`LoginProfile` carries only the user
-        // name, the create date and the reset flag), the model marks it sensitive,
-        // and this emulator serves no console sign-in, so keeping it would be
-        // holding a secret nothing may ever hand out. It is never stored, logged or
-        // echoed.
+        // The password is consumed HERE, the one place this operation touches it: the
+        // account keeps only the VERIFIER of it (`crate::state::hold_password`), which
+        // answers whether a password a later request presents is this one — the
+        // question `ChangePassword` asks of a user's current password — and nothing
+        // else. The password itself is never stored, logged or echoed: no shape
+        // reports one back (`LoginProfile` carries only the user name, the create date
+        // and the reset flag) and the model marks the member sensitive.
         //
         // `PasswordPolicyViolationException` is DECLINED for the reason it cannot
         // arise: it refuses a password that "did not meet the requirements imposed
@@ -288,6 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `LimitExceededException` is declined too: a login profile is bounded by
         // its user (at most one each), so the account's user quota — enforced by
         // `CreateUser` — is the only limit there is.
+        let held_password = store.hold_password(&password);
         drop(password);
 
         store.login_profiles.insert(
@@ -298,6 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // next sign-in" — the modelled member defaults to false, so a
                 // request that omits it creates a profile that does not demand one.
                 password_reset_required: input.password_reset_required,
+                password: held_password,
             },
         );
 

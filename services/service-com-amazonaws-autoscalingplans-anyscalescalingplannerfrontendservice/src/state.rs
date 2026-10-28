@@ -1133,13 +1133,14 @@ fn validate_target_tracking_configurations(
             "{member}: at least one target tracking configuration is required"
         ));
     }
-    if configurations.len() > MAX_TARGET_TRACKING_CONFIGURATIONS {
-        return Err(format!(
-            "{member}: Value of length {} failed to satisfy constraint: Member must have \
-             length less than or equal to {MAX_TARGET_TRACKING_CONFIGURATIONS}",
-            configurations.len()
-        ));
-    }
+    // A documented entry count is worded by [`check_entry_count`], the one rendering the
+    // crate gives this refusal, so this list past its bound reads exactly as every other
+    // list past its own does.
+    check_entry_count(
+        &member,
+        configurations.len(),
+        MAX_TARGET_TRACKING_CONFIGURATIONS,
+    )?;
     let mut metrics: BTreeSet<String> = BTreeSet::new();
     for (position, configuration) in configurations.iter().enumerate() {
         let at = format!("{member}[{position}]");

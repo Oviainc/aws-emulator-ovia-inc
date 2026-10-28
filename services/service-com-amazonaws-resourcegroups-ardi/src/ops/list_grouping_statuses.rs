@@ -235,12 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = store.groups.get(&key).ok_or_else(not_found)?;
 
         // The token is this service's own opaque encoding of the resource ARN the
-        // previous page stopped at, scoped to THIS listing of THIS group; anything
-        // else cannot name a resume point in it.
+        // previous page stopped at, scoped to THIS listing of THIS group — the group
+        // the key names IN ITS REGION; anything else cannot name a resume point in
+        // it.
         let listing = listing_of(&key.name);
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
-            Some(token) => match crate::state::decode_page_token(&listing, token) {
+            Some(token) => match crate::state::decode_page_token(&key.region, &listing, token) {
                 Some(key) => Some(key),
                 None => {
                     return Err(bad_request(
@@ -275,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = (page.len() < remaining.len())
             .then(|| {
                 page.last().map(|(resource_arn, _)| {
-                    crate::state::encode_page_token(&listing, resource_arn)
+                    crate::state::encode_page_token(&key.region, &listing, resource_arn)
                 })
             })
             .flatten();
@@ -295,7 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The listing one group's grouping-status pagination tokens belong to: a token
-/// issued here resumes THIS listing of THAT group, and no other.
+/// issued here resumes THIS listing of THAT group, and no other. The region the
+/// group lives in — the other half of its identity — is carried beside this name
+/// by the token codec ([`crate::state::encode_page_token`]), so a same-named
+/// group of another region is another listing.
 fn listing_of(group_name: &str) -> String {
     format!("grouping-statuses/{group_name}")
 }

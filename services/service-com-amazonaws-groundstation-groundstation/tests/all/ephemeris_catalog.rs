@@ -83,7 +83,7 @@ pub(crate) const OEM_BODY: &str = "CCSDS_OEM_VERS = 2.0\nCREATION_DATE = 2024-01
 /// stores a due instant and never arms a timer, so there is no task to drive while
 /// waiting, and this workspace's `tokio` carries no `time` feature.
 pub(crate) fn wait_out_validation() {
-    std::thread::sleep(EPHEMERIS_VALIDATION_SETTLES_AFTER + Duration::from_millis(300));
+    std::thread::sleep(EPHEMERIS_VALIDATION_SETTLES_AFTER + Duration::from_millis(600));
 }
 
 /// The satellites `setting` onboards, written into this service's store exactly where

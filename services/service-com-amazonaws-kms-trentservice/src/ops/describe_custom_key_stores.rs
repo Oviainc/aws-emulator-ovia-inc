@@ -201,6 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        // `DescribeCustomKeyStores` names no KMS key, so no key policy is in force: its
+        // permission is the caller's own ("Required permissions:
+        // kms:DescribeCustomKeyStores (IAM policy)"), and a principal whose identity
+        // policies do not allow it is refused before any key store is read.
+        crate::state::authorization::check_account_action(&*self.engine, ctx, Self::NAME)?;
         // A REPORTING operation: it reads the custom key stores of this account and
         // Region. The only thing it writes is a connection change the CLOCK has
         // already made due — one that was owed at this instant even if nobody had

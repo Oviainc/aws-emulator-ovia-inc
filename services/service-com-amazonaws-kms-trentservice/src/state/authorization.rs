@@ -21,6 +21,10 @@
 //! permission from the grants those tokens name, rather than additively beside the two
 //! policies. See [`authorize`].
 //!
+//! An operation that names NO key has no key policy to ask, so only the second authority
+//! is in force: its permission comes from the calling principal's identity-based policies
+//! alone, over the whole service in this Region ([`authorize_account_action`]).
+//!
 //! The pieces, each held in exactly one place — the same shape every other service's own
 //! `state/authorization.rs` takes, because this is one rule and not several:
 //!
@@ -238,6 +242,85 @@ pub fn authorize(
     } else {
         no_resource_policy_message(&caller.arn, &action, &key.arn)
     })
+}
+
+/// Whether the authorities in force let `caller` perform an ACCOUNT-LEVEL
+/// `kms:<operation>` — one that names no KMS key — and the refusal message when they do
+/// not.
+///
+/// Such an operation reaches no key, so no key policy is in force and the whole decision
+/// is the calling principal's identity-based policies: the permission KMS documents for
+/// one of these is an IAM-policy permission
+/// (`smithy_query(query="doc",shape="ListAliases")`: "Required permissions:
+/// kms:ListAliases (IAM policy)"), and a principal whose identity policies do not allow
+/// the action holds no other authority to fall back on — a grant covers one key and a key
+/// policy governs one key, so neither can carry a request that is about neither.
+///
+/// The resource the request is judged against is the whole service in `region`
+/// ([`account_resource`]), because an action with no resource type is written in a policy
+/// against the service's wildcard ARN.
+pub fn authorize_account_action(
+    caller: &Caller,
+    region: &str,
+    operation: &str,
+) -> Result<(), String> {
+    let action = format!("{}:{operation}", super::ARN_SERVICE);
+    let resource = account_resource(region);
+
+    // The same request context every key-scoped decision publishes, so one statement
+    // scoped to a principal is read the same way whichever operation asks.
+    let principal_context = condition_context(caller);
+    let published: Vec<&str> = principal_context
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let request = iam::Request::new(&action, &resource, &caller.principals)
+        .with_context(&principal_context)
+        .with_published_keys(&published);
+
+    match iam::identity_decision(&caller.documents, &request) {
+        // An explicit `Deny` wins over every `Allow`, whichever of the caller's documents
+        // states it.
+        Decision::Denied => Err(explicit_deny_message(
+            &caller.arn,
+            &action,
+            &resource,
+            "an identity-based policy",
+        )),
+        Decision::Allowed => Ok(()),
+        // A caller whose identity-based half cannot refuse (see the module docs) is
+        // served: refusing on evidence this emulator does not hold would deny access AWS
+        // permits.
+        _ if caller.identity_is_unbounded() => Ok(()),
+        _ => Err(no_identity_policy_message(&caller.arn, &action, &resource)),
+    }
+}
+
+/// The resource an ACCOUNT-LEVEL action is judged against: every KMS resource of this
+/// account in `region`, which is what an action carrying no resource type is written
+/// against in a policy. Built through [`super::ARN_SERVICE`] and the engine's one ARN
+/// builder, the same way [`super::key_arn`] names a key.
+#[must_use]
+pub fn account_resource(region: &str) -> String {
+    ::engine::emulator_arn(super::ARN_SERVICE, region, "*")
+}
+
+/// The whole account-level gate an implemented operation needs, on that operation's own
+/// error channel: who the request speaks for, whether its identity-based policies allow
+/// `kms:<operation>` in the Region the request was signed for, and the
+/// `AccessDeniedException` (HTTP 400) that refuses it when they do not.
+///
+/// One call per handler, so no two account-level operations gate themselves differently —
+/// and it reaches no store of this service, so a handler calls it before locking its own.
+pub fn check_account_action<E, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    let caller = caller(engine, ctx);
+    let region = super::request_region(ctx);
+    authorize_account_action(&caller, &region, operation)
+        .map_err(crate::scaffolded::Scaffolded::access_denied)
 }
 
 /// The condition keys a statement of these documents is judged under: the keys that name

@@ -206,6 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `ListAliases` names no KMS key, so no key policy is in force: its permission is
+        // the caller's own ("Required permissions: kms:ListAliases (IAM policy)"), and a
+        // principal whose identity policies do not allow it is refused before any alias
+        // of this account is read.
+        crate::state::authorization::check_account_action(&*self.engine, ctx, Self::NAME)?;
+
         let region = crate::state::request_region(ctx);
         let state = state.lock();
 

@@ -1484,6 +1484,19 @@ impl Stream {
         self.tags.extend(tags);
     }
 
+    /// Unassign the tags `keys` names from the stream: "Removed tags are deleted and cannot
+    /// be recovered after this operation successfully completes... If you specify a tag that
+    /// does not exist, it is ignored" (`RemoveTagsFromStream`), so a key the stream does not
+    /// carry removes nothing and every tag the request does not name stays as it was.
+    ///
+    /// The counterpart of [`Self::assign_tags`] over the same stored map, so a removal can
+    /// only ever take the stream further below the [`MAX_STREAM_TAGS`] ceiling.
+    pub fn unassign_tags<'keys>(&mut self, keys: impl IntoIterator<Item = &'keys str>) {
+        for key in keys {
+            self.tags.remove(key);
+        }
+    }
+
     /// The enhanced monitoring configuration the stream reports: one entry carrying the
     /// shard-level metrics that are enabled, which is an empty list until some are.
     fn enhanced_monitoring(&self) -> Vec<EnhancedMetrics> {

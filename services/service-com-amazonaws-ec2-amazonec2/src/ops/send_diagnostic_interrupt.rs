@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendDiagnosticInterrupt
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendDiagnosticInterrupt`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendDiagnosticInterrupt::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: delivers one diagnostic interrupt to the instance the request names —
+//! "the operating system crashes and reboots when a kernel panic or stop error is
+//! triggered" — which is a crash of the instance's OPERATING SYSTEM and no lifecycle move
+//! of the instance, so the instance is left in the state it was already in and the
+//! interrupt is recorded on it
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::record_diagnostic_interrupt`]).
+//!
+//! An interrupt has an operating system to crash only while the instance is up, so an
+//! instance that is `running` — or `pending`, on its way to it — takes one, and an instance
+//! in any other state is refused `IncorrectInstanceState`. An instance id this service
+//! cannot resolve is refused malformed before unknown, the order this service reads the
+//! two in ([`crate::state::require_instance_record`]).
+//!
+//! `DryRun` is answered BEFORE the store is read: the flag asks "whether you have the
+//! required permissions for the operation, without actually making the request", which is
+//! a question about the caller and not about the instance — the same order the sibling
+//! single-instance operation `crate::ops::get_console_screenshot` answers it in, and the
+//! only one under which a probe of a destructive operation cannot write.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +168,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendDiagnosticInterrupt` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendDiagnosticInterruptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendDiagnosticInterrupt"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{require_instance_record, require_service_state, InstanceStateName};
+
+        // Nothing about this answer depends on the request's Region or headers: which
+        // instance takes the interrupt is a fact of the id the request names.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the operation, WITHOUT
+        // ACTUALLY MAKING THE REQUEST … the error response is DryRunOperation"
+        // (`$DryRun`): the probe is a question about the caller's permissions, answered
+        // before the store is read, so a probe of an operation that crashes an operating
+        // system neither reads nor writes one byte of state.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move
+        // it already owed is materialised before one is read: an instance whose `running`
+        // transition fell due is running whether or not anybody called in the meantime.
+        store.materialize_due_transitions();
+
+        // Malformed before unknown, the order this service resolves an instance id in. The
+        // id is read back off the record the lookup resolved, so the interrupt is recorded
+        // against the stored instance rather than against the request's text.
+        let instance = require_instance_record(&store, &input.instance_id)?;
+        // An interrupt "triggers a kernel panic … or a blue screen/stop error", which needs
+        // an operating system that is up to crash. An instance in `pending` is one the
+        // clock is about to make `running` and nothing else, so this service's own launch
+        // span cannot be what refuses the interrupt; every other state is on its way down
+        // or already stopped, with no operating system running, so the request is refused
+        // rather than recorded against a state it cannot be carried out in.
+        if !matches!(
+            instance.state,
+            InstanceStateName::Running | InstanceStateName::Pending
+        ) {
+            return Err(Scaffolded::incorrect_instance_state(
+                &instance.instance_id,
+                instance.state.as_str(),
+                "sent a diagnostic interrupt",
+            ));
+        }
+        let instance_id = instance.instance_id.clone();
+
+        // The interrupt is DELIVERED here: it crashes and reboots the instance's operating
+        // system, which is no lifecycle move, so this records the interrupt and leaves the
+        // instance in the state it was in.
+        store.record_diagnostic_interrupt(&instance_id, ::std::time::SystemTime::now());
+
+        // The modelled output is `Unit`, and EC2's envelope carries the success flag
+        // itself (`crate::service`), so there is no member for this handler to fill.
+        Ok(SendDiagnosticInterruptOutput)
     }
 }

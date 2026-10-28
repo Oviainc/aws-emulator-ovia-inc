@@ -7,6 +7,11 @@
 //! membership is a SET of URIs, so disassociating a URI the set does not hold
 //! changes nothing and succeeds.
 //!
+//! Which resources a set holds is part of the set, so a call that really removes
+//! a member changed the set and the `LastUpdateTime` every reader reports moves
+//! to that instant, while one that removes nothing leaves it exactly where it
+//! was ([`crate::state::ResourceSetRecord::set_resources`]).
+//!
 //! Administrator-gated, like every organisation-scoped Firewall Manager
 //! operation: with no Firewall Manager default administrator association in this
 //! account/Region the call is refused by [`crate::state::require_administrator`]
@@ -197,6 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         // The accounts the discoverable inventory reports resources in, read
         // BEFORE this service's store is locked: that read locks the stores of
@@ -298,10 +304,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The membership is written through the record's own single writer, so
+        // the set's `LastUpdateTime` moves to the instant its membership changed
+        // and stays put when a call changed nothing — a URI the set does not hold
+        // leaves nothing to remove
+        // ([`crate::state::ResourceSetRecord::set_resources`]).
         if let Some(record) = store.resource_sets.get_mut(&id) {
+            let mut membership = record.resources.clone();
             for uri in &disassociated {
-                record.resources.remove(uri);
+                membership.remove(uri);
             }
+            record.set_resources(membership, now);
         }
         Ok(BatchDisassociateResourceOutput {
             resource_set_identifier: id,

@@ -241,7 +241,11 @@ fn referenced_model<'a>(reference: &'a str, rest_api_id: &str) -> Option<&'a str
 /// A schema that is not a JSON document, or that resolves no reference at all, is
 /// answered unchanged — so a read reports the caller's own text whenever flattening has
 /// nothing to do.
-fn flattened_schema(
+///
+/// `pub(crate)` because `GetModelTemplate` generates its sample payload from the same
+/// resolved document: a reference names another model of this API by that model's URL,
+/// which the generator cannot read, so the ONE resolution of such a reference is this one.
+pub(crate) fn flattened_schema(
     api: &crate::state::RestApiEntry,
     rest_api_id: &str,
     schema: &str,

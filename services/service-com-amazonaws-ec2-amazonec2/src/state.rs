@@ -1265,6 +1265,15 @@
 //! count and the latest instant rather than kept as a growing list, because nothing
 //! reclaims a queued reboot and an instance may be rebooted any number of times.
 //!
+//! A DIAGNOSTIC INTERRUPT is the same kind of fact, and is held the same way
+//! ([`InstanceRecord::diagnostic_interrupts`],
+//! [`InstanceRecord::last_diagnostic_interrupt_at`], written by
+//! [`ComAmazonawsEc2Amazonec2State::record_diagnostic_interrupt`]): the interrupt makes the
+//! instance's OPERATING SYSTEM crash and reboot, which is no lifecycle move of the
+//! instance, and no modelled member of [`Instance`] reports one. It is counted separately
+//! from the queued reboots because a caller asking for a reboot and a caller sending an
+//! interrupt are asking for different things, and one is not a reading of the other.
+//!
 //! ## EBS encryption by default: a setting of a Region, not a resource
 //!
 //! EBS encryption by default has no resource and no id: it is one boolean "for your
@@ -1970,6 +1979,16 @@ pub struct InstanceRecord {
     /// nobody has asked to reboot. The service's own clock reading, not a value any
     /// request carries.
     pub last_reboot_queued_at: Option<SystemTime>,
+    /// How many diagnostic interrupts have been sent to this instance: the interrupt
+    /// crashes and reboots the instance's operating system and moves the instance itself
+    /// nowhere, so — like [`InstanceRecord::queued_reboots`] — this count is the whole of
+    /// what one records. Held as a count because nothing reclaims an interrupt and an
+    /// instance may be interrupted any number of times.
+    pub diagnostic_interrupts: u32,
+    /// When the most recent diagnostic interrupt was sent to this instance — `None` for an
+    /// instance nobody has sent one to. The service's own clock reading, not a value any
+    /// request carries.
+    pub last_diagnostic_interrupt_at: Option<SystemTime>,
     pub launch_time: SystemTime,
     pub ami_launch_index: i32,
     /// Stored because the launch supplied it; `DescribeInstances` never reports user
@@ -6541,6 +6560,26 @@ impl ComAmazonawsEc2Amazonec2State {
         if let Some(instance) = self.instances.get_mut(instance_id) {
             instance.queued_reboots = instance.queued_reboots.saturating_add(1);
             instance.last_reboot_queued_at = Some(at);
+        }
+    }
+
+    /// Record one diagnostic interrupt sent to the instance `instance_id` names, as of
+    /// `at`.
+    ///
+    /// The ONE writer of a sent interrupt, so one `SendDiagnosticInterrupt` call records
+    /// one. Nothing else about the instance moves: the interrupt crashes and reboots the
+    /// instance's OPERATING SYSTEM, which leaves the instance in the state it was in, so
+    /// this touches neither [`InstanceRecord::state`] nor its
+    /// [`InstanceRecord::pending_transition`]. An id this store holds no instance for
+    /// records nothing — the handler refuses such an id before it gets here.
+    pub fn record_diagnostic_interrupt(&mut self, instance_id: &str, at: SystemTime) {
+        debug_assert!(
+            self.instances.contains_key(instance_id),
+            "an interrupt is recorded only for an instance the caller's id resolved to"
+        );
+        if let Some(instance) = self.instances.get_mut(instance_id) {
+            instance.diagnostic_interrupts = instance.diagnostic_interrupts.saturating_add(1);
+            instance.last_diagnostic_interrupt_at = Some(at);
         }
     }
 
@@ -31923,9 +31962,12 @@ impl ComAmazonawsEc2Amazonec2State {
             pending_transition: Some(PendingTransition::starting_now(InstanceStateName::Running)),
             state_transition_reason: None,
             state_reason: None,
-            // Nobody has asked to reboot an instance that has just been launched.
+            // Nobody has asked to reboot an instance that has just been launched, and
+            // nobody has interrupted it either.
             queued_reboots: 0,
             last_reboot_queued_at: None,
+            diagnostic_interrupts: 0,
+            last_diagnostic_interrupt_at: None,
             // The instance was launched when the fulfillment fell due, not when somebody
             // next asked about it.
             launch_time: at,
