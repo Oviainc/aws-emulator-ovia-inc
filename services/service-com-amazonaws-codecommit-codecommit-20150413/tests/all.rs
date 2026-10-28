@@ -81,6 +81,8 @@ mod differences;
 mod file_commit_history;
 #[path = "all/file_deletion.rs"]
 mod file_deletion;
+#[path = "all/file_does_not_exist_message.rs"]
+mod file_does_not_exist_message;
 #[path = "all/folder_collection_members.rs"]
 mod folder_collection_members;
 #[path = "all/folder_listing.rs"]

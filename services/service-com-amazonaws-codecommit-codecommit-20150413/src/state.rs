@@ -710,6 +710,20 @@ pub fn commit_does_not_exist_message(specifier: &str) -> String {
     format!("Could not find commit {specifier}")
 }
 
+/// `FileDoesNotExistException`'s message, built from the path the request asked
+/// for — the one place this crate words that code, the path sibling of
+/// [`commit_does_not_exist_message`].
+///
+/// The template's single slot is that path, in the canonical form that addresses a
+/// tree entry ([`normalize_path`]: leading separators, which name the same entry,
+/// removed). Nothing else of the request or of the state reaches the text: the
+/// sentence states which path the service looked for and failed to find, so it
+/// names neither the commit the path was resolved against nor the branch nor the
+/// repository.
+pub fn file_does_not_exist_message(path: &str) -> String {
+    format!("Could not find path {path}")
+}
+
 /// `ParentCommitIdOutdatedException`'s message: a FIXED sentence group carrying
 /// nothing from the request — neither the stale id nor the branch.
 ///

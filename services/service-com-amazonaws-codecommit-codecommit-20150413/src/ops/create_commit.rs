@@ -674,8 +674,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let source_entry = base.get(&source_path).cloned().ok_or_else(|| {
                         CreateCommitErrorModeled::FileDoesNotExistException(
                             FileDoesNotExistException {
-                                message: Some(format!(
-                                    "the source file {source_path} does not exist in this branch"
+                                message: Some(crate::state::file_does_not_exist_message(
+                                    &source_path,
                                 )),
                             },
                         )
@@ -775,7 +775,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for path in &deletes {
             let removed = files.remove(path).ok_or_else(|| {
                 CreateCommitErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
-                    message: Some(format!("the file {path} does not exist in this branch"))
+                    message: Some(crate::state::file_does_not_exist_message(path)),
                 })
             })?;
             deleted.push(file_metadata(path, &removed));
@@ -801,7 +801,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (path, file_mode) in &mode_changes {
             let entry = files.get_mut(path).ok_or_else(|| {
                 CreateCommitErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
-                    message: Some(format!("the file {path} does not exist in this branch")),
+                    message: Some(crate::state::file_does_not_exist_message(path)),
                 })
             })?;
             entry.file_mode = file_mode.clone();

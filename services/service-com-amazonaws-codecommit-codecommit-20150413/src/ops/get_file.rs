@@ -234,10 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let entry = commit.files.get(&file_path).ok_or_else(|| {
             GetFileErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
-                message: Some(format!(
-                    "the file {file_path} does not exist in the commit {}",
-                    commit.commit_id
-                )),
+                message: Some(crate::state::file_does_not_exist_message(&file_path)),
             })
         })?;
         let content = repository.blob(&entry.blob_id).ok_or_else(|| {

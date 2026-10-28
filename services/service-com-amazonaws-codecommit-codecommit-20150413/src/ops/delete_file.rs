@@ -377,10 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deletes nothing.
         let removed = files.remove(&file_path).ok_or_else(|| {
             DeleteFileErrorModeled::FileDoesNotExistException(FileDoesNotExistException {
-                message: Some(format!(
-                    "the file {file_path} does not exist in the branch {}",
-                    input.branch_name
-                )),
+                message: Some(crate::state::file_does_not_exist_message(&file_path)),
             })
         })?;
 
