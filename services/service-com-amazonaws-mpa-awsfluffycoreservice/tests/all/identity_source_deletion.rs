@@ -66,7 +66,7 @@ fn create_body(n: usize, tags: usize) -> Value {
 }
 
 /// Create one identity source and answer the ARN this service minted for it.
-async fn create_source(harness: &Harness, n: usize, tags: usize) -> String {
+pub(crate) async fn create_source(harness: &Harness, n: usize, tags: usize) -> String {
     let (status, created) = harness
         .call("POST", "/identity-sources", Some(create_body(n, tags)))
         .await;
@@ -84,7 +84,7 @@ async fn create_source(harness: &Harness, n: usize, tags: usize) -> String {
 
 /// `DELETE /identity-sources/{IdentitySourceArn}` — the label is non-greedy, so the ARN
 /// is percent-encoded into one path segment.
-async fn delete_source(harness: &Harness, arn: &str) -> (u16, Value) {
+pub(crate) async fn delete_source(harness: &Harness, arn: &str) -> (u16, Value) {
     harness
         .call("DELETE", &format!("/identity-sources/{}", encode_label(arn)), None)
         .await
@@ -92,7 +92,7 @@ async fn delete_source(harness: &Harness, arn: &str) -> (u16, Value) {
 
 /// The status `ListIdentitySources` reports for `arn`, or `None` when the page does not
 /// carry it at all.
-async fn listed_status(harness: &Harness, arn: &str) -> Option<String> {
+pub(crate) async fn listed_status(harness: &Harness, arn: &str) -> Option<String> {
     let (status, body) = harness.call("POST", "/identity-sources/?List", None).await;
     assert_eq!(status, 200, "ListIdentitySources returned {body:?}");
     body.get("IdentitySources")
@@ -106,7 +106,7 @@ async fn listed_status(harness: &Harness, arn: &str) -> Option<String> {
 }
 
 /// The stored source's `(Status, deletion_due)`, straight out of the store.
-fn stored(harness: &Harness, arn: &str) -> Option<(&'static str, Option<SystemTime>)> {
+pub(crate) fn stored(harness: &Harness, arn: &str) -> Option<(&'static str, Option<SystemTime>)> {
     let store = state::service_state(&*harness.engine).expect("the service store");
     let guard = store.lock();
     guard

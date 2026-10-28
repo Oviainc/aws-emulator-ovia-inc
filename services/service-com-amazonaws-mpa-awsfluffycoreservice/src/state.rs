@@ -120,7 +120,9 @@
 //! `DeleteIdentitySource` is what takes one out again: it puts the stored record into
 //! `DELETING` ([`IdentitySource::begin_deletion`]) and the clock removes it
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::remove_identity_source`]), so the
-//! record a later read reports — or omits — is this one store's.
+//! record a later read reports — or omits — is this one store's. A source an approver
+//! record of a stored team authenticates through is IN USE and is not removed at all
+//! ([`ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`]).
 //!
 //! # The policy catalog
 //!
@@ -1280,6 +1282,34 @@ impl ApprovalTeam {
         self.version = self.mint_version();
         self.version_id = self.version.to_string();
         self.last_update_time = Some(now);
+    }
+
+    /// EVERY approver record this team holds: its LIVE approvers, and the approvers of
+    /// the change it has been asked to approve ([`ApprovalTeam::pending_update`]).
+    ///
+    /// A team keeps two approver sets, and both are real: the requested change's set is
+    /// invited when the change is requested, is reported member-for-member in
+    /// `PendingUpdate$Approvers`, and becomes the live set when the change is activated
+    /// ([`ApprovalTeam::activate_pending_update`]). So a decision about the identities or
+    /// the identity sources a team depends on reads this, not one of the two sets: the
+    /// one that is live now is not the only one this store holds.
+    pub fn approver_records(&self) -> impl Iterator<Item = &Approver> {
+        self.approvers.iter().chain(
+            self.pending_update
+                .iter()
+                .flat_map(|update| update.approvers.iter()),
+        )
+    }
+
+    /// The same two sets, for update — what a change the clock owes an approver record
+    /// is applied through ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`]).
+    pub fn approver_records_mut(&mut self) -> impl Iterator<Item = &mut Approver> {
+        let requested = self
+            .pending_update
+            .as_mut()
+            .map(|update| update.approvers.as_mut_slice())
+            .unwrap_or_default();
+        self.approvers.iter_mut().chain(requested)
     }
 
     /// Put a requested change to the team's approvers: the team keeps the configuration
@@ -2535,15 +2565,11 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// that fell due first is applied first, and the later one acts on its result.
     pub fn materialize_due(&mut self, now: SystemTime) {
         for team in self.approval_teams.values_mut() {
-            // The approvers of the team AND of the change it has been asked to approve:
-            // an approver that change ADDS is invited when the change is requested, so
-            // its response comes due while the change is still waiting.
-            let requested_approvers = team
-                .pending_update
-                .as_mut()
-                .map(|update| update.approvers.as_mut_slice())
-                .unwrap_or_default();
-            for approver in team.approvers.iter_mut().chain(requested_approvers) {
+            // The approvers of the team AND of the change it has been asked to approve
+            // (`ApprovalTeam::approver_records_mut`): an approver that change ADDS is
+            // invited when the change is requested, so its response comes due while the
+            // change is still waiting.
+            for approver in team.approver_records_mut() {
                 if approver.primary_identity_status != ApproverIdentityStatus::Pending {
                     continue;
                 }
@@ -2929,18 +2955,21 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// The ARN of a stored approval team whose approvers authenticate through the
     /// identity source `arn` names, if any.
     ///
-    /// A team's approvers are recorded with the identity source each of them is
-    /// authenticated by (`Approver::primary_identity_source_arn`), so a source with such
-    /// a reference is IN USE: removing it would leave the team pointing at a source this
-    /// store no longer holds. It is the one place that reference is resolved, so every
+    /// An approver is recorded with the identity source they are authenticated by
+    /// (`Approver::primary_identity_source_arn`), so a source with such a reference is IN
+    /// USE: removing it would leave the team pointing at a source this store no longer
+    /// holds. BOTH approver sets a team holds are read
+    /// ([`ApprovalTeam::approver_records`]) — the live one and the one belonging to the
+    /// change the team has been asked to approve, which the team read reports and
+    /// activation installs as the live set — because a reference in either is a reference
+    /// this store holds. It is the one place that reference is resolved, so every
     /// operation deciding whether a source is in use reads the same records.
     #[must_use]
     pub fn team_arn_using_identity_source(&self, arn: &str) -> Option<&str> {
         self.approval_teams
             .values()
             .find(|team| {
-                team.approvers
-                    .iter()
+                team.approver_records()
                     .any(|approver| approver.primary_identity_source_arn == arn)
             })
             .map(|team| team.arn.as_str())
