@@ -27,3 +27,5 @@ mod state_roundtrip;
 mod support;
 #[path = "all/tag_key_refusal.rs"]
 mod tag_key_refusal;
+#[path = "all/tag_key_refusal_element_path.rs"]
+mod tag_key_refusal_element_path;

@@ -146,8 +146,10 @@ pub fn pattern_requirement(pattern: &str) -> String {
 ///
 /// Pending the migration noted on [`pattern_requirement`].
 ///
-/// `path` is the framework's own input-path form (segments joined with `.`, with `member`
-/// for the step from a list into its element).
+/// `path` is a path spelled by the framework's own path rule
+/// ([`::aws_smithy_schema_server::constraints::path`]) — the module BOTH halves of this
+/// service's validation build their paths through, so a position the walk reports and the
+/// same position a handler reports are spelled identically.
 pub fn violation_clause(path: &str, requirement: &str) -> String {
     format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
@@ -170,37 +172,73 @@ pub fn validation_envelope(clauses: &[String]) -> String {
     }
 }
 
-/// The `ValidationException` message for a tag key outside [`TAG_KEY_PATTERN`], at input
-/// path `path`.
-pub fn malformed_tag_key_message(path: &str) -> String {
-    validation_envelope(&[violation_clause(
-        path,
-        &pattern_requirement(TAG_KEY_PATTERN),
-    )])
+/// The `ValidationException` message for the tag keys outside [`TAG_KEY_PATTERN`] a
+/// request carried, one clause per offending key at the input path `paths` names it at.
+///
+/// Every offender is stated, not just the first, because that is what the boundary walk
+/// does with the constraints it CAN apply: it descends the whole list and accumulates a
+/// violation per element, and [`validation_envelope`] joins them. The count is bounded by
+/// the list itself (`@length(max: 200)`, [`MAX_TAGS`]).
+pub fn malformed_tag_key_message(paths: &[String]) -> String {
+    let requirement = pattern_requirement(TAG_KEY_PATTERN);
+    let clauses: Vec<String> = paths
+        .iter()
+        .map(|path| violation_clause(path, &requirement))
+        .collect();
+    validation_envelope(&clauses)
 }
 
-/// The input path a `tags` list's key occupies, in the framework's own input-path form:
-/// the `tags` member, the step into one element (`member`), then that element's `key`.
-const TAGS_MEMBER_KEY_PATH: &str = "tags.member.key";
+/// The Smithy member name of the list of whole tags, which both operations that accept
+/// whole tags submit their tags at (`smithy_query` operation `TagResource` /
+/// `InvokeDataAutomationAsync`).
+const TAGS_MEMBER: &str = "tags";
 
-/// The input path a `tagKeys` list's element occupies: the list holds the keys
-/// themselves, so the path stops at the step into one element.
-const TAG_KEYS_MEMBER_PATH: &str = "tagKeys.member";
+/// The Smithy member name of the key within one `Tag` (`smithy_query` shape `Tag`).
+const TAG_KEY_MEMBER: &str = "key";
 
-/// The refusal a sequence of tag keys carried at input path `path` earns, or `None` when
-/// every one of them satisfies [`TAG_KEY_PATTERN`].
+/// The Smithy member name of the list of bare tag keys (`smithy_query` operation
+/// `UntagResource`).
+const TAG_KEYS_MEMBER: &str = "tagKeys";
+
+/// The input path the `key` of the `tags` element at 1-based `position` occupies, built
+/// with the framework's own path rule ([`::aws_smithy_schema_server::constraints::path`]):
+/// the list member, the element's position and the step into it, then the member within
+/// that element.
+fn tags_member_key_path(position: usize) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[
+        path::member(TAGS_MEMBER),
+        path::element(position),
+        path::member(TAG_KEY_MEMBER),
+    ])
+}
+
+/// The input path the `tagKeys` element at 1-based `position` occupies: the list holds the
+/// keys themselves, so the path stops at the step into that element.
+fn tag_keys_member_path(position: usize) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[path::member(TAG_KEYS_MEMBER), path::element(position)])
+}
+
+/// The refusal a sequence of tag keys earns, or `None` when every one of them satisfies
+/// [`TAG_KEY_PATTERN`]; `path_of` spells the input path of the element at a 1-based
+/// position.
 ///
 /// The scan itself — WHICH keys are looked at, and what a malformed one reads as — lives
 /// here once, so the operations that accept a tag key cannot come to disagree about the
 /// rule (whether an empty list is refusable, whether the first offender or every offender
-/// is reported, how the member is named).
+/// is reported, how the element is named).
 fn malformed_tag_key_refusal_at<'a>(
     keys: impl IntoIterator<Item = &'a str>,
-    path: &str,
+    path_of: impl Fn(usize) -> String,
 ) -> Option<String> {
-    keys.into_iter()
-        .any(|key| !tag_key_is_well_formed(key))
-        .then(|| malformed_tag_key_message(path))
+    let paths: Vec<String> = keys
+        .into_iter()
+        .enumerate()
+        .filter(|(_, key)| !tag_key_is_well_formed(key))
+        .map(|(index, _)| path_of(index + 1))
+        .collect();
+    (!paths.is_empty()).then(|| malformed_tag_key_message(&paths))
 }
 
 /// The refusal a `tags` list earns, or `None` when every key in it is well formed.
@@ -209,17 +247,14 @@ fn malformed_tag_key_refusal_at<'a>(
 /// (`InvokeDataAutomationAsync` and `TagResource`), which differ only in whether the
 /// member is optional — an absent list is an empty slice, and carries no key to refuse.
 pub fn malformed_tag_refusal(tags: &[Tag]) -> Option<String> {
-    malformed_tag_key_refusal_at(tags.iter().map(|tag| tag.key.as_str()), TAGS_MEMBER_KEY_PATH)
+    malformed_tag_key_refusal_at(tags.iter().map(|tag| tag.key.as_str()), tags_member_key_path)
 }
 
 /// The refusal a `tagKeys` list earns, or `None` when every key in it is well formed:
 /// the same rule as [`malformed_tag_refusal`], for the operation that carries bare keys
 /// (`UntagResource`) and so names a different input path.
 pub fn malformed_tag_key_refusal(tag_keys: &[String]) -> Option<String> {
-    malformed_tag_key_refusal_at(
-        tag_keys.iter().map(String::as_str),
-        TAG_KEYS_MEMBER_PATH,
-    )
+    malformed_tag_key_refusal_at(tag_keys.iter().map(String::as_str), tag_keys_member_path)
 }
 
 /// Why a submission that names neither a data-automation project nor an inline blueprint

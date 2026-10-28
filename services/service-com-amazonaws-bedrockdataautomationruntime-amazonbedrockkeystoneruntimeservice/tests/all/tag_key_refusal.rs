@@ -7,8 +7,9 @@
 //!
 //! The rule under test: a request carrying a tag key outside the modelled `TagKey`
 //! pattern is refused with `ValidationException` (HTTP 400) whose message names the input
-//! path the key arrived at, and that refusal is the SAME for every operation that accepts
-//! a tag key — the submission that mints a resource, the operation that adds tags and the
+//! path the key arrived at — including the 1-based position of the list element it came in
+//! (`tag_key_refusal_element_path` is the suite that spans those positions) — and that
+//! refusal is the SAME for every operation that accepts a tag key — the submission that mints a resource, the operation that adds tags and the
 //! one that removes them. The three handlers reach it through one helper, so the rows
 //! below drive that one path from each of them and compare the answers to each other, not
 //! only to a constant.
@@ -250,6 +251,9 @@ async fn every_tag_key_accepting_operation_states_the_tag_key_refusal_identicall
         // One row per operation that accepts a tag key, with the input path that
         // operation's request carries it at. `InvokeDataAutomationAsync` and
         // `TagResource` carry whole tags; `UntagResource` carries bare keys.
+        // Every row below submits a ONE-element list, so the element the path names is at
+        // position 1; the positions themselves are spanned by
+        // `tag_key_refusal_element_path`.
         let operations: [(&str, Value, &str); 3] = [
             (
                 "InvokeDataAutomationAsync",
@@ -257,17 +261,17 @@ async fn every_tag_key_accepting_operation_states_the_tag_key_refusal_identicall
                     "s3://out-bucket/tag-key-refusal/",
                     Some(json!([{"key": key, "value": "v"}])),
                 ),
-                "tags.member.key",
+                "tags.1.member.key",
             ),
             (
                 "TagResource",
                 json!({"resourceARN": arn, "tags": [{"key": key, "value": "v"}]}),
-                "tags.member.key",
+                "tags.1.member.key",
             ),
             (
                 "UntagResource",
                 json!({"resourceARN": arn, "tagKeys": [key]}),
-                "tagKeys.member",
+                "tagKeys.1.member",
             ),
         ];
 
