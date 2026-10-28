@@ -183,9 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.db_shard_groups.get_mut(&key) else {
             return Err(DeleteDBShardGroupErrorModeled::DBShardGroupNotFoundFault(
                 DBShardGroupNotFoundFault {
-                    message: Some(format!(
-                        "DBShardGroup {} not found.",
-                        input.db_shard_group_identifier
+                    message: Some(crate::state::db_shard_group_not_found_message(
+                        &input.db_shard_group_identifier,
                     )),
                 },
             )

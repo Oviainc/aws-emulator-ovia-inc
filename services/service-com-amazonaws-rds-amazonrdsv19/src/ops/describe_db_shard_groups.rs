@@ -181,7 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         || {
                             DescribeDBShardGroupsErrorModeled::DBShardGroupNotFoundFault(
                                 DBShardGroupNotFoundFault {
-                                    message: Some(format!("DBShardGroup {requested} not found.")),
+                                    message: Some(
+                                        crate::state::db_shard_group_not_found_message(requested),
+                                    ),
                                 },
                             )
                         },
