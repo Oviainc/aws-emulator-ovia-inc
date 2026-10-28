@@ -6,6 +6,12 @@
 //! in [`crate::state::ComAmazonawsSignerWallabyserviceState::profiles`]. Every
 //! member of the answer is read back out of the stored record.
 //!
+//! Re-versioning keeps the profile's identity (same ARN, same creation time, same
+//! opaque id) and its version history, and it keeps the profile's revocation too:
+//! a name a `RevokeSigningProfile` moved to `Revoked` is still revoked after this
+//! call, with the same record of from which instant, why and by whom trust ended,
+//! so no version that revocation covers reads back as trusted again.
+//!
 //! The answer also carries a `tags` member the model does not declare, holding
 //! the created profile's resource identity (`resourceArn`, `internalId`) — see
 //! [`PutSigningProfileOutput`] for why it is declared by hand.
@@ -324,7 +330,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             // A profile this call created or re-versioned can sign: nothing in
             // the request holds it back, and only `CancelSigningProfile` /
-            // `RevokeSigningProfile` move it off `Active`.
+            // `RevokeSigningProfile` move it off `Active`. A name that is
+            // already REVOKED is the one exception, and it is not decided here:
+            // the store carries that profile's revocation — its `Revoked`
+            // status, the reason it reports and the one revocation record — onto
+            // whatever replaces it
+            // ([`crate::state::ComAmazonawsSignerWallabyserviceState::insert_profile`]),
+            // because trust that has already ended is not restored by writing to
+            // the profile again.
             status: crate::state::PROFILE_STATUS_ACTIVE.to_string(),
             // `statusReason` reports why a profile is not active, so an active
             // one carries none — and an active one has not been revoked, so it

@@ -19,8 +19,8 @@
 //!
 //! The rows differ along what the rules generalise over: the status the profile
 //! is in when the cancel arrives, how it got there (including a re-put, which
-//! makes the profile `Active` again), the platform, and the region the request
-//! is signed for.
+//! makes a canceled profile `Active` again and leaves a revoked one `Revoked`),
+//! the platform, and the region the request is signed for.
 
 use std::sync::Arc;
 
@@ -213,7 +213,8 @@ enum Setup {
     Revoked,
     /// Created, canceled, then re-put — which re-versions it to `Active`.
     CanceledThenReput,
-    /// Created, revoked, then re-put — likewise `Active` again.
+    /// Created, revoked, then re-put — which re-versions it but leaves the
+    /// revocation standing, so it is still `Revoked`.
     RevokedThenReput,
 }
 
@@ -283,8 +284,11 @@ const CASES: &[Case] = &[
         region: "eu-west-1",
         platform: "AmazonFreeRTOS-TI-CC3220SF",
         setup: Setup::RevokedThenReput,
-        status_before: "Active",
-        status_after: "Canceled",
+        // A re-put re-versions the profile without restoring trust in what the
+        // revocation untrusted, so the revoked status stands — and a cancel,
+        // the weaker fact, leaves it where it is.
+        status_before: "Revoked",
+        status_after: "Revoked",
     },
 ];
 

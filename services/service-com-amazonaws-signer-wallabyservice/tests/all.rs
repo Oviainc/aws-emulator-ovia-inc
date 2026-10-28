@@ -47,6 +47,9 @@ mod resource_tags;
 #[path = "all/revocation_status.rs"]
 mod revocation_status;
 
+#[path = "all/revocation_survives_a_reput.rs"]
+mod revocation_survives_a_reput;
+
 #[path = "all/signature_revocation.rs"]
 mod signature_revocation;
 

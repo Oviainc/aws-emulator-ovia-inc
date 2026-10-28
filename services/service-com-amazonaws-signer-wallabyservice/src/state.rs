@@ -307,6 +307,27 @@ impl SigningProfileRecord {
         });
     }
 
+    /// Carry the revocation `previous` holds onto this record, which is about to
+    /// REPLACE it under the same name.
+    ///
+    /// A revocation is a fact about trust that has already ended (see
+    /// [`Self::revoke`]), so nothing a later caller writes to the profile restores
+    /// that trust: a profile that was revoked stays `Revoked` and keeps the one
+    /// record of from which instant, why and by whom trust ended, however much of
+    /// the rest of it the replacing write rebuilds. Every version the profile has
+    /// had therefore stays covered by it — which is what
+    /// [`Self::version_revoked_at`] reports — rather than becoming trusted again
+    /// because the profile was written to. A `previous` nobody has revoked carries
+    /// nothing to keep.
+    pub fn carry_revocation_forward(&mut self, previous: &Self) {
+        if !previous.is_revoked() {
+            return;
+        }
+        self.status = previous.status.clone();
+        self.status_reason = previous.status_reason.clone();
+        self.revocation_record = previous.revocation_record.clone();
+    }
+
     /// This profile's ARN for `version` — the `profileVersionArn` a read of that
     /// version reports, which is the profile's own ARN with the version after it
     /// (see [`Self::profile_version_arn`], the same form for the current one).
@@ -573,8 +594,15 @@ impl ComAmazonawsSignerWallabyserviceState {
     /// Store `record` as `region`'s profile of that name, replacing whatever that
     /// region held under it; another region's profile of the same name is left
     /// alone.
-    pub fn insert_profile(&mut self, region: &str, record: SigningProfileRecord) {
+    ///
+    /// Replacing is not un-revoking: the revocation the replaced profile holds is
+    /// carried onto `record` ([`SigningProfileRecord::carry_revocation_forward`]),
+    /// so no write to a name reported as revoked makes it trusted again.
+    pub fn insert_profile(&mut self, region: &str, mut record: SigningProfileRecord) {
         let key = profile_key(region, &record.profile_name);
+        if let Some(previous) = self.profiles.get(&key) {
+            record.carry_revocation_forward(previous);
+        }
         self.profiles.insert(key, record);
     }
 

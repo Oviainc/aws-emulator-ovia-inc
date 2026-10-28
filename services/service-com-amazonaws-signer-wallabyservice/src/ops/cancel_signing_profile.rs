@@ -224,8 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not overwritten by a weaker one), and the call reports success either
         // way: this operation's error set models no refusal for the stored
         // status. The status read is the one the store holds NOW, not the
-        // profile's history: a later `PutSigningProfile` re-versions the profile
-        // and makes it `Active` again, and then a cancel moves it once more.
+        // profile's history: a later `PutSigningProfile` re-versions a canceled
+        // profile and makes it `Active` again, and then a cancel moves it once
+        // more — while a revoked one reads back `Revoked` after a re-put too,
+        // because the store carries its revocation forward.
         if profile.can_sign() {
             profile.status = crate::state::PROFILE_STATUS_CANCELED.to_string();
         }

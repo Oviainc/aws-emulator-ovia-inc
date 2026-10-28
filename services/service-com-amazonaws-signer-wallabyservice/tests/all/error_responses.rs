@@ -530,18 +530,20 @@ async fn signing_material_is_required_exactly_on_the_platforms_that_publish_it()
 /// becomes `Canceled`, and a profile already in a terminal, non-signing status
 /// keeps it — the call answers the recorded 204 either way, because this
 /// operation's modelled error set carries no refusal for the stored status. A
-/// profile that was revoked and then RE-PUT is active again, so the cancel moves
-/// it: the transition follows the stored status, not the profile's history.
+/// profile that was revoked and then RE-PUT keeps its revocation, so it is still
+/// `Revoked` and the cancel leaves it there: the transition follows the stored
+/// status, and a write to the profile does not restore the trust the revocation
+/// ended.
 #[tokio::test]
 async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
     // One row per status a profile can be in when the cancel arrives, plus the
-    // row that reaches `Active` again through a re-put. 204 is the recorded
-    // success for this DELETE.
+    // row that is re-put after a revoke. 204 is the recorded success for this
+    // DELETE.
     let rows: [(&str, &str, u16, &str); 4] = [
         ("Active", "Active_Cancel", 204, "Canceled"),
         ("Canceled", "Canceled_Cancel", 204, "Canceled"),
         ("Revoked", "Revoked_Cancel", 204, "Revoked"),
-        ("Revoked then re-put", "Reput_Cancel", 204, "Canceled"),
+        ("Revoked then re-put", "Reput_Cancel", 204, "Revoked"),
     ];
 
     for (status_before, name, expected_status, status_after) in rows {
@@ -567,8 +569,8 @@ async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
             _ => {}
         }
         if status_before == "Revoked then re-put" {
-            // A put re-versions the profile, and a profile a put created or
-            // re-versioned is `Active` — so this one is cancelable again.
+            // A put re-versions the profile, and the revocation it already
+            // carries stands — so this one is still `Revoked`.
             seed_profile(&router, name).await;
         }
 
