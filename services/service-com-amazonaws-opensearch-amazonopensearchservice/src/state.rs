@@ -1259,6 +1259,41 @@ impl Application {
         self.status = owed.status;
     }
 
+    /// Apply the settings an update asked to change to this application and record
+    /// when it changed.
+    ///
+    /// A member the request CARRIES replaces what the application held, and a member
+    /// it leaves out names nothing to change, so the record keeps the value it already
+    /// carries rather than having it cleared — the same rule
+    /// [`VpcEndpoint::begin_update`] applies to an endpoint's VPC options. An
+    /// explicitly empty list IS a value the request carries, so it leaves the
+    /// application holding none.
+    ///
+    /// The application's lifecycle status is not this call's to move: what an update
+    /// changes is the configuration the record carries, and the moves the clock owes
+    /// this application stay exactly as they were ([`Self::settle`]).
+    pub fn apply_update(
+        &mut self,
+        data_sources: Option<Vec<LinkedDataSource>>,
+        app_configs: Option<Vec<AppConfig>>,
+        iam_identity_center_options: Option<IamIdentityCenterOptionsInput>,
+        now: SystemTime,
+    ) {
+        if let Some(data_sources) = data_sources {
+            self.data_sources = data_sources;
+        }
+        if let Some(app_configs) = app_configs {
+            self.app_configs = app_configs;
+        }
+        if let Some(asked) = iam_identity_center_options {
+            self.iam_identity_center_options = Some(updated_iam_identity_center_options(
+                self.iam_identity_center_options.take(),
+                asked,
+            ));
+        }
+        self.last_updated_at = now;
+    }
+
     /// The application's data sources as a response reports them: absent where it
     /// holds none, because a member the application has nothing for is one the
     /// service leaves out rather than one it answers with an empty list.
@@ -8316,6 +8351,35 @@ pub fn stored_iam_identity_center_options(
             .iam_role_for_identity_center_application_arn,
         iam_identity_center_application_arn: None,
     }
+}
+
+/// `IamIdentityCenterOptionsInput` as an UPDATE leaves the settings a record already
+/// carries.
+///
+/// The same rule an update applies to the members of the request, one level down: a
+/// member the request carries replaces what the record held, and a member it leaves
+/// out keeps the stored value. The Identity Center application's own ARN is minted by
+/// that service rather than by a caller, so an update never moves it — the same
+/// reasoning as [`stored_iam_identity_center_options`].
+pub fn updated_iam_identity_center_options(
+    stored: Option<IamIdentityCenterOptions>,
+    input: IamIdentityCenterOptionsInput,
+) -> IamIdentityCenterOptions {
+    let mut options = stored.unwrap_or_default();
+    if input.enabled.is_some() {
+        options.enabled = input.enabled;
+    }
+    if input.iam_identity_center_instance_arn.is_some() {
+        options.iam_identity_center_instance_arn = input.iam_identity_center_instance_arn;
+    }
+    if input
+        .iam_role_for_identity_center_application_arn
+        .is_some()
+    {
+        options.iam_role_for_identity_center_application_arn =
+            input.iam_role_for_identity_center_application_arn;
+    }
+    options
 }
 
 /// `VPCOptions` as the service reports it back (`VPCDerivedInfo`).

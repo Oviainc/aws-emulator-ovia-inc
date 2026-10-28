@@ -433,9 +433,9 @@ async fn a_rebuild_replaces_the_content_the_reported_location_serves() {
 }
 
 /// A resource that holds no built content serves nothing at the location it used to:
-/// a rebuild whose content was to be READ from a caller-named file reports no
-/// `DownloadUri` and leaves nothing behind, and a delete withdraws the content with the
-/// resource.
+/// a rebuild whose content was to be READ from a caller-named file no object store
+/// serves reports no `DownloadUri` and leaves nothing behind, and a delete withdraws
+/// the content with the resource.
 #[tokio::test]
 async fn a_resource_with_no_built_content_serves_nothing() {
     let emulator = Emulator::new();
@@ -478,8 +478,8 @@ async fn a_resource_with_no_built_content_serves_nothing() {
                 .await;
             assert!(
                 reported.is_none(),
-                "case {case:?}: a resource nothing read a file for reports no \
-                 DownloadUri (state {state:?}), got {reported:?}"
+                "case {case:?}: a resource whose file the object store does not hold \
+                 reports no DownloadUri (state {state:?}), got {reported:?}"
             );
             assert_location_serves_nothing(&emulator, &uri, row.region, &case).await;
         } else {

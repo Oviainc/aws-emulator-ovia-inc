@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVocabularyFilter
-//! Creates a custom vocabulary filter from the words the request lists, or refuses a
-//! request whose words it would have to read from a file (see
-//! [`CreateVocabularyFilter::handle`]).
+//! Creates a custom vocabulary filter from the words the request lists, or from the
+//! file it names (see [`CreateVocabularyFilter::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -226,6 +225,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
+        let region = crate::state::request_region(ctx.parts());
+
         // "You can use Words or VocabularyFilterFileUri, but you can't use both." The
         // model can express neither requirement, so the handler is where they are
         // refused.
@@ -234,16 +235,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.vocabulary_filter_file_uri.as_deref(),
         ) {
             crate::state::ContentSource::Inline(words) => (words.to_vec(), None),
-            // Building this filter's word list would mean READING the object at that
-            // URI, which this emulator cannot do: it reads no object store and makes no
-            // outbound request. The RECORD is still real and is kept — the name, the
-            // language, the timestamps and the tag set are the control plane every
-            // later operation of this family reports — and the only thing a filter no
-            // words were loaded for does not report is a file of its own to download
-            // (`crate::state::VocabularyFilterRecord::download_uri`). No operation of
-            // this service reports a filter's words, so there is nothing else a filter
-            // recorded this way could be asked for.
-            crate::state::ContentSource::File(uri) => (Vec::new(), Some(uri.to_string())),
+            // This filter's words are READ from the object at that URI: it is an Amazon
+            // S3 object the caller uploaded before calling, and this emulator holds an
+            // Amazon S3 of its own (`crate::state::resolve_vocabulary_file`). This
+            // family models no processing state, so a file the store does not serve
+            // leaves the record real and its words unloaded — and the only thing such a
+            // filter does not report is a file of its own to download
+            // (`crate::state::VocabularyFilterRecord::download_uri`), since no
+            // operation of this service reports a filter's words.
+            crate::state::ContentSource::File(uri) => {
+                let verdict = crate::state::resolve_vocabulary_file(
+                    ctx,
+                    &region,
+                    crate::state::VOCABULARY_FILTER_FILE_MEMBER,
+                    uri,
+                )
+                .await;
+                match verdict.into_build() {
+                    Ok((words, _)) => (words, Some(uri.to_string())),
+                    Err(bytes) => {
+                        return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
+                            LimitExceededException {
+                                message: Some(crate::state::vocabulary_file_too_large_message(
+                                    crate::state::VOCABULARY_FILTER_FILE_MEMBER,
+                                    uri,
+                                    bytes,
+                                    crate::state::KIND_VOCABULARY_FILTER,
+                                )),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
             crate::state::ContentSource::Neither => {
                 return Err(bad_request(
                     "Your request must include either Words or VocabularyFilterFileUri. Add \
@@ -261,7 +285,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Amazon Transcribe publishes a 50 KB ceiling on a custom vocabulary filter's
         // size, so a longer list of words is refused rather than stored — which is also
-        // what keeps the words this emulator holds bounded.
+        // what keeps the words this emulator holds bounded. The read of a file the
+        // request named applies the same ceiling to the file itself.
         let content_bytes = crate::state::content_bytes(&words);
         if content_bytes > crate::state::MAX_VOCABULARY_CONTENT_BYTES {
             return Err(bad_request(&format!(
@@ -273,7 +298,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         // The guard is SCOPED: the store lock is released before this handler awaits
         // the write of the file the filter's `DownloadUri` names, which is a call out to
         // another emulated service and reaches none of this state.
@@ -370,8 +394,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The words this filter was built from are stored as the text file its
         // `DownloadUri` names, so a client that reads that location gets them back
         // ("use this URI to view or download the custom vocabulary filter"). A filter
-        // whose words were to be read from a caller-named file carries none, and
-        // nothing is built or served for it.
+        // whose file the object store did not serve carries none, and nothing is built
+        // or served for it.
         crate::state::store_vocabulary_content(
             ctx,
             &region,

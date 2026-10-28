@@ -57,6 +57,11 @@ const OUTPUT_ARN: &str = "arn:aws:mediaconnect:us-east-1:000000000000:output:col
 /// (`smithy_query(query="shape",shape="RouterInputArn")`).
 const ROUTER_INPUT_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerInput:abc123def456";
+/// A router output ARN matching the `RouterOutputArn` shape's pattern
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerOutput:[a-z0-9]{12}$`
+/// (`smithy_query(query="shape",shape="RouterOutputArn")`).
+const ROUTER_OUTPUT_ARN: &str =
+    "arn:aws:mediaconnect:us-east-1:000000000000:routerOutput:abc123def456";
 
 /// One expectation about which item a `crate::ops::…` path names.
 struct TypeRow {
@@ -330,13 +335,26 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
             },
         ),
         (
-            // Still a scaffold: it answers the 501 that names it, which is what proves a
-            // request on its own route reaches ITS handler and not a neighbour's — here the
-            // implemented UpdateRouterInput one route segment away.
+            // Implemented: it answers the modelled `NotFoundException` (404) for a router
+            // input ARN this store does not hold — on its own route, one segment away from
+            // the implemented UpdateRouterInput one.
             "StopRouterInput",
             "POST",
             format!("/v1/routerInput/stop/{ROUTER_INPUT_ARN}"),
             "",
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
+        ),
+        (
+            // Still a scaffold: it answers the 501 that names it, which is what proves a
+            // request on its own route reaches ITS handler and not a neighbour's — here the
+            // implemented router output routes that share its path prefix.
+            "TakeRouterInput",
+            "PUT",
+            format!("/v1/routerOutput/takeRouterInput/{ROUTER_OUTPUT_ARN}"),
+            "{}",
             Reached::ScaffoldedStub,
         ),
         (

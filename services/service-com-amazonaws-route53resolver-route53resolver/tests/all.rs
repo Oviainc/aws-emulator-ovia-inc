@@ -57,6 +57,8 @@ mod resolver_endpoints;
 mod resolver_query_log_config_associations;
 #[path = "all/resolver_query_log_config_listing.rs"]
 mod resolver_query_log_config_listing;
+#[path = "all/resolver_query_log_config_policies.rs"]
+mod resolver_query_log_config_policies;
 #[path = "all/resolver_query_log_configs.rs"]
 mod resolver_query_log_configs;
 #[path = "all/resolver_rule_association_listing.rs"]

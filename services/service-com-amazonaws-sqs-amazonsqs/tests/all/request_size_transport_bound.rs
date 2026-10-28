@@ -10,9 +10,10 @@
 //! two distinguishable answers.
 //!
 //! The ceiling itself is [`max_request_body_bytes`]: the largest payload any Amazon SQS
-//! request can carry (one maximum-size message, which
-//! `SendMessageRequest$MessageBody` documents as "1 MiB or 1,048,576 bytes") plus room
-//! for the request wrapped around it.
+//! request can carry — the largest batch a batch operation can be asked to judge, which is
+//! ten maximum-size messages, since a batch over the service's payload ceiling is refused
+//! by the OPERATION with the modelled `BatchRequestTooLong` and not by the transport —
+//! plus room for the request wrapped around it.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::service::max_request_body_bytes;
@@ -73,7 +74,7 @@ async fn a_request_body_above_the_transport_ceiling_is_refused_with_a_bare_413()
         ("one byte under the ceiling", ceiling - 1, false),
         ("exactly at the ceiling", ceiling, false),
         ("one byte past the ceiling", ceiling + 1, true),
-        ("far past the ceiling", 2 * 1024 * 1024, true),
+        ("far past the ceiling", 2 * ceiling, true),
     ];
 
     let router = emulator();

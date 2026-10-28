@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReusableDelegationSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReusableDelegationSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReusableDelegationSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +80,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::normalize_delegation_set_id;
+
+/// The most reusable delegation sets one response carries.
+///
+/// `ListReusableDelegationSetsRequest$MaxItems`'s own documentation: "The number
+/// of reusable delegation sets that you want Amazon Route 53 to return in the
+/// response to this request. If you specify a value greater than 100, Route 53
+/// returns only the first 100 reusable delegation sets."
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,20 +156,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReusableDelegationSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReusableDelegationSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReusableDelegationSets"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListReusableDelegationSetsErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // `page_size` above only bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        // `Marker` is "the ID of the first reusable delegation set that Amazon
+        // Route 53 will return if you submit another request", so a page RESUMES
+        // at it, and the response echoes it back as the caller sent it.
+        let marker = input.marker.clone().unwrap_or_default();
+        // A caller may resume with the bare id or with the `/delegationset/`
+        // prefixed `Id` a delegation-set response handed it back; both name the
+        // same set, as everywhere else this API takes a set id.
+        let start = normalize_delegation_set_id(&marker).to_string();
+
+        // A pure read: nothing below writes to the store.
+        let store = state.lock();
+        // The store keys delegation sets by their bare id in a BTreeMap, so this
+        // walk is a stable total order and a marker always resumes at the same
+        // place.
+        let matching = store
+            .delegation_sets
+            .values()
+            .filter(|set| start.is_empty() || set.id.as_str() >= start.as_str());
+
+        let mut delegation_sets = Vec::new();
+        let mut next_marker = None;
+        for set in matching {
+            if delegation_sets.len() >= page_size as usize {
+                // "the value of NextMarker identifies the next reusable
+                // delegation set that Amazon Route 53 will return if you submit
+                // another ListReusableDelegationSets request".
+                next_marker = Some(set.id.clone());
+                break;
+            }
+            delegation_sets.push(set.to_delegation_set());
+        }
+
+        Ok(ListReusableDelegationSetsOutput {
+            delegation_sets,
+            marker,
+            is_truncated: next_marker.is_some(),
+            next_marker,
+            // The echoed `maxitems`, so a request outside the documented range
+            // reads its own value back while the page itself stays clamped.
+            max_items: reported_max_items,
+        })
     }
 }

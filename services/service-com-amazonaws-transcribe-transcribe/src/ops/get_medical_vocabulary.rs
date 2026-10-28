@@ -208,9 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
             failure_reason: record.failure_reason.clone(),
             // "use this URI to view or download the custom medical vocabulary": only
-            // a vocabulary this service built has a file to download, and this
-            // emulator builds none from a file it does not read, so the member stays
-            // absent rather than naming a location that holds nothing. See
+            // a vocabulary this service FINISHED building has a file to download, so
+            // the member stays absent while the build is still running, and for one
+            // whose table file the object store did not serve, rather than naming a
+            // location that holds nothing. See
             // `crate::state::MedicalVocabularyRecord::download_uri`.
             download_uri: record.download_uri(),
         })

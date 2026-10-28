@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the settings of the ONE application the call names, in the
+//! [`crate::state::Application`] record `CreateApplication` minted and
+//! `GetApplication` reports — so the update's answer, the stored record and a later
+//! read of the application cannot disagree.
+//!
+//! A member the request CARRIES replaces what the application held, and a member it
+//! leaves out names nothing to change, so it keeps the value already stored
+//! ([`crate::state::Application::apply_update`]). An id that names no application of
+//! this account is the modelled `ResourceNotFoundException` rather than a record this
+//! call creates: an update changes an application that exists, it never mints one.
 //!
 //! ## Shape of an operation
 //!
@@ -101,6 +103,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{application_not_found, datetime, service_state, state_unavailable, Application};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -175,18 +179,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The record this call changes is resolved with whatever the clock already
+        // owed it materialised, so the update is applied to the application as it
+        // stands at `now` rather than to a stale one.
+        let application = store
+            .settled_application_mut(&input.id, now)
+            .ok_or_else(|| {
+                UpdateApplicationErrorModeled::ResourceNotFoundException(application_not_found(
+                    &input.id,
+                ))
+            })?;
+
+        application.apply_update(
+            input.data_sources,
+            input.app_configs,
+            input.iam_identity_center_options,
+            now,
+        );
+
+        // Answered from the record this call just wrote, so what the update reports and
+        // what a later read reports are one application.
+        Ok(updated(application))
+    }
+}
+
+/// The stored application as this operation answers with it.
+///
+/// Every member of `UpdateApplicationResponse` comes from the record, so the answer
+/// reports the settings the update left in place rather than the ones it was handed.
+fn updated(application: &Application) -> UpdateApplicationOutput {
+    UpdateApplicationOutput {
+        id: Some(application.id.clone()),
+        name: Some(application.name.clone()),
+        arn: Some(application.arn.clone()),
+        data_sources: application.reported_data_sources(),
+        iam_identity_center_options: application.iam_identity_center_options.clone(),
+        app_configs: application.reported_app_configs(),
+        created_at: Some(datetime(application.created_at)),
+        last_updated_at: Some(datetime(application.last_updated_at)),
     }
 }

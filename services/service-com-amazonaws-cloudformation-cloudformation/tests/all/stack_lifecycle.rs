@@ -25,9 +25,10 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 pub(crate) use crate::harness::{
-    call, call_in, create_stack, enroll_as_a_marketplace_seller, get_template, list_imports_ok,
-    member, router, router_with_engine, store, wait_for_the_transition, xml_blocks, xml_text,
-    xml_texts, xml_unescape, REGION,
+    call, call_in, create_stack, enroll_as_a_marketplace_seller, get_template,
+    is_service_assigned_id, list_imports_ok, member, router, router_with_engine, store,
+    wait_for_the_transition, xml_blocks, xml_text, xml_texts, xml_unescape, REGION,
+    SERVICE_ID_HEX_DIGITS,
 };
 
 /// The emulator's canonical account id, as every ARN it emits carries.
@@ -185,6 +186,47 @@ pub(crate) async fn rds(
         )
         .body(bytes::Bytes::from(body))
         .expect("a well-formed RDS request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    (status, body)
+}
+
+/// One ec2Query call to Amazon EC2 over the same router, answered with the HTTP status and
+/// the XML body.
+///
+/// The ONE EC2 caller of this crate's suites: a VPC or a subnet a stack CREATES lives in
+/// Amazon EC2, so a case that reads one back goes through EC2's own wire here, signed for
+/// `ec2` in the Region the stack was created in. The envelope is the same `Action` plus
+/// `Version` form body an awsQuery call carries, under EC2's own API version
+/// (`version: 2016-11-15`), and a list member is flattened into indexed keys
+/// (`VpcId.1`, `SubnetId.1`).
+pub(crate) async fn ec2(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version=2016-11-15");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(&form_encode(name));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("ec2.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/ec2/aws4_request, \
+                 SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed EC2 request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let body = String::from_utf8_lossy(response.body()).to_string();

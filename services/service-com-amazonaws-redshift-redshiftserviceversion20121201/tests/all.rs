@@ -47,6 +47,8 @@ mod event_categories;
 mod event_notifications;
 #[path = "all/event_subscriptions.rs"]
 mod event_subscriptions;
+#[path = "all/events.rs"]
+mod events;
 #[path = "all/existence_preconditions.rs"]
 mod existence_preconditions;
 #[path = "all/hsm_configurations.rs"]

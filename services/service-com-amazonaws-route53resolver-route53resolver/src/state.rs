@@ -298,6 +298,17 @@ pub const RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND: &str = "RSLVR-00800";
 /// caller names but cannot address. See [`resource_not_found_message`].
 pub const RSLVR_CODE_RESOURCE_NOT_FOUND: &str = "RSLVR-02025";
 
+/// The Route 53 Resolver service error code reported when a caller asks for a
+/// query logging configuration's resource policy and there is no policy to
+/// read.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
+/// status (400) and the exception shape name together do not say which Resolver
+/// fault occurred, and the model states no message text, so this code comes
+/// from the recorded responses of the query-logging policy read. See
+/// [`query_log_config_policy_access_denied`].
+pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED: &str = "RSLVR-01600";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -946,6 +957,40 @@ pub fn resolver_rule_in_use() -> ResourceInUseException {
 pub fn unknown_resolver_rule_arn(arn: &str) -> UnknownResourceException {
     UnknownResourceException {
         message: Some(format!(r#"Resolver rule with ARN "{arn}" does not exist."#)),
+    }
+}
+
+/// The `UnknownResourceException` the query-logging policy operations answer
+/// for an `Arn` the store holds no query logging configuration under.
+///
+/// Both operations address the configuration by its ARN rather than by its id,
+/// so — as for [`unknown_resolver_rule_arn`] — the sentence names what the
+/// request asked for: the ARN it was handed.
+pub fn unknown_resolver_query_log_config_arn(arn: &str) -> UnknownResourceException {
+    UnknownResourceException {
+        message: Some(format!(
+            r#"Resolver query log config with ARN "{arn}" does not exist."#
+        )),
+    }
+}
+
+/// The `AccessDeniedException` a read of a query logging configuration's
+/// resource policy answers while the configuration carries no policy.
+///
+/// A query logging configuration's resource policy is readable only while one is
+/// attached: with nothing attached the caller is granted nothing to read, which
+/// the model's `AccessDeniedException` ("the current account doesn't have the
+/// IAM permissions required to perform the specified Resolver operation") is the
+/// modelled answer for. The message is the one sentence the service words that
+/// fault with, carried behind its service error code
+/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED`]) and carrying nothing
+/// from the request; it is written out here rather than through
+/// [`rslvr_message`] because the service ends this sentence with no period.
+pub fn query_log_config_policy_access_denied() -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(format!(
+            "[{RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_ACCESS_DENIED}] Access denied"
+        )),
     }
 }
 
@@ -2848,6 +2893,16 @@ pub struct ResolverQueryLogConfigRecord {
     /// [`QUERY_LOG_CONFIG_STATUS_CREATED`] is owed, or `None` for a
     /// configuration with no transition in flight.
     pub settled_at: Option<Instant>,
+    /// The resource policy attached to this configuration, as the last
+    /// `PutResolverQueryLogConfigPolicy` for it wrote it, and `None` while no
+    /// policy has been attached.
+    ///
+    /// Held on the configuration's own record for the same reason as
+    /// [`ResolverRuleRecord::resolver_rule_policy`]: a resource policy belongs
+    /// to the resource it shares, so a read of the policy resolves through the
+    /// same record every other query-logging operation reads, and a
+    /// configuration the store no longer holds has no policy to report.
+    pub resolver_query_log_config_policy: Option<String>,
 }
 
 impl ResolverQueryLogConfigRecord {
@@ -3452,6 +3507,31 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// The same lookup as [`Self::rule_by_arn`], for the write side.
     pub fn rule_by_arn_mut(&mut self, arn: &str) -> Option<&mut ResolverRuleRecord> {
         self.resolver_rules
+            .values_mut()
+            .find(|record| record.arn == arn)
+    }
+
+    /// The stored query logging configuration `arn` names, if the store holds
+    /// one.
+    ///
+    /// The query-logging policy operations address a configuration by its `Arn`
+    /// and not by its `ResolverQueryLogConfigId`, so — as for
+    /// [`Self::rule_by_arn`] — they resolve it through this. The whole ARN is
+    /// compared, so an ARN naming another account, another region or another
+    /// resource type matches no configuration. The scan is over a store bounded
+    /// by [`MAX_STORED_QUERY_LOG_CONFIGS`].
+    pub fn query_log_config_by_arn(&self, arn: &str) -> Option<&ResolverQueryLogConfigRecord> {
+        self.resolver_query_log_configs
+            .values()
+            .find(|record| record.arn == arn)
+    }
+
+    /// The same lookup as [`Self::query_log_config_by_arn`], for the write side.
+    pub fn query_log_config_by_arn_mut(
+        &mut self,
+        arn: &str,
+    ) -> Option<&mut ResolverQueryLogConfigRecord> {
+        self.resolver_query_log_configs
             .values_mut()
             .find(|record| record.arn == arn)
     }

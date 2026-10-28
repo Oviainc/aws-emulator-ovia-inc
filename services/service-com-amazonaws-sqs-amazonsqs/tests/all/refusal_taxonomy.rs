@@ -421,10 +421,9 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::SourceArn("dead-letter"),
             request: json!({"MaxNumberOfMessagesPerSecond": 0}),
             code: "InvalidParameterValue",
-            message: invalid(
-                "0",
+            message: invalid_without_value(
                 "MaxNumberOfMessagesPerSecond",
-                &format!("Must be >= 1 and <= {MAX_MESSAGES_PER_SECOND}."),
+                &format!("You must enter a number that's between 1 and {MAX_MESSAGES_PER_SECOND}."),
             ),
         },
         Row {
@@ -433,10 +432,9 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::SourceArn("dead-letter"),
             request: json!({"MaxNumberOfMessagesPerSecond": MAX_MESSAGES_PER_SECOND + 1}),
             code: "InvalidParameterValue",
-            message: invalid(
-                &(MAX_MESSAGES_PER_SECOND + 1).to_string(),
+            message: invalid_without_value(
                 "MaxNumberOfMessagesPerSecond",
-                &format!("Must be >= 1 and <= {MAX_MESSAGES_PER_SECOND}."),
+                &format!("You must enter a number that's between 1 and {MAX_MESSAGES_PER_SECOND}."),
             ),
         },
         Row {

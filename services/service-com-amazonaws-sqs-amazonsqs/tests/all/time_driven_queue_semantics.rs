@@ -36,7 +36,8 @@ fn earlier(at: SystemTime, by: Duration) -> SystemTime {
 }
 
 /// Make every message the queue at `url` holds as old as if it had been sent `by` ago:
-/// the instant it was sent and the instant it became available both move back, so a
+/// the instant it was sent, the instant the queue holding it enqueued it (which is what
+/// its retention is counted from) and the instant it became available all move back, so a
 /// delayed message stays delayed and an in-flight one stays in flight.
 ///
 /// This is how a span the clock owes is reached without sleeping for it.
@@ -51,6 +52,7 @@ fn age_messages(engine: &engine::InMemoryEngine, url: &str, by: Duration) {
         .unwrap_or_else(|| panic!("case ageing {url}: no queue named {name}"));
     for message in &mut queue.messages {
         message.sent_at = earlier(message.sent_at, by);
+        message.retention_from = earlier(message.retention_from, by);
         message.available_at = earlier(message.available_at, by);
     }
 }

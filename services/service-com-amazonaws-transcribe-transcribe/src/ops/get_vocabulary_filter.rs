@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // update that supplied the words wrote them as the text file at that
             // location (`crate::state::store_vocabulary_content`), so a client reads
             // the words back by fetching it. The member is ABSENT for a filter whose
-            // words would have come from a file nothing read, which has no file of its
+            // words the object store did not serve, which has no file of its
             // own (`crate::state::VocabularyFilterRecord::download_uri`). This answer
             // itself carries no words: `GetVocabularyFilterResponse` has no member for
             // them, so the location is how the filter's content is reported.

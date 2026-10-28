@@ -291,14 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     id: entry.id.clone(),
                     sender_fault: true,
                     code: crate::scaffolded::INVALID_PARAMETER_VALUE.to_string(),
-                    message: Some(sqs::invalid_parameter_message(
-                        &requested.to_string(),
-                        sqs::VISIBILITY_TIMEOUT,
-                        &format!(
-                            "{} must be >= {min} and <= {max}.",
-                            sqs::VISIBILITY_TIMEOUT
-                        ),
-                    )),
+                    message: Some(sqs::visibility_timeout_out_of_range_message(requested)),
                 });
                 continue;
             }
@@ -330,6 +323,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         sender_fault: true,
                         code: crate::scaffolded::INVALID_PARAMETER_VALUE.to_string(),
                         message: Some(sqs::visibility_beyond_limit_message(requested, max)),
+                    })
+                }
+                // A handle this queue minted for a message it still holds that a later
+                // receive replaced is a lease that has run out, for that entry alone.
+                Err(sqs::VisibilityRefusal::ExpiredHandle) => {
+                    failed.push(BatchResultErrorEntry {
+                        id: entry.id.clone(),
+                        sender_fault: true,
+                        code: crate::scaffolded::INVALID_PARAMETER_VALUE.to_string(),
+                        message: Some(sqs::receipt_handle_expired_message(&entry.receipt_handle)),
                     })
                 }
             }

@@ -13,12 +13,13 @@
 //!    value that is not formed as a receipt handle — an opaque token of a handle's length
 //!    and alphabet — is refused as an invalid receipt handle at HTTP 404, with the
 //!    sentence for that class, which names no value; a handle ANOTHER queue minted is
-//!    refused at 404 as that queue's handle, naming it; and a handle of this queue that
-//!    holds no message any more (deleted, purged, or superseded by a later receive) is
-//!    refused at HTTP 400 as a `ReceiptHandle` value the call cannot act on, naming the
-//!    handle the request carried. None of them changes anything the queue holds. The
-//!    classification belongs to the HANDLE, so a batch entry is judged by the same kinds
-//!    of value and reports the same sentences.
+//!    refused at 404 as that queue's handle, naming it; and a handle of this queue whose
+//!    message is gone (deleted or purged) is refused at HTTP 400 as a `ReceiptHandle`
+//!    value the call cannot act on, naming the handle the request carried. None of them
+//!    changes anything the queue holds. The classification belongs to the HANDLE, so a
+//!    batch entry is judged by the same kinds of value and reports the same sentences.
+//!    (What a handle a LATER receive superseded names is
+//!    [`super::receipt_handle_leases`]'s rule.)
 //! 2. A change cannot hide a message for longer than ONE receive may, counted from the
 //!    receive its handle came from: what a consumer may still ask for shrinks by the span
 //!    it has already held the message.
@@ -200,8 +201,6 @@ enum Retired {
     Deleted,
     /// The queue it named a message of was purged.
     Purged,
-    /// A later receive of the same message minted a handle of its own.
-    Superseded,
     /// Another queue minted it, so it is a handle — just not one of this queue's.
     AnotherQueue,
 }
@@ -304,13 +303,6 @@ async fn a_handle_that_names_no_message_is_refused_by_what_the_value_is() {
             code: "InvalidParameterValue",
             expected: Expected::NoSuchMessage,
         },
-        RefusalRow {
-            case: "a handle a later receive superseded",
-            retired: Retired::Superseded,
-            status: 400,
-            code: "InvalidParameterValue",
-            expected: Expected::NoSuchMessage,
-        },
     ];
 
     for (index, row) in rows.iter().enumerate() {
@@ -337,16 +329,6 @@ async fn a_handle_that_names_no_message_is_refused_by_what_the_value_is() {
                 let handle = receive_handle(&router, &url, HELD_UNDER).await;
                 let _ = ok(&router, "PurgeQueue", json!({"QueueUrl": url})).await;
                 handle
-            }
-            Retired::Superseded => {
-                let first = receive_handle(&router, &url, MIN_VISIBILITY_TIMEOUT).await;
-                let second = receive_handle(&router, &url, HELD_UNDER).await;
-                assert_ne!(
-                    first, second,
-                    "case {}: every receive mints its own handle",
-                    row.case
-                );
-                first
             }
             Retired::AnotherQueue => {
                 let elsewhere =
