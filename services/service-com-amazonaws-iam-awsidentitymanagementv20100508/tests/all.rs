@@ -57,6 +57,8 @@ mod group_creation;
 mod group_deletion;
 #[path = "all/group_inline_policies.rs"]
 mod group_inline_policies;
+#[path = "all/group_inline_policy_removal.rs"]
+mod group_inline_policy_removal;
 #[path = "all/group_listing.rs"]
 mod group_listing;
 #[path = "all/group_membership.rs"]

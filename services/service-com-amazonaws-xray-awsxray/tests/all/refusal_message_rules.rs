@@ -28,8 +28,9 @@
 //!   constrains no resource is accepted and one that is not ARN syntax is
 //!   refused with a template naming the value and the syntax rule it broke;
 //! * a `RetrievalToken` of a form the service never mints is refused, on every
-//!   operation that takes one, with a template naming the value ONCE and
-//!   closing on one fixed detail phrase, while a well-formed token nothing
+//!   operation that takes one, with a two-clause template that names the
+//!   rejected value in EACH clause — the operation's parameter clause and the
+//!   execution-id decoder's own clause — while a well-formed token nothing
 //!   stands behind is a different class (`ResourceNotFoundException`, 404); and
 //! * a member outside its modelled `@pattern` is refused with AWS's validation
 //!   envelope quoting that pattern WITHOUT the anchors wrapping it, so the
@@ -39,7 +40,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::state::{
     retrieval_token_check, INVALID_INPUT_PARAMETERS_PREAMBLE, INVERTED_WINDOW_MESSAGE,
-    MALFORMED_RETRIEVAL_TOKEN_DETAIL, MAX_TRACE_IDS_PER_CALL,
+    MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX, MAX_TRACE_IDS_PER_CALL,
 };
 
 use super::xray_wire::{array, trace_id, Answer, Xray};
@@ -701,8 +702,9 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
         // Every operation that takes a `RetrievalToken`
         // (`smithy_query(query="operation",operation="CancelTraceRetrieval,
         // ListRetrievedTraces,GetRetrievedTracesGraph")`), with the leading
-        // clause it names the member by. The detail after `passed: ` is the
-        // SAME fixed phrase on all of them and carries no part of the request.
+        // clause it names the member by. The decoder clause after `passed: ` is
+        // the same on all of them: one fixed phrase closed by the rejected
+        // value, whatever the operation named the member.
         for (operation, path, clause, body) in [
             (
                 "ListRetrievedTraces",
@@ -723,8 +725,10 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
                 json!({"RetrievalToken": token}),
             ),
         ] {
-            let expected =
-                format!("Invalid {clause} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_DETAIL}");
+            let expected = format!(
+                "Invalid {clause} {token} passed: \
+                 {MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX}{token}"
+            );
             let refused = xray.call(path, &body).await;
             assert_eq!(
                 (refused.status, refused.error_type.as_deref()),
@@ -738,12 +742,13 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
                 "case {label:?} on {operation}: expected {expected:?}, got {:?}",
                 said(&refused)
             );
-            // The detail is fixed text: the rejected value appears ONCE, as the
-            // sentence's only variable, so the sentence does not grow with it.
+            // Both clauses name the rejected value, so the value read out of the
+            // decoder's clause alone is the one the request submitted.
             assert_eq!(
                 said(&refused).matches(token.as_str()).count(),
-                1,
-                "case {label:?} on {operation}: the rejected value must be named once, got {:?}",
+                2,
+                "case {label:?} on {operation}: the rejected value must be named in each clause, \
+                 got {:?}",
                 said(&refused)
             );
         }
@@ -768,7 +773,7 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
          {missing:?}"
     );
     assert!(
-        !said(&missing).contains(MALFORMED_RETRIEVAL_TOKEN_DETAIL),
+        !said(&missing).contains(MALFORMED_RETRIEVAL_TOKEN_DETAIL_PREFIX),
         "a token that is not there must not be stated as a malformed one, got {:?}",
         said(&missing)
     );
