@@ -41,6 +41,8 @@ mod list_tasks_empty_page;
 mod one_execution_per_device;
 #[path = "all/pagination_cursor_binding.rs"]
 mod pagination_cursor_binding;
+#[path = "all/pagination_resume_position.rs"]
+mod pagination_resume_position;
 #[path = "all/reboot_cache_refresh_instant.rs"]
 mod reboot_cache_refresh_instant;
 #[path = "all/region_gate_error_envelope.rs"]

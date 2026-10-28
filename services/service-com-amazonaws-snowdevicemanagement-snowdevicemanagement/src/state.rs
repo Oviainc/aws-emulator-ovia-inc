@@ -1846,6 +1846,27 @@ pub fn decode_token(token: &str, scope: &CursorScope<'_>) -> Option<String> {
     (payload == scope.payload(resume_key)).then(|| resume_key.to_string())
 }
 
+/// Where a page of the enumeration `scope` describes resumes, for the `nextToken` the
+/// request carried: `None` when it named none, so the page starts at the beginning;
+/// the resume key when the value is a cursor THIS enumeration issued; and the modelled
+/// refusal for every other value, which names a position here in nothing.
+///
+/// The one place a paginated handler interprets `nextToken`: each one lifts the error
+/// into its own modelled channel
+/// (`.map_err(<Op>ErrorModeled::ValidationException)?`), so the branch — and with it
+/// what counts as a cursor into an enumeration — exists once for all of them.
+pub fn resume_position(
+    next_token: Option<&str>,
+    scope: &CursorScope<'_>,
+) -> Result<Option<String>, ValidationException> {
+    match next_token {
+        None => Ok(None),
+        Some(token) => decode_token(token, scope)
+            .map(Some)
+            .ok_or_else(|| invalid_next_token(scope.operation)),
+    }
+}
+
 /// The longest `NextToken` the model allows (`@length(min: 1, max: 1024)`), which a
 /// cursor this service hands back has to fit for a client to be able to send it back.
 const MAX_NEXT_TOKEN_LENGTH: usize = 1024;

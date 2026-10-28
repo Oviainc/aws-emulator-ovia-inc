@@ -201,18 +201,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: &region,
             filters: &[Some(input.task_id.as_str()), input.state.as_deref()],
         };
-        let resume_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_token(token, &cursor) {
-                Some(key) => Some(key),
-                None => {
-                    return Err(ListExecutionsErrorModeled::ValidationException(
-                        crate::state::invalid_next_token(Self::NAME),
-                    )
-                    .into())
-                }
-            },
-        };
+        let resume_at = crate::state::resume_position(input.next_token.as_deref(), &cursor)
+            .map_err(ListExecutionsErrorModeled::ValidationException)?;
         let page_size = crate::state::page_size(input.max_results);
 
         let mut executions = Vec::with_capacity(page_size);

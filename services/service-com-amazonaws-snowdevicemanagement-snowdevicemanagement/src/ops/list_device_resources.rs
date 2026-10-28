@@ -201,18 +201,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.r#type.as_deref(),
             ],
         };
-        let resume_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_token(token, &cursor) {
-                Some(key) => Some(key),
-                None => {
-                    return Err(ListDeviceResourcesErrorModeled::ValidationException(
-                        crate::state::invalid_next_token(Self::NAME),
-                    )
-                    .into())
-                }
-            },
-        };
+        let resume_at = crate::state::resume_position(input.next_token.as_deref(), &cursor)
+            .map_err(ListDeviceResourcesErrorModeled::ValidationException)?;
         let page_size = crate::state::page_size(input.max_results);
 
         // "The Amazon Web Services resources available for a device": the Amazon EC2
