@@ -695,7 +695,9 @@ async fn an_association_is_read_back_by_its_id() {
     ];
 
     // Associate every row first, so each read below has to pick its own record
-    // out of a store holding all of them.
+    // out of a store holding all of them. Each row's VPC is one of the account's
+    // own, which `AssociateResolverRule` resolves against the Amazon EC2 store.
+    router.hold_vpcs(cases.iter().map(|row| row.vpc_id));
     let mut made: Vec<(&str, String, Value)> = Vec::new();
     for AssociationCase {
         case,
@@ -797,11 +799,13 @@ async fn the_creating_status_of_an_association_settles_without_anyone_asking() {
     let router = emulator();
     let endpoint = endpoint_id(&router, "ep-settle", "OUTBOUND").await;
     let rule_id = forward_rule(&router, "rule-settle", "settle.example.com", &endpoint).await;
+    let settle_vpc = "vpc-0000000000000settle";
+    router.hold_vpcs([settle_vpc]);
 
     let created = ok(
         &router,
         "AssociateResolverRule",
-        json!({ "ResolverRuleId": rule_id, "VPCId": "vpc-0000000000000settle" }),
+        json!({ "ResolverRuleId": rule_id, "VPCId": settle_vpc }),
     )
     .await;
     let id = string_member(association(&created), "Id");
@@ -848,6 +852,7 @@ async fn an_unknown_association_id_is_not_found() {
     let rule_id = forward_rule(&router, "rule-missing", "missing.example.com", &endpoint).await;
     // One real association exists, so "not found" is about the id and not about
     // an empty store.
+    router.hold_vpcs(["vpc-00000000000000real"]);
     ok(
         &router,
         "AssociateResolverRule",
@@ -935,6 +940,7 @@ async fn associating_is_refused_without_a_rule_and_refused_twice_over() {
     }
 
     let vpc = "vpc-0000000000000000d";
+    router.hold_vpcs([vpc, "vpc-0000000000000000e"]);
     let created = ok(
         &router,
         "AssociateResolverRule",

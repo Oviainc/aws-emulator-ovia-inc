@@ -54,12 +54,23 @@ const DOMAIN_LIST_ID_PREFIX: &str = "rslvr-fdl-";
 const RULE_GROUP_ID_PREFIX: &str = "rslvr-frg-";
 const ASSOCIATION_ID_PREFIX: &str = "rslvr-frgassoc-";
 
+/// The VPCs the rows name literally, in the form Amazon EC2 ids take.
+///
+/// A DNS Firewall rule group is associated WITH a VPC of the caller's account, and
+/// Route 53 Resolver resolves that `VpcId` against the account's own Amazon EC2 store, so
+/// the account holds these VPCs before any stack naming them is deployed
+/// ([`register_literal_vpcs`]).
+const LITERAL_VPC_IDS: [&str; 2] = ["vpc-0a1b2c3d4e5f60718", "vpc-00112233445566778"];
+
 /// The emulator with the services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
 /// suite here; the in-process callback CloudFormation makes signs its request either way
 /// (the credential scope is what routes it).
 fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The network the rows name is the caller's own: it exists before any stack is
+    // deployed, and no stack here declares it.
+    register_literal_vpcs(&engine);
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -71,6 +82,27 @@ fn build_router() -> MultiServiceRouter {
         service_com_amazonaws_route53resolver_route53resolver::EmulatedService::new(engine),
     );
     router
+}
+
+/// Put the VPCs the rows name into the account's own Amazon EC2 store, as the modelled
+/// shape that service reports.
+fn register_literal_vpcs(engine: &engine::InMemoryEngine) {
+    use service_com_amazonaws_ec2_amazonec2 as ec2;
+
+    let ec2_state = ec2::state::service_state(engine)
+        .expect("the in-memory engine carries the account's Amazon EC2 store");
+    let mut store = ec2_state.lock();
+    for (index, vpc_id) in LITERAL_VPC_IDS.iter().enumerate() {
+        store.vpcs.insert(
+            (*vpc_id).to_string(),
+            ec2::ops::types::Vpc {
+                vpc_id: Some((*vpc_id).to_string()),
+                cidr_block: Some(format!("10.{index}.0.0/16")),
+                state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+                ..Default::default()
+            },
+        );
+    }
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service` in `region`, which

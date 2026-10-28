@@ -27,6 +27,11 @@ pub const ACCOUNT: &str = "000000000000";
 /// subnets in; each subnet gets one /24 block of it.
 const VPC_CIDR_BLOCK: &str = "10.0.0.0/16";
 
+/// The IPv4 CIDR block every VPC [`Emulator::hold_vpcs`] registers carries. Two
+/// VPCs of one account may carry the same block, so one is enough for every row
+/// of every suite.
+const HELD_VPC_CIDR_BLOCK: &str = "172.31.0.0/16";
+
 /// The emulator a suite drives: the router every request goes through, and the
 /// shared engine it is mounted on.
 ///
@@ -100,6 +105,49 @@ impl Emulator {
                 },
             );
         }
+    }
+
+    /// Put one VPC per id into the account's own Amazon EC2 store.
+    ///
+    /// A Resolver resource is associated WITH a VPC of the caller's account, and
+    /// the association writes (`AssociateResolverRule`,
+    /// `AssociateResolverQueryLogConfig`, `AssociateFirewallRuleGroup`) resolve
+    /// the VPC id they are given against that store, so a suite whose write must
+    /// be served registers the VPCs it names here first — the way
+    /// [`Emulator::hold_subnets`] registers the subnets an endpoint's addresses
+    /// sit in.
+    ///
+    /// Each VPC is stored as the modelled shape Amazon EC2 reports, `available`,
+    /// with [`HELD_VPC_CIDR_BLOCK`]. An id the store already holds a VPC under
+    /// is left exactly as it was.
+    pub fn hold_vpcs<I>(&self, vpc_ids: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let ec2_state = ec2::state::service_state(&*self.engine)
+            .expect("the in-memory engine carries the account's Amazon EC2 store");
+        let mut store = ec2_state.lock();
+        for vpc_id in vpc_ids {
+            let vpc_id = vpc_id.as_ref().to_string();
+            store
+                .vpcs
+                .entry(vpc_id.clone())
+                .or_insert_with(|| ec2::ops::types::Vpc {
+                    vpc_id: Some(vpc_id),
+                    cidr_block: Some(HELD_VPC_CIDR_BLOCK.to_string()),
+                    state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
+                    ..Default::default()
+                });
+        }
+    }
+
+    /// Take the VPC `vpc_id` names out of the account's Amazon EC2 store, so a
+    /// Resolver write that names it afterwards resolves to nothing.
+    pub fn release_vpc(&self, vpc_id: &str) {
+        let ec2_state = ec2::state::service_state(&*self.engine)
+            .expect("the in-memory engine carries the account's Amazon EC2 store");
+        ec2_state.lock().vpcs.remove(vpc_id);
     }
 
     /// Take the subnet `subnet_id` names out of the account's Amazon EC2 store,

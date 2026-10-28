@@ -136,6 +136,9 @@ async fn an_associated_vpc_is_read_back_from_state() {
         );
 
         for (index, vpc) in vpcs.iter().enumerate() {
+            // The VPC is one of the account's own, which the associate resolves
+            // against the Amazon EC2 store.
+            router.hold_vpcs([vpc]);
             let made = ok(
                 &router,
                 "AssociateResolverQueryLogConfig",
@@ -244,6 +247,7 @@ async fn one_vpc_associates_with_several_configurations() {
     let first = config_id(&router, "first-config").await;
     let second = config_id(&router, "second-config").await;
     let vpc = "vpc-0123456789abcdef0";
+    router.hold_vpcs([vpc]);
 
     let mut ids: Vec<String> = Vec::new();
     for (case, config) in [("the first configuration", &first), ("the second", &second)] {
@@ -282,6 +286,7 @@ async fn one_vpc_associates_with_several_configurations() {
 async fn an_association_settles_from_creating_to_active() {
     let router = emulator();
     let config = config_id(&router, "settling-association").await;
+    router.hold_vpcs(["vpc-0123456789abcdef0"]);
     let made = ok(
         &router,
         "AssociateResolverQueryLogConfig",
@@ -351,6 +356,7 @@ async fn an_association_settles_from_creating_to_active() {
 async fn an_unknown_configuration_id_is_refused() {
     let router = emulator();
     let present = config_id(&router, "present-config").await;
+    router.hold_vpcs(["vpc-0123456789abcdef0"]);
 
     for (case, id) in [
         ("an id nothing minted", "rqlc-0123456789abcdef".to_string()),
@@ -410,6 +416,7 @@ async fn a_vpc_already_associated_is_refused() {
         ("a typical VPC id", "vpc-0123456789abcdef0"),
         ("a one-character resource id", "v"),
     ] {
+        router.hold_vpcs([vpc]);
         let request = json!({
             "ResolverQueryLogConfigId": config.clone(),
             "ResourceId": vpc,
@@ -454,6 +461,7 @@ async fn a_vpc_already_associated_is_refused() {
 async fn an_unknown_association_id_is_reported_as_missing() {
     let router = emulator();
     let config = config_id(&router, "readable-association").await;
+    router.hold_vpcs(["vpc-0123456789abcdef0"]);
     let made = ok(
         &router,
         "AssociateResolverQueryLogConfig",

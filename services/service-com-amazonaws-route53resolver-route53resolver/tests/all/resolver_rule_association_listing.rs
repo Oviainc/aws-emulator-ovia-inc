@@ -49,7 +49,8 @@ async fn seed_associations(router: &Emulator) -> (Vec<String>, Vec<String>) {
     associations.push(associate(router, &first_rule, FIRST_VPC).await);
     associations.push(associate(router, &first_rule, SECOND_VPC).await);
     // One record created WITHOUT a `Name`, so the Name filter is exercised on a
-    // member a record may not carry.
+    // member a record may not carry. Its VPC is already one of the account's,
+    // held by the associate above.
     let unnamed = ok(
         router,
         "AssociateResolverRule",

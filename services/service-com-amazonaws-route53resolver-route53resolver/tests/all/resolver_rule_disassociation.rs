@@ -26,7 +26,6 @@
 //! [`super::resolver_rule_deletion`].
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{emulator, expect_error, ok, string_member, without_status, Emulator};
 use super::resolver_rule_deletion::{forward_rule, outbound_endpoint};
@@ -200,11 +199,14 @@ fn fixture_vpcs(row_index: usize, count: usize) -> Vec<String> {
 /// WHOLE answered record, to compare a survivor against later, and a request
 /// with the optional `Name` left out.
 async fn associate_pair(
-    router: &MultiServiceRouter,
+    router: &Emulator,
     rule: &str,
     vpc: &str,
     name: Option<&str>,
 ) -> Value {
+    // The pair is made with a VPC of the account's own, which
+    // `AssociateResolverRule` resolves against the Amazon EC2 store.
+    router.hold_vpcs([vpc]);
     let mut request = json!({ "ResolverRuleId": rule, "VPCId": vpc });
     if let Some(name) = name {
         request

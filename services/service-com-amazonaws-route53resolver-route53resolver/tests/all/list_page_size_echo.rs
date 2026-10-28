@@ -69,7 +69,12 @@ async fn seed_endpoint(router: &Emulator, creator: &str, count: usize) -> String
 }
 
 /// Create one FORWARD rule through `endpoint` and associate it with `vpc`.
+///
+/// The VPC is registered in the account's own Amazon EC2 store first: a rule is
+/// associated WITH a VPC of the account, which the associate resolves against
+/// that store.
 async fn seed_rule(router: &Emulator, creator: &str, endpoint: &str, vpc: &str) {
+    router.hold_vpcs([vpc]);
     let created = ok(
         router,
         "CreateResolverRule",

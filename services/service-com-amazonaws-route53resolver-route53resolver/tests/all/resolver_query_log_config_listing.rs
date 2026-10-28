@@ -17,10 +17,9 @@
 //! in [`super::harness`].
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, emulator, expect_error, ok, parse_time, string_member, without_status, ACCOUNT,
+    call, emulator, expect_error, ok, parse_time, string_member, without_status, Emulator, ACCOUNT,
 };
 
 /// One seeded query logging configuration: what was asked for, and the `Id` the
@@ -61,7 +60,7 @@ const SEEDS: [(&str, &str, usize); 5] = [
 
 /// Create every configuration of [`SEEDS`], associate each with as many VPCs as
 /// its row asks for, and answer them in creation order.
-async fn seed_configs(router: &MultiServiceRouter) -> Vec<Seeded> {
+async fn seed_configs(router: &Emulator) -> Vec<Seeded> {
     let mut seeded = Vec::new();
     for (index, (name, destination, associations)) in SEEDS.iter().enumerate() {
         let created = ok(
@@ -81,12 +80,16 @@ async fn seed_configs(router: &MultiServiceRouter) -> Vec<Seeded> {
             "Id",
         );
         for vpc in 0..*associations {
+            let resource_id = format!("vpc-0000000000000{index}{vpc}0");
+            // Each association is made with a VPC of the account's own, which
+            // the associate resolves against the Amazon EC2 store.
+            router.hold_vpcs([&resource_id]);
             ok(
                 router,
                 "AssociateResolverQueryLogConfig",
                 json!({
                     "ResolverQueryLogConfigId": id.clone(),
-                    "ResourceId": format!("vpc-0000000000000{index}{vpc}0"),
+                    "ResourceId": resource_id,
                 }),
             )
             .await;

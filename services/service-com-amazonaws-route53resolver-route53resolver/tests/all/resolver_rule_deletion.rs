@@ -88,8 +88,13 @@ pub async fn forward_rule(
 
 /// Associate `rule` with `vpc` and return the association's `Id`.
 ///
+/// The association is made WITH a VPC of the caller's account, which
+/// `AssociateResolverRule` resolves against the account's own Amazon EC2 store,
+/// so the VPC this names is registered there first.
+///
 /// `pub` for the same reason as [`outbound_endpoint`].
-pub async fn associate(router: &MultiServiceRouter, rule: &str, vpc: &str) -> String {
+pub async fn associate(router: &Emulator, rule: &str, vpc: &str) -> String {
+    router.hold_vpcs([vpc]);
     let created = ok(
         router,
         "AssociateResolverRule",

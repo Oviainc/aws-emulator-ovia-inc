@@ -15,9 +15,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-// The account's own Amazon EC2 inventory, which `unresolvable_subnet_id`
-// resolves a `SubnetId` against: a VPC subnet lives in that service's store, so
-// it is read through its own accessors.
+// The account's own Amazon EC2 inventory, which `unresolvable_subnet_id` and
+// `unresolvable_vpc_id` resolve a `SubnetId` and a VPC id against: a VPC and its
+// subnets live in that service's store, so they are read through its own
+// accessors.
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 // The account's own AWS Outposts inventory, which `account_holds_outpost`
 // resolves an `OutpostArn` against: the Outposts live in that service's store,
@@ -880,15 +881,87 @@ pub fn unresolvable_subnet_id<'a, Eng: Send + Sync + 'static>(
     engine: &Eng,
     subnet_ids: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
+    unresolvable_ec2_id(engine, subnet_ids, |store, subnet_id| {
+        store.subnets.contains_key(subnet_id)
+    })
+}
+
+/// The `InvalidParameterException` a write answers for a VPC id that names no
+/// VPC of the account.
+///
+/// The sentence is the one Amazon EC2 words for that id
+/// ([`vpc_not_found_message`]), so the caller is told which value could not be
+/// resolved; the parameter at fault is the VPC id the sentence already carries,
+/// so no `FieldName` is added beside it, exactly as for [`subnet_not_found`].
+pub fn vpc_not_found(vpc_id: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: vpc_not_found_message(vpc_id),
+        field_name: None,
+    }
+}
+
+/// The same refusal as [`vpc_not_found`] in the `ValidationException` shape, for
+/// an operation whose model gives it that error and no
+/// `InvalidParameterException` to report a parameter it cannot resolve with.
+pub fn vpc_not_found_validation(vpc_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(vpc_not_found_message(vpc_id)),
+    }
+}
+
+/// What a VPC id that names no VPC of the account is refused with, in one place
+/// so the operations that resolve one cannot word it two ways.
+///
+/// Amazon EC2 owns the inventory the id is resolved against and words this
+/// sentence itself for its `InvalidVpcID.NotFound` — "The vpc ID '<id>' does not
+/// exist" — and a Resolver write that could not resolve the id reports what that
+/// inventory said about it, naming the id the REQUEST sent, exactly as the
+/// endpoint write path reports an unresolvable subnet.
+pub fn vpc_not_found_message(vpc_id: &str) -> String {
+    format!("The vpc ID '{vpc_id}' does not exist")
+}
+
+/// The first id in `vpc_ids`, in request order, that names no VPC of the
+/// account, or `None` when the account holds every one of them.
+///
+/// A Resolver resource is associated WITH a VPC of the caller's account: which
+/// VPCs exist is a fact of the account's own Amazon EC2 inventory — the one
+/// `DescribeVpcs` answers from — and not a value this service's caller supplies,
+/// so this is the one place that resolution happens, exactly as
+/// [`unresolvable_subnet_id`] resolves a `SubnetId` and
+/// [`account_holds_outpost`] an `OutpostArn`.
+///
+/// LOCKING. As [`unresolvable_subnet_id`]: the Amazon EC2 store lock is taken
+/// for this one pass and released before returning, and a handler calls this
+/// with no lock of its own held.
+pub fn unresolvable_vpc_id<'a, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    vpc_ids: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    unresolvable_ec2_id(engine, vpc_ids, |store, vpc_id| {
+        store.vpcs.contains_key(vpc_id)
+    })
+}
+
+/// The first of `ids` the account's own Amazon EC2 store does not hold, by the
+/// `holds` test naming the inventory to resolve against.
+///
+/// One pass for every kind of Amazon EC2 id this service resolves, so the
+/// lock discipline and the "no store is no inventory" allowance below are
+/// stated once rather than per id kind.
+fn unresolvable_ec2_id<'a, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ids: impl IntoIterator<Item = &'a str>,
+    holds: impl Fn(&ec2::ComAmazonawsEc2Amazonec2State, &str) -> bool,
+) -> Option<String> {
     let Some(state) = ec2::service_state(engine) else {
-        // No Amazon EC2 store on this engine is no subnet inventory to resolve
+        // No Amazon EC2 store on this engine is no inventory to resolve
         // against, so no id can be shown to name nothing.
         return None;
     };
     let store = state.lock();
-    subnet_ids
-        .into_iter()
-        .find(|subnet_id| !store.subnets.contains_key(*subnet_id))
+    ids.into_iter()
+        .find(|id| !holds(&store, id))
         .map(str::to_string)
 }
 

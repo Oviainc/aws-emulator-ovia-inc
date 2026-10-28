@@ -141,7 +141,12 @@ async fn outbound_endpoint(
 }
 
 /// Create a FORWARD rule through `endpoint` and associate it with `vpc`.
-async fn associate_rule_with_vpc(router: &MultiServiceRouter, endpoint: &str, vpc: &str) {
+///
+/// The VPC is registered in the account's own Amazon EC2 store first: a rule is
+/// associated WITH a VPC of the account, which the associate resolves against
+/// that store.
+async fn associate_rule_with_vpc(router: &Emulator, endpoint: &str, vpc: &str) {
+    router.hold_vpcs([vpc]);
     let created = ok(
         router,
         "CreateResolverRule",

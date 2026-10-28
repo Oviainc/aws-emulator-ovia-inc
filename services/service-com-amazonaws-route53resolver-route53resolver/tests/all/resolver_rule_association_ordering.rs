@@ -113,6 +113,9 @@ async fn concurrent_associates_of_one_pair_leave_exactly_one_listed_record() {
         )
         .await;
         let contested = vpc(racers);
+        // The pair is contested in a VPC of the account's own, which
+        // `AssociateResolverRule` resolves against the Amazon EC2 store.
+        router.hold_vpcs([&contested]);
 
         let mut tasks = Vec::new();
         for racer in 0..racers {
@@ -213,6 +216,7 @@ async fn the_listed_order_is_one_stable_total_order_over_the_stored_associations
             let router = Arc::clone(&router);
             let rule = rule.clone();
             let with = vpc(index);
+            router.hold_vpcs([&with]);
             tasks.push(tokio::spawn(async move {
                 try_associate(&router, &rule, &with, None).await
             }));
@@ -271,7 +275,9 @@ async fn the_listed_order_is_one_stable_total_order_over_the_stored_associations
 
         // A record created after the page was walked joins at the end; the
         // records already there keep their places.
-        let (status, appended) = try_associate(&router, &rule, &vpc(count + 100), None).await;
+        let late = vpc(count + 100);
+        router.hold_vpcs([&late]);
+        let (status, appended) = try_associate(&router, &rule, &late, None).await;
         assert_eq!(
             status, 200,
             "case {case:?}: one more distinct pair associates, got {status}: {appended}"

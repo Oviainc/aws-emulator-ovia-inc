@@ -601,6 +601,7 @@ async fn a_repeated_rule_request_id_resolves_to_the_rule_it_made() {
 async fn an_association_is_read_back_by_the_id_the_service_minted() {
     let router = emulator();
     let group = rule_group(&router, "assoc-group").await;
+    router.hold_vpcs(["vpc-0123456789abcdef0"]);
 
     let created = ok(
         &router,
@@ -772,10 +773,14 @@ async fn an_association_priority_is_held_to_its_published_range() {
         ("zero, far below the range", 0, false),
     ] {
         let group = rule_group(&router, &format!("priority-group-{priority}")).await;
+        let vpc = format!("vpc-{priority}");
+        // The association is made with a VPC of the account's own, which the
+        // associate resolves against the Amazon EC2 store.
+        router.hold_vpcs([&vpc]);
         let body = json!({
             "CreatorRequestId": format!("priority-{priority}"),
             "FirewallRuleGroupId": group,
-            "VpcId": format!("vpc-{priority}"),
+            "VpcId": vpc,
             "Priority": priority,
             "Name": format!("assoc-{priority}"),
         });
@@ -807,6 +812,7 @@ async fn an_association_priority_is_held_to_its_published_range() {
     // another VPC.
     let first = rule_group(&router, "uniqueness-first").await;
     let second = rule_group(&router, "uniqueness-second").await;
+    router.hold_vpcs(["vpc-shared", "vpc-elsewhere"]);
     ok(
         &router,
         "AssociateFirewallRuleGroup",
@@ -869,6 +875,7 @@ async fn an_association_priority_is_held_to_its_published_range() {
 async fn an_association_is_updated_and_then_removed() {
     let router = emulator();
     let group = rule_group(&router, "update-group").await;
+    router.hold_vpcs(["vpc-update"]);
     let created = ok(
         &router,
         "AssociateFirewallRuleGroup",
