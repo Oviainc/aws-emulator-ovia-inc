@@ -24,10 +24,23 @@ pub const REGION: &str = "us-east-1";
 /// queue url is built from.
 pub const HOST: &str = "sqs.us-east-1.amazonaws.com";
 
-/// A SigV4-shaped `Authorization` header: its credential scope is what routes the
-/// request to this service (signing name `sqs`) and names the region. Request
-/// authentication is off in these tests, so the signature itself is never checked.
-pub const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/us-east-1/sqs/aws4_request, SignedHeaders=host;x-amz-target, Signature=0000";
+/// The endpoint a client configured for `region` addresses, as Amazon SQS names its
+/// regional endpoints: every suite driving more than one region builds its host from this
+/// rather than re-deriving the form.
+pub fn host_in(region: &str) -> String {
+    format!("sqs.{region}.amazonaws.com")
+}
+
+/// A SigV4-shaped `Authorization` header whose credential scope names `region`: the scope
+/// is what routes the request to this service (signing name `sqs`) AND what says which
+/// region the call addressed. Request authentication is off in these tests, so the
+/// signature itself is never checked.
+pub fn authorization_in(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/sqs/aws4_request, \
+         SignedHeaders=host;x-amz-target, Signature=0000"
+    )
+}
 
 /// One emulator holding only this service, over one shared engine.
 pub fn emulator() -> MultiServiceRouter {
@@ -61,12 +74,23 @@ pub const OTHER_ACCOUNT: &str = "123456789012";
 
 /// The url a queue named `name` must be reachable at: `<endpoint>/<account>/<name>`.
 pub fn expected_url(name: &str) -> String {
-    format!("https://{HOST}/{}/{name}", account())
+    expected_url_in(REGION, name)
+}
+
+/// The same, for a queue created against `region`'s endpoint.
+pub fn expected_url_in(region: &str, name: &str) -> String {
+    format!("https://{}/{}/{name}", host_in(region), account())
 }
 
 /// The ARN a queue named `name` must report.
 pub fn expected_arn(name: &str) -> String {
-    format!("arn:aws:sqs:{REGION}:{}:{name}", account())
+    expected_arn_in(REGION, name)
+}
+
+/// The same, for a queue created against `region`'s endpoint: a queue ARN carries the
+/// region the queue lives in.
+pub fn expected_arn_in(region: &str, name: &str) -> String {
+    format!("arn:aws:sqs:{region}:{}:{name}", account())
 }
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
@@ -96,13 +120,25 @@ pub fn xml_element(body: &str, name: &str) -> Option<String> {
 
 /// Send one operation and return its HTTP status and parsed body.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    call_in(router, REGION, operation, body).await
+}
+
+/// The same, addressed to `region`: the request arrives on that region's endpoint and
+/// carries a credential scope naming it, which is everything that says which region a
+/// call was made in.
+pub async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", HOST)
+        .header("host", host_in(region))
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("AmazonSQS.{operation}"))
-        .header("authorization", AUTHORIZATION)
+        .header("authorization", authorization_in(region))
         .body(Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),
         ))
@@ -115,10 +151,20 @@ pub async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) ->
 
 /// Send one operation that must succeed.
 pub async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
-    let (status, parsed) = call(router, operation, &body).await;
+    ok_in(router, REGION, operation, body).await
+}
+
+/// The same, addressed to `region`.
+pub async fn ok_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let (status, parsed) = call_in(router, region, operation, &body).await;
     assert_eq!(
         status, 200,
-        "case {operation} {body}: expected HTTP 200, got {status} with {parsed}"
+        "case {operation} in {region} {body}: expected HTTP 200, got {status} with {parsed}"
     );
     parsed
 }
@@ -165,10 +211,23 @@ pub async fn receive_until(
     wanted: usize,
     deadline: Instant,
 ) -> Vec<(String, String)> {
+    receive_until_in(router, REGION, url, wanted, deadline).await
+}
+
+/// The same, receiving in `region`: a queue belongs to one region, so a suite driving
+/// several of them says which one each receive is made in.
+pub async fn receive_until_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    url: &str,
+    wanted: usize,
+    deadline: Instant,
+) -> Vec<(String, String)> {
     let mut delivered: Vec<(String, String)> = Vec::with_capacity(wanted);
     while delivered.len() < wanted && Instant::now() < deadline {
-        let reply = ok(
+        let reply = ok_in(
             router,
+            region,
             "ReceiveMessage",
             json!({
                 "QueueUrl": url,
@@ -202,23 +261,44 @@ pub fn fifo_attributes(extra: &[(&str, &str)]) -> Value {
 
 /// Create a queue and return the raw reply.
 pub async fn create(router: &MultiServiceRouter, name: &str, attributes: &Value) -> (u16, Value) {
+    create_in(router, REGION, name, attributes).await
+}
+
+/// The same, addressed to `region`: the queue is created in that region's namespace.
+pub async fn create_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    attributes: &Value,
+) -> (u16, Value) {
     let mut body = json!({"QueueName": name});
     if attributes.as_object().is_some_and(|map| !map.is_empty()) {
         body["Attributes"] = attributes.clone();
     }
-    call(router, "CreateQueue", &body).await
+    call_in(router, region, "CreateQueue", &body).await
 }
 
 /// Create a queue that must succeed and return its url.
 pub async fn create_ok(router: &MultiServiceRouter, name: &str, attributes: &Value) -> String {
-    let (status, parsed) = create(router, name, attributes).await;
+    create_ok_in(router, REGION, name, attributes).await
+}
+
+/// The same, addressed to `region`.
+pub async fn create_ok_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    attributes: &Value,
+) -> String {
+    let (status, parsed) = create_in(router, region, name, attributes).await;
     assert_eq!(
         status, 200,
-        "case create {name} with {attributes}: expected HTTP 200, got {status} with {parsed}"
+        "case create {name} in {region} with {attributes}: expected HTTP 200, got {status} \
+         with {parsed}"
     );
     parsed["QueueUrl"]
         .as_str()
-        .unwrap_or_else(|| panic!("case create {name}: no QueueUrl in {parsed}"))
+        .unwrap_or_else(|| panic!("case create {name} in {region}: no QueueUrl in {parsed}"))
         .to_string()
 }
 

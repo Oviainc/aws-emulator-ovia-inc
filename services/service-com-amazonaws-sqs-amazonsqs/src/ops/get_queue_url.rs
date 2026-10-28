@@ -184,7 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let queue = store.queues.get(&input.queue_name).ok_or_else(|| {
+        // A name resolves in the region the request addressed: "the name of the queue whose
+        // URL must be fetched" is unique within one region's queues, so the same name in
+        // another region is another queue and is not reported here.
+        let region = state::request_region(ctx.parts());
+        let queue = store.queue(&region, &input.queue_name).ok_or_else(|| {
             GetQueueUrlErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
         })?;
 

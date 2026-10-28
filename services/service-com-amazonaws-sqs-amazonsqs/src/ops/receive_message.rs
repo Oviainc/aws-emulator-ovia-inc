@@ -375,6 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let started = SystemTime::now();
+        // A queue url resolves in the region the request addressed: this region's queue of
+        // that name, and nothing another region holds.
+        let region = sqs::request_region(ctx.parts());
         loop {
             let now = SystemTime::now();
             // Amazon SQS asks KMS to decrypt the data key a message was sealed under WHEN
@@ -386,7 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let delivering = {
                 let mut state = store.lock();
                 state
-                    .queue_by_url_mut(&input.queue_url)
+                    .queue_by_url_mut(&region, &input.queue_url)
                     .is_some_and(|queue| {
                         // Retention lapses and visibility timeouts are owed by the clock,
                         // so what this sees is what the walk below would deliver.
@@ -417,7 +420,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let (messages, wait) = {
                 let mut state = store.lock();
-                let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+                let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
                     return Err(ReceiveMessageErrorModeled::QueueDoesNotExist(
                         sqs::queue_does_not_exist(),
                     )

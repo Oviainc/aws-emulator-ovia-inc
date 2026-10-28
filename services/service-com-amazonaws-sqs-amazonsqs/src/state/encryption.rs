@@ -294,11 +294,12 @@ pub fn authorize_queue_key<Eng: Send + Sync + 'static>(
     let Some(store) = crate::state::service_state(engine) else {
         return Ok(());
     };
+    let region = crate::state::request_region(ctx.parts());
     // The lock is released before KMS is consulted: nothing of this service's state is
     // read or written while the decision is being made.
     let configured = {
         let state = store.lock();
-        state.queue_by_url(queue_url).and_then(|queue| {
+        state.queue_by_url(&region, queue_url).and_then(|queue| {
             queue
                 .master_key_id()
                 .map(|key| (queue.arn.clone(), key.to_string()))
@@ -307,7 +308,6 @@ pub fn authorize_queue_key<Eng: Send + Sync + 'static>(
     let Some((queue_arn, master_key_id)) = configured else {
         return Ok(());
     };
-    let region = crate::state::request_region(ctx.parts());
     authorize_master_key(engine, ctx, &region, &queue_arn, &master_key_id, action)
 }
 

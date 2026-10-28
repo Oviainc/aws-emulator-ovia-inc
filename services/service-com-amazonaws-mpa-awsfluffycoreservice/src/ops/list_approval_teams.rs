@@ -3,10 +3,13 @@
 //! @op ListApprovalTeams
 //! Enumerates the stored approval teams from [`crate::state`], in creation order.
 //!
-//! `NextToken` is the creation-order sequence number of the last team the previous page
-//! returned, so the next page is every stored team ordered after it: a client paging with
-//! any `MaxResults` sees each team exactly once. A token that is not one this service
-//! issued earns `ValidationException` (400).
+//! `NextToken` is this listing's own: it names this listing and the creation-order
+//! position of the last team the previous page returned, so the next page is every
+//! stored team ordered after it — a client paging with any `MaxResults` sees each team
+//! exactly once. A token this listing did not hand out — one it cannot read, one another
+//! listing issued, or one naming a position this listing holds no team at (a position
+//! past the end, or one whose team has since been deleted) — earns
+//! `ValidationException` (400) rather than an empty page.
 //!
 //! `@readonly`: see the note in `get_approval_team.rs` for why
 //! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] is not a write of this handler's own.
@@ -164,13 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // The page and the token are the service's one seq-token paging rule
-        // ([`crate::state::page_by_seq_token`]): the token is the creation-order position
-        // the next page starts after, and anything else never came from here.
+        // The page and the token are the service's one position-token paging rule
+        // ([`crate::state::page_by_seq_token`]): the token names this listing and the
+        // creation-order position the next page starts after, and anything else — a
+        // token another listing issued, or one naming a position this listing never
+        // reported a team at — never came from here.
         let mut state = store.lock();
         state.materialize_due(::std::time::SystemTime::now());
 
         let page = crate::state::page_by_seq_token(
+            crate::state::Listing::ApprovalTeams,
             state.teams_in_creation_order(),
             input.next_token.as_deref(),
             input.max_results,

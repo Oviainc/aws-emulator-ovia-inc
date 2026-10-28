@@ -227,13 +227,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = store.lock();
 
+        // A queue url resolves in the region the request addressed: the same url against
+        // another region's endpoint names that region's queue of the same name, and
+        // nothing at all where it holds none.
+        let region = state::request_region(ctx.parts());
         let name = state::queue_name_from_url(&input.queue_url)
-            .filter(|name| store.queues.contains_key(*name))
+            .filter(|name| store.holds_queue(&region, name))
             .map(str::to_string)
             .ok_or_else(|| {
                 SetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
             })?;
-        let fifo = store.queues[&name].is_fifo();
+        let fifo = store
+            .queue(&region, &name)
+            .expect("the queue was resolved out of this same store")
+            .is_fifo();
 
         state::validate_attributes(&input.attributes, false, fifo).map_err(
             |refusal| match refusal {
@@ -255,11 +262,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(SetQueueAttributesErrorModeled::InvalidAttributeValue(error).into());
         }
+        // A dead-letter link never crosses an account or a region boundary: a
+        // `RedrivePolicy` whose target is some other namespace's queue could never
+        // deliver, so the attribute is left as it was rather than stored.
+        if let Some(why) = input
+            .attributes
+            .get(state::REDRIVE_POLICY)
+            .and_then(|value| state::redrive_policy_refusal(&region, value))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
+        }
 
         // The queue's own policy decides whether this caller may change it, so the
         // decision is taken against the document in force BEFORE this call.
         let (queue_arn, policy) = {
-            let queue = &store.queues[&name];
+            let queue = store
+                .queue(&region, &name)
+                .expect("the queue was resolved out of this same store");
             (queue.arn.clone(), queue.policy().map(str::to_string))
         };
         if let Some(denied) = state::authorization::denied(
@@ -273,8 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let queue = store
-            .queues
-            .get_mut(&name)
+            .queue_mut(&region, &name)
             .expect("the queue was resolved out of this same store");
         // The pair rule is judged over the set this call would LEAVE the queue carrying:
         // either attribute of such a pair may come from this request or from the queue.

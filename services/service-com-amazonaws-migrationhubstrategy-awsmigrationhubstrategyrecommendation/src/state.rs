@@ -2744,16 +2744,16 @@ pub async fn bucket_is_reachable(
 /// Refuse a bucket member naming one this service cannot use, with the refusal of the
 /// condition that actually holds.
 ///
-/// `Ok` for an absent member (nothing was named) and for a name carrying
-/// [`BUCKET_NAME_PREFIX`] — the namespace this service's own role provisions buckets in, so
-/// a name inside it is taken to name a bucket the service can reach rather than refusing
-/// every start call and leaving the resource unreachable.
+/// `Ok` for an absent member: nothing was named, so there is no bucket to use.
 ///
-/// For any OTHER name the condition is decided by looking the bucket up
-/// ([`bucket_is_reachable`]), because the two refusals tell a caller to do opposite things:
-/// a bucket the account does not hold is reported as the missing resource it is
-/// ([`bucket_not_found`], naming the bucket the request sent), and one the account does
-/// hold is reported as the permission failure its name earns
+/// A named bucket is one this service has to READ the import file out of or WRITE its
+/// results into, so the bucket itself is looked up before anything is minted
+/// ([`bucket_is_reachable`]) — a name is not a bucket, whatever it spells. The two refusals
+/// tell a caller to do opposite things, so each reports the condition that actually holds:
+/// a name object storage holds no bucket for is reported as the missing resource it is
+/// ([`bucket_not_found`], naming the bucket the request sent), and a bucket that IS there
+/// but lies outside [`BUCKET_NAME_PREFIX`] — the namespace this service may be reached
+/// under — is reported as the permission failure its name earns
 /// ([`BUCKET_PERMISSIONS_REFUSAL`]). Both are `ValidationException` (HTTP 400).
 pub async fn check_bucket_usable(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -2763,13 +2763,13 @@ pub async fn check_bucket_usable(
     let Some(bucket) = value else {
         return Ok(());
     };
-    if bucket.starts_with(BUCKET_NAME_PREFIX) {
-        return Ok(());
+    if !bucket_is_reachable(ctx, region, bucket).await {
+        return Err(bucket_not_found(bucket));
     }
-    if bucket_is_reachable(ctx, region, bucket).await {
+    if !bucket.starts_with(BUCKET_NAME_PREFIX) {
         return Err(bucket_permissions_incorrect());
     }
-    Err(bucket_not_found(bucket))
+    Ok(())
 }
 
 /// The bounds `StartImportFileTaskRequest$name` declares: `@length(min: 1, max: 50)`

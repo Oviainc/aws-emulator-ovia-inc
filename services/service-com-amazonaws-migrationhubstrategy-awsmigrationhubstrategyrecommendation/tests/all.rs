@@ -116,6 +116,9 @@ mod server_inventory;
 #[path = "all/server_strategies.rs"]
 mod server_strategies;
 
+#[path = "all/start_call_bucket_existence.rs"]
+mod start_call_bucket_existence;
+
 #[path = "all/start_call_bucket_reachability.rs"]
 mod start_call_bucket_reachability;
 
