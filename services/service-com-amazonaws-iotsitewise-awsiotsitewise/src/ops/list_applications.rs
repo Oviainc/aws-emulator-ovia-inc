@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below enumerates the applications this service's store
+//! holds, in one stable order, cut into pages of at most `maxResults` entries. The
+//! enumeration spans every workspace — this operation takes no `workspaceName` and
+//! an application's id identifies it across workspaces — and each summary is read
+//! off the stored record, so a listed application reports what
+//! `DescribeApplication` reports for it. A `nextToken` this operation never issued
+//! is refused rather than answered with an empty page, and nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +147,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // A listing needs no request metadata: the enumeration is a function of the
+        // store and the paging parameters alone, and every value a summary carries —
+        // the ARN included — is read off the stored record.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let now = ::std::time::SystemTime::now();
+
+        // A pure read: nothing below writes, so two callers listing in either order
+        // see the same enumeration.
+        let store = state.lock();
+
+        // Every application the store holds: this operation takes no `workspaceName`
+        // and models no filter, so the enumeration spans every workspace.
+        let mut applications: Vec<&crate::state::ApplicationRecord> =
+            store.applications.values().collect();
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two applications created in the same instant still order
+        // deterministically. The same order every other listing of this service
+        // enumerates in.
+        applications.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // This enumeration's resume point is an application's id, and the page walk
+        // every paginated listing of this service shares takes it from there: it
+        // resumes at the token's application, refusing a token whose resume point is
+        // not in this enumeration rather than answering an empty page, which would
+        // report absence as success; it cuts the page at `maxResults`, defaulting to
+        // this service's page size; and it mints the next page's token from the
+        // application that FOLLOWS the page, so a page that leaves nothing to resume
+        // from reports no token at all.
+        let page = crate::state::page_of(
+            &applications,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
+
+        Ok(ListApplicationsOutput {
+            applications: applications[page.start..page.end]
+                .iter()
+                .map(|record| summary(record, now))
+                .collect(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the operation documents `maxResults` only as "Maximum
+/// number of results to return". It is the default this service's other paginated
+/// listings already use, so a client that pages without asking for a size sees one
+/// page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored application as this operation's summary, as of `now`.
+///
+/// Every member is read off the stored record, so a listed application reports what
+/// `DescribeApplication` reports for it: the same ARN, id, name, workspace and
+/// creation instant, and the same status derived from the instant the transition the
+/// create owes falls due.
+fn summary(
+    record: &crate::state::ApplicationRecord,
+    now: ::std::time::SystemTime,
+) -> ApplicationSummary {
+    ApplicationSummary {
+        arn: record.arn.clone(),
+        id: record.id.clone(),
+        name: record.name.clone(),
+        status: record.status(now),
+        created_at: crate::state::to_date_time(record.created_at),
+        workspace_name: record.workspace_name.clone(),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+///
+/// The wording every paginated operation of this service refuses an unusable token
+/// with, so a client matching on the message sees one string whichever listing it
+/// was paging.
+fn invalid_token() -> ListApplicationsError {
+    ListApplicationsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> ListApplicationsError {
+    ListApplicationsErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
 }

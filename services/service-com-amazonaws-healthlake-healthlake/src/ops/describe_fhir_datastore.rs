@@ -168,7 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeFHIRDatastoreOutput {
-            datastore_properties: datastore.properties(),
+            // The reported restore window is derived against the instant this
+            // call runs, which is what makes its latest restorable point the
+            // present rather than a stale stored value.
+            datastore_properties: datastore.properties(::std::time::SystemTime::now()),
         })
     }
 }

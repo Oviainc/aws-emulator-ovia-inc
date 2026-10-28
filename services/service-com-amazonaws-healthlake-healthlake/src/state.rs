@@ -757,7 +757,15 @@ impl FhirResource {
 impl Datastore {
     /// This record as the modelled `DatastoreProperties`, the one shape
     /// `DescribeFHIRDatastore` and `ListFHIRDatastores` both report.
-    pub fn properties(&self) -> DatastoreProperties {
+    ///
+    /// `now` is the instant the reading call runs, which is what the reported
+    /// restore window is derived against ([`Datastore::restore_window`]): a
+    /// continuous backup's latest restorable point IS the present, so it is a
+    /// parameter rather than a stored value. Taking it from the caller also
+    /// makes one call's whole answer — every entry of a `ListFHIRDatastores`
+    /// page included — consistent at a single instant.
+    pub fn properties(&self, now: SystemTime) -> DatastoreProperties {
+        let window = self.restore_window(now);
         DatastoreProperties {
             datastore_id: self.id.clone(),
             datastore_arn: self.arn.clone(),
@@ -776,24 +784,26 @@ impl Datastore {
             nlp_configuration: self.nlp_configuration.clone(),
             analytics_configuration: self.analytics_configuration.clone(),
             profile_configuration: self.profile_configuration.clone(),
-            // Only the configuration half of the backup status is known here,
-            // plus the instant that configuration became enabled. The
-            // restore-point instants would each have to be derived from the
-            // clock on every read — `RestoreFHIRDatastore` holds a requested
-            // restore point against the window
-            // [`Datastore::restore_window`] derives at the instant it runs —
-            // and the scheduled-deletion instant describes retained backup
-            // data of a deleted data store, which nothing in this slice keeps,
-            // so all three stay unset rather than being invented here and
-            // making two identical reads of one data store differ.
+            // The backup status reports the stored configuration, the instant
+            // that configuration became enabled, and the two bounds of the
+            // window this data store can be restored to — all derived from this
+            // one record. The two restore points are exactly the window
+            // [`Datastore::restore_window`] derives and
+            // `RestoreFHIRDatastore` holds a requested restore point against,
+            // so a caller can read the window and then name a point inside it.
+            //
+            // `ScheduledPermanentDeletionTime` is "the time the retained backup
+            // data is scheduled for permanent deletion", and this service
+            // retains no backup data of a deleted data store, so there is no
+            // such instant to report.
             backup_status_info: self
                 .backup_configuration
                 .clone()
                 .map(|configuration| DatastoreBackupStatus {
                     configuration: Some(configuration),
                     backup_enabled_at: self.backup_enabled_at,
-                    earliest_restore_point: None,
-                    latest_restore_point: None,
+                    earliest_restore_point: window.map(|window| window.earliest),
+                    latest_restore_point: window.map(|window| window.latest),
                     scheduled_permanent_deletion_time: None,
                 }),
         }
@@ -964,8 +974,8 @@ pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
 /// the configuration names) up to now, which is the range
 /// `RestoreFHIRDatastore` holds a requested `RestorePointTime` against. The
 /// modelled `DatastoreBackupStatus.EarliestRestorePoint` / `LatestRestorePoint`
-/// describe the same two instants; [`Datastore::properties`] says why it does
-/// not report them.
+/// describe the same two instants, and [`Datastore::properties`] reports them
+/// from here on every read.
 #[derive(Debug, Clone, Copy)]
 pub struct RestoreWindow {
     pub earliest: ::aws_smithy_types::DateTime,

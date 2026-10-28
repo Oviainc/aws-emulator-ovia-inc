@@ -252,6 +252,12 @@ pub const QUERY_LOGGING_RESOURCE_TYPE: &str = "AWS::APS::QueryLoggingConfigurati
 pub const SCRAPER_LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`SCRAPER_LOGGING_STATUS_ACTIVE`].
 pub const SCRAPER_LOGGING_STATUS_DELETING: &str = "DELETING";
+/// See [`SCRAPER_LOGGING_STATUS_ACTIVE`]. The transient status a configuration whose
+/// UPDATE has been accepted reports until the clock settles it back to
+/// [`SCRAPER_LOGGING_STATUS_ACTIVE`]: an entry of
+/// `com.amazonaws.amp#ScraperLoggingConfigurationStatusCode` documented "Scraper logging
+/// configuration is being updated."
+pub const SCRAPER_LOGGING_STATUS_UPDATING: &str = "UPDATING";
 
 /// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
 /// report for a scraper's logging configuration — the resource's AWS type name, as
