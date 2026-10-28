@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
-    instance_not_found_message, ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State,
+    ComAmazonawsConnectcampaignsv2Amazonconnectcampaignservicev2State, INSTANCE_NOT_FOUND_MESSAGE,
     ONBOARDING_JOB_DURATION, ONBOARDING_STATUS_IN_PROGRESS,
 };
 
@@ -119,11 +119,13 @@ async fn create_campaign(
 }
 
 /// Assert `(status, body)` is the modelled 404 for an instance the account does not
-/// hold, naming the instance the request asked about.
+/// hold: the service's FIXED text for an instance that is not usable by Campaigns,
+/// which carries nothing from the request, so it reads the same whatever id was asked
+/// about.
 fn assert_instance_not_found(case: &str, what: &str, status: u16, body: &Value, instance: &str) {
     assert_eq!(
         status, 404,
-        "case {case:?}: expected HTTP 404 from {what}, got {status} {body}"
+        "case {case:?}: expected HTTP 404 from {what} for {instance:?}, got {status} {body}"
     );
     assert!(
         error_code(body).ends_with("ResourceNotFoundException"),
@@ -132,16 +134,9 @@ fn assert_instance_not_found(case: &str, what: &str, status: u16, body: &Value, 
     );
     assert_eq!(
         body.get("message").and_then(Value::as_str),
-        Some(instance_not_found_message(instance).as_str()),
-        "case {case:?}: expected the refusal from {what} to name the instance asked \
-         about, got {body}"
-    );
-    assert!(
-        body.get("message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains(instance)),
-        "case {case:?}: expected the refusal from {what} to carry the requested instance \
-         id {instance:?}, got {body}"
+        Some(INSTANCE_NOT_FOUND_MESSAGE),
+        "case {case:?}: expected the service's fixed text for an instance not usable by \
+         Campaigns from {what}, got {body}"
     );
 }
 

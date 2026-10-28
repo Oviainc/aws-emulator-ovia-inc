@@ -40,7 +40,8 @@ use crate::ops::types::{
     DiscoveryData, DownlinkDataflowDetails, Eirp, Elevation, EndpointDetails, EphemerisData,
     EphemerisMetaData, Frequency,
     FrequencyBandwidth,
-    InvalidParameterException, KmsKey, RangedConnectionDetails, S3Object, S3RecordingDetails,
+    InvalidParameterException, KmsKey, ProgramTrackSettings, RangedConnectionDetails,
+    ResourceNotFoundException, S3Object, S3RecordingDetails,
     Source, SpectrumConfig,
     TrackingOverrides, UplinkDataflowDetails,
 };
@@ -1587,6 +1588,22 @@ impl Contact {
             .any(|version| version.satellite_arn.as_deref() == Some(satellite_arn))
     }
 
+    /// Whether this contact's program track points its antenna at the ephemeris
+    /// `ephemeris_id` names.
+    ///
+    /// Read from the version in force and from the version still being applied, for the
+    /// same reason as [`Contact::flies_satellite`]: an `UPDATING` version is the
+    /// configuration the contact is about to be flown with, so an ephemeris either version
+    /// names is one this contact depends on.
+    pub fn program_tracks_ephemeris(&self, ephemeris_id: &str) -> bool {
+        [self.active_version(), self.latest_version()]
+            .into_iter()
+            .flatten()
+            .filter_map(|version| version.tracking_overrides.as_ref())
+            .filter_map(program_track_reference)
+            .any(|reference| reference.ephemeris_id == ephemeris_id)
+    }
+
     /// Release this contact's reservation, from whichever side of its pass the cancel
     /// arrived on. Only called for a contact [`Contact::is_cancellable`] admits.
     ///
@@ -3081,10 +3098,92 @@ pub const EPHEMERIS_ENABLED_BY_DEFAULT: bool = false;
 /// Space Track default), which no customer request creates.
 pub fn ephemeris_type_of(data: &EphemerisData) -> &'static str {
     match data {
-        EphemerisData::Tle(_) => "TLE",
-        EphemerisData::Oem(_) => "OEM",
-        EphemerisData::azEl(_) => "AZ_EL",
+        EphemerisData::Tle(_) => EPHEMERIS_TYPE_TLE,
+        EphemerisData::Oem(_) => EPHEMERIS_TYPE_OEM,
+        EphemerisData::azEl(_) => EPHEMERIS_TYPE_AZ_EL,
     }
+}
+
+/// The `EphemerisType` of an ephemeris supplied as a two-line element set.
+///
+/// This and the two below are values of the model's own `EphemerisType` enum, whose values
+/// are `TLE`, `OEM`, `AZ_EL` and `SERVICE_MANAGED` (`smithy_query(query="shape",
+/// shape="EphemerisType")`). They are named here because two rules read them: the type an
+/// ephemeris takes from the data it was created with ([`ephemeris_type_of`]) and the type a
+/// program track's reference requires ([`program_track_reference`]).
+pub const EPHEMERIS_TYPE_TLE: &str = "TLE";
+
+/// The `EphemerisType` of an ephemeris supplied as a CCSDS orbit ephemeris message.
+pub const EPHEMERIS_TYPE_OEM: &str = "OEM";
+
+/// The `EphemerisType` of an ephemeris supplied as azimuth/elevation pointing segments.
+pub const EPHEMERIS_TYPE_AZ_EL: &str = "AZ_EL";
+
+/// The ephemeris a contact's `trackingOverrides` point its antenna at.
+#[derive(Debug, Clone)]
+pub struct ProgramTrackReference<'a> {
+    /// The `ephemerisId` the overrides name.
+    pub ephemeris_id: &'a str,
+    /// The `EphemerisType` the member carrying that reference requires.
+    pub required_type: &'static str,
+    /// The request member the reference was named in, as a refusal reports it.
+    pub parameter_name: String,
+}
+
+/// The ephemeris `overrides` point the antenna at, or `None` when they override the
+/// tracking configuration without naming a program track.
+///
+/// A program track flies the antenna from a SUPPLIED trajectory, and the member of the
+/// union that carries the reference is what says which form that trajectory is in: the
+/// three members are documented "Program track settings for AzElEphemeris / OEMEphemeris /
+/// TLEEphemeris" and each one's `ephemerisId` as "Unique identifier of the azimuth
+/// elevation / OEM / TLE ephemeris" (`smithy_query(query="shape",
+/// shape="ProgramTrackSettings")`). So the member fixes the `EphemerisType` the ephemeris
+/// it names has to carry — the same type [`ephemeris_type_of`] derives from the data an
+/// ephemeris was created with.
+pub fn program_track_reference(overrides: &TrackingOverrides) -> Option<ProgramTrackReference<'_>> {
+    let (ephemeris_id, required_type, member) = match overrides.program_track_settings.as_ref()? {
+        ProgramTrackSettings::azEl(az_el) => (
+            az_el.ephemeris_id.as_str(),
+            EPHEMERIS_TYPE_AZ_EL,
+            "azEl",
+        ),
+        ProgramTrackSettings::Oem(oem) => (oem.ephemeris_id.as_str(), EPHEMERIS_TYPE_OEM, "oem"),
+        ProgramTrackSettings::Tle(tle) => (tle.ephemeris_id.as_str(), EPHEMERIS_TYPE_TLE, "tle"),
+    };
+    Some(ProgramTrackReference {
+        ephemeris_id,
+        required_type,
+        parameter_name: format!("trackingOverrides.programTrackSettings.{member}.ephemerisId"),
+    })
+}
+
+/// Why the program track a write takes cannot be flown, as the modelled refusal to answer
+/// with.
+///
+/// The two faults are different conditions and this service answers them differently, the
+/// same way it answers them for a config reference
+/// ([`ComAmazonawsGroundstationGroundstationState::typed_reference_fault`]).
+#[derive(Debug, Clone)]
+pub enum ProgramTrackFault {
+    /// The `ephemerisId` names no ephemeris this account holds: there is nothing to
+    /// reference, so the resource is MISSING (`ResourceNotFoundException`, HTTP 434).
+    Absent(ResourceNotFoundException),
+    /// It names an ephemeris that EXISTS, of another `EphemerisType` than the member
+    /// carrying the reference requires: a BAD PARAMETER (`InvalidParameterException`,
+    /// HTTP 431), since the reference resolved and no amount of waiting changes the form
+    /// of the trajectory it points at.
+    WrongType(InvalidParameterException),
+}
+
+/// What this service answers for a program track whose `ephemerisId` resolved to an
+/// ephemeris of another `EphemerisType` than the member naming it requires: the reference
+/// resolved, so nothing is missing — what is wrong is the form of the trajectory it points
+/// at, and the text states the type that position does take, composed as this service
+/// already states the type a config reference's position takes
+/// ([`wrong_config_type_message`]).
+pub fn wrong_ephemeris_type_message(required_type: &str) -> String {
+    format!("Invalid ephemerisId provided. Ephemeris Type must be of type \"{required_type}\".")
 }
 
 /// The Amazon S3 object `data` was supplied from, when it names one rather than carrying
@@ -3990,6 +4089,40 @@ impl ComAmazonawsGroundstationGroundstationState {
         }
     }
 
+    /// Why the program track `overrides` name cannot be flown, as the modelled refusal to
+    /// answer with; `None` when the ephemeris it names is one this account holds in the
+    /// form the member requires, when the overrides name no program track, and when the
+    /// write names no overrides at all.
+    ///
+    /// A program track points the antenna from an ephemeris of THIS account, so the
+    /// reference is resolved before a contact version carrying it is stored — which is
+    /// what every other reference this service's writes take is held to: a config ARN
+    /// ([`Self::typed_reference_fault`], [`Self::resolves_config`]) and an ephemeris's own
+    /// `satelliteId`. An id this account holds no ephemeris under references nothing, and
+    /// one naming an ephemeris of another `EphemerisType` than the member requires
+    /// ([`program_track_reference`]) points at a trajectory of the wrong form.
+    ///
+    /// Shared by both writers of a contact version, so a contact cannot be left holding a
+    /// program track the other writer would have refused.
+    pub fn program_track_fault(
+        &self,
+        overrides: Option<&TrackingOverrides>,
+    ) -> Option<ProgramTrackFault> {
+        let reference = program_track_reference(overrides?)?;
+        match self.ephemerides.get(reference.ephemeris_id) {
+            None => Some(ProgramTrackFault::Absent(ResourceNotFoundException {
+                message: Some(EPHEMERIS_NOT_FOUND.to_string()),
+            })),
+            Some(ephemeris) if ephemeris.ephemeris_type != reference.required_type => {
+                Some(ProgramTrackFault::WrongType(InvalidParameterException {
+                    message: Some(wrong_ephemeris_type_message(reference.required_type)),
+                    parameter_name: Some(reference.parameter_name),
+                }))
+            }
+            Some(_) => None,
+        }
+    }
+
     /// Why the two configs an `edge` of a mission profile's `dataflowEdges` names cannot
     /// form a dataflow, as the modelled `InvalidParameterException` (HTTP 431) to answer
     /// with; `None` when they can.
@@ -4356,21 +4489,26 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// The contacts that still depend on the ephemeris `ephemeris_id` names, as the
     /// refusal of a delete lists them; empty when nothing depends on it.
     ///
-    /// An ephemeris is what a contact's antenna is pointed by, through the satellite the
-    /// ephemeris applies to: a contact names its satellite by ARN
-    /// ([`Contact::flies_satellite`]), and the ephemeris in force for that satellite is the
-    /// trajectory its pass is flown on. So the ephemerides a contact depends on are the
-    /// ones that apply to its satellite, and a contact depends on them for as long as it is
-    /// not terminal ([`Contact::is_non_terminal`]) — once its pass is over or its
-    /// reservation released, nothing of it is still to be flown.
+    /// An ephemeris is what a contact's antenna is pointed by, in either of the two ways a
+    /// contact names one: through the satellite the ephemeris applies to — a contact names
+    /// its satellite by ARN ([`Contact::flies_satellite`]), and the ephemeris in force for
+    /// that satellite is the trajectory its pass is flown on — or by naming the ephemeris
+    /// itself in the program track of its tracking overrides
+    /// ([`Contact::program_tracks_ephemeris`]). So the ephemerides a contact depends on are
+    /// the ones that apply to its satellite plus the one its program track names, and a
+    /// contact depends on them for as long as it is not terminal
+    /// ([`Contact::is_non_terminal`]) — once its pass is over or its reservation released,
+    /// nothing of it is still to be flown.
     ///
-    /// Only an ephemeris whose status is [`EPHEMERIS_ENABLED`] is in force: that status is
-    /// what "whether or not the ephemeris is enabled" (`smithy_query(query="operation",
-    /// operation="DescribeEphemeris")`) reports, and one still validating, disabled,
-    /// invalid or expired is not the trajectory anything is flown on. CHOSEN coupling: AWS
-    /// documents only that such a resource "is in use by non-terminal state contacts", so
-    /// which contacts hold which ephemeris is this emulator's rule, stated once here rather
-    /// than per operation.
+    /// For the SATELLITE coupling, only an ephemeris whose status is [`EPHEMERIS_ENABLED`]
+    /// is in force: that status is what "whether or not the ephemeris is enabled"
+    /// (`smithy_query(query="operation", operation="DescribeEphemeris")`) reports, and one
+    /// still validating, disabled, invalid or expired is not the trajectory anything is
+    /// flown on. A contact that names an ephemeris OUTRIGHT holds it whatever its status:
+    /// the reference is the contact's own configuration, not a trajectory the service
+    /// chose. CHOSEN coupling: AWS documents only that such a resource "is in use by
+    /// non-terminal state contacts", so which contacts hold which ephemeris is this
+    /// emulator's rule, stated once here rather than per operation.
     ///
     /// Sorted, so a refusal listing them reads the same on every call whatever order the
     /// map iterates in.
@@ -4378,23 +4516,28 @@ impl ComAmazonawsGroundstationGroundstationState {
         let Some(ephemeris) = self.ephemerides.get(ephemeris_id) else {
             return Vec::new();
         };
-        if ephemeris.status != EPHEMERIS_ENABLED {
-            return Vec::new();
-        }
-        // An ephemeris that applies to no satellite is the trajectory of nothing, so no
-        // contact is flown on it.
-        let Some(satellite_arn) = ephemeris
-            .satellite_id
-            .as_deref()
-            .and_then(|satellite_id| self.satellites.get(satellite_id))
-            .map(|satellite| satellite.satellite_arn.clone())
-        else {
-            return Vec::new();
+        // The satellite whose passes are flown on this ephemeris, when it is in force at
+        // all and applies to a satellite this account is on-boarded to: an ephemeris that
+        // applies to no satellite is the trajectory of nothing.
+        let flown_satellite_arn = if ephemeris.status == EPHEMERIS_ENABLED {
+            ephemeris
+                .satellite_id
+                .as_deref()
+                .and_then(|satellite_id| self.satellites.get(satellite_id))
+                .map(|satellite| satellite.satellite_arn.clone())
+        } else {
+            None
         };
         let mut holding: Vec<String> = self
             .contacts
             .values()
-            .filter(|contact| contact.is_non_terminal() && contact.flies_satellite(&satellite_arn))
+            .filter(|contact| {
+                contact.is_non_terminal()
+                    && (contact.program_tracks_ephemeris(ephemeris_id)
+                        || flown_satellite_arn
+                            .as_deref()
+                            .is_some_and(|arn| contact.flies_satellite(arn)))
+            })
             .map(|contact| contact.contact_id.clone())
             .collect();
         holding.sort();

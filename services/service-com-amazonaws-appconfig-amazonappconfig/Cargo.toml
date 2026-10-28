@@ -27,6 +27,9 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # `arn`: the ONE parse of a resource ARN, shared with every other service — an
 # extension action's target URI is read through it rather than split here.
+# `validation`: the one collecting walk a service that words its own pre-handler refusal
+# uses, which restores each violation's value echo to the bytes the caller sent
+# (`service.rs`).
 service-common = { path = "../common" }
 # The `Content` an extension action-point event carries is base64, and a replacement
 # `Content` the action answers with is decoded the same way

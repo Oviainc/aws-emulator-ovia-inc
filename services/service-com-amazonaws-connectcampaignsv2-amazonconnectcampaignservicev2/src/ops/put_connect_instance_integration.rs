@@ -206,9 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PutConnectInstanceIntegrationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::instance_not_found_message(
-                            &input.connect_instance_id,
-                        ),
+                        message: crate::state::INSTANCE_NOT_FOUND_MESSAGE.to_string(),
                         x_amz_error_type: None,
                     },
                 )

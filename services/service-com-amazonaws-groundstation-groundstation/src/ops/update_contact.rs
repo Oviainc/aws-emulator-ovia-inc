@@ -158,17 +158,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether or not anybody called, and this version is appended on top of it.
         guard.settle_due_contacts();
 
-        let contact = guard.contacts.get_mut(&input.contact_id).ok_or_else(|| {
-            UpdateContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                // The MUTATION path's text: the id the request addressed plus the
-                // account the write was scoped to, as this service's other mutations
-                // answer. `DescribeContact` and `CancelContact` answer their own texts
-                // for the same missing contact.
-                message: Some(crate::state::contact_mutation_not_found_message(
-                    &input.contact_id,
-                )),
-            })
-        })?;
+        // Every gate below reads the contact rather than writing it, so it is borrowed
+        // immutably here: the program-track reference the request carries is resolved
+        // against the whole store ([`crate::state::program_track_fault`]) once those
+        // gates have passed, and only then is the version appended.
+        let contact = guard
+            .contacts
+            .get(&input.contact_id)
+            .ok_or_else(|| contact_not_found(&input.contact_id))?;
 
         // `clientToken` is `@idempotencyToken` on an `@idempotent` operation: a retry
         // carrying a token this contact has already seen answers with the version that
@@ -245,14 +242,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Accepted so far as the contact itself goes. What the request points the antenna
+        // at is resolved before anything is stored: a program track is flown from an
+        // ephemeris of this account, so one naming an ephemeris this account does not hold
+        // — or one of another form than the member naming it requires — is refused rather
+        // than appended, exactly as `ReserveContact` refuses it for a contact's first
+        // version.
+        match guard.program_track_fault(input.tracking_overrides.as_ref()) {
+            None => {}
+            Some(crate::state::ProgramTrackFault::Absent(error)) => {
+                return Err(UpdateContactErrorModeled::ResourceNotFoundException(error).into());
+            }
+            Some(crate::state::ProgramTrackFault::WrongType(error)) => {
+                return Err(UpdateContactErrorModeled::InvalidParameterException(error).into());
+            }
+        }
+
         // Accepted: the contact takes a new version, carrying what this request named
         // over what its newest version already held. The version is admitted UPDATING —
         // the service owes it its move to ACTIVE, which is when the contact is flown
         // with it and the version before it is superseded.
-        //
-        // An `ephemerisId` inside `trackingOverrides` is stored as given rather than
-        // resolved: no ephemeris can exist in this store while `CreateEphemeris` is a
-        // scaffold (its own issue), which is also how `ReserveContact` takes one.
+        let contact = guard
+            .contacts
+            .get_mut(&input.contact_id)
+            .ok_or_else(|| contact_not_found(&input.contact_id))?;
         let version_id = contact.append_version(
             input.satellite_arn,
             input.tracking_overrides,
@@ -265,4 +278,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_id: Some(version_id),
         })
     }
+}
+
+/// What this operation answers when `{contactId}` names no contact of this account.
+///
+/// The MUTATION path's text: the id the request addressed plus the account the write was
+/// scoped to, as this service's other mutations answer. `DescribeContact` and
+/// `CancelContact` answer their own texts for the same missing contact.
+fn contact_not_found(contact_id: &str) -> UpdateContactError {
+    UpdateContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::contact_mutation_not_found_message(contact_id)),
+    })
+    .into()
 }

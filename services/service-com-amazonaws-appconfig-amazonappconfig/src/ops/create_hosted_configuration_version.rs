@@ -339,10 +339,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if expected != latest {
                 return Err(CreateHostedConfigurationVersionErrorModeled::ConflictException(
                     ConflictException {
-                        message: Some(format!(
-                            "LatestVersionNumber {expected} does not match the latest hosted \
-                             configuration version {latest} of this configuration profile."
-                        )),
+                        message: Some(
+                            crate::state::hosted_configuration_version_stale_lock(
+                                expected, latest,
+                            ),
+                        ),
                     },
                 )
                 .into());
@@ -407,6 +408,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The action point is consulted BEFORE the version is created: a target that
         // refuses the action refuses this write and stores nothing, and a target that
         // answers a replacement `Content` decides what is stored.
+        //
+        // The invocation never leaves this process. `extension_actions::invoke` dispatches
+        // it over the IN-PROCESS callback (`ctx.callback().http_client()`, the emulator's
+        // connector bridge — see that module's `callback_client!`), so the destination is
+        // whichever emulated service owns the target's ARN, not a host on the network: a
+        // target's `Uri` is an ARN for one of four AWS services, read through
+        // `service_common::arn`, and anything else is refused as `InvalidActionUri` without
+        // a call being made. No socket is opened and no caller-supplied address is dialled.
         let mut replaced: Option<Vec<u8>> = None;
         for target in &targets {
             match crate::state::extension_actions::invoke(

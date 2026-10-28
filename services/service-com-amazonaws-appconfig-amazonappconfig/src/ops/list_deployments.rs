@@ -204,20 +204,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        let Some(page) = crate::state::paginate(
+        // The shared cursor, which words a token it will not resume itself, so every
+        // listing of this service states that refusal identically.
+        let page = match crate::state::paginate(
             ordered,
             crate::state::LISTING_DEPLOYMENTS,
             input.next_token.as_deref(),
             input.max_results,
-        ) else {
-            return Err(ListDeploymentsErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::next_token_not_issued()),
-                    reason: None,
-                    details: None,
-                },
-            )
-            .into());
+        ) {
+            Ok(page) => page,
+            Err(message) => {
+                return Err(ListDeploymentsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                        reason: None,
+                        details: None,
+                    },
+                )
+                .into())
+            }
         };
 
         Ok(ListDeploymentsOutput {

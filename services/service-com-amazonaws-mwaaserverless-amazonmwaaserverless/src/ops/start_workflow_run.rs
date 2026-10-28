@@ -258,48 +258,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A repeated @idempotencyToken replays the run it already started. Checked
         // before the version lookup, so a replay answers from the recorded run even
-        // when the version that request named has since been deleted. The token is
-        // remembered per region, because a token presented at one regional endpoint
-        // says nothing about what another endpoint started.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(recorded) = store.idempotency.get(&token_key(&region, token)).cloned() {
-                if recorded.request_fingerprint() != fingerprint {
-                    return Err(StartWorkflowRunErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "ClientToken {token} was already used for a StartWorkflowRun \
-                                 request with different parameters"
-                            ),
-                            resource_id: recorded.workflow_arn().to_string(),
-                            resource_type: "workflow-run".to_string(),
-                        },
-                    )
-                    .into());
-                }
-                let crate::state::IdempotentResult::StartWorkflowRun {
-                    workflow_arn,
-                    run_id,
-                    ..
-                } = &recorded
-                else {
-                    return Err(unavailable());
-                };
-                let run = store
-                    .workflow_in_mut(&region, workflow_arn)
-                    .and_then(|workflow| workflow.runs.get_mut(run_id))
-                    .ok_or_else(unavailable)?;
+        // when the version that request named has since been deleted. The lookup, the
+        // fingerprint comparison and the conflict a mismatch answers with are the
+        // shared rule (`crate::state::TokenLedger`), reached with this operation's
+        // name and the resource type its refusal reports, so the token is remembered
+        // per operation and per region: a token presented at one regional endpoint says
+        // nothing about what another endpoint started.
+        let tokens = crate::state::TokenLedger::of(Self::NAME, "workflow-run", &region);
+        let replayed = tokens
+            .replay(
+                &store.idempotency,
+                input.client_token.as_deref(),
+                &fingerprint,
+            )
+            .map_err(StartWorkflowRunErrorModeled::ConflictException)?;
+        if let Some(recorded) = replayed {
+            let crate::state::IdempotentResult::StartWorkflowRun {
+                workflow_arn,
+                run_id,
+                ..
+            } = &recorded
+            else {
+                return Err(unavailable());
+            };
+            let run = store
+                .workflow_in_mut(&region, workflow_arn)
+                .and_then(|workflow| workflow.runs.get_mut(run_id))
+                .ok_or_else(unavailable)?;
 
-                // A replay REPORTS the run this token already started, so it reports
-                // it the way every other reader of a run does: the ONE write a report
-                // may make, every status change the clock already owed
-                // (`crate::state::WorkflowRun::settle`), applied before the answer is
-                // built. Without it this call would answer the status the run held
-                // when it was admitted while `GetWorkflowRun` on the same record
-                // answers the one it has since been owed.
-                run.settle(now);
+            // A replay REPORTS the run this token already started, so it reports it the
+            // way every other reader of a run does: the ONE write a report may make,
+            // every status change the clock already owed
+            // (`crate::state::WorkflowRun::settle`), applied before the answer is
+            // built. Without it this call would answer the status the run held when it
+            // was admitted while `GetWorkflowRun` on the same record answers the one it
+            // has since been owed.
+            run.settle(now);
 
-                return Ok(response_for(run));
-            }
+            return Ok(response_for(run));
         }
 
         // Run the requested version, defaulting to the workflow's latest. A workflow
@@ -388,16 +384,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(unavailable)?;
         workflow.runs.insert(run_id.clone(), run);
 
-        if let Some(token) = input.client_token.as_deref() {
-            store.idempotency.record(
-                token_key(&region, token),
-                crate::state::IdempotentResult::StartWorkflowRun {
-                    request_fingerprint: fingerprint,
-                    workflow_arn: input.workflow_arn.clone(),
-                    run_id: run_id.clone(),
-                },
-            );
-        }
+        // The other half of the shared rule: the run this call started, remembered
+        // under the same key the replay above reads.
+        tokens.record(
+            &mut store.idempotency,
+            input.client_token.as_deref(),
+            crate::state::IdempotentResult::StartWorkflowRun {
+                request_fingerprint: fingerprint,
+                workflow_arn: input.workflow_arn.clone(),
+                run_id: run_id.clone(),
+            },
+        );
 
         // Answer from the stored run, never from the values just computed.
         let stored = store
@@ -406,13 +403,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(unavailable)?;
         Ok(response_for(stored))
     }
-}
-
-/// The idempotency-ledger key for a `ClientToken` of THIS operation at THIS region's
-/// endpoint, so one token used at two different regional endpoints records two
-/// entries.
-fn token_key(region: &str, client_token: &str) -> String {
-    format!("StartWorkflowRun:{region}:{client_token}")
 }
 
 /// Check every `StartWorkflowRun` input member whose modelled constraint this
