@@ -320,6 +320,17 @@ impl Session {
                 .all(|op| is_terminal_status(op.status))
     }
 
+    /// Whether this session's training queue is waiting on an operation nobody has
+    /// submitted: the slot it would execute next holds nothing, while later slots do.
+    ///
+    /// Such a session executes nothing until a caller supplies the missing sequence
+    /// number, so no instant the clock reaches settles it — which is what makes it the
+    /// session to release when the store is full and nothing has settled.
+    pub fn is_blocked_on_a_missing_operation(&self) -> bool {
+        !self.sequence_index.is_empty()
+            && !self.sequence_index.contains_key(&self.next_sequence_number)
+    }
+
     /// Materialise every status transition the clock has already made due at `now`.
     ///
     /// A reporting operation calls this before it answers: each change was owed at the
@@ -557,20 +568,40 @@ impl ComAmazonawsSagemakertrainingsessionruntimeLegorouterserviceState {
     /// runtime record into existence.
     ///
     /// Answers `None` when the store holds [`MAX_SESSIONS`] and none of them can be
-    /// released: only a session whose every operation has reached a terminal status is
-    /// released, so an operation a caller is still polling never vanishes into a 404
-    /// that cannot be told from "never existed".
+    /// released: a session is released only once nothing in it is still owed, so an
+    /// operation a caller is still polling never vanishes into a 404 that cannot be told
+    /// from "never existed".
+    ///
+    /// The oldest SETTLED session goes first, and each session is brought up to the
+    /// instant the clock has already reached before that is decided — an operation the
+    /// clock finished settles the session that holds it whether or not anybody polled it,
+    /// so eviction does not depend on who read what. Where nothing has settled, the
+    /// oldest session whose queue is waiting on an operation nobody submitted goes
+    /// instead: it executes nothing until a caller supplies that sequence number, so
+    /// keeping it would refuse every new session for as long as the caller never does.
+    /// Every session that survives both passes has an operation the clock is going to
+    /// settle, so the refusal below is one a retry gets past.
     pub fn session_for_submit(&mut self, name: &str, now: SystemTime) -> Option<&mut Session> {
         if !self.sessions.contains_key(name) {
             while self.sessions.len() >= MAX_SESSIONS {
+                for session in self.sessions.values_mut() {
+                    session.advance(now);
+                }
                 let releasable = self
                     .sessions
                     .iter()
                     .filter(|(_, session)| session.is_settled())
                     .min_by_key(|(key, session)| (session.created_at, (*key).clone()))
-                    .map(|(key, _)| key.clone());
-                // Every session still has an operation in flight; the submit is
-                // refused rather than one of them being thrown away.
+                    .map(|(key, _)| key.clone())
+                    .or_else(|| {
+                        self.sessions
+                            .iter()
+                            .filter(|(_, session)| session.is_blocked_on_a_missing_operation())
+                            .min_by_key(|(key, session)| (session.created_at, (*key).clone()))
+                            .map(|(key, _)| key.clone())
+                    });
+                // Every session still has an operation the clock has yet to settle; the
+                // submit is refused rather than one of them being thrown away.
                 let key = releasable?;
                 self.sessions.remove(&key);
             }

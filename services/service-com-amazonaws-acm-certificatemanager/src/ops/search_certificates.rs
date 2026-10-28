@@ -181,7 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Authorization comes FIRST: AWS decides it at the IAM layer, ahead of the
+        // service looking at anything, so a caller whose identity-based policies do not
+        // allow the action is refused without being told what this account holds. The
+        // request names no resource of its own, so what IAM evaluates is the collection
+        // this search reaches — every certificate of this account in the Region the
+        // caller signed for ([`crate::service::authorization::collection_arn`]).
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::service::authorization::collection_arn(
+                ctx,
+                crate::state::CERTIFICATE_RESOURCE_TYPE,
+            ),
+        )
+        .map_err(SearchCertificatesErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(validation_exception("the acm certificate store is unavailable"));
         };
