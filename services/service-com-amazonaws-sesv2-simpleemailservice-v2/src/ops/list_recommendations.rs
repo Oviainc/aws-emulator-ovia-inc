@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRecommendations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRecommendations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRecommendations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +145,285 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRecommendations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRecommendationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRecommendations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to read. That is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListRecommendations without the shared emulator state",
+            ));
+        };
+
+        // "Lists the recommendations present in your Amazon SES account in the current
+        // Amazon Web Services Region": the account is the one this request is
+        // authenticated for and the Region the one its own credential scope names.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+
+        // Every member of the request is read before anything is resolved against the
+        // account's records: a filter this operation cannot read, a page size outside
+        // the documented range and a token this listing never handed out are the
+        // caller's mistake whatever the account holds.
+        let filter = RecommendationFilter::from_request(input.filter.unwrap_or_default())?;
+
+        // "The value you specify has to be at least 1, and can be no more than 100."
+        // A value that is not a count of items at all — a negative one — is outside that
+        // range too, and is refused by the same leg rather than read as no limit.
+        let page_size = match input.page_size {
+            None => None,
+            Some(size) => match usize::try_from(size) {
+                Ok(size) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) => Some(size),
+                _ => {
+                    return Err(bad_request(format!(
+                        "PageSize {size} is outside the supported range of {MIN_PAGE_SIZE} to \
+                         {MAX_PAGE_SIZE}."
+                    )))
+                }
+            },
+        };
+
+        // The token is this operation's own: it names the last recommendation the
+        // previous page returned, so the next page resumes strictly after it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::RECOMMENDATIONS_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
+            ),
+        };
+
+        let mut store = state.lock();
+        // A listing reports where each finding stands, and a search the clock already
+        // owed — the one that settles a domain's DKIM or MAIL FROM setup — is part of
+        // what it reports.
+        store.settle(::std::time::SystemTime::now());
+
+        // Every recommendation this call reaches, ordered, then narrowed by the filter
+        // the request carried: the two together decide the sequence a page is a window
+        // over, so a token is a position in the NARROWED listing.
+        let matching: Vec<Recommendation> = store
+            .recommendations(&scope)
+            .into_iter()
+            .filter(|recommendation| filter.matches(recommendation, &scope))
+            .collect();
+        drop(store);
+
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => matching.partition_point(|recommendation| {
+                crate::state::recommendation_key(recommendation).as_str() <= last
+            }),
+        };
+        let remaining = &matching[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+        // "A string token indicating that there might be additional recommendations
+        // available to be listed": one only when recommendations remain behind this
+        // page, so a walk of the listing terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| {
+                page.last().map(|recommendation| {
+                    crate::state::encode_tagged_page_token(
+                        crate::state::RECOMMENDATIONS_PAGE_TOKEN_TAG,
+                        &crate::state::recommendation_key(recommendation),
+                    )
+                })
+            })
+            .flatten();
+
+        Ok(ListRecommendationsOutput {
+            recommendations: Some(page.to_vec()),
+            next_token,
+        })
     }
 }
+
+/// The smallest `PageSize` this operation accepts: "the value you specify has to be at
+/// least 1, and can be no more than 100" — the model binds no range on `MaxItems`, so
+/// the documented one is enforced here.
+const MIN_PAGE_SIZE: usize = 1;
+
+/// The largest `PageSize` this operation accepts; see [`MIN_PAGE_SIZE`].
+const MAX_PAGE_SIZE: usize = 100;
+
+/// `ListRecommendationsFilterKey$TYPE`: filter by the type of finding.
+const TYPE: &str = "TYPE";
+
+/// `ListRecommendationsFilterKey$IMPACT`: filter by the finding's impact.
+const IMPACT: &str = "IMPACT";
+
+/// `ListRecommendationsFilterKey$STATUS`: filter by whether the finding is still open.
+const STATUS: &str = "STATUS";
+
+/// `ListRecommendationsFilterKey$RESOURCE_ARN`: filter by the resource a finding is
+/// about.
+const RESOURCE_ARN: &str = "RESOURCE_ARN";
+
+/// The `ListRecommendationsFilter` a request carried, resolved to the recommendation
+/// members it constrains.
+///
+/// `ListRecommendationsFilterKey` names four keys and each constrains ONE member of a
+/// listed recommendation: `TYPE` its type, `IMPACT` its impact, `STATUS` its status and
+/// `RESOURCE_ARN` the resource it is about. A filter naming two keys keeps only the
+/// recommendations that satisfy both.
+///
+/// Every key NARROWS the account's listing and none of them looks a resource up, so a
+/// key whose value names nothing the account holds — a resource ARN it never created, a
+/// type or an impact no finding of its own carries — keeps no recommendation and leaves
+/// the listing empty, rather than being refused.
+#[derive(Debug, Default)]
+struct RecommendationFilter {
+    /// `TYPE`, a `RecommendationType`.
+    recommendation_type: Option<String>,
+    /// `IMPACT`, a `RecommendationImpact`.
+    impact: Option<String>,
+    /// `STATUS`, a `RecommendationStatus`.
+    status: Option<String>,
+    /// `RESOURCE_ARN`, the ARN of one resource of this service.
+    resource_arn: Option<String>,
+}
+
+impl RecommendationFilter {
+    /// Read the filter map, refusing a key the enum does not name and a value outside
+    /// the value set the key it arrived under filters on.
+    ///
+    /// The filter arrives as a map of plain strings, so each is the handler's to check:
+    /// the modelled constraints a boundary validator can enforce are already enforced
+    /// by the time this runs, and neither an enum member nor a well-formed ARN is one of
+    /// them. The entries are read in key order, so a refusal reads the same for the same
+    /// request however the request's map happened to be ordered.
+    fn from_request(
+        filter: ::std::collections::HashMap<String, String>,
+    ) -> Result<Self, ListRecommendationsError> {
+        let entries: ::std::collections::BTreeMap<String, String> = filter.into_iter().collect();
+        let mut resolved = Self::default();
+        for (key, value) in &entries {
+            match key.as_str() {
+                TYPE => {
+                    resolved.recommendation_type =
+                        Some(filter_value(TYPE, value, RECOMMENDATION_TYPE_VALUES)?);
+                }
+                IMPACT => {
+                    resolved.impact =
+                        Some(filter_value(IMPACT, value, RECOMMENDATION_IMPACT_VALUES)?);
+                }
+                STATUS => {
+                    resolved.status =
+                        Some(filter_value(STATUS, value, RECOMMENDATION_STATUS_VALUES)?);
+                }
+                RESOURCE_ARN => {
+                    // The value has to address a resource of this service before
+                    // anything can be narrowed to it: a value of another vendor, or one
+                    // naming no resource within this service's namespace, is a filter
+                    // this operation cannot read rather than one that narrows the
+                    // listing to nothing.
+                    if crate::state::ses_resource_of(value).is_none() {
+                        return Err(bad_request(INVALID_FILTER_RESOURCE));
+                    }
+                    resolved.resource_arn = Some(value.clone());
+                }
+                // The keys are a modelled enum, so a key outside the value set is
+                // refused at the request boundary before this runs; the branch is named
+                // anyway, so a key added to the enum without a branch of its own is
+                // refused rather than silently ignored.
+                key => return Err(invalid_filter_value(key)),
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Whether `recommendation` satisfies every key this filter named, for a call the
+    /// scope `scope` describes.
+    fn matches(
+        &self,
+        recommendation: &Recommendation,
+        scope: &crate::state::CallerScope,
+    ) -> bool {
+        let member_is = |member: &Option<String>, wanted: &Option<String>| match wanted {
+            None => true,
+            Some(wanted) => member.as_deref() == Some(wanted.as_str()),
+        };
+        member_is(&recommendation.r#type, &self.recommendation_type)
+            && member_is(&recommendation.impact, &self.impact)
+            && member_is(&recommendation.status, &self.status)
+            && self.resource_arn.as_deref().is_none_or(|wanted| {
+                // The ARN has to name a resource THIS call can reach before it can name
+                // one of the listing's: an ARN of another account or another Region
+                // reaches nothing here, whatever it names elsewhere — the same check
+                // every operation of this service makes on a caller-supplied ARN.
+                scope.covers_resource(wanted)
+                    && recommendation
+                        .resource_arn
+                        .as_deref()
+                        .is_some_and(|about| same_resource(about, wanted))
+            })
+    }
+}
+
+/// Whether the ARN a listed recommendation carries and the one a `RESOURCE_ARN` filter
+/// named address the same resource of this service.
+///
+/// The account and Region a filter's ARN carries are checked by the caller scope before
+/// this runs, so what is left to compare is which resource each names: a recommendation
+/// is about an email identity, whose ARN carries the identity's own name, and a domain
+/// name is compared the way DNS compares one — which makes a filter spelling a domain in
+/// another case name the same resource the rest of the API does. An ARN naming another
+/// kind of resource of this service carries another resource type, so it matches no
+/// recommendation.
+fn same_resource(about: &str, wanted: &str) -> bool {
+    match (
+        crate::state::ses_resource_of(about),
+        crate::state::ses_resource_of(wanted),
+    ) {
+        (Some((about_type, about_id)), Some((wanted_type, wanted_id))) => {
+            about_type == wanted_type
+                && crate::state::identity_key(about_id) == crate::state::identity_key(wanted_id)
+        }
+        _ => false,
+    }
+}
+
+/// `value` when the key it arrived under accepts it, and the refusal naming `key`
+/// otherwise.
+fn filter_value(
+    key: &str,
+    value: &str,
+    allowed: &[&str],
+) -> Result<String, ListRecommendationsError> {
+    if allowed.contains(&value) {
+        return Ok(value.to_string());
+    }
+    Err(invalid_filter_value(key))
+}
+
+/// How SES words `BadRequestException` for a filter value outside the value set the key
+/// it arrived under filters on.
+///
+/// Fixed text naming the KEY, with the offending value withheld, which is how SES states
+/// this refusal: a `TYPE` outside `RecommendationType` is answered `Invalid
+/// recommendation TYPE specified`. One wording for every key whose values are a modelled
+/// value set, so the refusal does not depend on which of them the request named.
+fn invalid_filter_value(key: &str) -> ListRecommendationsError {
+    bad_request(format!("Invalid recommendation {key} specified"))
+}
+
+/// How SES words `BadRequestException` for a `RESOURCE_ARN` filter value that addresses
+/// no resource of this service.
+///
+/// Also fixed text with the value withheld, but about the FILTER rather than about a
+/// value set: the value had to be a resource ARN, which is not a set of values SES could
+/// name in the refusal.
+const INVALID_FILTER_RESOURCE: &str = "Filter resource is invalid";
+
+/// Refuse the request with the error the model binds for invalid input.
+fn bad_request(message: impl Into<String>) -> ListRecommendationsError {
+    ListRecommendationsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+

@@ -45,3 +45,5 @@ mod security_configs;
 mod security_policy_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vpc_endpoint.rs"]
+mod vpc_endpoint;
