@@ -353,9 +353,9 @@ async fn cancelling_a_running_task_stops_what_it_had_not_moved_and_keeps_what_it
                 entry["ApproximateNumberOfMessagesMoved"].as_i64(),
                 entry["ApproximateNumberOfMessagesToMove"].as_i64()
             ),
-            (Some(moved), Some(stopped)),
-            "case {case}: expected the cancelled task's progress to stay at {moved} of \
-             {held_count}, got {entry}"
+            (Some(moved), Some(held_count)),
+            "case {case}: expected the cancelled task's progress to stay at {moved} of the \
+             {held_count} messages it was started over, got {entry}"
         );
         assert_eq!(
             count(&router, &destination_url, "ApproximateNumberOfMessages").await,

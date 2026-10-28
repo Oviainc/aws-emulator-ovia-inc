@@ -15,6 +15,8 @@
 mod batch_entry_faults;
 #[path = "all/cancel_message_move_task.rs"]
 mod cancel_message_move_task;
+#[path = "all/dead_letter_redrive.rs"]
+mod dead_letter_redrive;
 #[path = "all/delete_message_batch.rs"]
 mod delete_message_batch;
 #[path = "all/fifo_queue.rs"]
