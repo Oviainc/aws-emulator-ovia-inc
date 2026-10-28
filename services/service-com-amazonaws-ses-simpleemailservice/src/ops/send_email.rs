@@ -173,8 +173,10 @@ impl From<SendEmailErrorModeled> for SendEmailError {
 
 /// The number of recipients one message may address, from this operation's own
 /// documentation: "The message may not include more than 50 recipients, across
-/// the To:, CC: and BCC: fields."
-const MAX_RECIPIENTS: usize = 50;
+/// the To:, CC: and BCC: fields." The same ceiling every send of this service
+/// documents, so the number itself lives in one place
+/// ([`crate::state::MAX_RECIPIENTS`]).
+const MAX_RECIPIENTS: usize = crate::state::MAX_RECIPIENTS;
 
 /// Every recipient of a destination, To: then CC: then BCC:, in request order.
 ///

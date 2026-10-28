@@ -186,9 +186,18 @@ async fn every_configuration_form_round_trips_through_get_metric_stream() {
         }
         assert_eq!(
             got.get("IncludeLinkedAccountsMetrics").and_then(Value::as_bool),
-            request
-                .get("IncludeLinkedAccountsMetrics")
-                .and_then(Value::as_bool),
+            // "If you are creating a metric stream in a monitoring account, specify true to
+            // include metrics from source accounts in the metric stream."
+            // (`PutMetricStreamInput$IncludeLinkedAccountsMetrics`) — a configuration that
+            // does not ask for source-account metrics streams none, so the omitted form reads
+            // back as that setting rather than as nothing
+            // (`crate::metric_stream_scope` tables the rule).
+            Some(
+                request
+                    .get("IncludeLinkedAccountsMetrics")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            ),
             "case {case:?}: IncludeLinkedAccountsMetrics must round-trip, got {got}"
         );
         let created = stamp(&got, "CreationDate");
