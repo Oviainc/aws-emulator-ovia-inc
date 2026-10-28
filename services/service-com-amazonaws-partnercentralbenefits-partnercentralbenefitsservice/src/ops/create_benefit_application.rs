@@ -221,22 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every string pattern and length on this input, and the length of every list it
         // carries, is a modelled constraint the centralized walk has already enforced.
-        // `BenefitApplicationDetails` is an unconstrained `Document`, so its one bound
-        // lives here.
-        if let Some(why) = crate::state::details_rejection(input.benefit_application_details.as_ref())
-        {
-            return Err(CreateBenefitApplicationErrorModeled::ValidationException(
-                ValidationException {
-                    message: why.clone(),
-                    reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
-                    field_list: Some(crate::state::validation_field(
-                        "BenefitApplicationDetails",
-                        &why,
-                        crate::state::VALIDATION_CODE_INVALID_VALUE,
-                    )),
-                },
-            )
-            .into());
+        // `BenefitApplicationDetails` is an unconstrained `Document`, so its bounds live
+        // here — refused in the same envelope the walk's own refusals carry, see
+        // [`crate::state::details_refusal`].
+        if let Some(refusal) = crate::state::details_refusal(
+            crate::state::DETAILS_MEMBER,
+            input.benefit_application_details.as_ref(),
+        ) {
+            return Err(
+                CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),
+            );
         }
 
         // A create carrying its own `Tags` supplies tag keys exactly as `TagResource` does,

@@ -2214,6 +2214,30 @@ pub const DELIVERY_NOT_FOUND_MESSAGE: &str = "Requested Delivery does not exist 
 pub const DELIVERY_SOURCE_NOT_FOUND_MESSAGE: &str =
     "Requested Delivery Source does not exist in this account.";
 
+/// The refusal CloudWatch Logs answers the delete of a delivery-pipeline resource with while a
+/// delivery still references it — "You can't delete a delivery destination if any current
+/// deliveries are associated with it", and the same for a delivery source.
+///
+/// The sentence is FIXED for that error class apart from the KIND of resource the delete
+/// addresses, exactly as [`resource_not_found_message`] is: it interpolates neither the
+/// resource's name nor the id of any delivery, and it directs the caller to enumerate the
+/// deliveries itself (`DescribeDeliveries`, which the operation's documentation points at)
+/// because ANY number of deliveries can reference the resource — a wording that named one of
+/// them would promise a caller that deleting that one unblocks the delete.
+pub fn delivery_resource_in_use_message(resource_kind: &str) -> String {
+    format!(
+        "Could not delete this {resource_kind} as it is currently in use. Please delete any \
+         Deliveries that reference this resource and try again."
+    )
+}
+
+/// The resource kind [`delivery_resource_in_use_message`] names for a delivery destination,
+/// spelled the way this service's prose spells the resource.
+pub const DELIVERY_DESTINATION_RESOURCE_KIND: &str = "Delivery Destination";
+
+/// The resource kind [`delivery_resource_in_use_message`] names for a delivery source.
+pub const DELIVERY_SOURCE_RESOURCE_KIND: &str = "Delivery Source";
+
 /// The ARN service namespace of each vendor a delivery destination can be, paired with the
 /// `DeliveryDestinationType` the model spells it as.
 ///

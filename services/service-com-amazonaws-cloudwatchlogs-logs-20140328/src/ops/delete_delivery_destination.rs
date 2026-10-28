@@ -202,18 +202,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // "You can't delete a delivery destination if any current deliveries are associated
         // with it": a delivery names its destination by ARN, so the deliveries the store
-        // holds are what answers that.
-        if let Some(delivery) = store
+        // holds are what answers that. The refusal is the error class's fixed in-use text,
+        // which names no delivery — the documentation points the caller at DescribeDeliveries
+        // to find every delivery that references this destination.
+        if store
             .deliveries
             .values()
-            .find(|delivery| delivery.delivery_destination_arn == arn)
+            .any(|delivery| delivery.delivery_destination_arn == arn)
         {
             return Err(
                 DeleteDeliveryDestinationErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "The delivery destination {} cannot be deleted while delivery {} is \
-                         associated with it.",
-                        input.name, delivery.id
+                    message: Some(crate::state::delivery_resource_in_use_message(
+                        crate::state::DELIVERY_DESTINATION_RESOURCE_KIND,
                     )),
                 })
                 .into(),
