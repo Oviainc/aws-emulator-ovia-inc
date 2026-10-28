@@ -244,6 +244,7 @@ use crate::ops::types::{
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties, TargetTableConfig,
+    TriggerUpdate,
     UpdateClassifierInput, UpdateCrawlerInput, UpdateMLTransformInput, Workflow, WorkflowGraph,
     WorkflowRun,
     WorkflowRunStatistics, XMLClassifier,
@@ -3694,6 +3695,24 @@ impl TriggerEntry {
         }
     }
 
+    /// Replace the stored DEFINITION with the one a `TriggerUpdate` carries: "this object
+    /// updates the previous trigger definition by overwriting it completely"
+    /// (`TriggerUpdate`), so a member the update omits is left with no value rather than
+    /// with the one the previous definition had.
+    ///
+    /// Only the five definition members `TriggerUpdate` declares are touched. The record's
+    /// identity and the members the shape carries no value for — [`Self::name`],
+    /// [`Self::trigger_type`], [`Self::state`], [`Self::workflow_name`] and [`Self::tags`]
+    /// — are left as they are; `TriggerUpdate$Name` is "Reserved for future use", so it
+    /// renames nothing.
+    pub fn apply_update(&mut self, update: &TriggerUpdate) {
+        self.description = update.description.clone();
+        self.schedule = update.schedule.clone();
+        self.actions = update.actions.clone().unwrap_or_default();
+        self.predicate = update.predicate.clone();
+        self.event_batching_condition = update.event_batching_condition.clone();
+    }
+
     /// Rebuild the modelled `Trigger` output shape from what is stored.
     pub fn to_trigger(&self) -> Trigger {
         Trigger {
@@ -3726,6 +3745,79 @@ pub enum TriggerReference<'a> {
     Crawler(&'a str),
     /// `CreateTriggerRequest$WorkflowName`.
     Workflow(&'a str),
+}
+
+impl TriggerReference<'_> {
+    /// How a trigger write refuses the definition that names this missing entity: the
+    /// wording the lookup of THAT kind of entity answers with wherever it is made, so a
+    /// create and an update report one missing job, crawler or workflow alike.
+    pub fn refusal_message(&self) -> String {
+        match self {
+            // The job-definition miss is the same fixed sentence wherever a job is looked
+            // up, so a trigger that would run a job nothing holds is refused with it too,
+            // and discloses no name.
+            Self::Job(_) => messages::JOB_NOT_FOUND.to_string(),
+            Self::Crawler(name) => messages::crawler_not_found(name),
+            Self::Workflow(name) => messages::workflow_not_found(name),
+        }
+    }
+}
+
+/// The first rule the trigger DEFINITION `trigger_type`/`schedule`/`actions`/`predicate`
+/// breaks, worded as the refusal to answer with, or `None` when the definition is one the
+/// service could fire.
+///
+/// One copy of the rule, for every write that leaves a definition behind: `CreateTrigger`
+/// stores the definition its request carries and `UpdateTrigger` overwrites a stored one
+/// with the definition its `TriggerUpdate` carries, and both have to end up with a trigger
+/// that knows what to initiate and when. Every rule here is a modelled requirement:
+/// "the actions initiated by this trigger" (`Trigger$Actions`), "this field is required
+/// when the trigger type is SCHEDULED" (`Schedule`) and "...is CONDITIONAL" (`Predicate`),
+/// "an optional field if only one condition is listed. If multiple conditions are listed,
+/// then this field is required" (`Predicate$Logical`), and "a `cron` expression used to
+/// specify the schedule" (`Schedule`).
+///
+/// The caller lifts the sentence into its OWN modelled input error, which is the only part
+/// of the refusal that differs between the operations.
+pub fn trigger_definition_refusal(
+    trigger_type: &str,
+    schedule: Option<&str>,
+    actions: &[Action],
+    predicate: Option<&Predicate>,
+) -> Option<String> {
+    // A trigger that names no action initiates nothing when it fires, so a definition
+    // without one is refused rather than stored.
+    if actions.is_empty() {
+        return Some(messages::TRIGGER_ACTIONS_REQUIRED.to_string());
+    }
+
+    // Without the member its type requires, the service would hold a trigger with nothing
+    // to decide when it fires.
+    if trigger_type == TRIGGER_TYPE_SCHEDULED && schedule.is_none() {
+        return Some(messages::trigger_member_required("Schedule", trigger_type));
+    }
+    let conditions = predicate
+        .and_then(|predicate| predicate.conditions.as_ref())
+        .map_or(0, Vec::len);
+    if trigger_type == TRIGGER_TYPE_CONDITIONAL && conditions == 0 {
+        return Some(messages::trigger_member_required("Predicate", trigger_type));
+    }
+
+    // Without a `Logical`, a multi-condition predicate does not say whether all or any of
+    // its conditions must hold.
+    if conditions > 1 && predicate.is_none_or(|predicate| predicate.logical.is_none()) {
+        return Some(messages::predicate_logical_required(conditions));
+    }
+
+    // Anything but a `cron(<six fields>)` expression is not a schedule this service can
+    // run, so it is refused rather than stored and reported back.
+    if let Some(schedule) = schedule {
+        if !is_cron_expression(schedule) {
+            return Some(messages::schedule_not_a_cron_expression(schedule));
+        }
+    }
+
+    None
 }
 
 /// The first workflow, job or crawler a trigger's definition names that this store holds
@@ -7566,11 +7658,13 @@ pub mod messages {
     /// the requested name.
     pub const TRIGGER_ALREADY_EXISTS: &str = "Trigger already exists.";
 
-    /// A trigger create whose `Actions` list is empty. NOT recorded: what is pinned is the
-    /// behaviour — 400 with the operation's modelled `InvalidInputException` — and the
-    /// sentence names the member that has to name something, the way the crawler create's
-    /// own at-least-one refusal does.
-    pub const TRIGGER_ACTIONS_REQUIRED: &str = "Actions must specify at least one action.";
+    /// A trigger definition whose `Actions` list is absent or empty, on the create that
+    /// would store it or the update that would overwrite one with it. RECORDED wording,
+    /// with no trailing period: the refusal names the member that has to name something and
+    /// says that neither no list nor an empty one will do, and it discloses neither the
+    /// trigger nor the operation, so one constant serves every definition this service
+    /// judges.
+    pub const TRIGGER_ACTIONS_REQUIRED: &str = "Actions cannot be null or empty";
 
     /// A trigger create missing the member its `Type` requires: `Schedule` for a scheduled
     /// trigger ("This field is required when the trigger type is SCHEDULED" —
