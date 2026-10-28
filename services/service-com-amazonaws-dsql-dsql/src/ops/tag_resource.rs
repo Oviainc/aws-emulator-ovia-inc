@@ -253,17 +253,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let merged = held.len() + added;
         if merged > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
+                identity.quota_exceeded(
+                    format!(
                         "The request would leave the resource with {merged} tags, which exceeds \
                          the maximum of {} tags per resource.",
                         crate::state::MAX_TAGS_PER_RESOURCE
                     ),
-                    resource_id: identity.resource_id.clone(),
-                    resource_type: identity.resource_type.clone(),
-                    service_code: crate::state::ARN_SERVICE.to_string(),
-                    quota_code: "tags-per-resource".to_string(),
-                },
+                    QUOTA_CODE_TAGS_PER_RESOURCE,
+                ),
             )
             .into());
         }
@@ -277,6 +274,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(TagResourceOutput)
     }
 }
+
+/// The `quotaCode` the refusal at a resource's tag ceiling carries: the quota
+/// bounds how many tags ONE resource holds.
+const QUOTA_CODE_TAGS_PER_RESOURCE: &str = "tags-per-resource";
 
 /// The modelled server fault for a store this handler cannot reach, worded as the
 /// cluster handlers word it.
