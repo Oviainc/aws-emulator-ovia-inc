@@ -176,19 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `DestinationArn` is modelled `length 0..2048`, so an empty ARN can reach here;
-        // it names no experiment, so it is the same input as an absent one and must not
-        // become a second destination.
-        let destination_arn = input
-            .destination_arn
-            .as_deref()
-            .map(str::trim)
-            .filter(|arn| !arn.is_empty());
-        let iam_role_arn = input
-            .iam_role_arn
-            .as_deref()
-            .map(str::trim)
-            .filter(|arn| !arn.is_empty());
+        // An ARN this request declares is read through the one rule the destinations map
+        // is keyed by ([`crate::state::declared_arn`]), so the destination this put
+        // addresses is the one every other metrics call addresses.
+        let destination_arn = crate::state::declared_arn(input.destination_arn.as_deref());
+        let iam_role_arn = crate::state::declared_arn(input.iam_role_arn.as_deref());
 
         // The modelled constraints (the app monitor name's pattern and length, both
         // ARNs' `arn:...` pattern, the ARN's length) are refused before this handler

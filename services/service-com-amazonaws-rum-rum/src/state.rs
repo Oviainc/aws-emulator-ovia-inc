@@ -421,16 +421,39 @@ pub struct StoredRumEvent {
 /// optional `DestinationArn` — so it is the key the destinations map is held under.
 pub type MetricDestinationKey = (String, String);
 
+/// The ARN a request declares, with an absent, empty or whitespace-only value all read
+/// as "no ARN".
+///
+/// ONE reading of the optional ARN members of the metrics calls of this service — the
+/// `DestinationArn` of `PutRumMetricsDestination`, `DeleteRumMetricsDestination`,
+/// `BatchCreateRumMetricDefinitions`, `BatchDeleteRumMetricDefinitions`,
+/// `BatchGetRumMetricDefinitions` and `UpdateRumMetricDefinition`, and the `IamRoleArn`
+/// the put writes through — placed beside [`metric_destination_key`], the map key this
+/// reading decides, so the put and the delete, or the batch create and the batch read,
+/// cannot drift on which stored destination a request addresses.
+///
+/// Surrounding whitespace is not part of an ARN: `DestinationArn` is modelled
+/// `@length(min: 0, max: 2048)` with a pattern Smithy matches ANYWHERE in the value, and
+/// `IamRoleArn` carries no length bound at all, so a value with whitespace around the ARN
+/// reaches a handler. Whatever spelling arrives, the ARN is what is left once that
+/// whitespace is gone, and a value with nothing left names no experiment and no role: it
+/// is the same input as an absent one, and must not become a second destination.
+pub fn declared_arn(arn: Option<&str>) -> Option<&str> {
+    arn.map(str::trim).filter(|arn| !arn.is_empty())
+}
+
 /// The [`MetricDestinationKey`] for `destination` and `destination_arn`, with an absent
 /// or empty ARN normalised to the same key, so one destination cannot be stored twice
-/// under two spellings of "no ARN".
+/// under two spellings of "no ARN" — the ARN is read through [`declared_arn`], the one
+/// reading every caller of this key already applies, which is idempotent, so a key is the
+/// same whether the caller normalised the ARN first or not.
 pub fn metric_destination_key(
     destination: &str,
     destination_arn: Option<&str>,
 ) -> MetricDestinationKey {
     (
         destination.to_string(),
-        destination_arn.unwrap_or_default().to_string(),
+        declared_arn(destination_arn).unwrap_or_default().to_string(),
     )
 }
 

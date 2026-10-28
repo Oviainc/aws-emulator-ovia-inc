@@ -169,14 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `DestinationArn` is modelled `length 0..2048`, so an empty ARN can reach here;
-        // it names no experiment, so it is the same input as an absent one and addresses
-        // the destination that has no ARN.
-        let destination_arn = input
-            .destination_arn
-            .as_deref()
-            .map(str::trim)
-            .filter(|arn| !arn.is_empty());
+        // The ARN is read through the one rule the destinations map is keyed by
+        // ([`crate::state::declared_arn`]), so this call addresses the destination the put
+        // stored.
+        let destination_arn = crate::state::declared_arn(input.destination_arn.as_deref());
 
         // The prose-only pairing every metrics call of this service shares: an Evidently
         // destination is identified by an experiment ARN and a CloudWatch one carries

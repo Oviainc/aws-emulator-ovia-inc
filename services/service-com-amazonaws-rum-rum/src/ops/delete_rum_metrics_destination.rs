@@ -162,14 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `DestinationArn` is modelled `length 0..2048`, so an empty ARN can reach here;
-        // it names no experiment, so it is the same input as an absent one — exactly as
-        // the put reads it, which is what keeps the two addressing one destination.
-        let destination_arn = input
-            .destination_arn
-            .as_deref()
-            .map(str::trim)
-            .filter(|arn| !arn.is_empty());
+        // The ARN is read through the one rule the destinations map is keyed by
+        // ([`crate::state::declared_arn`]) — exactly as the put reads it, which is what
+        // keeps the two addressing one destination.
+        let destination_arn = crate::state::declared_arn(input.destination_arn.as_deref());
 
         // The one pairing rule the model states in prose only:
         // `DeleteRumMetricsDestinationRequest$DestinationArn` is "required if Destination
