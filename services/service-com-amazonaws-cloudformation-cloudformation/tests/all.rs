@@ -79,6 +79,8 @@ mod generated_template_reads;
 mod generated_template_updates;
 #[path = "all/generated_templates.rs"]
 mod generated_templates;
+#[path = "all/glue_job_resources.rs"]
+mod glue_job_resources;
 #[path = "all/handler_progress_reports.rs"]
 mod handler_progress_reports;
 #[path = "all/harness.rs"]
