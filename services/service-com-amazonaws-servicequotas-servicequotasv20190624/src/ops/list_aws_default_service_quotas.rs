@@ -12,8 +12,9 @@
 //! HTTP 200 with a `Quotas` list — empty for a service whose published defaults are
 //! not seeded, since the code itself exists — and `NoSuchResourceException` is
 //! reserved for a code the catalog does not know (one that is not an AWS service
-//! code). A `NextToken` this service did not issue is
-//! `InvalidPaginationTokenException`.
+//! code). A `NextToken` this service did not issue for THIS listing is
+//! `InvalidPaginationTokenException` — a token names a position in the set the
+//! request selected, so one cut from another `ServiceCode`'s listing resumes nothing.
 //!
 //! `MaxResults` bounds what a CALLER may ask for, not what this listing serves when
 //! none is named: a caller that names no `MaxResults` is served the service's WHOLE
@@ -143,8 +144,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<Vec<_>>()
         };
 
-        let page = crate::state::paginate(
+        // The token names a position in the listing THIS request selected — one
+        // service's defaults, as this region publishes them — so a token cut from
+        // another selection cannot resume here.
+        let listing = crate::state::listing_label(
             Self::NAME,
+            &[Some(&region), Some(&input.service_code)],
+        );
+        let page = crate::state::paginate(
+            &listing,
             quotas,
             input.max_results,
             input.next_token.as_deref(),
