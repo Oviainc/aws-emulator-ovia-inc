@@ -251,6 +251,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configuration of its own, so this response states the attributes every
         // later read of the new identity states.
         let dkim_attributes = Some(store.dkim_attributes_of(&record));
+        // Published to the account's identity registry as well as to this service's
+        // own table, so the classic SES surface lists the identity, reports its
+        // verification state and gates a send on it from the moment this call
+        // returns. The registry lock is taken while this service's store is held,
+        // which is this service's lock order. A publication the registry refuses is
+        // the account at the SAME documented identity quota this handler refuses past
+        // above, counted over every API that records an identity, so the create is
+        // refused rather than leaving behind an identity the other surfaces never see.
+        match crate::state::identity_registry(&*self.engine) {
+            Some(registry) => {
+                if registry
+                    .lock()
+                    .publish(crate::state::registry_record(&record))
+                    .is_none()
+                {
+                    return Err(CreateEmailIdentityErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "The account already holds the maximum of {} email identities.",
+                                ::service_common::ses_identities::MAX_REGISTERED_IDENTITIES
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                record.registered = true;
+            }
+            // No registry on this engine at all, so there is no other surface to
+            // publish to: the identity is this service's own, as it was before the
+            // account's set was shared.
+            None => record.registered = false,
+        }
         store.identities.insert(key, record);
         Ok(CreateEmailIdentityOutput {
             identity_type,

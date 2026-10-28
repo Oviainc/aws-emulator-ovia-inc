@@ -186,9 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing in `CreatePolicy` depends on it —
-        // IAM is global, so not even the ARN's region segment comes from the request.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The policy is named
+        // in the request — IAM is global, so not even the ARN's region segment comes from
+        // it.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreatePolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -245,6 +246,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        let path = input
+            .path
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before the policy is created and before the store is consulted, on the ARN the
+        // policy WOULD carry, with the tags this request attaches handed to the gate — the
+        // same decision `CreateUser` and `CreateRole` make. Nothing is created when it
+        // refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_POLICY,
+            &crate::state::policy_arn(&path, &input.policy_name),
+            &format!(
+                "policy {}",
+                crate::state::policy_arn(&path, &input.policy_name)
+            ),
+            crate::state::authorization::WrittenTags::Pairs(tags.as_deref().unwrap_or_default()),
+        )?;
+
         // IAM entity names are unique within the account and "are not distinguished
         // by case", so the case-folded name is the identity: a second create under
         // any casing of a held name is a conflict rather than a second policy.
@@ -275,9 +297,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let path = input
-            .path
-            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
         // One instant for the policy and for the version it creates: they are created
         // by this one call, and `Policy$UpdateDate`'s documentation says that "when a
         // policy has only one version, this field contains the date and time when the

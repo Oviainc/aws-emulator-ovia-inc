@@ -120,6 +120,11 @@ mod ses_firehose_event_destination_setup;
 // suites add their line to.
 #[path = "all/ses_v1_receipt_rule_sets_through_the_router.rs"]
 mod ses_v1_receipt_rule_sets_through_the_router;
+// Declared beside its sibling ses suites, at the head, for the reason the entries above
+// record: the appended tail and the sorted `s…` span are both regions concurrently landing
+// suites add their line to.
+#[path = "all/ses_identities_shared_across_v1_and_v2.rs"]
+mod ses_identities_shared_across_v1_and_v2;
 // Declared beside the suites above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions concurrent
 // suites add their line to.

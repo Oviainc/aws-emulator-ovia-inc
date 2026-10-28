@@ -289,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`RecoveryOptionType`), so this pool sends no reset message at all.
             crate::state::RecoveryDestination::AdminOnly => {
                 return Err(not_authorized(
-                    "Contact administrator to reset password.",
+                    crate::state::ADMIN_ONLY_RECOVERY_MESSAGE,
                 ));
             }
             // "If neither a verified phone number nor a verified email exists, Amazon
@@ -297,9 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // operation's own doc).
             crate::state::RecoveryDestination::None => {
                 return Err(invalid_parameter(
-                    "Cannot reset password for the user as there is no registered/verified \
-                     email or phone_number"
-                        .to_string(),
+                    crate::state::NO_RECOVERY_DESTINATION_MESSAGE.to_string(),
                 ));
             }
         };

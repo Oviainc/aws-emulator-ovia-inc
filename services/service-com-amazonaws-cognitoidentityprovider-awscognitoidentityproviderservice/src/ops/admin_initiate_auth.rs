@@ -537,7 +537,7 @@ fn not_authorized(message: &str) -> AdminInitiateAuthError {
 /// `RESET_REQUIRED`.
 fn password_reset_required() -> AdminInitiateAuthError {
     AdminInitiateAuthErrorModeled::PasswordResetRequiredException(PasswordResetRequiredException {
-        message: Some("Password reset required for the user.".to_string()),
+        message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
     })
     .into()
 }

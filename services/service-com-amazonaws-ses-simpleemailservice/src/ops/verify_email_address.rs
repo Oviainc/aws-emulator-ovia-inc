@@ -155,23 +155,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        if crate::state::service_state(&*self.engine).is_none() {
             // See `verify_email_identity.rs`: an engine with no store for this
             // service cannot serve the operation at all, and it models no server
             // error of its own.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "VerifyEmailAddress",
             ));
-        };
-        // Written to the ONE identity list every identity operation reads, so an
+        }
+        // Written to the ONE identity list every identity operation reads — this
+        // service's own and the account registry the v2 surface answers from — so an
         // address verified here is reported by `ListVerifiedEmailAddresses`,
-        // `ListIdentities` and `GetIdentityVerificationAttributes` alike, and is
-        // accepted as a `Source`. Idempotent, and `None` means the account is
-        // already at its identity limit, which is a refusal, not a server fault.
-        if state
-            .lock()
-            .verify_identity(&address, crate::state::IdentityType::EmailAddress)
-            .is_none()
+        // `ListIdentities`, `GetIdentityVerificationAttributes` and v2's
+        // `ListEmailIdentities` alike, and is accepted as a `Source`. Idempotent, and
+        // `None` means the account is already at its identity limit, which is a
+        // refusal, not a server fault.
+        if crate::state::record_identity(
+            &*self.engine,
+            &address,
+            crate::state::IdentityType::EmailAddress,
+        )
+        .is_none()
         {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "this account already holds the maximum of {} verified identities; delete one \

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminResetUserPassword
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminResetUserPassword`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminResetUserPassword::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +200,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminResetUserPassword` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminResetUserPasswordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminResetUserPassword"))
+        // Request metadata only: the pool and the user are named in the body, and
+        // `ClientMetadata` is input for the Lambda triggers this action would invoke,
+        // which this emulator invokes none of.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The instant the reset begins: what the user's last-modified date reports and
+        // what the issued code's validity window is counted from.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let user = pool.user(&input.username).ok_or_else(user_not_found)?;
+        if !user.enabled {
+            return Err(not_authorized("User is disabled."));
+        }
+        // The STORED username, which is the key the code is recorded under: the request
+        // may have named the user by its `sub`, or in another case for a pool whose
+        // usernames are case-insensitive.
+        let username = user.username.clone();
+
+        // "To use this API operation, your user pool must have self-service account
+        // recovery configured" (this operation's own doc), and where a reset message
+        // goes is the pool's `AccountRecoverySetting` decision — the same decision
+        // every password-reset message of this service follows.
+        let (attribute, destination) = match pool.recovery_destination(user) {
+            crate::state::RecoveryDestination::Delivered {
+                attribute,
+                destination,
+            } => (attribute, destination),
+            // "The `admin_only` option prevents self-service account recovery"
+            // (`RecoveryOptionType`), so this pool begins no code-based reset.
+            crate::state::RecoveryDestination::AdminOnly => {
+                return Err(not_authorized(crate::state::ADMIN_ONLY_RECOVERY_MESSAGE));
+            }
+            // A user holding no verified address has nowhere for a reset code to go, so
+            // there is no reset to begin.
+            crate::state::RecoveryDestination::None => {
+                return Err(invalid_parameter(
+                    crate::state::NO_RECOVERY_DESTINATION_MESSAGE.to_string(),
+                ));
+            }
+        };
+
+        // Sending the code is part of what this operation DOES: it is recorded as the
+        // ONE code outstanding for a password reset of this user, so a later send
+        // supersedes it and only the latest is accepted.
+        let code = crate::state::VerificationCode::issued(&attribute, &destination, now);
+        let user = guard
+            .pool_mut(&input.user_pool_id)
+            .and_then(|pool| pool.user_mut(&username))
+            .ok_or_else(internal_error)?;
+        // "Sets the requested user's account into a RESET_REQUIRED status, and sends
+        // them a password-reset code" (this operation in this service's model), so the
+        // user owes a new password before it signs in again and holds the code that
+        // authorises setting one. The model documents no precondition on the status the
+        // user is in — the only states this operation names are the pool's recovery
+        // configuration, checked above — so the status it sets is set whatever the user
+        // held before.
+        user.status = crate::state::UserStatus::ResetRequired;
+        user.issue_code(crate::state::CodePurpose::PasswordReset, code);
+        user.user_last_modified_date = now;
+
+        // This operation's response models no member: what it did is in the state a
+        // later read renders, and the code itself is delivered out of band.
+        Ok(AdminResetUserPasswordOutput {})
     }
 }
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminResetUserPasswordError {
+    AdminResetUserPasswordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user. Carries the fixed
+/// message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no username.
+fn user_not_found() -> AdminResetUserPasswordError {
+    AdminResetUserPasswordErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> AdminResetUserPasswordError {
+    AdminResetUserPasswordErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminResetUserPasswordError {
+    AdminResetUserPasswordErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminResetUserPasswordError {
+    AdminResetUserPasswordErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

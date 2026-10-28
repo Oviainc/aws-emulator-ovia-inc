@@ -273,6 +273,8 @@ async fn a_refusal_names_the_decision_and_points_at_the_evaluation_that_withheld
         );
 
         let message = element(&body, "Message");
+        // The sentence the decision is named in, and — where the evaluation withheld the
+        // call — the pointer at its authorization details.
         assert_access_denied_message(
             case.case,
             &message,
@@ -318,13 +320,15 @@ async fn a_refusal_names_the_decision_and_points_at_the_evaluation_that_withheld
 async fn the_same_refused_call_is_worded_identically_every_time() {
     let router = router();
     let user_name = "repeated";
-    // No identity-based policy at all, so every call below is the implicit deny.
+    // No identity-based policy at all, so every call below is the implicit deny — and the
+    // refusal of a caller holding no document ends at the reason, with no evaluation to
+    // point at.
     let access_key_id = principal(&router, "repeated refusals", user_name, &[]).await;
 
     let mut seen: Vec<String> = Vec::new();
     // Rows spanning repeated calls and Regions in three of AWS's geographies, including
-    // the one IAM's global endpoint lives in: a message carrying a per-refusal value, or
-    // anything drawn from the request's Region, would differ across them.
+    // the one IAM's global endpoint lives in: a message carrying anything drawn from the
+    // request's Region would differ across them.
     for region in ["us-east-1", "us-east-1", "eu-west-1", "ap-southeast-2"] {
         let (status, body) =
             call_signed_in_region(&router, Some(&access_key_id), region, "ListUsers", &[]).await;

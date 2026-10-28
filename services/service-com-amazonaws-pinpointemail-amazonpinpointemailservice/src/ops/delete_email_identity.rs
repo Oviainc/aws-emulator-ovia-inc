@@ -153,6 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // Removed from the account's identity registry as well, so every other API over
+        // the account's email identities stops reporting it too. The registry lock is
+        // taken while this service's store is held, which is this service's lock order.
+        if let Some(registry) = crate::state::identity_registry(&*self.engine) {
+            registry.lock().forget(&input.email_identity);
+        }
 
         Ok(DeleteEmailIdentityOutput {})
     }
