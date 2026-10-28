@@ -235,25 +235,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolution comes before the listing: a tenant the account does not hold is
         // reported missing rather than answered with an empty page, which is what tells
         // a client "no such tenant" from "that tenant holds nothing".
-        if !store.tenants.contains_key(&tenant_name) {
+        let Some(tenant) = store.tenants.get(&tenant_name) else {
             return Err(ListTenantResourcesErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::requested_tenant_not_found(&tenant_name)),
                 },
             )
             .into());
-        }
+        };
 
         // The association table is keyed by the resource ARN and then the tenant name,
         // so one tenant's associations come out in resource-ARN order: a page is a
         // window over that order and the resume point is a position in it, which keeps a
         // token valid even if the resource it names has since been disassociated. The
         // filter narrows the sequence a page is a window over, so a token is a position
-        // in the NARROWED listing.
+        // in the NARROWED listing. A row is reported only when it is one the tenant
+        // record just resolved holds: a row left behind by a deleted tenant of the same
+        // name belongs to no tenant, so it is the resource's listing that still reports
+        // it and no tenant's.
         let associated: Vec<TenantResource> = store
             .tenant_resource_associations
             .values()
-            .filter(|record| record.tenant_name == tenant_name)
+            .filter(|record| record.belongs_to(tenant))
             .map(crate::state::TenantResourceAssociationRecord::tenant_resource_view)
             .filter(|resource| {
                 resource_type

@@ -15,23 +15,20 @@
 //! refusal of any operation on this plane shifts it.
 //!
 //! Each test is a table rather than one request: the rows span the refusal classes this
-//! plane answers (the two validation calls, the configuration update, the status update
-//! and a conflicting create — 400 and 409 alike), the portals a preference can route to,
-//! the ORDER refusals and successful writes arrive in, and — for the validation flow,
-//! whose refusal keeps a failed-attempt count of its own — whether a validation code is
-//! OUTSTANDING when the submitted one is refused. That last state no wire call of this
-//! emulator can reach, because `SendProcurementPortalValidation` cannot confirm delivery
-//! of the test e-invoice and so issues no code, so the code is issued through the state
-//! the verify reads (as `retired_units_and_portal_validation.rs` does).
+//! plane answers (the code submission, the configuration update, the status update and a
+//! conflicting create — 400 and 409 alike), the portals a preference can route to, the
+//! ORDER refusals and successful calls arrive in, and — for the validation flow, whose
+//! refusal keeps a failed-attempt count of its own — whether a validation code is
+//! OUTSTANDING when the submitted one is refused. A code is made outstanding through the
+//! call that issues one, `SendProcurementPortalValidation`, and then read from state,
+//! because the modelled response carries only the ARN.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
-use service_com_amazonaws_invoicing_invoicing::state::{
-    self, ComAmazonawsInvoicingInvoicingState, IssuedPortalValidation,
-};
+use service_com_amazonaws_invoicing_invoicing::state::ComAmazonawsInvoicingInvoicingState;
 
 /// Every value `ProcurementPortalName` accepts (`smithy_query(query="shape",
 /// shape="ProcurementPortalName")`).
@@ -243,10 +240,10 @@ fn send_validation(subject: &Subject) -> Value {
     json!({"ProcurementPortalPreferenceArn": subject.arn})
 }
 
-/// The same start, carrying a `ClientToken` — there is no success for a replay of a
-/// refused call to answer with.
+/// The same start, carrying a `ClientToken` — so a replay of it answers with the ARN the
+/// first call returned.
 fn send_validation_with_token(subject: &Subject) -> Value {
-    json!({"ProcurementPortalPreferenceArn": subject.arn, "ClientToken": "refused-send-1"})
+    json!({"ProcurementPortalPreferenceArn": subject.arn, "ClientToken": "send-1"})
 }
 
 /// A code submitted for the subject preference while none is outstanding.
@@ -290,22 +287,6 @@ fn conflicting_create(subject: &Subject) -> Value {
 /// Every refusal class this plane answers for a preference that EXISTS, one row each.
 fn refusal_classes() -> Vec<Refusal> {
     vec![
-        Refusal {
-            label: "a validation start that cannot confirm delivery",
-            portal: PORTAL_NAMES[0],
-            operation: "SendProcurementPortalValidation",
-            request: send_validation,
-            http_status: 400,
-            error_code: "ValidationException",
-        },
-        Refusal {
-            label: "the same start carrying a ClientToken",
-            portal: PORTAL_NAMES[1],
-            operation: "SendProcurementPortalValidation",
-            request: send_validation_with_token,
-            http_status: 400,
-            error_code: "ValidationException",
-        },
         Refusal {
             label: "a code submitted while none is outstanding",
             portal: PORTAL_NAMES[2],
@@ -402,7 +383,7 @@ async fn subject_at_version_two(
 /// SUCCESSFUL write left them, however many times that call is repeated.
 ///
 /// The rows are the refusal classes this plane answers for a preference that exists: the
-/// two validation calls, the status update's three, the configuration update's, and a
+/// code submission's two, the status update's three, the configuration update's, and a
 /// conflicting create (a 409, so the rule is not read as being about 400 alone), spread
 /// across the portals `ProcurementPortalName` admits.
 #[tokio::test]
@@ -461,9 +442,12 @@ struct Step {
     label: &'static str,
     operation: &'static str,
     request: fn(&Subject) -> Value,
-    /// Whether this call SUCCEEDS and writes the configuration — which is exactly when
-    /// the reported version advances.
-    writes: bool,
+    /// Whether this call SUCCEEDS at all — which is not the same thing as writing the
+    /// configuration: the validation start succeeds and writes none.
+    succeeds: bool,
+    /// Whether this call writes the CONFIGURATION — which is exactly when the reported
+    /// version advances.
+    writes_configuration: bool,
 }
 
 /// A status update that moves one plane to a status the modelled enum admits, so it
@@ -478,46 +462,59 @@ fn accepted_status_update(subject: &Subject) -> Value {
 /// The steps a sequence is built from, each named once here so a row is just an order.
 fn step(label: &'static str) -> Step {
     match label {
-        "refused send" => Step {
+        "accepted send" => Step {
             label,
             operation: "SendProcurementPortalValidation",
             request: send_validation,
-            writes: false,
+            succeeds: true,
+            writes_configuration: false,
+        },
+        "accepted send with a token" => Step {
+            label,
+            operation: "SendProcurementPortalValidation",
+            request: send_validation_with_token,
+            succeeds: true,
+            writes_configuration: false,
         },
         "refused verify" => Step {
             label,
             operation: "VerifyProcurementPortalValidation",
             request: verify_unissued_code,
-            writes: false,
+            succeeds: false,
+            writes_configuration: false,
         },
         "refused status update" => Step {
             label,
             operation: "UpdateProcurementPortalPreferenceStatus",
             request: status_update_stating_nothing,
-            writes: false,
+            succeeds: false,
+            writes_configuration: false,
         },
         "accepted update" => Step {
             label,
             operation: "PutProcurementPortalPreference",
             request: accepted_update,
-            writes: true,
+            succeeds: true,
+            writes_configuration: true,
         },
         "accepted status update" => Step {
             label,
             operation: "UpdateProcurementPortalPreferenceStatus",
             request: accepted_status_update,
-            writes: true,
+            succeeds: true,
+            writes_configuration: true,
         },
         other => panic!("case {other}: no such step"),
     }
 }
 
 /// RULE: the reported `Version` is one plus the number of calls that SUCCESSFULLY wrote
-/// the preference, and `LastUpdateDate` moves only with those calls — so interleaving
-/// refusals with writes, in any order, cannot shift either.
+/// the preference's CONFIGURATION, and `LastUpdateDate` moves only with those calls — so
+/// interleaving refusals, and calls that succeed without writing a configuration, with the
+/// writes, in any order, cannot shift either.
 ///
-/// The rows are orders in which refusals and successful writes arrive: refusals first,
-/// refusals between the writes, and a sequence with no successful write at all.
+/// The rows are orders in which those three kinds of call arrive: no configuration write
+/// first, some between the writes, and a sequence with no configuration write at all.
 #[tokio::test]
 async fn the_version_counts_the_successful_writes_only() {
     let router = emulator();
@@ -526,7 +523,7 @@ async fn the_version_counts_the_successful_writes_only() {
         (
             "refusals before the writes",
             vec![
-                "refused send",
+                "accepted send",
                 "refused verify",
                 "refused status update",
                 "accepted update",
@@ -537,18 +534,18 @@ async fn the_version_counts_the_successful_writes_only() {
             "refusals between the writes",
             vec![
                 "accepted update",
-                "refused send",
+                "accepted send",
                 "accepted status update",
                 "refused verify",
-                "refused send",
+                "accepted send with a token",
                 "accepted update",
             ],
         ),
         (
             "nothing but refusals",
             vec![
-                "refused send",
-                "refused send",
+                "accepted send",
+                "accepted send",
                 "refused verify",
                 "refused status update",
             ],
@@ -588,8 +585,10 @@ async fn the_version_counts_the_successful_writes_only() {
             let previous_last_update = last_update(&reported);
             let request = (step.request)(&subject);
             let (status, body) = call(&router, step.operation, &request).await;
-            if step.writes {
+            if step.writes_configuration {
                 successful_writes += 1;
+            }
+            if step.succeeds {
                 assert_eq!(
                     status, 200,
                     "case {label} / {}: expected HTTP 200, got {status} {body}",
@@ -612,7 +611,7 @@ async fn the_version_counts_the_successful_writes_only() {
                  {successful_writes} successful writes, got {reported}",
                 step.label
             );
-            if step.writes {
+            if step.writes_configuration {
                 assert!(
                     last_update(&reported) >= previous_last_update,
                     "case {label} / {}: a successful write stamps the instant it changed \
@@ -623,8 +622,8 @@ async fn the_version_counts_the_successful_writes_only() {
                 assert_eq!(
                     last_update(&reported),
                     previous_last_update,
-                    "case {label} / {}: a refused call must not restamp LastUpdateDate, \
-                     got {reported}",
+                    "case {label} / {}: a call that wrote no configuration must not \
+                     restamp LastUpdateDate, got {reported}",
                     step.label
                 );
             }
@@ -641,29 +640,26 @@ async fn the_version_counts_the_successful_writes_only() {
     }
 }
 
-/// Make a validation code outstanding for `arn`, as a CONFIRMED delivery of the test
-/// e-invoice would.
+/// Make a validation code outstanding for `arn`, through the call that ISSUES one.
 ///
-/// `SendProcurementPortalValidation` cannot confirm that delivery in this emulator — it
-/// performs no outbound delivery and hosts no procurement portal, so the send answers the
-/// modelled 400 (one of the refusal rows above). A suite that needs a code that IS
-/// outstanding issues it through the state the verify reads, from the same generator the
-/// service mints one with.
-pub(crate) fn issue_code(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
-    let handle = engine.state::<ComAmazonawsInvoicingInvoicingState>();
-    let mut store = handle.lock();
-    let code = store.issue_portal_validation_code();
-    let issued_at = state::now();
-    store
-        .procurement_portal_preferences
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("case issue a code: {arn} must name a created preference"))
-        .validation = Some(IssuedPortalValidation {
-        code: code.clone(),
-        issued_at,
-        verified_at: None,
-    });
-    code
+/// `SendProcurementPortalValidation` is that call — the model documents it as initiating
+/// the validation by issuing a validation code — so the code is issued over the wire and
+/// then READ from state: the modelled response carries only the ARN, because the real
+/// service delivers the code through the configured procurement portal.
+pub(crate) async fn issue_code(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+) -> String {
+    ok(
+        router,
+        "SendProcurementPortalValidation",
+        &json!({"ProcurementPortalPreferenceArn": arn}),
+    )
+    .await;
+    outstanding_code(engine, arn).unwrap_or_else(|| {
+        panic!("case issue a code: the send must leave a code outstanding for {arn}")
+    })
 }
 
 /// The validation code this service issued for `arn` and has not seen back yet, read from
@@ -860,7 +856,11 @@ async fn a_rejected_validation_code_writes_no_configuration() {
             }
         }
 
-        let issued = row.issue_a_code.then(|| issue_code(&engine, &arn));
+        let issued = if row.issue_a_code {
+            Some(issue_code(&router, &engine, &arn).await)
+        } else {
+            None
+        };
         let before = get_preference(&router, &arn).await;
         let before_summary = listed_summary(&router, &arn).await;
         let expected_version = 1 + row.writes_after_create;

@@ -128,7 +128,7 @@ async fn workspace_and_task(router: &MultiServiceRouter) {
 /// reached, so the suite can address an execution standing in EVERY state the
 /// lifecycle admits — including the terminal ones no call of this emulator
 /// reaches, because a compute node's container image runs nowhere here.
-fn set_run_state(engine: &engine::InMemoryEngine, execution_id: &str, run_state: &str) {
+pub(crate) fn set_run_state(engine: &engine::InMemoryEngine, execution_id: &str, run_state: &str) {
     let state = service_state(engine).expect("the IoT SiteWise store");
     let mut store = state.lock();
     store
@@ -140,7 +140,7 @@ fn set_run_state(engine: &engine::InMemoryEngine, execution_id: &str, run_state:
 
 /// Put a recorded cancellation on a stored execution, or take it off, so a row
 /// can stand in a state a cancel itself leaves behind.
-fn set_cancel_requested_at(
+pub(crate) fn set_cancel_requested_at(
     engine: &engine::InMemoryEngine,
     execution_id: &str,
     at: Option<SystemTime>,

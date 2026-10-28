@@ -405,21 +405,26 @@ const MAX_HORIZON_SECS: i64 = 604_800;
 /// The same ceiling for an alarm whose period is shorter than [`ONE_HOUR_SECS`]: one day.
 const MAX_SUB_HOUR_HORIZON_SECS: i64 = 86_400;
 
-/// The refusal for an evaluation horizon past [`MAX_SUB_HOUR_HORIZON_SECS`], in the words the
-/// rule is published in: "For alarms with a period of less than one hour (3,600 seconds), the
-/// total evaluation period can't be longer than one day (86,400 seconds)."
-/// (`PutMetricAlarmInput$Period`).
-const SUB_HOUR_HORIZON_REFUSAL: &str =
-    "For alarms with a period of less than one hour (3,600 seconds), the total evaluation \
-     period can't be longer than one day (86,400 seconds).";
-
-/// The refusal for an evaluation horizon past [`MAX_HORIZON_SECS`], in the words that rule is
-/// published in: "An alarm's total current evaluation period can be no longer than seven days,
-/// so Period multiplied by EvaluationPeriods can't be more than 604,800 seconds."
-/// (`PutMetricAlarmInput$Period`).
-const HORIZON_REFUSAL: &str =
-    "An alarm's total current evaluation period can be no longer than seven days, so Period \
-     multiplied by EvaluationPeriods can't be more than 604,800 seconds.";
+/// CloudWatch's refusal for an evaluation horizon past the ceiling of `period`'s regime.
+///
+/// One of two fixed sentences, chosen only by whether `period` is shorter than
+/// [`ONE_HOUR_SECS`]: the member names the rule relates, the ceiling it enforces and the
+/// resolution boundary that selects the regime are constants OF THE RULE, so neither sentence
+/// carries a value from the request — a caller branching on the message sees the same two
+/// strings whatever period and evaluation-period count were asked for.
+fn horizon_refusal(period: i32) -> String {
+    if i64::from(period) < ONE_HOUR_SECS {
+        format!(
+            "Metrics cannot be checked across more than a day (EvaluationPeriods * Period must \
+             be <= {MAX_SUB_HOUR_HORIZON_SECS}) for alarms using period < {ONE_HOUR_SECS}"
+        )
+    } else {
+        format!(
+            "Metrics cannot be checked across more than a week (EvaluationPeriods * Period must \
+             be <= {MAX_HORIZON_SECS}) for alarms using period >= {ONE_HOUR_SECS}"
+        )
+    }
+}
 
 /// The `Period` values an alarm that aligns its evaluated range to clock boundaries may carry:
 /// "When you use a wall clock window, the alarm's period must be 1 minute (60 seconds), 5
@@ -429,12 +434,12 @@ const HORIZON_REFUSAL: &str =
 /// window can start at.
 const WALL_CLOCK_PERIODS: [i32; 5] = [60, 300, 3_600, 86_400, 604_800];
 
-/// The refusal for a `Period` no wall clock boundary matches, in the words the rule is
-/// published in (see [`WALL_CLOCK_PERIODS`]).
+/// CloudWatch's refusal for a `Period` no wall clock boundary matches.
+///
+/// A fixed sentence, not built from the request: it names the admissible windows in units
+/// ([`WALL_CLOCK_PERIODS`]) and does not echo the period that was asked for.
 const WALL_CLOCK_PERIOD_REFUSAL: &str =
-    "When you use a wall clock window, the alarm's period must be 1 minute (60 seconds), 5 \
-     minutes (300 seconds), 1 hour (3,600 seconds), 1 day (86,400 seconds), or 1 week (604,800 \
-     seconds). Other period values aren't supported with a wall clock window.";
+    "Wall Clock evaluation period must be 1 minute, 5 minutes, 1 hour, 1 day or 1 week.";
 
 /// The metric math function an alarm's expression may not call at all, and CloudWatch's own
 /// refusal for it: a search returns every series its query matches, and an alarm watches one
@@ -486,12 +491,13 @@ fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
         }
         if let Some(periods) = input.evaluation_periods {
             let horizon = i64::from(period).saturating_mul(i64::from(periods));
-            if i64::from(period) < ONE_HOUR_SECS {
-                if horizon > MAX_SUB_HOUR_HORIZON_SECS {
-                    return Some(SUB_HOUR_HORIZON_REFUSAL.to_string());
-                }
-            } else if horizon > MAX_HORIZON_SECS {
-                return Some(HORIZON_REFUSAL.to_string());
+            let ceiling = if i64::from(period) < ONE_HOUR_SECS {
+                MAX_SUB_HOUR_HORIZON_SECS
+            } else {
+                MAX_HORIZON_SECS
+            };
+            if horizon > ceiling {
+                return Some(horizon_refusal(period));
             }
         }
     }

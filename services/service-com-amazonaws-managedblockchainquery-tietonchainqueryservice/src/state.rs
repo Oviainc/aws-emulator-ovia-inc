@@ -35,7 +35,9 @@
 //!   a native token, the `decimals` its own contract publishes for a token a contract
 //!   issues — in one place for every operation that reports one, so an event's `value`,
 //!   the balance it moves and the `decimals` the contract itself reports agree about the
-//!   unit as well as the quantity;
+//!   unit as well as the quantity; an amount recorded WITHOUT a token, the way a
+//!   transaction's fee is, is an amount of the currency of the chain it was recorded on
+//!   ([`network_native_decimals`]);
 //! * every contract `GetAssetContract` reports is one the network's ledger holds, so an
 //!   address no contract is deployed at is a not-found rather than an invented answer.
 //!
@@ -141,6 +143,32 @@ pub fn native_token_decimals(token_id: Option<&str>) -> u32 {
         Some(NATIVE_TOKEN_ETH) => NATIVE_TOKEN_ETH_DECIMALS,
         _ => 0,
     }
+}
+
+/// The `tokenId` of the currency `network` is a network OF: `btc` on the Bitcoin
+/// networks, `eth` on the Ethereum ones.
+///
+/// Read off the network, which is a value of the model's `QueryNetwork` enum
+/// (`BITCOIN_MAINNET | BITCOIN_TESTNET | ETHEREUM_MAINNET | ETHEREUM_SEPOLIA_TESTNET`),
+/// via the documented Bitcoin half of that set ([`is_bitcoin`]): a network of a chain
+/// runs that chain's own currency, so this is what a NATIVE amount recorded on it is an
+/// amount of, whether the record names a token or not.
+pub fn native_token_id(network: &str) -> &'static str {
+    if is_bitcoin(network) {
+        NATIVE_TOKEN_BTC
+    } else {
+        NATIVE_TOKEN_ETH
+    }
+}
+
+/// How many decimal places an amount of `network`'s OWN currency is reported with — the
+/// precision that currency fixes ([`native_token_decimals`] of [`native_token_id`]).
+///
+/// For the native amounts a record carries without naming a token, the way a
+/// transaction's fee is paid in the currency of the chain that mined it and nothing on
+/// the record says so.
+pub fn network_native_decimals(network: &str) -> u32 {
+    native_token_decimals(Some(native_token_id(network)))
 }
 
 /// The widest subdivision an amount can be quoted at: an amount is held in an `i128`, so
@@ -295,6 +323,11 @@ impl StoredTransaction {
     /// Every `ChainAddress`-typed member is rendered in the spelling the ledger keys an
     /// address by ([`derived::normalize_address`]), the same form every other response
     /// of this service reports an address in.
+    ///
+    /// `transactionFee` is an amount of the chain's own currency, so it is quoted in that
+    /// currency the same way a `TransactionEvent$value` or a `TokenBalance$balance` of the
+    /// native token is; the gas members beside it are counts of gas and a price per unit
+    /// of it, which no currency subdivides, so they stay the integers the ledger holds.
     pub fn transaction(&self) -> Transaction {
         Transaction {
             network: self.network.clone(),
@@ -310,13 +343,23 @@ impl StoredTransaction {
                 .contract_address
                 .as_deref()
                 .map(derived::normalize_address),
+            // `gasUsed` and `cumulativeGasUsed` count GAS and `effectiveGasPrice` is a
+            // price per unit of it, so none of the three is an amount of the chain's
+            // currency: each is reported as the integer the ledger holds.
             gas_used: self.gas_used.map(|amount| amount.to_string()),
             cumulative_gas_used: self.cumulative_gas_used.map(|amount| amount.to_string()),
             effective_gas_price: self.effective_gas_price.map(|amount| amount.to_string()),
             signature_v: self.signature_v,
             signature_r: self.signature_r.clone(),
             signature_s: self.signature_s.clone(),
-            transaction_fee: self.transaction_fee.map(|amount| amount.to_string()),
+            // The fee IS an amount of the chain's own currency — held, like every amount
+            // in this ledger, in that currency's smallest unit — so it is quoted in the
+            // currency, at the precision the currency itself fixes
+            // ([`network_native_decimals`]), by the one renderer every reported amount
+            // goes through ([`amount_string`]).
+            transaction_fee: self
+                .transaction_fee
+                .map(|amount| amount_string(amount, network_native_decimals(&self.network))),
             transaction_id: self.transaction_id.clone(),
             confirmation_status: Some(self.confirmation_status.clone()),
             execution_status: self.execution_status.clone(),

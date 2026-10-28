@@ -49,7 +49,10 @@ fn uri(network: &str, peer: &str) -> String {
 }
 
 /// `DisassociateConnectPeer` on `network` for `peer`.
-async fn disassociate(
+///
+/// `pub(crate)` because `tests/all/connect_peer_delete_cascade.rs` removes the same tie the
+/// other way round (by deleting the peer), so both suites address it through one helper.
+pub(crate) async fn disassociate(
     emulator: &Emulator,
     network: &str,
     peer: &str,
@@ -73,7 +76,10 @@ async fn disassociate_ok(
 }
 
 /// The `ResourceId`s one telemetry page reports for the Connect peers of `network`.
-async fn telemetry_peers(emulator: &Emulator, case: &str, network: &str) -> Vec<String> {
+///
+/// `pub(crate)` because `tests/all/connect_peer_delete_cascade.rs` asserts over the same
+/// listing: one definition of what the telemetry of a global network reports.
+pub(crate) async fn telemetry_peers(emulator: &Emulator, case: &str, network: &str) -> Vec<String> {
     let (status, body) = emulator
         .get(&format!(
             "/global-networks/{network}/network-telemetry?resourceType=connect-peer"

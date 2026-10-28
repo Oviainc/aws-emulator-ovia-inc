@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePlatformApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePlatformApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePlatformApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +59,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,23 +145,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_PLATFORM_APPLICATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Remove the platform application `PlatformApplicationArn` names, and the device
+    /// endpoints registered against it, from this account's persisted state.
+    ///
+    /// A MUTATION the spec names: "Deletes a platform application object for one of the
+    /// supported push notification services" (this operation's doc). The operation
+    /// models no lookup miss — its only client error is `InvalidParameterException` — so
+    /// an ARN this account holds no application record for is a SUCCESS that removes
+    /// nothing: the answer and the state are the same however many times the same delete
+    /// arrives, as they are for the device endpoint's delete.
+    ///
+    /// What the idempotence does NOT cover is a value that is not an ARN of this
+    /// region's own endpoint at all: it names no application anywhere this endpoint
+    /// serves, so it is bad input, refused with the modelled `InvalidParameterException`
+    /// (HTTP 400) before the store is consulted. An ARN-shaped value of this region that
+    /// names something other than one of this account's applications is simply a record
+    /// this store does not hold, which is the idempotent case above.
+    ///
+    /// A device endpoint exists only as a registration of one device against ONE
+    /// application — "Creates an endpoint for a device and mobile app on one of the
+    /// supported push notification services" (`CreatePlatformEndpoint` doc), and the
+    /// endpoint's own ARN nests under that application — so the endpoints of a deleted
+    /// application go with it, the way a deleted topic's subscriptions do. Their
+    /// SUBSCRIPTIONS stay where they are, as they do when the endpoint itself is
+    /// deleted: unsubscribing is a separate call the caller makes.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePlatformApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePlatformApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePlatformApplication"))
+        let region = state::request_region(ctx.parts());
+        if let Some(message) = state::regional_arn_refusal(
+            "PlatformApplicationArn",
+            &input.platform_application_arn,
+            &region,
+        ) {
+            return Err(
+                DeletePlatformApplicationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(
+                DeletePlatformApplicationErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the SNS store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = store.lock();
+
+        if store
+            .platform_applications
+            .remove(&input.platform_application_arn)
+            .is_some()
+        {
+            let orphaned: Vec<String> = store
+                .endpoints_of_application(&input.platform_application_arn)
+                .into_iter()
+                .map(|endpoint| endpoint.arn.clone())
+                .collect();
+            for arn in orphaned {
+                store.platform_endpoints.remove(&arn);
+            }
+        }
+
+        Ok(DeletePlatformApplicationOutput)
     }
 }

@@ -89,6 +89,8 @@ mod instance_profile_role_removal;
 mod instance_profile_roles;
 #[path = "all/instance_profile_tag_listing.rs"]
 mod instance_profile_tag_listing;
+#[path = "all/instance_profile_tag_removal.rs"]
+mod instance_profile_tag_removal;
 #[path = "all/instance_profile_tags.rs"]
 mod instance_profile_tags;
 #[path = "all/instance_profiles.rs"]

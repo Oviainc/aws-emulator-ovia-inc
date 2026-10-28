@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagInstanceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagInstanceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagInstanceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the tag keys named here are dropped from the persisted instance
+//! profile in this service's state (`crate::state`), and what remains is read back by
+//! `GetInstanceProfile` and `ListInstanceProfileTags`.
+//!
+//! A 501 from an operation in this service means "nobody has written it yet", never
+//! "the emulator is broken".
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagInstanceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagInstanceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagInstanceProfile"))
+        // `ctx` carries request metadata only; untagging an instance profile depends
+        // on nothing in it — IAM is global, and the profile is named in the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagInstanceProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not distinguished by
+        // case", so the profile is found under the case-folded name whatever case the
+        // request spelled it in — the same lookup `TagInstanceProfile` and
+        // `GetInstanceProfile` make.
+        let key = crate::state::name_key(&input.instance_profile_name);
+        let Some(record) = store.instance_profiles.get_mut(&key) else {
+            return Err(UntagInstanceProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Instance Profile {} cannot be found.",
+                        input.instance_profile_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Removes the specified tags from the IAM instance profile": the removal, and
+        // the exact key comparison it makes, are the one shared rule in `crate::state`,
+        // so a named key the profile does not hold drops nothing rather than failing
+        // the call.
+        let remaining = crate::state::remove_tags(
+            record.profile.tags.as_ref(),
+            input.tag_keys.iter().map(String::as_str),
+        );
+
+        // An empty tag set is the same as no tags, which is how `CreateInstanceProfile`
+        // stores one: the member is reported only when the profile actually carries
+        // tags.
+        record.profile.tags = (!remaining.is_empty()).then_some(remaining);
+        Ok(UntagInstanceProfileOutput)
     }
 }

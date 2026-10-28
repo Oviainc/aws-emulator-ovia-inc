@@ -168,16 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.connect_peer_id)
             .is_some_and(|record| record.global_network_id == input.global_network_id);
 
-        // The telemetry registration the association made is held under the PEER's own ARN
-        // (`AssociateConnectPeer`), so that ARN is read from the stored peer before the
-        // association goes; a peer whose own record is gone registered nothing left to drop.
-        let peer_arn = store
-            .connect_peers
-            .get(&input.connect_peer_id)
-            .map(|peer| peer.arn.clone());
-
+        // Untying the peer drops the association AND the telemetry registration that
+        // association made under the peer's ARN, in the one place of the store that unties
+        // a peer: a global network reports the telemetry of the connections it still holds,
+        // and this one it no longer does. The ARN is computed from the peer id there rather
+        // than read out of the stored peer, so the removal does not depend on the peer's own
+        // record still being there.
         let removed = if addressed_here {
-            store.connect_peer_associations.remove(&input.connect_peer_id)
+            store.untie_connect_peer(&input.connect_peer_id)
         } else {
             None
         }
@@ -189,13 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
         })?;
-
-        // The association is what registered the BGP session with this global network, so
-        // untying it deregisters the session too: a global network reports the telemetry of
-        // the connections it still holds, and this one it no longer does.
-        if let Some(arn) = peer_arn {
-            store.deregister_telemetry_resource(&input.global_network_id, &arn);
-        }
 
         // The removed association is reported as `DELETING`, the way every other removal of
         // an association of this service reports the record it just removed; a later read no

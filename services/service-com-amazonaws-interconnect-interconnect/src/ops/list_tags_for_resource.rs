@@ -179,9 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // invalid input, and a DIFFERENT code from an in-scope ARN that merely names
         // nothing (below), which is what lets a caller tell "wrong account" from "no
         // such resource".
-        if let Some(message) =
-            crate::state::arn_scope_violation(&parsed, &crate::state::request_region(ctx))
-        {
+        let region = crate::state::request_region(ctx);
+        if let Some(message) = crate::state::arn_scope_violation(&parsed, &region) {
             return Err(
                 ListTagsForResourceErrorModeled::InterconnectValidationException(
                     InterconnectValidationException { message },
@@ -199,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.materialise_due_transitions(::std::time::Instant::now());
             store
-                .connection_by_arn(&input.arn)
+                .connection_in_by_arn(&region, &input.arn)
                 .map(|stored| stored.connection.tags.clone())
         };
 

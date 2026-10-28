@@ -63,7 +63,10 @@ const PUBLISHED_ROWS: &[usize] = &[0, 2, 4];
 
 /// `POST /2020-05-31/connection-functions` with the request document `body` — the route the
 /// model binds this operation to.
-async fn list_connection_functions(router: &MultiServiceRouter, body: &str) -> Answer {
+///
+/// `pub(crate)` so the suite that checks a DELETE leaves the listing behind drives the
+/// listing through this one call path rather than a second copy of it.
+pub(crate) async fn list_connection_functions(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -76,7 +79,11 @@ async fn list_connection_functions(router: &MultiServiceRouter, body: &str) -> A
 
 /// A `ListConnectionFunctionsRequest` document naming whichever of the three input members the
 /// case under test names, and leaving every other one out entirely.
-fn list_body(max_items: Option<i32>, marker: Option<&str>, stage: Option<&str>) -> String {
+pub(crate) fn list_body(
+    max_items: Option<i32>,
+    marker: Option<&str>,
+    stage: Option<&str>,
+) -> String {
     let mut out = format!(
         "<ListConnectionFunctionsRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -99,7 +106,7 @@ fn list_body(max_items: Option<i32>, marker: Option<&str>, stage: Option<&str>) 
 /// `ConnectionFunctionSummaryList`'s member carries `xmlName` `ConnectionFunctionSummary`
 /// (`smithy_query(query="shape",shape="ConnectionFunctionSummaryList")`), so each entry travels
 /// in an element of that name inside the `ConnectionFunctions` wrapper.
-fn summaries(answer: &Answer) -> Vec<&Node> {
+pub(crate) fn summaries(answer: &Answer) -> Vec<&Node> {
     match answer.root().at("ConnectionFunctions") {
         Some(wrapper) => wrapper.children_named("ConnectionFunctionSummary"),
         None => Vec::new(),
