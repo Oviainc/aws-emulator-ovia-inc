@@ -79,6 +79,8 @@ mod list_baselines;
 mod list_enabled_baselines;
 #[path = "all/list_filter_narrowing.rs"]
 mod list_filter_narrowing;
+#[path = "all/list_pagination.rs"]
+mod list_pagination;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/one_enabled_control_per_target.rs"]

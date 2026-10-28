@@ -1713,6 +1713,59 @@ pub fn check_recurrence(recurrence: &RecurrenceSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// The member path a `TimeZoneId` refusal names, spelled the way AWS spells a member path
+/// in a constraint message (lower camel case, from the input's root).
+const TIME_ZONE_ID_MEMBER: &str = "timeZoneId";
+
+/// The member path a `NumberOfOnCalls` refusal names.
+const NUMBER_OF_ON_CALLS_MEMBER: &str = "recurrence.numberOfOnCalls";
+
+/// `Ok` when `time_zone_id` names a zone of the IANA time zone database, else the
+/// `ValidationException` message naming the member and the value it could not resolve.
+///
+/// The model constrains the member only by length and pattern, and documents its VALUE as a
+/// time zone "in Internet Assigned Numbers Authority (IANA) format", adding that designators
+/// for zones without Daylight Savings Time rules are not supported. A rotation's shifts are
+/// computed in that zone, so a name no zone database resolves names no schedule: the name is
+/// resolved against the zone database itself — `chrono-tz`, which compiles the IANA release —
+/// rather than against a hand-written list that would refuse zones the service admits.
+///
+/// Every operation that WRITES a time zone onto a rotation reads its request through here, so
+/// the set of zones the service admits cannot drift between them.
+pub fn check_time_zone_id(time_zone_id: &str) -> Result<(), String> {
+    if time_zone_id.parse::<::chrono_tz::Tz>().is_ok() {
+        return Ok(());
+    }
+    Err(format!(
+        "Value '{time_zone_id}' at '{TIME_ZONE_ID_MEMBER}' failed to satisfy constraint: \
+         Member must be a time zone name in Internet Assigned Numbers Authority (IANA) format"
+    ))
+}
+
+/// `Ok` when the recurrence's `NumberOfOnCalls` can be met by a shift team of `team_size`
+/// contacts, else the `ValidationException` message naming the member, the value and the team
+/// the rotation has.
+///
+/// `NumberOfOnCalls` is "the number of contacts, or shift team members designated to be on
+/// call concurrently during a shift" — members of THIS rotation's team, so a rotation cannot
+/// put more of them on call at once than it has. The model bounds the member below (`range`
+/// min 1) and leaves the upper bound to the rotation, which is why it is checked here, once,
+/// for every operation that installs a recurrence on a team.
+pub fn check_number_of_on_calls(
+    recurrence: &RecurrenceSettings,
+    team_size: usize,
+) -> Result<(), String> {
+    let on_calls = recurrence.number_of_on_calls;
+    if usize::try_from(on_calls).is_ok_and(|on_calls| on_calls <= team_size) {
+        return Ok(());
+    }
+    Err(format!(
+        "Value '{on_calls}' at '{NUMBER_OF_ON_CALLS_MEMBER}' failed to satisfy constraint: \
+         Member must have value less than or equal to {team_size}, the number of contacts in \
+         the rotation"
+    ))
+}
+
 /// Whether one of `RecurrenceSettings`' settings lists is present AND carries an entry.
 ///
 /// An absent list and an empty one say the same thing: this recurrence has no shift of that
