@@ -45,6 +45,8 @@ mod application_assignment_describe;
 mod application_assignments;
 #[path = "all/application_assignments_for_principal.rs"]
 mod application_assignments_for_principal;
+#[path = "all/application_assignments_list.rs"]
+mod application_assignments_list;
 #[path = "all/application_authentication_methods.rs"]
 mod application_authentication_methods;
 #[path = "all/application_authentication_methods_list.rs"]

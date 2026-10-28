@@ -24,7 +24,7 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     AccessControlAttribute, AccountAssignment, AccountAssignmentForPrincipal,
     AccountAssignmentOperationStatus,
-    AccountAssignmentOperationStatusMetadata, Application,
+    AccountAssignmentOperationStatusMetadata, Application, ApplicationAssignment,
     ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
     CustomerManagedPolicyReference, DisplayData, EncryptionConfigurationDetails, Grant,
     InstanceAccessControlAttributeConfiguration, InstanceMetadata,
@@ -2253,6 +2253,29 @@ pub struct ApplicationAssignmentRecord {
     pub principal_id: String,
 }
 
+impl ApplicationAssignmentRecord {
+    /// The record's sort/pagination key within ONE application's enumeration: the request
+    /// has already fixed the application, so what remains of the assignment's identity is
+    /// the (type, id) of the principal it grants access to.
+    ///
+    /// The pair is UNIQUE within an application — it is exactly the rest of the identity
+    /// tuple [`ComAmazonawsSsoadminSwbexternalserviceState::application_assignment_position`]
+    /// compares — so no two rows of one application share a key and a cursor resumes after
+    /// exactly one of them.
+    pub fn page_key(&self) -> String {
+        format!("{}#{}", self.principal_type, self.principal_id)
+    }
+
+    /// This record as the modeled `ApplicationAssignment` shape.
+    pub fn to_shape(&self) -> ApplicationAssignment {
+        ApplicationAssignment {
+            application_arn: self.application_arn.clone(),
+            principal_type: self.principal_type.clone(),
+            principal_id: self.principal_id.clone(),
+        }
+    }
+}
+
 /// The status record of one create/delete assignment operation, keyed by its
 /// `RequestId` so `DescribeAccountAssignment*Status` and
 /// `ListAccountAssignment*Status` read real history rather than a synthesised answer.
@@ -4147,6 +4170,13 @@ pub fn cursor_application_grants(application_arn: &str) -> String {
 /// method's type) only distinguishes rows WITHIN one application.
 pub fn cursor_application_authentication_methods(application_arn: &str) -> String {
     format!("applicationAuthenticationMethods|{application_arn}")
+}
+
+/// Cursor scope of a `ListApplicationAssignments` enumeration: the operation and the
+/// application whose direct assignments it walks, since the key (a principal's type and
+/// id) only distinguishes rows WITHIN one application.
+pub fn cursor_application_assignments(application_arn: &str) -> String {
+    format!("applicationAssignments|{application_arn}")
 }
 
 /// Cursor scope of a `ListApplicationAssignmentsForPrincipal` enumeration: the operation

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplicationAssignments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplicationAssignments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplicationAssignments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the DIRECT assignments stored on one application, each projected from the
+//! [`crate::state::ApplicationAssignmentRecord`] a `CreateApplicationAssignment` wrote and
+//! a `DescribeApplicationAssignment` reads back. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplicationAssignments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationAssignmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplicationAssignments"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationAssignmentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the application whose
+        // assignments it walks, so a token issued for another read — or never issued at all
+        // — cannot silently resume inside this one.
+        let scope = crate::state::cursor_application_assignments(&input.application_arn);
+        // A `NextToken` this service did not issue for THIS enumeration is a bad request,
+        // not an empty page: answering an empty page would silently end a caller's
+        // enumeration early.
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListApplicationAssignmentsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                })
+            },
+        )?;
+
+        let ordered: Vec<(String, ApplicationAssignment)> = {
+            let region = crate::state::request_region(ctx.parts());
+            let mut store = state.lock();
+            // A REPORT, so the only thing it writes is what the CLOCK already owes every
+            // instance at this instant — an instance whose deletion instant has passed is
+            // gone, and the applications held inside it, with their assignments, with it.
+            // The same transitions a read made a moment later would have applied anyway.
+            store.on_request(&region, ::std::time::SystemTime::now());
+
+            // The assignments are enumerated UNDER an application, so an `ApplicationArn`
+            // nothing holds is the modelled `ResourceNotFoundException` rather than an empty
+            // page, which would read as "this application has no principal assigned".
+            if store.application(&input.application_arn).is_none() {
+                return Err(
+                    ListApplicationAssignmentsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::application_not_found_message(
+                                &input.application_arn,
+                            )),
+                            // The model's `ResourceNotFoundExceptionReason` enum carries only
+                            // KMS key states, none of which this refusal is.
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // Exactly the stored rows of this application, keyed and ordered by the
+            // principal's (type, id) — both the page order and the cursor order, and the
+            // part of an assignment's identity tuple the request has not already fixed.
+            let mut rows: Vec<(String, ApplicationAssignment)> = store
+                .application_assignments
+                .iter()
+                .filter(|record| record.application_arn == input.application_arn)
+                .map(|record| (record.page_key(), record.to_shape()))
+                .collect();
+            rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+            rows
+        };
+
+        // `MaxResults` carries the model's own range (1..100), already enforced before this
+        // handler runs; `page` clamps an absent one to the same ceiling.
+        let (application_assignments, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListApplicationAssignmentsOutput {
+            application_assignments: Some(application_assignments),
+            next_token,
+        })
     }
 }
