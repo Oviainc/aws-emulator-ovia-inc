@@ -20,18 +20,21 @@
 //! 3. The recurrence must describe a schedule: `RecurrenceSettings` carries the daily,
 //!    weekly and monthly settings lists, and one carrying none of them says when no shift
 //!    ever starts, so it is refused with the modelled `ValidationException`.
-//! 4. `ContactIds` — "the Amazon Resource Names (ARNs) of the contacts to add to the
+//! 4. `TimeZoneId` must name a zone of the IANA time zone database
+//!    ([`crate::state::check_time_zone_id`]): the rotation's shifts are computed in that
+//!    zone, so a name no zone database resolves is refused rather than stored.
+//! 5. `ContactIds` — "the Amazon Resource Names (ARNs) of the contacts to add to the
 //!    rotation" — must name stored contacts; the first that does not answers the modelled
 //!    `ResourceNotFoundException` (HTTP 404).
+//! 6. `Recurrence.NumberOfOnCalls` must be met by that team
+//!    ([`crate::state::check_number_of_on_calls`]): the members on call concurrently are
+//!    members of this rotation's team, so a rotation cannot put more of them on call at once
+//!    than it has.
 //!
 //! `StartTime` is optional on the request but NOT on the rotation: the create assigns the
 //! rotation's effective start time — the named instant, or the instant it is stored when
 //! the request names none — and persists it, so `GetRotation` (whose `StartTime` is
 //! modelled required) and `ListRotations` report the same single value for one rotation.
-//!
-//! `TimeZoneId` is stored as given: the model constrains it by length and pattern and
-//! documents only the IANA format of the value, not the set of zone names the service
-//! accepts, so refusing a name here would refuse requests AWS admits.
 //!
 //! `Name` is NOT the rotation's identity: the model declares no conflict error for this
 //! operation, so two rotations may carry the same name, and each create mints its own ARN
@@ -199,7 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{check_recurrence, rotation_arn, RotationRecord};
+        use crate::state::{
+            check_number_of_on_calls, check_recurrence, check_time_zone_id, rotation_arn,
+            RotationRecord,
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateRotationErrorModeled::InternalServerException(
@@ -228,6 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler makes, so the refusals cannot drift apart.
         check_recurrence(&input.recurrence).map_err(validation)?;
 
+        // The zone the rotation's shifts are read in, resolved against the IANA zone
+        // database — the same reading `UpdateRotation` gives the zone it installs.
+        check_time_zone_id(&input.time_zone_id).map_err(validation)?;
+
         // Every contact on the rotation team must exist.
         if let Some(missing) = input
             .contact_ids
@@ -243,6 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // How many of that team can be on call at once is bounded by the team itself.
+        check_number_of_on_calls(&input.recurrence, input.contact_ids.len()).map_err(validation)?;
 
         // A retried create carrying the token its first call carried is the SAME call, so
         // long as it still names the same rotation name. A token reused with a DIFFERENT
