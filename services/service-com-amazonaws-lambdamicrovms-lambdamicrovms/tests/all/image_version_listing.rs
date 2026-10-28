@@ -14,9 +14,8 @@
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
 //! (`call`, `image_body`, …) is the one `microvm_lifecycle` owns; the listing's own
-//! harness keeps the shared engine so a test can hold an image of SEVERAL versions,
-//! which no implemented operation mints yet (`UpdateMicrovmImage`, which does, is still
-//! a scaffold stub).
+//! harness keeps the shared engine so a test can hold an image of SEVERAL versions
+//! without driving an update for each.
 
 use std::sync::Arc;
 
@@ -66,7 +65,7 @@ fn emulator_with_store() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions`, with whatever `query`
 /// adds to the query string.
-async fn list_versions(
+pub(crate) async fn list_versions(
     router: &MultiServiceRouter,
     identifier: &str,
     query: &str,
@@ -102,8 +101,7 @@ async fn create_image(router: &MultiServiceRouter, name: &str, extra: Value) -> 
 /// create persisted under a version of its own, with its build already settled.
 ///
 /// Writing the records the handlers read is what lets a listing test hold an image of
-/// several versions: the only operation that mints a further version
-/// (`UpdateMicrovmImage`) is still a scaffold stub.
+/// several versions without driving an `UpdateMicrovmImage` for each.
 fn seed_versions(engine: &engine::InMemoryEngine, name: &str, versions: &[&str]) {
     let state = service_state(engine).expect("the service's own store");
     let mut store = state.lock();

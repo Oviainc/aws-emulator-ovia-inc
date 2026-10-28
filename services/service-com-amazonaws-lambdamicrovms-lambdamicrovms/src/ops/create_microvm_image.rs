@@ -342,26 +342,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let base_image_version = Some(input.base_image_version.unwrap_or_else(|| {
             store.resolve_base_image_version(&input.base_image_arn)
         }));
-        let egress_network_connectors = match input.egress_network_connectors {
-            Some(connectors) if !connectors.is_empty() => connectors,
-            _ => vec![crate::state::managed_network_connector_arn(
-                &region,
-                crate::state::DEFAULT_EGRESS_NETWORK_CONNECTOR,
-            )],
-        };
-        let cpu_configurations = match input.cpu_configurations {
-            Some(configurations) if !configurations.is_empty() => configurations,
-            _ => crate::state::default_cpu_configurations(),
-        };
-        let resources = match input.resources {
-            Some(resources) if !resources.is_empty() => resources,
-            _ => crate::state::default_resources(),
-        };
-        let logging = Some(
-            input
-                .logging
-                .unwrap_or_else(|| crate::state::default_logging(&input.name)),
+        // The resolution is shared with every other operation that mints a version, so
+        // the records a create and an update persist cannot disagree about it.
+        let egress_network_connectors = crate::state::resolve_egress_network_connectors(
+            &region,
+            input.egress_network_connectors,
         );
+        let cpu_configurations = crate::state::resolve_cpu_configurations(input.cpu_configurations);
+        let resources = crate::state::resolve_resources(input.resources);
+        let logging = Some(crate::state::resolve_logging(&input.name, input.logging));
 
         // The asynchronous build fans out into one build per target the accepted
         // `cpuConfigurations` ask for, so the version's build records exist from the

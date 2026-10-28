@@ -19,6 +19,8 @@ mod gone_image_delete_refusal;
 mod image_build_read_path;
 #[path = "all/image_build_scope.rs"]
 mod image_build_scope;
+#[path = "all/image_configuration_update.rs"]
+mod image_configuration_update;
 #[path = "all/image_listing.rs"]
 mod image_listing;
 #[path = "all/image_request_validation.rs"]

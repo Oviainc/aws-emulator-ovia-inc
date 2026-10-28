@@ -117,6 +117,23 @@ pub const MAX_MICROVM_IMAGES: usize = 500;
 /// and chosen for the same reasons as [`MAX_MICROVM_IMAGES`], on `RunMicrovm`.
 pub const MAX_ACTIVE_MICROVMS: usize = 500;
 
+/// How many versions one MicroVM image may hold.
+///
+/// The model declares `ServiceQuotaExceededException` on `UpdateMicrovmImage` — the
+/// operation that "triggers a new version build" and so mints a further version of an
+/// image — so a per-image ceiling is the service's own modelled behaviour. Modelled and
+/// chosen for the same reasons as [`MAX_MICROVM_IMAGES`]: high enough that no realistic
+/// use meets it, finite so one image's version history cannot grow without bound.
+pub const MAX_MICROVM_IMAGE_VERSIONS: usize = 500;
+
+/// The `message` of the 402 a configuration update answers for an image already holding
+/// [`MAX_MICROVM_IMAGE_VERSIONS`] versions. AWS publishes no wording for it, so — like
+/// the message the per-account image quota answers with — the sentence states the rule
+/// and the limit it is built from.
+pub fn too_many_image_versions_message() -> String {
+    format!("this MicroVM image already holds its limit of {MAX_MICROVM_IMAGE_VERSIONS} versions")
+}
+
 /// How long a `TERMINATED` MicroVM stays readable before its record is reclaimed, so
 /// terminated MicroVMs do not accumulate for the process's lifetime. AWS publishes no
 /// figure, so this span is chosen.
@@ -167,6 +184,38 @@ pub const IMAGE_STATE_CREATED: &str = "CREATED";
 /// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state an image
 /// carries while `DeleteMicrovmImage`'s asynchronous deletion is in flight.
 pub const IMAGE_STATE_DELETING: &str = "DELETING";
+/// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state an image
+/// carries while the build `UpdateMicrovmImage` triggered is in flight.
+pub const IMAGE_STATE_UPDATING: &str = "UPDATING";
+/// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state an image
+/// reaches once the build `UpdateMicrovmImage` triggered has succeeded.
+pub const IMAGE_STATE_UPDATED: &str = "UPDATED";
+
+/// Whether an image in `state` still has an asynchronous lifecycle operation of this
+/// service's own in flight.
+///
+/// `MicrovmImageState` names each lifecycle of an image by a pair: the progressive
+/// value the service reports while the work it started runs, and the settled value it
+/// reaches when that work ends. A record in a progressive value is one this service is
+/// still writing, so the next call that would start further work on it has nothing
+/// stable to start from.
+pub fn is_image_lifecycle_in_flight(state: &str) -> bool {
+    matches!(
+        state,
+        IMAGE_STATE_CREATING | IMAGE_STATE_UPDATING | IMAGE_STATE_DELETING
+    )
+}
+
+/// The `message` of the 400 a configuration update answers for an image whose own
+/// lifecycle work is still in flight ([`is_image_lifecycle_in_flight`]).
+///
+/// The refusal names the image by the ARN the service minted for it — the one identity
+/// of the record, whichever form `MicrovmImageIdentifier` the request addressed it by —
+/// and states the condition rather than the state it happened to be in (recorded AWS
+/// behaviour).
+pub fn image_not_updatable_message(image_arn: &str) -> String {
+    format!("Cannot update MicroVM Image in its current state: {image_arn}")
+}
 
 /// The version the FIRST build of a MicroVM image is minted as.
 ///
@@ -441,6 +490,60 @@ pub const DEFAULT_MINIMUM_MEMORY_IN_MIB: i32 = 2048;
 /// a request that names neither gets the service's own target: a log group under this
 /// service's own namespace, named for the image. The prefix is recorded AWS behaviour.
 pub const DEFAULT_LOG_GROUP_PREFIX: &str = "/aws/lambda-microvms";
+
+/// The `egressNetworkConnectors` a build request's own list resolves to: the
+/// connectors it asked for, or the AWS-managed egress connector in `region` when it
+/// asked for none.
+///
+/// `egressNetworkConnectors` are "the list of egress network connectors available to
+/// the MicroVM at runtime", so an accepted version records the connectors the MicroVM
+/// will actually have rather than nothing — see
+/// [`DEFAULT_EGRESS_NETWORK_CONNECTOR`]. The resolution is the one every operation
+/// that mints a version performs, so the versions a create and an update persist
+/// cannot disagree about it.
+pub fn resolve_egress_network_connectors(
+    region: &str,
+    requested: Option<Vec<String>>,
+) -> Vec<String> {
+    match requested {
+        Some(connectors) if !connectors.is_empty() => connectors,
+        _ => vec![managed_network_connector_arn(
+            region,
+            DEFAULT_EGRESS_NETWORK_CONNECTOR,
+        )],
+    }
+}
+
+/// The `cpuConfigurations` a build request's own list resolves to: the configurations
+/// it asked for, or the service's own ([`default_cpu_configurations`]) when it asked
+/// for none. Resolved for every minted version, as
+/// [`resolve_egress_network_connectors`] is.
+pub fn resolve_cpu_configurations(
+    requested: Option<Vec<CpuConfiguration>>,
+) -> Vec<CpuConfiguration> {
+    match requested {
+        Some(configurations) if !configurations.is_empty() => configurations,
+        _ => default_cpu_configurations(),
+    }
+}
+
+/// The `resources` a build request's own list resolves to: the requirement it asked
+/// for, or the service's own floor ([`default_resources`]) when it asked for none.
+/// Resolved for every minted version, as [`resolve_egress_network_connectors`] is.
+pub fn resolve_resources(requested: Option<Vec<Resources>>) -> Vec<Resources> {
+    match requested {
+        Some(resources) if !resources.is_empty() => resources,
+        _ => default_resources(),
+    }
+}
+
+/// The `logging` a build request resolves to for the image named `name`: the
+/// configuration it asked for, or this service's own ([`default_logging`]) when it
+/// named neither arm of the union. Resolved for every minted version, as
+/// [`resolve_egress_network_connectors`] is.
+pub fn resolve_logging(name: &str, requested: Option<Logging>) -> Logging {
+    requested.unwrap_or_else(|| default_logging(name))
+}
 
 /// The `cpuConfigurations` an image gets when the request names none.
 pub fn default_cpu_configurations() -> Vec<CpuConfiguration> {
@@ -897,8 +1000,13 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                         }
                     }
                 }
+                // The build settling ends the lifecycle that started it: each
+                // progressive `MicrovmImageState` reaches its own settled value, and a
+                // record already in a settled one is left as it is.
                 if image.state == IMAGE_STATE_CREATING {
                     image.state = IMAGE_STATE_CREATED.to_string();
+                } else if image.state == IMAGE_STATE_UPDATING {
+                    image.state = IMAGE_STATE_UPDATED.to_string();
                 }
             }
         }

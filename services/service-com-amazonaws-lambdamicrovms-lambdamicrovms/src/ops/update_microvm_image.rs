@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMicrovmImage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMicrovmImage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMicrovmImage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Re-configures a MicroVM image this account holds: the request carries the whole
+//! configuration (PUT semantics), so the call mints a FURTHER
+//! [`crate::state::MicrovmImageVersion`] on the stored [`crate::state::MicrovmImage`]
+//! rather than editing the one already there, and the image is reported `UPDATING`
+//! with that version's build in flight. A later read materialises `UPDATED`, and the
+//! new version becomes the image's active one, once the clock has made the build due.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +142,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    ComAmazonawsLambdamicrovmsLambdamicrovmsState as ServiceState, MicrovmImage,
+    MicrovmImageVersion, MintedResource,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -218,18 +221,292 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMicrovmImage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMicrovmImageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let updated_at = crate::state::now_datetime();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // `clientToken` is this operation's `@idempotencyToken`, so a retry of a call
+        // that already minted a version reports that version rather than minting a
+        // second build of the same configuration.
+        if let Some((image, version)) = replayed(&store, input.client_token.as_deref()) {
+            return Ok(output_of(image, version));
+        }
+
+        // The AUTHORIZATION verdict, decided BEFORE any lookup: an identifier in the
+        // AWS-OWNED namespace names an image of AWS's own catalogue, which no account
+        // may re-configure — denied rather than reported missing, so a 404 never tells
+        // a caller with no permission on the identifier whether it exists.
+        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
+            return Err(UpdateMicrovmImageErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage": a value that
+        // is neither an id this account holds nor a well-formed ARN addresses nothing
+        // this API can ever name, which is a bad REQUEST (400) rather than a resource
+        // that happens to be missing (404) — the same separation the read path makes.
+        let reference = store.resolve_image_reference(&input.image_identifier);
+        if matches!(reference, crate::state::ImageReference::Malformed) {
+            return Err(validation(crate::state::invalid_arn_format_message(
+                &input.image_identifier,
+            )));
+        }
+
+        // The REQUEST is validated before anything is looked up or written, and on the
+        // same rules the create applies to the same members: a request that is itself
+        // invalid can never build, whatever this account holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMicrovmImage"))
+        // `codeArtifact$uri` is "The URI of the code artifact in Amazon S3" and the
+        // build resolves that location before anything is persisted.
+        let CodeArtifact::Uri(code_artifact_uri) = &input.code_artifact;
+        if crate::state::s3_object_uri(code_artifact_uri).is_none() {
+            return Err(validation(
+                crate::state::CODE_ARTIFACT_URI_REQUIREMENT.to_string(),
+            ));
+        }
+
+        // `baseImageArn` is "The ARN of the base MicroVM image", resolved before the
+        // build is scheduled: a reference into the AWS-published catalogue must name an
+        // entry of it, and one into this account's own namespace an image this account
+        // holds. A reference into neither namespace names nothing this emulator holds
+        // and is taken as given rather than refused.
+        let base_image_resolves =
+            match crate::state::managed_microvm_image_id(&input.base_image_arn) {
+                Some(image_id) => crate::state::is_published_managed_base_image(image_id),
+                None => {
+                    !crate::state::is_own_microvm_image_arn(&input.base_image_arn)
+                        || store.image(&input.base_image_arn).is_some()
+                }
+            };
+        if !base_image_resolves {
+            return Err(validation(crate::state::base_image_not_found_message(
+                &input.base_image_arn,
+            )));
+        }
+
+        let crate::state::ImageReference::Resolved(name) = reference else {
+            return Err(not_found(&input.image_identifier));
+        };
+        let Some(image) = store.images.get(&name) else {
+            return Err(not_found(&input.image_identifier));
+        };
+
+        // An image whose own lifecycle work is still in flight is not a record this
+        // call can build the next version from: `MicrovmImageState`'s progressive
+        // values mark the spans this service is still writing the record itself, so the
+        // update is refused for as long as one is in flight.
+        if crate::state::is_image_lifecycle_in_flight(&image.state) {
+            return Err(validation(crate::state::image_not_updatable_message(
+                &image.image_arn,
+            )));
+        }
+
+        // "Updates the configuration of a MicroVM image and triggers a new version
+        // build": the configuration the request carries becomes a FURTHER version of
+        // the image, named by the next `major.minor` after the ones it already holds,
+        // so every version the image has built stays readable.
+        //
+        // The image's version ceiling: the modelled 402 rather than a version history
+        // that grows without bound.
+        if image.versions.len() >= crate::state::MAX_MICROVM_IMAGE_VERSIONS {
+            return Err(UpdateMicrovmImageErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::too_many_image_versions_message()),
+                    resource_id: Some(image.image_arn.clone()),
+                    resource_type: Some("MicrovmImage".to_string()),
+                    service_code: Some("lambda".to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        let image_version = crate::state::next_image_version(
+            image.versions.keys().map(::std::string::String::as_str),
+        );
+        // `tags` is not an input of this operation, so the new version carries the tag
+        // set the image carries — the one the tagging operations maintain.
+        let tags = image.tags.clone();
+
+        // A member the request OMITS whose value the service supplies is resolved here
+        // and stored, through the same resolution the create performs, so the version
+        // this update persists reports the configuration the service actually accepted.
+        let base_image_version = Some(
+            input
+                .base_image_version
+                .unwrap_or_else(|| store.resolve_base_image_version(&input.base_image_arn)),
+        );
+        let egress_network_connectors = crate::state::resolve_egress_network_connectors(
+            &region,
+            input.egress_network_connectors,
+        );
+        let cpu_configurations = crate::state::resolve_cpu_configurations(input.cpu_configurations);
+        let resources = crate::state::resolve_resources(input.resources);
+        let logging = Some(crate::state::resolve_logging(&name, input.logging));
+
+        // The build of the new version fans out into one build per target its accepted
+        // `cpuConfigurations` ask for, exactly as the create's does.
+        let builds = store.mint_builds(&cpu_configurations, updated_at);
+
+        let version = MicrovmImageVersion {
+            image_version: image_version.clone(),
+            state: crate::state::VERSION_STATE_IN_PROGRESS.to_string(),
+            status: crate::state::VERSION_STATUS_INACTIVE.to_string(),
+            base_image_arn: input.base_image_arn,
+            base_image_version,
+            build_role_arn: input.build_role_arn,
+            description: input.description,
+            code_artifact: input.code_artifact,
+            logging,
+            egress_network_connectors,
+            cpu_configurations,
+            resources,
+            additional_os_capabilities: input.additional_os_capabilities.unwrap_or_default(),
+            hooks: input.hooks,
+            environment_variables: crate::state::sorted_map(input.environment_variables),
+            // The version is minted by THIS call, so it is created now; minting it is
+            // also its first write, so both stamps are this instant.
+            created_at: updated_at,
+            updated_at: Some(updated_at),
+            tags,
+            // The build is asynchronous: the version completes, and with it the image's
+            // UPDATING -> UPDATED move, once the clock makes it due. Until then the
+            // version the image was serving stays its active one.
+            build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
+            builds,
+        };
+
+        let Some(image) = store.images.get_mut(&name) else {
+            return Err(unavailable());
+        };
+        image.versions.insert(image_version.clone(), version);
+        image.state = crate::state::IMAGE_STATE_UPDATING.to_string();
+        image.updated_at = Some(updated_at);
+        let image_arn = image.image_arn.clone();
+
+        if let Some(token) = input.client_token {
+            store.record_minted(
+                "UpdateMicrovmImage",
+                &token,
+                MintedResource::Image {
+                    image_arn,
+                    image_version: image_version.clone(),
+                },
+                now,
+            );
+        }
+
+        // The response is the PERSISTED record, read back out of the store.
+        let Some((image, version)) = stored(&store, &name, &image_version) else {
+            return Err(unavailable());
+        };
+        Ok(output_of(image, version))
+    }
+}
+
+/// The modelled server error for a store this handler cannot reach.
+fn unavailable() -> UpdateMicrovmImageError {
+    UpdateMicrovmImageErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the MicroVM image store is unavailable".to_string()),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// The modelled 400 for a request this operation cannot accept, carrying `message`.
+fn validation(message: String) -> UpdateMicrovmImageError {
+    UpdateMicrovmImageErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 404 for an `imageIdentifier` that resolves to no image this account
+/// holds, built from the identifier the request carried.
+///
+/// `ResourceNotFoundException` models `message` as its only required member;
+/// `resourceType` and `resourceId` are optional and this service leaves them unset, so
+/// the message is the whole envelope.
+fn not_found(identifier: &str) -> UpdateMicrovmImageError {
+    UpdateMicrovmImageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::image_not_found_message(identifier),
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
+}
+
+/// The image and version `client_token` already minted on THIS operation, if it minted
+/// one.
+///
+/// The replay returns what the token minted whatever the retried request now carries:
+/// this service models no idempotent-parameter-mismatch error, so a retry whose body
+/// differs is answered with the version that token built rather than with an unmodelled
+/// error.
+fn replayed<'a>(
+    store: &'a ServiceState,
+    client_token: Option<&str>,
+) -> Option<(&'a MicrovmImage, &'a MicrovmImageVersion)> {
+    let MintedResource::Image {
+        image_arn,
+        image_version,
+    } = store.minted_by("UpdateMicrovmImage", client_token)?
+    else {
+        return None;
+    };
+    let image = store.image(image_arn)?;
+    Some((image, image.versions.get(image_version)?))
+}
+
+/// The persisted image named `name` together with one of its versions.
+fn stored<'a>(
+    store: &'a ServiceState,
+    name: &str,
+    image_version: &str,
+) -> Option<(&'a MicrovmImage, &'a MicrovmImageVersion)> {
+    let image = store.images.get(name)?;
+    Some((image, image.versions.get(image_version)?))
+}
+
+/// The modelled response for a stored image and the version this call minted.
+///
+/// `updatedAt` is `@required` on this response, and the image this operation answers
+/// for has just been written, so the stamp the record carries is the one reported; a
+/// record carrying none would be one no write has ever touched.
+fn output_of(image: &MicrovmImage, version: &MicrovmImageVersion) -> UpdateMicrovmImageOutput {
+    UpdateMicrovmImageOutput {
+        image_arn: image.image_arn.clone(),
+        name: image.name.clone(),
+        state: image.state.clone(),
+        latest_active_image_version: image.latest_active_image_version.clone(),
+        latest_failed_image_version: image.latest_failed_image_version.clone(),
+        created_at: image.created_at,
+        base_image_arn: version.base_image_arn.clone(),
+        base_image_version: version.base_image_version.clone(),
+        build_role_arn: version.build_role_arn.clone(),
+        description: version.description.clone(),
+        code_artifact: version.code_artifact.clone(),
+        logging: version.logging.clone(),
+        egress_network_connectors: crate::state::wire_list(&version.egress_network_connectors),
+        cpu_configurations: crate::state::wire_list(&version.cpu_configurations),
+        resources: crate::state::wire_list(&version.resources),
+        additional_os_capabilities: crate::state::wire_list(&version.additional_os_capabilities),
+        hooks: version.hooks.clone(),
+        environment_variables: crate::state::wire_map(&version.environment_variables),
+        updated_at: image
+            .updated_at
+            .or(version.updated_at)
+            .unwrap_or(version.created_at),
+        image_version: version.image_version.clone(),
     }
 }
