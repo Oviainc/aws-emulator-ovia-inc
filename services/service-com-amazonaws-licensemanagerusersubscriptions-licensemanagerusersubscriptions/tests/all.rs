@@ -23,6 +23,8 @@ mod identity_provider_subscriptions;
 mod instance_authorization_is_hoisted;
 #[path = "all/instance_fleet_resolution.rs"]
 mod instance_fleet_resolution;
+#[path = "all/instance_gate_is_one_function.rs"]
+mod instance_gate_is_one_function;
 #[path = "all/instance_products_follow_the_registrations.rs"]
 mod instance_products_follow_the_registrations;
 #[path = "all/instance_status_check_date.rs"]
