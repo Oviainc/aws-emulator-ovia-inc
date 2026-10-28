@@ -117,8 +117,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::stack_sets::{
-    detailed_status, instance_status, new_instance_stack_name, operation_action,
-    operation_status, target_accounts, StoredStackInstance,
+    detailed_status, distinct, instance_status, new_instance_stack_name, operation_action,
+    operation_id_already_exists, operation_status, refuse_oversized_parameters,
+    region_does_not_exist, requested_targets, stack_set_has_no_template, unknown_target_region,
+    StoredStackInstance,
 };
 use crate::state::{status, StoredStack};
 
@@ -220,7 +222,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CreateStackInstances",
             ));
         };
-        let accounts = target_accounts(input.accounts.as_deref(), input.deployment_targets.as_ref())
+        // "You can specify Accounts or DeploymentTargets, but not both": a request naming
+        // its targets wrongly is wrong whatever the store holds, so it is refused HERE,
+        // before any stack set is resolved. What the targeting means for the stack set this
+        // request names — whose permission model decides whether OUs are targets at all —
+        // is resolved under the lock below.
+        let targets =
+            requested_targets(input.accounts.as_deref(), input.deployment_targets.as_ref())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "A list of StackSet parameters whose values you want to override in the selected
+        // stack instances": a parameter the request supplies is a parameter of the template
+        // it is resolved against, so a list longer than a template can declare is refused
+        // HERE, before the store is read — the resolution below runs once per instance this
+        // request deploys, so the parameter count is a factor of its work.
+        refuse_oversized_parameters("ParameterOverrides", input.parameter_overrides.as_deref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "You must specify at least one value for Regions."
         if input.regions.is_empty() {
@@ -228,13 +243,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You must specify at least one value for Regions",
             ));
         }
+        // Every Region named has to be a Region that exists: a deployment to one that does
+        // not could never carry a stack, so the whole request is refused and no instance is
+        // deployed to the Regions beside it either.
+        if let Some(unknown) = unknown_target_region(&input.regions) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                region_does_not_exist(unknown),
+            ));
+        }
         // "Creates stack instances for the specified accounts, within the specified Amazon
         // Web Services Regions": one instance per account and Region pair, so the PRODUCT of
-        // the two lists is what this request asks the store to hold — and both lists are the
-        // caller's. A product past the ceiling one StackSet's instances are bounded by is
-        // refused HERE, before the store is read at all, so no oversized request drives work
-        // under the store lock.
-        let requested = accounts.len().saturating_mul(input.regions.len());
+        // the two lists — over their DISTINCT values, since a repeated account or Region
+        // names the same pair — is what this request asks the store to hold, and both lists
+        // are the caller's. A product past the ceiling one StackSet's instances are bounded
+        // by is refused HERE, before the store is read at all, and the product is recomputed
+        // under the lock from what the targeting really selects, so no oversized request
+        // drives work under the store lock.
+        let regions = distinct(input.regions.clone());
+        let requested = targets.accounts.len().saturating_mul(regions.len());
         if requested > crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET {
             return Err(CreateStackInstancesErrorModeled::LimitExceededException(
                 LimitExceededException {
@@ -259,7 +285,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the stack set says every instance deploys, read under a short lock so the
         // caller-sized template is processed below it rather than while every other
         // CloudFormation request waits.
-        let (stack_set_id, stack_set_name, template_body, parameters, capabilities, tags) = {
+        let (
+            accounts,
+            stack_set_id,
+            stack_set_name,
+            template_body,
+            parameters,
+            capabilities,
+            tags,
+        ) = {
             let mut store = state.lock();
             store.settle(now);
             let stack_set = store
@@ -273,6 +307,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
+            // Which accounts this targeting really selects for THIS stack set: the
+            // permission model the stack set carries is what says whether organizational
+            // units are targets of it at all.
+            let accounts = targets
+                .accounts_in(stack_set)
+                .map_err(|refusal| refusal.refuse("CreateStackInstances"))?;
+            // The product the ceilings below are read against is the RESOLVED selection's,
+            // not the request's literal account list: the pre-lock check is a cheap early
+            // reject over the accounts the request named, and this is the authoritative one.
+            let requested = accounts.len().saturating_mul(regions.len());
             // "Only one operation can be performed for a stack set at a given time": the
             // refusal names the StackSet it is about and the operation that still holds it.
             if let Some(in_flight) = stack_set.operation_in_flight() {
@@ -296,9 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateStackInstancesErrorModeled::OperationIdAlreadyExistsException(
                         OperationIdAlreadyExistsException {
-                            message: Some(format!(
-                                "Operation id {operation_id} already exists"
-                            )),
+                            message: Some(operation_id_already_exists(&operation_id)),
                         },
                     )
                     .into(),
@@ -338,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|instance| (instance.account.as_str(), instance.region.as_str()))
                 .collect();
             for account in &accounts {
-                for target_region in &input.regions {
+                for target_region in &regions {
                     if held.contains(&(account.as_str(), target_region.as_str())) {
                         return Err(
                             CreateStackInstancesErrorModeled::InvalidOperationException(
@@ -359,10 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(template_body) = stack_set.template_body.clone() else {
                 return Err(CreateStackInstancesErrorModeled::InvalidOperationException(
                     InvalidOperationException {
-                        message: Some(format!(
-                            "StackSet {} has no template to deploy",
-                            stack_set.stack_set_name
-                        )),
+                        message: Some(stack_set_has_no_template(&stack_set.stack_set_name)),
                     },
                 )
                 .into());
@@ -386,7 +425,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            for target_region in &input.regions {
+            for target_region in &regions {
                 if store
                     .live_stacks(target_region)
                     .count()
@@ -406,6 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             (
+                accounts,
                 stack_set.stack_set_id.clone(),
                 stack_set.stack_set_name.clone(),
                 template_body,
@@ -435,7 +475,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|parameter| named.contains(&parameter.key))
             .cloned()
             .collect();
-        let overrides = crate::state::parameters_in_force(&template_body, merged);
+        // The ONE reading of "the StackSet's parameters with this instance's overrides
+        // applied", shared with the operations that UPDATE an instance: a parameter the
+        // request did not override keeps the value the StackSet holds for it rather than
+        // falling back to the template's default.
+        let overrides = crate::state::parameters_in_force(
+            &template_body,
+            crate::state::stack_sets::parameters_with_overrides(&parameters, &merged),
+        );
         // Applying the template's transforms is caller-sized work, so it happens HERE,
         // between the two locks, and once for every instance this request deploys.
         let processed_template = crate::state::template::process(&template_body);
@@ -451,8 +498,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         > = {
             let mut store = state.lock();
             store.settle(now);
-            input
-                .regions
+            regions
                 .iter()
                 .map(|target_region| {
                     (target_region.clone(), store.exported_values(target_region))
@@ -468,7 +514,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let no_exports = ::std::collections::BTreeMap::new();
         let mut prepared: Vec<(StoredStack, String, String, Option<String>)> = Vec::new();
         for account in &accounts {
-            for target_region in &input.regions {
+            for target_region in &regions {
                 let stack_name = new_instance_stack_name(&stack_set_name);
                 let mut stack = StoredStack::new_processed(
                     crate::state::new_stack_id(target_region, &stack_name),

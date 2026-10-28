@@ -412,8 +412,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .count();
         if template_sources != 1 {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                "You must specify exactly one of TemplateBody, TemplateURL or \
-                 UsePreviousTemplate",
+                crate::state::ONE_TEMPLATE_SOURCE,
             ));
         }
         // A `TemplateURL` says WHERE the revised template is, not what it means: the object
