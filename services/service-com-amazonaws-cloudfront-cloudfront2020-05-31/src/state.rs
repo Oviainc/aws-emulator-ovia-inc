@@ -2404,6 +2404,10 @@ impl StoredDistributionTenant {
     /// Whether a viewer asking for `domain` is routed to this tenant: the tenant holds the
     /// domain AND the domain is not still waiting for a managed certificate
     /// ([`Self::domain_pending_validation`]).
+    ///
+    /// This is also what makes the tenant's claim on the domain an ENFORCED one
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]): a domain nothing
+    /// routes yet is a domain no route collides with.
     pub fn serves_domain(&self, domain: &str) -> bool {
         self.holds_domain(domain) && !self.domain_pending_validation(domain)
     }
@@ -4304,29 +4308,49 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// domain only once CloudFront can serve it: a domain still waiting for the tenant's
     /// CloudFront managed certificate to be validated is not in it yet
     /// ([`StoredDistributionTenant::domain_pending_validation`]), which is why a by-domain
-    /// read of it answers "no such entity" while the certificate is pending. Whether the
-    /// domain is CLAIMED is the separate question
-    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]) a second claim on
-    /// it is refused by: a pending domain is claimed from the moment the tenant is created.
+    /// read of it answers "no such entity" while the certificate is pending. It is also the
+    /// index a second claim on the domain is refused against
+    /// ([`ComAmazonawsCloudfrontCloudfront20200531State::domain_in_use`]): a claim is
+    /// enforced from the moment it can be served, not from the moment it is written down.
+    ///
+    /// Several tenants may therefore hold the same domain while none of their claims is
+    /// served yet, and the validation that resolves such a race decides ONE of them: the
+    /// EARLIEST claim validated for a domain is the one it routes to, so the map answers the
+    /// first-created serving tenant and a later duplicate never takes a domain away from
+    /// it. The id breaks a tie, so the answer is a property of the store rather than of the
+    /// walk.
     pub fn distribution_tenant_by_domain(&self, domain: &str) -> Option<&StoredDistributionTenant> {
         self.distribution_tenants
             .values()
-            .find(|tenant| tenant.serves_domain(domain))
+            .filter(|tenant| tenant.serves_domain(domain))
+            .min_by(|left, right| {
+                (left.created_time, left.id.as_str()).cmp(&(right.created_time, right.id.as_str()))
+            })
     }
 
-    /// Whether `domain` is already associated with a CloudFront resource this store holds:
-    /// a domain of a distribution tenant other than `except_tenant_id`, or an alias of a
-    /// distribution.
+    /// Whether `domain` is already SERVED by a CloudFront resource this store holds: a
+    /// domain of a distribution tenant other than `except_tenant_id` that the tenant can
+    /// already be reached at, or an alias of a distribution.
     ///
     /// "The CNAME specified is already defined for CloudFront": one domain name routes to
     /// at most one CloudFront resource, so the check spans every resource kind that can
     /// claim one. `except_tenant_id` is the tenant a mutation is rewriting, whose own
     /// domains are no conflict with itself.
+    ///
+    /// A claim counts only once the certificate it is served over has been VALIDATED, which
+    /// is exactly when the domain enters the host-to-tenant map
+    /// ([`StoredDistributionTenant::serves_domain`]): until then nothing resolves the domain
+    /// to the resource, so there is no route for a second claim to collide with and the
+    /// claim is not enforced. A tenant whose CloudFront managed certificate is still
+    /// pending validation therefore does not take a domain, while a tenant whose
+    /// certificate has been issued — and a distribution's alias, which cannot be declared
+    /// without a custom viewer certificate that covers it
+    /// ([`alias_certificate_mismatch`]) — does.
     pub fn domain_in_use(&self, domain: &str, except_tenant_id: Option<&str>) -> bool {
-        let held_by_tenant = self.distribution_tenants.values().any(|tenant| {
-            Some(tenant.id.as_str()) != except_tenant_id && tenant.holds_domain(domain)
+        let served_by_tenant = self.distribution_tenants.values().any(|tenant| {
+            Some(tenant.id.as_str()) != except_tenant_id && tenant.serves_domain(domain)
         });
-        held_by_tenant
+        served_by_tenant
             || self.distributions.values().any(|distribution| {
                 distribution
                     .config
@@ -9616,17 +9640,22 @@ pub fn distribution_tenant_already_exists(name: &str) -> EntityAlreadyExists {
     }
 }
 
-/// The modelled `CNAMEAlreadyExists` (HTTP 409) for a domain another CloudFront resource
-/// already claims.
+/// The sentence `CNAMEAlreadyExists` carries, on the wire.
 ///
-/// The sentence is CloudFront's own for this code, with the domain that conflicts named at
-/// the end of it so a caller that submitted several learns which one.
-pub fn cname_already_exists(domain: &str) -> CNAMEAlreadyExists {
+/// The WIRE text — what the recorded service answers this code with — and the WHOLE of it:
+/// CloudFront states the condition without naming any of the names the request submitted,
+/// so nothing from the request is appended to it. Like
+/// [`NO_SUCH_ORIGIN_ACCESS_IDENTITY_MESSAGE`] it differs from the sentence the MODEL's
+/// documentation of the error shape uses for the same rule ("The CNAME specified is already
+/// defined for CloudFront."); do not "correct" this constant to the documentation sentence.
+pub const CNAME_ALREADY_EXISTS_MESSAGE: &str =
+    "One or more of the CNAMEs you provided are already associated with a different resource.";
+
+/// The modelled `CNAMEAlreadyExists` (HTTP 409) for a domain another CloudFront resource
+/// already serves.
+pub fn cname_already_exists() -> CNAMEAlreadyExists {
     CNAMEAlreadyExists {
-        message: Some(format!(
-            "One or more of the CNAMEs you provided are already associated with a different \
-             resource: {domain}"
-        )),
+        message: Some(CNAME_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 

@@ -233,6 +233,8 @@ mod tenant_domain_certificate_gate;
 mod tenant_invalidation_batch_quantity;
 #[path = "all/tenant_invalidations.rs"]
 mod tenant_invalidations;
+#[path = "all/tenant_unvalidated_domain_claim.rs"]
+mod tenant_unvalidated_domain_claim;
 #[path = "all/tenant_web_acl_association.rs"]
 mod tenant_web_acl_association;
 #[path = "all/tenant_web_acl_association_scope.rs"]

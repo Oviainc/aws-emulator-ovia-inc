@@ -48,6 +48,7 @@ use crate::distribution_lifecycle::{
     call, create_distribution, emulator, Answer, Node, ACCOUNT_ID, API_VERSION,
     CUSTOM_VIEWER_CERTIFICATE,
 };
+use crate::managed_certificate_domain_ownership::await_certificate_issuance;
 
 // ---------------------------------------------------------------------------
 // Calling the distribution tenant surface
@@ -791,10 +792,12 @@ async fn a_name_names_at_most_one_distribution_tenant() {
 }
 
 /// "The CNAME specified is already defined for CloudFront": a domain routes to at most one
-/// CloudFront resource, so a create claiming a domain another tenant holds — or an alias a
-/// distribution holds — is refused with `CNAMEAlreadyExists` (HTTP 409) and stores
-/// nothing. DNS names are case-insensitive, so the case the domain is written in does not
-/// make it a different domain.
+/// CloudFront resource, so a create claiming a domain another tenant is already SERVED at —
+/// or an alias a distribution holds — is refused with `CNAMEAlreadyExists` (HTTP 409) and
+/// stores nothing. DNS names are case-insensitive, so the case the domain is written in does
+/// not make it a different domain. A claim is enforced only once the certificate it waits on
+/// has been validated, which is what [`crate::tenant_unvalidated_domain_claim`] is about and
+/// why the holder's issuance is waited out here.
 #[tokio::test]
 async fn a_domain_routes_to_at_most_one_cloudfront_resource() {
     let router = emulator();
@@ -816,6 +819,9 @@ async fn a_domain_routes_to_at_most_one_cloudfront_resource() {
         "case {}: expected HTTP 201, got {} with {}",
         holder.case, created.status, created.raw
     );
+    // The holder's domains are taken only once the certificate the create asked for has
+    // been issued, so the clock is given the span it owes that issuance in.
+    await_certificate_issuance().await;
 
     // Rows: the same domain again, the same domain in another case, the other domain of
     // the same tenant, an alias a DISTRIBUTION holds, and one domain of a pair where the

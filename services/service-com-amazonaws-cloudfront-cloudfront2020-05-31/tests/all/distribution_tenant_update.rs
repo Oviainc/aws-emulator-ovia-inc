@@ -54,6 +54,7 @@ use crate::distribution_tenant_lifecycle::{
     multi_tenant_distribution,
 };
 use crate::managed_certificate_details::get_managed_certificate_details;
+use crate::managed_certificate_domain_ownership::await_certificate_issuance;
 use crate::tenant_web_acl_association::{read_tenant, web_acl_of};
 use crate::web_acl_association::{Stated, WEB_ACLS};
 
@@ -976,6 +977,10 @@ async fn an_inadmissible_update_is_refused_and_changes_nothing() {
     let distribution_id = multi_tenant_distribution(&router, "ref-tenant-update-refused").await;
     let standard = standard_distribution(&router, "ref-tenant-update-standard").await;
     let neighbour = create_tenant(&router, &distribution_id, "neighbour", "neighbour").await;
+    // The neighbour's domain is taken only once the certificate its create asked for has
+    // been issued, so the clock is given the span it owes that issuance in before the row
+    // that claims the domain runs.
+    await_certificate_issuance().await;
     let world = World {
         other_tenant_domain: neighbour.domain.clone(),
         distribution_alias: standard.1,

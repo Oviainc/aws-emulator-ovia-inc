@@ -16,7 +16,7 @@
 //!   well-formed token that is not the stored one is a failed precondition;
 //! * `Domains` is where the tenant's viewers reach it, so a stated domain list is checked
 //!   for shape, for a conflict with any domain or alias another CloudFront resource in this
-//!   emulator already claims, against the documented per-tenant domain quota, and — for
+//!   emulator is already SERVED at, against the documented per-tenant domain quota, and — for
 //!   every domain the tenant does not hold ALREADY — for a proof that the account controls
 //!   it, exactly as the create that first bound a domain to this tenant checked;
 //! * the parameter values the tenant ends up with have to satisfy the multi-tenant
@@ -349,12 +349,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The CNAME specified is already defined for CloudFront": a domain routes to at
-        // most one CloudFront resource, across tenants and distribution aliases alike. The
-        // tenant being rewritten is excluded — its own domains are no conflict with itself.
+        // most one CloudFront resource, across tenants and distribution aliases alike, so
+        // the conflict is with a domain another resource is already SERVED at. The tenant
+        // being rewritten is excluded — its own domains are no conflict with itself — and a
+        // domain whose only other claimant cannot be reached at it yet, because the
+        // certificate that claim waits on has not been validated, routes nowhere and so
+        // takes nothing.
         for domain in &effective_domains {
             if store.domain_in_use(domain, Some(&input.id)) {
                 return Err(UpdateDistributionTenantErrorModeled::CNAMEAlreadyExists(
-                    crate::state::cname_already_exists(domain),
+                    crate::state::cname_already_exists(),
                 )
                 .into());
             }

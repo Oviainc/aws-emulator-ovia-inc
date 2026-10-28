@@ -10,10 +10,13 @@
 //!
 //! * while a tenant's CloudFront managed certificate is still `pending-validation`, every
 //!   domain it covers answers `EntityNotFound` (HTTP 404) with the one sentence a read of an
-//!   unknown tenant carries, even though the tenant itself is readable by id and the domain
-//!   is already CLAIMED (a second tenant asking for it is refused `CNAMEAlreadyExists`);
+//!   unknown tenant carries, even though the tenant itself is readable by id — and because
+//!   nothing routes the domain yet, it is not taken either: a second tenant naming the
+//!   identical domain is ACCEPTED (the duplicate-claim rule itself is
+//!   [`crate::tenant_unvalidated_domain_claim`]'s);
 //! * once the issuance the clock owes is due, the same read answers HTTP 200 with that
-//!   tenant's `Id` and its current version — in any case the domain is written in;
+//!   tenant's `Id` and its current version — in any case the domain is written in, and the
+//!   EARLIEST of several claims on one domain is the one it routes to;
 //! * a tenant that asked for NO managed certificate waits for nothing: its domains resolve
 //!   from the moment the create returns.
 //!
@@ -274,26 +277,33 @@ async fn a_domain_resolves_to_its_tenant_once_its_certificate_is_issued() {
                     by_id.status, by_id.raw
                 );
 
-                // And the domain is CLAIMED from the moment the tenant was created: a
-                // second tenant asking for it is refused.
+                // And because nothing routes the domain while the claim waits on its
+                // certificate, the domain is not taken: a second tenant naming it is
+                // accepted, under an id of its own.
                 let second = Case {
                     case,
                     name: format!("{}-second", row.name),
                     domains: vec![row.domains[0].clone()],
                     validation_token_host: Some(self_hosted_token_host()),
                 };
-                let refused =
+                let accepted =
                     create_distribution_tenant(&router, &second.xml(&distribution_id)).await;
                 assert_eq!(
-                    refused.status, 409,
-                    "case {case}: expected a second claim on {:?} to be refused, got {} with {}",
-                    row.domains[0], refused.status, refused.raw
+                    accepted.status, 201,
+                    "case {case}: expected a second claim on the unvalidated {:?} to be \
+                     accepted, got {} with {}",
+                    row.domains[0], accepted.status, accepted.raw
                 );
-                assert_eq!(
-                    refused.error_code(),
-                    "CNAMEAlreadyExists",
-                    "case {case}: expected CNAMEAlreadyExists, got {}",
-                    refused.raw
+                let second_id = text(
+                    accepted.root(),
+                    "Id",
+                    case,
+                    "the second tenant",
+                    &accepted.raw,
+                );
+                assert_ne!(
+                    second_id, id,
+                    "case {case}: expected the second claim to mint its own id, got {second_id:?}"
                 );
 
                 await_certificate_issuance().await;
@@ -321,7 +331,9 @@ async fn a_domain_resolves_to_its_tenant_once_its_certificate_is_issued() {
         }
 
         // Now every domain resolves to this tenant, at the version the create handed back,
-        // in every case it is written in.
+        // in every case it is written in — including the one a second tenant also claimed
+        // while this one's certificate was pending: the EARLIEST claim on a domain is the
+        // one it routes to.
         for domain in &row.domains {
             for (form, written) in [
                 ("as submitted", domain.clone()),

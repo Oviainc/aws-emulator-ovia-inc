@@ -10,9 +10,9 @@
 //!   here and never derived from the request;
 //! * `Domains` is where the tenant's viewers reach it, so every domain is checked for
 //!   shape, for a conflict with any domain or alias another CloudFront resource in this
-//!   emulator already claims, against the documented per-tenant domain quota, and for a
-//!   PROOF that the account controls it — a tenant is bound to a domain only when this
-//!   call asks CloudFront to validate it (a `ManagedCertificateRequest`) or the domain
+//!   emulator is already SERVED at, against the documented per-tenant domain quota, and
+//!   for a PROOF that the account controls it — a tenant is bound to a domain only when
+//!   this call asks CloudFront to validate it (a `ManagedCertificateRequest`) or the domain
 //!   already resolves to a CloudFront resource in this account;
 //! * `Parameters` has to satisfy the multi-tenant distribution's
 //!   `TenantConfig$ParameterDefinitions`, and every caller-chosen list the request carries
@@ -325,11 +325,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The CNAME specified is already defined for CloudFront": a domain routes to at
-        // most one CloudFront resource, across tenants and distribution aliases alike.
+        // most one CloudFront resource, across tenants and distribution aliases alike — so
+        // the conflict is with a domain another resource is already SERVED at, which is the
+        // one index this store answers it from. A domain whose only claimant cannot be
+        // reached at it yet, because the certificate the claim waits on has not been
+        // validated, routes nowhere and so takes nothing: several tenants may stage a claim
+        // on it, and the validation decides which one it ends up routing to.
         for domain in &domains {
             if store.domain_in_use(domain, None) {
                 return Err(CreateDistributionTenantErrorModeled::CNAMEAlreadyExists(
-                    crate::state::cname_already_exists(domain),
+                    crate::state::cname_already_exists(),
                 )
                 .into());
             }
