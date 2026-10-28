@@ -522,6 +522,14 @@ pub const MARKER_SCOPE_USER_GROUPS: &str = "user-groups";
 /// read as a position among the instance profiles.
 pub const MARKER_SCOPE_INSTANCE_PROFILES: &str = "instance-profiles";
 
+/// The marker scope of the instance profiles ONE role is bound to, which
+/// `ListInstanceProfilesForRole` pages over. The role's key follows it, so a marker
+/// issued while paging one role's profiles names no position in another role's — and
+/// it is its OWN scope, so a token issued while paging the account's whole instance
+/// profile collection is not read as a position among one role's:
+/// see [`role_instance_profiles_marker_scope`].
+pub const MARKER_SCOPE_ROLE_INSTANCE_PROFILES: &str = "role-instance-profiles";
+
 /// The marker scope of the managed policies an account can read — the ones it holds
 /// itself and the ones AWS owns ([`AWS_MANAGED_POLICIES`]) — which `ListPolicies`
 /// pages over. It is its OWN scope, like the user and role collections, and ONE
@@ -3296,6 +3304,12 @@ const SERVICE_PROVISIONED_ROLE_ID_BASE: u64 = 1 << 63;
 /// The marker scope of the attachment set of the role keyed by `role_key`.
 pub fn role_attached_policies_marker_scope(role_key: &str) -> String {
     format!("{MARKER_SCOPE_ROLE_ATTACHED_POLICIES}:{role_key}")
+}
+
+/// The marker scope of the instance profiles the role keyed by `role_key` is bound to.
+/// See [`MARKER_SCOPE_ROLE_INSTANCE_PROFILES`].
+pub fn role_instance_profiles_marker_scope(role_key: &str) -> String {
+    format!("{MARKER_SCOPE_ROLE_INSTANCE_PROFILES}:{role_key}")
 }
 
 /// The marker scope of the membership of the group keyed by `group_key`.

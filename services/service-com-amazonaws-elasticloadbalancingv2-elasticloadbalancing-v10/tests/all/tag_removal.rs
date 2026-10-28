@@ -422,16 +422,16 @@ async fn a_removal_naming_a_resource_the_store_does_not_hold_is_refused_with_the
         // The framework's XML codec escapes the quotes a message carries, so the VALUE
         // is what is compared — through the crate's one reader for that encoding.
         let said = unescaped(&message(&refused));
-        // A removal selects its resources through a LIST, so the refusal is about the
-        // whole selection: the collection-level wording of the kind, naming no ARN.
-        assert_eq!(
-            said,
-            crate::tag_not_found_wording::collection_message(expected_code),
-            "case {case:?}: expected the service's wording, got {said:?}"
+        // The wording belongs to the KIND the ARN declares: the catalog of the templates
+        // lives in `all/tag_not_found_wording_by_kind.rs`, which is where the rule itself
+        // is pinned.
+        let expected = crate::tag_not_found_wording_by_kind::tag_not_found_message(
+            expected_code,
+            arn,
         );
-        assert!(
-            !said.contains(arn.as_str()),
-            "case {case:?}: expected a message naming no ARN, got {said:?}"
+        assert_eq!(
+            said, expected,
+            "case {case:?}: expected the service's wording {expected:?}, got {said:?}"
         );
 
         // A live resource named beside the absent one keeps every key: the removal is

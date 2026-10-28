@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateFirewallRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateFirewallRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateFirewallRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The association is a resource of its own
+//! ([`crate::state::FirewallRuleGroupAssociationRecord`]), which
+//! `GetFirewallRuleGroupAssociation`, `ListFirewallRuleGroupAssociations` and
+//! `DisassociateFirewallRuleGroup` resolve by the id this operation mints. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +180,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateFirewallRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateFirewallRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateFirewallRuleGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateFirewallRuleGroupErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `Name`'s pattern carries a negative lookahead, outside what the
+        // boundary validator's regex engine accepts, so it is enforced here —
+        // before the store is locked, so nothing is written.
+        if !crate::state::name_satisfies_pattern(&input.name) {
+            return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::name_pattern_violation(&input.name)),
+                },
+            )
+            .into());
+        }
+
+        // "The allowed values for Priority are between 100 and 9900": the model
+        // puts no range on `Priority`, so the bounds its doc states are enforced
+        // here.
+        if !crate::state::ASSOCIATION_PRIORITY_RANGE.contains(&input.priority) {
+            return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Priority {} is outside the allowed values, which are between {} and {}",
+                        input.priority,
+                        crate::state::ASSOCIATION_PRIORITY_RANGE.start(),
+                        crate::state::ASSOCIATION_PRIORITY_RANGE.end()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mutation_protection = input
+            .mutation_protection
+            .clone()
+            // "When you create the association, the default setting is
+            // DISABLED."
+            .unwrap_or_else(|| crate::state::MUTATION_PROTECTION_DISABLED.to_string());
+        if !crate::ops::types::MUTATION_PROTECTION_STATUS_VALUES
+            .contains(&mutation_protection.as_str())
+        {
+            return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "MutationProtection must be one of {:?}",
+                        crate::ops::types::MUTATION_PROTECTION_STATUS_VALUES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let timestamp = crate::state::now_rfc3339();
+        let mut store = state.lock();
+
+        // "A unique string that identifies the request and that allows failed
+        // requests to be retried without the risk of running the operation
+        // twice": a repeat resolves to the association it already made.
+        if let Some(existing_id) = store
+            .firewall_rule_group_association_creator_request_ids
+            .get(&input.creator_request_id)
+        {
+            if let Some(record) = store.firewall_rule_group_associations.get(existing_id) {
+                return Ok(AssociateFirewallRuleGroupOutput {
+                    firewall_rule_group_association: Some(record.to_association(now)),
+                });
+            }
+        }
+
+        let Some(group) = store.firewall_rule_groups.get(&input.firewall_rule_group_id) else {
+            return Err(
+                AssociateFirewallRuleGroupErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+                )
+                .into(),
+            );
+        };
+
+        // "If the rule group contains any rule configured with the
+        // PartnerThreatProtection rule type, the calling account must hold an
+        // active Amazon Web Services Marketplace subscription to the named
+        // partner. If the subscription is missing, the association request is
+        // rejected." This emulator holds no such subscription, so a group
+        // carrying one of those rules cannot be associated.
+        let partner = group
+            .rules
+            .iter()
+            .filter_map(|record| {
+                record
+                    .rule
+                    .firewall_rule_type
+                    .as_ref()
+                    .and_then(|rule_type| rule_type.partner_threat_protection.as_ref())
+            })
+            .map(|config| config.partner.clone())
+            .next();
+        if let Some(partner) = partner {
+            return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::partner_subscription_missing(&partner)),
+                },
+            )
+            .into());
+        }
+
+        // A rule group whose last change has not settled yet still has one in
+        // flight, so the association is refused with the sentence the model
+        // states for that class and nothing is written.
+        if group.status_at(now) != crate::state::FIREWALL_RULE_GROUP_STATUS_COMPLETE {
+            return Err(AssociateFirewallRuleGroupErrorModeled::ConflictException(
+                crate::state::state_transition_conflict(),
+            )
+            .into());
+        }
+
+        // One rule group is associated with one VPC at most once, and "you must
+        // specify a unique priority for each rule group that you associate with a
+        // single VPC".
+        if store
+            .find_firewall_rule_group_association(&input.firewall_rule_group_id, &input.vpc_id)
+            .is_some()
+        {
+            return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Firewall rule group {} is already associated with VPC {}",
+                        input.firewall_rule_group_id, input.vpc_id
+                    )),
+                },
+            )
+            .into());
+        }
+        if store
+            .firewall_rule_group_associations
+            .values()
+            .any(|record| record.vpc_id == input.vpc_id && record.priority == input.priority)
+        {
+            return Err(AssociateFirewallRuleGroupErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Priority {} is already in use by another rule group associated with VPC {}",
+                        input.priority, input.vpc_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: an associate past the cap is refused BEFORE
+        // anything is written. The retry path above is unaffected — it allocates
+        // no record.
+        if !store.can_store_another_firewall_rule_group_association() {
+            return Err(AssociateFirewallRuleGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator stores at most {} firewall rule group associations; remove one before making another",
+                        crate::state::MAX_STORED_FIREWALL_RULE_GROUP_ASSOCIATIONS
+                    )),
+                    resource_type: Some(
+                        crate::state::RESOURCE_TYPE_FIREWALL_RULE_GROUP_ASSOCIATION.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let seq = store.next_seq();
+        let id = crate::state::mint_firewall_rule_group_association_id(seq);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &region,
+            &format!("firewall-rule-group-association/{id}"),
+        );
+
+        let record = crate::state::FirewallRuleGroupAssociationRecord {
+            seq,
+            id: id.clone(),
+            arn,
+            firewall_rule_group_id: input.firewall_rule_group_id.clone(),
+            vpc_id: input.vpc_id.clone(),
+            name: input.name.clone(),
+            priority: input.priority,
+            mutation_protection,
+            creator_request_id: input.creator_request_id.clone(),
+            // The model's `FirewallRuleGroupAssociationStatus` carries no
+            // `CREATING` value: an association the service is still putting in
+            // place reports `UPDATING`, and the move to `COMPLETE` is the one the
+            // clock owes — so a caller reading it straight after this call still
+            // observes the transient status.
+            status: crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING.to_string(),
+            // "Additional information about the status of the response, IF
+            // AVAILABLE": an association coming up with nothing to report adds
+            // nothing, so none is invented here.
+            status_message: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: timestamp.clone(),
+            modification_time: timestamp,
+            settled_at: Some(now + crate::state::PROVISIONING_DELAY),
+        };
+
+        let association = record.to_association(now);
+        store
+            .firewall_rule_group_association_creator_request_ids
+            .insert(input.creator_request_id.clone(), id.clone());
+        store.firewall_rule_group_associations.insert(id, record);
+
+        Ok(AssociateFirewallRuleGroupOutput {
+            firewall_rule_group_association: Some(association),
+        })
     }
 }

@@ -47,3 +47,5 @@ mod security_policy_listing;
 mod state_roundtrip;
 #[path = "all/vpc_endpoint.rs"]
 mod vpc_endpoint;
+#[path = "all/vpc_endpoint_delete.rs"]
+mod vpc_endpoint_delete;

@@ -53,6 +53,8 @@ mod state_roundtrip;
 mod subnet_vpc_membership;
 #[path = "all/tag_not_found_wording.rs"]
 mod tag_not_found_wording;
+#[path = "all/tag_not_found_wording_by_kind.rs"]
+mod tag_not_found_wording_by_kind;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;
 #[path = "all/tag_writes.rs"]

@@ -97,6 +97,8 @@ mod instance_profile_tag_removal;
 mod instance_profile_tags;
 #[path = "all/instance_profiles.rs"]
 mod instance_profiles;
+#[path = "all/instance_profiles_for_role.rs"]
+mod instance_profiles_for_role;
 #[path = "all/login_profile_absence_wording.rs"]
 mod login_profile_absence_wording;
 #[path = "all/login_profile_deletion.rs"]
