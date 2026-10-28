@@ -14,12 +14,17 @@
 //!   ARN no longer carries tags;
 //! * an id that resolves to no stored dashboard — never created, or already
 //!   deleted — is the modelled 404 naming the identifier the REQUEST supplied, and
-//!   writes nothing.
+//!   writes nothing;
+//! * the `clientToken` the delete models makes it idempotent: a repeat of a
+//!   request already served under a token is a RETRY of that call, answered from
+//!   it rather than from a store that no longer holds what it removed, and it
+//!   removes nothing further; a repeat carrying no token, or a token of its own, is
+//!   a new call and draws the not-found refusal.
 //!
 //! The rows differ along what the rule generalises over: whether the dashboard
 //! carried tags, whether it had a description, the size of its definition literal,
-//! whether the delete carried a `clientToken`, how many sibling dashboards its own
-//! project held and how many a second project held.
+//! whether the delete carried a `clientToken` and how long that token is, how many
+//! sibling dashboards its own project held and how many a second project held.
 //!
 //! Every request this suite sends goes through a helper a sibling suite already
 //! has, rather than a second copy of it: the HTTP harness (`call`, `error_code`,
@@ -395,8 +400,9 @@ async fn a_delete_of_a_dashboard_the_store_does_not_hold_is_a_modelled_not_found
     let before = describe_dashboard(&router, &stored).await.1;
 
     // A delete that lands first, so the SECOND delete of the same id is a row of
-    // this table: a `clientToken` buys no replay of the answer that already went
-    // out, exactly as the creates in this crate leave idempotency to its own issue.
+    // this table. The landing delete carries NO token, so no token in this table
+    // names a call that was ever served: a repeat under an unspent token is a new
+    // call, and a new call finds nothing to remove.
     let (doomed, _) = create_dashboard(
         &router,
         "the-twice-deleted-dashboard",
@@ -465,4 +471,227 @@ async fn a_delete_of_a_dashboard_the_store_does_not_hold_is_a_modelled_not_found
         vec![stored.clone()],
         "the store must hold exactly the one dashboard that was never deleted"
     );
+}
+
+/// The bounds of the token's modelled length, as an independent oracle for the
+/// forms the idempotency table spans. Source:
+/// `smithy_query(query="operation", operation="DeleteDashboard")` — `clientToken`
+/// (ClientToken, len 36..64, pattern `^\S{36,64}$`).
+const TOKEN_MIN: usize = 36;
+/// See [`TOKEN_MIN`].
+const TOKEN_MAX: usize = 64;
+
+/// A `clientToken` of exactly `length` characters, seeded from `seed`: every
+/// character outside the modelled pattern becomes a hyphen, which the value is
+/// then padded out with.
+fn token_of(seed: &str, length: usize) -> String {
+    let mut token: String = seed
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    token.truncate(length);
+    while token.len() < length {
+        token.push('-');
+    }
+    token
+}
+
+/// One row of the idempotency table: how long the token the delete carries is,
+/// and the shape of the dashboard it removes.
+#[derive(Debug)]
+struct ReplayCase {
+    label: &'static str,
+    /// How long the `clientToken` the delete carries is.
+    token_length: usize,
+    /// The tags the deleted dashboard was created with, if any.
+    tags: Option<Value>,
+    /// The description the deleted dashboard was created with, if any.
+    description: Option<&'static str>,
+    /// How long the deleted dashboard's definition literal is.
+    definition_length: usize,
+    /// How many dashboards the project holds beside the two the row addresses.
+    bystanders: usize,
+}
+
+/// The rows: the token spans its modelled length from the floor to the ceiling,
+/// and the dashboard it removes spans tags, descriptions, definition sizes and
+/// how much else the project holds.
+fn replay_cases() -> Vec<ReplayCase> {
+    vec![
+        ReplayCase {
+            label: "a-token-at-the-modelled-floor",
+            token_length: TOKEN_MIN,
+            tags: None,
+            description: None,
+            definition_length: 32,
+            bystanders: 0,
+        },
+        ReplayCase {
+            label: "a-token-mid-range-tags-and-a-description",
+            token_length: 48,
+            tags: Some(json!({ "floor": "one", "line": "two" })),
+            description: Some("the dashboard the token deletes"),
+            definition_length: 256,
+            bystanders: 1,
+        },
+        ReplayCase {
+            label: "a-token-one-under-the-modelled-ceiling",
+            token_length: TOKEN_MAX - 1,
+            tags: Some(json!({ "owner": "monitor" })),
+            description: Some("d"),
+            definition_length: 64,
+            bystanders: 3,
+        },
+        ReplayCase {
+            label: "a-token-at-the-modelled-ceiling",
+            token_length: TOKEN_MAX,
+            tags: Some(json!({ "team": "controls" })),
+            description: None,
+            definition_length: 4_096,
+            bystanders: 2,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_client_token_serves_one_delete_and_replays_its_retry() {
+    for case in replay_cases() {
+        let (router, engine) = router_with_engine();
+        let project = create_project(&router, case.label, "the-owning-project").await;
+        let (doomed, _) = create_dashboard(
+            &router,
+            case.label,
+            &project,
+            "the-dashboard-the-token-deletes",
+            case.description,
+            case.definition_length,
+            case.tags.as_ref(),
+        )
+        .await;
+        let (neighbour, _) = create_dashboard(
+            &router,
+            case.label,
+            &project,
+            "the-dashboard-the-spent-token-must-not-delete",
+            None,
+            64,
+            None,
+        )
+        .await;
+        let bystanders = create_dashboards(&router, case.label, &project, case.bystanders).await;
+
+        let token = token_of(case.label, case.token_length);
+        assert!(
+            (TOKEN_MIN..=TOKEN_MAX).contains(&token.chars().count())
+                && !token.contains(char::is_whitespace),
+            "case {:?}: the probe token must itself be modelled, got {token:?}",
+            case.label
+        );
+
+        let (status, first) = delete_dashboard(&router, &doomed, Some(&token)).await;
+        assert_eq!(
+            status, 204,
+            "case {:?}: the delete under a fresh token expected 204, got {status} {first}",
+            case.label
+        );
+
+        // The SAME request under the SAME token is a RETRY: it replays the answer
+        // the first call gave rather than the not-found refusal the removal itself
+        // would now produce, and removes nothing further.
+        let (status, replayed) = delete_dashboard(&router, &doomed, Some(&token)).await;
+        assert_eq!(
+            (status, &replayed),
+            (204, &first),
+            "case {:?}: a retried delete must replay the answer of the call it repeats, \
+             got {status} {replayed} after {first}",
+            case.label
+        );
+        let mut surviving = bystanders.clone();
+        surviving.push(neighbour.clone());
+        surviving.sort();
+        assert_eq!(
+            stored_dashboard_ids(&engine),
+            surviving,
+            "case {:?}: a retried delete must remove nothing further",
+            case.label
+        );
+
+        // A DIFFERENT request reusing that spent token belongs to the call the token
+        // names: this operation declares no conflict error (its errors are
+        // InternalFailureException, InvalidRequestException, ResourceNotFoundException
+        // and ThrottlingException — smithy_query query="operation"
+        // operation="DeleteDashboard"), so the token alone identifies its call and
+        // that call's answer is replayed. The dashboard this request addressed stays.
+        let (status, reused) = delete_dashboard(&router, &neighbour, Some(&token)).await;
+        assert_eq!(
+            (status, &reused),
+            (204, &first),
+            "case {:?}: a request reusing a spent token must be answered from the call \
+             that spent it, got {status} {reused} after {first}",
+            case.label
+        );
+        let (status, still_there) = describe_dashboard(&router, &neighbour).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: a request reusing a spent token must remove nothing, \
+             got {status} {still_there}",
+            case.label
+        );
+
+        // A repeat carrying NO token is a new call, and so is one carrying a token of
+        // its own: each finds nothing left to remove and is the modelled 404.
+        let fresh = token_of(&format!("{}-fresh", case.label), case.token_length);
+        for (probe, carried) in [
+            ("carrying no token", None),
+            ("carrying a token of its own", Some(fresh.as_str())),
+        ] {
+            let (status, refused) = delete_dashboard(&router, &doomed, carried).await;
+            assert_eq!(
+                (status, error_code(&refused)),
+                (404, "ResourceNotFoundException"),
+                "case {:?} ({probe}): a repeat that is a new call must be the modelled \
+                 not-found, got {status} {refused}",
+                case.label
+            );
+        }
+
+        // That refusal spent nothing, so the fresh token still serves the request the
+        // spent one would not: the neighbour goes under it.
+        let (status, accepted) = delete_dashboard(&router, &neighbour, Some(&fresh)).await;
+        assert_eq!(
+            status, 204,
+            "case {:?}: the delete under the token no served call spent expected 204, \
+             got {status} {accepted}",
+            case.label
+        );
+        let mut left = bystanders.clone();
+        left.sort();
+        assert_eq!(
+            stored_dashboard_ids(&engine),
+            left,
+            "case {:?}: the store must hold exactly the dashboards no delete named",
+            case.label
+        );
+
+        // A token is scoped to the operation it was sent to, so the value this delete
+        // spent still serves a create, which carries its own token in the payload.
+        let (status, created) = call(
+            &router,
+            "POST",
+            DASHBOARDS,
+            Some(json!({
+                "projectId": project,
+                "dashboardName": "created-under-the-token-the-delete-spent",
+                "dashboardDefinition": definition_of(32),
+                "clientToken": token,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: a create under the token this delete spent expected 201, \
+             got {status} {created}",
+            case.label
+        );
+    }
 }

@@ -582,6 +582,42 @@ async fn delete_rows(router: &MultiServiceRouter) -> Vec<DeleteRow> {
         .unwrap_or_default()
         .to_string();
 
+    // The dashboard goes in a project of its OWN: the `DeleteProject` row below
+    // removes the project it addresses with every dashboard that project holds, and
+    // a row must not remove the resource another row addresses.
+    let (status, dashboard_project) = call(
+        router,
+        "POST",
+        "/projects",
+        Some(json!({ "portalId": project_portal, "projectName": "ReplayDashboardProject" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "CreateProject for the dashboard: got {status} {dashboard_project}"
+    );
+    let dashboard_project_id = dashboard_project["projectId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let (status, dashboard) = call(
+        router,
+        "POST",
+        "/dashboards",
+        Some(json!({
+            "projectId": dashboard_project_id,
+            "dashboardName": "ReplayDeleteDashboard",
+            "dashboardDefinition": "{\"widgets\":[]}",
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateDashboard: got {status} {dashboard}");
+    let dashboard_id = dashboard["dashboardId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
     create_workspace(router, "replay-delete-workspace").await;
     ingest(router, FIRST_ALIAS, SAMPLES).await;
 
@@ -614,6 +650,14 @@ async fn delete_rows(router: &MultiServiceRouter) -> Vec<DeleteRow> {
             case: "DeleteProject",
             method: "DELETE",
             uri: format!("/projects/{project_id}"),
+            token_in_query: true,
+            body: None,
+            status: 204,
+        },
+        DeleteRow {
+            case: "DeleteDashboard",
+            method: "DELETE",
+            uri: format!("/dashboards/{dashboard_id}"),
             token_in_query: true,
             body: None,
             status: 204,
