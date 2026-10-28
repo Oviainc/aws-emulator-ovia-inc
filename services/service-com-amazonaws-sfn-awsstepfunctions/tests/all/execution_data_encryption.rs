@@ -333,6 +333,17 @@ impl Chain {
     /// A state machine with `encryption`, one execution of it, and the moment that
     /// execution's outcome is due: the records every read below reports from.
     async fn run(&self, name: &str, encryption: Option<Value>) -> (String, String) {
+        self.run_with_input(name, encryption, "{}").await
+    }
+
+    /// [`Self::run`] with the execution started on `input`, for a suite that reads
+    /// that payload back out of the records.
+    pub(crate) async fn run_with_input(
+        &self,
+        name: &str,
+        encryption: Option<Value>,
+        input: &str,
+    ) -> (String, String) {
         let mut request = json!({
             "name": name,
             "definition": HELLO_DEFINITION,
@@ -346,7 +357,7 @@ impl Chain {
         let started = self
             .sfn(
                 "StartExecution",
-                &json!({ "stateMachineArn": machine, "input": "{}" }),
+                &json!({ "stateMachineArn": machine, "input": input }),
             )
             .await;
         let execution = string(&started, "executionArn");
@@ -357,19 +368,19 @@ impl Chain {
 
 /// One read of data a state machine's key seals, and whether it decrypts that data at
 /// all.
-struct Read {
-    case: &'static str,
-    operation: &'static str,
+pub(crate) struct Read {
+    pub(crate) case: &'static str,
+    pub(crate) operation: &'static str,
     /// Whether the request reports the encrypted datum, which is what needs the
     /// caller's grant on the key.
-    decrypts: bool,
+    pub(crate) decrypts: bool,
     /// The request body, built from the state machine ARN and the execution ARN.
-    request: fn(&str, &str) -> Value,
+    pub(crate) request: fn(&str, &str) -> Value,
 }
 
 /// Every read the rule covers, and — beside each — the request form of the same
 /// operation that reports none of the encrypted datum.
-fn reads() -> Vec<Read> {
+pub(crate) fn reads() -> Vec<Read> {
     vec![
         Read {
             case: "DescribeExecution reports the execution's input and output",

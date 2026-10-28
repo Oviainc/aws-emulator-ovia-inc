@@ -236,18 +236,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // successful response without the encrypted definition"). The decision is made
         // with no store of this service locked.
         if !included_data.is_metadata_only() {
-            if let Some(why) = crate::state::encryption::execution_read_denied(
+            if let Some(refusal) = crate::state::encryption::execution_read_denied(
                 &*self.engine,
                 ctx,
                 &endpoint_region,
                 &input.execution_arn,
             ) {
-                return Err(
-                    DescribeStateMachineForExecutionErrorModeled::KmsAccessDeniedException(
-                        KmsAccessDeniedException { message: Some(why) },
-                    )
-                    .into(),
-                );
+                return Err(crate::kms_key_refusal!(
+                    DescribeStateMachineForExecutionErrorModeled,
+                    refusal
+                )
+                .into());
             }
         }
 

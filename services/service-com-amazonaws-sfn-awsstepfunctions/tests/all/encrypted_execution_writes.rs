@@ -73,20 +73,20 @@ fn policy_delegating(actions: &[&str]) -> Value {
 
 /// One write of data the caller supplies into an execution, and whether that data is
 /// sealed under the execution's key.
-struct Write {
-    case: &'static str,
-    operation: &'static str,
+pub(crate) struct Write {
+    pub(crate) case: &'static str,
+    pub(crate) operation: &'static str,
     /// Whether the request carries data the key must seal, which is what needs the
     /// caller's grant on the key.
-    seals: bool,
+    pub(crate) seals: bool,
     /// The request body, built from the `taskToken` a worker holds and the execution
     /// ARN.
-    request: fn(&str, &str) -> Value,
+    pub(crate) request: fn(&str, &str) -> Value,
 }
 
 /// Every write the rule covers, and — beside each — the request form of the same
 /// operation that carries nothing to seal.
-fn writes() -> Vec<Write> {
+pub(crate) fn writes() -> Vec<Write> {
     vec![
         Write {
             case: "SendTaskFailure carrying only the error",
@@ -158,7 +158,7 @@ fn writes() -> Vec<Write> {
 /// The token is the proof the issue's own first cause asks for — an execution that
 /// entered a `Task` state naming an activity ARN queues a task on that activity, and
 /// the next poll is handed it.
-async fn outstanding_task(
+pub(crate) async fn outstanding_task(
     chain: &Chain,
     name: &str,
     encryption: Option<Value>,
@@ -211,7 +211,7 @@ async fn outstanding_task(
 }
 
 /// The message a refusal carries, for an assertion that names it.
-fn message(answer: &Value) -> String {
+pub(crate) fn message(answer: &Value) -> String {
     answer
         .get("message")
         .and_then(Value::as_str)

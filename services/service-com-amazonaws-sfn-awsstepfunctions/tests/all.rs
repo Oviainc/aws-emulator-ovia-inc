@@ -61,6 +61,8 @@ mod execution_history_outcomes;
 mod execution_history_state_lifecycle;
 #[path = "all/execution_interpreter.rs"]
 mod execution_interpreter;
+#[path = "all/execution_key_state.rs"]
+mod execution_key_state;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
 #[path = "all/integration_member_names.rs"]

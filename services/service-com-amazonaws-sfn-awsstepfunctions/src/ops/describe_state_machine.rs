@@ -264,16 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // METADATA_ONLY to get a successful response without the encrypted
         // definition"). The decision is made with no store of this service locked.
         if !included_data.is_metadata_only() {
-            if let Some(why) = crate::state::encryption::state_machine_read_denied(
+            if let Some(refusal) = crate::state::encryption::state_machine_read_denied(
                 &*self.engine,
                 ctx,
                 &endpoint_region,
                 &input.state_machine_arn,
             ) {
-                return Err(DescribeStateMachineErrorModeled::KmsAccessDeniedException(
-                    KmsAccessDeniedException { message: Some(why) },
-                )
-                .into());
+                return Err(
+                    crate::kms_key_refusal!(DescribeStateMachineErrorModeled, refusal).into(),
+                );
             }
         }
 

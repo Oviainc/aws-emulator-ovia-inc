@@ -191,16 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // execution is stopped. The decision is made with no store of this service
         // locked.
         if input.error.is_some() || input.cause.is_some() {
-            if let Some(why) = crate::state::encryption::execution_write_denied(
+            if let Some(refusal) = crate::state::encryption::execution_write_denied(
                 &*self.engine,
                 ctx,
                 &endpoint_region,
                 &input.execution_arn,
             ) {
-                return Err(StopExecutionErrorModeled::KmsAccessDeniedException(
-                    KmsAccessDeniedException { message: Some(why) },
-                )
-                .into());
+                return Err(crate::kms_key_refusal!(StopExecutionErrorModeled, refusal).into());
             }
         }
         // The store is held for THIS block alone: the stop itself is one state-level

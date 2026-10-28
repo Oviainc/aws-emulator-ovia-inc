@@ -202,15 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that carries neither asks nothing of the key. The decision is made with no
         // store of this service locked.
         if input.error.is_some() || input.cause.is_some() {
-            if let Some(why) = crate::state::encryption::task_reply_write_denied(
+            if let Some(refusal) = crate::state::encryption::task_reply_write_denied(
                 &*self.engine,
                 ctx,
                 &input.task_token,
             ) {
-                return Err(SendTaskFailureErrorModeled::KmsAccessDeniedException(
-                    KmsAccessDeniedException { message: Some(why) },
-                )
-                .into());
+                return Err(crate::kms_key_refusal!(SendTaskFailureErrorModeled, refusal).into());
             }
         }
 

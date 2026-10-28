@@ -205,13 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is written. `output` is required of this operation, so there is no reply here
         // that seals nothing. The decision is made with no store of this service
         // locked.
-        if let Some(why) =
+        if let Some(refusal) =
             crate::state::encryption::task_reply_write_denied(&*self.engine, ctx, &input.task_token)
         {
-            return Err(SendTaskSuccessErrorModeled::KmsAccessDeniedException(
-                KmsAccessDeniedException { message: Some(why) },
-            )
-            .into());
+            return Err(crate::kms_key_refusal!(SendTaskSuccessErrorModeled, refusal).into());
         }
 
         // Phase 1, under the lock: resolve the task, refuse what cannot be answered,

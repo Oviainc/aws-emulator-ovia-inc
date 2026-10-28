@@ -9,9 +9,10 @@
 //! disagree with what that call does.
 //!
 //! The report carries the execution's `input` and `output`, which a state machine on a
-//! customer managed KMS key sealed under that key, so the caller's `kms:Decrypt` grant
-//! on it is decided first — `crate::state::encryption`, which answers the modelled
-//! `KmsAccessDeniedException` for a caller the key's policy does not allow.
+//! customer managed KMS key sealed under that key, so unsealing them is decided first —
+//! `crate::state::encryption`, which answers the modelled `KmsInvalidStateException`
+//! while the key's own key state admits no use of it and `KmsAccessDeniedException` for
+//! a caller the key's policy does not allow.
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
@@ -256,20 +257,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now();
         // A state machine encrypted with a CUSTOMER MANAGED KMS key hands its
-        // execution's data out only to a caller that key permits: this report carries
-        // the execution's `input` and `output`, which were sealed under that key, so
-        // the caller's `kms:Decrypt` grant on it is decided before any of it is read.
-        // The decision is made with no store of this service locked.
-        if let Some(why) = crate::state::encryption::execution_read_denied(
+        // execution's data out only through that key: this report carries the
+        // execution's `input` and `output`, which were sealed under it, so unsealing
+        // them is decided before any of it is read — the key's own key state, and the
+        // caller's `kms:Decrypt` grant on it. The decision is made with no store of
+        // this service locked.
+        if let Some(refusal) = crate::state::encryption::execution_read_denied(
             &*self.engine,
             ctx,
             &endpoint_region,
             &input.execution_arn,
         ) {
-            return Err(DescribeExecutionErrorModeled::KmsAccessDeniedException(
-                KmsAccessDeniedException { message: Some(why) },
-            )
-            .into());
+            return Err(crate::kms_key_refusal!(DescribeExecutionErrorModeled, refusal).into());
         }
 
         let mut store = state.lock();

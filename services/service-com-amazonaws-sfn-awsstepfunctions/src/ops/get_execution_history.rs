@@ -227,21 +227,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is returned. The default is true."
         let with_data = input.include_execution_data.unwrap_or(true);
         // The data of an execution of a state machine encrypted with a CUSTOMER
-        // MANAGED KMS key is handed out only to a caller that key permits, so the
-        // caller's `kms:Decrypt` grant on it is decided before any of it is read. A
-        // request that asks for no execution data decrypts nothing, so it needs no
-        // grant. The decision is made with no store of this service locked.
+        // MANAGED KMS key is handed out only through that key, so unsealing it is
+        // decided before any of it is read — the key's own key state, and the caller's
+        // `kms:Decrypt` grant on it. A request that asks for no execution data
+        // decrypts nothing, so it needs neither. The decision is made with no store of
+        // this service locked.
         if with_data {
-            if let Some(why) = crate::state::encryption::execution_read_denied(
+            if let Some(refusal) = crate::state::encryption::execution_read_denied(
                 &*self.engine,
                 ctx,
                 &endpoint_region,
                 &input.execution_arn,
             ) {
-                return Err(GetExecutionHistoryErrorModeled::KmsAccessDeniedException(
-                    KmsAccessDeniedException { message: Some(why) },
-                )
-                .into());
+                return Err(
+                    crate::kms_key_refusal!(GetExecutionHistoryErrorModeled, refusal).into(),
+                );
             }
         }
 
