@@ -433,6 +433,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CloudWatch: a policy's alarms are state, not a value a response invents.
             alarms: Vec::new(),
             creation_time,
+            // Putting a policy again is an UPDATE of that policy, so what it has already
+            // been executed for survives: a breach it has performed is not performed twice
+            // because its configuration was re-written.
+            executed_transitions: stored
+                .as_ref()
+                .map(|existing| existing.executed_transitions.clone())
+                .unwrap_or_default(),
+            last_executed: stored.as_ref().and_then(|existing| existing.last_executed),
         };
         state.policies.insert(key.clone(), record);
 
@@ -458,6 +466,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for key in &orphaned {
             crate::state::retire_policy_alarms(&*self.engine, key, "TargetTrackingScaling");
         }
+
+        // A policy that is put against an alarm ALREADY in ALARM is owed its execution from
+        // the instant that alarm transitioned, so what the clock has made due is performed
+        // here — and the clock is left watching for the next breach, which a client drives in
+        // CloudWatch and then looks for on the resource this policy scales rather than here.
+        crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
+        crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 
         // The audit record for a state-changing call.
         ::tracing::info!(

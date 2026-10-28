@@ -29,11 +29,14 @@ sha2 = { workspace = true }
 # Renders that digest, and the opaque `NextToken` payload, as printable text.
 hex = { workspace = true }
 # A target-tracking policy's CloudWatch alarms are created in the CloudWatch
-# emulator's own alarm store, and a scalable target resolves the DynamoDB table or
-# index it names in the DynamoDB emulator's own table store: both are reached through
-# the shared engine, which needs the owning service's state TYPE.
+# emulator's own alarm store, a scalable target resolves the DynamoDB table or
+# index it names in the DynamoDB emulator's own table store, and executing a
+# scaling policy moves the ECS service's desired count in the ECS emulator's own
+# service store: all are reached through the shared engine, which needs the
+# owning service's state TYPE.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
 # Parses the `cron(...)` schedule a scheduled action carries (and `chrono`, which it
 # is built on, parses an `at(...)` expression's date and time).
 cron = "0.15"
