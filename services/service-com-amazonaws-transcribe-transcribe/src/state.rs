@@ -523,6 +523,36 @@ pub fn concurrency_limit_message(limit: usize, family: &str) -> String {
 /// that value rather than anything the request chose.
 pub const MEDICAL_SCRIBE_LANGUAGE_CODE: &str = MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES[0];
 
+/// The template an AWS HealthScribe job's clinical note summary is generated from when
+/// the start asked for none: "The default is HISTORY_AND_PHYSICAL" (model doc for
+/// `ClinicalNoteGenerationSettings$NoteTemplate`, also one of
+/// [`crate::ops::types::MEDICAL_SCRIBE_NOTE_TEMPLATE_VALUES`]). The default is RECORDED
+/// on the job, so every operation that reports its settings reports the same template
+/// rather than each one re-defaulting — the same treatment [`DEFAULT_INPUT_TYPE`] gets.
+pub const DEFAULT_NOTE_TEMPLATE: &str = "HISTORY_AND_PHYSICAL";
+
+/// The `MedicalScribeSettings` a Medical Scribe job is RECORDED with: the ones the
+/// start asked for, with the documented default of every member that states one filled
+/// in — which for this shape is the clinical-note template ([`DEFAULT_NOTE_TEMPLATE`]).
+///
+/// The template is materialised even for a start that named no
+/// `ClinicalNoteGenerationSettings` at all, because clinical note generation is not
+/// opt-in for this family: the operation "generates clinical notes" for every job it
+/// accepts (`smithy_query(query="operation", operation="StartMedicalScribeJob")`), so
+/// a template always applies to a recorded job and the record says which one.
+pub fn recorded_medical_scribe_settings(
+    mut settings: MedicalScribeSettings,
+) -> MedicalScribeSettings {
+    let mut clinical_note = settings
+        .clinical_note_generation_settings
+        .unwrap_or_default();
+    if clinical_note.note_template.is_none() {
+        clinical_note.note_template = Some(DEFAULT_NOTE_TEMPLATE.to_string());
+    }
+    settings.clinical_note_generation_settings = Some(clinical_note);
+    settings
+}
+
 /// The most Medical Scribe jobs this emulator runs AT ONCE for an account.
 ///
 /// A CHOSEN figure, not a published one — AWS gives no per-account number for
@@ -4122,6 +4152,8 @@ pub struct MedicalScribeJobRecord {
     /// [`Self::output_encryption_kms_key_id`].
     pub kms_encryption_context: Option<std::collections::HashMap<String, String>>,
     pub data_access_role_arn: String,
+    /// `Settings`, as [`recorded_medical_scribe_settings`] records them: what the start
+    /// asked for, with the documented clinical-note template default materialised.
     pub settings: MedicalScribeSettings,
     pub channel_definitions: Option<Vec<MedicalScribeChannelDefinition>>,
     /// Whether the start request carried a `MedicalScribeContext`, which is the ONLY

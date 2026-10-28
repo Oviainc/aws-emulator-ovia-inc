@@ -73,6 +73,8 @@ mod list_cursor_rule;
 mod list_paging_rule;
 #[path = "all/media_object_resolution.rs"]
 mod media_object_resolution;
+#[path = "all/medical_scribe_clinical_note_template.rs"]
+mod medical_scribe_clinical_note_template;
 #[path = "all/medical_scribe_job_listing.rs"]
 mod medical_scribe_job_listing;
 #[path = "all/medical_scribe_jobs.rs"]

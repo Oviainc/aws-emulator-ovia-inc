@@ -26,6 +26,11 @@
 //! a custom vocabulary whose build has not finished successfully (only `READY` makes one
 //! usable), name nothing this job could apply.
 //!
+//! The settings the job is RECORDED with carry the documented default of the
+//! clinical-note template when the request named none, so every later read reports the
+//! template the note will be summarised with (see
+//! [`crate::state::recorded_medical_scribe_settings`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -453,7 +458,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output_encryption_kms_key_id: input.output_encryption_kms_key_id,
             kms_encryption_context: input.kms_encryption_context,
             data_access_role_arn: input.data_access_role_arn,
-            settings: input.settings,
+            // The documented default of the clinical-note template is RECORDED here,
+            // so every operation that reports this job's settings reports the same
+            // template (see [`crate::state::recorded_medical_scribe_settings`]).
+            settings: crate::state::recorded_medical_scribe_settings(input.settings),
             channel_definitions: input.channel_definitions,
             // Only WHETHER a context was given is reported; see the record's own
             // documentation for why the context itself is not kept.

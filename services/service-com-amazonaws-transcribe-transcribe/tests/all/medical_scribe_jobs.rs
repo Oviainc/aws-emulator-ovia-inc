@@ -24,6 +24,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_NOTE_TEMPLATE;
 
 use crate::transcription_jobs::Transcribe;
 
@@ -43,10 +44,14 @@ const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/HealthScribeAccess";
 /// The members `StartMedicalScribeJob` accepts that the `MedicalScribeJob` shape also
 /// carries, so a stored job must read them back unchanged
 /// (`smithy_query(query="shape", shape="MedicalScribeJob")`).
+///
+/// `Settings` is not among them: its `ClinicalNoteGenerationSettings.NoteTemplate`
+/// documents a default, which the job is RECORDED with, so the settings read back are
+/// the requested ones with that default materialised — asserted on its own below, the
+/// way the transcription suite asserts `SubtitlesOutput.OutputStartIndex`.
 const ECHOED_MEMBERS: &[&str] = &[
     "MedicalScribeJobName",
     "Media",
-    "Settings",
     "DataAccessRoleArn",
     "ChannelDefinitions",
     "Tags",
@@ -283,6 +288,30 @@ async fn a_started_medical_scribe_job_reads_back_exactly_as_it_was_started() {
                 );
             }
         }
+        // Every settings member reads back as the request sent it, except the
+        // clinical-note template: "The default is HISTORY_AND_PHYSICAL" (model doc for
+        // `ClinicalNoteGenerationSettings$NoteTemplate`), and a documented default is
+        // materialised on the record, so a start that named no template reads back the
+        // one its job's note will be summarised with.
+        let mut expected_settings = request["Settings"].clone();
+        let requested_template = request["Settings"]["ClinicalNoteGenerationSettings"]
+            ["NoteTemplate"]
+            .as_str()
+            .unwrap_or(DEFAULT_NOTE_TEMPLATE)
+            .to_string();
+        expected_settings
+            .as_object_mut()
+            .expect("every row's Settings are a JSON object")
+            .insert(
+                "ClinicalNoteGenerationSettings".to_string(),
+                json!({"NoteTemplate": requested_template}),
+            );
+        assert_eq!(
+            fetched["Settings"], expected_settings,
+            "case {case:?}: expected the recorded settings {expected_settings:?}, got {:?}",
+            fetched["Settings"]
+        );
+
         // A job carrying no tags reports no `Tags` at all: `TagList` is modelled
         // `length {min 1, max 200}`, so an empty list is not a value of that shape.
         if request.get("Tags").is_none() {

@@ -21,6 +21,7 @@
 //! harness (`crate::transcription_jobs`), reused rather than stood up a second time.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_NOTE_TEMPLATE;
 
 use crate::transcription_jobs::Transcribe;
 
@@ -303,11 +304,24 @@ async fn a_medical_scribe_start_with_a_speaker_ceiling_and_no_partitioning_is_re
             )
             .await;
         if *accepted {
+            // The settings the job was started with, plus the clinical-note template
+            // its record materialises from the member's documented default ("The
+            // default is HISTORY_AND_PHYSICAL", model doc for
+            // `ClinicalNoteGenerationSettings$NoteTemplate`; pinned over the whole
+            // template class by `crate::medical_scribe_clinical_note_template`).
+            let mut expected = settings.clone();
+            expected
+                .as_object_mut()
+                .expect("a row's settings are a JSON object")
+                .insert(
+                    "ClinicalNoteGenerationSettings".to_string(),
+                    json!({"NoteTemplate": DEFAULT_NOTE_TEMPLATE}),
+                );
             assert_eq!(
                 fetched.ok(case)["MedicalScribeJob"]["Settings"],
-                *settings,
+                expected,
                 "case {case:?}: the stored job must report the settings it was started \
-                 with, got {:?}",
+                 with, expected {expected:?}, got {:?}",
                 fetched.body
             );
         } else {

@@ -24,6 +24,7 @@
 //! home for the text every family's not-found refusal carries.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_transcribe_transcribe::state::DEFAULT_NOTE_TEMPLATE;
 
 use crate::transcription_job_request_rules::not_found_message;
 use crate::transcription_jobs::{Reply, Transcribe};
@@ -253,13 +254,25 @@ async fn a_medical_scribe_start_naming_a_custom_resource_this_account_lacks_is_r
                     .ok(&case);
 
                 // The served start stored the reference, so a read reports it: the
-                // mode's settings members plus the row's, and nothing else.
+                // mode's settings members plus the row's, and nothing else — beside the
+                // clinical-note template every recorded job carries, which this family's
+                // documented default materialises ("The default is HISTORY_AND_PHYSICAL",
+                // model doc for `ClinicalNoteGenerationSettings$NoteTemplate`; pinned by
+                // `crate::medical_scribe_clinical_note_template`).
                 let fetched = get(&transcribe, &name).await;
                 let settings = fetched.ok(&case)["MedicalScribeJob"]["Settings"].clone();
+                let mut expected = request["Settings"].clone();
+                expected
+                    .as_object_mut()
+                    .expect("a start request's Settings are a JSON object")
+                    .insert(
+                        "ClinicalNoteGenerationSettings".to_string(),
+                        json!({"NoteTemplate": DEFAULT_NOTE_TEMPLATE}),
+                    );
                 assert_eq!(
-                    settings, request["Settings"],
+                    settings, expected,
                     "case {case:?}: the stored job must report the settings it was \
-                     started with, got {settings:?}"
+                     started with, expected {expected:?}, got {settings:?}"
                 );
             }
         }
