@@ -8,8 +8,8 @@
 //! response and the next `GetQueue` project the same stored record.
 //!
 //! A reserved queue's concurrency is not an independent member: it is the slot count its
-//! reservation plan reserves, so a call that stores a new plan without stating
-//! `ConcurrentJobs` stores that plan's count as the queue's concurrency too — the rule
+//! reservation plan reserves, so a call on such a queue stores that plan's count as the
+//! queue's concurrency and a `ConcurrentJobs` it states does not apply — the rule
 //! `CreateQueue` applies to a plan it stores, shared through
 //! [`crate::state::concurrent_jobs_for`].
 //!
@@ -326,15 +326,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "For reserved queues, update your reservation plan instead in order to increase
         // your yearly commitment": a reserved queue's concurrency IS the slot count its
-        // plan reserves, so a plan this call stores sets the concurrency beside it rather
-        // than leaving the previous plan's count behind. One rule, in one place, shared
-        // with `CreateQueue` — a request that states `ConcurrentJobs` still stores the
-        // value it entered, and one that states neither keeps what is stored.
-        record.concurrent_jobs = crate::state::concurrent_jobs_for(
+        // plan reserves, so it is read from the plan the queue holds AFTER the write above
+        // — a plan this call stored sets the concurrency beside it, and a call that stored
+        // none leaves the standing plan's count in place, whatever `ConcurrentJobs` the
+        // request entered. An on-demand queue has no plan, so the value it entered is the
+        // one stored and one that states nothing keeps what is stored. One rule, in one
+        // place, shared with `CreateQueue`.
+        // Read from the record before it is borrowed for writing, so the plan the write
+        // above stored is the one the concurrency comes from.
+        let concurrent_jobs = crate::state::concurrent_jobs_for(
+            &record.pricing_plan,
             input.concurrent_jobs,
-            input.reservation_plan_settings.as_ref(),
+            record.reserved_slots(),
             record.concurrent_jobs,
         );
+        record.concurrent_jobs = concurrent_jobs;
         if let Some(maximum_concurrent_feeds) = input.maximum_concurrent_feeds {
             record.maximum_concurrent_feeds = maximum_concurrent_feeds;
         }

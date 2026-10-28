@@ -849,26 +849,36 @@ pub fn check_concurrent_jobs(
 /// the queue a reservation plan, or may do neither.
 ///
 /// `Queue$ConcurrentJobs` is "the maximum number of jobs your queue can process
-/// concurrently", and for a RESERVED queue the model points the caller at the plan rather
-/// than at the member: "For reserved queues, specify the number of jobs you can process
-/// concurrently in your reservation plan instead" on a create, and "For reserved queues,
-/// update your reservation plan instead in order to increase your yearly commitment" on an
-/// update. So the slot count a plan reserves IS the concurrency of the queue it is stored
-/// on, which makes the rule one rule for every call that stores a plan: a call that stores
-/// one and states no `ConcurrentJobs` takes the queue's concurrency from that plan's
-/// `ReservedSlots`, so the two members of one projected `Queue` can never disagree.
+/// concurrently", and which of the two a queue takes it from is decided by its PRICING
+/// PLAN:
 ///
-/// A call that STATES the member takes the value it entered (the allocation
-/// [`check_concurrent_jobs`] measured), and a call that does neither keeps `stored` — the
-/// value an earlier call persisted, or [`DEFAULT_CONCURRENT_JOBS`] on a create.
+/// * a `RESERVED` queue buys its capacity by the slot count its plan reserves —
+///   `ReservationPlan$ReservedSlots` is "the number of reserved transcode slots (RTS) for
+///   this queue. The number of RTS determines how many jobs the queue can process in
+///   parallel; each RTS can process one job at a time" — and the model points a caller who
+///   states the member at the plan instead of at the member: "For reserved queues, specify
+///   the number of jobs you can process concurrently in your reservation plan instead" on a
+///   create, "For reserved queues, update your reservation plan instead in order to
+///   increase your yearly commitment" on an update. So the member DOES NOT APPLY to a
+///   reserved queue: its concurrency is `plan_slots`, the slot count of the plan the queue
+///   holds once this call has stored any plan it carried, whatever the request entered. The
+///   two members of one projected `Queue` therefore can never disagree.
+/// * an `ON_DEMAND` queue has no plan to buy capacity with, so its concurrency is the
+///   allocation the request states (the one [`check_concurrent_jobs`] measured against the
+///   Region's pool).
+///
+/// A call that leaves the deciding value absent keeps `stored` — the value an earlier call
+/// persisted, or [`DEFAULT_CONCURRENT_JOBS`] on a create.
 pub fn concurrent_jobs_for(
+    pricing_plan: &str,
     requested: Option<i32>,
-    settings: Option<&ReservationPlanSettings>,
+    plan_slots: Option<i32>,
     stored: i32,
 ) -> i32 {
-    requested
-        .or_else(|| settings.map(|settings| settings.reserved_slots))
-        .unwrap_or(stored)
+    if pricing_plan == PRICING_PLAN_RESERVED {
+        return plan_slots.unwrap_or(stored);
+    }
+    requested.unwrap_or(stored)
 }
 
 /// How this service refuses a concurrency that is not a number of jobs.

@@ -9,10 +9,12 @@
 //! reservation plan instead", and
 //! `smithy_query(query="doc",shape="UpdateQueueRequest",member="ConcurrentJobs")`: "For
 //! reserved queues, update your reservation plan instead in order to increase your yearly
-//! commitment"). Every call that STORES a plan therefore stores that plan's
-//! `ReservedSlots` as the queue's concurrency, unless the same call states
+//! commitment"). Every call on such a queue therefore stores the stored plan's
+//! `ReservedSlots` as the queue's concurrency, whether or not the same call states
 //! `ConcurrentJobs` itself — so the two members of one projected `Queue` never contradict
 //! each other, and every later reader (`GetQueue`, `ListQueues`) projects the same pair.
+//! The sibling suite `queue_reserved_concurrency_member` covers the calls that state the
+//! member.
 //!
 //! What a plan is allowed to say — the floor of a slot count, and that the count is
 //! one-way — is the sibling suite `queue_capacity_validation`'s rule; what an on-demand
@@ -34,14 +36,14 @@ const QUEUE: &str = "reserved";
 
 /// `GET /2017-08-29/queues` — the account's queues, the third channel that projects a
 /// queue's concurrency.
-async fn list_queues(emulator: &Emulator) -> Reply {
+pub(crate) async fn list_queues(emulator: &Emulator) -> Reply {
     emulator.send("GET", "/2017-08-29/queues", None).await
 }
 
 /// A `ReservationPlanSettings` reserving `slots` transcode slots. `Commitment` models
 /// exactly one value and `RenewalType` two
 /// (`smithy_query(query="shape",shape="Commitment,RenewalType")`).
-fn plan(renewal_type: &str, slots: i32) -> Value {
+pub(crate) fn plan(renewal_type: &str, slots: i32) -> Value {
     json!({
         "commitment": "ONE_YEAR",
         "renewalType": renewal_type,
@@ -160,7 +162,7 @@ fn cases() -> Vec<Case> {
 
 /// The queue `ListQueues` reports under `name`, or `Value::Null` when the listing holds no
 /// such queue.
-fn listed(listing: &Reply, name: &str) -> Value {
+pub(crate) fn listed(listing: &Reply, name: &str) -> Value {
     listing
         .at("/queues")
         .as_array()

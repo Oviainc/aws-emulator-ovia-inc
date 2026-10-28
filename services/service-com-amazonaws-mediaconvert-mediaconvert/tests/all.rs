@@ -87,6 +87,8 @@ mod queue_name_identity;
 mod queue_pause_gating;
 #[path = "all/queue_reserved_concurrency.rs"]
 mod queue_reserved_concurrency;
+#[path = "all/queue_reserved_concurrency_member.rs"]
+mod queue_reserved_concurrency_member;
 #[path = "all/queue_update.rs"]
 mod queue_update;
 #[path = "all/resource_projection_defaults.rs"]
