@@ -300,6 +300,23 @@ pub const MAX_PROPERTY_VALUES_RETURNED: usize = 50;
 /// `TooManyTagsException` (HTTP 400) that operation models.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The message the modelled `TooManyTagsException` carries for a tagging call
+/// that would leave a resource past [`MAX_TAGS_PER_RESOURCE`], or `None` while
+/// `resulting` — the size of the tag set the call would leave on the resource —
+/// is within it.
+///
+/// The message is the sentence the model states for this error class, with
+/// nothing added: `TooManyTagsException`'s documentation is "The number of tags
+/// exceeds the limit."
+/// (`smithy_query(query="shape",shape="TooManyTagsException")`), which names no
+/// value of the request, so the refusal names none either. The decision and the
+/// message are ONE function, so no caller can refuse on one count and report
+/// another.
+pub fn too_many_tags_violation(resulting: usize) -> Option<String> {
+    (resulting > MAX_TAGS_PER_RESOURCE)
+        .then(|| "The number of tags exceeds the limit.".to_string())
+}
+
 /// The tag-key prefix Amazon Web Services reserves for the tags it applies
 /// itself.
 ///

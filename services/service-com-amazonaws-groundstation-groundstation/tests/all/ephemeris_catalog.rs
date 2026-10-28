@@ -259,6 +259,35 @@ pub(crate) fn az_el_inline(ranges: &[(i64, i64)]) -> Value {
     }})
 }
 
+/// An ephemeris of the form the `ProgramTrackSettings` member `member` names — `azEl`,
+/// `oem` or `tle`, which are the members of that union and of `EphemerisData` alike
+/// (`smithy_query(query="shape", shape="ProgramTrackSettings")`) — created through
+/// `CreateEphemeris` on `router`, answering the `ephemerisId` it minted.
+///
+/// A contact's program track references an ephemeris BY ID, and a reference a write stores
+/// has to resolve, so every suite that drives `ReserveContact` or `UpdateContact` with
+/// tracking overrides stores the ephemeris those overrides name through the same front
+/// door rather than inventing an id for it.
+pub(crate) async fn program_track_ephemeris(router: &MultiServiceRouter, member: &str) -> String {
+    let data = match member {
+        "azEl" => az_el_inline(&[(1_800_000_000, 1_800_086_400)]),
+        "oem" => json!({"oem": {"oemData": OEM_BODY}}),
+        "tle" => tle_inline(&[(1_800_000_000, 1_800_086_400)]),
+        other => panic!("case {other}: not a ProgramTrackSettings member"),
+    };
+    create_ok(
+        router,
+        &format!("program track {member}"),
+        json!({
+            "name": format!("program track {member}"),
+            "enabled": true,
+            "expirationTime": FUTURE,
+            "ephemeris": data,
+        }),
+    )
+    .await
+}
+
 /// The Amazon S3 object a suite row supplies its data from.
 pub(crate) fn s3_object(key: &str) -> Value {
     json!({"bucket": "ground-station-ephemerides", "key": key, "version": "3HL4kqtJlcpXroDTDmj"})

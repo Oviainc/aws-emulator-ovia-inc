@@ -16,10 +16,9 @@
 //!
 //! An ARN that names no stored resource is refused with `ResourceNotFoundException`
 //! (HTTP 404); a call that would leave the resource carrying more than
-//! [`crate::state::MAX_TAGS_PER_RESOURCE`] tags with
-//! `ServiceQuotaExceededException` (HTTP 402) — the per-resource tag count is a
-//! service QUOTA, so exceeding it is a quota refusal — decided BEFORE anything
-//! is stored, so a refused call changes nothing.
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`] tags with the `TooManyTagsException`
+//! (HTTP 400) this operation models for exactly that failure — decided BEFORE
+//! anything is stored, so a refused call changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -92,28 +91,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iottwinmaker-awsiottwin
 // (every other operation of it declares it) but `TagResource`'s own error list omits
 // it, and an unreachable shared store is a server fault this handler must be able to
 // report as one rather than as a client error it is not.
-// `ServiceQuotaExceededException` is widened in for the same reason: the service models
-// the shape (HTTP 402) and the per-resource tag count is one of its quotas, so the
-// refusal this handler owes a call that would exceed it has to be sayable here even
-// though this operation's own error list does not name the shape.
 // `ValidationException` is widened in for the same reason again: the service models the
 // shape (HTTP 400, declared by every create of it) and a request naming a tag key in
 // the reserved namespace is a bad request rather than a tag-count one, so the refusal
 // it earns has to be sayable here.
 #[smithy_macros::operation_error(
     "com.amazonaws.iottwinmaker#TagResource",
-    extra_errors = [
-        "InternalServerException",
-        "ServiceQuotaExceededException",
-        "ValidationException"
-    ]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
-    ServiceQuotaExceededException(ServiceQuotaExceededException),
     TooManyTagsException(TooManyTagsException),
     ValidationException(ValidationException),
 }
@@ -223,18 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key| !tags.contains_key(key.as_str()))
             .count();
         let resulting = tags.len() + added;
-        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
-            // The CUMULATIVE count of a resource's tags is a service quota
-            // ("tags per resource"), not a property of this one request, so the
-            // refusal is the quota one: a caller's quota handling keys on the
-            // error CODE, and a per-call tag-shape rejection
-            // (`TooManyTagsException`, which the boundary validator serves from
-            // the modelled `TagMap` length) is a different refusal. It carries
-            // no message — the quota and the resource are the caller's own
-            // request — so nothing is constructed here.
-            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException { message: None },
-            )
+        // Exceeding the per-resource tag maximum is the failure this operation
+        // models an error FOR, so that modelled error is the refusal: a client
+        // handling the operation's declared error set is told the tag limit was
+        // reached rather than handed a code the operation never declares.
+        if let Some(message) = crate::state::too_many_tags_violation(resulting) {
+            return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
+                message: Some(message),
+            })
             .into());
         }
 
