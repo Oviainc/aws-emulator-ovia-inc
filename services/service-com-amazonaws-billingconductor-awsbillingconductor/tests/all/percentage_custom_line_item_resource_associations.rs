@@ -298,7 +298,7 @@ fn bare_id(arn: &str) -> String {
 /// period the associating call landed in, and a read that names no billing period is
 /// scoped to the current one, so both are decided by the wall clock rather than by a
 /// fixed month.
-fn period(months: i64) -> String {
+pub(crate) fn period(months: i64) -> String {
     let current =
         service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
     let (year, month) = current

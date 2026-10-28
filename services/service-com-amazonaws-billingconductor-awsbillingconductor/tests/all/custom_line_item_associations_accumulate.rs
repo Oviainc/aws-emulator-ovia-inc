@@ -137,7 +137,11 @@ async fn resource_associations_accumulate_across_calls() {
 }
 
 /// The `AssociationSize` `ListCustomLineItems` reports for one item.
-async fn association_size(emulator: &Emulator, target: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suites about the same membership count it rather than
+/// reading the derived member a second way (see
+/// `tests/all/resource_re_association_restores_billing_periods.rs`).
+pub(crate) async fn association_size(emulator: &Emulator, target: &str) -> Value {
     let (status, body) = emulator
         .send(
             "POST",

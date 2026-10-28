@@ -346,6 +346,53 @@ impl BillingPeriodSpan {
         }
         left
     }
+
+    /// This span and `other` as ONE span, when together they cover an unbroken stretch
+    /// of billing periods; `None` when a period neither of them covers lies between
+    /// them, so the two are separate stretches.
+    ///
+    /// Two half-open spans join when neither one's exclusive end falls before the
+    /// other's inclusive start: they overlap, or one begins exactly where the other
+    /// ends, which is contiguous because the end is EXCLUSIVE and so names the first
+    /// period the span does NOT cover. The joined span runs from the earlier inclusive
+    /// start to the later exclusive end, each bound kept as the call that set it spelled
+    /// it, and an absent bound is open and so swallows the other.
+    ///
+    /// The counterpart of [`Self::minus`]: subtraction is what a call that ends a
+    /// resource over a range does to its spans, and this is what a call that puts it in
+    /// effect over one does ([`add_billing_periods`]).
+    pub fn union(&self, other: &Self) -> Option<Self> {
+        let (start, end) = (self.start_key(), self.end_key());
+        let (other_start, other_end) = (other.start_key(), other.end_key());
+        if periods_lie_between(end, other_start) || periods_lie_between(other_end, start) {
+            return None;
+        }
+        let inclusive_start = match (start, other_start) {
+            (Some(start), Some(other_start)) if other_start < start => {
+                other.inclusive_start.clone()
+            }
+            // An absent start is the unbounded past, so the other span's start is the
+            // earlier one only when this span has one at all.
+            (Some(_), None) => other.inclusive_start.clone(),
+            _ => self.inclusive_start.clone(),
+        };
+        let exclusive_end = match (end, other_end) {
+            (Some(end), Some(other_end)) if other_end > end => other.exclusive_end.clone(),
+            // An absent end is open, so it is the later one.
+            (Some(_), None) => other.exclusive_end.clone(),
+            _ => self.exclusive_end.clone(),
+        };
+        Some(Self::new(inclusive_start, exclusive_end))
+    }
+}
+
+/// Is there a billing period between the half-open bound `end` and the inclusive bound
+/// `start` — does `end` fall strictly before `start`?
+///
+/// Both are the month counts [`billing_period_key`] returns, and an ABSENT bound is
+/// open — the unbounded future or past — so nothing lies beyond it.
+fn periods_lie_between(end: Option<i64>, start: Option<i64>) -> bool {
+    matches!((end, start), (Some(end), Some(start)) if end < start)
 }
 
 /// Take the billing periods `removed` names out of `spans`, the stretches of billing
@@ -379,6 +426,50 @@ pub fn remove_billing_periods(
     }
     *spans = left;
     PeriodsRemoval::Changed
+}
+
+/// Put the billing periods `added` names INTO `spans`, the stretches of billing periods
+/// ONE resource is in effect over, and report what that did to them.
+///
+/// The periods a resource is in effect over are the UNION of the ranges the calls that
+/// put it in effect named: a range that runs on from a stretch the resource already has
+/// — overlapping it, or beginning exactly at its exclusive end — joins that stretch into
+/// one ([`BillingPeriodSpan::union`]), a range sharing no period with any of them becomes
+/// a stretch of its own, and a range every period of which is already in effect leaves
+/// them exactly as they are, so a repeat of one call changes nothing. The spans stay
+/// disjoint and ascending, because joining every stretch a span touches leaves one.
+///
+/// An addition that would leave the resource in more separate stretches than
+/// [`MAX_BILLING_PERIOD_SPANS`] is REFUSED and writes nothing, for the reason that
+/// constant gives.
+///
+/// The inverse of [`remove_billing_periods`], and the only place billing periods are put
+/// into a stored span list, so a bounded call means the same thing wherever it lands.
+pub fn add_billing_periods(
+    spans: &mut Vec<BillingPeriodSpan>,
+    added: &BillingPeriodSpan,
+) -> PeriodsAddition {
+    let mut joined = added.clone();
+    let mut left: Vec<BillingPeriodSpan> = Vec::new();
+    for span in spans.iter() {
+        match span.union(&joined) {
+            Some(union) => joined = union,
+            None => left.push(span.clone()),
+        }
+    }
+    left.push(joined);
+    // The stretches a read walks are ascending, and the one this call joined can belong
+    // anywhere among them; an absent inclusive start is the unbounded past, so it sorts
+    // first.
+    left.sort_by_key(|span| span.start_key().unwrap_or(i64::MIN));
+    if left == *spans {
+        return PeriodsAddition::Unchanged;
+    }
+    if left.len() > MAX_BILLING_PERIOD_SPANS {
+        return PeriodsAddition::AtSpanLimit;
+    }
+    *spans = left;
+    PeriodsAddition::Changed
 }
 
 /// The `CurrencyCode` a resource's charges are denominated in, DERIVED from the
@@ -1503,6 +1594,20 @@ pub enum PeriodsRemoval {
     AtSpanLimit,
 }
 
+/// What putting a range of billing periods INTO a resource association did — see
+/// [`ResourceAssociationRecord::add_periods`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodsAddition {
+    /// The billing periods the association is in effect in changed.
+    Changed,
+    /// Every billing period the range names was already in effect, so nothing changed —
+    /// which is how a retry of a call that already applied answers.
+    Unchanged,
+    /// REFUSED: the addition would leave the resource in more separate stretches of
+    /// billing periods than [`MAX_BILLING_PERIOD_SPANS`], so nothing was written.
+    AtSpanLimit,
+}
+
 impl ResourceAssociationRecord {
     /// An association of `arn` in effect over `span` — the billing period range the
     /// associating call named.
@@ -1555,6 +1660,16 @@ impl ResourceAssociationRecord {
     /// no period at all is empty ([`Self::is_empty`]) and its record goes.
     pub fn remove_periods(&mut self, removed: &BillingPeriodSpan) -> PeriodsRemoval {
         remove_billing_periods(&mut self.spans, removed)
+    }
+
+    /// Put the billing periods `added` names INTO this association, and report what that
+    /// did to the periods it is in effect in, through the addition every store here
+    /// shares ([`add_billing_periods`]): an association is in effect over the UNION of
+    /// the ranges the calls that associated the resource named, so a call naming periods
+    /// this association does not cover puts THOSE periods in effect while one naming
+    /// only periods it already covers writes nothing.
+    pub fn add_periods(&mut self, added: &BillingPeriodSpan) -> PeriodsAddition {
+        add_billing_periods(&mut self.spans, added)
     }
 
     /// Is this association in effect in no billing period at all, so that nothing of
@@ -1867,10 +1982,16 @@ impl CustomLineItemRecord {
         versions
     }
 
-    /// The association for `arn`, if this item already holds one.
-    pub fn association(&self, arn: &str) -> Option<&ResourceAssociationRecord> {
+    /// The association this item holds for `arn`, if any — the ONE record the resource
+    /// is held by, whatever billing periods it is in effect over.
+    ///
+    /// Whether the resource is associated IN a billing period is the record's own
+    /// question ([`ResourceAssociationRecord::covers`]) and never this lookup's: a
+    /// resource the item holds a record for can be in effect in some periods and not in
+    /// others, so a caller deciding anything period-scoped asks the record.
+    pub fn association_mut(&mut self, arn: &str) -> Option<&mut ResourceAssociationRecord> {
         self.associated_resources
-            .iter()
+            .iter_mut()
             .find(|association| association.arn == arn)
     }
 

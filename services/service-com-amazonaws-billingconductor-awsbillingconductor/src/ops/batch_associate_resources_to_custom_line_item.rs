@@ -12,9 +12,12 @@
 //! is a modelled error for the whole call; a fault of ONE named resource is that
 //! element's `Error`, because the batch's other elements still succeed.
 //!
-//! The operation is `@idempotent`: re-associating a resource the item already holds
-//! succeeds and changes nothing, so a retry (or a repeat inside one request) cannot
-//! double-count `AssociationSize`.
+//! An association is in effect over the BILLING PERIODS of the ranges the calls that
+//! associated the resource named, so a call puts the periods its `BillingPeriodRange`
+//! names in effect whether or not the item already holds the resource — the resource is
+//! held by ONE record either way. The operation is `@idempotent` on that union:
+//! re-associating over periods already in effect changes nothing, so a retry (or a
+//! repeat inside one request) cannot double-count `AssociationSize`.
 //!
 //! ## Shape of an operation
 //!
@@ -337,10 +340,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 Ok(resource_arn) => resource_arn,
             };
-            // `@idempotent`: the association this call asks for already holds, so the
-            // call adds nothing and leaves the stored range as the earlier call set
-            // it — and `AssociationSize` does not double-count.
-            if target.association(&resource_arn).is_some() {
+            // The billing periods this call puts the association in effect over: "the
+            // billing period range in which the custom line item request will be
+            // applied", beginning no earlier than the period the call was made in when
+            // it names no start of its own.
+            let added = crate::state::BillingPeriodSpan::started_now(
+                inclusive_start_billing_period.clone(),
+                exclusive_end_billing_period.clone(),
+            );
+            // An item that already holds a record for the resource keeps that ONE
+            // record and GAINS the periods this call names: the periods an association
+            // is in effect over are the union of the ranges the associating calls named,
+            // so a range the stored association does not cover is put in effect — and a
+            // range it already covers writes nothing, which is how `@idempotent` leaves
+            // `AssociationSize` unable to double-count.
+            if let Some(outcome) = target
+                .association_mut(&resource_arn)
+                .map(|association| association.add_periods(&added))
+            {
+                match outcome {
+                    crate::state::PeriodsAddition::Changed => {
+                        target.last_modified_time_millis = now;
+                    }
+                    crate::state::PeriodsAddition::Unchanged => {}
+                    // One stretch of billing periods more than a stored association may
+                    // be in effect over is a limit this resource's element cannot get
+                    // around, and nothing of it was written.
+                    crate::state::PeriodsAddition::AtSpanLimit => {
+                        failures.push(failed(
+                            requested,
+                            "SERVICE_LIMIT_EXCEEDED",
+                            format!(
+                                "the association of {resource_arn} is in effect over at most {} \
+                                 separate ranges of billing periods",
+                                crate::state::MAX_BILLING_PERIOD_SPANS
+                            ),
+                        ));
+                        continue;
+                    }
+                }
                 associated.push(AssociateResourceResponseElement {
                     arn: Some(requested.clone()),
                     error: None,
@@ -369,11 +407,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target
                 .associated_resources
                 .push(crate::state::ResourceAssociationRecord::new(
-                    resource_arn,
-                    crate::state::BillingPeriodSpan::new(
-                        inclusive_start_billing_period.clone(),
-                        exclusive_end_billing_period.clone(),
-                    ),
+                    resource_arn, added,
                 ));
             target.last_modified_time_millis = now;
             associated.push(AssociateResourceResponseElement {

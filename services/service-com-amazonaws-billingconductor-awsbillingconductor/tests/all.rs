@@ -121,6 +121,8 @@ mod pricing_rules_associated_to_pricing_plan;
 mod reserved_tag_keys;
 #[path = "all/resource_association_billing_periods.rs"]
 mod resource_association_billing_periods;
+#[path = "all/resource_re_association_restores_billing_periods.rs"]
+mod resource_re_association_restores_billing_periods;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_surface.rs"]
