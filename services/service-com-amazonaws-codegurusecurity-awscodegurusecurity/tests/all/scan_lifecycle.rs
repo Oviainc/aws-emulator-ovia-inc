@@ -80,6 +80,20 @@ pub(crate) async fn call(
     path_and_query: &str,
     body: Option<Value>,
 ) -> Answer {
+    call_signed_for(router, REGION, method, path_and_query, body).await
+}
+
+/// [`call`] with the region of the request's SigV4 credential SCOPE named by the caller,
+/// so a case can drive a scope other than the suite's. The `Host` header stays this
+/// service's endpoint in the suite's region, because the scope is what a region is read
+/// from (`crate::scan_arn_region` drives the rows).
+pub(crate) async fn call_signed_for(
+    router: &MultiServiceRouter,
+    scope_region: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Option<Value>,
+) -> Answer {
     let host = format!("codeguru-security.{REGION}.amazonaws.com");
     let payload = body.map(|b| b.to_string()).unwrap_or_default();
     let request = http::Request::builder()
@@ -90,8 +104,8 @@ pub(crate) async fn call(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/codeguru-security/\
-                 aws4_request, SignedHeaders=host, Signature=abc"
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{scope_region}/\
+                 codeguru-security/aws4_request, SignedHeaders=host, Signature=abc"
             ),
         )
         .body(bytes::Bytes::from(payload))
@@ -248,7 +262,13 @@ fn is_modelled_uuid(value: &str) -> bool {
 /// The `ScanNameArn` shape's pattern:
 /// `^arn:aws:codeguru-security:[\S]+:[\d]{12}:scans\/[a-zA-Z0-9-_$:.]*$`.
 pub(crate) fn expected_scan_arn(scan_name: &str) -> String {
-    format!("arn:aws:codeguru-security:{REGION}:000000000000:scans/{scan_name}")
+    expected_scan_arn_in(REGION, scan_name)
+}
+
+/// [`expected_scan_arn`] for a scan of `region`, so a suite driving a region other than
+/// this one's spells the ARN template in the same one place (`crate::scan_arn_region`).
+pub(crate) fn expected_scan_arn_in(region: &str, scan_name: &str) -> String {
+    format!("arn:aws:codeguru-security:{region}:000000000000:scans/{scan_name}")
 }
 
 // ---------------------------------------------------------------------------------
