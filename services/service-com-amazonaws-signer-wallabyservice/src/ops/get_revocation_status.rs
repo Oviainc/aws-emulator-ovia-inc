@@ -24,6 +24,13 @@
 //! ([`crate::service::missing_list_member_constraint`]) rather than as a value
 //! that was null.
 //!
+//! A `platformId` outside the character class the route's published contract
+//! declares for it is refused for that constraint
+//! ([`crate::state::platform_id_pattern_refusal`]) before any platform is
+//! resolved, so the catalog only ever decides about ids that are platform ids:
+//! "does not exist" says the id was well formed and unknown, which a value the
+//! class excludes is not.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -176,6 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and no other region's.
         let region = crate::state::request_region(ctx.parts());
 
+        // Every value this route's published contract CONSTRAINS is refused for
+        // the constraint it violated before anything it might name is resolved,
+        // in the order the model declares the members — so `platformId`, whose
+        // published character class this service checks itself, comes before
+        // `certificateHashes`. A value outside that class is not a platform id
+        // at all: it names no platform, so it is refused for the syntax it
+        // violated rather than reported as a platform that does not exist, which
+        // would say the id was well formed but unknown.
+        if let Some(message) =
+            crate::state::platform_id_pattern_refusal(PLATFORM_ID_QUERY, &input.platform_id)
+        {
+            return Err(validation(message));
+        }
+
         // `certificateHashes` is `@required`, and what it requires is a
         // certificate to check — so a request that supplies the parameter but no
         // element in it is refused for what it actually did (supplied nothing),
@@ -191,7 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `platformId` names the signing platform the signature was produced on,
         // and this service publishes the WHOLE set of platforms a signature can
-        // be produced on, so an id outside that catalog names no platform at all.
+        // be produced on, so an id inside the published character class but
+        // outside that catalog names no platform at all.
         if crate::state::signing_platform(&input.platform_id).is_none() {
             return Err(validation(crate::state::platform_not_found_message(
                 &input.platform_id,
@@ -286,6 +308,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// it (`smithy_query(query="operation",operation="GetRevocationStatus")`) — the
 /// name a refusal of that member states.
 const CERTIFICATE_HASHES_QUERY: &str = "certificateHashes";
+
+/// The wire name of the `platformId` input member, as `@httpQuery` binds it —
+/// the name a refusal of that member states.
+const PLATFORM_ID_QUERY: &str = "platformId";
 
 /// The modelled 400 for a request this operation cannot act on: a
 /// `certificateHashes` carrying nothing, a `platformId` naming no published

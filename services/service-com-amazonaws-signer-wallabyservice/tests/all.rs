@@ -20,6 +20,9 @@ mod error_responses;
 #[path = "all/job_listing.rs"]
 mod job_listing;
 
+#[path = "all/platform_id_character_class.rs"]
+mod platform_id_character_class;
+
 #[path = "all/platform_listing.rs"]
 mod platform_listing;
 

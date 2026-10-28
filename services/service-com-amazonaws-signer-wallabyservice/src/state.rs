@@ -1441,8 +1441,102 @@ pub fn signing_platform(platform_id: &str) -> Option<&'static SigningPlatformEnt
 }
 
 /// The refusal prose for a `platformId` this emulator publishes no platform for.
+///
+/// Says the id was WELL FORMED and unknown — a platform another endpoint may
+/// publish, or one that was withdrawn. An id that is not a platform id at all is
+/// a different answer ([`platform_id_pattern_refusal`]).
 pub fn platform_not_found_message(platform_id: &str) -> String {
     format!("Platform with id {platform_id} does not exist")
+}
+
+/// The character class a `platformId` carried by `GET /revocations` is published
+/// to fall inside.
+///
+/// Source: the `@pattern` the model of the signer DATA PLANE — which publishes
+/// the contract of that route — declares on `PlatformId`
+/// (`smithy_query(query="shape",shape="PlatformId",model_path="services/\
+/// service-com-amazonaws-signerdata-signerdataplane/smithy-model/\
+/// com-amazonaws-signerdata-signerdataplane.json")`). This service serves that
+/// route (it holds the revocation records that answer it) while its own copy of
+/// the operation omits the trait, so the published expression is stated here —
+/// once, because a refusal quotes the expression a value had to satisfy and
+/// [`satisfies_platform_id_pattern`] decides against the same one.
+pub const REVOCATION_PLATFORM_ID_PATTERN: &str = "^[a-zA-Z0-9_-]+$";
+
+/// Whether `value` falls inside [`REVOCATION_PLATFORM_ID_PATTERN`]: at least one
+/// character, every one of them an ASCII letter, an ASCII digit, `_` or `-`.
+///
+/// The expression is anchored at both ends, so satisfying it is a property of
+/// the WHOLE value: one character outside the class — a space, a `.`, a `/`, a
+/// `!`, anything non-ASCII — puts the value outside it, and so does the empty
+/// string.
+fn satisfies_platform_id_pattern(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The longest rejected value a clause states in full.
+///
+/// The value between the quotes is the caller's OWN bytes — AWS builds the
+/// clause from the request, so a caller comparing the echo against what it sent
+/// must see it whole. A value with no ceiling at all would let one oversized
+/// query parameter become an equally large error body, so the ceiling is set
+/// where the shared refusal-wording module sets the largest echo it restores
+/// into a clause (16 KiB): 64x the longest identifier any member of this service
+/// declares, so every value a client plausibly sends — a long id, an over-long
+/// ARN — is quoted whole, and only request-sized content is shortened.
+const MAX_STATED_VALUE: usize = 16 * 1024;
+
+/// `value` as a clause states it: itself when it is within
+/// [`MAX_STATED_VALUE`], otherwise the prefix that fits — cut on a character
+/// boundary, never mid-UTF-8 — with the whole length stated after it, which is
+/// how the framework shortens a value too large for a clause it renders itself.
+///
+/// Rendering only: the value is checked against the published class UNELIDED
+/// ([`satisfies_platform_id_pattern`]), because a decision taken on a prefix
+/// would refuse a long value the class admits.
+fn stated_value(value: &str) -> String {
+    if value.len() <= MAX_STATED_VALUE {
+        return value.to_string();
+    }
+    // `end` starts inside the value (its length is past the bound) and only
+    // walks down, so the slice below is always in range and on a boundary.
+    let mut end = MAX_STATED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
+}
+
+/// How a `platformId` outside the published character class is refused, or
+/// `None` when it falls inside it.
+///
+/// A value outside a published constraint is refused for the SYNTAX it violated,
+/// which is a different answer from a catalog lookup's
+/// ([`platform_not_found_message`]): a value that is not a platform id at all
+/// names no platform, so it is never reported as a platform that does not exist.
+/// It is therefore decided before anything the value might name is resolved.
+///
+/// The sentence is the one the boundary validator writes for every constraint it
+/// refuses — the clause [`::aws_smithy_schema_server::Violation::message`]
+/// renders from the member path and the violated requirement, inside
+/// [`::aws_smithy_schema_server::envelope`] — so a constraint this service has
+/// to check itself is worded exactly like one the model carries. `member` is the
+/// Smithy member name the value arrived on, put through the framework's own path
+/// builder, so every member held to the class is named one way.
+pub fn platform_id_pattern_refusal(member: &str, value: &str) -> Option<String> {
+    if satisfies_platform_id_pattern(value) {
+        return None;
+    }
+    ::aws_smithy_schema_server::envelope(&[::aws_smithy_schema_server::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member(member),
+        kind: ::aws_smithy_schema_server::ViolationKind::Pattern(
+            REVOCATION_PLATFORM_ID_PATTERN.to_string(),
+        ),
+        value: Some(stated_value(value)),
+    }])
 }
 
 /// Which `overrides.signingConfiguration` member an override refusal is about.
