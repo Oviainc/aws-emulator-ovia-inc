@@ -193,19 +193,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
+        // A page token is OPAQUE and self-verifying: only a cursor this listing
+        // issued names a position in it, so a value the caller made up is refused
+        // instead of being read as some arbitrary position — a caller that hands
+        // back a stale or hand-built cursor is told so rather than silently
+        // restarting the walk at page one. The refusal quotes the rejected value in
+        // angle brackets, as this service words it, and the identity list is left
+        // untouched.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::LISTING_IDENTITIES, token)
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                            "Invalid NextToken <{token}>."
+                        ))
+                    })?,
+            ),
+        };
+
         // The store is keyed by the identity string, so iteration is in one
         // stable (lexicographic) order for every caller — which is what makes a
-        // `NextToken` resumable at all. The token is the identity the next page
+        // `NextToken` resumable at all. The cursor names the identity the next page
         // starts at, so a page boundary never repeats or skips an entry even when
         // identities are added or removed between calls.
-        let resume_from = input.next_token.as_deref().unwrap_or("");
-        // `(Included(&str), Unbounded)` rather than `resume_from..`, so the range
-        // is over `str` keys (a `RangeFrom<&str>` would ask the map for `&str`
-        // keys, which it does not have).
-        let page = (
-            std::ops::Bound::Included(resume_from),
-            std::ops::Bound::Unbounded,
-        );
+        let page = match resume_from.as_deref() {
+            Some(resume_from) => (
+                std::ops::Bound::Included(resume_from),
+                std::ops::Bound::Unbounded,
+            ),
+            None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        };
         let mut identities: Vec<String> = Vec::new();
         let mut next_token = None;
         for (name, identity) in state.identities.range::<str, _>(page) {
@@ -213,10 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if identities.len() == page_size {
-                next_token = Some(name.clone());
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::LISTING_IDENTITIES,
+                    name,
+                ));
                 break;
             }
-            identities.push(name.clone());
+            // The identity as it was RECORDED, which is the value every other reader
+            // of the list reports and the one an identity recorded through another of
+            // the account's email APIs carries.
+            identities.push(identity.name.clone());
         }
 
         Ok(ListIdentitiesOutput {

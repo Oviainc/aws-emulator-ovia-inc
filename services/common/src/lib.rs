@@ -50,7 +50,7 @@
 //!   which operation it names — for every service whose published target prefix carries
 //!   dots of its own, which the framework's first-dot readers cannot route;
 //!
-//! Beside them, five SHARED STORES live here, each held once in the shared engine so
+//! Beside them, six SHARED STORES live here, each held once in the shared engine so
 //! the services on either side of a hand-off cannot hold two copies of one fact:
 //!
 //! * [`iot_job_executions`], the IoT job-execution store the IoT control plane writes
@@ -74,7 +74,11 @@
 //! * [`management_events`], the account's management-event (audit) log — written by the
 //!   service that SERVED an API call, which is the only one that knows the call
 //!   happened, and read by CloudTrail, which is the service that reports it
-//!   (`LookupEvents`).
+//!   (`LookupEvents`);
+//! * [`ses_identities`], the account's email identity registry — the ONE set of
+//!   identities Amazon SES's two APIs publish, written by whichever surface records or
+//!   deletes an identity and read by both, so an identity created with the modern API
+//!   is listed, reported and gated on by the legacy one and the other way round.
 //!
 //! # Why a shared rule
 //!
@@ -285,6 +289,10 @@ pub mod query_timestamps;
 pub mod response_media_type;
 pub mod rfc3339;
 pub mod rpc_target;
+/// The account's EMAIL IDENTITY registry, shared by the two SES surfaces: the set of
+/// identities one account holds and the verification state of each, written by
+/// whichever surface records or deletes one and read by both.
+pub mod ses_identities;
 pub mod shared_path;
 pub mod validation;
 pub mod validation_message;

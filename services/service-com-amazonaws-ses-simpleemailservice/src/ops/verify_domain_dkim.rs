@@ -169,20 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        if crate::state::service_state(&*self.engine).is_none() {
             // See `verify_email_identity.rs`: an engine with no store for this
             // service cannot serve the operation at all, and it models no server
             // error of its own.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "VerifyDomainDkim",
             ));
-        };
-        // Adds the domain to the identity list if it is not in it already, and
+        }
+        // Adds the domain to the identity list if it is not in it already — this
+        // service's own and the account registry the v2 surface answers from — and
         // STORES the tokens on its record: asking again answers with the tokens
         // the domain already carries, so the CNAME records a caller has already
         // published stay the ones the service reports. `None` means the account
         // is already at its identity limit.
-        let Some(dkim_tokens) = state.lock().request_easy_dkim(&domain) else {
+        let Some(dkim_tokens) = crate::state::record_easy_dkim(&*self.engine, &domain) else {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "this account already holds the maximum of {} verified identities; delete one \
                  before verifying {domain}",

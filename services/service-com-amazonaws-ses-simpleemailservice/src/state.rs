@@ -32,6 +32,15 @@
 //! A listing this store serves a page at a time hands the caller an OPAQUE,
 //! self-verifying cursor ([`encode_page_token`]), so a token this service never
 //! issued is refused instead of being read as some arbitrary position.
+//!
+//! The identity list here is this surface's VIEW of one account-wide set of email
+//! identities, which lives in the shared engine as
+//! [`::service_common::ses_identities::SesIdentityDirectory`] and which the SES v2
+//! surface publishes to and reads as well: an identity belongs to the account rather
+//! than to the API that recorded it. What a record here adds to that set is what THIS
+//! API adds to an identity — its policies, its Easy DKIM setup, its notification
+//! topics, its custom MAIL FROM setup — and [`reconcile_identities`] is where the two
+//! are brought back into agreement, on every operation this service serves.
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -682,6 +691,12 @@ pub struct Identity {
     /// `IdentityVerificationAttributes$VerificationToken` is documented as
     /// "The verification token for a domain identity. Null for email address
     /// identities."
+    ///
+    /// The value is the account REGISTRY's
+    /// ([`::service_common::ses_identities::SesIdentityRecord::verification_token`]),
+    /// copied onto this record when the identity is published, so a domain recorded
+    /// through either SES surface carries one TXT value and every read of it answers
+    /// the same.
     pub verification_token: Option<String>,
     /// This identity's Easy DKIM setup, when one has been asked for:
     /// `VerifyDomainDkim` records it and `GetIdentityDkimAttributes` reports it.
@@ -726,6 +741,16 @@ pub struct Identity {
     /// timer: nothing sleeps for it, and a reader materialises the move only
     /// once the clock has already made it due ([`Self::settle_verification`]).
     pub verification_due: Option<SystemTime>,
+    /// Whether the account's identity registry
+    /// ([`::service_common::ses_identities::SesIdentityDirectory`]) already carries
+    /// this identity.
+    ///
+    /// The registry is the account's SET of identities, which the SES v2 surface
+    /// publishes to and reads as well, so this flag is what tells an identity
+    /// DELETED through that surface — registered here, gone from the registry —
+    /// from one this service has recorded but not published yet
+    /// ([`reconcile_identities`]).
+    pub registered: bool,
 }
 
 impl Identity {
@@ -1116,6 +1141,11 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// does not restart the span an identity already part-way through it has
     /// left to run.
     ///
+    /// The verification TOKEN a domain identity carries is not minted here: it is
+    /// the account registry's, which both SES surfaces publish an identity to, so a
+    /// domain recorded through either one carries the same TXT value
+    /// ([`reconcile_identities`] copies it back onto this record).
+    ///
     /// The record is stored [`VerificationStatus::Pending`]: requesting
     /// verification only STARTS it — the identity's owner has yet to follow the
     /// link in the message SES sends, or to publish the domain's TXT record — so
@@ -1137,13 +1167,6 @@ impl ComAmazonawsSesSimpleemailserviceState {
         if is_new && self.identities.len() >= MAX_IDENTITIES {
             return None;
         }
-        // Minted BEFORE the entry is taken, and only for an identity that is
-        // about to be recorded: re-verification must not mint a second token for
-        // a domain that already carries one.
-        let verification_token = match (is_new, identity_type) {
-            (true, IdentityType::Domain) => Some(self.new_verification_token()),
-            _ => None,
-        };
         let requested_at = SystemTime::now();
         Some(
             self.identities
@@ -1152,7 +1175,7 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     name: name.to_string(),
                     identity_type,
                     verification_status: VerificationStatus::Pending,
-                    verification_token,
+                    verification_token: None,
                     dkim: None,
                     dkim_enabled: DKIM_SIGNING_AT_IDENTITY_START,
                     notifications: NotificationSettings::default(),
@@ -1160,6 +1183,10 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     policies: BTreeMap::new(),
                     verified_at: requested_at,
                     verification_due: requested_at.checked_add(IDENTITY_VERIFICATION_SPAN),
+                    // Published to the account registry by the operation that
+                    // recorded it, so the other SES surface answers for the
+                    // identity from the moment this call returns.
+                    registered: false,
                 }),
         )
     }
@@ -1540,14 +1567,6 @@ impl ComAmazonawsSesSimpleemailserviceState {
         )
     }
 
-    /// A fresh domain-verification token, the value a domain identity publishes
-    /// as a TXT record: 44 opaque characters, the length SES's own token
-    /// carries. Opaque to the caller; only its stability across reads matters,
-    /// which the stored [`Identity`] record is what provides.
-    pub fn new_verification_token(&mut self) -> String {
-        self.mint_token()[..44].to_string()
-    }
-
     /// A fresh Easy DKIM token, the value a domain identity publishes as the
     /// label of a `<token>._domainkey.<domain>` CNAME record:
     /// [`EASY_DKIM_TOKEN_LEN`] opaque characters. Opaque to the caller; only its
@@ -1781,6 +1800,10 @@ pub const LISTING_RECEIPT_RULE_SETS: &str = "ListReceiptRuleSets";
 /// listing.
 pub const LISTING_CONFIGURATION_SETS: &str = "ListConfigurationSets";
 
+/// The listing name stamped into a `ListIdentities` page token, for the same
+/// reason: a cursor cut from the identity list resumes only that listing.
+pub const LISTING_IDENTITIES: &str = "ListIdentities";
+
 /// The bytes every page token of this service digests before the listing and the
 /// key, so a token of this service is not a token of any other.
 const PAGE_TOKEN_DOMAIN: &[u8] = b"com.amazonaws.ses#page-token\0";
@@ -1834,12 +1857,12 @@ pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
 ///
 /// A value with no angle-addr is returned trimmed and unchanged, so a malformed
 /// value stays malformed for the caller's own check.
+///
+/// The reading itself is `service_common::ses_identities`', which the account's
+/// identity registry keys by, so this surface and the registry cannot disagree about
+/// which mailbox a value names.
 pub fn addr_spec(value: &str) -> &str {
-    let trimmed = value.trim();
-    match (trimmed.rfind('<'), trimmed.rfind('>')) {
-        (Some(open), Some(close)) if open + 1 < close => trimmed[open + 1..close].trim(),
-        _ => trimmed,
-    }
+    ::service_common::ses_identities::addr_spec(value)
 }
 
 /// The identity an ARN of this service names, when it names one: the ARN's
@@ -1870,6 +1893,13 @@ fn identity_named_by_arn(value: &str) -> Option<&str> {
 /// ([`identity_named_by_arn`]), and anything else is the identity itself; either
 /// way the value is keyed by its addr-spec, the way the writers key it
 /// ([`addr_spec`]).
+///
+/// The SPELLING is kept: this table is keyed by the value an identity was recorded
+/// with, and that is the value `ListIdentities` reports. The account's identity
+/// registry compares the domain part the way DNS does
+/// (`service_common::ses_identities::identity_key`), so two records here that differ
+/// only in the case of their domain are one identity of the ACCOUNT — the registry
+/// holds it once, under the spelling it was first recorded with.
 pub fn identity_key(value: &str) -> &str {
     let trimmed = value.trim();
     identity_named_by_arn(trimmed).unwrap_or_else(|| addr_spec(trimmed))
@@ -2759,10 +2789,250 @@ fn system_entropy() -> u64 {
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
+///
+/// Every call RECONCILES this service's identity list against the account's identity
+/// registry first ([`reconcile_identities`]), so an operation served here answers for
+/// every identity the account holds — including the ones recorded through the SES v2
+/// surface — and for none it has deleted.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsSesSimpleemailserviceState>> {
+    let engine = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()?;
+    let state = engine.state::<ComAmazonawsSesSimpleemailserviceState>();
+    let registry = engine.state::<::service_common::ses_identities::SesIdentityDirectory>();
+    reconcile_identities(&state, &registry, SystemTime::now());
+    Some(state)
+}
+
+/// Record `name` as an identity of this account of class `identity_type` — in this
+/// service's own identity list and in the account registry both SES surfaces answer
+/// from — and hand back the stored record.
+///
+/// This is what the verification operations of this surface write through, so an
+/// identity they record is one the v2 surface lists and reports from the moment the
+/// call returns, and a DOMAIN identity carries the registry's TXT verification token
+/// (the value the owner publishes at `_amazonses.<domain>`).
+///
+/// Idempotent, exactly as [`ComAmazonawsSesSimpleemailserviceState::verify_identity`]
+/// is: an identity already held keeps its record, its token and whatever is left of
+/// the span its pending verification started.
+///
+/// `None` when this account is already at its identity limit and this is a new
+/// identity — the caller refuses the request — or when the engine has no store for
+/// this service at all.
+pub fn record_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+    identity_type: IdentityType,
+) -> Option<Identity> {
+    let state = service_state(engine)?;
+    let registry = identity_registry(engine)?;
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    let recorded = state.verify_identity(name, identity_type)?.clone();
+    let published = registry.publish(registry_record(&recorded))?.clone();
+    let held = state.identities.get_mut(identity_key(&recorded.name))?;
+    held.registered = true;
+    held.verification_token = published.verification_token;
+    Some(held.clone())
+}
+
+/// Set up Easy DKIM for the domain identity `domain` — recording the domain as an
+/// identity of this account if it is not one already, in this service's list and in
+/// the account registry both — and hand back the tokens it is to publish as CNAME
+/// records.
+///
+/// The identity half of `VerifyDomainDkim`, which "adds the domain to the list of
+/// identities associated with your account": the same list, and the same publication,
+/// as [`record_identity`].
+///
+/// `None` when this account is already at its identity limit and the domain is a new
+/// identity, or when the engine has no store for this service.
+pub fn record_easy_dkim<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    domain: &str,
+) -> Option<Vec<String>> {
+    let state = service_state(engine)?;
+    let registry = identity_registry(engine)?;
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    let tokens = state.request_easy_dkim(domain)?;
+    let recorded = state.identities.get(identity_key(domain))?.clone();
+    let published = registry.publish(registry_record(&recorded))?.clone();
+    let held = state.identities.get_mut(identity_key(domain))?;
+    held.registered = true;
+    held.verification_token = published.verification_token;
+    Some(tokens)
+}
+
+/// Remove `name` from this account's identity list — from this service's own store and
+/// from the account registry both — so neither SES surface reports it afterwards.
+///
+/// Removing an identity this account does not hold changes nothing, which is the rule
+/// both delete operations of this surface follow.
+pub fn forget_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let Some(registry) = identity_registry(engine) else {
+        return;
+    };
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    state.identities.remove(identity_key(name));
+    registry.forget(name);
+}
+
+/// The account's identity registry in the shared engine, which this service and the
+/// SES v2 surface both publish to and read: call it with a handler's `&*self.engine`.
+///
+/// An operation that RECORDS or DELETES an identity publishes the change here, so the
+/// other surface answers for it from the moment the call returns. Take this lock while
+/// holding this service's own store, never the other way round, so two callers on
+/// different surfaces cannot wait on each other.
+pub fn identity_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::ses_identities::SesIdentityDirectory>> {
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
-        .map(::engine::InMemoryEngine::state::<ComAmazonawsSesSimpleemailserviceState>)
+        .map(::engine::InMemoryEngine::state::<
+            ::service_common::ses_identities::SesIdentityDirectory,
+        >)
+}
+
+/// Bring this service's identity list and the account's identity registry back into
+/// agreement at `now`, so every API over the account's identities answers for ONE set
+/// of them.
+///
+/// The reconciliation itself is the registry's
+/// ([`::service_common::ses_identities::SesIdentityDirectory::reconcile`]), written
+/// once there rather than per surface; what this service contributes is its
+/// [`AccountIdentityRecord`] impl below — how its own table is keyed, how a record of
+/// it is published, and what an adopted one starts with.
+fn reconcile_identities(
+    state: &::engine::ServiceState<ComAmazonawsSesSimpleemailserviceState>,
+    registry: &::engine::ServiceState<::service_common::ses_identities::SesIdentityDirectory>,
+    now: SystemTime,
+) {
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    registry.reconcile(&mut state.identities, now);
+}
+
+impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
+    /// This service's table is keyed by the identity's addr-spec, the way its own
+    /// operations look one up ([`identity_key`]).
+    fn table_key(name: &str) -> String {
+        identity_key(name).to_string()
+    }
+
+    fn identity_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    fn mark_registered(
+        &mut self,
+        published: &::service_common::ses_identities::SesIdentityRecord,
+    ) {
+        self.registered = true;
+        // The TXT value a domain identity's owner publishes is the registry's, so both
+        // surfaces report the one value, and it is stored here so every later read of
+        // this record answers the same.
+        self.verification_token = published.verification_token.clone();
+    }
+
+    fn published(&self) -> ::service_common::ses_identities::SesIdentityRecord {
+        registry_record(self)
+    }
+
+    /// The registry's verification state, due instant and TXT token, with the defaults
+    /// every identity of this surface starts with.
+    fn adopt(
+        published: &::service_common::ses_identities::SesIdentityRecord,
+        now: SystemTime,
+    ) -> Self {
+        use ::service_common::ses_identities::SesIdentityKind;
+
+        Identity {
+            name: published.name.clone(),
+            identity_type: match published.kind {
+                SesIdentityKind::EmailAddress => IdentityType::EmailAddress,
+                SesIdentityKind::Domain => IdentityType::Domain,
+            },
+            verification_status: service_status(published.verification),
+            verification_token: published.verification_token.clone(),
+            // Easy DKIM is set up by `VerifyDomainDkim`, notification topics by
+            // `SetIdentityNotificationTopic`, a custom MAIL FROM domain by
+            // `SetIdentityMailFromDomain` and a policy by `PutIdentityPolicy`: an
+            // identity recorded elsewhere has had none of them asked for, so it starts
+            // where every identity of this surface starts.
+            dkim: None,
+            dkim_enabled: DKIM_SIGNING_AT_IDENTITY_START,
+            notifications: NotificationSettings::default(),
+            mail_from: None,
+            policies: BTreeMap::new(),
+            // The identity was added to the account's list when it was recorded, which
+            // is not an instant this surface observed; the registry carries the
+            // verification it is still owed, which is what a reader of this record
+            // reports.
+            verified_at: now,
+            verification_due: published.verification_due,
+            registered: true,
+        }
+    }
+}
+
+/// How the account registry carries the identity `identity`: the identity as it was
+/// recorded, its class, and the verification this service holds for it.
+pub fn registry_record(
+    identity: &Identity,
+) -> ::service_common::ses_identities::SesIdentityRecord {
+    use ::service_common::ses_identities::{SesIdentityKind, SesIdentityRecord};
+
+    SesIdentityRecord {
+        name: identity.name.clone(),
+        kind: match identity.identity_type {
+            IdentityType::EmailAddress => SesIdentityKind::EmailAddress,
+            IdentityType::Domain => SesIdentityKind::Domain,
+        },
+        verification: registry_state(identity.verification_status),
+        verification_due: identity.verification_due,
+        verification_token: identity.verification_token.clone(),
+    }
+}
+
+/// This service's spelling of a registry verification state.
+fn service_status(
+    state: ::service_common::ses_identities::SesVerificationState,
+) -> VerificationStatus {
+    use ::service_common::ses_identities::SesVerificationState;
+
+    match state {
+        SesVerificationState::Pending => VerificationStatus::Pending,
+        SesVerificationState::Success => VerificationStatus::Success,
+        SesVerificationState::Failed => VerificationStatus::Failed,
+        SesVerificationState::TemporaryFailure => VerificationStatus::TemporaryFailure,
+        SesVerificationState::NotStarted => VerificationStatus::NotStarted,
+    }
+}
+
+/// The registry's spelling of this service's verification status.
+fn registry_state(
+    status: VerificationStatus,
+) -> ::service_common::ses_identities::SesVerificationState {
+    use ::service_common::ses_identities::SesVerificationState;
+
+    match status {
+        VerificationStatus::Pending => SesVerificationState::Pending,
+        VerificationStatus::Success => SesVerificationState::Success,
+        VerificationStatus::Failed => SesVerificationState::Failed,
+        VerificationStatus::TemporaryFailure => SesVerificationState::TemporaryFailure,
+        VerificationStatus::NotStarted => SesVerificationState::NotStarted,
+    }
 }
