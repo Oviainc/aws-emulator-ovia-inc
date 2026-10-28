@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(ListExperimentTargetAccountConfigurationsOutput {
-            target_account_configurations: Some(page.configurations),
+            target_account_configurations: Some(page.entries),
             next_token: page.next_token,
         })
     }

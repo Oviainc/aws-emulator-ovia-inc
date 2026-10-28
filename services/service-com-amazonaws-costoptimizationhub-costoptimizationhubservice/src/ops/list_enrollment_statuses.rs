@@ -11,6 +11,12 @@
 //! organization's management account may read, so either from any other caller
 //! is refused with the modelled `AccessDeniedException`.
 //!
+//! The records the answer carries are the ones the request ADDRESSES — the
+//! account `accountId` names, else the caller's own, widened by
+//! `includeOrganizationInfo` to every account of the organization
+//! (`crate::state::...::addressed_accounts`) — so a request admitted as a read
+//! of a named account answers that account's record.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,11 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Both of these ask for accounts other than the caller's — the
             // organization's enrollment, and one named member account — which
             // is a view only the organization's management account has.
+            let named: &[String] = input.account_id.as_slice();
             let asks_for_other_accounts = input.include_organization_info
-                || input
-                    .account_id
-                    .as_deref()
-                    .is_some_and(|wanted| wanted != caller);
+                || named.iter().any(|wanted| wanted != caller);
             if asks_for_other_accounts && !store.is_management_account(caller) {
                 return Err(not_an_organization_view());
             }
@@ -192,20 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .enrollments
                 .get(caller)
                 .and_then(|enrollment| enrollment.include_member_accounts);
-            // Without `includeOrganizationInfo` the answer covers the calling
-            // account only; with it, every account enrolled in the organization.
+            // An `accountId` selects that account's record; naming none, the
+            // answer covers the calling account only, or — with
+            // `includeOrganizationInfo` — every account enrolled in the
+            // organization. An addressed account Cost Optimization Hub holds no
+            // record for contributes nothing.
             let scoped: Vec<crate::state::Enrollment> = store
-                .enrollments
-                .values()
-                .filter(|enrollment| {
-                    input.include_organization_info || enrollment.account_id == caller
-                })
-                .filter(|enrollment| {
-                    input
-                        .account_id
-                        .as_deref()
-                        .is_none_or(|wanted| wanted == enrollment.account_id)
-                })
+                .addressed_accounts(caller, named, input.include_organization_info)
+                .iter()
+                .filter_map(|account| store.enrollments.get(account))
                 .cloned()
                 .collect();
             (include_member_accounts, scoped)

@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    service_state, MAX_PAGE_SIZE, MAX_RECORDS_PER_STORE,
+    service_state, MAX_PAGE_SIZE, MAX_RECORDS_PER_STORE, SCHEDULING_SETTLES_AFTER,
 };
 use service_com_amazonaws_groundstation_groundstation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -55,13 +55,17 @@ pub(crate) const ABSENT_MISSION_PROFILE_ARN: &str =
 pub(crate) const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Longer than every settle span this service chooses — the `SCHEDULING` ->
-/// `SCHEDULED` move the scheduler owes a reservation and the `UPDATING` -> `ACTIVE` move
-/// it owes a contact version — so a read taken after it observes the move that was owed.
+/// `SCHEDULED` move the scheduler owes a reservation, the `UPDATING` -> `ACTIVE` move it
+/// owes a contact version and the `CANCELLING` -> `CANCELLED` move it owes a stopped
+/// pass, which are one and the same span — so a read taken after it observes the move
+/// that was owed. Derived from that span rather than written out, so it cannot drift
+/// from what the service actually owes.
 ///
 /// Waited out with `std::thread::sleep` rather than `tokio::time::sleep`: the emulator
 /// stores a due instant and never arms a timer, so there is no task to drive while
 /// waiting, and this workspace's `tokio` carries no `time` feature.
-pub(crate) const AFTER_SETTLE: Duration = Duration::from_millis(600);
+pub(crate) const AFTER_SETTLE: Duration =
+    SCHEDULING_SETTLES_AFTER.saturating_add(Duration::from_millis(600));
 
 /// The uplink band this suite grants the account before creating an antenna-uplink
 /// config: a sub-band of the 2025–2120 MHz the service operates

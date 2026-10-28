@@ -53,41 +53,56 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The ARN namespace (and sigv4 signing name) of this service, per `OPERATIONS.md`.
 pub const ARN_SERVICE: &str = "groundstation";
 
+/// How long after the call that starts it a transition this service owes the clock falls
+/// due, for every such transition this emulator chooses the span of (the ones below).
+///
+/// AWS documents no duration for any of them — the real service takes minutes to place a
+/// stream's network interfaces or to validate an ephemeris — so the span is the
+/// emulator's own, and it is a FIXED one: a caller does not have to guess a different
+/// wait per resource. It is deliberately never zero, and deliberately longer than the
+/// handful of requests a caller makes next, so the transient status and the state errors
+/// that go with it are observable rather than a race against the caller's own next call.
+/// Nothing sleeps for it: the due instant is stored, and a later reporting call
+/// materialises the move once it has passed.
+const CLOCK_OWED_TRANSITION_SPAN: Duration = Duration::from_secs(3);
+
 /// `ReserveContact` admits a contact in `SCHEDULING`; the scheduler moves it to
-/// `SCHEDULED` on its own. CHOSEN span (AWS documents no duration for it), inside the
-/// 250–750 ms band this project gives a clock-owed transition, so a caller that reads
-/// the contact straight after reserving it still observes the transient status.
-pub const SCHEDULING_SETTLES_AFTER: Duration = Duration::from_millis(300);
+/// `SCHEDULED` on its own. CHOSEN span (AWS documents no duration for it): the span this
+/// emulator gives every transition it owes the clock, which is deliberately never zero
+/// and long enough that a caller that goes on working against the service after
+/// reserving — reserving another contact, reading the first one back — still observes the
+/// transient status and the errors it carries.
+pub const SCHEDULING_SETTLES_AFTER: Duration = CLOCK_OWED_TRANSITION_SPAN;
 
 /// `CreateDataflowEndpointGroup` admits a dataflow endpoint in `creating`; the service
 /// finishes attaching it and it becomes `created` on its own. CHOSEN span (AWS documents
 /// no duration for it — the real service takes minutes to place the stream's network
-/// interfaces), inside the 250–750 ms band this project gives a clock-owed transition, so
-/// a caller that reads the group straight after creating it still observes `creating`.
-pub const ENDPOINT_CREATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
+/// interfaces): the span this emulator gives every transition it owes the clock, so a
+/// caller that goes on working after the create still observes `creating`.
+pub const ENDPOINT_CREATION_SETTLES_AFTER: Duration = CLOCK_OWED_TRANSITION_SPAN;
 
 /// `UpdateContact` appends a contact version in `UPDATING` ("the version is being applied
 /// to the contact" — `smithy_query(query="shape", shape="VersionStatus")`); the service
 /// applies it and it becomes `ACTIVE` on its own. CHOSEN span (AWS documents no duration
-/// for it), inside the 250–750 ms band this project gives a clock-owed transition, so a
-/// caller that reads the contact straight after updating it still observes the version
-/// being applied and the configuration still in force.
-pub const VERSION_ACTIVATES_AFTER: Duration = Duration::from_millis(300);
+/// for it): the span this emulator gives every transition it owes the clock, so a caller
+/// that goes on working after the update still observes the version being applied and the
+/// configuration still in force.
+pub const VERSION_ACTIVATES_AFTER: Duration = CLOCK_OWED_TRANSITION_SPAN;
 
 /// `CancelContact` on a contact whose pass is already under way STOPS it: the contact
 /// reports `CANCELLING` while the stop is being carried out and reaches `CANCELLED` on its
-/// own. CHOSEN span (AWS documents no duration for it), inside the 250–750 ms band this
-/// project gives a clock-owed transition, so a caller that reads the contact straight after
-/// stopping it still observes the release under way.
-pub const CANCELLATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
+/// own. CHOSEN span (AWS documents no duration for it): the span this emulator gives every
+/// transition it owes the clock, so a caller that goes on working after the cancel still
+/// observes the release under way.
+pub const CANCELLATION_SETTLES_AFTER: Duration = CLOCK_OWED_TRANSITION_SPAN;
 
 /// `CreateEphemeris` admits an ephemeris in `VALIDATING`; the service validates the
 /// supplied data and the ephemeris reaches `ENABLED`, `DISABLED` or `INVALID` on its own.
 /// CHOSEN span (AWS documents no duration for it — the real service takes up to minutes to
-/// validate an ephemeris), inside the 250–750 ms band this project gives a clock-owed
-/// transition, so a caller that lists the ephemeris straight after creating it still
-/// observes `VALIDATING`.
-pub const EPHEMERIS_VALIDATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
+/// validate an ephemeris): the span this emulator gives every transition it owes the
+/// clock, so a caller that goes on working after the create — creating the rest of a set
+/// of ephemerides, then reading the first one back — still observes `VALIDATING`.
+pub const EPHEMERIS_VALIDATION_SETTLES_AFTER: Duration = CLOCK_OWED_TRANSITION_SPAN;
 
 /// Which `ConfigCapabilityType` a `ConfigTypeData` union member selects.
 ///

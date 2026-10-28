@@ -266,6 +266,10 @@ pub mod json_reference_path;
 pub mod jwt;
 pub mod lex;
 pub mod management_events;
+/// The ONE reading of the JSON Schema document a gateway model carries, and the two
+/// documents a gateway control plane generates from it: the sample payload one answers a
+/// template request with, and the mapping skeleton the other does.
+pub mod model_mapping_template;
 pub mod network;
 pub mod query_error_envelope;
 /// An `@httpQuery`-bound timestamp read in the `epoch-seconds` form the model declares (or
