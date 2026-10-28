@@ -1497,6 +1497,14 @@ use crate::scaffolded::Scaffolded;
 mod image_recycle_bin;
 pub use image_recycle_bin::{RecycledImageRecord, recycled_image, require_recycled_image};
 
+/// What `CreateNetworkAcl` adds to the network ACL store in the "Network ACLs" section
+/// below: the `ResourceType` its tag specification may name, the entries a caller-created
+/// ACL comes with, the quota refusal for one ACL too many, and the `ClientToken` map that
+/// makes the create idempotent. Re-exported, so a handler reaches them as
+/// `crate::state::<item>` like every other primitive of this module.
+pub mod network_acls;
+pub use network_acls::*;
+
 /// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
 /// charge and the error channel `CreateTrafficMirrorFilter` and
 /// `DescribeTrafficMirrorFilters` share. Re-exported, so a handler reaches them as
@@ -2899,6 +2907,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// repeat of the same request answers with that gateway instead of creating a second
     /// one.
     pub carrier_gateway_client_tokens: HashMap<String, String>,
+    /// A `CreateNetworkAcl` `ClientToken` and the network ACL id it minted, so a repeat of
+    /// the same request answers with that ACL instead of creating a second one.
+    ///
+    /// Beside the ACL store itself ([`Self::network_acls`], in the "Network ACLs" section
+    /// below), the way [`Self::carrier_gateway_client_tokens`] sits beside its own store. One
+    /// entry per ACL at most — [`Self::forget_network_acl_client_tokens_of`] drops an ACL's
+    /// entry as the ACL is removed — so the map is bounded by the ACL ceiling and by the
+    /// token length [`MAX_CLIENT_TOKEN_CHARS`] holds a token to.
+    pub network_acl_client_tokens: HashMap<String, String>,
     /// Every VPC flow log the account holds, by `FlowLogId`, as the modelled
     /// [`FlowLog`] shape beside the one fact that shape carries no member for — the bytes
     /// the record was charged ([`FlowLogRecord`]) — so a member a writer sets round-trips
@@ -3849,6 +3866,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             carrier_gateways: BTreeMap::new(),
             carrier_gateway_available_at: BTreeMap::new(),
             carrier_gateway_client_tokens: HashMap::new(),
+            // A fresh account has created no network ACL of its own, so no `ClientToken` has
+            // minted one.
+            network_acl_client_tokens: HashMap::new(),
             // A fresh account monitors nothing, so it holds no flow log.
             flow_logs: BTreeMap::new(),
             flow_log_client_tokens: HashMap::new(),
@@ -39791,6 +39811,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// actually holds and silently weaken [`MAX_STORED_BYTES`].
     pub fn remove_network_acl(&mut self, network_acl_id: &str) -> Option<NetworkAcl> {
         let network_acl = self.network_acls.remove(network_acl_id)?;
+        // The `CreateNetworkAcl` `ClientToken` that minted this ACL, if one did, goes with
+        // it: a token left naming an ACL the store no longer holds would replay into a
+        // dangling id.
+        self.forget_network_acl_client_tokens_of(network_acl_id);
         if network_acl.is_default != Some(true) {
             self.release_stored_bytes(network_acl_payload_bytes(
                 network_acl.entries.as_deref().unwrap_or_default(),
