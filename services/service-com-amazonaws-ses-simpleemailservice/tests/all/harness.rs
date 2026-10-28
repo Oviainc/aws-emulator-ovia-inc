@@ -14,6 +14,24 @@ use std::sync::Arc;
 /// The API version SES's query API carries on every request.
 pub const VERSION: &str = "2010-12-01";
 
+/// The Region every request this harness builds is scoped to, which is the
+/// Region of its SigV4 credential scope ([`AUTHORIZATION`]) and therefore the
+/// Region an ARN such a request names has to be in.
+pub const REGION: &str = "us-east-1";
+
+/// The account this emulator serves, which is the account an ARN a request
+/// names has to belong to.
+pub fn account() -> String {
+    engine::EMULATOR_ACCOUNT_ID.to_string()
+}
+
+/// The ARN of the Amazon SNS topic `name` of this account in [`REGION`], which
+/// is the published form of a topic ARN
+/// (`arn:<partition>:sns:<region>:<account-id>:<topic-name>`).
+pub fn topic_arn(name: &str) -> String {
+    format!("arn:aws:sns:{REGION}:{}:{name}", account())
+}
+
 /// How the router resolves which service a request is for: the 4th field of the
 /// SigV4 credential scope is the signing name, and this service's is `ses`
 /// (`resolve_route_key`). Request authentication is off unless the process turns
@@ -90,6 +108,172 @@ pub async fn call(router: &MultiServiceRouter, action: &str, params: &[Field]) -
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     (status, String::from_utf8_lossy(response.body()).into_owned())
+}
+
+/// The destination an event destination publishes to, as the form fields that
+/// name it on the wire.
+///
+/// Here rather than in one suite because `CreateConfigurationSetEventDestination`
+/// and `UpdateConfigurationSetEventDestination` carry the same
+/// `EventDestination` shape, so the suites about them write one destination on
+/// the wire between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// `SNSDestination.TopicARN`.
+    Sns(String),
+    /// `KinesisFirehoseDestination`: `(IAMRoleARN, DeliveryStreamARN)`.
+    Firehose(String, String),
+    /// `CloudWatchDestination.DimensionConfigurations`: one entry per
+    /// `(DimensionName, DimensionValueSource, DefaultDimensionValue)`.
+    CloudWatch(Vec<(String, String, String)>),
+    /// No destination member at all.
+    None,
+    /// Both an SNS and a CloudWatch destination, which is more than one.
+    SnsAndCloudWatch(String),
+}
+
+impl Destination {
+    /// The form fields this destination contributes to a request.
+    pub fn fields(&self) -> Vec<Field> {
+        match self {
+            Self::Sns(topic_arn) => {
+                vec![field("EventDestination.SNSDestination.TopicARN", topic_arn)]
+            }
+            Self::Firehose(role_arn, stream_arn) => vec![
+                field(
+                    "EventDestination.KinesisFirehoseDestination.IAMRoleARN",
+                    role_arn,
+                ),
+                field(
+                    "EventDestination.KinesisFirehoseDestination.DeliveryStreamARN",
+                    stream_arn,
+                ),
+            ],
+            Self::CloudWatch(dimensions) => dimensions
+                .iter()
+                .enumerate()
+                .flat_map(|(index, (name, source, default))| {
+                    let at = format!(
+                        "EventDestination.CloudWatchDestination.DimensionConfigurations.member.{}",
+                        index + 1
+                    );
+                    [
+                        field(format!("{at}.DimensionName"), name),
+                        field(format!("{at}.DimensionValueSource"), source),
+                        field(format!("{at}.DefaultDimensionValue"), default),
+                    ]
+                })
+                .collect(),
+            Self::None => Vec::new(),
+            Self::SnsAndCloudWatch(topic_arn) => {
+                let mut fields = Self::Sns(topic_arn.clone()).fields();
+                fields.extend(
+                    Self::CloudWatch(vec![(
+                        "campaign".to_string(),
+                        "messageTag".to_string(),
+                        "none".to_string(),
+                    )])
+                    .fields(),
+                );
+                fields
+            }
+        }
+    }
+}
+
+/// One call of `action` carrying a whole `EventDestination` — the request shape
+/// `CreateConfigurationSetEventDestination` and
+/// `UpdateConfigurationSetEventDestination` share.
+pub async fn write_event_destination(
+    router: &MultiServiceRouter,
+    action: &str,
+    configuration_set: &str,
+    name: &str,
+    enabled: bool,
+    event_types: &[&str],
+    destination: &Destination,
+) -> (u16, String) {
+    let mut params = vec![
+        field("ConfigurationSetName", configuration_set),
+        field("EventDestination.Name", name),
+        field(
+            "EventDestination.Enabled",
+            if enabled { "true" } else { "false" },
+        ),
+    ];
+    for (index, event_type) in event_types.iter().enumerate() {
+        params.push(field(
+            format!("EventDestination.MatchingEventTypes.member.{}", index + 1),
+            *event_type,
+        ));
+    }
+    params.extend(destination.fields());
+    call(router, action, &params).await
+}
+
+/// `CreateConfigurationSetEventDestination`.
+pub async fn create_event_destination(
+    router: &MultiServiceRouter,
+    configuration_set: &str,
+    name: &str,
+    enabled: bool,
+    event_types: &[&str],
+    destination: &Destination,
+) -> (u16, String) {
+    write_event_destination(
+        router,
+        "CreateConfigurationSetEventDestination",
+        configuration_set,
+        name,
+        enabled,
+        event_types,
+        destination,
+    )
+    .await
+}
+
+/// `UpdateConfigurationSetEventDestination`.
+pub async fn update_event_destination(
+    router: &MultiServiceRouter,
+    configuration_set: &str,
+    name: &str,
+    enabled: bool,
+    event_types: &[&str],
+    destination: &Destination,
+) -> (u16, String) {
+    write_event_destination(
+        router,
+        "UpdateConfigurationSetEventDestination",
+        configuration_set,
+        name,
+        enabled,
+        event_types,
+        destination,
+    )
+    .await
+}
+
+/// The `<EventDestinations>` element `DescribeConfigurationSet` reports for
+/// `name`, asked for by the attribute group the model's own
+/// `ConfigurationSetAttribute` enum names.
+pub async fn described_event_destinations(router: &MultiServiceRouter, name: &str) -> String {
+    let (status, body) = call(
+        router,
+        "DescribeConfigurationSet",
+        &[
+            field("ConfigurationSetName", name),
+            field(
+                "ConfigurationSetAttributeNames.member.1",
+                "eventDestinations",
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case describe {name}: expected 200, got {status} with {body}"
+    );
+    element(&body, "EventDestinations").unwrap_or_default()
 }
 
 /// Percent-encode a form field, leaving only the RFC 3986 unreserved set.

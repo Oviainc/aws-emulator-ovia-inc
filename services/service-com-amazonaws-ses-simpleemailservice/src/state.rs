@@ -905,6 +905,30 @@ impl ConfigurationSet {
             .find(|destination| destination.name == name)
     }
 
+    /// Replace this set's event destination named like `destination`, keeping
+    /// the place it holds in the list, and say whether there was one to replace.
+    ///
+    /// `false` when the set carries no destination of that name: the caller
+    /// refuses the request with the modelled `EventDestinationDoesNotExist`
+    /// rather than recording a destination nobody created — that is what
+    /// [`Self::add_event_destination`] is for. The place is kept because the
+    /// order the destinations were added in is what every reader reports them
+    /// in, and replacing one of them reorders none.
+    pub fn replace_event_destination(
+        &mut self,
+        destination: crate::ops::types::EventDestination,
+    ) -> bool {
+        let Some(held) = self
+            .event_destinations
+            .iter_mut()
+            .find(|held| held.name == destination.name)
+        else {
+            return false;
+        };
+        *held = destination;
+        true
+    }
+
     /// Record `destination` on this set, and say whether it was recorded.
     ///
     /// `false` when the set already holds [`MAX_EVENT_DESTINATIONS`]
@@ -2345,6 +2369,26 @@ fn is_default_dimension_value(value: &str) -> bool {
 /// Shared by `CreateConfigurationSetEventDestination` and
 /// `UpdateConfigurationSetEventDestination`, which hold a destination to one
 /// rule between them; each wraps the fault in its own modelled error.
+/// Read every ARN member of `destination` as the trimmed value it names a
+/// resource by, so the destination is STORED the way it was asked about.
+///
+/// [`check_event_destination`] judges, and [`resolve_sns_topic`] asks about, the
+/// trimmed value of each ARN member; a store keeping the padded text would
+/// report back a value no later lookup of this service would match, making the
+/// record disagree with the resource it names. Shared by
+/// `CreateConfigurationSetEventDestination` and
+/// `UpdateConfigurationSetEventDestination`, which write one destination shape
+/// between them.
+pub fn trim_event_destination_arns(destination: &mut crate::ops::types::EventDestination) {
+    if let Some(sns) = destination.sns_destination.as_mut() {
+        sns.topic_arn = sns.topic_arn.trim().to_string();
+    }
+    if let Some(firehose) = destination.kinesis_firehose_destination.as_mut() {
+        firehose.delivery_stream_arn = firehose.delivery_stream_arn.trim().to_string();
+        firehose.iam_role_arn = firehose.iam_role_arn.trim().to_string();
+    }
+}
+
 pub fn check_event_destination(
     destination: &crate::ops::types::EventDestination,
     region: &str,
