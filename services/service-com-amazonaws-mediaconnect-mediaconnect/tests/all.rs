@@ -193,3 +193,5 @@ mod failover_primary_source;
 mod router_network_interface_association_integrity;
 #[path = "all/flow_removal_clears_router_references.rs"]
 mod flow_removal_clears_router_references;
+#[path = "all/bridge_output_network_name_paths_agree.rs"]
+mod bridge_output_network_name_paths_agree;
