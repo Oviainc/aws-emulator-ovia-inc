@@ -289,29 +289,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(now);
 
         // A repeated @idempotencyToken replays its first answer rather than minting a
-        // second workflow; the same token with a different request is a conflict. The
-        // token is remembered per region, because a token presented at one regional
-        // endpoint says nothing about what another endpoint created.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(recorded) = store.idempotency.get(&token_key(&region, token)).cloned() {
-                if recorded.request_fingerprint() != fingerprint {
-                    return Err(CreateWorkflowErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "ClientToken {token} was already used for a CreateWorkflow \
-                                 request with different parameters"
-                            ),
-                            resource_id: recorded.workflow_arn().to_string(),
-                            resource_type: "workflow".to_string(),
-                        },
-                    )
-                    .into());
-                }
-                let workflow = store
-                    .workflow_in(&region, recorded.workflow_arn())
-                    .ok_or_else(unavailable)?;
-                return Ok(response_for(workflow));
-            }
+        // second workflow; the same token with a different request is a conflict. Both
+        // are the shared rule (`crate::state::TokenLedger`) — the ledger key, the
+        // fingerprint comparison and the identity a mismatch reports are single-homed
+        // there, reached with this operation's name and the resource type its refusal
+        // reports — so the token is remembered per operation and per region, because a
+        // token presented at one regional endpoint says nothing about what another
+        // endpoint created. All this handler keeps is how it answers from the record.
+        let tokens = crate::state::TokenLedger::of(Self::NAME, "workflow", &region);
+        let replayed = tokens
+            .replay(
+                &store.idempotency,
+                input.client_token.as_deref(),
+                &fingerprint,
+            )
+            .map_err(CreateWorkflowErrorModeled::ConflictException)?;
+        if let Some(recorded) = replayed {
+            let workflow = store
+                .workflow_in(&region, recorded.workflow_arn())
+                .ok_or_else(unavailable)?;
+            return Ok(response_for(workflow));
         }
 
         // "You must use unique workflow names within your account" — a second create
@@ -438,28 +435,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.claim_workflow_name(&region, &input.name, &arn);
         store.workflows.insert(arn.clone(), workflow);
-        if let Some(token) = input.client_token.as_deref() {
-            store.idempotency.record(
-                token_key(&region, token),
-                crate::state::IdempotentResult::CreateWorkflow {
-                    request_fingerprint: fingerprint,
-                    workflow_arn: arn.clone(),
-                },
-            );
-        }
+        // The other half of the shared rule: what this call produced, remembered under
+        // the same key the replay above reads.
+        tokens.record(
+            &mut store.idempotency,
+            input.client_token.as_deref(),
+            crate::state::IdempotentResult::CreateWorkflow {
+                request_fingerprint: fingerprint,
+                workflow_arn: arn.clone(),
+            },
+        );
 
         // Read the response back out of the stored record, so the answer can only ever
         // be what was persisted.
         let stored = store.workflow_in(&region, &arn).ok_or_else(unavailable)?;
         Ok(response_for(stored))
     }
-}
-
-/// The idempotency-ledger key for a `ClientToken` of THIS operation at THIS region's
-/// endpoint, so one token used on two different operations — or at two different
-/// regional endpoints — records two entries.
-fn token_key(region: &str, client_token: &str) -> String {
-    format!("CreateWorkflow:{region}:{client_token}")
 }
 
 /// Check every `CreateWorkflow` input member whose modelled constraint this
