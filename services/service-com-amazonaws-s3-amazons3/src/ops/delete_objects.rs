@@ -318,6 +318,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
         // something away, because each identifier performs exactly what a `DeleteObject`
         // for it would, notifications included.
         let mut events: Vec<crate::state::notifications::ObjectEvent> = Vec::new();
+        // Whether this bucket replicates anything at all, asked ONCE for the whole request:
+        // a batch may name up to `MAX_KEYS_PER_DELETE` identifiers and a configuration up to
+        // `MAX_REPLICATION_RULES` rules, so asking per key what a bucket carrying no
+        // configuration owes would multiply the two for nothing.
+        let replicates = store.replicates_objects(&input.bucket);
         for identifier in identifiers {
             let key = identifier.key.as_str();
             match identifier.version_id.as_deref() {
@@ -402,6 +407,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteObjects<Eng
                     // `null` marker of a suspended bucket under the id a request names it
                     // by.
                     Some(crate::state::ObjectDeletion::MarkerLaid { version_id, .. }) => {
+                        // A DELETE MARKER is replicated where the covering rules ask for it
+                        // — the same seam a single-object delete replicates its marker
+                        // through, so a batch delete marks the destinations a one-at-a-time
+                        // delete of the same keys would. Only for a bucket that carries a
+                        // configuration at all (`replicates`, asked once above).
+                        if replicates {
+                            let _ = store.replicate_delete_marker(&input.bucket, key);
+                        }
                         events.push(
                             crate::state::notifications::ObjectEvent::new(
                                 crate::state::notifications::ObjectEventKind::DeleteMarkerCreated,

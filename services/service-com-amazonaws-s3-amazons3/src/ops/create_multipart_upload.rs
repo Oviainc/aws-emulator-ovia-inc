@@ -450,6 +450,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => Vec::new(),
         };
 
+        // The `ChecksumType` this upload is SETTLED with, decided here — at the one request
+        // that settles it — from the algorithm the initiation named and the type it asked
+        // for ([`crate::state::settle_multipart_checksum_type`]). An initiation naming a
+        // type the algorithm does not admit (a full-object checksum of a multipart object
+        // under an algorithm whose part checksums do not combine into one) names a parameter
+        // that is not valid for the request, which is `InvalidRequest` (400) with the
+        // sentence the modelled shape states for itself — this operation declares no error
+        // shapes, so it goes out through the unmodelled channel, and nothing is recorded.
+        //
+        // An initiation that named no algorithm settles no type: no checksum is computed for
+        // such an upload at all (`crate::state::multipart_checksum`), so reporting a type
+        // would describe a computation nothing performed.
+        let checksum_type = match input.checksum_algorithm.as_deref() {
+            Some(algorithm) => {
+                let Some(settled) = crate::state::settle_multipart_checksum_type(
+                    algorithm,
+                    input.checksum_type.as_deref(),
+                ) else {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        crate::state::INVALID_REQUEST_MESSAGE,
+                    ));
+                };
+                Some(settled.to_string())
+            }
+            None => None,
+        };
+
         let upload = crate::state::MultipartUpload {
             key: input.key.clone(),
             // Read here, where the upload comes into being, so `Initiated` is the moment
@@ -485,7 +514,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             encryption: encryption.clone(),
             checksum_algorithm: input.checksum_algorithm.clone(),
-            checksum_type: input.checksum_type.clone(),
+            checksum_type: checksum_type.clone(),
             // An initiation records an upload with no part at all: "You must initiate a
             // multipart upload … before you can upload any part" (`UploadPart`'s own
             // documentation), so the parts arrive afterwards, through `UploadPart`.
@@ -608,12 +637,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ssekms_key_id: encryption.kms_key_id.clone(),
             ssekms_encryption_context: encryption.kms_encryption_context.clone(),
             bucket_key_enabled: encryption.bucket_key_enabled,
-            // "The algorithm that was used to create a checksum of the object" and the
-            // checksum type: the configuration the upload was recorded with, echoed from
-            // the store, and nothing is reported when the request named none. No checksum
-            // VALUE is reported anywhere: nothing here computes one.
+            // "The algorithm that was used to create a checksum of the object" and "the
+            // checksum type that you want Amazon S3 to use to calculate the object's
+            // checksum value" (`CreateMultipartUploadOutput$ChecksumType`): the
+            // configuration the upload was recorded with, which for the type is the one this
+            // initiation SETTLED rather than the one the request happened to carry — an
+            // initiation naming an algorithm and no type settles the type that algorithm
+            // admits, and that is the type every later reader of the upload reports and the
+            // completion composes its value under. Nothing is reported when the request
+            // named no algorithm. No checksum VALUE is reported here: the parts it would be
+            // computed from have not been uploaded yet.
             checksum_algorithm: input.checksum_algorithm.clone(),
-            checksum_type: input.checksum_type.clone(),
+            checksum_type: checksum_type.clone(),
             // "The date when this multipart upload will become eligible for an abort
             // operation": the instant the matching lifecycle rule aborts it, with that
             // rule's own identifier beside it. Both are reported exactly when such a rule
