@@ -205,6 +205,8 @@ mod stack_output_resolution;
 mod stack_own_subnets_db_subnet_group;
 #[path = "all/stack_outputs.rs"]
 mod stack_outputs;
+#[path = "all/stack_parameter_driven_updates.rs"]
+mod stack_parameter_driven_updates;
 #[path = "all/stack_policy_enforcement.rs"]
 mod stack_policy_enforcement;
 #[path = "all/stack_reported_members.rs"]

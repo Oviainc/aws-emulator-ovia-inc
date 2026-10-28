@@ -33,7 +33,15 @@ use crate::stack_lifecycle::{
 };
 
 /// The `PhysicalResourceId` the stack reports for the resource `logical_id`.
-async fn physical_id(router: &MultiServiceRouter, stack: &str, logical_id: &str) -> String {
+///
+/// Shared with `stack_parameter_driven_updates.rs`, which deploys the same types through the
+/// other half of the UPDATE surface (a changed stack parameter under the previous template),
+/// so both read a resource's identity the same way.
+pub(crate) async fn physical_id(
+    router: &MultiServiceRouter,
+    stack: &str,
+    logical_id: &str,
+) -> String {
     let (status_code, body) = call(
         router,
         "DescribeStackResources",
@@ -448,9 +456,10 @@ async fn user_parameters(
 }
 
 /// [`user_parameters`] against a group addressed by the member and report action of its KIND:
-/// the one reader of a group's own parameter settings in this suite, so the create cases and
-/// the update cases below cannot drift apart about how that report is read.
-async fn group_settings(
+/// the one reader of a group's own parameter settings, so the create cases, the update cases
+/// below and `stack_parameter_driven_updates.rs` cannot drift apart about how that report is
+/// read.
+pub(crate) async fn group_settings(
     router: &MultiServiceRouter,
     parameters_describe: &str,
     name_member: &str,
