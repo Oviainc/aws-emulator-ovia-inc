@@ -157,7 +157,12 @@ async fn create_ok(router: &MultiServiceRouter, case: &str, name: &str) -> (Stri
 ///
 /// No handler ever sleeps; only this test waits, because it is asking about a status the
 /// clock reaches on its own.
-async fn wait_for_status(router: &MultiServiceRouter, case: &str, id: &str, expected: &str) {
+pub(crate) async fn wait_for_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    id: &str,
+    expected: &str,
+) {
     for _ in 0..40 {
         let (status, body) = get(router, id).await;
         assert_eq!(
@@ -205,7 +210,7 @@ async fn accept(
 
 /// A graph in `graph_status`, left there with the transition that put it there still in
 /// flight for the transient statuses — so the caller must fire its refusals immediately.
-async fn graph_in_status(
+pub(crate) async fn graph_in_status(
     router: &MultiServiceRouter,
     case: &str,
     graph_status: &str,
