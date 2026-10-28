@@ -19,6 +19,8 @@ mod closed_tunnel_shape;
 mod destination_service_limit;
 #[path = "all/limit_refusals.rs"]
 mod limit_refusals;
+#[path = "all/member_update_stamp.rs"]
+mod member_update_stamp;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/rotate_refusal_error_contract.rs"]
