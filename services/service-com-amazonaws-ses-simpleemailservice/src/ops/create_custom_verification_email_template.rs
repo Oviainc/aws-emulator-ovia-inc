@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomVerificationEmailTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomVerificationEmailTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomVerificationEmailTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a custom verification email template in this account's store — this is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +171,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomVerificationEmailTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomVerificationEmailTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomVerificationEmailTemplate"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateCustomVerificationEmailTemplate",
+            ));
+        };
+        let mut state = state.lock();
+
+        // One instant for the whole call, with the verification move the clock
+        // already owes each of this account's identities materialised against it:
+        // the sender gate below reads the status a caller reading the same
+        // identity at this instant is reported.
+        state.settle_identities(::std::time::SystemTime::now());
+
+        // The size the model documents for this email is the one this operation
+        // can refuse content on: `TemplateContent` is "The content of the custom
+        // verification email. The total size of the email must be less than 10
+        // MB", so content from that size on is content no custom verification
+        // email can be built from — which is what this operation's
+        // invalid-content error reports. The sentence the refusal states is that
+        // documented condition, in the model's own words and in the megabytes it
+        // states them in, read off the bound this crate holds it at
+        // ([`crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES`], which
+        // cites the same sentence) rather than a figure of its own.
+        if input.template_content.len() >= crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES
+        {
+            return Err(
+                CreateCustomVerificationEmailTemplateErrorModeled::CustomVerificationEmailInvalidContentException(
+                    CustomVerificationEmailInvalidContentException {
+                        message: Some(format!(
+                            "The total size of the custom verification email must be less than \
+                             {} MB.",
+                            crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_CONTENT_BYTES / 1_000_000
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Creating is not replacing: a name the store already holds is the naming
+        // conflict this operation models, and replacing that template is what
+        // `UpdateCustomVerificationEmailTemplate` is for.
+        if state
+            .custom_verification_email_templates
+            .contains_key(&input.template_name)
+        {
+            return Err(
+                CreateCustomVerificationEmailTemplateErrorModeled::CustomVerificationEmailTemplateAlreadyExistsException(
+                    CustomVerificationEmailTemplateAlreadyExistsException {
+                        custom_verification_email_template_name: Some(
+                            input.template_name.clone(),
+                        ),
+                        message: Some(format!(
+                            "Custom verification email template <{}> already exists.",
+                            input.template_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The template's sender is the address the verification message would be
+        // sent FROM, so it must be an identity this account has verified — what
+        // `FromEmailAddressNotVerifiedException` reports: "the sender address
+        // specified for a custom verification email is not verified, and is
+        // therefore not eligible to send the custom verification email". Read with
+        // the same reading of a verified sender as every other send
+        // (`state::is_verified_sender`), so a verified domain covers the mailboxes
+        // in it, and read BEFORE anything is written, so a refused call leaves no
+        // template behind.
+        if !state.is_verified_sender(&input.from_email_address) {
+            return Err(
+                CreateCustomVerificationEmailTemplateErrorModeled::FromEmailAddressNotVerifiedException(
+                    FromEmailAddressNotVerifiedException {
+                        from_email_address: Some(input.from_email_address.clone()),
+                        message: Some(crate::state::unverified_from_address_message(
+                            &input.from_email_address,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store applies the account's ceiling on these templates, so a create
+        // past it is refused with the modelled service-limit error rather than
+        // growing the store without end. The ceiling itself is the account limit
+        // SES documents (`crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES`)
+        // and the message states it; the wording around it is this service's own,
+        // in the form its sibling service-limit refusals already state
+        // (`create_template.rs`, `create_receipt_rule_set.rs`), so one class of
+        // refusal reads one way across this crate. The members are kept exactly as
+        // they were sent: a template is rendered when a send names it, never
+        // rewritten here.
+        if state
+            .put_custom_verification_email_template(
+                crate::state::CustomVerificationEmailTemplate {
+                    template_name: input.template_name.clone(),
+                    from_email_address: input.from_email_address,
+                    template_subject: input.template_subject,
+                    template_content: input.template_content,
+                    success_redirection_url: input.success_redirection_url,
+                    failure_redirection_url: input.failure_redirection_url,
+                },
+            )
+            .is_none()
+        {
+            return Err(
+                CreateCustomVerificationEmailTemplateErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Custom verification email template limit exceeded: this account may \
+                             hold {} custom verification email templates.",
+                            crate::state::MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(CreateCustomVerificationEmailTemplateOutput)
     }
 }

@@ -814,7 +814,10 @@ async fn a_refused_create_stores_nothing() {
                 }),
             ),
             "ResourceNotFoundException",
-            format!("stream {absent} not found"),
+            format!(
+                "Stream refusal-no-such-stream under account {} not found.",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
         ),
         (
             "source-stream-still-creating",

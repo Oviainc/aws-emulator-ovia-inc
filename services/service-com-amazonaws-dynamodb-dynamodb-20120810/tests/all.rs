@@ -33,6 +33,8 @@ mod delete_table_description_projection;
 mod describe_continuous_backups_reads;
 #[path = "all/describe_contributor_insights_reports.rs"]
 mod describe_contributor_insights_reports;
+#[path = "all/disable_kinesis_streaming_destination.rs"]
+mod disable_kinesis_streaming_destination;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/endpoint_discovery.rs"]

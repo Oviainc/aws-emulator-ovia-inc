@@ -688,15 +688,14 @@ fn serve_resolved<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> 
     let Some(state) = crate::state::service_state(engine) else {
         return refusal_response(None, API_CONFIGURATION_ERROR);
     };
-    // What the records answer this request, what VALIDATING its payload needs, and what
-    // METERING that answer is subject to. All three are computed under a shared read of
-    // the store, which is RELEASED before either of the last two runs: validating a
+    // What this request RESOLVES to: the integration that is to answer it, what VALIDATING
+    // its payload needs, and what METERING it is subject to. All three are read under a
+    // shared read of the store, which is RELEASED before any of them runs: validating a
     // payload against a caller-stored JSON Schema is the one piece of work here whose cost
     // a caller's own records decide, so it must not hold the lock every other request to
     // this service waits on, and recording a metered request needs an exclusive lock of
-    // its own. The answer is computed from records alone, so computing it before the two
-    // changes nothing a caller can see.
-    let (answer, pending_body, metering) = {
+    // its own.
+    let (integration, pending_body, metering) = {
         let store = state.lock();
         let Some(resolved) = resolve(&store, &addressed) else {
             // The api was deleted between the claim and now, or another process minted the
@@ -770,29 +769,26 @@ fn serve_resolved<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> 
         }
         let pending_body = pending_body_check(api, live_method, &call);
 
-        // The integration is what answers, and performing it is the half this module shares
-        // with `TestInvokeMethod`: the SAME records decide a simulated invocation and a real
-        // one, so the two cannot answer one configuration differently.
-        let answer = match perform_integration(live_method, &call) {
-            Ok(served) => served_response(served),
-            Err(unserved) => {
-                tracing::warn!(
-                    api_id = %api.id,
-                    stage = %stage.stage_name,
-                    path = %matched_path,
-                    verb = %verb,
-                    reason = %unserved.reason,
-                    "the stage cannot serve this call through the method's integration"
-                );
-                refusal_response(Some(api), unserved.refusal)
-            }
+        // The integration is what answers, and it is READ here and PERFORMED below, after
+        // the payload check: the step list this module opens with has the request validator
+        // ahead of the integration, so a payload the method's model does not admit is
+        // refused with the integration never performed at all. Performing it is the half
+        // this module shares with `TestInvokeMethod`, so the SAME records decide a
+        // simulated invocation and a real one.
+        let integration = ResolvedIntegration {
+            api_id: api.id.clone(),
+            stage: stage.stage_name.clone(),
+            path: matched_path.to_string(),
+            verb: verb.to_string(),
+            method: live_method.cloned(),
+            call,
         };
         // The 429 this call earns if the plans metering it have no request left for it,
         // rendered now because it is rendered from the api's own gateway responses.
         let metering = admission
             .filter(|admission| !admission.throttled_plans.is_empty())
             .map(|admission| (admission, refusal_response(Some(api), THROTTLED)));
-        (answer, pending_body, metering)
+        (integration, pending_body, metering)
     };
 
     // The usage plan METERS the call before its payload is checked, as API Gateway's
@@ -816,7 +812,54 @@ fn serve_resolved<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> 
         }
     }
 
-    answer
+    // The request has got past everything the method declares about it, so now — and only
+    // now — the integration is performed.
+    match perform_integration(integration.method.as_ref(), &integration.call) {
+        Ok(served) => served_response(served),
+        Err(unserved) => {
+            tracing::warn!(
+                api_id = %integration.api_id,
+                stage = %integration.stage,
+                path = %integration.path,
+                verb = %integration.verb,
+                reason = %unserved.reason,
+                "the stage cannot serve this call through the method's integration"
+            );
+            // Rendered through the api's own gateway response for the refusal, so the
+            // records are read again — briefly, and only to render it.
+            let store = state.lock();
+            let api = resolve(&store, &addressed).map(|resolved| resolved.api);
+            refusal_response(api, unserved.refusal)
+        }
+    }
+}
+
+/// The integration a resolved call is to be performed through, carried OUT of the store
+/// lock so that it is performed only once the request has got past the method's request
+/// validator and the usage plans metering it.
+///
+/// Owned rather than borrowed for the same reason [`PendingBodyCheck`] is: both run with
+/// the lock released, and the integration is performed after the payload check, so what it
+/// reads has to outlive the lock. The copy is of ONE method's own records — what a
+/// control-plane call had to store for it — so it is bounded by the method's configuration
+/// rather than by anything the invoke carries.
+#[derive(Debug)]
+struct ResolvedIntegration {
+    /// The api the call resolved to, for the server log an integration this emulator
+    /// cannot perform leaves.
+    api_id: String,
+    /// The stage it was invoked through, for that same log.
+    stage: String,
+    /// The resource path the request matched, for that same log.
+    path: String,
+    /// The verb the method is addressed by, for that same log.
+    verb: String,
+    /// The LIVE method the deployed one names, which carries the integration; `None` when
+    /// the deployment holds a method the api no longer carries, which is an integration
+    /// there is nothing to call.
+    method: Option<MethodEntry>,
+    /// What the integration reads off this method request.
+    call: MethodRequest,
 }
 
 /// Record this request against every usage plan that meters the presented API key, and

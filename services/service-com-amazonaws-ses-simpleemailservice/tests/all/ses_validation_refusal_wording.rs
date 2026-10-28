@@ -13,8 +13,8 @@
 //!    value, because the member held none: `Value at '<path>' failed to satisfy
 //!    constraint: Member must not be null`;
 //! 3. the clause of a value outside an ENUM's admitted set states the position and the
-//!    admitted set and no value, with the set listed in the order this service lists that
-//!    enum's values;
+//!    admitted set and no value, with the set listed in ASCENDING order over its values
+//!    whatever order the model declares them in;
 //! 4. every other constraint class keeps the framework's clause, the value it submitted
 //!    included — so rules 2 and 3 are classes, not a blanket.
 //!
@@ -31,15 +31,35 @@ use crate::harness::{call, element, emulator, field, xml_text, Field};
 const VALIDATION_ERROR: &str = "ValidationError";
 
 /// `com.amazonaws.ses#IdentityType`, declared `EmailAddress, Domain`
-/// (`smithy_query(query="shape",shape="IdentityType")`), as this service LISTS it in a
-/// refusal: `Domain, EmailAddress`. No order the model carries reproduces this one.
+/// (`smithy_query(query="shape",shape="IdentityType")`), as this service STATES it in a
+/// refusal: ascending over the values, which reverses the declaration order.
 const IDENTITY_TYPE_LISTED: &str = "Domain, EmailAddress";
 
+/// `com.amazonaws.ses#TlsPolicy` (`DeliveryOptions$TlsPolicy`), declared
+/// `Require, Optional` (`query="shape",shape="TlsPolicy"`), stated ascending.
+const TLS_POLICY_LISTED: &str = "Optional, Require";
+
+/// `com.amazonaws.ses#BehaviorOnMXFailure`, declared `UseDefaultValue, RejectMessage`
+/// (`query="shape",shape="BehaviorOnMXFailure"`), stated ascending.
+const BEHAVIOR_ON_MX_FAILURE_LISTED: &str = "RejectMessage, UseDefaultValue";
+
+/// `com.amazonaws.ses#ReceiptFilterPolicy` (`ReceiptIpFilter$Policy`), declared
+/// `Block, Allow` (`query="shape",shape="ReceiptFilterPolicy"`), stated ascending.
+const RECEIPT_FILTER_POLICY_LISTED: &str = "Allow, Block";
+
+/// `com.amazonaws.ses#ConfigurationSetAttribute`, the element of
+/// `ConfigurationSetAttributeList`, declared
+/// `eventDestinations, trackingOptions, deliveryOptions, reputationOptions`
+/// (`query="shape",shape="ConfigurationSetAttribute"`), stated ascending — a four-valued
+/// enum reached through a LIST member, so neither its arity nor its position is what the
+/// order depends on.
+const CONFIGURATION_SET_ATTRIBUTE_LISTED: &str =
+    "deliveryOptions, eventDestinations, reputationOptions, trackingOptions";
+
 /// `com.amazonaws.ses#NotificationType`, declared `Bounce, Complaint, Delivery`
-/// (`query="shape",shape="NotificationType"`). This service publishes no listing for it,
-/// so a clause states the model's declaration order — the fallback, which is what this row
-/// pins: no refusal of this member has been observed, so a later observation showing
-/// another order is a listing to record, not a regression here.
+/// (`query="shape",shape="NotificationType"`). Its declaration order already IS the
+/// ascending one, so this row pins that the rule leaves such a set alone rather than
+/// permuting it.
 const NOTIFICATION_TYPE_LISTED: &str = "Bounce, Complaint, Delivery";
 
 /// The whole envelope one clause is stated in.
@@ -159,7 +179,7 @@ async fn an_absent_required_member_is_refused_with_the_position_and_no_value() {
 }
 
 #[tokio::test]
-async fn a_value_outside_an_enum_is_refused_with_the_listed_set_and_no_value() {
+async fn a_value_outside_an_enum_is_refused_with_the_ascending_set_and_no_value() {
     assert_rows(vec![
         Row {
             case: "ListIdentities IdentityType outside its two-valued set",
@@ -199,6 +219,66 @@ async fn a_value_outside_an_enum_is_refused_with_the_listed_set_and_no_value() {
                 field("Enabled", "true"),
             ],
             message: one_error(&enum_clause("notificationType", NOTIFICATION_TYPE_LISTED)),
+        },
+        Row {
+            case: "PutConfigurationSetDeliveryOptions TlsPolicy, a nested member whose enum is \
+                   declared in the reverse of the stated order",
+            action: "PutConfigurationSetDeliveryOptions",
+            params: vec![
+                field("ConfigurationSetName", "guarded-set"),
+                field("DeliveryOptions.TlsPolicy", "NotAPolicy"),
+            ],
+            message: one_error(&enum_clause("deliveryOptions.tlsPolicy", TLS_POLICY_LISTED)),
+        },
+        Row {
+            case: "PutConfigurationSetDeliveryOptions TlsPolicy in the wrong case, which is \
+                   still outside the set",
+            action: "PutConfigurationSetDeliveryOptions",
+            params: vec![
+                field("ConfigurationSetName", "guarded-set"),
+                field("DeliveryOptions.TlsPolicy", "require"),
+            ],
+            message: one_error(&enum_clause("deliveryOptions.tlsPolicy", TLS_POLICY_LISTED)),
+        },
+        Row {
+            case: "SetIdentityMailFromDomain BehaviorOnMXFailure, another two-valued enum \
+                   declared in the reverse of the stated order",
+            action: "SetIdentityMailFromDomain",
+            params: vec![
+                field("Identity", "example.com"),
+                field("MailFromDomain", "mail.example.com"),
+                field("BehaviorOnMXFailure", "Bogus"),
+            ],
+            message: one_error(&enum_clause(
+                "behaviorOnMXFailure",
+                BEHAVIOR_ON_MX_FAILURE_LISTED,
+            )),
+        },
+        Row {
+            case: "CreateReceiptFilter Policy, an enum two structures deep",
+            action: "CreateReceiptFilter",
+            params: vec![
+                field("Filter.Name", "block-a-host"),
+                field("Filter.IpFilter.Cidr", "10.0.0.1/32"),
+                field("Filter.IpFilter.Policy", "Deny"),
+            ],
+            message: one_error(&enum_clause(
+                "filter.ipFilter.policy",
+                RECEIPT_FILTER_POLICY_LISTED,
+            )),
+        },
+        Row {
+            case: "DescribeConfigurationSet attribute name, a four-valued enum reached through \
+                   a list",
+            action: "DescribeConfigurationSet",
+            params: vec![
+                field("ConfigurationSetName", "guarded-set"),
+                field("ConfigurationSetAttributeNames.member.1", "deliveryoptions"),
+            ],
+            message: one_error(&enum_clause(
+                "configurationSetAttributeNames.1.member",
+                CONFIGURATION_SET_ATTRIBUTE_LISTED,
+            )),
         },
     ])
     .await;

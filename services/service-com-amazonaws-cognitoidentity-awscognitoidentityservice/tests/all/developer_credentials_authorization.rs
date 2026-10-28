@@ -437,9 +437,8 @@ struct OperationRow {
 /// satisfies its modelled input and the resource it addresses.
 ///
 /// `pool_id` is a pool of this account the row may read, write or destroy: each row gets
-/// its own, so a row that deletes it does not disturb the next one. The stub this service
-/// still answers 501 for (`DeleteIdentities`) is left out: it decides nothing yet, and the
-/// `@optionalAuth` identity flow is covered by its own test below. `DescribeIdentity` is
+/// its own, so a row that deletes it does not disturb the next one. The `@optionalAuth`
+/// identity flow is covered by its own test below. `DescribeIdentity` is
 /// left out for a different reason: every row here is driven with a POOL id, and that
 /// operation addresses an IDENTITY, so the resource its decision is made against is the
 /// pool of an identity a row would first have to mint — which is why it has a case of its
@@ -539,6 +538,14 @@ fn operation_rows(pool_id: &str) -> Vec<OperationRow> {
             operation: "ListTagsForResource",
             request: json!({ "ResourceArn": pool_arn }),
             resource: pool_arn.clone(),
+        },
+        OperationRow {
+            // A batch of identities names no single pool — an `IdentityId` carries none —
+            // so the decision is made about the account's identity pools. The id named is
+            // well-formed and names no identity, so the authorized call deletes nothing.
+            operation: "DeleteIdentities",
+            request: json!({ "IdentityIdsToDelete": [ABSENT_IDENTITY_ID] }),
+            resource: any_pool_arn(),
         },
         named("DeleteIdentityPool", json!({ "IdentityPoolId": pool_id })),
     ]

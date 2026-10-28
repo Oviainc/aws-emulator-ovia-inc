@@ -27,6 +27,8 @@ mod cluster_region_derived_values;
 mod create_cluster_replay_configuration;
 #[path = "all/delete_cluster_idempotency.rs"]
 mod delete_cluster_idempotency;
+#[path = "all/delete_cluster_in_flight.rs"]
+mod delete_cluster_in_flight;
 #[path = "all/encryption_key_selection.rs"]
 mod encryption_key_selection;
 #[path = "all/error_contract.rs"]

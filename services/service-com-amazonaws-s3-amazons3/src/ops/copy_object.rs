@@ -353,6 +353,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this copy owes
+        // names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
+        let output = self.store(input, ctx, &correlation)?;
+        // Recorded LAST, so the response carries the pair the notifications already named
+        // this call by.
+        correlation.answer();
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
+    /// Store the copy this request asks for, answering what the caller is told and
+    /// starting the notifications the destination bucket's configuration owes for it.
+    ///
+    /// Everything that reads or writes the store lives here, so the guard is released
+    /// when this returns.
+    fn store(
+        &self,
+        input: CopyObjectInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        correlation: &crate::state::request_ids::RequestCorrelation,
+    ) -> Result<CopyObjectOutput, CopyObjectError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store neither the source can be read nor the copy recorded, and
             // none of the modelled errors says that, so the scaffold's 501 carries what is
@@ -858,7 +882,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(object) => created.of_object(object),
             None => created,
         };
-        let pending = crate::state::notifications::pending(&store, &input.bucket, &[created]);
+        let pending =
+            crate::state::notifications::pending(&store, &input.bucket, &[created], correlation);
 
         let output = CopyObjectOutput {
             // "Container for all response elements" — the entity tag and last-modified

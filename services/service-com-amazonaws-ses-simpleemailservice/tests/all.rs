@@ -41,6 +41,8 @@ mod ses_configuration_set_sending_state;
 mod ses_create_receipt_rule;
 #[path = "all/ses_custom_verification_email_send.rs"]
 mod ses_custom_verification_email_send;
+#[path = "all/ses_custom_verification_email_templates.rs"]
+mod ses_custom_verification_email_templates;
 #[path = "all/ses_identity_policies.rs"]
 mod ses_identity_policies;
 #[path = "all/ses_identity_policy_delete.rs"]

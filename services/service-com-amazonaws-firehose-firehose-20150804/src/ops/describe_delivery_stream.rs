@@ -8,8 +8,9 @@
 //! A member whose default the service documents is reported with that default
 //! MATERIALISED rather than omitted: the stream's SSE state (`DISABLED` for a stream that
 //! was never encrypted), a destination's `CompressionFormat`, `BufferingHints`,
-//! `EncryptionConfiguration` and `S3BackupMode`. A client comparing desired against
-//! actual configuration, or round-tripping a description back into `UpdateDestination`,
+//! `EncryptionConfiguration`, `S3BackupMode` and `CloudWatchLoggingOptions` (logging off
+//! for a destination that never asked for it). A client comparing desired against actual
+//! configuration, or round-tripping a description back into `UpdateDestination`,
 //! then reads an explicit value where AWS reports one.
 //!
 //! ## Shape of an operation
@@ -248,6 +249,24 @@ const DEFAULT_ELASTICSEARCH_S3_BACKUP_MODE: &str = "FailedDocumentsOnly";
 /// FailedEventsOnly."
 const DEFAULT_SPLUNK_S3_BACKUP_MODE: &str = "FailedEventsOnly";
 
+/// The CloudWatch logging a destination description reports, which every destination type
+/// carries a block for.
+///
+/// A destination created without a `CloudWatchLoggingOptions` block is not logging:
+/// `Enabled` "Enables or disables CloudWatch logging", and nothing asked for it. The
+/// description reports that state EXPLICITLY — the block with logging off — rather than
+/// leaving the member out, the same way this path materialises a destination's other
+/// effective values, so a client reading the configuration back can tell whether error
+/// logging is on instead of having to read an absent member as a default it has to know.
+///
+/// A block that WAS supplied keeps the log group and stream it named, with `Enabled`
+/// filled in when the caller left it out: the reported state is the one Firehose acts on.
+fn logging(options: &Option<CloudWatchLoggingOptions>) -> Option<CloudWatchLoggingOptions> {
+    let mut reported = options.clone().unwrap_or_default();
+    reported.enabled = Some(reported.enabled.unwrap_or(false));
+    Some(reported)
+}
+
 /// Render one stored destination: its assigned id plus the `*DestinationDescription`
 /// matching the configuration variant the create supplied.
 fn destination_description(destination: &crate::state::Destination) -> DestinationDescription {
@@ -273,7 +292,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 encryption_configuration: encryption_configuration(
                     config.encryption_configuration.as_ref(),
                 ),
-                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 processing_configuration: config.processing_configuration.clone(),
                 s3_backup_mode: Some(s3_backup_mode(
                     config.s3_backup_mode.as_ref(),
@@ -311,7 +330,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     .s3_backup_configuration
                     .as_ref()
                     .map(s3_description),
-                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 secrets_manager_configuration: config.secrets_manager_configuration.clone(),
             }),
             ..rendered
@@ -332,7 +351,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 )),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
                 processing_configuration: config.processing_configuration.clone(),
-                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 vpc_configuration_description: None,
                 document_id_options: config.document_id_options.clone(),
             }),
@@ -352,7 +371,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     s3_backup_mode: config.s3_backup_mode.clone(),
                     s3_destination_description: Some(s3_description(&config.s3_configuration)),
                     processing_configuration: config.processing_configuration.clone(),
-                    cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                    cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                     vpc_configuration_description: None,
                     document_id_options: config.document_id_options.clone(),
                 },
@@ -373,7 +392,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 )),
                 s3_destination_description: Some(s3_description(&config.s3_configuration)),
                 processing_configuration: config.processing_configuration.clone(),
-                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 buffering_hints: config.buffering_hints.clone(),
                 secrets_manager_configuration: config.secrets_manager_configuration.clone(),
             }),
@@ -388,7 +407,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     name: config.endpoint_configuration.name.clone(),
                 }),
                 buffering_hints: config.buffering_hints.clone(),
-                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 request_configuration: config.request_configuration.clone(),
                 processing_configuration: config.processing_configuration.clone(),
                 role_arn: config.role_arn.clone(),
@@ -411,7 +430,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 meta_data_column_name: config.meta_data_column_name.clone(),
                 content_column_name: config.content_column_name.clone(),
                 snowflake_vpc_configuration: config.snowflake_vpc_configuration.clone(),
-                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 processing_configuration: config.processing_configuration.clone(),
                 role_arn: Some(config.role_arn.clone()),
                 retry_options: config.retry_options.clone(),
@@ -433,7 +452,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                     s3_backup_mode: config.s3_backup_mode.clone(),
                     s3_destination_description: Some(s3_description(&config.s3_configuration)),
                     processing_configuration: config.processing_configuration.clone(),
-                    cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                    cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                     vpc_configuration_description: None,
                 },
             ),
@@ -447,7 +466,7 @@ fn destination_description(destination: &crate::state::Destination) -> Destinati
                 schema_evolution_configuration: config.schema_evolution_configuration.clone(),
                 table_creation_configuration: config.table_creation_configuration.clone(),
                 buffering_hints: config.buffering_hints.clone(),
-                cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+                cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
                 processing_configuration: config.processing_configuration.clone(),
                 s3_backup_mode: config.s3_backup_mode.clone(),
                 retry_options: config.retry_options.clone(),
@@ -475,7 +494,7 @@ fn s3_description(config: &S3DestinationConfiguration) -> S3DestinationDescripti
         encryption_configuration: encryption_configuration(
             config.encryption_configuration.as_ref(),
         ),
-        cloud_watch_logging_options: config.cloud_watch_logging_options.clone(),
+        cloud_watch_logging_options: logging(&config.cloud_watch_logging_options),
     }
 }
 

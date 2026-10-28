@@ -281,7 +281,7 @@ async fn get_hypervisor_property_mappings_reports_the_stored_mappings() {
         let arn = service_state(&*engine)
             .expect("the in-memory engine must expose this state")
             .lock()
-            .page_of_hypervisors(None, 100)
+            .page_of_hypervisors(REGION, None, 100)
             .items
             .into_iter()
             .find(|record| record.host == *host)

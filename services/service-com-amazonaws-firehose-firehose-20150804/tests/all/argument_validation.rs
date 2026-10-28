@@ -584,10 +584,19 @@ async fn the_source_configuration_a_create_takes_is_fixed_by_its_declared_type()
             "case {case:?}: got {refused:?}"
         );
         let message = error_message(&refused);
-        assert!(
-            message.contains(member) && message.contains(stream_type),
-            "case {case:?}: the refusal must name the missing member and the declared \
-             type, got {message:?}"
+        // The sentence names the source configuration that type is FED BY and the type
+        // that requires it. Firehose's own name for the Kinesis source configuration is
+        // not the request member's name, so the expectation takes that one from the
+        // service's wording and every other from the model's member name.
+        let configuration = if *member == "KinesisStreamSourceConfiguration" {
+            "KinesisSourceStreamConfig"
+        } else {
+            member
+        };
+        let expected = format!("{configuration} is mandatory for {stream_type} stream type.");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
         // A refused create stores nothing.
         let (status, described) = emulator

@@ -72,7 +72,12 @@
 //! Every listing pages through one helper ([`page_of_where`], handing back a [`Page`]),
 //! so a page boundary and the token that encodes it mean the same thing whichever
 //! resource is being listed, filtered ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::page_of_virtual_machines`])
-//! or not.
+//! or not. Every resource of this service is REGIONAL — its region is a segment of the
+//! ARN it is minted and keyed under — so every listing reports only the records of the
+//! region the listing request itself was addressed to ([`arn_is_in_region`], applied
+//! before the page is cut), whichever resource it lists: one store serves every region a
+//! client addresses, and a listing is an account-and-region listing, never a listing of
+//! every region at once.
 //!
 //! A hypervisor also carries its PROPERTY MAPPINGS ([`StoredPropertyMappings`]) — the
 //! VMware-to-Amazon tag mappings and the IAM role they are applied with. They live on
@@ -1289,7 +1294,12 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.gateways.len()
     }
 
-    /// One page of gateways in key order.
+    /// One page of the gateways of `region`, in key order.
+    ///
+    /// `region` is the region the listing request was addressed to, and only the gateways
+    /// minted in it are part of the listing ([`page_of_in_region`]): a gateway is a
+    /// regional resource, so one of another region is no more part of this listing than a
+    /// gateway of another account would be.
     ///
     /// `after` is the ARN the previous page ended on (resolved from a `NextToken`), and
     /// the page starts at the next key AFTER it — so a record created, or deleted,
@@ -1297,8 +1307,13 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// skipping a record that stayed put. `limit` is the caller's `MaxResults` already
     /// clamped to [`MAX_PAGE_SIZE`] by the handler, so no request can make one response
     /// carry the whole store.
-    pub fn page_of_gateways(&self, after: Option<&str>, limit: usize) -> Page<StoredGateway> {
-        page_of(&self.gateways, after, limit)
+    pub fn page_of_gateways(
+        &self,
+        region: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Page<StoredGateway> {
+        page_of_in_region(&self.gateways, region, after, limit)
     }
 
     /// Set the bandwidth rate-limit schedule of the gateway stored under `arn`, and hand
@@ -1557,10 +1572,16 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.hypervisors.len()
     }
 
-    /// One page of hypervisors in ARN order — the order `ListHypervisors` reports them
-    /// in. Same contract as [`Self::page_of_gateways`], whose implementation it shares.
-    pub fn page_of_hypervisors(&self, after: Option<&str>, limit: usize) -> Page<StoredHypervisor> {
-        page_of(&self.hypervisors, after, limit)
+    /// One page of the hypervisors of `region`, in ARN order — the order `ListHypervisors`
+    /// reports them in. Same contract as [`Self::page_of_gateways`], whose implementation
+    /// it shares, region scope included.
+    pub fn page_of_hypervisors(
+        &self,
+        region: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Page<StoredHypervisor> {
+        page_of_in_region(&self.hypervisors, region, after, limit)
     }
 
     /// Every hypervisor this store holds whose `Host` is `host`, in ARN order.
@@ -1790,27 +1811,30 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.virtual_machines.len()
     }
 
-    /// One page of the virtual machines a read AT `now` reports, in ARN order — the order
-    /// `ListVirtualMachines` reports them in — holding only the machines of
-    /// `hypervisor_arn` when one is named.
+    /// One page of the virtual machines of `region` that a read AT `now` reports, in ARN
+    /// order — the order `ListVirtualMachines` reports them in — holding only the machines
+    /// of `hypervisor_arn` when one is named.
     ///
-    /// A machine whose discovering sync has not fallen due yet is not part of the listing
-    /// at all ([`StoredVirtualMachine::discovered_as_of`]), exactly as a machine of another
-    /// hypervisor is not: the filter is applied BEFORE the page is cut, so a page holds up
-    /// to `limit` MATCHING machines and carries a token only while a matching machine
-    /// remains past its boundary, and a filtered listing pages exactly like an unfiltered
-    /// one. Same boundary contract as [`Self::page_of_gateways`], whose implementation it
-    /// shares.
+    /// A machine of another region is not part of the listing at all, exactly as
+    /// [`Self::page_of_gateways`] lists only the gateways of the region the request was
+    /// addressed to. Nor is a machine whose discovering sync has not fallen due yet
+    /// ([`StoredVirtualMachine::discovered_as_of`]), or one of another hypervisor: every
+    /// filter is applied BEFORE the page is cut, so a page holds up to `limit` MATCHING
+    /// machines and carries a token only while a matching machine remains past its
+    /// boundary, and a filtered listing pages exactly like an unfiltered one. Same boundary
+    /// contract as [`Self::page_of_gateways`], whose implementation it shares.
     pub fn page_of_virtual_machines(
         &self,
+        region: &str,
         hypervisor_arn: Option<&str>,
         after: Option<&str>,
         limit: usize,
         now: SystemTime,
     ) -> Page<StoredVirtualMachine> {
-        page_of_where(&self.virtual_machines, after, limit, |machine| {
-            machine.discovered_as_of(now)
-                && hypervisor_arn.is_none_or(|arn| machine.hypervisor_arn == arn)
+        page_of_where(&self.virtual_machines, after, limit, |arn, machine| {
+            arn_is_in_region(arn, region)
+                && machine.discovered_as_of(now)
+                && hypervisor_arn.is_none_or(|filter| machine.hypervisor_arn == filter)
         })
     }
 
@@ -1875,30 +1899,41 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     }
 }
 
-/// One page of an ARN-keyed resource map in key order — the paging every list
-/// operation of this service does, written once.
+/// One page of the records of an ARN-keyed map that are stored in `region`, in key order
+/// — the paging every list operation of this service does, written once.
 ///
 /// `after` is the key the previous page ended on (resolved from a `NextToken`), and the
 /// page starts at the next key AFTER it — so a record created, or deleted, between two
 /// pages changes what the second page holds without ever repeating or skipping a record
 /// that stayed put. `limit` is the caller's `MaxResults` already clamped to
 /// [`MAX_PAGE_SIZE`] by the handler, so no request can make one response carry a whole
-/// store.
-fn page_of<T: Clone>(records: &BTreeMap<String, T>, after: Option<&str>, limit: usize) -> Page<T> {
-    page_of_where(records, after, limit, |_| true)
+/// store. A record of another region is not part of the listing at all
+/// ([`arn_is_in_region`]): the filter is applied before the page is cut, so a page holds
+/// up to `limit` records OF THAT REGION and promises a successor only while one remains.
+fn page_of_in_region<T: Clone>(
+    records: &BTreeMap<String, T>,
+    region: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Page<T> {
+    page_of_where(records, after, limit, |arn, _| {
+        arn_is_in_region(arn, region)
+    })
 }
 
-/// One page of the records of an ARN-keyed map that `keep` accepts, in key order.
+/// One page of the records of an ARN-keyed map that `keep` accepts — judged on the ARN
+/// the record is keyed under and the record itself — in key order.
 ///
-/// The paging [`page_of`] does, with a predicate: the records `keep` rejects are not part
-/// of the listing at all, so they neither fill a page nor make one promise a successor.
-/// `page_of` is this with a predicate that keeps everything, so a filtered listing and an
-/// unfiltered one cut their pages and mint their tokens the same way.
+/// The paging [`page_of_in_region`] does, with a predicate: the records `keep` rejects are
+/// not part of the listing at all, so they neither fill a page nor make one promise a
+/// successor. `page_of_in_region` is this with a predicate that keeps the records of one
+/// region, so a further-filtered listing and a merely regional one cut their pages and
+/// mint their tokens the same way.
 fn page_of_where<T: Clone>(
     records: &BTreeMap<String, T>,
     after: Option<&str>,
     limit: usize,
-    keep: impl Fn(&T) -> bool,
+    keep: impl Fn(&str, &T) -> bool,
 ) -> Page<T> {
     let lower = match after {
         Some(key) => Bound::Excluded(key.to_string()),
@@ -1906,7 +1941,7 @@ fn page_of_where<T: Clone>(
     };
     let mut remaining = records
         .range((lower, Bound::Unbounded))
-        .filter(|(_, record)| keep(record));
+        .filter(|(arn, record)| keep(arn, record));
     let page: Vec<(&String, &T)> = remaining.by_ref().take(limit).collect();
     // A token only when a record really remains past this page: the final page must
     // not carry one, or a paginating client never stops.
@@ -2190,6 +2225,19 @@ fn is_arn_segment(segment: &str) -> bool {
         && segment
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Whether `arn` names a resource of `region` — read off the region segment of the ARN
+/// the store keys the record under, which is the region the request that minted it was
+/// addressed to.
+///
+/// The question every listing of this service answers before it reports a record: a
+/// resource is regional, so one minted in another region belongs to another region's
+/// listing. `region` is normalised through [`arn_region`] exactly as a minted ARN's
+/// segment was, so the two are compared in one spelling; anything that is not an ARN of
+/// this service at all is in no region.
+pub fn arn_is_in_region(arn: &str, region: &str) -> bool {
+    arn_parts(arn).is_some_and(|parts| parts.region == arn_region(region))
 }
 
 /// The region to mint an ARN in, falling back to [`DEFAULT_REGION`] for anything that

@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
-use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrait};
+use ::aws_smithy_schema_server::constraints::{validate, LengthTrait, PatternTrait, Violation};
 use ::aws_smithy_schema_server::envelope;
 
 use crate::ops::types::{
@@ -563,6 +563,20 @@ pub fn resource_type_of(resource_arn: &str) -> &'static str {
     }
 }
 
+/// The Region segment every ARN of this service carries, as both `ConnectorArn`'s and
+/// `ChallengeArn`'s own `@pattern` write it (smithy_query: shape ConnectorArn, ChallengeArn):
+/// two or more lower-case words joined by `-`, then a number with no leading zero.
+///
+/// The service's ONE spelling of that rule. It is a macro rather than a `const` so the same
+/// expression can be `concat!`ed into the whole-ARN pattern below AND anchored on its own for
+/// a single Region name ([`WHOLE_REGION_PATTERN`]) — `concat!` takes literals, so a `const`
+/// would have to be re-spelled at one of the two places and the two could then drift.
+macro_rules! region_segment_pattern {
+    () => {
+        r"[a-z]+(-[a-z]+)+-[1-9]\d*"
+    };
+}
+
 /// The form a `ResourceArn` naming one of this service's resources takes: `ConnectorArn`'s
 /// own `@pattern` with `ChallengeArn`'s challenge segment appended OPTIONALLY.
 ///
@@ -571,7 +585,9 @@ pub fn resource_type_of(resource_arn: &str) -> &'static str {
 /// drift apart here. Written exactly as the model writes them, because it is also the
 /// requirement a refusal quotes back.
 pub const RESOURCE_ARN_PATTERN: &str = concat!(
-    r"^arn:aws(-[a-z]+)*:pca-connector-scep:[a-z]+(-[a-z]+)+-[1-9]\d*:\d{12}",
+    r"^arn:aws(-[a-z]+)*:pca-connector-scep:",
+    region_segment_pattern!(),
+    r":\d{12}",
     r":connector\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}",
     r"(\/challenge\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})?$"
 );
@@ -610,28 +626,39 @@ static M_RESOURCE_ARN: Schema = Schema::new_member(
 .with_traits(&RESOURCE_ARN_TRAITS);
 
 /// The root of the shadow input the walk runs over. Its member list is empty on purpose: the
-/// walk visits what [`TaggedResource`] WRITES, and a root struct schema carries no member
+/// walk visits what [`ConstrainedString`] WRITES, and a root struct schema carries no member
 /// name, so it contributes no path segment.
-static TAGGED_RESOURCE_SCHEMA: Schema = Schema::new_struct(
+static SHADOW_INPUT_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
-        "com.amazonaws.pcaconnectorscep#TaggedResource",
+        "com.amazonaws.pcaconnectorscep#ConstrainedString",
         "com.amazonaws.pcaconnectorscep",
-        "TaggedResource",
+        "ConstrainedString",
     ),
     ShapeType::Structure,
     &[],
 );
 
-/// One request's `ResourceArn`, written for the validating walk the way the codec writes a
-/// string member.
-struct TaggedResource<'a> {
-    resource_arn: &'a str,
+/// One string value, written for the validating walk the way the codec writes a string
+/// member: the member schema says which constraints the walk then reads.
+struct ConstrainedString<'a> {
+    member: &'static Schema,
+    value: &'a str,
 }
 
-impl SerializableStruct for TaggedResource<'_> {
+impl SerializableStruct for ConstrainedString<'_> {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
-        s.write_string(&M_RESOURCE_ARN, self.resource_arn)
+        s.write_string(self.member, self.value)
     }
+}
+
+/// Every constraint `member` declares that `value` breaks, as the framework's own constraint
+/// walk reports them: one entry per constraint broken, length before pattern.
+///
+/// The ONE place this crate evaluates a string constraint, so a value checked here is checked
+/// — and, where the answer is a message, worded — exactly as the request boundary checks the
+/// same string on a constrained member.
+fn string_violations(member: &'static Schema, value: &str) -> Vec<Violation> {
+    validate(&ConstrainedString { member, value }, &SHADOW_INPUT_SCHEMA)
 }
 
 /// How many fields an ARN is built from: `arn:<partition>:<service>:<region>:<account>:<resource>`.
@@ -685,8 +712,7 @@ pub fn resource_arn_rejection(resource_arn: &str) -> Option<String> {
     if names_another_services_resource(resource_arn) {
         return None;
     }
-    let violations = validate(&TaggedResource { resource_arn }, &TAGGED_RESOURCE_SCHEMA);
-    envelope(&violations)
+    envelope(&string_violations(&M_RESOURCE_ARN, resource_arn))
 }
 
 /// Whether `character` is one a tag key or a tag value may carry.
@@ -790,33 +816,43 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// Whether `value` has the shape every ARN of this service requires of its Region segment:
-/// `[a-z]+(-[a-z]+)+-[1-9]\d*` (smithy_query shape=ConnectorArn), within
-/// [`MAX_REGION_LENGTH`] — two or more lower-case words joined by `-`, then a number with no
-/// leading zero.
+/// [`region_segment_pattern`] anchored to a WHOLE value, so one Region name on its own is
+/// read by the very expression an ARN embeds it as.
+const WHOLE_REGION_PATTERN: &str = concat!("^", region_segment_pattern!(), "$");
+
+/// A Region name's only constraint: [`WHOLE_REGION_PATTERN`]. How long the name may be is a
+/// separate bound ([`MAX_REGION_LENGTH`]) — the emulator's own rather than one either ARN
+/// pattern states — so it is not a trait here.
+static REGION_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new(WHOLE_REGION_PATTERN)));
+    traits
+});
+
+/// The `region` member schema the constraint walk is driven over for one Region name.
+static M_REGION: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.pcaconnectorscep#ConstrainedString$region",
+        "com.amazonaws.pcaconnectorscep",
+        "region",
+    ),
+    ShapeType::String,
+    "region",
+    0,
+)
+.with_traits(&REGION_TRAITS);
+
+/// Whether `value` has the shape every ARN of this service requires of its Region segment,
+/// within [`MAX_REGION_LENGTH`].
+///
+/// The shape is not restated here: the check runs [`region_segment_pattern`] — the same
+/// expression [`RESOURCE_ARN_PATTERN`] embeds — through the same constraint walk
+/// ([`string_violations`]) that refuses a `ResourceArn`. So the Region a record is filed under
+/// is, by construction, one the ARN built from it can name and that ARN can be read back by.
+/// The length bound is the separate bound it is, and the only thing checked beside the
+/// pattern.
 pub fn is_region_shaped(value: &str) -> bool {
-    if value.is_empty() || value.len() > MAX_REGION_LENGTH {
-        return false;
-    }
-    let Some((words, number)) = value.rsplit_once('-') else {
-        return false;
-    };
-    if !number
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
-        || !number.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    let mut word_count = 0usize;
-    for word in words.split('-') {
-        if word.is_empty() || !word.bytes().all(|byte| byte.is_ascii_lowercase()) {
-            return false;
-        }
-        word_count += 1;
-    }
-    word_count >= 2
+    value.len() <= MAX_REGION_LENGTH && string_violations(&M_REGION, value).is_empty()
 }
 
 /// A fresh identifier in the UUID form every id in this service's ARNs and its challenge

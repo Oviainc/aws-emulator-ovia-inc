@@ -2728,6 +2728,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// ensure the idempotency of the request"
     /// (`AssociateClientVpnTargetNetworkRequest$ClientToken`).
     pub client_vpn_target_network_client_tokens: HashMap<String, String>,
+    /// The IAM roles each ACM certificate is associated with for ACM for Nitro Enclaves, by
+    /// the certificate's ARN, as [`EnclaveCertificateRecord`]s: the roles themselves beside
+    /// the two facts of the certificate's uploaded bundle that every report of an association
+    /// carries and no request names — the Amazon S3 bucket it was uploaded to and the KMS key
+    /// its private key is encrypted with.
+    ///
+    /// Starts EMPTY: a certificate is in this map only because
+    /// `AssociateEnclaveCertificateIamRole` associated a role with it. Ordered by certificate
+    /// ARN, and each record's roles by role ARN, which is the one stable order
+    /// `GetAssociatedEnclaveCertificateIamRoles` reports them in. See
+    /// [`enclave_certificate_iam_roles`] and
+    /// [`ComAmazonawsEc2Amazonec2State::associate_enclave_certificate_iam_role`], the one way
+    /// an association is stored.
+    pub enclave_certificate_iam_roles: BTreeMap<String, EnclaveCertificateRecord>,
     /// Every Reserved Instance the account holds, by `ReservedInstancesId`, as the modelled
     /// [`crate::ops::types::ReservedInstances`] shape itself — for the same reason
     /// [`Self::vpcs`] holds [`Vpc`]s: every member a writer sets round-trips through a
@@ -3826,6 +3840,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             client_vpn_routes: BTreeMap::new(),
             client_vpn_route_client_tokens: HashMap::new(),
             client_vpn_target_network_client_tokens: HashMap::new(),
+            // A fresh account has associated no IAM role with an ACM certificate, so no
+            // certificate bundle has been uploaded for an enclave either.
+            enclave_certificate_iam_roles: BTreeMap::new(),
             // A fresh account has bought nothing, so it holds no Reserved Instances and has
             // asked for no modification of one.
             reserved_instances: BTreeMap::new(),
@@ -37967,6 +37984,16 @@ pub fn ipam_routing_policy_registration_delta_payload_bytes(
 mod client_vpn;
 
 pub use client_vpn::*;
+
+/// The IAM roles each ACM certificate is associated with for ACM for Nitro Enclaves: the
+/// store's record, the form of the two ARNs the surface takes, the refusals for a value that
+/// is neither, and the projection every report of an association reads — in a file of their
+/// own rather than as more lines here. Everything it declares is re-exported below, so a
+/// handler reaches it as `crate::state::require_enclave_certificate_arn` like any helper of
+/// this module.
+pub mod enclave_certificate_iam_roles;
+
+pub use enclave_certificate_iam_roles::*;
 
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another IPAM internet registry association fits inside the store's ceiling

@@ -344,6 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The pair of ids that name this request: the response below carries them in its
+        // `x-amz-request-id` / `x-amz-id-2` headers, and every notification this write
+        // owes names the call it came of by them.
+        let correlation = crate::state::request_ids::RequestCorrelation::mint();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store the object cannot be recorded at all, and none of the
             // modelled errors says that, so the scaffold's 501 carries what is true:
@@ -844,7 +848,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(object) => created.of_object(object),
             None => created,
         };
-        let pending = crate::state::notifications::pending(&store, &input.bucket, &[created]);
+        let pending =
+            crate::state::notifications::pending(&store, &input.bucket, &[created], &correlation);
 
         let output = PutObjectOutput {
             e_tag: Some(etag),
@@ -901,6 +906,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already recorded.
         drop(store);
         crate::state::notifications::publish(ctx, pending);
+        // Recorded LAST, so the response this returns carries the pair the notifications
+        // above already named this call by.
+        correlation.answer();
 
         Ok(output)
     }

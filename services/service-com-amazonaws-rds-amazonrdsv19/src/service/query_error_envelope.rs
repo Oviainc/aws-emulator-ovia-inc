@@ -101,22 +101,42 @@ pub fn with_request_id(mut resp: RtResponse) -> RtResponse {
     resp
 }
 
-/// The modelled operation the service's routing table names for this request, or `None`
-/// when the request names none.
-fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
-    let key = svc.definition().protocol().routing_key(req).ok()?;
-    svc.definition().routing_table().get(key)
-}
-
 /// Serves a modelled operation through the framework exactly as the routing table would,
 /// then adds the envelope's `<RequestId>` to the response.
 ///
-/// It stores no operation of its own: the one it delegates to is the one the service's
-/// routing table names for the request, resolved from the `svc` the framework passes into
-/// [`ErasedOperation::run`]. So the framework still owns the whole
-/// deserialize → validate → handle → serialize sequence (and every status, code and
-/// message it answers with), and this wrapper owns one element of the envelope.
-pub struct RequestIdEnvelopeOperation;
+/// The operation it delegates to is the one THIS service names for the request: its
+/// audited table first (every modelled operation, served behind the recorder that makes
+/// each served call a management event — see [`crate::service::management_events`]), and
+/// the generated routing table resolved from the `svc` the framework passes into
+/// [`ErasedOperation::run`] for anything that table does not hold. Either way the
+/// framework still owns the whole deserialize → validate → handle → serialize sequence
+/// (and every status, code and message it answers with), and this wrapper owns one
+/// element of the envelope.
+pub struct RequestIdEnvelopeOperation {
+    /// Every modelled operation, each served behind the audit recorder, keyed by the same
+    /// routing key the generated table uses.
+    audited: OperationRoutingTable,
+}
+
+impl RequestIdEnvelopeOperation {
+    /// Serve requests through `audited`, falling back to the generated routing table for
+    /// a key it does not hold.
+    pub fn new(audited: OperationRoutingTable) -> Self {
+        Self { audited }
+    }
+
+    /// The operation that serves this request, or `None` when nothing names one.
+    fn operation_for<'s>(
+        &'s self,
+        svc: &'s dyn Service,
+        req: &RtRequest,
+    ) -> Option<&'s dyn ErasedOperation> {
+        let key = svc.definition().protocol().routing_key(req).ok()?;
+        self.audited
+            .get(key)
+            .or_else(|| svc.definition().routing_table().get(key))
+    }
+}
 
 impl ErasedOperation for RequestIdEnvelopeOperation {
     fn run<'r>(
@@ -126,7 +146,7 @@ impl ErasedOperation for RequestIdEnvelopeOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            match modeled_operation(svc, req) {
+            match self.operation_for(svc, req) {
                 Some(op) => with_request_id(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a
                 // request only when the routing table holds its key; answered as the

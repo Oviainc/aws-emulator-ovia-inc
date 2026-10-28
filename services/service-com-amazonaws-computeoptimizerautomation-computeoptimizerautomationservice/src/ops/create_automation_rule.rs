@@ -251,6 +251,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateAutomationRuleErrorModeled::OptInRequiredException(refusal).into());
         }
 
+        // The caller's STANDING in each account the rule would apply actions in:
+        // an organization rule automatically applies its actions to the accounts
+        // its configuration names, which is what an association permits, so an
+        // account that is not associated right now may not be scoped — see
+        // `crate::state::…::may_scope_rule_to`. Judged AHEAD of the token ledger
+        // and of the store, so a refused create neither consumes its client
+        // token nor mints a rule.
+        if !guard.may_scope_rule_to(input.organization_configuration.as_ref()) {
+            return Err(access_denied());
+        }
+
         match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
             crate::state::TokenOutcome::Fresh => {}
             // A retry of the same create: answer with the rule the first call
@@ -388,6 +399,17 @@ fn output_for(rule: &crate::state::StoredRule) -> CreateAutomationRuleOutput {
         tags: Some(rule.tags.clone()),
         created_timestamp: Some(rule.created_timestamp),
     }
+}
+
+/// The modelled 403 (`AccessDeniedException`, HTTP 403), for a rule the caller
+/// may not scope to an account it names. The message is this service's fixed
+/// access-denied sentence: it names no account, so the refusal discloses nothing
+/// about which accounts the organization reaches.
+fn access_denied() -> CreateAutomationRuleError {
+    CreateAutomationRuleErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::ACCESS_DENIED_MESSAGE.into()),
+    })
+    .into()
 }
 
 /// Why this request's parameter values are not valid, if they are not.
