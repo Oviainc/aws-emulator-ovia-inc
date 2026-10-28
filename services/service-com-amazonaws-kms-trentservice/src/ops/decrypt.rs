@@ -1,16 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Decrypt
-//! IMPLEMENTED: opens the ciphertext envelope `Encrypt` produced and returns the
-//! original plaintext. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: returns the plaintext of a ciphertext this service can open, which is
+//! one of two kinds. This is the ONLY file to touch for this operation.
 //!
-//! The envelope names the key that sealed it, so `Decrypt` needs no `KeyId`; when one
-//! is given it must name that same key. The AES-GCM tag is what distinguishes a
-//! ciphertext this service produced from a foreign or altered one, and a matching
-//! encryption context from a different one — both failures are
-//! `InvalidCiphertextException`. An encryption context that is not a legal context at
-//! all never reaches that tag: it is a malformed request, refused by the validation
-//! every operation taking one shares ([`crate::state::check_encryption_context`]).
+//! A ciphertext a SYMMETRIC encryption key sealed is the envelope `Encrypt` produced:
+//! it names the key that sealed it, so `Decrypt` needs no `KeyId`; when one is given it
+//! must name that same key. The AES-GCM tag is what distinguishes a ciphertext this
+//! service produced from a foreign or altered one, and a matching encryption context
+//! from a different one — both failures are `InvalidCiphertextException`. An encryption
+//! context that is not a legal context at all never reaches that tag: it is a malformed
+//! request, refused by the validation every operation taking one shares
+//! ([`crate::state::check_encryption_context`]).
+//!
+//! A ciphertext an ASYMMETRIC encryption key opens was produced OUTSIDE KMS, by the
+//! public half `GetPublicKey` published, with one of the `EncryptionAlgorithms` that key
+//! advertises: it carries no metadata, so the request's `KeyId` is what names the key
+//! and its `EncryptionAlgorithm` what names the scheme, and the private half this store
+//! holds opens it ([`crate::state::decrypt_asymmetric`]). The algorithm is a
+//! cryptographic parameter, so the same bytes declared under the other advertised digest
+//! do not open and are refused `InvalidCiphertextException` like any ciphertext this key
+//! did not receive. An algorithm the key's spec does not advertise, and a key whose
+//! usage is not encryption and decryption, are `InvalidKeyUsageException`.
 //!
 //! Key material does not cross Regions. A ciphertext whose key this endpoint's Region
 //! holds no record of — and a `KeyId` that is an ARN of another Region — names material
@@ -418,9 +429,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CiphertextBlob is required and was not provided",
             ));
         };
-        let Some(envelope) = crate::state::parse_envelope(blob) else {
-            return Err(invalid_ciphertext());
-        };
 
         // Who the request speaks for, resolved BEFORE this service's store is locked, so
         // the IAM and STS stores the resolution reads are never reached while this
@@ -433,51 +441,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // known and its key state has been judged.
         let tokens = input.grant_tokens.clone().unwrap_or_default();
 
-        // The envelope names the key whose material sealed it, and this endpoint can
-        // open the ciphertext only with a key of its OWN Region: single-Region key
-        // material does not travel, so a ciphertext whose key is not held here names
-        // material this endpoint cannot authorize. That is an authorization decision
-        // and not a lookup — KMS does not disclose whether that key exists — so it is
-        // refused with `AccessDeniedException` rather than reported as a missing
-        // resource. Material the keys of a multi-Region set SHARE is held by every
-        // member, so a replica opens its primary's ciphertext here as usual.
-        let Some(key) = state.key_in(&region, &envelope.key_id) else {
-            return Err(crate::state::foreign_key_material());
+        // WHICH SCHEME produced this ciphertext follows from the KEY, not from the
+        // bytes. A ciphertext an ASYMMETRIC key opens was produced outside KMS, under
+        // the public half `GetPublicKey` published, and carries no metadata at all —
+        // "the standard format for asymmetric key ciphertext does not include
+        // configurable fields" — so nothing in it names a key and the request must:
+        // `KeyId` "is required only when the ciphertext was encrypted under an
+        // asymmetric KMS key"
+        // (`smithy_query(query="doc",shape="DecryptRequest",member="KeyId")`). A
+        // ciphertext a SYMMETRIC encryption key sealed carries "metadata that it adds
+        // to the symmetric ciphertext blob", which is this service's envelope, and so
+        // names its own key.
+        let asymmetric = match input.key_id.as_deref() {
+            Some(requested) => match state.resolve(&region, requested) {
+                crate::state::KeyRef::Found(requested_key) if requested_key.is_asymmetric() => {
+                    Some(requested_key)
+                }
+                _ => None,
+            },
+            None => None,
         };
 
-        // "Specify the key ID ... of the KMS key" only when the caller wants KMS to
-        // check its assumption. A `KeyId` that names an EXISTING key other than the
-        // one which sealed the ciphertext is an `IncorrectKeyException`; one that
-        // names no key at all is the same `NotFoundException` any other operation
-        // answers for it (`Decrypt` models no `InvalidArnException`, so a malformed
-        // ARN is reported the same way).
-        if let Some(requested) = input.key_id.as_deref() {
-            match state.resolve(&region, requested) {
-                crate::state::KeyRef::Found(requested_key)
-                    if requested_key.key_id == key.key_id => {}
-                crate::state::KeyRef::Found(_) => {
-                    return Err(incorrect_key());
-                }
-                crate::state::KeyRef::UnauthorizedAccount => {
-                    return Err(crate::state::unauthorized_account(Self::NAME));
-                }
-                // A `KeyId` that is an ARN of another Region names a key this endpoint
-                // cannot authorize for the ciphertext either, so it is refused the same
-                // way the ciphertext's own foreign key is: on authorization, not as a
-                // lookup miss.
-                crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn
-                    if crate::state::names_another_region(&region, requested) =>
-                {
+        // The envelope of a ciphertext this service's `Encrypt` sealed — `None` for a
+        // raw ciphertext an asymmetric key opens, which is not an envelope at all.
+        let mut envelope = None;
+        let key = match asymmetric {
+            Some(key) => key,
+            None => {
+                let Some(parsed) = crate::state::parse_envelope(blob) else {
+                    return Err(invalid_ciphertext());
+                };
+
+                // The envelope names the key whose material sealed it, and this endpoint
+                // can open the ciphertext only with a key of its OWN Region:
+                // single-Region key material does not travel, so a ciphertext whose key
+                // is not held here names material this endpoint cannot authorize. That is
+                // an authorization decision and not a lookup — KMS does not disclose
+                // whether that key exists — so it is refused with `AccessDeniedException`
+                // rather than reported as a missing resource. Material the keys of a
+                // multi-Region set SHARE is held by every member, so a replica opens its
+                // primary's ciphertext here as usual.
+                let Some(key) = state.key_in(&region, &parsed.key_id) else {
                     return Err(crate::state::foreign_key_material());
+                };
+
+                // "Specify the key ID ... of the KMS key" only when the caller wants KMS
+                // to check its assumption. A `KeyId` that names an EXISTING key other than
+                // the one which sealed the ciphertext is an `IncorrectKeyException`; one
+                // that names no key at all is the same `NotFoundException` any other
+                // operation answers for it (`Decrypt` models no `InvalidArnException`, so
+                // a malformed ARN is reported the same way).
+                if let Some(requested) = input.key_id.as_deref() {
+                    match state.resolve(&region, requested) {
+                        crate::state::KeyRef::Found(requested_key)
+                            if requested_key.key_id == key.key_id => {}
+                        crate::state::KeyRef::Found(_) => {
+                            return Err(incorrect_key());
+                        }
+                        crate::state::KeyRef::UnauthorizedAccount => {
+                            return Err(crate::state::unauthorized_account(Self::NAME));
+                        }
+                        // A `KeyId` that is an ARN of another Region names a key this
+                        // endpoint cannot authorize for the ciphertext either, so it is
+                        // refused the same way the ciphertext's own foreign key is: on
+                        // authorization, not as a lookup miss.
+                        crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn
+                            if crate::state::names_another_region(&region, requested) =>
+                        {
+                            return Err(crate::state::foreign_key_material());
+                        }
+                        crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                            return Err(DecryptErrorModeled::NotFoundException(
+                                NotFoundException {
+                                    message: Some(crate::state::key_not_found_message(
+                                        &region, requested,
+                                    )),
+                                },
+                            )
+                            .into());
+                        }
+                    }
                 }
-                crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
-                    return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(crate::state::key_not_found_message(&region, requested)),
-                    })
-                    .into());
-                }
+                envelope = Some(parsed);
+                key
             }
-        }
+        };
 
         if !key.is_usable() {
             if key.key_state == crate::state::KEY_STATE_DISABLED {
@@ -532,23 +580,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(message));
         }
 
+        // "Specify the same algorithm that was used to encrypt the data", whose
+        // default "SYMMETRIC_DEFAULT represents the only supported algorithm that is
+        // valid for symmetric encryption KMS keys"
+        // (`smithy_query(query="doc",shape="DecryptRequest",member="EncryptionAlgorithm")`).
         let algorithm = input
             .encryption_algorithm
             .clone()
             .unwrap_or_else(|| crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string());
-        if algorithm != crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT {
-            return Err(DecryptErrorModeled::InvalidKeyUsageException(
-                InvalidKeyUsageException {
-                    message: Some(format!(
-                        "The encryption algorithm {algorithm} is incompatible with the key \
-                         spec {} of {}; it must be {}.",
-                        key.key_spec,
-                        key.arn,
-                        crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT
-                    )),
-                },
-            )
-            .into());
+
+        // Which algorithms can open a ciphertext of this key is exactly the key's own
+        // `EncryptionAlgorithms` — the list `DescribeKey` and `GetPublicKey` report for
+        // it, which follows from its key spec — and a key with no such list cannot
+        // decrypt at all: "for encrypting, decrypting, re-encrypting, and generating
+        // data keys, the KeyUsage must be ENCRYPT_DECRYPT"
+        // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+        let Some(supported) = key.algorithms_under(crate::state::KEY_USAGE_ENCRYPT_DECRYPT) else {
+            return Err(invalid_key_usage(format!(
+                "{} has KeyUsage {}, which cannot be used to decrypt; it must be {}.",
+                key.arn,
+                key.key_usage,
+                crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+            )));
+        };
+        if !supported.contains(&algorithm) {
+            let requirement = if let [only] = supported.as_slice() {
+                format!("it must be {only}")
+            } else {
+                format!("it must be one of {}", supported.join(", "))
+            };
+            return Err(invalid_key_usage(format!(
+                "The encryption algorithm {algorithm} is incompatible with the key spec {} \
+                 of {}; {requirement}.",
+                key.key_spec, key.arn
+            )));
         }
 
         if input.dry_run == Some(true) {
@@ -563,14 +628,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The encryption context is authenticated, not stored: a context that differs
-        // from the one `Encrypt` was given fails the tag, exactly as a tampered
-        // ciphertext does. Which VERSION of the key's material sealed the ciphertext
-        // is read from the same tag, so a ciphertext sealed before a rotation opens
-        // under the material it was sealed with.
-        let Some(opened) = crate::state::unseal(key, &envelope, input.encryption_context.as_ref())
-        else {
-            return Err(invalid_ciphertext());
+        let (plaintext, key_material_id) = match &envelope {
+            // A ciphertext this service's `Encrypt` sealed. The encryption context is
+            // authenticated, not stored: a context that differs from the one `Encrypt`
+            // was given fails the tag, exactly as a tampered ciphertext does. Which
+            // VERSION of the key's material sealed the ciphertext is read from the same
+            // tag, so a ciphertext sealed before a rotation opens under the material it
+            // was sealed with.
+            Some(envelope) => {
+                let Some(opened) =
+                    crate::state::unseal(key, envelope, input.encryption_context.as_ref())
+                else {
+                    return Err(invalid_ciphertext());
+                };
+                (opened.plaintext, opened.key_material_id)
+            }
+            // A ciphertext produced OUTSIDE KMS under the public half of this key's key
+            // pair: "the Decrypt operation also decrypts ciphertext that was encrypted
+            // outside of KMS by the public key in an KMS asymmetric KMS key"
+            // (`smithy_query(query="doc",shape="Decrypt")`). It is opened with the
+            // private half this store holds, under the parameters the declared algorithm
+            // names — so a ciphertext produced under a DIFFERENT advertised algorithm
+            // than the one declared does not open, which is what makes the algorithm a
+            // cryptographic parameter and not a label. No `KeyMaterialId` accompanies
+            // it: that member "is present only when the operation uses a symmetric
+            // encryption KMS key".
+            None => match crate::state::decrypt_asymmetric(key, &algorithm, blob) {
+                Ok(plaintext) => (plaintext, None),
+                Err(crate::state::AsymmetricRefusal::NotThisCiphertext) => {
+                    return Err(invalid_ciphertext());
+                }
+                Err(crate::state::AsymmetricRefusal::Unsupported) => {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "Decrypt with the {algorithm} encryption algorithm"
+                    )));
+                }
+            },
         };
         let key_arn = key.arn.clone();
         let key_origin = key.origin.clone();
@@ -583,7 +676,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DecryptResponse {
             modelled: DecryptOutput {
                 key_id: Some(key_arn),
-                plaintext: Some(opened.plaintext),
+                plaintext: Some(plaintext),
                 encryption_algorithm: Some(algorithm),
                 // Only a `Recipient` request has a ciphertext for one, and those are
                 // refused above.
@@ -593,7 +686,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // encryption KMS key" (`smithy_query(shape="DecryptResponse")`), which
                 // is exactly the material that carries an id — the version that
                 // actually opened this ciphertext, not whichever version is current.
-                key_material_id: opened.key_material_id,
+                key_material_id,
             },
             // Where that key's material comes from — the same field `DescribeKey`
             // reports as `KeyMetadata.Origin`, read from the one key record so the two
@@ -605,8 +698,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The ciphertext is not one this service can open: it is not an envelope, or its
-/// authentication tag did not verify under the key and encryption context given.
+/// The ciphertext is not one this service can open: it is not an envelope and no key the
+/// request names could have produced one, its authentication tag did not verify under the
+/// key and encryption context given, or the private half of the asymmetric key named does
+/// not open it under the declared encryption algorithm.
 ///
 /// The refusal carries NO message. What it would have to say is which of the ciphertext,
 /// the key and the encryption context did not agree, and a caller who presented a
@@ -615,6 +710,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn invalid_ciphertext() -> DecryptError {
     DecryptErrorModeled::InvalidCiphertextException(InvalidCiphertextException {
         message: None,
+    })
+    .into()
+}
+
+/// Refuse a key that cannot decrypt, or an algorithm its key spec does not support:
+/// "the KeyUsage value of the KMS key is incompatible with the API operation" and "the
+/// encryption algorithm ... specified for the operation is incompatible with the type of
+/// key material in the KMS key (KeySpec)"
+/// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`) — the two reasons that
+/// error names, which is why one refusal serves both.
+fn invalid_key_usage(message: String) -> DecryptError {
+    DecryptErrorModeled::InvalidKeyUsageException(InvalidKeyUsageException {
+        message: Some(message),
     })
     .into()
 }
