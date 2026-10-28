@@ -137,7 +137,9 @@ impl From<CreateVolumeErrorModeled> for CreateVolumeError {
 ///   volume size" (Amazon EBS `CreateVolume$Size`);
 /// * `SizeInGB`, `Iops` and `Throughput` must be ones the named volume type accepts,
 ///   per [`crate::state::VOLUME_TYPE_SPECS`], whose doc carries the published ranges
-///   and the sentences they come from;
+///   and the sentences they come from — applied through
+///   [`crate::state::VolumeTypeSpec::require_accepted_configuration`], the one place
+///   that rule lives, which `ModifyVolume` judges its target by too;
 /// * "If KmsKeyId is specified, the encrypted state must be true" (Amazon EBS
 ///   `CreateVolume$KmsKeyId`);
 /// * no tag key a `TagSpecification` carries may be in the namespace AWS reserves for
@@ -153,7 +155,7 @@ fn validate_configuration(
 ) -> Result<(), ValidationException> {
     use crate::state::{
         field_validation_failed, reject_reserved_tag_keys, require_zone_in_region,
-        specification_tag_keys, volume_type_spec, DEFAULT_VOLUME_TYPE,
+        specification_tag_keys, volume_type_spec, VolumeMemberValue, DEFAULT_VOLUME_TYPE,
     };
 
     // A tag key in the reserved `aws:` namespace names a tag AWS generates, not one a
@@ -177,74 +179,24 @@ fn validate_configuration(
         ));
     };
 
-    let (size_min, size_max) = spec.size_range();
-    match input.size_in_gb {
-        None if input.snapshot_id.is_none() => {
-            return Err(field_validation_failed(
-                "SizeInGB",
-                "SizeInGB is required unless SnapshotId names the snapshot the volume \
-                 is restored from",
-            ));
-        }
-        Some(size) if size < size_min || size > size_max => {
-            return Err(field_validation_failed(
-                "SizeInGB",
-                format!(
-                    "SizeInGB must be from {size_min} to {size_max} GiB for a \
-                     {volume_type} volume"
-                ),
-            ));
-        }
-        // No size with a snapshot source takes the snapshot's size, and a size inside
-        // the type's range stands as asked for.
-        None | Some(_) => {}
+    // A volume with no size of its own takes the snapshot's, so one that names neither
+    // names no capacity source at all.
+    if input.size_in_gb.is_none() && input.snapshot_id.is_none() {
+        return Err(field_validation_failed(
+            "SizeInGB",
+            "SizeInGB is required unless SnapshotId names the snapshot the volume \
+             is restored from",
+        ));
     }
 
-    match (input.iops, spec.iops) {
-        (Some(_), None) => {
-            return Err(field_validation_failed(
-                "Iops",
-                format!(
-                    "Iops must be omitted for a {volume_type} volume, which does not \
-                     provision IOPS"
-                ),
-            ));
-        }
-        (Some(iops), Some((min, max))) if iops < min || iops > max => {
-            return Err(field_validation_failed(
-                "Iops",
-                format!("Iops must be from {min} to {max} for a {volume_type} volume"),
-            ));
-        }
-        (None, _) if spec.iops_required => {
-            return Err(field_validation_failed(
-                "Iops",
-                format!("Iops is required for a {volume_type} volume"),
-            ));
-        }
-        (Some(_), Some(_)) | (None, _) => {}
-    }
-
-    match (input.throughput, spec.throughput_mib) {
-        (Some(_), None) => {
-            return Err(field_validation_failed(
-                "Throughput",
-                format!(
-                    "Throughput must be omitted for a {volume_type} volume, whose \
-                     throughput is not configurable"
-                ),
-            ));
-        }
-        (Some(throughput), Some((min, max))) if throughput < min || throughput > max => {
-            return Err(field_validation_failed(
-                "Throughput",
-                format!(
-                    "Throughput must be from {min} to {max} MiB/s for a {volume_type} volume"
-                ),
-            ));
-        }
-        (Some(_), Some(_)) | (None, _) => {}
-    }
+    // The per-type size, IOPS and throughput rules, applied through the one helper the
+    // modification path applies them through too. A create provisions exactly what it
+    // names, so each performance member's named value IS the resulting one.
+    spec.require_accepted_configuration(
+        input.size_in_gb,
+        VolumeMemberValue::named(input.iops),
+        VolumeMemberValue::named(input.throughput),
+    )?;
 
     if let Some(kms_key_id) = input.kms_key_id.as_deref() {
         // `KmsKeyId`'s modelled `len 0..128` admits the empty string, which names no

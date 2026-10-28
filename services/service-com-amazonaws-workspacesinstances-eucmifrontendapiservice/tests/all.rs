@@ -55,6 +55,8 @@ mod volume_configuration_validation;
 mod volume_lifecycle;
 #[path = "all/volume_modification.rs"]
 mod volume_modification;
+#[path = "all/volume_type_rule_sharing.rs"]
+mod volume_type_rule_sharing;
 #[path = "all/volume_zone_affinity.rs"]
 mod volume_zone_affinity;
 #[path = "all/wire_error_responses.rs"]

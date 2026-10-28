@@ -1372,6 +1372,135 @@ impl VolumeTypeSpec {
             self.published_size_gib.1.min(model_max),
         )
     }
+
+    /// Refuse a configuration this volume type does not accept: a size outside
+    /// [`Self::size_range`], provisioned IOPS or a throughput outside the range the
+    /// type publishes, a performance member named for a type that takes no value for
+    /// it at all, or no IOPS where the type requires them.
+    ///
+    /// The ONE place that rule is applied, so the create of a volume and the
+    /// modification of one cannot drift apart and refuse different configurations for
+    /// the same type. Each caller passes what IT has: `size` is the size the volume
+    /// ends up with, and the performance members arrive as [`VolumeMemberValue`]s
+    /// carrying both the value the request NAMED (what "must be omitted" is judged on)
+    /// and the value the volume ends up with (what the published range is judged on) —
+    /// the same value twice for a create, which names every member it changes, and a
+    /// resolved target for a modification, whose unnamed members are retained or
+    /// defaulted.
+    ///
+    /// Returns the modelled `ValidationException` naming the ONE member the request is
+    /// refused for, echoing no submitted value ([`field_validation_failed`]).
+    pub fn require_accepted_configuration(
+        &self,
+        size: Option<i32>,
+        iops: VolumeMemberValue,
+        throughput: VolumeMemberValue,
+    ) -> Result<(), ValidationException> {
+        let volume_type = self.volume_type;
+
+        let (size_min, size_max) = self.size_range();
+        if let Some(size) = size {
+            if size < size_min || size > size_max {
+                return Err(field_validation_failed(
+                    "SizeInGB",
+                    format!(
+                        "SizeInGB must be from {size_min} to {size_max} GiB for a \
+                         {volume_type} volume"
+                    ),
+                ));
+            }
+        }
+
+        match (iops.named, self.iops) {
+            (Some(_), None) => {
+                return Err(field_validation_failed(
+                    "Iops",
+                    format!(
+                        "Iops must be omitted for a {volume_type} volume, which does not \
+                         provision IOPS"
+                    ),
+                ));
+            }
+            (_, Some((min, max))) if iops.resulting.is_some_and(|iops| iops < min || iops > max) => {
+                return Err(field_validation_failed(
+                    "Iops",
+                    format!("Iops must be from {min} to {max} for a {volume_type} volume"),
+                ));
+            }
+            // A type that requires IOPS must end up with some: a create names them,
+            // and a modification keeps the volume's own while it keeps its type and
+            // takes the documented default when it changes it, so this is the case
+            // where neither is available.
+            (None, _) if self.iops_required && iops.resulting.is_none() => {
+                return Err(field_validation_failed(
+                    "Iops",
+                    format!("Iops is required for a {volume_type} volume"),
+                ));
+            }
+            (_, Some(_)) | (None, None) => {}
+        }
+
+        match (throughput.named, self.throughput_mib) {
+            (Some(_), None) => {
+                return Err(field_validation_failed(
+                    "Throughput",
+                    format!(
+                        "Throughput must be omitted for a {volume_type} volume, whose \
+                         throughput is not configurable"
+                    ),
+                ));
+            }
+            (_, Some((min, max)))
+                if throughput
+                    .resulting
+                    .is_some_and(|throughput| throughput < min || throughput > max) =>
+            {
+                return Err(field_validation_failed(
+                    "Throughput",
+                    format!(
+                        "Throughput must be from {min} to {max} MiB/s for a {volume_type} volume"
+                    ),
+                ));
+            }
+            (_, Some(_)) | (None, None) => {}
+        }
+
+        Ok(())
+    }
+}
+
+/// What one request says about a configurable performance member of a volume, as
+/// [`VolumeTypeSpec::require_accepted_configuration`] judges it: the value the request
+/// NAMED for the member, and the value the volume ENDS UP with.
+///
+/// The two differ only where a call resolves a member it does not name — a
+/// modification retains the volume's value, or takes the target type's default — which
+/// is why both travel: whether a type takes the member at all is a question about what
+/// the request named, while a published range is a question about the value the volume
+/// is left with.
+#[derive(Debug, Clone, Copy)]
+pub struct VolumeMemberValue {
+    /// The value the request named for the member, or `None` when it named none.
+    pub named: Option<i32>,
+    /// The value the volume ends up with, or `None` when it ends up with none.
+    pub resulting: Option<i32>,
+}
+
+impl VolumeMemberValue {
+    /// The member of a call whose named value IS the resulting one: a create provisions
+    /// exactly what it names.
+    pub fn named(value: Option<i32>) -> Self {
+        Self {
+            named: value,
+            resulting: value,
+        }
+    }
+
+    /// The member of a call that names one value and resolves another: a modification
+    /// whose unnamed members are retained or defaulted.
+    pub fn resolved(named: Option<i32>, resulting: Option<i32>) -> Self {
+        Self { named, resulting }
+    }
 }
 
 /// Every volume type this service provisions, and what each one accepts.

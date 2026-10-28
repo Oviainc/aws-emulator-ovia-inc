@@ -248,7 +248,10 @@ fn target_configuration(
 ///   [`crate::state::VOLUME_TYPE_SPECS`] — so a size the current type allows but the
 ///   target type does not is refused, and so is a performance member the target type
 ///   takes no value for ("This parameter is valid only for gp3, io1, and io2 volumes",
-///   "valid only for gp3 volumes").
+///   "valid only for gp3 volumes"). That rule lives in ONE place,
+///   [`crate::state::VolumeTypeSpec::require_accepted_configuration`], which
+///   `CreateVolume` judges its own configuration by, so the two cannot refuse
+///   different configurations for the same type.
 ///
 /// Returns the modelled `ValidationException` naming the ONE member the request is
 /// refused for, echoing no submitted value
@@ -259,9 +262,7 @@ fn validate_target(
     target: &TargetConfiguration,
     spec: &crate::state::VolumeTypeSpec,
 ) -> Result<(), ValidationException> {
-    use crate::state::field_validation_failed;
-
-    let volume_type = &target.volume_type;
+    use crate::state::{field_validation_failed, VolumeMemberValue};
 
     if let (Some(asked), Some(current)) = (input.size_in_gb, volume.size_in_gb) {
         if asked < current {
@@ -272,73 +273,15 @@ fn validate_target(
         }
     }
 
-    let (size_min, size_max) = spec.size_range();
-    if let Some(size) = target.size_in_gb {
-        if size < size_min || size > size_max {
-            return Err(field_validation_failed(
-                "SizeInGB",
-                format!(
-                    "SizeInGB must be from {size_min} to {size_max} GiB for a \
-                     {volume_type} volume"
-                ),
-            ));
-        }
-    }
-
-    match (input.iops, spec.iops) {
-        (Some(_), None) => {
-            return Err(field_validation_failed(
-                "Iops",
-                format!(
-                    "Iops must be omitted for a {volume_type} volume, which does not \
-                     provision IOPS"
-                ),
-            ));
-        }
-        (_, Some((min, max))) if target.iops.is_some_and(|iops| iops < min || iops > max) => {
-            return Err(field_validation_failed(
-                "Iops",
-                format!("Iops must be from {min} to {max} for a {volume_type} volume"),
-            ));
-        }
-        // A type that requires IOPS must end up with some: the volume keeps its own
-        // while it keeps its type, and a change of type takes the documented default,
-        // so this is the case where neither is available.
-        (None, Some(_)) if spec.iops_required && target.iops.is_none() => {
-            return Err(field_validation_failed(
-                "Iops",
-                format!("Iops is required for a {volume_type} volume"),
-            ));
-        }
-        (_, Some(_)) | (None, None) => {}
-    }
-
-    match (input.throughput, spec.throughput_mib) {
-        (Some(_), None) => {
-            return Err(field_validation_failed(
-                "Throughput",
-                format!(
-                    "Throughput must be omitted for a {volume_type} volume, whose \
-                     throughput is not configurable"
-                ),
-            ));
-        }
-        (_, Some((min, max)))
-            if target
-                .throughput
-                .is_some_and(|throughput| throughput < min || throughput > max) =>
-        {
-            return Err(field_validation_failed(
-                "Throughput",
-                format!(
-                    "Throughput must be from {min} to {max} MiB/s for a {volume_type} volume"
-                ),
-            ));
-        }
-        (_, Some(_)) | (None, None) => {}
-    }
-
-    Ok(())
+    // The per-type size, IOPS and throughput rules, applied through the one helper the
+    // create path applies them through too. A member this call does not name was
+    // resolved against the volume and the target type above, so each performance member
+    // carries both what the call named and what the volume ends up with.
+    spec.require_accepted_configuration(
+        target.size_in_gb,
+        VolumeMemberValue::resolved(input.iops, target.iops),
+        VolumeMemberValue::resolved(input.throughput, target.throughput),
+    )
 }
 
 /// The response for a modification, read out of the stored record: the id of the
