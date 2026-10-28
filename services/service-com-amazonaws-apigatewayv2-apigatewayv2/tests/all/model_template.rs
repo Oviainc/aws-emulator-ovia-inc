@@ -809,11 +809,12 @@ async fn a_schema_whose_template_would_not_fit_the_bounds_is_refused_not_expande
             "ValidationException",
             "case {case:?}: expected ValidationException, got {body}"
         );
-        // The refusal names the bound it hit, so the caller can see which one.
+        // The refusal names the bound it hit, so the caller can see which one — the steps
+        // a generation may take, or the bytes of template it may build.
         let message = as_str(&body, "message");
         assert!(
-            message.contains(&MAX_STEPS.to_string())
-                || message.contains(&MAX_TEMPLATE_BYTES.to_string()),
+            message.contains(&format!("{MAX_STEPS} steps"))
+                || message.contains(&format!("{MAX_TEMPLATE_BYTES} bytes of template")),
             "case {case:?}: expected the refusal to name the bound it hit, got {message:?}"
         );
     }

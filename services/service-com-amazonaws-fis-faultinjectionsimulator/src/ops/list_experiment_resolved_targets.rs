@@ -155,20 +155,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token is the position in the experiment's resolution the next page resumes
         // at, behind this operation's marker, so anything without that marker — or
         // carrying a value that is no position — was never issued by this operation.
-        let resume_at = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => match crate::state::resolved_target_page_token_index(token) {
-                Some(index) => index,
-                None => {
-                    return Err(
-                        ListExperimentResolvedTargetsErrorModeled::ValidationException(
-                            crate::state::invalid_next_token(),
-                        )
-                        .into(),
-                    )
-                }
-            },
-        };
+        // Decoding it is the shared rule; lifting its refusal into this operation's error
+        // enum is the only part of it that belongs to this operation.
+        let resume_at = crate::state::page_resume_point(
+            input.next_token.as_deref(),
+            crate::state::resolved_target_page_token_index,
+        )
+        .map_err(ListExperimentResolvedTargetsErrorModeled::ValidationException)?;
 
         let page_size = crate::state::page_size(input.max_results);
         // A pure read: the resolution was computed when the experiment was started, so
@@ -186,35 +179,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        let mut resolved_targets =
-            Vec::with_capacity(page_size.min(experiment.resolved_targets.len()));
-        let mut next_token = None;
-        for (index, resolved) in experiment.resolved_targets.iter().enumerate() {
-            // Resume at the position the token names, which indexes the experiment's
-            // WHOLE resolution — so a token means the same thing whatever `targetName`
-            // the resumed request filters by.
-            if index < resume_at {
-                continue;
-            }
-            // The filter is applied BEFORE the page is cut, so a page holds `maxResults`
-            // matching targets and the token only names one the filter admits.
-            if input
-                .target_name
-                .as_deref()
-                .is_some_and(|wanted| resolved.target_name.as_deref() != Some(wanted))
-            {
-                continue;
-            }
-            if resolved_targets.len() >= page_size {
-                next_token = Some(crate::state::resolved_target_page_token(index));
-                break;
-            }
-            resolved_targets.push(resolved.clone());
-        }
+        // The page walk itself is the shared one, so this operation pages by the same rule
+        // as every other list of this service; what belongs to this operation is that its
+        // collection is keyed by POSITION in the experiment's WHOLE resolution — so a token
+        // means the same thing whatever `targetName` the resumed request filters by — the
+        // filter it applies BEFORE the page is cut, and the summary shape it reports.
+        let page = crate::state::ordered_page(
+            experiment
+                .resolved_targets
+                .iter()
+                .enumerate()
+                .filter(|(_, resolved)| {
+                    input
+                        .target_name
+                        .as_deref()
+                        .is_none_or(|wanted| resolved.target_name.as_deref() == Some(wanted))
+                }),
+            resume_at,
+            page_size,
+            crate::state::resolved_target_page_token,
+            Clone::clone,
+        );
 
         Ok(ListExperimentResolvedTargetsOutput {
-            resolved_targets: Some(resolved_targets),
-            next_token,
+            resolved_targets: Some(page.entries),
+            next_token: page.next_token,
         })
     }
 }

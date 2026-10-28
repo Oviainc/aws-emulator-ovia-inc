@@ -146,39 +146,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The token is the resource type the next page starts at, behind this operation's
         // marker; a value without that marker, or one naming no published resource type,
-        // was never issued by this operation.
-        let resume_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::target_resource_type_page_token_id(token) {
-                Some(resource_type) => Some(resource_type),
-                None => {
-                    return Err(ListTargetResourceTypesErrorModeled::ValidationException(
-                        crate::state::invalid_next_token(),
-                    )
-                    .into())
-                }
-            },
-        };
+        // was never issued by this operation. Decoding it is the shared rule; lifting its
+        // refusal into this operation's error enum is the only part of it that belongs to
+        // this operation.
+        let resume_at = crate::state::page_resume_point(
+            input.next_token.as_deref(),
+            crate::state::target_resource_type_page_token_id,
+        )
+        .map_err(ListTargetResourceTypesErrorModeled::ValidationException)?;
 
-        let page_size = crate::state::page_size(input.max_results);
-        let mut target_resource_types = Vec::with_capacity(page_size);
-        let mut next_token = None;
-        for entry in crate::state::TARGET_RESOURCE_TYPE_CATALOG {
-            // Resume at the first id at or after the one the token named, which is the
-            // order the catalog is kept in.
-            if resume_at.is_some_and(|from| entry.id < from) {
-                continue;
-            }
-            if target_resource_types.len() >= page_size {
-                next_token = Some(crate::state::target_resource_type_page_token(entry.id));
-                break;
-            }
-            target_resource_types.push(entry.to_summary());
-        }
+        // The page walk itself is the shared one over a service-owned catalog, so this
+        // operation and `ListActions` cut their pages and mint their tokens by the same
+        // rule; what belongs to this operation is the catalog it walks, the page size the
+        // caller sized and the summary shape it reports.
+        let page = crate::state::catalog_page(
+            crate::state::TARGET_RESOURCE_TYPE_CATALOG,
+            resume_at,
+            crate::state::page_size(input.max_results),
+            crate::state::TargetResourceTypeCatalogEntry::to_summary,
+        );
 
         Ok(ListTargetResourceTypesOutput {
-            target_resource_types: Some(target_resource_types),
-            next_token,
+            target_resource_types: Some(page.entries),
+            next_token: page.next_token,
         })
     }
 }

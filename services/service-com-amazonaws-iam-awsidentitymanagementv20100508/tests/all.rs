@@ -35,6 +35,8 @@ mod aws_managed_policy_attachability;
 mod aws_managed_policy_catalog;
 #[path = "all/boundary_and_provider_writes.rs"]
 mod boundary_and_provider_writes;
+#[path = "all/change_password.rs"]
+mod change_password;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
 #[path = "all/delegation_request_filing.rs"]

@@ -447,10 +447,15 @@ async fn a_disassociated_source_is_deleting_until_the_clock_has_removed_it() {
     }
 
     // (case, how the instant the clock owes the deletion sits relative to now, reported)
+    //
+    // The near-side rows are pinned far enough ahead of the due instant for the read that
+    // follows to be taken while it is still ahead on a loaded machine — a row pinned a
+    // millisecond ahead races the read itself, which says nothing about the rule. The
+    // tight boundary is kept on the far side, where elapsed time cannot flip the answer.
     let ages: [(&str, i64, bool); 3] = [
         (
-            "one millisecond before its deletion is due",
-            1,
+            "half a deletion span before it is due",
+            S3_TABLE_INTEGRATION_SOURCE_DELETION_DELAY_MS / 2,
             true,
         ),
         (
