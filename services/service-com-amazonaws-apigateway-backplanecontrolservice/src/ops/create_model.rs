@@ -107,7 +107,11 @@ pub fn is_model_name(name: &str) -> bool {
 /// Whether `media_type` types a JSON payload: the `application/json` the schema sentence
 /// names, and any media type carrying the structured `+json` suffix, which is the same
 /// JSON syntax under another name.
-fn is_json_media_type(media_type: &::mime::Mime) -> bool {
+///
+/// `pub(crate)` because the content-type family a schema's LANGUAGE follows from is one
+/// rule: `GetModelTemplate` generates its sample payload only from a JSON Schema document,
+/// which is what a model of this family carries.
+pub(crate) fn is_json_media_type(media_type: &::mime::Mime) -> bool {
     media_type.subtype() == ::mime::JSON || media_type.suffix() == Some(::mime::JSON)
 }
 

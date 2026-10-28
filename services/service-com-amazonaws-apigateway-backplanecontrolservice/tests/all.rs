@@ -254,3 +254,5 @@ mod base_path_mapping_collection;
 mod test_invoke_method_data_plane_parity;
 #[path = "all/request_validator_precedes_the_integration.rs"]
 mod request_validator_precedes_the_integration;
+#[path = "all/model_template.rs"]
+mod model_template;
