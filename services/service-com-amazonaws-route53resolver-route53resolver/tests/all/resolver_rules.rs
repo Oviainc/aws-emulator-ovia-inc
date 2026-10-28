@@ -19,12 +19,18 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     call, emulator, error_type, expect_error, ok, parse_time, string_member, without_status,
-    ACCOUNT, REGION,
+    Emulator, ACCOUNT, REGION,
 };
 
 /// Create a Resolver endpoint of `direction` and return its `Id`, so a rule has
 /// a real stored endpoint to route its queries through.
-async fn endpoint_id(router: &MultiServiceRouter, creator: &str, direction: &str) -> String {
+///
+/// The endpoint's addresses are placed in subnets of the caller's VPC, which
+/// `CreateResolverEndpoint` resolves against the account's own Amazon EC2 store,
+/// so the subnets this names are registered there first.
+async fn endpoint_id(router: &Emulator, creator: &str, direction: &str) -> String {
+    let subnets = [format!("subnet-{creator}-a"), format!("subnet-{creator}-b")];
+    router.hold_subnets(&subnets);
     let created = ok(
         router,
         "CreateResolverEndpoint",
@@ -33,8 +39,8 @@ async fn endpoint_id(router: &MultiServiceRouter, creator: &str, direction: &str
             "Direction": direction,
             "SecurityGroupIds": ["sg-00000000000000001"],
             "IpAddresses": [
-                { "SubnetId": format!("subnet-{creator}-a"), "Ip": "10.0.0.10" },
-                { "SubnetId": format!("subnet-{creator}-b"), "Ip": "10.0.1.10" },
+                { "SubnetId": subnets[0], "Ip": "10.0.0.10" },
+                { "SubnetId": subnets[1], "Ip": "10.0.1.10" },
             ],
         }),
     )
@@ -1171,7 +1177,7 @@ async fn a_rule_forwarding_target_precondition_is_refused_with_its_rslvr_error_c
 /// The rules span what a list query selects on: the rule type, the endpoint a
 /// forwarding rule routes through, `Name` present or absent, and a `DomainName`
 /// written relative or already fully qualified.
-async fn seed_rules(router: &MultiServiceRouter) -> (String, String, Vec<String>) {
+async fn seed_rules(router: &Emulator) -> (String, String, Vec<String>) {
     let first_endpoint = endpoint_id(router, "ep-list-one", "OUTBOUND").await;
     let second_endpoint = endpoint_id(router, "ep-list-two", "OUTBOUND").await;
 
