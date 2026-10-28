@@ -2,6 +2,11 @@
 
 //! @op GetUser
 //!
+//! Reports the IAM user record the request addresses — named, or the user the signing
+//! access key belongs to. A pure read; the call is decided against the caller's
+//! identity-based policies first ([`crate::state::authorization::authorize_named`]), so a
+//! caller that may not read the user learns that rather than learning the record.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,7 +191,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        match store.users.get(&key) {
+        // The user the request addresses, if the account holds one. The LOOKUP comes
+        // first but the answer to it is withheld until the call has been authorized,
+        // because IAM decides a call against the caller's policies before it reads the
+        // resource: a caller that may not read a user learns that it may not, never
+        // whether that user exists.
+        let held = store.users.get(&key);
+
+        // IAM authorizes its own API, this read included: the signing principal's
+        // identity-based policies — its own and those of every group it belongs to — are
+        // evaluated before the record is reported, so a `Deny` about this request refuses
+        // it wherever that `Deny` is carried. The decision is made on the ARN of the user
+        // the request addresses (the held user's own ARN, or, for a name the account holds
+        // no user under, the ARN that name would carry at the default path, since there is
+        // no other path to attribute it to), and the refusal names that user by TYPE and
+        // name (`user Bob`) rather than by ARN — the name the request carried, exactly as
+        // `ListUserTags` names it, and for the nameless form the name the account holds
+        // the signing key's user under, since the request carried none.
+        let addressed = match &input.user_name {
+            Some(user_name) => user_name.clone(),
+            None => held.map_or_else(|| key.clone(), |user| user.user_name.clone()),
+        };
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &addressed),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_USER,
+            &resource,
+            &format!("user {addressed}"),
+        )?;
+
+        match held {
             Some(user) => Ok(GetUserOutput { user: user.clone() }),
             None => Err(GetUserErrorModeled::NoSuchEntityException(NoSuchEntityException {
                 message: Some(format!(
