@@ -166,9 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // This call names its target by log group name alone, so nothing here is read off
-        // the request metadata `ctx` carries.
-        let _ = ctx;
+        // This call names its target by log group name alone; the Region the request was
+        // signed for is what scopes the lookup for the resource kinds that are keyed by it.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UntagLogGroupError::from(UntagLogGroupErrorModeled::ServiceUnavailableException(
@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Removes the specified tags from the specified log group": there is no tag set to
         // remove from until that group exists.
-        let Some(stored) = store.resource_tags_mut(&resource) else {
+        let Some(stored) = store.resource_tags_mut(&region, &resource) else {
             return Err(UntagLogGroupErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::resource_not_found_message(resource.kind())),

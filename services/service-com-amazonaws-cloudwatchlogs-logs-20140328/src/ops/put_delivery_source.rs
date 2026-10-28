@@ -238,14 +238,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A delivery source is the pairing of its name with the resource it represents: the
-        // name "must be unique for all delivery sources in your account", and
+        // name "must be unique for all delivery sources in your account" within the Region the
+        // put was signed for, and
         // `DeliverySource$resourceArns` holds "the ARN of the Amazon Web Services resource
         // that sends logs and is represented by this delivery source". A put that keeps the
         // name and names another resource would make every delivery already paired with that
         // source — each of which names it by this name — deliver a different resource's logs,
         // so it is refused as the conflict it is ("This operation attempted to create a
         // resource that already exists") rather than applied.
-        if let Some(stored) = store.delivery_sources.get(&input.name) {
+        if let Some(stored) = store.delivery_source(&region, &input.name) {
             if !stored.resource_arns.contains(&input.resource_arn) {
                 return Err(PutDeliverySourceErrorModeled::ConflictException(
                     ConflictException {
@@ -301,20 +302,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             None => store
-                .delivery_sources
-                .get(&input.name)
+                .delivery_source(&region, &input.name)
                 .map(|stored| stored.tags.clone())
                 .unwrap_or_default(),
         };
-        store.delivery_sources.insert(input.name.clone(), record);
+        // A delivery source belongs to the Region its put was signed for: the same name in
+        // another Region is another source, which this one neither reads nor overwrites.
+        store
+            .delivery_sources
+            .insert(crate::state::RegionalKey::new(&region, &input.name), record);
 
         Ok(PutDeliverySourceOutput {
             // "A structure containing information about the delivery source that was just
             // created or updated" — read back out of the store, so what this call reports is
             // what `GetDeliverySource` reports afterwards.
             delivery_source: store
-                .delivery_sources
-                .get(&input.name)
+                .delivery_source(&region, &input.name)
                 .map(crate::state::DeliverySourceRecord::reported),
         })
     }

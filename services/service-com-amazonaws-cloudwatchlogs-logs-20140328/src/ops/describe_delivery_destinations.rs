@@ -187,9 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation reports on stored delivery
-        // destinations and needs none of it.
-        let _ = ctx;
+        // A delivery destination is a regional resource, so what this reports is the
+        // destinations of the Region the request was signed for; nothing else on the request
+        // takes part.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeDeliveryDestinationsError::from(
@@ -227,14 +228,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // One enumeration, in the order the store holds it (by destination name), of the
-        // destinations the request's filter selects: `names` is "An array of delivery
-        // destination names that filters the results to delivery destinations with ANY
-        // specified name", so a destination is selected when its own name is among them, and
-        // every destination is selected when the request names none at all.
+        // One enumeration, in the order the store holds it (by destination name) of the
+        // Region's own destinations, of the ones the request's filter selects: `names` is "An
+        // array of delivery destination names that filters the results to delivery destinations
+        // with ANY specified name", so a destination is selected when its own name is among
+        // them, and every destination is selected when the request names none at all.
         let matching: Vec<&crate::state::DeliveryDestinationRecord> = store
-            .delivery_destinations
-            .values()
+            .delivery_destinations_in(&region)
             .filter(|destination| {
                 input
                     .names

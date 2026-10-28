@@ -140,9 +140,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting one destination's policy reads the account's store; nothing on the
-        // request but the destination name it asks for takes part, and nothing is written.
-        let _ = ctx;
+        // Reporting one destination's policy reads the delivery destinations of the Region the
+        // request was signed for — a delivery destination is a regional resource — and nothing
+        // is written.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetDeliveryDestinationPolicyError::from(
@@ -155,11 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // The resource this request specifies is the delivery destination, so a name the
-        // account does not hold is what "the specified resource does not exist" answers.
+        // The resource this request specifies is the delivery destination, so a name this
+        // Region does not hold one under is what "the specified resource does not exist"
+        // answers.
         let destination = store
-            .delivery_destinations
-            .get(&input.delivery_destination_name)
+            .delivery_destination(&region, &input.delivery_destination_name)
             .ok_or_else(|| {
                 GetDeliveryDestinationPolicyError::from(
                     GetDeliveryDestinationPolicyErrorModeled::ResourceNotFoundException(

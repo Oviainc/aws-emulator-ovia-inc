@@ -152,9 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the delivery this call reconfigures is
-        // identified by its own id and by nothing about the request.
-        let _ = ctx;
+        // A delivery is a regional resource, so the delivery this call reconfigures is the one
+        // the Region the request was signed for holds under that id.
+        let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateDeliveryConfigurationError::from(
@@ -167,10 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // "The ID of the delivery to be updated by this request": an id this account holds no
+        // "The ID of the delivery to be updated by this request": an id this Region holds no
         // delivery under names no delivery, which is the modelled not-found refusal — the one
         // every delivery operation answers such an id with.
-        let Some(delivery) = store.deliveries.get_mut(&input.id) else {
+        let Some(delivery) = store.delivery_mut(&region, &input.id) else {
             return Err(
                 UpdateDeliveryConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
