@@ -784,6 +784,14 @@ async fn drift_detection_over_a_stack_set_reports_what_each_instance_really_is()
         "case {:?}: expected StackInstanceNotFoundException, got {body}",
         "an account the StackSet has no instance in"
     );
+    // The same sentence `DescribeStackInstance` answers for a pair this StackSet holds no
+    // instance for (`delete_stack_instances.rs`): one wording for the one exception.
+    assert_eq!(
+        xml_text(&body, "Message").as_deref(),
+        Some("StackInstance not found"),
+        "case {:?}: expected the stack-instance-not-found sentence, got {body}",
+        "an account the StackSet has no instance in"
+    );
 }
 
 #[tokio::test]

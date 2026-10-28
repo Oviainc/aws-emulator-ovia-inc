@@ -234,6 +234,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // type is refused by the operations that submit the template for DEPLOYMENT, which
         // are the ones that consult the resource-type registry
         // (`crate::state::resource_types`).
+        //
+        // The template-VALIDATION rules, on the other hand, are each decided from the
+        // document alone — a function no template may use, an intrinsic spelled with the
+        // wrong arguments, a name the template does not declare, a dependency cycle — so
+        // they are this operation's verdict too, and the body is held to exactly the pass
+        // the operations that SUBMIT one hold it to, worded identically
+        // (`crate::state::template_validation`). The values in force are the template's own
+        // `Default`s, which is every value a request carrying nothing but a body fixes.
+        let parameters: ::std::collections::BTreeMap<String, String> =
+            crate::state::parameters_in_force(template_body, Vec::new())
+                .into_iter()
+                .map(|parameter| (parameter.key, parameter.value))
+                .collect();
+        let processed = template::process_with_parameters(template_body, &parameters);
+        crate::state::validate_submitted_template(
+            template_body,
+            &processed,
+            &parameters,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let required = template::required_capabilities(&template);
         Ok(ValidateTemplateOutput {
             // One `TemplateParameter` per parameter the template declares, carrying what

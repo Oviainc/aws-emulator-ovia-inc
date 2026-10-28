@@ -5967,6 +5967,18 @@ pub fn stack_set_does_not_exist(name_or_id: &str) -> String {
     format!("StackSet {name_or_id} not found")
 }
 
+/// The `ValidationError` message CloudFormation answers a request for a stack set's
+/// AUTOMATIC-DEPLOYMENT targets with when the stack set it resolves is not service-managed.
+///
+/// Automatic deployment is deployment through Organizations, which is what the
+/// service-managed permission model IS ("StackSets automatically creates the IAM roles
+/// required to deploy to accounts managed by Organizations"), so a stack set under any other
+/// permission model has no such targets to report at all — a different answer from a
+/// service-managed stack set that has none YET. Entirely fixed text: no part of it is taken
+/// from the request.
+pub const AUTO_DEPLOYMENT_IS_SERVICE_MANAGED_ONLY: &str =
+    "Auto-deployment targets are only available for service-managed stack sets";
+
 /// The message CloudFormation answers when a stack set holds no operation under the
 /// `OperationId` a request named.
 ///
@@ -5986,10 +5998,15 @@ pub fn drift_operation_does_not_exist() -> &'static str {
     "Detect Drift Operation not found"
 }
 
-/// The message CloudFormation answers when a stack set holds no instance in the account
-/// and Region a request named — the pair that identifies one instance of a stack set.
-pub fn stack_instance_does_not_exist(account: &str, region: &str) -> String {
-    format!("Stack instance in account {account} and Region {region} not found")
+/// The `StackInstanceNotFoundException` message CloudFormation answers when a stack set
+/// holds no instance in the account and Region a request named — the pair that identifies
+/// one instance of a stack set.
+///
+/// The text carries no variable part, the way [`drift_operation_does_not_exist`] carries
+/// none: the error names the KIND of record the request did not resolve, and the account and
+/// Region the caller asked for are the ones it already sent.
+pub fn stack_instance_does_not_exist() -> &'static str {
+    "StackInstance not found"
 }
 
 /// The refusal for a request that does not name exactly ONE source for the template it

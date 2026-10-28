@@ -215,6 +215,8 @@ mod template_by_reference;
 mod template_outputs;
 #[path = "all/template_quotas.rs"]
 mod template_quotas;
+#[path = "all/template_refusal_wording.rs"]
+mod template_refusal_wording;
 #[path = "all/template_stages_and_resource_events.rs"]
 mod template_stages_and_resource_events;
 #[path = "all/template_summary.rs"]
