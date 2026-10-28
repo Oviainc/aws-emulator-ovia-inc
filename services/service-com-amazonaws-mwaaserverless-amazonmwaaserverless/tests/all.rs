@@ -33,6 +33,8 @@ mod resource_tag_listing;
 mod resource_tagging;
 #[path = "all/resource_untagging.rs"]
 mod resource_untagging;
+#[path = "all/run_execution_outcome.rs"]
+mod run_execution_outcome;
 #[path = "all/run_lifecycle_progression.rs"]
 mod run_lifecycle_progression;
 #[path = "all/run_report_agreement.rs"]

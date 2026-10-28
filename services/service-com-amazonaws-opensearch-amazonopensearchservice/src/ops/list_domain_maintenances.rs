@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomainMaintenances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomainMaintenances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the [`crate::state::Maintenance`] records
+//! `StartDomainMaintenance` persisted on the domain — "a list of the submitted
+//! maintenance actions" — narrowed by `Action` and `Status` and paged by
+//! `MaxResults`/`NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomainMaintenances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation, and it reports the SAME projection
+//! `GetDomainMaintenanceStatus` answers with
+//! ([`crate::state::Maintenance::to_details`]), so a listing and a read of one action
+//! cannot disagree. The one write it makes is materialising the status moves the
+//! clock already owed each action — owed at this instant whether or not anybody
+//! called.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +91,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation answers with: `MaxResults` is
+/// `@range(max: 100)`, the same bound this service's other listings serve.
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +167,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomainMaintenances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainMaintenancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomainMaintenances"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        // `MaxResults` is `@range(max: 100)`, so a larger page size is a malformed
+        // request; the boundary validator refuses it before this handler runs, and
+        // the check is repeated here so the rule holds however the request reached
+        // us. A NEGATIVE page size is malformed for the same reason — it is not a
+        // page size at all — while `@default(0)` (no page size sent) stays the
+        // unbounded case below.
+        if input.max_results < 0 || input.max_results > MAX_PAGE_SIZE {
+            return Err(ListDomainMaintenancesErrorModeled::ValidationException(
+                crate::state::max_results_out_of_range(input.max_results, MAX_PAGE_SIZE),
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Listing the actions materialises only what the clock already owed at
+        // `now`: a step whose span has passed has happened whether or not anybody
+        // asked. Nothing else about the record changes on a read.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            ListDomainMaintenancesErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        // `Action` is "the name of the action" and `Status` "the status of the
+        // action": each narrows the listing to the actions that carry the value
+        // named, and a request naming neither lists them all. Newest first, so the
+        // actions a caller is asking about are the ones a first page reports.
+        let selected: Vec<&crate::state::Maintenance> = domain
+            .maintenances
+            .iter()
+            .rev()
+            .filter(|maintenance| {
+                input
+                    .action
+                    .as_deref()
+                    .is_none_or(|action| maintenance.action == action)
+                    && input
+                        .status
+                        .as_deref()
+                        .is_none_or(|status| maintenance.status == status)
+            })
+            .collect();
+
+        // The token names the first action of the page to answer with, so a caller
+        // resumes exactly where the previous page stopped. It is only ever a value
+        // this operation handed out, so one that names no action of the listing is a
+        // malformed request rather than an empty page — and because the listing is
+        // what the filters selected, a token is scoped to the filters it was issued
+        // under.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => selected
+                .iter()
+                .position(|maintenance| maintenance.maintenance_id == token)
+                .ok_or_else(|| {
+                    ListDomainMaintenancesErrorModeled::ValidationException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+
+        // "An optional parameter that specifies the maximum number of results to
+        // return." `MaxResults` is `@default(0)`, so a request that sends no page
+        // size reaches here as zero: nothing bounds the page but the domain's own
+        // maintenance history, which is bounded by its cap.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(selected.len());
+        let end = start.saturating_add(page_size).min(selected.len());
+        let page: Vec<DomainMaintenanceDetails> = selected[start..end]
+            .iter()
+            .map(|maintenance| maintenance.to_details(&input.domain_name))
+            .collect();
+
+        // "When nextToken is returned, there are more results available" — so the
+        // member is present only while the listing holds an action this page did not
+        // report, and the last page carries none.
+        let next_token = selected
+            .get(end)
+            .map(|maintenance| maintenance.maintenance_id.clone());
+
+        Ok(ListDomainMaintenancesOutput {
+            domain_maintenances: Some(page),
+            next_token,
+        })
     }
 }

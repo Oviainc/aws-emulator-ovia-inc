@@ -32,6 +32,9 @@ mod error_surface;
 #[path = "all/list_databases.rs"]
 mod list_databases;
 
+#[path = "all/numeric_bounds.rs"]
+mod numeric_bounds;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

@@ -12,6 +12,8 @@
 //! `DisassociateTimeSeriesFromAssetProperty` detached owns no property any more, so that
 //! one is read from the record that call left standing
 //! ([`crate::state::DisassociatedTimeSeriesRecord`]) and reports no `assetId`/`propertyId`.
+//! A lookup carrying a `workspaceName` is answered from the series stored under THAT
+//! workspace instead ([`crate::state::CaptureSourceRecord`]).
 //!
 //! ## Shape of an operation
 //!
@@ -208,23 +210,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the time series. ... specify one of the following: The alias of the time
         // series. The assetId and propertyId that identifies the asset property." — so
         // EXACTLY one of the two identifying forms names the series, and either half of
-        // the pair on its own names nothing. The first clause is the DISASSOCIATED
-        // series — one no asset property owns, which only its alias names.
-        let identified = match (
+        // the pair on its own names nothing. A request that identifies no series is
+        // invalid whatever scope it names, so the form is settled before the scope is.
+        let form = match (
             input.asset_id.as_deref(),
             input.property_id.as_deref(),
             input.alias.as_deref(),
         ) {
             (Some(asset_label), Some(property_label), None) => {
+                crate::state::SeriesLookup::Pair(asset_label, property_label)
+            }
+            (None, None, Some(alias)) => crate::state::SeriesLookup::Alias(alias),
+            _ => {
+                return Err(invalid_request(
+                    "Specify either alias, or assetId and propertyId.".to_string(),
+                ))
+            }
+        };
+
+        // `workspaceName` scopes the lookup to one SiteWise workspace, so it is
+        // answered from the time series stored under that workspace — the streams
+        // ingestion recorded it for, which `GetCaptureData` reads back by the same
+        // identifiers this read reports — and the workspace it was scoped to is
+        // reported with them. An identifier that names none of them, or a workspace
+        // this store does not hold, is the absence it is.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            let summary = store
+                .workspace_series(workspace, form)
+                .map_err(|miss| workspace_series_miss(workspace, &miss))?
+                .time_series_summary(&region);
+            return Ok(DescribeTimeSeriesOutput {
+                asset_id: summary.asset_id,
+                property_id: summary.property_id,
+                alias: summary.alias,
+                data_type: summary.data_type,
+                data_type_spec: summary.data_type_spec,
+                time_series_creation_date: summary.time_series_creation_date,
+                time_series_last_update_date: summary.time_series_last_update_date,
+                time_series_arn: summary.time_series_arn,
+                time_series_id: summary.time_series_id,
+                workspace_name: Some(workspace.to_string()),
+            });
+        }
+
+        // Outside a workspace the alias form stands for the asset property it is bound
+        // to, resolved through the same index `GetAssetPropertyValue` and
+        // `BatchPutAssetPropertyValue` resolve aliases with — and, for an alias no
+        // property carries, for the stream itself, which
+        // `DisassociateTimeSeriesFromAssetProperty` leaves standing and alias-addressed
+        // ingestion creates.
+        let identified = match form {
+            crate::state::SeriesLookup::Pair(asset_label, property_label) => {
                 Identified::Property(asset_label.to_string(), property_label.to_string())
             }
-            (None, None, Some(alias)) => {
-                // An alias stands for the asset property it is bound to, resolved
-                // through the same index `GetAssetPropertyValue` and
-                // `BatchPutAssetPropertyValue` resolve aliases with — and, for an
-                // alias no property carries, for the stream itself, which
-                // `DisassociateTimeSeriesFromAssetProperty` leaves standing and
-                // alias-addressed ingestion creates.
+            crate::state::SeriesLookup::Alias(alias) => {
                 match store.property_alias_index.get(alias) {
                     Some((asset_id, property_id)) => {
                         Identified::Property(asset_id.clone(), property_id.clone())
@@ -243,32 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 }
             }
-            _ => {
-                return Err(invalid_request(
-                    "Specify either alias, or assetId and propertyId.".to_string(),
-                ))
-            }
         };
-
-        // `workspaceName` scopes the lookup to one SiteWise workspace. This store
-        // holds no time series inside a workspace — nothing that ingests one
-        // records a workspace for it — so a scoped lookup resolves to nothing: to
-        // the workspace itself when the store does not hold that either, and
-        // otherwise to the series the request identified inside it. A request that
-        // identifies no series is still invalid first: the scope only narrows where
-        // a well-formed lookup is answered from.
-        if let Some(workspace) = input.workspace_name.as_deref() {
-            if !store.workspaces.contains_key(workspace) {
-                return Err(not_found(crate::state::not_found_message(
-                    crate::state::RESOURCE_WORKSPACE,
-                    workspace,
-                )));
-            }
-            return Err(not_found(format!(
-                "The time series the request identifies could not be found in the workspace \
-                 {workspace}."
-            )));
-        }
 
         // A series no asset property owns reports what the store kept of it: no
         // `assetId`/`propertyId` pair names it, and its alias, identity, data type and
@@ -340,6 +354,16 @@ fn not_found(message: String) -> DescribeTimeSeriesError {
             message,
         }),
     )
+}
+
+/// The refusal a workspace-scoped lookup that resolved nothing answers with:
+/// every absence it can stop at is a missing resource, named as the resource it
+/// is and echoing the identifier the request supplied for it.
+fn workspace_series_miss(
+    workspace: &str,
+    miss: &crate::state::WorkspaceSeriesMiss,
+) -> DescribeTimeSeriesError {
+    not_found(crate::state::workspace_series_miss_message(workspace, miss))
 }
 
 /// HTTP 400 `InvalidRequestException` carrying `message`.

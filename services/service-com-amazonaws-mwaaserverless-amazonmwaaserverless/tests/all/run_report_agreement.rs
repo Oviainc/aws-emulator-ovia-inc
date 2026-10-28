@@ -19,8 +19,9 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    RUN_ADMITTED_AFTER, RUN_SETTLE_AFTER, RUN_STATUS_FAILED, RUN_STATUS_QUEUED,
-    RUN_STATUS_STARTING, RUN_STATUS_STOPPED, RUN_STATUS_STOPPING,
+    RUN_ADMITTED_AFTER, RUN_DEQUEUED_AFTER, RUN_STATUS_FAILED, RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING, RUN_STATUS_STARTING, RUN_STATUS_STOPPED, RUN_STATUS_STOPPING,
+    RUN_STATUS_SUCCESS, TASK_LEVEL_RUNS_FOR,
 };
 
 use crate::run_lifecycle_progression::with_run;
@@ -129,7 +130,7 @@ fn rows() -> Vec<Row> {
             case: "starting/whole schedule overdue",
             status: RUN_STATUS_STARTING,
             due_in_millis: -5_000,
-            expected_status: RUN_STATUS_FAILED,
+            expected_status: RUN_STATUS_SUCCESS,
         },
         Row {
             case: "queued/nothing owed yet",
@@ -138,10 +139,16 @@ fn rows() -> Vec<Row> {
             expected_status: RUN_STATUS_QUEUED,
         },
         Row {
-            case: "queued/terminal change owed",
+            case: "queued/the start of the execution owed",
             status: RUN_STATUS_QUEUED,
             due_in_millis: -1,
-            expected_status: RUN_STATUS_FAILED,
+            expected_status: RUN_STATUS_RUNNING,
+        },
+        Row {
+            case: "running/the completion owed",
+            status: RUN_STATUS_RUNNING,
+            due_in_millis: -1,
+            expected_status: RUN_STATUS_SUCCESS,
         },
         Row {
             case: "stopping/shutdown not complete yet",
@@ -300,7 +307,10 @@ async fn a_replay_after_the_schedule_elapsed_agrees_with_the_run_it_started() {
 
     // What a client that retries a start it never saw the answer to does: the clock has
     // meanwhile owed the run its whole remaining schedule.
-    tokio::time::sleep(RUN_ADMITTED_AFTER + RUN_SETTLE_AFTER + Duration::from_millis(300)).await;
+    tokio::time::sleep(
+        RUN_ADMITTED_AFTER + RUN_DEQUEUED_AFTER + TASK_LEVEL_RUNS_FOR + Duration::from_millis(300),
+    )
+    .await;
 
     let (status, replay) = harness.call("StartWorkflowRun", request).await;
     assert_eq!(
@@ -309,7 +319,7 @@ async fn a_replay_after_the_schedule_elapsed_agrees_with_the_run_it_started() {
     );
     assert_eq!(
         replay["Status"].as_str(),
-        Some(RUN_STATUS_FAILED),
+        Some(RUN_STATUS_SUCCESS),
         "case real clock: a replay served after the schedule elapsed must report the \
          status the run reached unpolled, got {:?}",
         replay["Status"]

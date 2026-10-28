@@ -208,11 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // they were.
         //
         // The doc sentence names "datasets, time series, pipelines, and tasks"; a TIME
-        // SERIES is not among the contents counted here because this store holds none
-        // inside a workspace — `DeleteTimeSeries` scoped to one resolves to nothing —
-        // and the workspace-keyed video streams a capture source holds are ingested
-        // data rather than a resource a caller creates and deletes one at a time, so
-        // they go with the workspace instead of blocking it forever.
+        // SERIES is not among the contents counted here because the only time series
+        // this store holds inside a workspace are the video streams a capture source
+        // holds, which are ingested data with no create of their own rather than a
+        // resource a caller creates one at a time, so they go with the workspace
+        // instead of blocking it forever — a `DeleteTimeSeries` scoped to the
+        // workspace is what removes one on its own.
         let contents = store.workspace_contents(&input.workspace_name);
         if !contents.is_empty() {
             return Err(DeleteWorkspaceError::Modeled(

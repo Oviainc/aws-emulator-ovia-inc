@@ -25,6 +25,12 @@
 //! Reporting a domain materialises only the configuration change the clock already
 //! owed it, exactly as [`crate::ops::describe_domain`] does; nothing else is written.
 //!
+//! A name no domain is stored under is refused with the service's GENERIC envelope —
+//! the modelled `BaseException`, HTTP 400, saying what was not found
+//! ([`crate::state::domain_not_found_message`]) — which is the refusal this operation
+//! answers an unknown domain with, rather than the not-found envelope its siblings
+//! use.
+//!
 //! Nothing a caller sends sizes this answer: the only count that could, the stored
 //! `ZoneAwarenessConfig$AvailabilityZoneCount`, is reported — and turned into zone
 //! information — only within the values that member publishes
@@ -386,9 +392,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already owed this domain at `now` — it would have fallen due whether or not
         // anybody called. Nothing else about the record changes on a read.
         let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
-            DescribeDomainHealthErrorModeled::ResourceNotFoundException(
-                crate::state::domain_not_found(&input.domain_name),
-            )
+            DescribeDomainHealthErrorModeled::BaseException(crate::state::domain_not_found_base(
+                &input.domain_name,
+            ))
         })?;
 
         Ok(domain_health(domain))

@@ -181,10 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
-        // The either/or rules inside a schedule, which `UpdateLifecyclePolicy`
+        // The cross-member rules inside a schedule, which `UpdateLifecyclePolicy`
         // inherits from the shapes it carries: a `CreateRule` states when to
-        // create in exactly one of its two documented forms, and a `RetainRule`
-        // retains by exactly one of its two documented modes. They run BEFORE
+        // create in exactly one of its two documented forms, a `RetainRule`
+        // retains by exactly one of its two documented modes, and it retains at
+        // least as much as the schedule's other rules require. They run BEFORE
         // the store is touched, so a refused update leaves the stored policy
         // exactly as it was.
         if let Some(refusal) =

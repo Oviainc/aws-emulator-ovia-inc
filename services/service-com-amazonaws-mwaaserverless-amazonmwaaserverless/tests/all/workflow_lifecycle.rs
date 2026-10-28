@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    RUN_ADMITTED_AFTER, RUN_SETTLE_AFTER, WORKFLOW_DELETED_AFTER,
+    RUN_ADMITTED_AFTER, RUN_DEQUEUED_AFTER, TASK_LEVEL_RUNS_FOR, WORKFLOW_DELETED_AFTER,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::{
     ComAmazonawsMwaaserverlessAmazonmwaaserverlessState, EmulatedService,
@@ -860,7 +860,10 @@ async fn a_run_leaves_its_non_terminal_status_when_the_clock_makes_the_change_du
 
     // Each transition is owed by the clock, so it lands without anybody polling for
     // it. The whole schedule is covered row by row in `run_lifecycle_progression`.
-    tokio::time::sleep(RUN_ADMITTED_AFTER + RUN_SETTLE_AFTER + Duration::from_millis(300)).await;
+    tokio::time::sleep(
+        RUN_ADMITTED_AFTER + RUN_DEQUEUED_AFTER + TASK_LEVEL_RUNS_FOR + Duration::from_millis(300),
+    )
+    .await;
 
     let (status, settled) = harness
         .call(
@@ -871,16 +874,14 @@ async fn a_run_leaves_its_non_terminal_status_when_the_clock_makes_the_change_du
     assert_eq!(status, 200, "expected GetWorkflowRun to succeed, got {settled:?}");
     let detail = &settled["RunDetail"];
     assert_eq!(
-        detail["RunState"], "FAILED",
-        "no Airflow engine runs the definition, so the run ends in the modelled failure \
-         state, got {:?}",
+        detail["RunState"], "SUCCESS",
+        "every task this run's definition declared has finished, so the run completed \
+         successfully, got {:?}",
         detail["RunState"]
     );
     assert!(
-        detail["ErrorMessage"]
-            .as_str()
-            .is_some_and(|m| m.contains("Airflow")),
-        "a failed run must say why it failed, got {:?}",
+        detail["ErrorMessage"].is_null(),
+        "a run that completed successfully reports no ErrorMessage, got {:?}",
         detail["ErrorMessage"]
     );
     assert!(
