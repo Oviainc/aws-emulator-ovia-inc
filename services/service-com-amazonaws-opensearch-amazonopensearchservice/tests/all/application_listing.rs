@@ -118,7 +118,10 @@ fn listed(answer: &Answer, case: &str) -> Vec<Value> {
 }
 
 /// The `id`s a listing answer reports, in the order it reported them.
-fn listed_ids(answer: &Answer, case: &str) -> Vec<String> {
+///
+/// Reached by a sibling suite as `super::application_listing::listed_ids`, so the crate
+/// holds ONE reader of a listing answer's rows.
+pub(crate) fn listed_ids(answer: &Answer, case: &str) -> Vec<String> {
     listed(answer, case)
         .iter()
         .map(|row| string_member(row, "id", case))

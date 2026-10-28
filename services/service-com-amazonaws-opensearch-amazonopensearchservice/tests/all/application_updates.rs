@@ -139,7 +139,10 @@ struct Row {
 
 /// A list of `count` configuration settings, alternating between the two keys
 /// `AppConfigType` declares, so a row can carry a list of any size the member allows.
-fn app_configs(count: usize) -> Value {
+///
+/// Reached by a sibling suite as `super::application_updates::app_configs`, so the
+/// crate holds ONE generator of this model-bounded list.
+pub(crate) fn app_configs(count: usize) -> Value {
     Value::Array(
         (0..count)
             .map(|index| {
