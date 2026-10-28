@@ -20,6 +20,9 @@
 // nothing here. The cross-model claim — that each key is served by exactly one of the
 // models publishing this wire identity — needs every claimant mounted and lives in
 // `core/router/tests/all/events_store_ownership.rs`.
+#[path = "all/match_budget_cost.rs"]
+mod match_budget_cost;
+
 #[path = "all/reserved_event_source.rs"]
 mod reserved_event_source;
 

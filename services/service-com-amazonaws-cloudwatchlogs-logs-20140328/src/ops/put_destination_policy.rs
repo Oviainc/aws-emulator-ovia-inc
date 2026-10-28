@@ -223,11 +223,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The policy is "associated with an existing destination", so there is nothing to
         // associate one with until `PutDestination` has created that destination. This
         // operation models no `ResourceNotFoundException`, so a destination the account does
-        // not hold is refused with the `InvalidParameterException` it does model, carrying
-        // this service's missing-resource sentence for the kind that is missing.
+        // not hold is refused with the `InvalidParameterException` it does model — an error
+        // class documented only as "A parameter is specified incorrectly", which carries no
+        // sentence of its own, so the refusal states which parameter value was rejected by
+        // naming the requested destination.
         let Some(destination) = store.destinations.get_mut(&input.destination_name) else {
-            return Err(invalid(crate::state::resource_not_found_message(
-                "destination",
+            return Err(invalid(crate::state::destination_not_found_message(
+                &input.destination_name,
             )));
         };
 
