@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrial
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrial`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrial::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: releases the trial `CreateTrial` stored in `crate::state`, so a later
+//! `DescribeTrial` cannot find it, `ListTrials` no longer reports it and the name is free
+//! again, and answers the ARN the deleted record carried. A trial the account does not
+//! hold gets the modelled `ResourceNotFound`, and one that still has trial components
+//! making it up is refused, because SageMaker documents deleting those components first
+//! as this operation's precondition. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +135,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrial` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrialErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrial"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `TrialName` here is an `ExperimentEntityName` — a name, never an ARN — and the
+        // name is not case-sensitive, so the record is addressed through the same
+        // case-folded key `CreateTrial` stored it under.
+        let region = crate::state::request_region(ctx);
+        let key = crate::state::entity_key(&input.trial_name);
+
+        let mut store = state.lock();
+        // Nothing stored under the name means there is nothing to release: the modelled
+        // not-found failure, never a 200 recording the deletion of nothing. Worded the way
+        // this service's trial reader words the same fact, naming the trial by the ARN the
+        // identifier resolves to in the Region the request signed for.
+        let Some(arn) = store.trials.get(&key).map(|trial| trial.arn.clone()) else {
+            let missing =
+                crate::state::resource_arn(&region, "experiment-trial", &input.trial_name);
+            return Err(DeleteTrialErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Trial {missing} does not exist.")),
+            })
+            .into());
+        };
+
+        // "All trial components that make up the trial must be deleted first" (this
+        // operation's model doc, smithy_query query=doc shape=DeleteTrial), so a trial that
+        // components are still part of is REFUSED rather than deleted out from under the
+        // memberships that reference it — otherwise `ListTrialComponents`' `TrialName`
+        // filter selects on a trial no reader can describe. The operation models no error
+        // for a precondition the caller can satisfy itself (with `DeleteTrialComponent`,
+        // or `DisassociateTrialComponent` for a component that is part of other trials
+        // too), so this is the 400 `ValidationException`, and its fixed text is that
+        // documented sentence. The ARN and the count are read off the stored record and
+        // the membership index, so the refusal carries nothing fixed here but the sentence.
+        // The index is queried by the SAME folded key the record is addressed by, so the
+        // precondition and the lookup can never disagree about which trial is meant.
+        let components = store.trial_component_keys_in_trial(&key).len();
+        if components > 0 {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Unable to delete trial {arn} because it has {components} trial \
+                 component(s) associated with it. All trial components that make up the \
+                 trial must be deleted first."
+            )));
+        }
+
+        // No component makes up the trial any more, so the record itself is all there is to
+        // release: the name is free for another create from here on, and every reader of
+        // the trial answers its not-found failure.
+        store.trials.remove(&key);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        // The ARN the deleted trial carried, so the caller reads back the same ARN
+        // `CreateTrial` minted rather than one rebuilt from this request — the two differ
+        // whenever the trial was created in another Region or spelled in another case.
+        Ok(DeleteTrialOutput {
+            trial_arn: Some(arn),
+        })
     }
 }
