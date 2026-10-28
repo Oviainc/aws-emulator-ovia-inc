@@ -38,12 +38,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::SERVICE_PRINCIPAL;
-use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    ACTIVATION_DELAY, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
-};
+use service_com_amazonaws_kinesis_kinesis_20131202::state::SHARD_ITERATOR_TYPE_TRIM_HORIZON;
 
 use crate::target_dispatch::{
-    drain, emulator, events, given_queue, given_role, kinesis, Emulator, DETAIL_TYPE, SOURCE,
+    drain, emulator, events, given_queue, given_role, given_stream, kinesis, Emulator, DETAIL_TYPE,
+    SOURCE,
 };
 
 /// The stream every row below points its targets at, and the rule that matches.
@@ -138,30 +137,6 @@ struct Placement {
     case: &'static str,
     bus: Option<&'static str>,
     shards: i64,
-}
-
-/// A provisioned stream of `shards` shards, past the transition its creation
-/// armed; answered with the ARN a target names it by.
-async fn given_stream(emulator: &Emulator, case: &str, shards: i64) -> String {
-    kinesis(
-        emulator,
-        case,
-        "CreateStream",
-        &json!({ "StreamName": STREAM_NAME, "ShardCount": shards }),
-    )
-    .await;
-    tokio::time::sleep(ACTIVATION_DELAY + Duration::from_millis(400)).await;
-    let summary = kinesis(
-        emulator,
-        case,
-        "DescribeStreamSummary",
-        &json!({ "StreamName": STREAM_NAME }),
-    )
-    .await;
-    summary["StreamDescriptionSummary"]["StreamARN"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: DescribeStreamSummary reported no StreamARN"))
-        .to_string()
 }
 
 /// A reader of every shard of the stream, each positioned at that shard's oldest
@@ -426,7 +401,7 @@ async fn a_consumer_reads_every_kinesis_targets_record_exactly_once() {
     for placement in placements {
         let case = placement.case;
         let emulator = emulator();
-        let stream_arn = given_stream(&emulator, case, placement.shards).await;
+        let stream_arn = given_stream(&emulator, case, STREAM_NAME, placement.shards).await;
         let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "stream-dead-letters").await;
         let role_arn = given_role(
             &emulator,

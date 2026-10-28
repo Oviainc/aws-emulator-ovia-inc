@@ -36,19 +36,15 @@
 //! owns.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
     InvocationOutcome, MAX_TARGETS_PER_RULE, SERVICE_PRINCIPAL,
 };
-use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    ACTIVATION_DELAY, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
-};
 
 use crate::target_dispatch::{
-    drain, emulator, given_queue, given_role, given_rule, invocations, kinesis, publish_details,
-    Emulator,
+    drain, emulator, given_queue, given_role, given_rule, given_stream, invocations,
+    publish_details, read_shards, shard_map, Emulator,
 };
 
 /// The rule every case below publishes through, and the stream its targets name.
@@ -59,108 +55,21 @@ const STREAM_NAME: &str = "telemetry";
 /// the target's role has to be allowed to make.
 const TARGET_ACTION: &str = "kinesis:PutRecord";
 
-/// How long a case waits before treating a freshly created stream as ready: past
-/// the instant the create armed the stream's `CREATING` -> `ACTIVE` transition
-/// for.
-fn past_activation() -> Duration {
-    ACTIVATION_DELAY + Duration::from_millis(400)
-}
-
-/// A provisioned stream of `shards` shards, past the transition its creation
-/// armed; answered with the ARN a target names it by.
-///
 /// More than one shard, because the partition key is what chooses among them: a
 /// single-shard stream would hold every record whatever key it was written under.
-async fn given_stream(emulator: &Emulator, case: &str, shards: i64) -> String {
-    kinesis(
-        emulator,
-        case,
-        "CreateStream",
-        &json!({ "StreamName": STREAM_NAME, "ShardCount": shards }),
-    )
-    .await;
-    tokio::time::sleep(past_activation()).await;
-    let summary = kinesis(
-        emulator,
-        case,
-        "DescribeStreamSummary",
-        &json!({ "StreamName": STREAM_NAME }),
-    )
-    .await;
-    summary["StreamDescriptionSummary"]["StreamARN"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: DescribeStreamSummary reported no StreamARN"))
-        .to_string()
-}
+const SHARD_COUNT: i64 = 2;
 
 /// Every record the stream holds, as (partition key, data text) pairs, read from
-/// each of its shards from that shard's oldest retained record.
-async fn records(emulator: &Emulator, case: &str) -> Vec<(String, String)> {
-    let listed = kinesis(
-        emulator,
-        case,
-        "ListShards",
-        &json!({ "StreamName": STREAM_NAME }),
-    )
-    .await;
-    let shards: Vec<String> = listed["Shards"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|shard| {
-            shard["ShardId"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case}: a shard carries no ShardId"))
-                .to_string()
-        })
-        .collect();
-    assert!(
-        !shards.is_empty(),
-        "case {case}: the stream has at least one shard to read, got {listed}"
-    );
-    let mut held: Vec<(String, String)> = Vec::new();
-    for shard in shards {
-        let iterator = kinesis(
-            emulator,
-            case,
-            "GetShardIterator",
-            &json!({
-                "StreamName": STREAM_NAME,
-                "ShardId": shard,
-                "ShardIteratorType": SHARD_ITERATOR_TYPE_TRIM_HORIZON,
-            }),
-        )
-        .await["ShardIterator"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {case}: expected a ShardIterator for {shard}"))
-            .to_string();
-        let answer = kinesis(
-            emulator,
-            case,
-            "GetRecords",
-            &json!({ "ShardIterator": iterator }),
-        )
-        .await;
-        for record in answer["Records"].as_array().cloned().unwrap_or_default() {
-            let encoded = record["Data"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case}: a record carries no Data: {record}"));
-            let data = aws_smithy_types::base64::decode(encoded).unwrap_or_else(|error| {
-                panic!("case {case}: a record's Data is not base64 ({error}): {record}")
-            });
-            held.push((
-                record["PartitionKey"]
-                    .as_str()
-                    .unwrap_or_else(|| {
-                        panic!("case {case}: a record carries no PartitionKey: {record}")
-                    })
-                    .to_string(),
-                String::from_utf8_lossy(&data).to_string(),
-            ));
-        }
-    }
-    held
+/// each of its shards from that shard's oldest retained record. WHICH shard served
+/// a record is `kinesis_target_shard_affinity`'s subject, so the pairs here are
+/// pooled over the whole `shards`-shard map.
+async fn records(emulator: &Emulator, case: &str, shards: i64) -> Vec<(String, String)> {
+    let map = shard_map(emulator, case, STREAM_NAME, shards).await;
+    read_shards(emulator, case, STREAM_NAME, &map)
+        .await
+        .into_iter()
+        .map(|record| (record.key, record.data))
+        .collect()
 }
 
 /// The `Detail` each published event carries: the members the rows below select
@@ -278,7 +187,7 @@ fn rows() -> Vec<Row> {
 async fn a_kinesis_target_is_written_one_record_per_event_keyed_by_its_path() {
     let emulator = emulator();
     let case = "kinesis targets";
-    let stream_arn = given_stream(&emulator, case, 2).await;
+    let stream_arn = given_stream(&emulator, case, STREAM_NAME, SHARD_COUNT).await;
     let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "stream-dead-letters").await;
     let role_arn = given_role(
         &emulator,
@@ -327,7 +236,7 @@ async fn a_kinesis_target_is_written_one_record_per_event_keyed_by_its_path() {
     // What the stream holds, grouped by partition key: every event delivered
     // under one key is one record, so the COUNT under a key is part of the
     // assertion rather than only the presence of the key.
-    let held = records(&emulator, case).await;
+    let held = records(&emulator, case, SHARD_COUNT).await;
     let mut by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (key, data) in &held {
         by_key.entry(key.clone()).or_default().push(data.clone());
@@ -440,7 +349,7 @@ async fn a_stream_targets_role_decides_whether_the_record_is_written() {
 
     for row in rows {
         let emulator = emulator();
-        let stream_arn = given_stream(&emulator, row.case, 2).await;
+        let stream_arn = given_stream(&emulator, row.case, STREAM_NAME, SHARD_COUNT).await;
         let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "role-dead-letters").await;
         let role_arn =
             given_role(&emulator, "stream-writer", row.principal, Some(row.allowed)).await;
@@ -459,7 +368,7 @@ async fn a_stream_targets_role_decides_whether_the_record_is_written() {
 
         let details = vec![detail(TENANTS[0])];
         let event_ids = publish_details(&emulator, &details).await;
-        let held = records(&emulator, row.case).await;
+        let held = records(&emulator, row.case, SHARD_COUNT).await;
         let dead_letters = drain(&emulator, &dead_letter_url).await;
         let recorded = invocations(&emulator);
 

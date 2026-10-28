@@ -53,6 +53,8 @@ mod input_validation;
 mod kinesis_partition_key_json_text;
 #[path = "all/kinesis_target_delivery.rs"]
 mod kinesis_target_delivery;
+#[path = "all/kinesis_target_shard_affinity.rs"]
+mod kinesis_target_shard_affinity;
 #[path = "all/kinesis_target_stream_consumption.rs"]
 mod kinesis_target_stream_consumption;
 #[path = "all/missing_resource_wording.rs"]

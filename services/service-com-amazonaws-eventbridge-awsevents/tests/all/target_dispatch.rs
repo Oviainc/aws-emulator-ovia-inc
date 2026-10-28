@@ -30,7 +30,7 @@
 //! invocation the role does not govern at all.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
@@ -38,6 +38,9 @@ use service_com_amazonaws_eventbridge_awsevents::state::{
     METRIC_NAMESPACE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
 };
 use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
+use service_com_amazonaws_kinesis_kinesis_20131202::state::{
+    partition_key_hash, ACTIVATION_DELAY, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below is signed for.
@@ -662,6 +665,183 @@ fn epoch_seconds() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// How long the deliveries of one publication are given to reach a stream before
+/// the records that never arrived are a failed assertion, and how long a read
+/// sleeps before trying again.
+const DELIVERY_BUDGET: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// One shard of a stream: its id and the slice of the 128-bit hash key space it
+/// covers, as `ListShards` publishes them.
+pub(crate) struct Shard {
+    pub(crate) id: String,
+    starting: u128,
+    ending: u128,
+}
+
+/// One record a shard served: the shard it came from, its partition key and its
+/// data as text.
+#[derive(Debug, Clone)]
+pub(crate) struct Held {
+    pub(crate) shard: String,
+    pub(crate) key: String,
+    pub(crate) data: String,
+}
+
+/// A stream called `stream` of `shard_count` shards, past the transition its
+/// creation armed; answered with the ARN a target names it by.
+pub(crate) async fn given_stream(
+    emulator: &Emulator,
+    case: &str,
+    stream: &str,
+    shard_count: i64,
+) -> String {
+    kinesis(
+        emulator,
+        case,
+        "CreateStream",
+        &json!({ "StreamName": stream, "ShardCount": shard_count }),
+    )
+    .await;
+    tokio::time::sleep(ACTIVATION_DELAY + Duration::from_millis(400)).await;
+    kinesis(
+        emulator,
+        case,
+        "DescribeStreamSummary",
+        &json!({ "StreamName": stream }),
+    )
+    .await["StreamDescriptionSummary"]["StreamARN"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: DescribeStreamSummary reported no StreamARN"))
+        .to_string()
+}
+
+/// Every shard of `stream`, with the hash key range each covers; `expected` is the
+/// map the stream was created with.
+pub(crate) async fn shard_map(
+    emulator: &Emulator,
+    case: &str,
+    stream: &str,
+    expected: i64,
+) -> Vec<Shard> {
+    let listed = kinesis(emulator, case, "ListShards", &json!({ "StreamName": stream })).await;
+    let described = listed["Shards"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        described.len(),
+        usize::try_from(expected).expect("the shard count fits a usize"),
+        "case {case}: expected the stream's {expected} shards, got {listed}"
+    );
+    described
+        .iter()
+        .map(|shard| {
+            let bound = |member: &str| {
+                shard["HashKeyRange"][member]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case}: no {member} on {shard}"))
+                    .parse::<u128>()
+                    .unwrap_or_else(|error| {
+                        panic!("case {case}: {member} is not a hash key ({error}): {shard}")
+                    })
+            };
+            Shard {
+                id: shard["ShardId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case}: a shard carries no ShardId: {shard}"))
+                    .to_string(),
+                starting: bound("StartingHashKey"),
+                ending: bound("EndingHashKey"),
+            }
+        })
+        .collect()
+}
+
+/// The shard of `shards` a record keyed on `partition_key` belongs on: the one
+/// whose published range covers that key's hash ("an MD5 hash function is used to
+/// map partition keys to 128-bit integer values and to map associated data records
+/// to shards", `PutRecordInput$PartitionKey`).
+pub(crate) fn covering_shard(shards: &[Shard], partition_key: &str) -> Option<String> {
+    let hash = partition_key_hash(partition_key);
+    shards
+        .iter()
+        .find(|shard| (shard.starting..=shard.ending).contains(&hash))
+        .map(|shard| shard.id.clone())
+}
+
+/// Read every shard of `stream` from its oldest retained record and give back what
+/// they served, each record WITH the shard it sat on: `GetShardIterator` at the
+/// trim horizon, then one `GetRecords`.
+pub(crate) async fn read_shards(
+    emulator: &Emulator,
+    case: &str,
+    stream: &str,
+    shards: &[Shard],
+) -> Vec<Held> {
+    let mut held = Vec::new();
+    for shard in shards {
+        let iterator = kinesis(
+            emulator,
+            case,
+            "GetShardIterator",
+            &json!({
+                "StreamName": stream,
+                "ShardId": shard.id,
+                "ShardIteratorType": SHARD_ITERATOR_TYPE_TRIM_HORIZON,
+            }),
+        )
+        .await["ShardIterator"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: no ShardIterator for {}", shard.id))
+            .to_string();
+        let answer = kinesis(
+            emulator,
+            case,
+            "GetRecords",
+            &json!({ "ShardIterator": iterator, "Limit": 100 }),
+        )
+        .await;
+        for record in answer["Records"].as_array().cloned().unwrap_or_default() {
+            let encoded = record["Data"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: a record carries no Data: {record}"));
+            let data = aws_smithy_types::base64::decode(encoded).unwrap_or_else(|error| {
+                panic!("case {case}: a record's Data is not base64 ({error}): {record}")
+            });
+            held.push(Held {
+                shard: shard.id.clone(),
+                key: record["PartitionKey"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("case {case}: a record carries no PartitionKey: {record}")
+                    })
+                    .to_string(),
+                data: String::from_utf8_lossy(&data).to_string(),
+            });
+        }
+    }
+    held
+}
+
+/// Everything `stream` holds once it holds `want` records, so a delivery still in
+/// flight is read again rather than read as missing; gives up after
+/// [`DELIVERY_BUDGET`] so a delivery that never arrives fails an assertion instead
+/// of hanging.
+pub(crate) async fn read_shards_until(
+    emulator: &Emulator,
+    case: &str,
+    stream: &str,
+    shards: &[Shard],
+    want: usize,
+) -> Vec<Held> {
+    let deadline = Instant::now() + DELIVERY_BUDGET;
+    loop {
+        let held = read_shards(emulator, case, stream, shards).await;
+        if held.len() >= want || Instant::now() >= deadline {
+            return held;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The `Sum` of the rule's `FailedInvocations` over a window around now, and the
