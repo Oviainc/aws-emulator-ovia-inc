@@ -107,6 +107,8 @@ mod function_lifecycle;
 mod function_recursion_config;
 #[path = "all/function_scaling_config.rs"]
 mod function_scaling_config;
+#[path = "all/function_scaling_config_convergence.rs"]
+mod function_scaling_config_convergence;
 #[path = "all/function_scaling_config_default.rs"]
 mod function_scaling_config_default;
 #[path = "all/function_url_config.rs"]
@@ -141,6 +143,8 @@ mod policy_versions_and_resources;
 mod provisioned_concurrency;
 #[path = "all/provisioned_concurrency_resolution.rs"]
 mod provisioned_concurrency_resolution;
+#[path = "all/published_function_arn.rs"]
+mod published_function_arn;
 #[path = "all/read_representation_and_download_plane.rs"]
 mod read_representation_and_download_plane;
 #[path = "all/refusal_message_rules.rs"]

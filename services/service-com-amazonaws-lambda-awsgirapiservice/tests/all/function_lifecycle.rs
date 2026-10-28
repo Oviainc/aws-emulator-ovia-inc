@@ -386,11 +386,10 @@ async fn create_function_persists_what_it_reports() {
         );
         let created = answer.json();
 
-        let expected_arn = if case.version == "$LATEST" {
-            function_arn(case.name)
-        } else {
-            format!("{}:{}", function_arn(case.name), case.version)
-        };
+        // `CreateFunction`'s subject is the function, so the ARN it reports is the
+        // function's own unqualified one whether or not the call also published a version;
+        // the published version is reported by `Version` alone, asserted below.
+        let expected_arn = function_arn(case.name);
         assert_eq!(
             created["FunctionArn"],
             serde_json::json!(expected_arn),
