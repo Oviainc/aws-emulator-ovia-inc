@@ -13,8 +13,9 @@
 //!   carries none leaves the record's own, and `DeploymentParameters` is not a member of
 //!   the run, so nothing of it is reported on one;
 //! * what the stop wrote is what the readers answer: `GetExperimentRun` reports the same
-//!   document, the run's timeline gains one entry for the stop after the one the start
-//!   wrote, and the definition leaves the status it holds while an experiment is in flight
+//!   document, the run's timeline gains one entry for the stop — which heads the
+//!   most-recent-first feed, ahead of the one the start wrote — and the definition leaves
+//!   the status it holds while an experiment is in flight
 //!   — so a new run of it may be started again;
 //! * a run the experiment has already finished with takes no second stop: that is HTTP 409
 //!   `ConflictException` and it writes nothing;
@@ -281,19 +282,22 @@ async fn a_stop_ends_the_run_and_frees_the_definition() {
             "case {case:?}: expected GetExperimentRun to report {ended}, got {}",
             read.json()
         );
-        // The timeline gained one entry for the stop, after the one the start wrote.
+        // The timeline gained one entry for the stop, and the listing serves it most
+        // recent first, so the stop heads the feed and the start the run began with tails
+        // it.
         let events = list_events(&router, &scope.application, &definition_id, 1).await;
         assert_eq!(
             event_types(case, &events),
             vec![
-                state::EVENT_RUN_STARTED.to_string(),
                 state::EVENT_RUN_STOPPED.to_string(),
+                state::EVENT_RUN_STARTED.to_string(),
             ],
-            "case {case:?}: expected the start then the stop on the timeline, got {}",
+            "case {case:?}: expected the stop then the start on the timeline, got {}",
             events.json()
         );
         let stop_event = items(case, &events, "Items")
-            .pop()
+            .into_iter()
+            .next()
             .unwrap_or_else(|| panic!("case {case:?}: the timeline reported no entries"));
         assert_eq!(
             stop_event.get("TriggeredBy").and_then(Value::as_str),

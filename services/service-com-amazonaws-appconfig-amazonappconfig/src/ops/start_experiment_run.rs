@@ -335,6 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default(),
             // The timeline starts empty and the entry below is the first thing on it.
             event_log: Vec::new(),
+            events_recorded: 0,
         };
         // Starting the run is the first action anything performed on it, so it is the
         // first entry on the timeline `ListExperimentRunEvents` reports.

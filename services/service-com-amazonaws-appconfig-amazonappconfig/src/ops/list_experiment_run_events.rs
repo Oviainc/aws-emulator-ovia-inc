@@ -7,13 +7,12 @@
 //! that act on the run append to as they act. Nothing here writes, so listing a run's
 //! events changes nothing a later caller sees.
 //!
-//! The entries come back in the order they HAPPENED — the operation is documented as
-//! answering "a timeline of actions and state changes that occurred during the run", and a
-//! timeline reads forwards. The model documents no other order for this listing (unlike
-//! `Deployment$EventLog`, whose own documentation asks for the most recent first), so
-//! chronological order is this service's reading of it; the log is append-only, so an
-//! entry's position in it is a stable total order and therefore what
-//! [`crate::state::paginate`] keys its cursor on.
+//! The entries come back MOST RECENT FIRST, the order AppConfig serves a resource's event
+//! feed in (the convention its `Deployment$EventLog` documents in so many words: "The most
+//! recent events are displayed first"), so the head of the first page is the newest entry
+//! whatever page size a caller asks for. The log is append-only, so an entry's position in
+//! it is a stable total order; complementing that position is what turns it into the
+//! descending key [`crate::state::paginate`] keys its cursor on.
 //!
 //! ## Shape of an operation
 //!
@@ -198,14 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The log is append-only, so an entry's position in it is both the order the
-        // entries happened in and a TOTAL order — what a pagination cursor needs to
-        // resume exactly once.
+        // Newest first, so the page a caller reads without paging at all carries the
+        // latest actions on the run. Each entry keeps the key its own place on the
+        // timeline gives it, so an entry a later call appends shifts no existing key —
+        // which is what a pagination cursor needs to resume exactly once.
         let ordered: Vec<(String, ExperimentRunEvent)> = run
-            .event_log
-            .iter()
-            .enumerate()
-            .map(|(position, event)| (timeline_key(position), event.clone()))
+            .timeline_newest_first()
+            .into_iter()
+            .map(|(place, event)| (timeline_key(place), event))
             .collect();
 
         // A `NextToken` this listing did not mint is a bad request rather than "start from
@@ -240,12 +239,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The sort key of the entry at `position` in a run's event log, built so that ASCENDING
-/// key order is the order the entries happened in: [`crate::state::paginate`] walks its
-/// input in ascending key order, and the fixed width makes the string comparison agree
-/// with the numeric one (`"10"` must not sort before `"9"`).
-fn timeline_key(position: usize) -> String {
-    format!("{position:010}")
+/// The sort key of the entry at `place` on a run's timeline, built so that ASCENDING key
+/// order is MOST RECENT FIRST: [`crate::state::paginate`] walks its input in ascending key
+/// order, and an entry's place rises with the order it was appended in, so the key has to
+/// descend as the place rises.
+///
+/// The complement is taken against the largest place there can be, so none underflows it,
+/// and both are rendered at that value's fixed width, which makes the string comparison
+/// agree with the numeric one (`"10"` must not sort before `"9"`).
+fn timeline_key(place: u64) -> String {
+    const WIDTH: usize = u64::MAX.ilog10() as usize + 1;
+    format!("{:0WIDTH$}", u64::MAX - place)
 }
 
 /// The 404 this operation answers for a level of the path that addresses nothing.

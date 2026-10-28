@@ -133,11 +133,17 @@ pub const REPLICATE_TO_NONE: &str = "NONE";
 /// `OVERRIDES_UPDATED` | `RUN_STOPPED`).
 ///
 /// Each value names an action a CALL on the run performs, so an entry of that type is on
-/// the timeline only where the call that performs it ran. `RUN_STARTED` is the entry the
-/// start of the run writes; the other three belong to the calls that change a run's
-/// exposure or overrides and to the one that stops it, and are recorded by those
-/// operations, each of which spells its own value where it writes its entry.
+/// the timeline only where the call that performs it ran: the start of the run writes the
+/// first, an update that moves the run's audience exposure or its treatment assignments
+/// writes the exposure's or the overrides' value, and the call that ends the run writes
+/// the last.
 pub const EVENT_RUN_STARTED: &str = "RUN_STARTED";
+/// See [`EVENT_RUN_STARTED`]: the entry an update that moves the run's audience exposure
+/// writes.
+pub const EVENT_EXPOSURE_UPDATED: &str = "EXPOSURE_UPDATED";
+/// See [`EVENT_RUN_STARTED`]: the entry an update that moves the run's treatment
+/// assignment overrides writes.
+pub const EVENT_OVERRIDES_UPDATED: &str = "OVERRIDES_UPDATED";
 /// See [`EVENT_RUN_STARTED`]: the entry the call that stops the run writes.
 pub const EVENT_RUN_STOPPED: &str = "RUN_STOPPED";
 
@@ -256,6 +262,14 @@ pub const MAX_RETAINED_DEPLOYMENTS_PER_ENVIRONMENT: usize = 200;
 /// experiment has already finished with, never one that is still running. The bound is
 /// the emulator's, not an AppConfig quota.
 pub const MAX_RETAINED_EXPERIMENT_RUNS_PER_DEFINITION: usize = 200;
+
+/// How many entries ONE experiment run's timeline keeps.
+///
+/// The same bound as the histories above and for the same reason: every entry is appended
+/// by a call a caller made on the run, so a run acted on in a loop keeps the most recent
+/// entries and drops the oldest rather than growing without limit. The bound is the
+/// emulator's, not an AppConfig quota.
+pub const MAX_RETAINED_EXPERIMENT_RUN_EVENTS: usize = 200;
 
 /// The `LocationUri` that selects AppConfig's own hosted configuration store: "For the
 /// AppConfig hosted configuration store and for feature flags, specify `hosted`", as the
@@ -909,6 +923,13 @@ const DESCRIPTION_REVERT_COMPLETED: &str = "Deployment reverted";
 const DESCRIPTION_RUN_STARTED: &str = "Experiment run started";
 /// See [`DESCRIPTION_RUN_STARTED`].
 const DESCRIPTION_RUN_STOPPED: &str = "Experiment run stopped";
+/// See [`DESCRIPTION_RUN_STARTED`]: the action an update that moves the run's audience
+/// exposure performed. The exposure itself is not spelled into the sentence — the entry's
+/// own `ExposurePercentage` member reports the value in force at the event.
+const DESCRIPTION_EXPOSURE_UPDATED: &str = "Experiment run exposure updated";
+/// See [`DESCRIPTION_EXPOSURE_UPDATED`], for the run's treatment assignment overrides,
+/// which the entry's own `TreatmentOverrides` member reports.
+const DESCRIPTION_OVERRIDES_UPDATED: &str = "Experiment run treatment overrides updated";
 
 /// How long after it completed a deployment may still be reverted: "AppConfig only
 /// allows a revert within 72 hours of deployment completion", from the model's own
@@ -1395,8 +1416,16 @@ pub struct ExperimentRun {
     /// This run's timeline, in the order the entries happened: one entry per action a
     /// call performed on the run, appended as that call performed it. Nothing on it is
     /// owed by the clock — a run moves only when a call moves it — so the log is written
-    /// only by the calls that act on the run and is never recomputed by a reader.
+    /// only by the calls that act on the run and is never recomputed by a reader. The most
+    /// recent [`MAX_RETAINED_EXPERIMENT_RUN_EVENTS`] of them are kept.
     pub event_log: Vec<ExperimentRunEvent>,
+    /// How many entries have been appended to `event_log` since the run started, counting
+    /// the ones dropped once the log reached its retention bound.
+    ///
+    /// An entry's number within this count is its place on the timeline, which dropping an
+    /// older entry does not move — so it is a stable total order over the entries, which is
+    /// what the listing's pagination cursor keys on.
+    pub events_recorded: u64,
 }
 
 impl ExperimentRun {
@@ -1420,14 +1449,61 @@ impl ExperimentRun {
         if result.is_some() {
             self.result = result;
         }
-        self.event_log.push(experiment_run_event(
-            EVENT_RUN_STOPPED,
-            TRIGGERED_BY_USER,
-            DESCRIPTION_RUN_STOPPED.to_string(),
-            now,
-            self.exposure_percentage,
-            self.treatment_overrides.clone(),
-        ));
+        self.record_event(EVENT_RUN_STOPPED, DESCRIPTION_RUN_STOPPED, now);
+    }
+
+    /// Apply one caller's update to this run at `now`, and record on the timeline every
+    /// change it made.
+    ///
+    /// The timeline is the run's record of "actions and state changes that occurred during
+    /// the run" (`ListExperimentRunEvents`'s own documentation), so an entry is appended
+    /// for each state this write MOVED: the exposure's own event type where the audience
+    /// exposure becomes a different one, the overrides' where the assignment map becomes a
+    /// different map. A member the request omitted, or one restating the value the run
+    /// already holds, moves nothing and records nothing, and `ExperimentRunEventType`
+    /// carries no value for a description, so a description is written without an entry.
+    /// Each entry occurred at this write and reports the exposure and the overrides in
+    /// force once the write had been applied — `ExperimentRunEvent` reports both "at the
+    /// time of the event".
+    ///
+    /// A member the request carries replaces the stored one; supplying `TreatmentOverrides`
+    /// replaces the assignment map rather than merging into it, the member being the
+    /// override set itself. The empty string is a value the caller sent rather than an
+    /// omission (`Description` is len 0..1024), so it replaces the stored text.
+    pub fn apply_update(
+        &mut self,
+        description: Option<String>,
+        exposure_percentage: Option<f32>,
+        treatment_overrides: Option<TreatmentOverrides>,
+        now: SystemTime,
+    ) {
+        if let Some(description) = description {
+            self.description = Some(description);
+        }
+        // Read BEFORE the write: what moved is the difference between the value stored and
+        // the value the request asked for.
+        let exposure_moved = exposure_percentage.is_some_and(|requested| {
+            self.exposure_percentage
+                .is_none_or(|stored| stored != requested)
+        });
+        let overrides_moved = treatment_overrides.as_ref().is_some_and(|requested| {
+            !treatment_overrides_match(self.treatment_overrides.as_ref(), requested)
+        });
+        if let Some(exposure_percentage) = exposure_percentage {
+            self.exposure_percentage = Some(exposure_percentage);
+        }
+        if let Some(treatment_overrides) = treatment_overrides {
+            self.treatment_overrides = Some(treatment_overrides);
+        }
+        // This call wrote the record, so the record was last updated now; `started_at` is
+        // the instant the run started and does not move.
+        self.updated_at = now;
+        if exposure_moved {
+            self.record_event(EVENT_EXPOSURE_UPDATED, DESCRIPTION_EXPOSURE_UPDATED, now);
+        }
+        if overrides_moved {
+            self.record_event(EVENT_OVERRIDES_UPDATED, DESCRIPTION_OVERRIDES_UPDATED, now);
+        }
     }
 
     /// Record the first entry on this run's timeline: a caller started the run.
@@ -1437,14 +1513,67 @@ impl ExperimentRun {
     /// (`smithy_query(query="shape",shape="ExperimentRunEvent")`), which for this entry is
     /// what the start wrote.
     pub fn record_start_event(&mut self) {
+        self.record_event(EVENT_RUN_STARTED, DESCRIPTION_RUN_STARTED, self.started_at);
+    }
+
+    /// Append one entry to this run's timeline, reporting the exposure and the overrides
+    /// the run holds at the instant the entry occurred at — the one place an entry is
+    /// built, so every action on a run records its entry the same way.
+    ///
+    /// The timeline keeps the most recent [`MAX_RETAINED_EXPERIMENT_RUN_EVENTS`] entries
+    /// and drops the oldest beyond that, so a run acted on in a loop cannot grow this
+    /// store without limit.
+    fn record_event(&mut self, event_type: &str, description: &str, occurred_at: SystemTime) {
         self.event_log.push(experiment_run_event(
-            EVENT_RUN_STARTED,
+            event_type,
             TRIGGERED_BY_USER,
-            DESCRIPTION_RUN_STARTED.to_string(),
-            self.started_at,
+            description.to_string(),
+            occurred_at,
             self.exposure_percentage,
             self.treatment_overrides.clone(),
         ));
+        self.events_recorded = self.events_recorded.saturating_add(1);
+        if self.event_log.len() > MAX_RETAINED_EXPERIMENT_RUN_EVENTS {
+            let beyond_the_bound = self.event_log.len() - MAX_RETAINED_EXPERIMENT_RUN_EVENTS;
+            self.event_log.drain(..beyond_the_bound);
+        }
+    }
+
+    /// This run's timeline MOST RECENT FIRST, each entry beside the number it was appended
+    /// under.
+    ///
+    /// The number is the entry's place in [`Self::events_recorded`], which dropping an
+    /// older entry does not move, so it is a stable total order the listing's pagination
+    /// cursor can resume on.
+    pub fn timeline_newest_first(&self) -> Vec<(u64, ExperimentRunEvent)> {
+        // The entries kept are the last ones recorded, so the oldest one held is as far
+        // back from the total as the log is long.
+        let oldest_held = self
+            .events_recorded
+            .saturating_sub(self.event_log.len() as u64);
+        self.event_log
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(position, event)| (oldest_held + position as u64, event.clone()))
+            .collect()
+    }
+}
+
+/// Whether two treatment-override sets assign the same entities to the same treatments.
+///
+/// `TreatmentOverrides` is a union whose only member is the inline assignment map, so the
+/// sets match when both are absent or both carry the same map; a run holding none is moved
+/// by any set at all.
+fn treatment_overrides_match(
+    stored: Option<&TreatmentOverrides>,
+    requested: &TreatmentOverrides,
+) -> bool {
+    match (stored, requested) {
+        (Some(TreatmentOverrides::Inline(stored)), TreatmentOverrides::Inline(requested)) => {
+            stored == requested
+        }
+        (None, _) => false,
     }
 }
 
@@ -2651,18 +2780,20 @@ pub fn experiment_definition_not_updatable(
     )
 }
 
-/// `Message` for an update refused because the run it addressed is no longer running.
+/// `Message` for an update refused because the run it addressed has already reached the
+/// terminal status an experiment run ends in.
 ///
-/// Derived from the state that refused it — the run addressed and the status it holds —
-/// so the caller can see why the run takes no further change.
-pub fn experiment_run_not_running(
-    experiment_definition_id: &str,
+/// AWS's template for this refusal, rendered from the request: the run number it addressed
+/// and the experiment definition it addressed that run under — an `Identifier`, documented
+/// as the definition's "ID or name", so the sentence names the definition exactly as the
+/// request did — around the fixed text stating that the run is already terminal.
+pub fn experiment_run_already_terminal(
     run: i32,
-    status: &str,
+    experiment_definition_identifier: &str,
 ) -> String {
     format!(
-        "Run {run} of experiment definition {experiment_definition_id} is {status}, so it \
-         cannot be updated: only a running experiment can be updated."
+        "Cannot update experiment run {run} for experiment definition \
+         {experiment_definition_identifier} because it is already terminal."
     )
 }
 

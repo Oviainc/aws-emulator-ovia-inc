@@ -193,6 +193,7 @@ fn seed_finished_runs(
             definition_snapshot: snapshot.clone(),
             tags: HashMap::new(),
             event_log: Vec::new(),
+            events_recorded: 0,
         };
         // The timeline entry the start of a run writes, so a seeded run's log is the one
         // its own writer would have left rather than an empty one.

@@ -51,6 +51,8 @@ mod environment_update;
 mod experiment_definitions;
 #[path = "all/experiment_run_refusal_messages.rs"]
 mod experiment_run_refusal_messages;
+#[path = "all/experiment_run_timeline.rs"]
+mod experiment_run_timeline;
 #[path = "all/extension_action_points.rs"]
 mod extension_action_points;
 #[path = "all/extension_association_refusal_messages.rs"]

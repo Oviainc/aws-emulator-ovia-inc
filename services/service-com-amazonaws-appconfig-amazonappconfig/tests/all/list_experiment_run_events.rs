@@ -3,8 +3,8 @@
 //! `ListExperimentRunEvents` — the timeline of one experiment run — end to end over HTTP.
 //!
 //! RULE: the listing reports the events this service RECORDED on the addressed run, one
-//! entry per action a call performed on it, in the order they happened, each entry
-//! reporting the type of action, who triggered it, when it occurred and the run's exposure
+//! entry per action a call performed on it, MOST RECENT FIRST, each entry reporting the
+//! type of action, who triggered it, when it occurred and the run's exposure
 //! and overrides at that moment; the entries are cut into pages of at most `MaxResults`,
 //! resumed only by a `NextToken` this listing itself minted; and an application, a
 //! definition or a run number that addresses nothing is HTTP 404 rather than an empty
@@ -29,7 +29,8 @@ use crate::resource_tags::{filler, pct};
 /// The values `ExperimentRunEventType` accepts
 /// (`smithy_query(query="shape", shape="ExperimentRunEventType")`). Every entry a listing
 /// reports must name one of them, and the entry a start writes names the first.
-const EVENT_TYPES: &[&str] = &[
+/// `pub(crate)` because more than one suite in this target reads a run's timeline.
+pub(crate) const EVENT_TYPES: &[&str] = &[
     "RUN_STARTED",
     "EXPOSURE_UPDATED",
     "OVERRIDES_UPDATED",
@@ -49,8 +50,9 @@ const MAX_MAX_RESULTS: i64 = 50;
 
 /// `GET .../experimentruns/{Run}/events`, with `query` as the raw query string (empty for
 /// a request that names neither `MaxResults` nor `NextToken`; both are `httpQuery`
-/// members, named `max_results` and `next_token`).
-async fn list_events(
+/// members, named `max_results` and `next_token`). `pub(crate)` because more than one
+/// suite in this target reads a run's timeline.
+pub(crate) async fn list_events(
     router: &MultiServiceRouter,
     application: &str,
     definition: &str,

@@ -64,7 +64,8 @@ const FIXED_MEMBERS: &[&str] = &[
 const PATCHED_MEMBERS: &[&str] = &["Description", "ExposurePercentage", "TreatmentOverrides"];
 
 /// `PATCH /applications/{ApplicationIdentifier}/experimentdefinitions/{ExperimentDefinitionIdentifier}/experimentruns/{Run}/update`.
-async fn update_run(
+/// `pub(crate)` because more than one suite in this target updates a run.
+pub(crate) async fn update_run(
     router: &MultiServiceRouter,
     application: &str,
     definition: &str,

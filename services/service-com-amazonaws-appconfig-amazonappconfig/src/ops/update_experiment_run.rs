@@ -285,18 +285,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // This operation "updates a running experiment" (its own documentation), and a run
-        // the experiment has already finished with is delivering nothing left to change —
-        // so an update of it conflicts with the current state of the resource and writes
-        // nothing.
+        // This operation "updates a running experiment" (its own documentation), and an
+        // experiment run is a forward-only state machine: once it has reached the terminal
+        // status it ends in, nothing moves it back, so no later request can make this one
+        // acceptable. That is an input this service will not satisfy rather than a
+        // conflict with a state that can clear, so it is refused as a bad request and
+        // writes nothing.
         if !run.is_active() {
-            return Err(UpdateExperimentRunErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(crate::state::experiment_run_not_running(
-                        &run.experiment_definition_id,
-                        run.run,
-                        &run.status,
+            return Err(UpdateExperimentRunErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::experiment_run_already_terminal(
+                        input.run,
+                        &input.experiment_definition_identifier,
                     )),
+                    reason: None,
+                    details: None,
                 },
             )
             .into());
@@ -328,28 +331,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A PATCH over the stored record: a member the request carries replaces the stored
-        // one, a member it omits keeps the value the run already holds. The empty string is
-        // a value the caller sent, not an omission (`Description` is len 0..1024), so it
-        // replaces the stored text with the empty one. Supplying `TreatmentOverrides`
-        // replaces the assignment map rather than merging into it: the member is the
-        // override set itself.
+        // one, a member it omits keeps the value the run already holds. Applying it is the
+        // record's own work, so the timeline entry each moved state owes is appended where
+        // the move happens — one `EXPOSURE_UPDATED` where the audience exposure becomes a
+        // different one, one `OVERRIDES_UPDATED` where the assignment map does — and
+        // `ListExperimentRunEvents` projects them.
         //
         // `Run`, `Status`, `StartedAt`, `EndedAt`, `Result`, the definition snapshot and the
         // run's own tags are not members of this request — which run of which definition
         // this is, and what the experiment concluded, are not rewritten here — so each is
         // reported back out of the stored record untouched.
-        if let Some(description) = input.description {
-            run.description = Some(description);
-        }
-        if let Some(exposure_percentage) = input.exposure_percentage {
-            run.exposure_percentage = Some(exposure_percentage);
-        }
-        if let Some(treatment_overrides) = input.treatment_overrides {
-            run.treatment_overrides = Some(treatment_overrides);
-        }
-        // This call wrote the record, so the record was last updated now; `StartedAt` is the
-        // instant the run started and does not move.
-        run.updated_at = now;
+        run.apply_update(
+            input.description,
+            input.exposure_percentage,
+            input.treatment_overrides,
+            now,
+        );
 
         // Answered from the updated record, so this response and a later `GetExperimentRun`
         // report the same run.
