@@ -19,6 +19,8 @@ mod arn_addressed_tag_refusals;
 mod batch_and_transact_items;
 #[path = "all/batch_execute_statement.rs"]
 mod batch_execute_statement;
+#[path = "all/batch_write_capacity_residue.rs"]
+mod batch_write_capacity_residue;
 #[path = "all/collection_cap_constraint_reports.rs"]
 mod collection_cap_constraint_reports;
 #[path = "all/continuous_backups.rs"]

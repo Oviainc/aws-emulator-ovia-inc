@@ -412,6 +412,19 @@ pub const PARTITION_WRITE_UNITS_PER_SECOND: i64 = 1000;
 /// ceiling behind it.
 pub const PARTITION_BURST_WINDOW: Duration = Duration::from_secs(1);
 
+/// How far ahead of its own refill a write budget may be drawn when a batch write must
+/// make progress ([`Table::admit_item_write_with_progress`]).
+///
+/// CHOSEN by this emulator, not documented: it is the capacity the storage layer behind
+/// ONE partition can serve in a second ([`PARTITION_WRITE_UNITS_PER_SECOND`] over
+/// [`PARTITION_BURST_WINDOW`]), which is the most work a single partition can do ahead
+/// of the provisioning that pays for it. Borrowed units are charged and repay at the
+/// rate in force, so this bounds only the burst a progress allowance can add, never the
+/// sustained rate a table admits.
+fn progress_borrowing_allowance() -> f64 {
+    burst_ceiling(PARTITION_WRITE_UNITS_PER_SECOND, PARTITION_BURST_WINDOW)
+}
+
 /// How many partition key values one table keeps a write budget for at a time.
 ///
 /// Admission-control bookkeeping has to be bounded like everything else this store
@@ -1852,11 +1865,47 @@ impl CapacityBudget {
         self.available(units_per_second, window, now) >= units
     }
 
+    /// Whether the budget can serve `units` by BORROWING against its own refill: the
+    /// draw may leave the budget in deficit, but no deeper than `allowance`.
+    ///
+    /// Reports it without taking anything, so a write held to two budgets at once
+    /// debits neither when either of them refuses it.
+    pub fn covers_borrowing(
+        &self,
+        units_per_second: i64,
+        window: Duration,
+        units: f64,
+        now: SystemTime,
+        allowance: f64,
+    ) -> bool {
+        self.available(units_per_second, window, now) - units >= -allowance
+    }
+
+    /// Take `units` the budget may be SHORT of, leaving it in deficit by the shortfall.
+    ///
+    /// The units are charged in full, so nothing is served from capacity that is never
+    /// accounted: the deficit repays at the rate in force, which leaves the rate this
+    /// budget bounds exactly what it was. What borrowing changes is only how far ahead
+    /// of its own refill one draw may be served (see
+    /// [`Table::admit_item_write_with_progress`]), and
+    /// [`CapacityBudget::covers_borrowing`] is what bounds that.
+    pub fn take_borrowing(
+        &mut self,
+        units_per_second: i64,
+        window: Duration,
+        units: f64,
+        now: SystemTime,
+    ) {
+        let available = self.available(units_per_second, window, now);
+        self.measured_at = now;
+        self.remaining = Some(available - units);
+    }
+
     /// What has refilled by `now`: the figure last measured plus the rate over the time
     /// since, held at the ceiling the burst window allows.
     fn available(&self, units_per_second: i64, window: Duration, now: SystemTime) -> f64 {
         let rate = units_as_f64(units_per_second);
-        let ceiling = rate * window.as_secs_f64();
+        let ceiling = burst_ceiling(units_per_second, window);
         let elapsed = now
             .duration_since(self.measured_at)
             .unwrap_or_default()
@@ -1876,6 +1925,17 @@ impl CapacityBudget {
                 .duration_since(self.measured_at)
                 .is_ok_and(|idle| idle >= window)
     }
+}
+
+/// The MOST a budget refilled at `units_per_second` can ever hold: the rate over the
+/// whole window it accumulates credit over.
+///
+/// It is the ceiling [`CapacityBudget::available`] holds a refill at, so it is also the
+/// largest single draw that budget can ever cover however long the caller waits — which
+/// is what tells a write that is merely waiting for capacity from one no amount of
+/// waiting admits.
+pub fn burst_ceiling(units_per_second: i64, window: Duration) -> f64 {
+    units_as_f64(units_per_second) * window.as_secs_f64()
 }
 
 /// What is left of the per-partition-key write capacity of one table: one budget per
@@ -1912,6 +1972,56 @@ impl KeyWriteBudgets {
     /// still live the least recently spent from gives way, because it is the closest to
     /// having refilled.
     fn take(&mut self, partition: &AttributeValueKey, units: f64, now: SystemTime) -> bool {
+        self.make_room_for(partition, now);
+        self.budgets
+            .entry(partition.clone())
+            .or_insert_with(|| CapacityBudget::new(now))
+            .take_within(
+                PARTITION_WRITE_UNITS_PER_SECOND,
+                PARTITION_BURST_WINDOW,
+                units,
+                now,
+            )
+    }
+
+    /// Whether that key's budget can serve `units` by borrowing against its own refill,
+    /// no deeper than `allowance` ([`CapacityBudget::covers_borrowing`]).
+    fn covers_borrowing(
+        &self,
+        partition: &AttributeValueKey,
+        units: f64,
+        now: SystemTime,
+        allowance: f64,
+    ) -> bool {
+        self.budgets.get(partition).is_none_or(|budget| {
+            budget.covers_borrowing(
+                PARTITION_WRITE_UNITS_PER_SECOND,
+                PARTITION_BURST_WINDOW,
+                units,
+                now,
+                allowance,
+            )
+        })
+    }
+
+    /// Take `units` from that key's budget, leaving it in deficit by whatever it was
+    /// short of ([`CapacityBudget::take_borrowing`]).
+    fn take_borrowing(&mut self, partition: &AttributeValueKey, units: f64, now: SystemTime) {
+        self.make_room_for(partition, now);
+        self.budgets
+            .entry(partition.clone())
+            .or_insert_with(|| CapacityBudget::new(now))
+            .take_borrowing(
+                PARTITION_WRITE_UNITS_PER_SECOND,
+                PARTITION_BURST_WINDOW,
+                units,
+                now,
+            );
+    }
+
+    /// Hold the map at [`MAX_TRACKED_WRITE_KEYS`] entries before an entry for
+    /// `partition` is added to it.
+    fn make_room_for(&mut self, partition: &AttributeValueKey, now: SystemTime) {
         if self.budgets.len() >= MAX_TRACKED_WRITE_KEYS && !self.budgets.contains_key(partition) {
             self.budgets
                 .retain(|_, budget| !budget.refilled(PARTITION_BURST_WINDOW, now));
@@ -1927,15 +2037,6 @@ impl KeyWriteBudgets {
                 self.budgets.remove(&oldest);
             }
         }
-        self.budgets
-            .entry(partition.clone())
-            .or_insert_with(|| CapacityBudget::new(now))
-            .take_within(
-                PARTITION_WRITE_UNITS_PER_SECOND,
-                PARTITION_BURST_WINDOW,
-                units,
-                now,
-            )
     }
 }
 
@@ -4881,6 +4982,86 @@ impl Table {
         }
         self.key_write_budgets
             .take(partition, capacity.table, now);
+        Ok(())
+    }
+
+    /// Whether the ceilings a write is admitted from could EVER cover this write — that
+    /// is, whether waiting for capacity to refill could admit it at all.
+    ///
+    /// A budget never holds more than its whole burst window's worth of credit
+    /// ([`burst_ceiling`]), so a write that asks for more than that is not waiting for
+    /// capacity: no later attempt at it is admitted either, whatever the caller does.
+    /// That is what tells a request worth handing back for a retry from one a retry
+    /// could never get through.
+    pub fn can_ever_admit_item_write(&self, capacity: &WriteCapacity) -> bool {
+        if let Some(provisioned) = self.provisioned_write_rate() {
+            if capacity.total() > burst_ceiling(provisioned, BURST_CAPACITY_WINDOW) {
+                return false;
+            }
+        }
+        capacity.table <= burst_ceiling(PARTITION_WRITE_UNITS_PER_SECOND, PARTITION_BURST_WINDOW)
+    }
+
+    /// Admit one item write that must make PROGRESS: the same two ceilings as
+    /// [`Self::admit_item_write`], except that a write they are merely SHORT of capacity
+    /// for may be served by BORROWING against their own refill, which leaves them in
+    /// deficit by the shortfall.
+    ///
+    /// What this serves is the batch write surface, whose residue a caller is documented
+    /// to resend ("you can provide this value directly to a subsequent BatchWriteItem
+    /// operation"): the capacity a table has left decides HOW MANY of a batch's requests
+    /// land, not WHETHER the call got anything done, so a batch that could otherwise
+    /// store nothing stores the first request it can and hands the rest back — which is
+    /// what keeps that retry loop converging.
+    ///
+    /// The units borrowed are charged in full and repay at the rate in force, so the
+    /// SUSTAINED rate either ceiling admits is exactly the rate it is provisioned for;
+    /// and the borrowing is bounded ([`progress_borrowing_allowance`]), so a caller that
+    /// keeps writing past what its table is provisioned for runs the allowance out and
+    /// is refused from then on. Two writes are refused here as they are there: one past
+    /// what the ceilings can ever hold ([`Self::can_ever_admit_item_write`]), because no
+    /// later attempt at it would be admitted either, and one whose shortfall is deeper
+    /// than the allowance.
+    pub fn admit_item_write_with_progress(
+        &mut self,
+        partition: &AttributeValueKey,
+        capacity: &WriteCapacity,
+        now: SystemTime,
+    ) -> Result<(), WriteThrottle> {
+        let Err(throttle) = self.admit_item_write(partition, capacity, now) else {
+            return Ok(());
+        };
+        if !self.can_ever_admit_item_write(capacity) {
+            return Err(throttle);
+        }
+        // Neither budget is borrowed from unless BOTH have the room to lend: a write
+        // that is refused did no work, so it owes no capacity anywhere.
+        let total = capacity.total();
+        let allowance = progress_borrowing_allowance();
+        let provisioned = self.provisioned_write_rate();
+        if let Some(provisioned) = provisioned {
+            if !self.write_budget.covers_borrowing(
+                provisioned,
+                BURST_CAPACITY_WINDOW,
+                total,
+                now,
+                allowance,
+            ) {
+                return Err(WriteThrottle::TableProvisioned);
+            }
+        }
+        if !self
+            .key_write_budgets
+            .covers_borrowing(partition, capacity.table, now, allowance)
+        {
+            return Err(WriteThrottle::KeyRange);
+        }
+        if let Some(provisioned) = provisioned {
+            self.write_budget
+                .take_borrowing(provisioned, BURST_CAPACITY_WINDOW, total, now);
+        }
+        self.key_write_budgets
+            .take_borrowing(partition, capacity.table, now);
         Ok(())
     }
 

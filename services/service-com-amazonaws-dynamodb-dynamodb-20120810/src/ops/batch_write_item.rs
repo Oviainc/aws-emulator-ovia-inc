@@ -6,9 +6,13 @@
 //! you perform a BatchWriteItem operation on an existing item, that item's values will be
 //! overwritten". Each operation lands through the same store write sites `PutItem` and
 //! `DeleteItem` use ([`crate::state::ComAmazonawsDynamodbDynamodb20120810State::put_item`]
-//! and `delete_item`), so numbers are canonicalized and capacity is accounted the same way
-//! on this path as on the single-item one — and so is the record each change publishes
-//! on its table's stream ([`crate::state::publish_item_changes`]).
+//! and `delete_item`), so numbers are canonicalized exactly as they are on the
+//! single-item path, each write is charged the capacity it consumed from the same
+//! per-table budget, and so is the record each change publishes on its table's stream
+//! ([`crate::state::publish_item_changes`]). What this path does NOT share with the
+//! single-item one is the admission decision for a write the budget is short of: a
+//! single-item write has nowhere to report a request it did not apply, so it is refused,
+//! while a batch reports it in `UnprocessedItems` — see the admission paragraph below.
 //!
 //! The whole request is resolved and validated BEFORE any item lands — the tables, the key
 //! schema, every value's own rules, the documented item size and the index key limits — so
@@ -29,9 +33,19 @@
 //! ([`crate::state::Table::admit_item_write`]): one the throughput component does not
 //! admit is handed back in `UnprocessedItems`, in the form it was sent, and stores
 //! nothing — so a hot partition key is throttled while the same rate spread over many
-//! keys is served. A batch NONE of whose operations were admitted is answered with
-//! `ProvisionedThroughputExceededException`, carrying the `ThrottlingReasons` entry for
-//! the ceiling that bound and the ARN of the table it bound on. `ReturnConsumedCapacity`
+//! keys is served. How much capacity a table has left decides HOW MANY of a batch's
+//! requests land, not WHETHER the call gets anything done: while nothing has landed, the
+//! request in hand may be served from capacity BORROWED against the budget's own refill
+//! ([`crate::state::Table::admit_item_write_with_progress`]), so every call answers at
+//! once with a residue its caller can resend and the documented drain loop converges.
+//! Borrowed units are charged in full and repay at the provisioned rate, and the
+//! borrowing is bounded, so a caller that keeps writing past what its table is
+//! provisioned for runs that allowance out: from then on a batch of writes the budget
+//! cannot cover gets nothing done and is refused with
+//! `ProvisionedThroughputExceededException`, as is one none of whose requests the
+//! ceilings could ever cover. The refusal carries the
+//! `ThrottlingReasons` entry for the ceiling that bound and the ARN of the table it
+//! bound on. `ReturnConsumedCapacity`
 //! reports one `ConsumedCapacity` per table written and `ReturnItemCollectionMetrics=SIZE`
 //! one `ItemCollectionMetrics` list per table, both totalled from stored state by
 //! [`crate::state::WriteLedger`].
@@ -393,7 +407,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             table.write_capacity(before.as_ref(), None)
                         }
                     };
-                    table.admit_item_write(&write.key().partition, &capacity, now)
+                    // While the batch has stored NOTHING, the request in hand is the one
+                    // that makes the call make progress: the capacity the table has left
+                    // decides how many of the batch's requests land, not whether the call
+                    // got anything done, so a request the budgets are merely short for is
+                    // served from capacity borrowed against their own refill — charged in
+                    // full, bounded, and repaid at the provisioned rate. Once something
+                    // has landed, the rest of the batch is held to the capacity that is
+                    // actually there.
+                    if processed == 0 {
+                        table.admit_item_write_with_progress(
+                            &write.key().partition,
+                            &capacity,
+                            now,
+                        )
+                    } else {
+                        table.admit_item_write(&write.key().partition, &capacity, now)
+                    }
                 };
                 if let Err(throttle) = admitted {
                     throttled = Some((name.clone(), throttle));
@@ -432,13 +462,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::publish_item_changes(&*self.engine, &mut store, now);
         applied?;
 
-        // "If BatchWriteItem cannot process any items due to throttling (for example,
-        // insufficient provisioned throughput on the tables in the request, or
-        // partition-level or account-level limits), it returns a
-        // ProvisionedThroughputExceededException" — so a batch NONE of whose operations
-        // were admitted is answered with the throttle itself, naming the ceiling that
-        // bound and the table it bound on; a batch that got some of its work done
-        // answers 200 and hands the rest back.
+        // "If none of the items CAN be processed due to insufficient provisioned
+        // throughput on all of the tables in the request, then BatchWriteItem returns a
+        // ProvisionedThroughputExceededException": a batch that got no work done is one
+        // whose first request the ceilings could not cover even by borrowing against
+        // their refill — because it asks for more than they can ever hold, or because
+        // the caller has already borrowed its allowance — so that is what is refused,
+        // naming the ceiling that bound and the table it bound on. Everything else
+        // answers 200 and hands the rest back for the caller's retry loop to drain.
         if processed == 0 {
             if let Some((name, throttle)) = throttled {
                 return Err(
