@@ -5,7 +5,9 @@
 //! the submitted CloudFormation stack names and tag key/value pairs into it, `REMOVE`
 //! subtracts them. Coverage is a SET, so repeating a request changes nothing. The
 //! account has exactly ONE tag app-boundary key, so an `ADD` that would leave it
-//! covering a second, different key is refused and stores nothing.
+//! covering a second, different key is refused and stores nothing, and a tag key that
+//! does not begin with the documented `Devops-guru-` prefix cannot define coverage at
+//! all, so a request naming one is refused whatever the `Action`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,6 +173,33 @@ fn different_app_boundary_key(
     .into()
 }
 
+/// A `ValidationException` (HTTP 400) refusing a request whose tag filters name an
+/// app-boundary key that cannot define analysis coverage, because it does not begin with
+/// [`crate::state::APP_BOUNDARY_KEY_PREFIX`].
+///
+/// The message is built from the request and that prefix: the keys the request names
+/// which the rule rejects, and the prefix they lack.
+fn app_boundary_key_without_prefix(
+    rejected: &std::collections::BTreeSet<&str>,
+) -> UpdateResourceCollectionError {
+    let joined = rejected.iter().copied().collect::<Vec<_>>().join(", ");
+    let prefix = crate::state::APP_BOUNDARY_KEY_PREFIX;
+    UpdateResourceCollectionErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "App boundary key provided in request (provided={{{joined}}}) does not begin with \
+             the prefix '{prefix}', cant add these resource collection filters"
+        ),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: "ResourceCollection.Tags[].AppBoundaryKey".to_string(),
+            message: format!(
+                "a tag key that defines your resource coverage must begin with the prefix '{prefix}'"
+            ),
+        }]),
+    })
+    .into()
+}
+
 /// The `UpdateResourceCollection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -250,6 +279,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         let submitted_tags: Vec<&UpdateTagCollectionFilter> =
             input.resource_collection.tags.iter().flatten().collect();
+
+        // KEY FORM. A tag key used to define this account's analysis coverage must begin
+        // with the documented prefix (`crate::state::defines_analysis_boundary`), so a key
+        // without it is refused whatever the `Action`: it can never BE coverage, so there
+        // is neither coverage to add under it nor coverage to subtract from it. Checked on
+        // the request alone, before the store is even locked, so nothing is written.
+        let rejected_keys: std::collections::BTreeSet<&str> = submitted_tags
+            .iter()
+            .map(|tag| tag.app_boundary_key.as_str())
+            .filter(|key| !crate::state::defines_analysis_boundary(key))
+            .collect();
+        if !rejected_keys.is_empty() {
+            return Err(app_boundary_key_without_prefix(&rejected_keys));
+        }
 
         let mut guard = state.lock();
 
