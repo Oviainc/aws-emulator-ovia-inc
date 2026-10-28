@@ -45,8 +45,9 @@ use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports:
 
 use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
 
-/// `GenericString`'s ceiling, which `ResourceNotFoundException.Message` targets:
-/// `@length 0..1024` (smithy_query shape `ResourceNotFoundException`, member `Message`).
+/// `GenericString`'s ceiling, which every member of `ResourceNotFoundException` targets
+/// — `Message`, `ResourceId` and `ResourceType` alike: `@length 0..1024` (smithy_query
+/// shape `ResourceNotFoundException`).
 const MESSAGE_MAX_LEN: usize = 1024;
 
 /// One row: a well-formed export ARN that names nothing, and the region the request
@@ -241,12 +242,28 @@ fn check_not_found(
             "case {label:?}: the message must not restate request content, but {message:?} contains {segment:?}"
         );
     }
-    // The identity belongs in the modelled ResourceId member instead.
-    assert_eq!(
-        body["ResourceId"],
-        json!(arn),
-        "case {label:?}: the refusal must report the ARN it could not find in ResourceId, got {body}"
-    );
+    // The identity belongs in the modelled ResourceId member instead — whole whenever
+    // that member has room for it, and by its leading characters when the ARN runs past
+    // the member's own bound (`tests/all/not_found_member_bounds.rs` owns that rule).
+    let reported = body["ResourceId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {label:?}: the refusal must carry a ResourceId, got {body}"));
+    if arn.chars().count() <= MESSAGE_MAX_LEN {
+        assert_eq!(
+            reported, arn,
+            "case {label:?}: the refusal must report the ARN it could not find in ResourceId, got {body}"
+        );
+    } else {
+        assert!(
+            reported.chars().count() <= MESSAGE_MAX_LEN,
+            "case {label:?}: ResourceId must satisfy its modelled length 0..{MESSAGE_MAX_LEN}, got {} characters in {reported:?}",
+            reported.chars().count()
+        );
+        assert!(
+            arn.starts_with(reported.trim_end_matches('.')),
+            "case {label:?}: ResourceId must report the ARN's leading characters, got {reported:?}"
+        );
+    }
     message
 }
 

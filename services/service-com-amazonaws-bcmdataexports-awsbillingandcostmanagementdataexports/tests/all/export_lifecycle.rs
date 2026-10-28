@@ -58,6 +58,28 @@ const NAME_MAX_LEN: usize = 128;
 /// `pub(crate)` so every suite in this target asserts the one status.
 pub(crate) const NOT_FOUND_STATUS: u16 = 400;
 
+/// The `@length` ceiling of an ARN this service accepts (smithy_query shape `Arn`:
+/// `@length(min: 20, max: 2048)`). Stated from the MODEL, so a suite's expectation is not
+/// read from the code under test.
+///
+/// `pub(crate)` so every suite that walks ARN lengths states the model's ceiling once.
+pub(crate) const MAX_ARN_CHARS: usize = 2048;
+
+/// A well-formed ARN of THIS account naming `resource`, `chars` characters long.
+///
+/// Built through `engine::emulator_arn` and padded inside the RESOURCE segment, so it
+/// satisfies the modelled `Arn` pattern
+/// (`^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`) and the
+/// boundary validator hands it to the handler.
+///
+/// `pub(crate)` for the reason [`MAX_ARN_CHARS`] is: the suites that drive an outsized ARN
+/// at a refusal share this one builder rather than each growing a copy of it.
+pub(crate) fn padded_arn(resource: &str, chars: usize) -> String {
+    let base = ::engine::emulator_arn(SIGNING_NAME, REGION, resource);
+    let padding = chars.saturating_sub(base.chars().count());
+    format!("{base}{}", "a".repeat(padding))
+}
+
 /// An in-process client: the one shared engine, this service mounted on a router, and a
 /// signed-looking request per call.
 ///

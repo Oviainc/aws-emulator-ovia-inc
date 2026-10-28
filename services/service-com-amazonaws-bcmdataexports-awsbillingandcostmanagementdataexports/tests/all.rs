@@ -45,6 +45,8 @@ mod export_lifecycle;
 mod front_door_authorization;
 #[path = "all/minted_export_arn.rs"]
 mod minted_export_arn;
+#[path = "all/not_found_member_bounds.rs"]
+mod not_found_member_bounds;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/not_found_wire_status.rs"]

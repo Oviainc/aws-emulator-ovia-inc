@@ -36,7 +36,7 @@
 
 use serde_json::{json, Value};
 
-use crate::export_lifecycle::error_code;
+use crate::export_lifecycle::{error_code, padded_arn, MAX_ARN_CHARS};
 use crate::front_door_authorization::{allow_all_but, create_request, Emulator};
 
 /// The `@length` ceiling of a `GenericString`, which `AccessDeniedException$Message`
@@ -44,10 +44,6 @@ use crate::front_door_authorization::{allow_all_but, create_request, Emulator};
 /// max: 1024)`). Stated from the MODEL, so the expectation is not read from the code under
 /// test.
 const MESSAGE_MAX_CHARS: usize = 1024;
-
-/// The `@length` ceiling of an ARN this service accepts (smithy_query shape `Arn`:
-/// `@length(min: 20, max: 2048)`).
-const MAX_ARN_CHARS: usize = 2048;
 
 /// The `@length` ceiling of an export's `Name` (smithy_query shape `Export`, member
 /// `Name`: `@length(min: 1, max: 128)`, pattern `^[0-9A-Za-z\-_]+$`) — the caller-supplied
@@ -60,17 +56,9 @@ const MAX_EXPORT_NAME_CHARS: usize = 128;
 /// pins "a substantial prefix survives" and not one arithmetic answer.
 const ECHOED_PREFIX_CHARS: usize = 512;
 
-/// A well-formed ARN of this account, `chars` characters long, naming no export.
-///
-/// Built through `engine::emulator_arn` and padded inside the RESOURCE segment, so it
-/// satisfies the modelled `Arn` pattern
-/// (`^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`) and the
-/// boundary validator hands it to the handler.
-fn padded_arn(chars: usize) -> String {
-    let base = ::engine::emulator_arn("bcm-data-exports", "us-east-1", "export/bounded_message");
-    let padding = chars.saturating_sub(base.chars().count());
-    format!("{base}{}", "a".repeat(padding))
-}
+/// The resource segment of the ARN this suite asks about (see
+/// [`crate::export_lifecycle::padded_arn`]).
+const BOUNDED_MESSAGE_RESOURCE: &str = "export/bounded_message";
 
 /// The shortest ARN this service's modelled pattern can spell for this account: the empty
 /// region the pattern permits and a one-character resource segment.
@@ -98,7 +86,7 @@ fn arn_of(chars: usize) -> String {
     if chars == shortest_arn().chars().count() {
         shortest_arn()
     } else {
-        padded_arn(chars)
+        padded_arn(BOUNDED_MESSAGE_RESOURCE, chars)
     }
 }
 

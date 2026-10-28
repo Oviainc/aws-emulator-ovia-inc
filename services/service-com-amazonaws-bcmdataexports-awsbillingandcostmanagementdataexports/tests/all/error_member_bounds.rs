@@ -20,7 +20,7 @@
 
 use serde_json::json;
 
-use crate::export_lifecycle::error_code;
+use crate::export_lifecycle::{error_code, padded_arn, MAX_ARN_CHARS};
 use crate::front_door_authorization::Emulator;
 
 /// The `@length` ceiling of a `GenericString`, which every message member of every error
@@ -29,26 +29,20 @@ use crate::front_door_authorization::Emulator;
 /// test.
 const MESSAGE_MAX_CHARS: usize = 1024;
 
-/// The `@length` ceiling of an ARN this service accepts (smithy_query shape `Arn`:
-/// `@length(min: 20, max: 2048)`).
-const MAX_ARN_CHARS: usize = 2048;
+/// The resource segment of the ARN this suite asks about (see
+/// [`crate::export_lifecycle::padded_arn`]).
+const BOUNDED_ACCESS_DENIED_RESOURCE: &str = "export/bounded_access_denied";
 
 /// The action `UntagResource` is judged on, which the refusal names.
 const UNTAG_ACTION: &str = "bcm-data-exports:UntagResource";
 
 /// A well-formed ARN of this account, `chars` characters long, naming no export.
 ///
-/// Built through `engine::emulator_arn` and padded inside the RESOURCE segment, so it
-/// satisfies the modelled `Arn` pattern and the boundary validator hands it to the
-/// handler.
-fn padded_arn(chars: usize) -> String {
-    let base = ::engine::emulator_arn(
-        "bcm-data-exports",
-        "us-east-1",
-        "export/bounded_access_denied",
-    );
-    let padding = chars.saturating_sub(base.chars().count());
-    format!("{base}{}", "a".repeat(padding))
+/// Built by the shared [`crate::export_lifecycle::padded_arn`] builder, which pads inside
+/// the RESOURCE segment, so it satisfies the modelled `Arn` pattern and the boundary
+/// validator hands it to the handler.
+fn bounded_arn(chars: usize) -> String {
+    padded_arn(BOUNDED_ACCESS_DENIED_RESOURCE, chars)
 }
 
 #[tokio::test]
@@ -67,7 +61,7 @@ async fn an_authorization_refusal_echoing_an_outsized_arn_stays_within_the_bound
         MESSAGE_MAX_CHARS - 1,
         90,
     ] {
-        let arn = padded_arn(chars);
+        let arn = bounded_arn(chars);
         let case = format!("an ARN of {chars} characters");
         let (status, body) = emulator
             .call(

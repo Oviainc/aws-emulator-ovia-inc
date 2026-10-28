@@ -683,13 +683,33 @@ pub const EXECUTION_NOT_FOUND_MESSAGE: &str = "Execution not found";
 /// with `message`: [`EXPORT_NOT_FOUND_MESSAGE`] on the export-definition operations and
 /// [`RESOURCE_NOT_FOUND_MESSAGE`] on the resource-tagging ones.
 pub fn resource_not_found(arn: &str, message: &str) -> ResourceNotFoundException {
+    not_found_exception(message, arn, EXPORT_RESOURCE_TYPE)
+}
+
+/// The modelled `ResourceNotFoundException` reporting `resource_id` of kind
+/// `resource_type` with the sentence `message` — every member held inside the bound the
+/// model gives it.
+///
+/// All three members target `GenericString`, `@length(0, 1024)`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), while the
+/// identifier the refusal reports is a caller-supplied value whose OWN modelled shape
+/// admits more — an `Arn` runs to 2048 characters, twice what the member it is reported
+/// in admits — and the boundary validator hands such a value straight to the handler. So
+/// the identifier gives way to the member's bound, exactly as an echoed resource gives
+/// way to the room a refusal sentence leaves it ([`clip_to_budget`]): an identifier the
+/// member has room for is reported WHOLE, because it is the identity of what was not
+/// found and a client reads it to know which of its own requests failed
+/// (`tests/all/not_found_message.rs`), and a longer one is reported by its leading
+/// characters, which is what a client can still match its request against.
+fn not_found_exception(
+    message: &str,
+    resource_id: &str,
+    resource_type: &str,
+) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: message.to_string(),
-        // `ResourceId` reports the identifier WHOLE rather than shortened: it is the
-        // identity of what was not found, not prose about it, and a client reads it to
-        // know which of its own requests failed (`tests/all/not_found_message.rs`).
-        resource_id: arn.to_string(),
-        resource_type: EXPORT_RESOURCE_TYPE.to_string(),
+        message: clip_to_budget(message, GENERIC_STRING_LENGTH_LIMIT),
+        resource_id: clip_to_budget(resource_id, GENERIC_STRING_LENGTH_LIMIT),
+        resource_type: clip_to_budget(resource_type, GENERIC_STRING_LENGTH_LIMIT),
     }
 }
 
@@ -760,11 +780,11 @@ pub fn not_found_error<E>(
 /// Like every other not-found of this service the sentence is a constant: the identity of
 /// what was not found is reported in the modelled `ResourceId`, not in the prose.
 pub fn execution_not_found(execution_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: EXECUTION_NOT_FOUND_MESSAGE.to_string(),
-        resource_id: execution_id.to_string(),
-        resource_type: EXECUTION_RESOURCE_TYPE.to_string(),
-    }
+    not_found_exception(
+        EXECUTION_NOT_FOUND_MESSAGE,
+        execution_id,
+        EXECUTION_RESOURCE_TYPE,
+    )
 }
 
 /// The message a tagging operation refuses a `ResourceArn` of another account with.
@@ -1226,13 +1246,17 @@ pub fn field_validation_failed(
     }
 }
 
-/// The most a refusal message may run to, in bytes.
+/// The most a value reported in a modelled `GenericString` member may run to, in bytes.
 ///
-/// `ValidationException$Message` is `@length(0, 1024)` (smithy_query shape
-/// `ValidationException`), and that bound counts CHARACTERS — a byte budget bounds those
-/// too, since no character is shorter than a byte, and is what the message's own parts can
-/// be measured in as they are assembled.
-pub(crate) const MESSAGE_LENGTH_LIMIT: usize = 1024;
+/// Every string member of every error shape of this service targets `GenericString`,
+/// `@length(0, 1024)` (smithy_query shape `GenericString`), and that bound counts
+/// CHARACTERS — a byte budget bounds those too, since no character is shorter than a byte,
+/// and is what a value's own parts can be measured in as they are assembled.
+pub(crate) const GENERIC_STRING_LENGTH_LIMIT: usize = 1024;
+
+/// The most a refusal message may run to, in bytes: the bound of the `GenericString` it
+/// is reported in ([`GENERIC_STRING_LENGTH_LIMIT`]).
+pub(crate) const MESSAGE_LENGTH_LIMIT: usize = GENERIC_STRING_LENGTH_LIMIT;
 
 /// How a refusal message quotes the several values it was built from: `items` joined with
 /// `separator` for as many as `budget` bytes admit, and the number of items left unquoted
