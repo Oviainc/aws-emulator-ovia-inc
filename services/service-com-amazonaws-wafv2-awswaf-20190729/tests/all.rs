@@ -61,6 +61,8 @@ mod managed_rule_group_versions;
 mod managed_rule_groups;
 #[path = "all/managed_rule_sets.rs"]
 mod managed_rule_sets;
+#[path = "all/mobile_sdk_release_listing.rs"]
+mod mobile_sdk_release_listing;
 #[path = "all/mobile_sdk_releases.rs"]
 mod mobile_sdk_releases;
 #[path = "all/parameter_validation.rs"]
