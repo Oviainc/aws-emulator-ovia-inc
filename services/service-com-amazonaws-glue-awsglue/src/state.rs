@@ -120,6 +120,10 @@
 //! uniqueness constraint within that one glossary
 //! ([`ComAmazonawsGlueAwsglueState::glossary_term_by_name`]), which is what
 //! `CreateGlossaryTerm`'s modelled `AlreadyExistsException` refuses a second create under.
+//! Which terms an ASSET carries is recorded on the asset instead
+//! ([`AssetEntry::glossary_terms`]), as the set of ids its associations named: the
+//! association is to the id, so the two namespaces are independent and a term deleted
+//! after being associated leaves its id on the asset.
 //!
 //! RESOURCE POLICIES — the IAM policy documents `PutResourcePolicy` attaches to a Glue
 //! resource — sit beside the catalog tree in one per-account namespace keyed by the
@@ -416,6 +420,16 @@ pub const MAX_ASSET_TYPES: usize = 1_000;
 /// `PutAsset` models no limit error, so the refusal is the closest client error it does
 /// model (`InvalidInputException`).
 pub const MAX_ASSETS: usize = 1_000;
+
+/// How many glossary terms one asset can carry: the modelled bound on the member that
+/// REPORTS them, "len 1..10" on `GlossaryTermIdList`
+/// (`smithy_query operation=AssociateGlossaryTerms`), which is the shape both
+/// `AssociateGlossaryTermsResponse$GlossaryTerms` and `GetAssetOutput$GlossaryTerms` target
+/// — so an asset holding more than this many terms could not be reported by either reader,
+/// whatever the input list of one request is allowed to carry. An association that would
+/// leave an asset past it is therefore refused with the closest client error the operation
+/// models (`InvalidInputException`) rather than stored.
+pub const MAX_ASSET_GLOSSARY_TERMS: usize = 10;
 
 /// Ceiling on the business glossaries this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]: `CreateGlossary` writes a record any caller can reach, so the number
@@ -2038,6 +2052,32 @@ impl ComAmazonawsGlueAwsglueState {
         self.form_types.remove(identifier)
     }
 
+    /// The names of the asset types that still reference the form type `form_type` names,
+    /// in this namespace's own order.
+    ///
+    /// An asset type's `Forms` entry holds the form type identifier its put sent, resolved
+    /// against this store when it was stored ([`Self::form_type_by_reference`]), and a form
+    /// type's identifier is its name ([`FormTypeEntry::id`]) — so an entry references this
+    /// form type exactly when it names it. An asset type is reported ONCE however many of
+    /// its entries name the form type, because it is one dependency either way.
+    ///
+    /// This is a LIVE scan of what the store holds now, so an asset type deleted since the
+    /// reference was written is no longer a dependency. One copy, shared, so the delete
+    /// that refuses on a dependency and anything that reports one agree on what a
+    /// reference is.
+    pub fn asset_types_referencing_form_type(&self, form_type: &str) -> Vec<String> {
+        self.asset_types
+            .values()
+            .filter(|asset_type| {
+                asset_type
+                    .forms
+                    .values()
+                    .any(|form_type_identifier| form_type_identifier == form_type)
+            })
+            .map(|asset_type| asset_type.name.clone())
+            .collect()
+    }
+
     /// Whether the store can hold another asset type, i.e. is below [`MAX_ASSET_TYPES`].
     pub fn can_store_asset_type(&self) -> bool {
         self.asset_types.len() < MAX_ASSET_TYPES
@@ -2072,6 +2112,19 @@ impl ComAmazonawsGlueAwsglueState {
             .or_else(|| self.asset_types.get(identifier))
     }
 
+    /// Remove the asset type an `Identifier` targeting `AssetTypeId` names, reporting the
+    /// record that was removed, or `None` when this store holds no such asset type.
+    ///
+    /// The identifier resolves exactly as a read resolves one
+    /// ([`Self::asset_type_by_reference`]), so a delete reaches the record a get of the
+    /// same identifier would report. Only the asset type record is removed: the assets
+    /// that are instances of it record the identifier their own puts sent and are left as
+    /// they stand.
+    pub fn remove_asset_type_by_reference(&mut self, identifier: &str) -> Option<AssetTypeEntry> {
+        let name = self.asset_type_by_reference(identifier)?.name.clone();
+        self.asset_types.remove(&name)
+    }
+
     /// Whether the store can hold another asset, i.e. is below [`MAX_ASSETS`].
     pub fn can_store_asset(&self) -> bool {
         self.assets.len() < MAX_ASSETS
@@ -2090,6 +2143,18 @@ impl ComAmazonawsGlueAwsglueState {
     /// The stored asset an `AssetId` names, mutably.
     pub fn asset_mut(&mut self, identifier: &str) -> Option<&mut AssetEntry> {
         self.assets.get_mut(identifier)
+    }
+
+    /// Remove the asset an `AssetId` names, reporting the record that was removed, or
+    /// `None` when this account holds no asset under that identifier.
+    ///
+    /// The identifier resolves exactly as a read resolves one ([`Self::asset`]) — it is
+    /// this namespace's own key — so a delete reaches the record a get of the same
+    /// identifier would report. The asset's own record is all that is removed: the asset
+    /// type it was an instance of and the glossary terms its associations named are their
+    /// own records in their own namespaces.
+    pub fn remove_asset(&mut self, identifier: &str) -> Option<AssetEntry> {
+        self.assets.remove(identifier)
     }
 
     /// Whether the store can hold another business glossary, i.e. is below
@@ -2156,6 +2221,19 @@ impl ComAmazonawsGlueAwsglueState {
     /// The stored glossary term whose `Id` is `id`, mutably.
     pub fn glossary_term_mut(&mut self, id: &str) -> Option<&mut GlossaryTermEntry> {
         self.glossary_terms.get_mut(id)
+    }
+
+    /// Remove the glossary term whose `Id` is `id`, reporting the record removed and
+    /// `None` when this account holds none under that id.
+    ///
+    /// The one place a term leaves the namespace, resolving the identifier the way
+    /// [`Self::glossary_term`] does — the `GlossaryTermId` is the whole address — so the
+    /// delete and the reads cannot disagree about which record an identifier names. Only
+    /// the term record is removed: an asset an association put this id on keeps it
+    /// ([`AssetEntry::glossary_terms`]), because the association is to the id and the two
+    /// surfaces are not cross-locked.
+    pub fn remove_glossary_term(&mut self, id: &str) -> Option<GlossaryTermEntry> {
+        self.glossary_terms.remove(id)
     }
 
     /// The term carrying this `Name` within the glossary `glossary_id` names, or `None`
@@ -5597,11 +5675,70 @@ pub fn asset_type_not_found_message(identifier: &str) -> String {
 }
 
 /// The message the catalog's asset surface refuses an identifier it holds no asset under
-/// with, for the reason [`asset_type_not_found_message`] is worded the way it is, and
-/// shared by every operation that resolves an `AssetId`
-/// ([`ComAmazonawsGlueAwsglueState::asset`]).
+/// with: the value of that refusal's `EntityNotFoundException$Message`.
+///
+/// Worded the way this surface words a miss, exactly as the form type and business
+/// glossary ones above do ([`form_type_not_found_message`]): the refusal text is itself a
+/// JSON document carrying the sentence under a `Message` key, so that text — braces and
+/// all — is what the modelled member carries. This surface words the sentence the other
+/// way round from those two, naming the resource kind and then the identifier that
+/// resolved to nothing. `serde_json` renders it, so an identifier carrying a quote or a
+/// backslash still yields a well-formed document.
+///
+/// `identifier` is the text's one variable part and is taken from the request.
+///
+/// One copy, shared by every operation that resolves an `AssetId`
+/// ([`ComAmazonawsGlueAwsglueState::asset`]) — the asset's own reader and the glossary
+/// term association that addresses one — so two of them cannot disagree about how the one
+/// miss is worded.
 pub fn asset_not_found_message(identifier: &str) -> String {
-    format!("Asset {identifier} not found")
+    let sentence = format!("Asset not found: {identifier}");
+    serde_json::json!({ "Message": sentence }).to_string()
+}
+
+/// The message the catalog's business glossary surface refuses an identifier it holds no
+/// glossary TERM under with: the value of that refusal's
+/// `EntityNotFoundException$Message`.
+///
+/// Worded the way the glossary itself words a miss ([`glossary_not_found_message`]) — the
+/// refusal text is a JSON document carrying the sentence under a `Message` key — with the
+/// resource named as the service names it, a business glossary term.
+///
+/// `identifier` is the text's one variable part and is taken from the request.
+///
+/// One copy, shared by every operation that resolves a `GlossaryTermId`
+/// ([`ComAmazonawsGlueAwsglueState::glossary_term`]), so two of them cannot disagree about
+/// how the one miss is worded.
+pub fn glossary_term_not_found_message(identifier: &str) -> String {
+    let sentence = format!("Business glossary term {identifier} not found.");
+    serde_json::json!({ "Message": sentence }).to_string()
+}
+
+/// The message the catalog refuses the delete of a form type an ASSET TYPE still
+/// references with: the value of that refusal's `ConflictException$Message`.
+///
+/// Worded the way this surface words a dependency refusal — the text is a JSON document
+/// carrying the sentence under a `Message` key, as every refusal of the metadata form type
+/// surface is ([`form_type_not_found_message`]) — and the sentence names the form type and
+/// then each dependency that holds it, as a catalog type reference: the kind, the asset
+/// namespace of the account the catalog belongs to, and the dependent's own name.
+///
+/// The variable parts come from the request and the store: `form_type_name` is the name of
+/// the form type the request's `Identifier` resolved to, the account is this emulator's,
+/// and `asset_type_names` are the names of the asset types that still reference it, in the
+/// namespace's own order so two refusals of one delete read the same.
+pub fn form_type_dependency_message(form_type_name: &str, asset_type_names: &[String]) -> String {
+    let account_id = ::engine::emulator_account_id();
+    let dependencies = asset_type_names
+        .iter()
+        .map(|asset_type| format!("gluetype glueAsset#glue_{account_id}#{asset_type}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sentence = format!(
+        "Form type {form_type_name} cannot be deleted because of the following \
+         dependencies: {dependencies}"
+    );
+    serde_json::json!({ "Message": sentence }).to_string()
 }
 
 /// A stored asset: one catalog entity `PutAsset` registers as an instance of an asset
@@ -5649,11 +5786,29 @@ pub struct AssetEntry {
     /// provide to ensure the idempotency of the request", so a retry carrying the token of
     /// the put already stored is answered with that record rather than writing it again.
     pub client_token: Option<String>,
+    /// The glossary terms associated with this asset, as the `GlossaryTermId` of each, in
+    /// the order they were first associated.
+    ///
+    /// A SET, held in insertion order: associating a term already held changes nothing, so
+    /// the same association sent twice leaves one entry, and the order two reads report is
+    /// the order the associations happened in. The ids are stored exactly as the
+    /// association sent them and are NOT resolved against the term namespace afterwards,
+    /// because the association is to the id: a term deleted after being associated leaves
+    /// its id on the asset, which is why this is not a list of references into
+    /// [`ComAmazonawsGlueAwsglueState::glossary_terms`]. An asset no association has
+    /// reached holds none, and the list never grows past
+    /// [`MAX_ASSET_GLOSSARY_TERMS`].
+    ///
+    /// A put under an identifier already stored does not touch it: `PutAsset` sets an
+    /// asset's forms and carries no glossary term member at all, so the association
+    /// surface is the only writer.
+    pub glossary_terms: Vec<String>,
 }
 
 impl AssetEntry {
     /// The record a put stores for an identifier this store does not hold yet: the
-    /// request's members, stamped with the instant `now` the put was served at.
+    /// request's members, stamped with the instant `now` the put was served at. A fresh
+    /// asset carries no glossary term: the put models no member to send one with.
     pub fn new(
         id: String,
         asset_type_id: String,
@@ -5672,7 +5827,45 @@ impl AssetEntry {
             created_at: now,
             updated_at: now,
             client_token,
+            glossary_terms: Vec::new(),
         }
+    }
+
+    /// This record's glossary terms as the modelled `GlossaryTermIdList`, which is what
+    /// every operation that reports an asset's associations answers with, or `None` when
+    /// the asset carries none.
+    ///
+    /// An asset with no association reports no list rather than an empty one: the modelled
+    /// list is "len 1..10", so an empty list is not a value this member can carry.
+    pub fn glossary_terms_list(&self) -> Option<Vec<String>> {
+        if self.glossary_terms.is_empty() {
+            None
+        } else {
+            Some(self.glossary_terms.clone())
+        }
+    }
+
+    /// Merge `identifiers` into this asset's glossary term set, reporting the terms the
+    /// asset carries afterwards, or `None` when the merge would take it past
+    /// [`MAX_ASSET_GLOSSARY_TERMS`].
+    ///
+    /// A union, not a replacement: an id the asset already holds keeps its place and is
+    /// not repeated, and an id it does not hold is appended, so the terms an earlier
+    /// association added survive a later one and an association sent twice is the same
+    /// state as sending it once. The bound is checked against the UNION, so re-associating
+    /// terms an asset already holds is served however full it is.
+    pub fn associate_glossary_terms(&mut self, identifiers: &[String]) -> Option<Vec<String>> {
+        let mut merged = self.glossary_terms.clone();
+        for identifier in identifiers {
+            if !merged.iter().any(|held| held == identifier) {
+                merged.push(identifier.clone());
+            }
+        }
+        if merged.len() > MAX_ASSET_GLOSSARY_TERMS {
+            return None;
+        }
+        self.glossary_terms = merged;
+        Some(self.glossary_terms.clone())
     }
 
     /// This record's forms as the modelled `AssetFormMap`, which is what every operation

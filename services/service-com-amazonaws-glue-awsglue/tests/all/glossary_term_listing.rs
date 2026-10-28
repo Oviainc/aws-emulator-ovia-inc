@@ -357,12 +357,24 @@ async fn the_listing_reports_what_the_store_holds_now() {
         "case listed twice: a listing must change nothing, got {again:?} then {before:?}"
     );
 
-    // `DeleteGlossaryTerm` is still a scaffold, so the record is dropped from the store the
-    // listing reads rather than through that operation.
+    // A term the store no longer holds is not listed. The record is dropped through
+    // `DeleteGlossaryTerm`, the operation that owns that removal.
     {
-        let state = engine.state::<ComAmazonawsGlueAwsglueState>();
         let removed = ids.last().expect("three terms were created").clone();
-        state.lock().glossary_terms.remove(&removed);
+        ok(
+            &router,
+            "DeleteGlossaryTerm",
+            &json!({ "Identifier": &removed }),
+        )
+        .await;
+        assert!(
+            !engine
+                .state::<ComAmazonawsGlueAwsglueState>()
+                .lock()
+                .glossary_terms
+                .contains_key(&removed),
+            "case after the delete: the store must no longer hold {removed}"
+        );
     }
 
     let after = listed_names(&ok(

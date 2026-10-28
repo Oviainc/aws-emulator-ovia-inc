@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/asset_deletion.rs"]
+mod asset_deletion;
 #[path = "all/asset_types.rs"]
 mod asset_types;
 #[path = "all/assets.rs"]
@@ -105,6 +107,8 @@ mod get_table_entity_not_found;
 mod glossaries;
 #[path = "all/glossary_deletion.rs"]
 mod glossary_deletion;
+#[path = "all/glossary_term_association.rs"]
+mod glossary_term_association;
 #[path = "all/glossary_term_listing.rs"]
 mod glossary_term_listing;
 #[path = "all/glossary_terms.rs"]
