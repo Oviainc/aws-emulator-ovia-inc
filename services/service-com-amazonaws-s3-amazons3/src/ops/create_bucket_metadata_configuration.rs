@@ -245,22 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // count outside the published range reaches this handler, and a value that is not
         // valid for the parameter carrying it is what `InvalidArgument` (HTTP 400) reports.
         // Checked wherever a `RecordExpiration` is carried, which on this operation is the
-        // journal table's own.
-        if let Some(days) = configuration.journal_table_configuration.record_expiration.days {
-            if !(crate::state::MIN_METADATA_RECORD_EXPIRATION_DAYS
-                ..=crate::state::MAX_METADATA_RECORD_EXPIRATION_DAYS)
-                .contains(&days)
-            {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::INVALID_ARGUMENT_CODE,
-                    crate::state::INVALID_ARGUMENT_STATUS,
-                    format!(
-                        "RecordExpiration.Days must be a whole number from {} to {}, got {days}",
-                        crate::state::MIN_METADATA_RECORD_EXPIRATION_DAYS,
-                        crate::state::MAX_METADATA_RECORD_EXPIRATION_DAYS
-                    ),
-                ));
-            }
+        // journal table's own — the shared rule, so this create and the update that changes
+        // the same setting judge it identically.
+        if let Some(message) = crate::state::metadata_record_expiration_refusal(
+            &configuration.journal_table_configuration.record_expiration,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                message,
+            ));
         }
 
         // "If server-side encryption with Key Management Service (KMS) keys (SSE-KMS) is

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBucketMetadataJournalTableConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBucketMetadataJournalTableConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enables or disables journal table record expiration for the S3 Metadata
+//! configuration the named general purpose bucket carries. The `RecordExpiration` the
+//! request carries is the whole of its payload
+//! (`JournalTableConfigurationUpdates$RecordExpiration` is that shape's one, required
+//! member), so it replaces the settings the configuration carried and
+//! `GetBucketMetadataConfiguration` reports it from then on. Nothing else moves: the journal
+//! table itself — which every configuration has, so this neither creates nor drops one — its
+//! name and status, and the inventory and annotation tables, are left exactly as they were.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBucketMetadataJournalTableConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404), one carrying no
+//! metadata configuration [`crate::state::NO_SUCH_CONFIGURATION_CODE`] (HTTP 404), an
+//! `x-amz-expected-bucket-owner` that is not this account's HTTP 403 `AccessDenied`, and a
+//! retention outside the published day range `InvalidArgument` (HTTP 400) with nothing
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -114,9 +119,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UpdateBucketMetadataJour
 // here — hence the `UpdateBucketMetadataJournalTableConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#UpdateBucketMetadataJournalTableConfiguration")]
+// Widened by `NoSuchBucket`: the model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="UpdateBucketMetadataJournalTableConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped operation
+// does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#UpdateBucketMetadataJournalTableConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum UpdateBucketMetadataJournalTableConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -170,18 +186,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBucketMetadataJournalTableConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBucketMetadataJournalTableConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Everything this write needs is in its deserialized input: the expected owner and
+        // the configuration updates travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The expected owner of the general purpose bucket that corresponds to the metadata
+        // table configuration that you want to enable or disable journal table record
+        // expiration for"
+        // (`UpdateBucketMetadataJournalTableConfigurationRequest$ExpectedBucketOwner`),
+        // judged the way every other bucket-scoped operation in this crate judges it: this
+        // emulator serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and this
+            // operation models no server-fault error to say so, so the scaffold's 501
+            // carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateBucketMetadataJournalTableConfiguration",
+            ));
+        };
+
+        // Refused BEFORE anything is written, so a refused update leaves the configuration
+        // expiring its journal records exactly as it did: the one rule every request carrying
+        // a `RecordExpiration` is judged by, shared with the create that settles the journal
+        // table in the first place.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBucketMetadataJournalTableConfiguration"))
+        // `ContentMD5` is NOT verified, and `ChecksumAlgorithm` not acted on: by the time
+        // this handler runs the payload is the deserialized container rather than the bytes a
+        // digest was computed over, so nothing this handler holds can confirm or deny either.
+        // That is where every other bucket-subresource write in this crate leaves them.
+        if let Some(message) = crate::state::metadata_record_expiration_refusal(
+            &input.journal_table_configuration.record_expiration,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_ARGUMENT_CODE,
+                crate::state::INVALID_ARGUMENT_STATUS,
+                message,
+            ));
+        }
+
+        // The bucket is looked up FIRST, so a request naming a bucket this emulator does not
+        // hold answers that rather than reporting whatever is wrong with the state of a
+        // bucket that does not exist (the order every other bucket-subresource write in this
+        // crate keeps).
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(
+                UpdateBucketMetadataJournalTableConfigurationErrorModeled::NoSuchBucket(
+                    NoSuchBucket {},
+                )
+                .into(),
+            );
+        };
+        // "Enables or disables journal table record expiration for an S3 Metadata
+        // configuration on a general purpose bucket" (this operation's own documentation):
+        // the journal table belongs to a metadata configuration, so a bucket carrying none
+        // has no records to expire and the request names a configuration that is not there —
+        // the answer every other call on a subresource the bucket does not carry gives, with
+        // nothing written.
+        if !bucket.update_metadata_journal_record_expiration(
+            input.journal_table_configuration.record_expiration.clone(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_CONFIGURATION_CODE,
+                crate::state::NO_SUCH_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_CONFIGURATION_MESSAGE,
+            ));
+        }
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(UpdateBucketMetadataJournalTableConfigurationOutput)
     }
 }
+
+/// The code S3 answers a request whose `x-amz-expected-bucket-owner` is not the owner of
+/// the bucket it names, the way every other bucket-scoped operation in this crate answers
+/// it. Not a shape in this model, so it goes out through the unmodelled channel.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`] — the status an owner mismatch is answered with: "403
+/// Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
