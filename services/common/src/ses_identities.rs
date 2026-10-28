@@ -15,9 +15,10 @@
 //! So the set lives HERE, once in the shared engine, rather than in each surface's
 //! own store: a surface PUBLISHES the identities it records and ADOPTS the ones it
 //! does not hold yet, and each keeps beside that only what its own API adds (the
-//! classic surface's sending-authorization policies, Easy DKIM setup and
-//! notification topics; the v2 surface's DKIM attributes, tags and certificate
-//! associations).
+//! classic surface's sending-authorization policies and notification topics; the v2
+//! surface's tags and certificate associations). What makes an identity the one the
+//! account holds is carried here too — its verification, and the Easy DKIM setup
+//! ([`SesDkimSetup`]) whose tokens its owner publishes in DNS.
 //!
 //! Nothing here names a wire shape. The registry holds the identity as its creator
 //! spelled it, which class of identity it is, the verification state and the instant
@@ -95,6 +96,26 @@ pub enum SesVerificationState {
     NotStarted,
 }
 
+/// The Easy DKIM setup one identity of the account holds.
+///
+/// DKIM keys are published for an IDENTITY, not for an API: the tokens the owner puts
+/// in the domain's DNS, whether the service has found them there, and whether messages
+/// from the identity are signed are facts about the account's identity. So they are
+/// carried HERE beside it, and a surface that adopts the identity reports the setup the
+/// account holds rather than one of its own making — a client that published the records
+/// one API handed it reads those same records back from the others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SesDkimSetup {
+    /// Whether messages sent from the identity are DKIM-signed.
+    pub signing_enabled: bool,
+    /// Where the search for the published records stands, in the same value set the
+    /// identity's own verification uses ([`SesVerificationState`]); each surface spells
+    /// it onto the shape its own model declares.
+    pub status: SesVerificationState,
+    /// The tokens the identity's owner publishes, in the order they were generated.
+    pub tokens: Vec<String>,
+}
+
 /// One identity the account holds, as the registry records it.
 #[derive(Debug, Clone)]
 pub struct SesIdentityRecord {
@@ -120,6 +141,13 @@ pub struct SesIdentityRecord {
     /// answers the value the owner was told to publish. `None` for an address
     /// identity, which has no DNS record to publish.
     pub verification_token: Option<String>,
+    /// The Easy DKIM setup the account holds for this identity ([`SesDkimSetup`]), and
+    /// `None` while no setup has been asked for.
+    ///
+    /// Recorded once, by whichever surface set Easy DKIM up, and reported by all of
+    /// them: the tokens an owner has already published stay the tokens every API
+    /// answers with.
+    pub dkim: Option<SesDkimSetup>,
 }
 
 impl SesIdentityRecord {
@@ -137,6 +165,9 @@ impl SesIdentityRecord {
             verification,
             verification_due,
             verification_token: None,
+            // Easy DKIM is set up by a call of its own, so an identity whose
+            // verification has only just been requested holds no setup yet.
+            dkim: None,
         }
     }
 
@@ -200,6 +231,13 @@ impl SesIdentityDirectory {
             Some(held) => {
                 held.verification = record.verification;
                 held.verification_due = record.verification_due;
+                // The Easy DKIM setup is the account identity's, so a publisher that
+                // holds one is reporting the account's and the registry takes it; one
+                // that holds none — a surface whose API never set DKIM up for the
+                // identity — must not erase the setup another surface recorded.
+                if let Some(dkim) = record.dkim {
+                    held.dkim = Some(dkim);
+                }
             }
             None => {
                 if self.identities.len() >= MAX_REGISTERED_IDENTITIES {
@@ -322,8 +360,29 @@ impl SesIdentityDirectory {
                 .map(|record| (R::table_key(&record.name), R::adopt(record, now)))
                 .collect();
             for (key, record) in adopted {
+                // A surface whose own API gives every identity of this class an Easy
+                // DKIM setup has just built one for an identity the account holds no
+                // setup for. The setup belongs to the identity, so the registry takes
+                // it and every other surface answers with those same tokens.
+                if let Some(setup) = record.published().dkim {
+                    self.adopt_dkim(record.identity_name(), setup);
+                }
                 table.insert(key, record);
             }
+        }
+    }
+
+    /// Record `setup` as the identity `name`'s Easy DKIM setup, unless the account
+    /// already holds one for it.
+    ///
+    /// The first setup stands: the tokens an owner has been handed are the records it
+    /// publishes, so nothing replaces them behind its back.
+    fn adopt_dkim(&mut self, name: &str, setup: SesDkimSetup) {
+        let Some(held) = self.identities.get_mut(&identity_key(name)) else {
+            return;
+        };
+        if held.dkim.is_none() {
+            held.dkim = Some(setup);
         }
     }
 
@@ -346,12 +405,12 @@ impl SesIdentityDirectory {
 /// [`SesIdentityDirectory::reconcile`] reaches it.
 ///
 /// Each API over the account's identities keeps, beside the registry, what IT adds to
-/// an identity — the classic SES surface's sending-authorization policies, Easy DKIM
-/// setup and notification topics; the v2 surface's DKIM attributes, tags and
-/// certificate associations. This trait is the little each of those records has to
-/// answer for the reconciliation to be written once: how its table is keyed, which
-/// identity it is for, whether the registry carries it yet, how the registry carries
-/// it, and how to make one from a registry record.
+/// an identity — the classic SES surface's sending-authorization policies and
+/// notification topics; the v2 surface's tags and certificate associations. This trait
+/// is the little each of those records has to answer for the reconciliation to be
+/// written once: how its table is keyed, which identity it is for, whether the registry
+/// carries it yet, how the registry carries it, and how to make one from a registry
+/// record.
 pub trait AccountIdentityRecord: Sized {
     /// The key this surface's own table holds the identity `name` under.
     ///
@@ -374,7 +433,8 @@ pub trait AccountIdentityRecord: Sized {
     fn mark_registered(&mut self, published: &SesIdentityRecord);
 
     /// How the registry carries this record: the identity as it was recorded, its
-    /// class, and the verification this surface holds for it.
+    /// class, the verification this surface holds for it, and the Easy DKIM setup it
+    /// holds for it ([`SesDkimSetup`]).
     fn published(&self) -> SesIdentityRecord;
 
     /// This surface's record of an identity the registry holds and it does not.

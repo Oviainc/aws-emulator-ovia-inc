@@ -45,6 +45,8 @@ mod ses_custom_verification_email_send;
 mod ses_custom_verification_email_template_creation;
 #[path = "all/ses_custom_verification_email_templates.rs"]
 mod ses_custom_verification_email_templates;
+#[path = "all/ses_custom_verification_template_sender_gate.rs"]
+mod ses_custom_verification_template_sender_gate;
 #[path = "all/ses_delete_receipt_rule.rs"]
 mod ses_delete_receipt_rule;
 #[path = "all/ses_identity_dkim.rs"]

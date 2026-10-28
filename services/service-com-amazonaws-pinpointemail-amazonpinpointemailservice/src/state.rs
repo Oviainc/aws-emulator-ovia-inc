@@ -187,6 +187,15 @@ impl EmailIdentityRecord {
 
         let mut adopted = Self::new(&record.name, now);
         adopted.registered = true;
+        // Easy DKIM is set up for the ACCOUNT's identity: when the account already
+        // holds a setup for this one — recorded through another of its email APIs —
+        // the record is adopted with THOSE tokens, the records the owner publishes,
+        // rather than with a second set of this API's own making.
+        if let (Some(shared), Some(dkim)) = (record.dkim.as_ref(), adopted.dkim.as_mut()) {
+            dkim.signing_enabled = shared.signing_enabled;
+            dkim.status = Some(service_dkim_status(shared.status).to_string());
+            dkim.tokens = Some(shared.tokens.clone());
+        }
         match record.verification {
             // Verified: the same three facts this service writes itself when a
             // verification falls due.
@@ -446,11 +455,14 @@ impl ::service_common::ses_identities::AccountIdentityRecord for EmailIdentityRe
 }
 
 /// How the account registry carries the identity `record`: the identity as it was
-/// created, its class, and the verification this service holds for it.
+/// created, its class, the verification this service holds for it, and the Easy DKIM
+/// setup it holds for it.
 pub fn registry_record(
     record: &EmailIdentityRecord,
 ) -> ::service_common::ses_identities::SesIdentityRecord {
-    use ::service_common::ses_identities::{SesIdentityKind, SesIdentityRecord, SesVerificationState};
+    use ::service_common::ses_identities::{
+        SesDkimSetup, SesIdentityKind, SesIdentityRecord, SesVerificationState,
+    };
 
     SesIdentityRecord {
         name: record.identity_name.clone(),
@@ -469,5 +481,47 @@ pub fn registry_record(
         // operation of this surface reports it, and the registry mints it once so the
         // surface whose model carries one answers a stable value for the identity.
         verification_token: None,
+        // The Easy DKIM setup belongs to the account's identity rather than to this
+        // API, so the setup generated here — the tokens the owner publishes as CNAME
+        // records, where the search for them stands, and whether messages from the
+        // identity are signed — is published for every API over these identities to
+        // report.
+        dkim: record.dkim.as_ref().map(|dkim| SesDkimSetup {
+            signing_enabled: dkim.signing_enabled,
+            status: registry_dkim_state(dkim.status.as_deref()),
+            tokens: dkim.tokens.clone().unwrap_or_default(),
+        }),
+    }
+}
+
+/// The registry's spelling of a stored `DkimStatus`.
+///
+/// This surface writes two of the model's values (`DKIM_STATUS_PENDING` and
+/// `DKIM_STATUS_SUCCESS`): a setup is waiting for the records it told the caller to
+/// publish until they have been found.
+fn registry_dkim_state(
+    status: Option<&str>,
+) -> ::service_common::ses_identities::SesVerificationState {
+    use ::service_common::ses_identities::SesVerificationState;
+
+    match status {
+        Some(DKIM_STATUS_SUCCESS) => SesVerificationState::Success,
+        _ => SesVerificationState::Pending,
+    }
+}
+
+/// This surface's spelling of a registry Easy DKIM status, out of the model's
+/// `DkimStatus` value set (`shared_types::DKIM_STATUS_VALUES`).
+fn service_dkim_status(
+    status: ::service_common::ses_identities::SesVerificationState,
+) -> &'static str {
+    use ::service_common::ses_identities::SesVerificationState;
+
+    match status {
+        SesVerificationState::Pending => DKIM_STATUS_PENDING,
+        SesVerificationState::Success => DKIM_STATUS_SUCCESS,
+        SesVerificationState::Failed => "FAILED",
+        SesVerificationState::TemporaryFailure => "TEMPORARY_FAILURE",
+        SesVerificationState::NotStarted => "NOT_STARTED",
     }
 }

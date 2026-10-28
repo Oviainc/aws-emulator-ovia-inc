@@ -153,6 +153,26 @@ pub(crate) fn pairs_of(xml: &str, key: &str, value: &str) -> BTreeMap<String, St
         .collect()
 }
 
+/// Each `<entry>` block of an awsQuery answer's MAP, as `(key, the value block)`.
+///
+/// The serializer writes a map as `<entry><key>…</key><value>…</value></entry>`, with the
+/// first entry (and the first member inside it) carrying the service's namespace
+/// attribute, so both halves are read through [`block_of`] rather than by tag text. Here
+/// for the same reason as [`pairs_of`]: each pair is read from the entry that carries
+/// BOTH, so an entry missing one half contributes nothing instead of misaligning the rest.
+pub(crate) fn entries_of(xml: &str) -> Vec<(String, &str)> {
+    xml.split("<entry")
+        .skip(1)
+        .filter_map(|block| block.split_once('>'))
+        .filter_map(|(_, body)| body.split("</entry>").next())
+        .filter_map(|entry| {
+            let key = block_of(entry, "key")?.to_string();
+            let value = block_of(entry, "value")?;
+            Some((key, value))
+        })
+        .collect()
+}
+
 /// A `DescribeStacks` answer's `Outputs`, as the key/value map a client reads it as.
 pub(crate) fn outputs_of(xml: &str) -> BTreeMap<String, String> {
     pairs_of(xml, "OutputKey", "OutputValue")

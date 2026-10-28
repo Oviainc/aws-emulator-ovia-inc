@@ -177,6 +177,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         record.dkim_enabled = input.dkim_enabled;
 
+        // Whether SES signs messages from the identity is a fact about the
+        // ACCOUNT's identity, not about this API, so the account's identity
+        // registry takes the new value too and every other surface over those
+        // identities reports it. Published after this service's own store is
+        // released, which keeps this service's lock order (its store, then the
+        // registry).
+        drop(state);
+        crate::state::publish_identity(&*self.engine, &identity);
+
         // `SetIdentityDkimEnabledResponse` has no members: what the call
         // produced is the state it wrote, which `GetIdentityDkimAttributes`
         // reports.

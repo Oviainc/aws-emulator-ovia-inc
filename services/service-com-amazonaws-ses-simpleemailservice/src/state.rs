@@ -702,6 +702,12 @@ pub struct Identity {
     /// `VerifyDomainDkim` records it and `GetIdentityDkimAttributes` reports it.
     /// `None` is Easy DKIM NEVER SET UP for the identity, which is how every
     /// identity starts.
+    ///
+    /// Easy DKIM is set up for the ACCOUNT's identity, so the setup here is the one
+    /// the account's identity registry carries
+    /// ([`::service_common::ses_identities::SesDkimSetup`]) whenever another API over
+    /// those identities recorded it: one identity, one set of tokens its owner
+    /// publishes, whichever API handed them out.
     pub dkim: Option<EasyDkimSettings>,
     /// Whether DKIM signing is on for email sent from this identity, as
     /// `SetIdentityDkimEnabled` writes it and
@@ -1218,9 +1224,18 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// setup keeps it, so asking again answers with the same tokens — the
     /// records a caller has already published stay the ones the service reports.
     ///
+    /// `held` is the setup the ACCOUNT already holds for the domain, when another
+    /// API over the account's identities recorded one: Easy DKIM is set up for the
+    /// identity rather than per API, so the tokens its owner publishes are those and
+    /// this call stores and answers with them instead of minting a second set.
+    ///
     /// `None` when the list already holds [`MAX_IDENTITIES`] identities and this
     /// is a new one, which is the ceiling [`Self::verify_identity`] applies.
-    pub fn request_easy_dkim(&mut self, domain: &str) -> Option<Vec<String>> {
+    pub fn request_easy_dkim(
+        &mut self,
+        domain: &str,
+        held: Option<EasyDkimSettings>,
+    ) -> Option<Vec<String>> {
         self.verify_identity(domain, IdentityType::Domain)?;
         if let Some(stored) = self
             .identities
@@ -1229,13 +1244,20 @@ impl ComAmazonawsSesSimpleemailserviceState {
         {
             return Some(stored.tokens.clone());
         }
-        // Minted only for a domain that is about to be given a setup, so asking
-        // again never generates a second set of tokens for one domain.
-        let tokens: Vec<String> = (0..EASY_DKIM_TOKEN_COUNT)
-            .map(|_| self.new_dkim_token())
-            .collect();
+        // Minted only for a domain that is about to be given a setup and that the
+        // account holds no setup for, so asking again never generates a second set
+        // of tokens for one domain.
+        let setup = match held {
+            Some(held) => held,
+            None => EasyDkimSettings::pending(
+                (0..EASY_DKIM_TOKEN_COUNT)
+                    .map(|_| self.new_dkim_token())
+                    .collect(),
+            ),
+        };
+        let tokens = setup.tokens.clone();
         let identity = self.identities.get_mut(domain)?;
-        identity.dkim = Some(EasyDkimSettings::pending(tokens.clone()));
+        identity.dkim = Some(setup);
         Some(tokens)
     }
 
@@ -1355,11 +1377,11 @@ impl ComAmazonawsSesSimpleemailserviceState {
     /// itself, or any domain suffix of it — whatever verification state the
     /// list holds for that identity.
     ///
-    /// The weaker reading of a sender, and the one a request that only RECORDS
-    /// an address is read against: the account has asked SES about the address,
-    /// which a verification that has not completed is still evidence of, while
-    /// whether that verification succeeded is read where a message is actually
-    /// sent ([`Self::is_verified_sender`]). Both readings walk the same names
+    /// The weaker reading of a sender: the account has asked SES about the
+    /// address, which a verification that has not completed is still evidence of,
+    /// while whether the address is ELIGIBLE TO SEND is
+    /// [`Self::is_verified_sender`] — which is what every operation that gates on
+    /// a sender reads. Both readings walk the same names
     /// ([`sender_identity_names`]), so an identity for a domain covers the
     /// mailboxes in it and in its subdomains here too.
     pub fn holds_sending_identity(&self, address: &str) -> bool {
@@ -2847,6 +2869,10 @@ pub fn record_identity<Eng: Send + Sync + 'static>(
 /// identities associated with your account": the same list, and the same publication,
 /// as [`record_identity`].
 ///
+/// The tokens are the ACCOUNT's: a domain the account already holds an Easy DKIM setup
+/// for — because another API over its identities recorded one — keeps that setup, so
+/// every surface answers with the records the owner was told to publish.
+///
 /// `None` when this account is already at its identity limit and the domain is a new
 /// identity, or when the engine has no store for this service.
 pub fn record_easy_dkim<Eng: Send + Sync + 'static>(
@@ -2857,7 +2883,17 @@ pub fn record_easy_dkim<Eng: Send + Sync + 'static>(
     let registry = identity_registry(engine)?;
     let mut state = state.lock();
     let mut registry = registry.lock();
-    let tokens = state.request_easy_dkim(domain)?;
+    // The setup the ACCOUNT already holds for the domain, when another API over its
+    // identities recorded one: its tokens are the records the owner publishes, so
+    // this call answers with them rather than with a second set.
+    let held = registry
+        .get(domain)
+        .and_then(|record| record.dkim.as_ref())
+        .map(|shared| EasyDkimSettings {
+            tokens: shared.tokens.clone(),
+            status: service_status(shared.status),
+        });
+    let tokens = state.request_easy_dkim(domain, held)?;
     let recorded = state.identities.get(identity_key(domain))?.clone();
     let published = registry.publish(registry_record(&recorded))?.clone();
     let held = state.identities.get_mut(identity_key(domain))?;
@@ -2882,6 +2918,29 @@ pub fn forget_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
     let mut registry = registry.lock();
     state.identities.remove(identity_key(name));
     registry.forget(name);
+}
+
+/// Publish the identity `name` as this service now holds it — its verification and its
+/// Easy DKIM setup — to the account's identity registry, so every other API over the
+/// account's identities reports what this one last wrote.
+///
+/// What an operation that CHANGES a shared fact about an identity calls once it has
+/// written it. Changes nothing when the account holds no such identity, and writes
+/// nothing but the registry's record of it.
+pub fn publish_identity<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
+    let Some(state) = service_state(engine) else {
+        return;
+    };
+    let Some(registry) = identity_registry(engine) else {
+        return;
+    };
+    // The lock order of this service: its own store, then the registry.
+    let state = state.lock();
+    let mut registry = registry.lock();
+    let Some(held) = state.identities.get(identity_key(name)) else {
+        return;
+    };
+    registry.publish(registry_record(held));
 }
 
 /// The account's identity registry in the shared engine, which this service and the
@@ -2945,6 +3004,15 @@ impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
         // surfaces report the one value, and it is stored here so every later read of
         // this record answers the same.
         self.verification_token = published.verification_token.clone();
+        // The account may already hold an Easy DKIM setup for the identity, recorded
+        // through another API over these identities, and its tokens are the records the
+        // owner publishes: this record takes them rather than reporting none.
+        if self.dkim.is_none() {
+            self.dkim = published.dkim.as_ref().map(|shared| EasyDkimSettings {
+                tokens: shared.tokens.clone(),
+                status: service_status(shared.status),
+            });
+        }
     }
 
     fn published(&self) -> ::service_common::ses_identities::SesIdentityRecord {
@@ -2957,7 +3025,7 @@ impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
         published: &::service_common::ses_identities::SesIdentityRecord,
         now: SystemTime,
     ) -> Self {
-        use ::service_common::ses_identities::SesIdentityKind;
+        use ::service_common::ses_identities::{SesIdentityKind, SesVerificationState};
 
         Identity {
             name: published.name.clone(),
@@ -2967,13 +3035,34 @@ impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
             },
             verification_status: service_status(published.verification),
             verification_token: published.verification_token.clone(),
-            // Easy DKIM is set up by `VerifyDomainDkim`, notification topics by
-            // `SetIdentityNotificationTopic`, a custom MAIL FROM domain by
-            // `SetIdentityMailFromDomain` and a policy by `PutIdentityPolicy`: an
-            // identity recorded elsewhere has had none of them asked for, so it starts
-            // where every identity of this surface starts.
-            dkim: None,
-            dkim_enabled: DKIM_SIGNING_AT_IDENTITY_START,
+            // Easy DKIM is set up for the ACCOUNT's identity, so an identity recorded
+            // through another API over these identities is adopted with the setup the
+            // account holds for it — the tokens its owner publishes and where the
+            // search for them stands — and with none when no setup was ever asked for.
+            //
+            // Notification topics are set by `SetIdentityNotificationTopic`, a custom
+            // MAIL FROM domain by `SetIdentityMailFromDomain` and a policy by
+            // `PutIdentityPolicy`: an identity recorded elsewhere has had none of them
+            // asked for, so each starts where every identity of this surface starts it.
+            dkim: published.dkim.as_ref().map(|shared| EasyDkimSettings {
+                tokens: shared.tokens.clone(),
+                // An identity whose verification succeeded is one whose published
+                // records the service has read, so a setup still waiting on them is
+                // no longer — the rule every surface over these identities applies
+                // when it adopts one.
+                status: match (shared.status, published.verification) {
+                    (SesVerificationState::Pending, SesVerificationState::Success) => {
+                        VerificationStatus::Success
+                    }
+                    (status, _) => service_status(status),
+                },
+            }),
+            dkim_enabled: published
+                .dkim
+                .as_ref()
+                .map_or(DKIM_SIGNING_AT_IDENTITY_START, |shared| {
+                    shared.signing_enabled
+                }),
             notifications: NotificationSettings::default(),
             mail_from: None,
             policies: BTreeMap::new(),
@@ -2989,11 +3078,12 @@ impl ::service_common::ses_identities::AccountIdentityRecord for Identity {
 }
 
 /// How the account registry carries the identity `identity`: the identity as it was
-/// recorded, its class, and the verification this service holds for it.
+/// recorded, its class, the verification this service holds for it, and the Easy DKIM
+/// setup it holds for it.
 pub fn registry_record(
     identity: &Identity,
 ) -> ::service_common::ses_identities::SesIdentityRecord {
-    use ::service_common::ses_identities::{SesIdentityKind, SesIdentityRecord};
+    use ::service_common::ses_identities::{SesDkimSetup, SesIdentityKind, SesIdentityRecord};
 
     SesIdentityRecord {
         name: identity.name.clone(),
@@ -3004,6 +3094,15 @@ pub fn registry_record(
         verification: registry_state(identity.verification_status),
         verification_due: identity.verification_due,
         verification_token: identity.verification_token.clone(),
+        // The Easy DKIM setup belongs to the account's identity rather than to this
+        // API, so what `VerifyDomainDkim` recorded here is published for every surface
+        // over these identities to report: the tokens the owner publishes, where the
+        // search for them stands, and whether messages from the identity are signed.
+        dkim: identity.dkim.as_ref().map(|dkim| SesDkimSetup {
+            signing_enabled: identity.dkim_enabled,
+            status: registry_state(dkim.status),
+            tokens: dkim.tokens.clone(),
+        }),
     }
 }
 

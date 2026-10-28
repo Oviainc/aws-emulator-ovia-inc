@@ -16,10 +16,12 @@
 //! [`::service_common::ses_identities::SesIdentityDirectory`] and which the classic
 //! SES surface publishes to and reads as well: an identity belongs to the account
 //! rather than to the API that created it. What a record here adds to that set is what
-//! THIS API adds to an identity — its DKIM configuration, its tags, its default
-//! configuration set, its certificate associations — and [`reconcile_identities`] is
-//! where the two are brought back into agreement, on every operation this service
-//! serves.
+//! THIS API adds to an identity — how its model spells its DKIM configuration, its
+//! tags, its default configuration set, its certificate associations — and
+//! [`reconcile_identities`] is where the two are brought back into agreement, on every
+//! operation this service serves. The Easy DKIM setup itself is the account identity's
+//! ([`::service_common::ses_identities::SesDkimSetup`]): the tokens an owner publishes
+//! are the same records whichever API handed them out.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1977,12 +1979,22 @@ impl EmailIdentityRecord {
             SesIdentityKind::EmailAddress => IdentityKind::EmailAddress,
             SesIdentityKind::Domain => IdentityKind::Domain,
         };
-        // The DKIM configuration `CreateEmailIdentity` gives an identity whose request
-        // carries no `DkimSigningAttributes`: Easy DKIM for a domain, nothing for an
-        // address.
-        let dkim = match kind {
-            IdentityKind::Domain => DkimState::easy_dkim(&identity_key(&record.name), None),
-            IdentityKind::EmailAddress => DkimState::not_started(),
+        // The DKIM configuration this record is adopted with. Easy DKIM is set up for
+        // the ACCOUNT's identity, so an identity the account already holds a setup for
+        // — recorded through another API over its identities — is adopted with THAT
+        // setup, whose tokens are the records its owner publishes; otherwise it is the
+        // configuration `CreateEmailIdentity` gives an identity whose request carries
+        // no `DkimSigningAttributes`: Easy DKIM for a domain, nothing for an address.
+        let dkim = match (record.dkim.as_ref(), kind) {
+            (Some(shared), _) => {
+                let mut dkim = DkimState::easy_dkim(&identity_key(&record.name), None);
+                dkim.signing_enabled = shared.signing_enabled;
+                dkim.status = adopted_status(shared.status);
+                dkim.tokens = shared.tokens.clone();
+                dkim
+            }
+            (None, IdentityKind::Domain) => DkimState::easy_dkim(&identity_key(&record.name), None),
+            (None, IdentityKind::EmailAddress) => DkimState::not_started(),
         };
         let mut adopted = Self::new(&record.name, kind, dkim, now);
         adopted.registered = true;
@@ -4638,11 +4650,12 @@ impl ::service_common::ses_identities::AccountIdentityRecord for EmailIdentityRe
 }
 
 /// How the account registry carries the identity `record`: the identity as it was
-/// created, its class, and the verification this service holds for it.
+/// created, its class, the verification this service holds for it, and the Easy DKIM
+/// setup it holds for it.
 pub fn registry_record(
     record: &EmailIdentityRecord,
 ) -> ::service_common::ses_identities::SesIdentityRecord {
-    use ::service_common::ses_identities::{SesIdentityKind, SesIdentityRecord, SesVerificationState};
+    use ::service_common::ses_identities::{SesDkimSetup, SesIdentityKind, SesIdentityRecord};
 
     SesIdentityRecord {
         name: record.name.clone(),
@@ -4650,13 +4663,7 @@ pub fn registry_record(
             IdentityKind::EmailAddress => SesIdentityKind::EmailAddress,
             IdentityKind::Domain => SesIdentityKind::Domain,
         },
-        verification: match record.verification_status {
-            SesStatus::Pending => SesVerificationState::Pending,
-            SesStatus::Success => SesVerificationState::Success,
-            SesStatus::NotStarted => SesVerificationState::NotStarted,
-            SesStatus::Failed => SesVerificationState::Failed,
-            SesStatus::TemporaryFailure => SesVerificationState::TemporaryFailure,
-        },
+        verification: registry_state(record.verification_status),
         // A verification nothing owes a move to — one that can never complete, or one
         // adopted in a state the account owes none to — carries no due instant, so no
         // reader of the registry completes a verification nothing was waiting on.
@@ -4668,6 +4675,36 @@ pub fn registry_record(
         // operation of this surface reports it, and the registry mints it once so the
         // classic surface answers one stable value for the identity.
         verification_token: None,
+        // The Easy DKIM setup belongs to the account's identity rather than to this
+        // API, so the setup SES generated here — the tokens the owner publishes as
+        // CNAME records, where the search for them stands, and whether messages from
+        // the identity are signed — is published for every surface over these
+        // identities to report. An identity SES generated no token set for carries no
+        // setup to share: one with no DKIM configuration at all, and one whose keys the
+        // caller owns (BYODKIM), whose stored token is a selector rather than records
+        // another API could report.
+        dkim: (record.dkim.origin == DkimOrigin::AwsSes && !record.dkim.tokens.is_empty()).then(
+            || SesDkimSetup {
+                signing_enabled: record.dkim.signing_enabled,
+                status: registry_state(record.dkim.status),
+                tokens: record.dkim.tokens.clone(),
+            },
+        ),
+    }
+}
+
+/// The registry's spelling of one of this service's statuses.
+fn registry_state(
+    status: SesStatus,
+) -> ::service_common::ses_identities::SesVerificationState {
+    use ::service_common::ses_identities::SesVerificationState;
+
+    match status {
+        SesStatus::Pending => SesVerificationState::Pending,
+        SesStatus::Success => SesVerificationState::Success,
+        SesStatus::NotStarted => SesVerificationState::NotStarted,
+        SesStatus::Failed => SesVerificationState::Failed,
+        SesStatus::TemporaryFailure => SesVerificationState::TemporaryFailure,
     }
 }
 
