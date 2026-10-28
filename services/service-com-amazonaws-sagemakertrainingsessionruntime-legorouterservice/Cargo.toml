@@ -30,5 +30,12 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
-[lints]
-workspace = true
+[lints.rust]
+# As the workspace sets for every crate.
+unsafe_code = "forbid"
+
+# The session queue reads the two outcomes of a release as a `match`, which is how the
+# store's own comments explain it; the shorter form clippy asks for changes nothing a
+# caller sees, so this crate keeps the `match` and turns that lint off here.
+[lints.clippy]
+question_mark = "allow"

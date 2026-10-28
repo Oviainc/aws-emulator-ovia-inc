@@ -203,6 +203,10 @@ mod capacity_blocks;
 // starts.
 #[path = "all/capacity_manager.rs"]
 mod capacity_manager;
+// What `GetCapacityManagerAttributes` reports about those settings: every member of the
+// result, over the account histories behind it and the Regions it is asked for in.
+#[path = "all/capacity_manager_attributes.rs"]
+mod capacity_manager_attributes;
 #[path = "all/capacity_reservation_billing_requests.rs"]
 mod capacity_reservation_billing_requests;
 #[path = "all/capacity_reservation_fleets.rs"]
