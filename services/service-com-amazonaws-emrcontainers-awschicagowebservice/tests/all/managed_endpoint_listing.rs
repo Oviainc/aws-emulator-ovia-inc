@@ -102,6 +102,41 @@ pub(crate) fn described(body: &Value, case: &str) -> Value {
     field(body, "/endpoint", case).clone()
 }
 
+/// The whole record `DescribeManagedEndpoint` answers with for one endpoint.
+///
+/// This and the three helpers below are the ones every endpoint suite reads a stored
+/// endpoint through, so no suite carries its own copy of them.
+pub(crate) async fn endpoint_record(emr: &Emr, cluster: &str, id: &str, case: &str) -> Value {
+    let answer = describe_endpoint(emr, cluster, id).await;
+    described(answer.ok(case), case)
+}
+
+/// The `state` `DescribeManagedEndpoint` reports for one endpoint.
+pub(crate) async fn endpoint_state(emr: &Emr, cluster: &str, id: &str, case: &str) -> String {
+    text(&endpoint_record(emr, cluster, id, case).await, "/state", case)
+}
+
+/// The record the listing of `cluster` reports for `id`: the copy the describe has to
+/// agree with, because both readers answer from one stored endpoint.
+pub(crate) async fn listed_record(emr: &Emr, cluster: &str, id: &str, case: &str) -> Value {
+    let answer = list_endpoints(emr, cluster, "").await;
+    let body = answer.ok(case).clone();
+    listed(&body, case)
+        .into_iter()
+        .find(|candidate| text(candidate, "/id", case) == id)
+        .unwrap_or_else(|| panic!("case {case:?}: the listing does not report {id}: {body}"))
+}
+
+/// The record without its `state`, so two reads taken in different phases of a transition
+/// can be compared on everything else.
+pub(crate) fn without_state(endpoint: &Value, case: &str) -> Value {
+    let mut copy = endpoint.clone();
+    copy.as_object_mut()
+        .unwrap_or_else(|| panic!("case {case:?}: the endpoint is not an object: {endpoint}"))
+        .remove("state");
+    copy
+}
+
 /// One acceptable `CreateManagedEndpoint` body: the five members the model marks
 /// `@required` beside `virtualClusterId`, which is an `@httpLabel`
 /// (smithy_query: operation `CreateManagedEndpoint`).
