@@ -71,7 +71,8 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     Attachment, Attribute, AutoScalingGroupProvider, AwsVpcConfiguration, CapacityProvider,
     CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
-    ClusterSetting, Container, ContainerDefinition, ContainerInstance, DaemonContainerDefinition,
+    ClusterSetting, Container, ContainerDefinition, ContainerImage, ContainerInstance,
+    DaemonContainerDefinition,
     DaemonDeploymentConfiguration, DaemonSummary,
     DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController,
@@ -83,10 +84,12 @@ use crate::ops::types::{
     NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProtectedTask,
     ProxyConfiguration,
-    Resource, Rollback, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,
+    ResolvedConfiguration, Resource, Rollback, RuntimePlatform, Scale, Service,
+    ServiceConnectConfiguration,
     ServiceCurrentRevisionSummary, ServiceDeployment, ServiceDeploymentAlarms,
     ServiceDeploymentBrief, ServiceDeploymentCircuitBreaker, ServiceEvent, ServiceRegistry,
-    ServiceRevisionSummary,
+    ServiceRevision, ServiceRevisionLoadBalancer, ServiceRevisionSummary,
+    ServiceRevisionVpcLatticeConfiguration,
     ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
     TaskDefinitionPlacementConstraint, TaskOverride, TaskSet,
     ThresholdConfiguration, UpdatedExpressGatewayService, VersionInfo, Volume,
@@ -1188,6 +1191,27 @@ pub const SERVICE_DEPLOYMENT_ROLLBACK_SUCCESSFUL: &str = "ROLLBACK_SUCCESSFUL";
 /// could not be carried out, because there is no earlier service revision of the service
 /// to put back.
 pub const SERVICE_DEPLOYMENT_ROLLBACK_FAILED: &str = "ROLLBACK_FAILED";
+/// See [`SERVICE_DEPLOYMENT_IN_PROGRESS`]: the status of a rollout a caller asked to stop
+/// where it stands, from the instant the stop was asked for until it has been carried out
+/// (`StopServiceDeployment`: "Stops an ongoing service deployment").
+pub const SERVICE_DEPLOYMENT_STOP_REQUESTED: &str = "STOP_REQUESTED";
+/// See [`SERVICE_DEPLOYMENT_STOP_REQUESTED`]: the same for a stop that puts the previous
+/// service revision back — the rollback has been asked for and has not begun yet.
+pub const SERVICE_DEPLOYMENT_ROLLBACK_REQUESTED: &str = "ROLLBACK_REQUESTED";
+
+/// The `StopServiceDeploymentStopType` that undoes the rollout: "ROLLBACK - This option
+/// rolls back the service deployment to the previous service revision. You can use this
+/// option even if you didn't configure the service deployment for the rollback option."
+///
+/// Also the stop type a request that names none is stopped with, since
+/// `StopServiceDeployment$stopType` documents it as the stop type the operation offers:
+/// "The valid values are `ROLLBACK`."
+pub const STOP_TYPE_ROLLBACK: &str = "ROLLBACK";
+
+/// The other `StopServiceDeploymentStopType`: the rollout is stopped where it stands, with
+/// no service revision put back, so the service keeps what the rollout had released by
+/// then.
+pub const STOP_TYPE_ABORT: &str = "ABORT";
 
 /// The `DeploymentLifecycleHookTargetType` of a hook that PAUSES a rollout rather than
 /// running custom logic: "PAUSE - Pauses the deployment at the specified lifecycle stage
@@ -1274,6 +1298,11 @@ pub const DEFAULT_LIST_SERVICE_DEPLOYMENTS_PAGE_SIZE: usize = 20;
 /// the `serviceDeploymentArns` doc: "The ARN of the service deployment. You can specify a
 /// maximum of 20 ARNs."
 pub const MAX_DESCRIBE_SERVICE_DEPLOYMENTS: usize = 20;
+
+/// How many service revisions ONE `DescribeServiceRevisions` request may name, from the
+/// `serviceRevisionArns` doc: "The ARN of the service revision. You can specify a maximum
+/// of 20 ARNs."
+pub const MAX_DESCRIBE_SERVICE_REVISIONS: usize = 20;
 
 /// `ServiceDeploymentAlarms$status` and `ServiceDeploymentCircuitBreaker$status` for a
 /// failure-detection mechanism the deployment's configuration did not turn on — one of
@@ -3380,6 +3409,18 @@ pub struct ServiceDeploymentRecord {
     /// `ServiceDeployment$rollback`: "The rollback options the service deployment uses when
     /// the deployment fails" — carried by exactly the rollouts a rollback ended.
     pub rollback: Option<Rollback>,
+    /// When the stop a caller asked for is CARRIED OUT, and `None` once it has been (or
+    /// for a rollout nobody asked to stop).
+    ///
+    /// A stop does not take effect in the call that asks for it: the rollout reports the
+    /// stop as REQUESTED ([`SERVICE_DEPLOYMENT_STOP_REQUESTED`]) and the CLOCK carries it
+    /// out [`TRANSITION_SPAN`] later, stored rather than slept on.
+    pub stop_due_at: Option<SystemTime>,
+    /// The `StopServiceDeploymentStopType` a caller asked this rollout to stop with — it
+    /// decides where the stop leaves the service — kept once asked, so a rollout that is
+    /// stopping under a request a caller already made is told apart from one that ended
+    /// without anybody asking.
+    pub stop_type: Option<String>,
 }
 
 /// One PAUSE lifecycle hook of a rollout, as the rollout reached it.
@@ -3431,6 +3472,43 @@ pub enum LifecycleHookRefusal {
     NoPreviousRevision,
 }
 
+/// Why the stop a request asks for cannot be taken on the rollout it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceDeploymentStopRefusal {
+    /// No stored rollout carries the service-deployment ARN the request named.
+    NoSuchDeployment,
+    /// That rollout is not ONGOING: it ended without anybody asking it to stop.
+    NotOngoing,
+}
+
+/// End one rollout at `at` with `status` and `reason`, dropping every wait it still owed.
+///
+/// A rollout that has ended waits for nothing: the hook it stood at never got its action,
+/// the stages ahead of it are never reached, and a stop or a rollback that had not run its
+/// course does not run afterwards — this end is the one the rollout keeps.
+fn finish_deployment(
+    deployment: &mut ServiceDeploymentRecord,
+    at: DateTime,
+    status: &str,
+    reason: &str,
+) {
+    deployment.status = status.to_string();
+    deployment.status_reason = reason.to_string();
+    deployment.finished_at = Some(at);
+    for hook in deployment
+        .lifecycle_hooks
+        .iter_mut()
+        .filter(|hook| hook.status == LIFECYCLE_HOOK_AWAITING_ACTION)
+    {
+        hook.status = LIFECYCLE_HOOK_FAILED.to_string();
+    }
+    deployment.pending_hook_stops.clear();
+    deployment.hook_due_at = None;
+    deployment.complete_due_at = None;
+    deployment.rollback_due_at = None;
+    deployment.stop_due_at = None;
+}
+
 /// The PAUSE stops one rollout has, in the order it reaches them.
 ///
 /// `DeploymentConfiguration$lifecycleHooks` is "an array of deployment lifecycle hook
@@ -3479,6 +3557,22 @@ impl ServiceDeploymentRecord {
         self.finished_at.is_some()
     }
 
+    /// Whether this rollout is STOPPING: a stop has been asked for and not carried out
+    /// yet, or the rollback that is undoing it has not run its course. Either way the
+    /// rollout is already on its way to an end, so it reaches no steady state and no
+    /// further stop can be asked for on it.
+    pub fn is_stopping(&self) -> bool {
+        self.stop_due_at.is_some() || self.rollback_due_at.is_some()
+    }
+
+    /// Whether a caller has asked this rollout to STOP — whether or not that stop has been
+    /// carried out yet. A rollout that ended without anybody asking (it reached the steady
+    /// state it was rolling out, a later deployment replaced it, its service was deleted)
+    /// carries no such request.
+    pub fn stop_requested(&self) -> bool {
+        self.stop_type.is_some()
+    }
+
     /// The PAUSE hook this rollout is waiting on, if it stands at one.
     pub fn awaiting_hook(&self) -> Option<&LifecycleHookRecord> {
         self.lifecycle_hooks
@@ -3522,6 +3616,88 @@ impl ServiceDeploymentRecord {
             status_reason: Some(self.status_reason.clone()),
         }
     }
+}
+
+/// One SERVICE REVISION: the workload configuration ONE rollout released, as the call that
+/// released it left the service.
+///
+/// `DescribeServiceRevisions`: "A service revision is a version of the service that includes
+/// the values for the Amazon ECS resources (for example, task definition) and the
+/// environment resources (for example, load balancers, subnets, and security groups)", and
+/// `ServiceRevision`: "Whenever you create or deploy a service, Amazon ECS automatically
+/// creates and captures the configuration that you're trying to deploy in the service
+/// revision." So the record is written by the call that RELEASES a revision and never
+/// changed afterwards: what it holds is what that call was deploying, not what the service
+/// happens to run now.
+#[derive(Debug, Clone)]
+pub struct ServiceRevisionRecord {
+    pub arn: String,
+    pub service_arn: String,
+    pub cluster_arn: String,
+    /// `ServiceRevision$taskDefinition`: "The task definition the service revision uses."
+    pub task_definition_arn: Option<String>,
+    /// The capacity provider strategy the revision uses, for a service that named one
+    /// instead of a launch type, and `None` for one that named a launch type.
+    pub capacity_provider_strategy: Option<Vec<CapacityProviderStrategyItem>>,
+    pub launch_type: Option<String>,
+    /// The Fargate-only members, carried by exactly the revisions of a service that runs
+    /// on Fargate: the platform version the revision's tasks run and the platform family
+    /// they run on.
+    pub platform_version: Option<String>,
+    pub platform_family: Option<String>,
+    pub load_balancers: Vec<LoadBalancer>,
+    pub service_registries: Vec<ServiceRegistry>,
+    pub network_configuration: Option<NetworkConfiguration>,
+    /// `ServiceRevision$containerImages`: "The container images the service revision
+    /// uses", read off the task-definition revision this one released.
+    pub container_images: Vec<ContainerImage>,
+    pub service_connect_configuration: Option<ServiceConnectConfiguration>,
+    pub volume_configurations: Vec<ServiceVolumeConfiguration>,
+    pub vpc_lattice_configurations: Vec<VpcLatticeConfiguration>,
+    /// `ServiceRevision$createdAt`: "The time that the service revision was created."
+    pub created_at: DateTime,
+}
+
+/// `ServiceRevision$resolvedConfiguration`: "The resolved configuration for the service
+/// revision which contains the actual resources your service revision uses, such as which
+/// target groups serve traffic."
+///
+/// The target groups are the ones the revision's own configuration names, so a revision
+/// that names none has no resolved configuration at all. A listener rule belongs to the
+/// load balancer rather than to ECS, and nothing here provisions one, so only a rule the
+/// configuration itself stated is reported.
+fn resolved_configuration(record: &ServiceRevisionRecord) -> Option<ResolvedConfiguration> {
+    if record.load_balancers.is_empty() && record.vpc_lattice_configurations.is_empty() {
+        return None;
+    }
+    Some(ResolvedConfiguration {
+        load_balancers: Some(
+            record
+                .load_balancers
+                .iter()
+                .map(|balancer| ServiceRevisionLoadBalancer {
+                    target_group_arn: balancer.target_group_arn.clone(),
+                    production_listener_rule: balancer
+                        .advanced_configuration
+                        .as_ref()
+                        .and_then(|advanced| advanced.production_listener_rule.clone()),
+                })
+                .collect(),
+        ),
+        vpc_lattice_configurations: Some(
+            record
+                .vpc_lattice_configurations
+                .iter()
+                .map(|configuration| ServiceRevisionVpcLatticeConfiguration {
+                    target_group_arn: Some(configuration.target_group_arn.clone()),
+                    production_listener_rule: configuration
+                        .advanced_configuration
+                        .as_ref()
+                        .and_then(|advanced| advanced.production_listener_rule.clone()),
+                })
+                .collect(),
+        ),
+    })
 }
 
 /// Which optional service fields a response carries, as `DescribeServices$include`
@@ -4201,6 +4377,11 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// finished deployments as well as the one under way) and the key is the ARN the
     /// listing reports.
     pub service_deployments: HashMap<String, ServiceDeploymentRecord>,
+    /// `serviceRevisionArn` -> the service revision. `ServiceRevision` is "a record of the
+    /// workload configuration Amazon ECS is attempting to deploy", captured by the call
+    /// that releases it, so an entry is a SNAPSHOT: a later update releases another
+    /// revision rather than rewriting this one.
+    pub service_revisions: HashMap<String, ServiceRevisionRecord>,
     /// `(clusterName, serviceName)` -> the EXPRESS service. Keyed like `services`
     /// because an Express service's name is unique within its cluster the same way, and
     /// held BESIDE them because the two are different resources: an Express service is
@@ -4408,8 +4589,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 self.current_service_deployment(service)
                     // A rollout that still owes a wait at a PAUSE lifecycle hook has not
                     // reached its end, however settled the task set it placed is: it ends
-                    // where the action taken on that hook takes it.
-                    .filter(|deployment| !deployment.awaits_lifecycle_action())
+                    // where the action taken on that hook takes it. Nor does one that is
+                    // already stopping: the end it reaches is the stop's.
+                    .filter(|deployment| {
+                        !deployment.awaits_lifecycle_action() && !deployment.is_stopping()
+                    })
                     .map(|deployment| deployment.arn.clone())
             });
             // A superseded deployment is reported while it is "in the process of being
@@ -4835,6 +5019,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         at: DateTime,
         now: SystemTime,
     ) -> Option<String> {
+        // The revision this rollout releases is captured with it, whether or not the ECS
+        // scheduler is the one rolling it out: "Whenever you create or deploy a service,
+        // Amazon ECS automatically creates and captures the configuration that you're
+        // trying to deploy in the service revision."
+        self.record_service_revision(key, at);
         let service = self.services.get(key)?;
         if !service.places_tasks() {
             return None;
@@ -4885,10 +5074,164 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 complete_due_at: None,
                 rollback_due_at: None,
                 rollback: None,
+                stop_due_at: None,
+                stop_type: None,
             },
         );
         self.prune_service_deployments(&service_arn);
         Some(arn)
+    }
+
+    /// Capture what `key`'s current service revision IS, under the ARN the service carries
+    /// for it.
+    ///
+    /// Captured once: a revision records the configuration the call that released it was
+    /// deploying, so a rollout that runs a revision which was already released (the
+    /// redeployment a rollback performs) leaves the capture it already has alone.
+    fn record_service_revision(&mut self, key: &(String, String), at: DateTime) {
+        let Some(service) = self.services.get(key) else {
+            return;
+        };
+        let arn = service.service_revision_arn.clone();
+        if self.service_revisions.contains_key(&arn) {
+            return;
+        }
+        let record = self.captured_service_revision(service, at);
+        self.service_revisions.insert(arn, record);
+    }
+
+    /// The revision record a release of `service`'s current configuration captures.
+    ///
+    /// Every member is read off the service as it stands in this instant — the same
+    /// configuration its own `Deployment` reports for the rollout
+    /// ([`Self::service_view`]), so the revision and the deployment that rolls it out
+    /// cannot disagree.
+    fn captured_service_revision(
+        &self,
+        service: &ServiceRecord,
+        at: DateTime,
+    ) -> ServiceRevisionRecord {
+        // "A service will return either a capacityProviderStrategy or launchType
+        // parameter, but not both, depending where one was specified when it was created."
+        let (launch_type, capacity_provider_strategy) = match &service.launch_type {
+            Some(launch_type) => (Some(launch_type.clone()), None),
+            None => (None, Some(service.capacity_provider_strategy.clone())),
+        };
+        // The Fargate-only members: "A platform family is specified only for tasks using
+        // the Fargate launch type", and so is a platform version — the version the tasks
+        // of this revision run, which is what the alias a request named resolves to.
+        let fargate = service.runs_on_fargate();
+        let os_family = self.service_os_family(service);
+        let platform_family = fargate.then(|| os_family_display(&os_family));
+        let platform_version = fargate.then(|| {
+            let requested = service
+                .platform_version
+                .clone()
+                .unwrap_or_else(|| PLATFORM_VERSION_LATEST.to_string());
+            resolved_platform_version(&requested, &os_family)
+        });
+        // "The container images the service revision uses", read off the task-definition
+        // revision this one releases.
+        let container_images = service
+            .task_definition
+            .as_ref()
+            .and_then(|key| self.task_definitions.get(key))
+            .map(|definition| {
+                definition
+                    .container_definitions
+                    .iter()
+                    .map(|container| ContainerImage {
+                        container_name: container.name.clone(),
+                        // "The container image digest": a digest is what a pull of the
+                        // image resolves, and nothing here pulls one.
+                        image_digest: None,
+                        image: container.image.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ServiceRevisionRecord {
+            arn: service.service_revision_arn.clone(),
+            service_arn: service.arn.clone(),
+            cluster_arn: service.cluster_arn.clone(),
+            task_definition_arn: service.task_definition_arn.clone(),
+            capacity_provider_strategy,
+            launch_type,
+            platform_version,
+            platform_family,
+            load_balancers: service.load_balancers.clone(),
+            service_registries: service.service_registries.clone(),
+            network_configuration: service.network_configuration.clone(),
+            container_images,
+            service_connect_configuration: service.service_connect_configuration.clone(),
+            volume_configurations: service.volume_configurations.clone(),
+            vpc_lattice_configurations: service.vpc_lattice_configurations.clone(),
+            created_at: at,
+        }
+    }
+
+    /// The `ServiceRevision` `DescribeServiceRevisions` reports for ONE captured revision:
+    /// what the call that released it captured, and nothing a later call changed.
+    pub fn service_revision_view(&self, record: &ServiceRevisionRecord) -> ServiceRevision {
+        ServiceRevision {
+            service_revision_arn: Some(record.arn.clone()),
+            service_arn: Some(record.service_arn.clone()),
+            cluster_arn: Some(record.cluster_arn.clone()),
+            task_definition: record.task_definition_arn.clone(),
+            capacity_provider_strategy: record.capacity_provider_strategy.clone(),
+            launch_type: record.launch_type.clone(),
+            platform_version: record.platform_version.clone(),
+            platform_family: record.platform_family.clone(),
+            load_balancers: Some(record.load_balancers.clone()),
+            service_registries: Some(record.service_registries.clone()),
+            network_configuration: record.network_configuration.clone(),
+            container_images: Some(record.container_images.clone()),
+            // "Indicates whether Runtime Monitoring is turned on": nothing here turns
+            // GuardDuty Runtime Monitoring on, so no revision runs with it.
+            guard_duty_enabled: false,
+            service_connect_configuration: record.service_connect_configuration.clone(),
+            volume_configurations: Some(record.volume_configurations.clone()),
+            // The Fargate ephemeral-storage encryption a service configures, which
+            // nothing in this slice lets a service configure (the same member the
+            // service's own `Deployment` reports empty).
+            fargate_ephemeral_storage: None,
+            created_at: Some(record.created_at),
+            vpc_lattice_configurations: Some(record.vpc_lattice_configurations.clone()),
+            resolved_configuration: resolved_configuration(record),
+            // "The resources created and managed by Amazon ECS when you create an Express
+            // service": an Express service is a resource of its own here, and no revision
+            // of an ECS service owns any of them.
+            ecs_managed_resources: None,
+            // "The effective runtime overrides that Amazon ECS applies to this service
+            // revision. This value is present only when Amazon ECS detects a difference
+            // between the task definition and the actual runtime" — nothing runs a
+            // container here, so no such difference is detected.
+            overrides: None,
+            gateway_connectors: None,
+            // The optional monitoring configuration a service sets, which nothing in this
+            // slice lets a service set.
+            monitoring: None,
+        }
+    }
+
+    /// Drop every captured revision that no stored service and no stored rollout names.
+    ///
+    /// A revision is read back through the service or the rollout that names it, so the
+    /// ones worth keeping are exactly those; the rest went with the history that named
+    /// them ([`Self::prune_service_deployments`]).
+    fn prune_service_revisions(&mut self) {
+        let mut named: HashSet<String> = self
+            .services
+            .values()
+            .map(|service| service.service_revision_arn.clone())
+            .collect();
+        named.extend(
+            self.service_deployments
+                .values()
+                .map(|deployment| deployment.target_service_revision_arn.clone()),
+        );
+        self.service_revisions
+            .retain(|arn, _| named.contains(arn));
     }
 
     /// Mint the id of one PAUSE lifecycle hook of a rollout.
@@ -4911,6 +5254,49 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     fn advance_service_deployments(&mut self, now: SystemTime) {
         let arns: Vec<String> = self.service_deployments.keys().cloned().collect();
         for arn in arns {
+            // The stop a caller asked for: once it is due the rollout has been stopped,
+            // whether or not anybody called to look. Where it leaves the service is the
+            // stop type's: a ROLLBACK runs the previous service revision again, and any
+            // other stop ends the rollout where it stood.
+            let stopping = self
+                .service_deployments
+                .get(&arn)
+                .and_then(|record| {
+                    record
+                        .stop_due_at
+                        .map(|due| (due, record.stop_type.clone(), record.deployment_id.clone()))
+                })
+                .filter(|(due, _, _)| *due <= now);
+            if let Some((due, stop_type, deployment_id)) = stopping {
+                if let Some(record) = self.service_deployments.get_mut(&arn) {
+                    record.stop_due_at = None;
+                }
+                if stop_type.as_deref() == Some(STOP_TYPE_ROLLBACK) {
+                    let refusal = self
+                        .roll_back_service_deployment(&arn, due, &stop_rollback_reason())
+                        .err();
+                    // A rollback whose previous revision is no longer there to put back
+                    // cannot be carried out, and nobody is left to refuse it to.
+                    if refusal.is_some() {
+                        if let Some(record) = self.service_deployments.get_mut(&arn) {
+                            let reason = no_previous_revision_reason(&record.service_arn);
+                            finish_deployment(
+                                record,
+                                DateTime::from(due),
+                                SERVICE_DEPLOYMENT_ROLLBACK_FAILED,
+                                &reason,
+                            );
+                        }
+                    }
+                } else if let Some(record) = self.service_deployments.get_mut(&arn) {
+                    finish_deployment(
+                        record,
+                        DateTime::from(due),
+                        SERVICE_DEPLOYMENT_STOPPED,
+                        &stopped_by_request_reason(&deployment_id),
+                    );
+                }
+            }
             // The hooked stage the rollout was travelling to: once that is due it stands at
             // the stage, and the hook there is waiting for its action.
             let reached = self
@@ -4952,7 +5338,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .map(|hook| (hook.hook_id.clone(), hook.timeout_action.clone(), hook.expires_at))
             });
             if let Some((hook_id, action, at)) = expired {
-                let refusal = self.resume_service_deployment(&arn, &action, at).err();
+                let refusal = self
+                    .resume_service_deployment(&arn, &action, at, &hook_rollback_reason())
+                    .err();
                 if let Some(record) = self.service_deployments.get_mut(&arn) {
                     if let Some(hook) = record
                         .lifecycle_hooks
@@ -5033,7 +5421,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
         // The action is taken BEFORE the hook is marked, so a rollback that cannot be
         // carried out leaves the hook waiting for one that can.
-        self.resume_service_deployment(arn, action, now)?;
+        self.resume_service_deployment(arn, action, now, &hook_rollback_reason())?;
         if let Some(record) = self.service_deployments.get_mut(arn) {
             if let Some(hook) = record
                 .lifecycle_hooks
@@ -5057,9 +5445,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         arn: &str,
         action: &str,
         at: SystemTime,
+        rollback_reason: &str,
     ) -> Result<(), LifecycleHookRefusal> {
         if action == LIFECYCLE_HOOK_ACTION_ROLLBACK {
-            return self.roll_back_service_deployment(arn, at);
+            return self.roll_back_service_deployment(arn, at, rollback_reason);
         }
         let record = self
             .service_deployments
@@ -5090,6 +5479,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         &mut self,
         arn: &str,
         at: SystemTime,
+        rollback_reason: &str,
     ) -> Result<(), LifecycleHookRefusal> {
         let record = self
             .service_deployments
@@ -5097,12 +5487,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .ok_or(LifecycleHookRefusal::NoSuchDeployment)?
             .clone();
         let source = self
-            .service_deployments
-            .values()
-            .filter(|other| {
-                other.service_arn == record.service_arn && other.order_key() < record.order_key()
-            })
-            .max_by(|left, right| left.order_key().cmp(&right.order_key()))
+            .previous_service_deployment(&record)
             .cloned()
             .ok_or(LifecycleHookRefusal::NoPreviousRevision)?;
         let definition = source
@@ -5168,14 +5553,91 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             record.rollback_due_at = Some(at + TRANSITION_SPAN);
             record.rollback = Some(Rollback {
                 // "The reason the rollback happened. For example, the circuit breaker
-                // initiated the rollback operation" — this one was asked for.
-                reason: Some(format!(
-                    "The {LIFECYCLE_HOOK_ACTION_ROLLBACK} action was taken on the paused \
-                     lifecycle hook of this service deployment."
-                )),
+                // initiated the rollback operation" — this one was asked for, by the call
+                // that asked for it.
+                reason: Some(rollback_reason.to_string()),
                 started_at: Some(timestamp),
                 service_revision_arn: Some(source.target_service_revision_arn.clone()),
             });
+        }
+        Ok(())
+    }
+
+    /// The rollout of the same service just BEFORE `record`: the one that released the
+    /// service revision a rollback of `record` puts back
+    /// (`ServiceDeployment$sourceServiceRevisions`: "the currently deployed workload
+    /// configuration"), and so `None` for a service's FIRST rollout.
+    fn previous_service_deployment(
+        &self,
+        record: &ServiceDeploymentRecord,
+    ) -> Option<&ServiceDeploymentRecord> {
+        self.service_deployments
+            .values()
+            .filter(|other| {
+                other.service_arn == record.service_arn && other.order_key() < record.order_key()
+            })
+            .max_by(|left, right| left.order_key().cmp(&right.order_key()))
+    }
+
+    /// Record the stop a caller asked for on the rollout `arn` records:
+    /// `StopServiceDeployment` "stops an ongoing service deployment".
+    ///
+    /// ONGOING is the whole precondition: a rollout that has already ended without anybody
+    /// asking it to is refused and changed in no way. A rollout a caller HAS asked to stop
+    /// is already stopping under that request, so asking again is answered with the stop
+    /// already in effect and changes nothing — the second request asks for what the first
+    /// one already got.
+    ///
+    /// The stop itself is a span the CLOCK settles
+    /// ([`Self::advance_service_deployments`]) — this call records that it was asked for,
+    /// and until it is carried out the rollout reports the REQUESTED status of the stop
+    /// type it was asked with.
+    pub fn request_service_deployment_stop(
+        &mut self,
+        arn: &str,
+        stop_type: &str,
+        at: SystemTime,
+    ) -> Result<(), ServiceDeploymentStopRefusal> {
+        let record = self
+            .service_deployments
+            .get(arn)
+            .ok_or(ServiceDeploymentStopRefusal::NoSuchDeployment)?;
+        if record.stop_requested() {
+            return Ok(());
+        }
+        if record.is_finished() || record.is_stopping() {
+            return Err(ServiceDeploymentStopRefusal::NotOngoing);
+        }
+        let deployment_id = record.deployment_id.clone();
+        let rollback = stop_type == STOP_TYPE_ROLLBACK;
+        // Whether the rollback this stop asks for can be carried out is NOT part of that
+        // precondition: "You can use this option even if you didn't configure the service
+        // deployment for the rollback option", so the stop is taken on an ongoing rollout
+        // whatever lies behind it, and a rollback with no earlier service revision to put
+        // back ends the rollout in [`SERVICE_DEPLOYMENT_ROLLBACK_FAILED`] where the clock
+        // carries it out.
+        if let Some(record) = self.service_deployments.get_mut(arn) {
+            record.status = if rollback {
+                SERVICE_DEPLOYMENT_ROLLBACK_REQUESTED.to_string()
+            } else {
+                SERVICE_DEPLOYMENT_STOP_REQUESTED.to_string()
+            };
+            record.status_reason = stop_requested_reason(&deployment_id, rollback);
+            record.stop_type = Some(stop_type.to_string());
+            record.stop_due_at = Some(at + TRANSITION_SPAN);
+            // A rollout that is stopping waits at no lifecycle hook any more: the stop is
+            // the end it is heading for, so the hook it stood at never gets its action and
+            // the stages ahead of it are never reached.
+            for hook in record
+                .lifecycle_hooks
+                .iter_mut()
+                .filter(|hook| hook.status == LIFECYCLE_HOOK_AWAITING_ACTION)
+            {
+                hook.status = LIFECYCLE_HOOK_FAILED.to_string();
+            }
+            record.pending_hook_stops.clear();
+            record.hook_due_at = None;
+            record.complete_due_at = None;
         }
         Ok(())
     }
@@ -5194,25 +5656,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ) {
         for deployment in self.service_deployments.values_mut() {
             if deployment.service_arn == service_arn && !deployment.is_finished() {
-                deployment.status = status.to_string();
-                deployment.status_reason = reason.to_string();
-                deployment.finished_at = Some(at);
-                // A rollout that has ended waits for nothing: the hook it stood at never
-                // got its action, and the stages ahead of it are never reached — so there
-                // is no hook left for `ContinueServiceDeployment` to act on.
-                for hook in deployment
-                    .lifecycle_hooks
-                    .iter_mut()
-                    .filter(|hook| hook.status == LIFECYCLE_HOOK_AWAITING_ACTION)
-                {
-                    hook.status = LIFECYCLE_HOOK_FAILED.to_string();
-                }
-                deployment.pending_hook_stops.clear();
-                deployment.hook_due_at = None;
-                deployment.complete_due_at = None;
-                // A rollback that had not run its course when the rollout ended does not
-                // run it afterwards: this end is the one the rollout keeps.
-                deployment.rollback_due_at = None;
+                finish_deployment(deployment, at, status, reason);
             }
         }
     }
@@ -5237,6 +5681,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         for arn in &arns[..first_kept] {
             self.service_deployments.remove(arn);
         }
+        // The revisions those rollouts released are read back through them, so the ones
+        // nothing names any more go with them.
+        self.prune_service_revisions();
     }
 
     /// The stored SERVICE DEPLOYMENT of `service`'s current (`PRIMARY`) deployment, if
@@ -8339,6 +8786,49 @@ pub fn no_previous_service_revision_message(arn: &str) -> String {
         "The service deployment {arn} can't be rolled back because its service has no \
          previous service revision."
     )
+}
+
+/// The `ConflictException` message for a stop asked for on a rollout that is not ongoing:
+/// `StopServiceDeployment` "stops an ongoing service deployment", and a rollout that
+/// reached an end nobody asked for is no longer one — the end the message names.
+pub fn service_deployment_not_ongoing_message(arn: &str) -> String {
+    format!("ServiceDeployment is stopping or has already finished for arn: {arn}")
+}
+
+/// `Rollback$reason` ("The reason the rollback happened") of a rollback the action taken on
+/// a paused lifecycle hook asked for.
+fn hook_rollback_reason() -> String {
+    format!(
+        "The {LIFECYCLE_HOOK_ACTION_ROLLBACK} action was taken on the paused lifecycle hook \
+         of this service deployment."
+    )
+}
+
+/// `Rollback$reason` of a rollback a request to STOP the rollout asked for, with the stop
+/// type that rolls it back.
+fn stop_rollback_reason() -> String {
+    format!(
+        "This service deployment was stopped with the {STOP_TYPE_ROLLBACK} stop type, which \
+         rolls it back to the previous service revision."
+    )
+}
+
+/// `ServiceDeploymentRecord::status_reason` of a rollout a caller has asked to stop, while
+/// the stop is still being carried out.
+fn stop_requested_reason(deployment_id: &str, rollback: bool) -> String {
+    if rollback {
+        format!(
+            "A request was made to stop ECS deployment {deployment_id} and roll the service \
+             back to the previous service revision."
+        )
+    } else {
+        format!("A request was made to stop ECS deployment {deployment_id}.")
+    }
+}
+
+/// `ServiceDeploymentRecord::status_reason` of a rollout a caller stopped where it stood.
+fn stopped_by_request_reason(deployment_id: &str) -> String {
+    format!("ECS deployment {deployment_id} was stopped by a request to stop it.")
 }
 
 /// `ServiceDeployment$alarms`: "The CloudWatch alarms that determine when a service

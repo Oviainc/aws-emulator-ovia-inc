@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopServiceDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopServiceDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops an ongoing service deployment.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopServiceDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rule: a stop is taken on exactly the rollout the ARN names while that rollout is
+//! still ONGOING, and where it leaves the service is the stop type's — `ROLLBACK` runs the
+//! service revision the rollout before it released again, any other stop ends the rollout
+//! where it stands; a request that names a rollout nothing recorded is refused, and so is
+//! one that names a rollout which reached an end nobody asked for, while a second request
+//! for a stop a caller already asked for is answered with the stop already in effect and
+//! changes nothing. The state it reads and writes is the service deployment in
+//! [`crate::state`]; the stop itself is a span the clock settles
+//! (`state::ServiceDeploymentRecord::stop_due_at`).
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +163,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopServiceDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopServiceDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopServiceDeployment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopServiceDeploymentErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let deployment_arn = input.service_deployment_arn.trim().to_string();
+        // "How you want Amazon ECS to stop the service. The valid values are ROLLBACK" —
+        // the stop type a request that names none is stopped with.
+        let stop_type = input
+            .stop_type
+            .clone()
+            .unwrap_or_else(|| crate::state::STOP_TYPE_ROLLBACK.to_string());
+
+        let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // Whether a rollout is still ongoing is a question about NOW: the end the clock
+        // already owed it has happened whether or not anybody called to look.
+        guard.advance_clock(now);
+
+        match guard.request_service_deployment_stop(&deployment_arn, &stop_type, now) {
+            Ok(()) => Ok(StopServiceDeploymentOutput {
+                // "The ARN of the stopped service deployment."
+                service_deployment_arn: Some(deployment_arn),
+            }),
+            Err(crate::state::ServiceDeploymentStopRefusal::NoSuchDeployment) => Err(
+                StopServiceDeploymentErrorModeled::ServiceDeploymentNotFoundException(
+                    ServiceDeploymentNotFoundException {
+                        message: Some(crate::state::service_deployment_not_found_message(
+                            &deployment_arn,
+                        )),
+                    },
+                )
+                .into(),
+            ),
+            Err(crate::state::ServiceDeploymentStopRefusal::NotOngoing) => Err(
+                StopServiceDeploymentErrorModeled::ConflictException(ConflictException {
+                    // "The existing task ARNs which are already associated with the
+                    // clientToken": this conflict is about one deployment's own state and
+                    // holds no task of anybody's.
+                    resource_ids: None,
+                    message: Some(crate::state::service_deployment_not_ongoing_message(
+                        &deployment_arn,
+                    )),
+                })
+                .into(),
+            ),
+        }
     }
 }

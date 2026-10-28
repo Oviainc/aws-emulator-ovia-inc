@@ -93,6 +93,8 @@ mod resource_tags;
 mod service_delete_drain;
 #[path = "all/service_deployment_lifecycle_hooks.rs"]
 mod service_deployment_lifecycle_hooks;
+#[path = "all/service_deployment_stops.rs"]
+mod service_deployment_stops;
 #[path = "all/service_derived_members.rs"]
 mod service_derived_members;
 #[path = "all/service_lifecycle.rs"]
@@ -103,6 +105,8 @@ mod service_listing;
 mod service_load_balancer_cross_field;
 #[path = "all/service_projection.rs"]
 mod service_projection;
+#[path = "all/service_revisions.rs"]
+mod service_revisions;
 #[path = "all/service_run_state.rs"]
 mod service_run_state;
 #[path = "all/service_validation.rs"]
