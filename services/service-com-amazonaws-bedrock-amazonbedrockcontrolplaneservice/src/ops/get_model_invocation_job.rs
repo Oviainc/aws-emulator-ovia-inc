@@ -8,9 +8,12 @@
 //!
 //! `@readonly`, and the one write it makes is the status transition the CLOCK already made
 //! due for that job ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::model_invocation_job`]):
-//! the job was owed it at the due instant even if nobody had called, which is why the
-//! instants this reports are the due ones rather than the instant of the read. The job's own
-//! RUN is materialised the same way and for the same reason: a job the clock has carried
+//! the job was owed it once its span had elapsed, which is why the instants this reports are
+//! the due ones rather than the instant of the read. ONE stage of the progression is
+//! materialised per read ([`crate::state::ModelInvocationJobRecord::settle`]), so a client
+//! polling a job reads it queued, being validated, scheduled and running in turn — whatever
+//! interval it polls at — and a stop it issues on the job it just read running still has a
+//! running job to wind down. The job's own RUN is materialised the same way and for the same reason: a job the clock has carried
 //! into the status that says it has begun — "InProgress – this job has begun. You can start
 //! viewing the results in the output S3 location" — has read its records, invoked the model
 //! over them and stored the results under its output prefix

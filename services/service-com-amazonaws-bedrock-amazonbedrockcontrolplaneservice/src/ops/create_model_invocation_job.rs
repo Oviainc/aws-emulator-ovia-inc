@@ -4,10 +4,11 @@
 //! Submits a batch inference job: the job is minted `Submitted` — "this job has been
 //! submitted to a queue for validation" — and the submission arms the whole clock the job
 //! runs on (`state::ModelInvocationJobClock`), so it is owed `Validating`, then
-//! `Scheduled`, then `InProgress`, and only then its terminal status. The record this
-//! operation writes is the one `ops/get_model_invocation_job.rs` reads back and
-//! `ops/list_model_invocation_jobs.rs` reports, so the job this call submits is the job
-//! every later request sees.
+//! `Scheduled`, then `InProgress`, and only then its terminal status — one stage per call
+//! that reads it, each dwelling its own span, so no poller is carried past a stage
+//! (`state::ModelInvocationJobRecord::settle`). The record this operation writes is the one
+//! `ops/get_model_invocation_job.rs` reads back and `ops/list_model_invocation_jobs.rs`
+//! reports, so the job this call submits is the job every later request sees.
 //!
 //! The submission also performs the `Validating` step over REAL data: it reads the records
 //! of the object `inputDataConfig` names out of this emulator's own Amazon S3
@@ -360,20 +361,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // out", counted from the instant it was submitted — so the instant it times out
             // is that submission plus those hours, and a job the request set no timeout for
             // has none. The conversion cannot narrow a value the modelled `range 24..168`
-            // admits; one outside it reports no expiration instant rather than one AT the
-            // submission.
+            // admits; one outside it — a negative count, or one whose hours no instant this
+            // clock can represent stands after — reports no expiration instant rather than
+            // one AT the submission, and every step of the arithmetic is checked, so no
+            // request can make it overflow.
             job_expiration_time: input
                 .timeout_duration_in_hours
                 .and_then(|hours| u64::try_from(hours).ok())
-                .map(|hours| {
-                    now + ::std::time::Duration::from_secs(hours * crate::state::SECONDS_PER_HOUR)
-                }),
+                .and_then(|hours| hours.checked_mul(crate::state::SECONDS_PER_HOUR))
+                .and_then(|seconds| now.checked_add(::std::time::Duration::from_secs(seconds))),
             model_invocation_type,
             tags: input.tags.unwrap_or_default(),
             // The inference runs after this call returns, so the job is reported as queued
             // for validation now and the submission arms every later transition at once:
-            // each stage of the progression is owed at an instant fixed here, so the job
-            // dwells in each of them and no single later call both arms a move and spends it.
+            // each stage of the progression is owed at an instant fixed here, no single
+            // later call both arms a move and spends it, and the stage after the one a read
+            // materialises is re-counted from that read, so every stage is one a caller
+            // polling the job reads it in.
             status: crate::state::MODEL_INVOCATION_JOB_STATUS_SUBMITTED,
             validating_due_at: Some(clock.validating_at),
             // A job whose input cannot be processed is never scheduled and never begins:

@@ -85,6 +85,8 @@ mod model_customization_pass_role;
 mod model_import_jobs;
 #[path = "all/model_invocation_job_execution.rs"]
 mod model_invocation_job_execution;
+#[path = "all/model_invocation_job_poll_interval.rs"]
+mod model_invocation_job_poll_interval;
 #[path = "all/model_invocation_job_terminal_status.rs"]
 mod model_invocation_job_terminal_status;
 #[path = "all/model_invocation_jobs.rs"]

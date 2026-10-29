@@ -54,15 +54,6 @@ pub(crate) const BUCKET: &str = "example-batch-inference";
 /// A bucket no `CreateBucket` below ever creates.
 const ABSENT_BUCKET: &str = "example-batch-inference-missing";
 
-/// How long after it was submitted a job is owed its move to `Validating`.
-const VALIDATES_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_VALIDATES_AFTER;
-
-/// How long after it entered validation a job is owed its move to `Scheduled`.
-const SCHEDULES_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_SCHEDULES_AFTER;
-
-/// How long after it was scheduled a job is owed its move to `InProgress`.
-const BEGINS_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_BEGINS_AFTER;
-
 /// How long after it began a job is owed its terminal status.
 const COMPLETE_AFTER: Duration = bedrock::state::MODEL_INVOCATION_JOB_COMPLETE_AFTER;
 
@@ -168,6 +159,42 @@ impl Emulator {
             .unwrap_or_else(|| panic!("the store holds no job at {arn}"))
             .clone()
     }
+
+    /// Age the stored job `arn` names by `by`, as though every instant of its timeline had
+    /// fallen that much earlier: the submission, the last change and every instant the clock
+    /// owes it a transition at move back together, so the job's own timeline is untouched and
+    /// only the amount of it that has already elapsed changes.
+    ///
+    /// This is how a case brings the wall clock a caller polling at a long interval would
+    /// wait through without sleeping through it.
+    pub(crate) fn age_job(&self, arn: &str, by: Duration) {
+        let state = bedrock::state::service_state(&*self.engine)
+            .expect("the shared engine carries this service's store");
+        let mut store = state.lock();
+        let job = store
+            .model_invocation_jobs
+            .get_mut(arn)
+            .unwrap_or_else(|| panic!("the store holds no job at {arn}"));
+        job.submit_time -= by;
+        job.last_modified_at -= by;
+        if let Some(ended) = job.ended_at.as_mut() {
+            *ended -= by;
+        }
+        if let Some(expires) = job.job_expiration_time.as_mut() {
+            *expires -= by;
+        }
+        for due in [
+            &mut job.validating_due_at,
+            &mut job.scheduled_due_at,
+            &mut job.in_progress_due_at,
+            &mut job.completed_due_at,
+            &mut job.stopped_due_at,
+        ] {
+            if let Some(instant) = due.as_mut() {
+                *instant -= by;
+            }
+        }
+    }
 }
 
 /// `PUT /<bucket>` — `CreateBucket` — so the input objects below have a bucket to live in
@@ -244,6 +271,52 @@ pub(crate) async fn read_job(emu: &Emulator, arn: &str) -> Reply {
 /// live under.
 pub(crate) fn job_id(arn: &str) -> &str {
     arn.rsplit('/').next().expect("an ARN has a last segment")
+}
+
+/// How long a case polls a job for before it concludes the progression is stuck.
+///
+/// An absolute bound, generous next to the spans this service arms — room for a slow machine
+/// rather than for another order of magnitude.
+pub(crate) const POLL_BUDGET: Duration = Duration::from_secs(20);
+
+/// How long a case waits between two reads of a job while it polls it.
+pub(crate) const POLL_STEP: Duration = Duration::from_millis(100);
+
+/// Poll `GetModelInvocationJob` the way a client does until the job reports `target`, and
+/// hand back the read that first reported it.
+///
+/// A job leaves each stage of the progression no earlier than the first call that reads it
+/// there, so a case reaches a stage by POLLING rather than by sleeping through a span and
+/// reading once — which is also what a client does.
+pub(crate) async fn poll_until_status(
+    emu: &Emulator,
+    case: &str,
+    arn: &str,
+    target: &str,
+) -> Reply {
+    let started = ::std::time::Instant::now();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let reply = read_job(emu, arn).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: the job must stay readable while it is polled, got {} {:?}",
+            reply.status, reply.body
+        );
+        let status = reply.text("status");
+        if status == target {
+            return reply;
+        }
+        if seen.last() != Some(&status) {
+            seen.push(status);
+        }
+        assert!(
+            started.elapsed() < POLL_BUDGET,
+            "case {case:?}: a client polling the job must read it {target} inside \
+             {POLL_BUDGET:?}, saw {seen:?}"
+        );
+        ::tokio::time::sleep(POLL_STEP).await;
+    }
 }
 
 /// The record count a response reports under `name`, or `None` when it omits the member.
@@ -421,25 +494,13 @@ async fn a_job_that_has_begun_has_run_the_model_over_its_input_and_written_its_r
         submitted.push((index, arn));
     }
 
-    // Every row is submitted before the wait, so the suite waits ONE clock-owed span rather
-    // than one per row: the span after which a submitted job has begun.
-    ::tokio::time::sleep(VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER + SLACK).await;
-
+    // Every row is polled to the status that says it has begun: a job leaves each stage of
+    // the progression no earlier than the first read that finds it there, so the status is
+    // reached by reading the job rather than by sleeping through the pre-start spans.
     for (index, arn) in &submitted {
         let row = &rows[*index];
         let case = row.case;
-        let reply = read_job(&emu, arn).await;
-        assert_eq!(
-            reply.status, 200,
-            "case {case:?}: the job must be readable, got {} {:?}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.get("status"),
-            json!("InProgress"),
-            "case {case:?}: the job must have begun, got {:?}",
-            reply.get("status")
-        );
+        let reply = poll_until_status(&emu, case, arn, "InProgress").await;
 
         let total = i64::try_from(row.lines.len()).expect("a small record count");
         for (member, expected) in [
@@ -554,10 +615,11 @@ async fn a_job_that_has_begun_has_run_the_model_over_its_input_and_written_its_r
         );
 
         // The terminal status the run decided, read off the record settled past the instant
-        // the job is owed it, rather than by sleeping through the running span once more.
+        // the job is owed it, rather than by sleeping through the running span once more. The
+        // job was READ running above, so the only transition it still owes is that terminal
+        // one, a run span after that read.
         let mut record = emu.stored_job(arn);
-        record.settle(record.submit_time + VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER
-            + COMPLETE_AFTER);
+        record.settle(SystemTime::now() + COMPLETE_AFTER + SLACK);
         assert_eq!(
             record.status, row.terminal_status,
             "case {case:?}: the job must end {}, got {}",
@@ -666,12 +728,10 @@ async fn an_input_the_object_store_reports_unusable_fails_the_job() {
     }
 
     // A job whose input cannot be processed is validated and then failed, one span apart, so
-    // the wait is the two spans the submission armed.
-    ::tokio::time::sleep(VALIDATES_AFTER + SCHEDULES_AFTER + SLACK).await;
-
+    // a client polling it reads it queued, then being validated, then failed.
     for (index, arn) in &submitted {
         let case = rows[*index].case;
-        let reply = read_job(&emu, arn).await;
+        let reply = poll_until_status(&emu, case, arn, "Failed").await;
         assert_eq!(
             reply.get("status"),
             json!("Failed"),
@@ -755,17 +815,28 @@ async fn a_listing_reports_the_counts_the_read_of_one_job_reports() {
         "a job that has not begun has processed nothing, got {summary:?}"
     );
 
-    ::tokio::time::sleep(VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER + SLACK).await;
-
-    // The listing is what takes the run here, so the counts it reports are the run's own —
-    // and the read that follows reports the same ones rather than running the job again.
-    let listed = emu.bedrock("GET", "/model-invocation-jobs", None).await;
-    let summary = listed
-        .get("invocationJobSummaries")
-        .as_array()
-        .and_then(|rows| rows.first())
-        .cloned()
-        .expect("the listing carries the submitted job");
+    // A LISTING observes every job it carries exactly as a read observes one, so the
+    // listing is what carries this job through its progression here — and it is what takes
+    // the run, so the counts it reports are the run's own.
+    let started = ::std::time::Instant::now();
+    let summary = loop {
+        let listed = emu.bedrock("GET", "/model-invocation-jobs", None).await;
+        let summary = listed
+            .get("invocationJobSummaries")
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .expect("the listing carries the submitted job");
+        if summary.get("status").and_then(Value::as_str) == Some("InProgress") {
+            break summary;
+        }
+        assert!(
+            started.elapsed() < POLL_BUDGET,
+            "a client listing the jobs must read this one running inside {POLL_BUDGET:?}, got \
+             {summary:?}"
+        );
+        ::tokio::time::sleep(POLL_STEP).await;
+    };
     let read = read_job(&emu, &arn).await;
     for (member, expected) in [
         ("totalRecordCount", 2),
@@ -823,8 +894,7 @@ async fn with_no_object_store_to_ask_nothing_is_concluded_about_the_input() {
     )
     .await;
 
-    ::tokio::time::sleep(VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER + SLACK).await;
-    let reply = read_job(&emu, &arn).await;
+    let reply = poll_until_status(&emu, "an unknown input", &arn, "InProgress").await;
     assert_eq!(
         reply.get("status"),
         json!("InProgress"),
@@ -849,10 +919,10 @@ async fn with_no_object_store_to_ask_nothing_is_concluded_about_the_input() {
         );
     }
 
+    // The job was READ running, so the only transition it still owes is its terminal status,
+    // a run span after that read.
     let mut record = emu.stored_job(&arn);
-    record.settle(
-        record.submit_time + VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER + COMPLETE_AFTER,
-    );
+    record.settle(SystemTime::now() + COMPLETE_AFTER + SLACK);
     assert_eq!(
         record.status, "Completed",
         "the lifecycle a job with an unknown input runs is the one it has always had, got {}",
