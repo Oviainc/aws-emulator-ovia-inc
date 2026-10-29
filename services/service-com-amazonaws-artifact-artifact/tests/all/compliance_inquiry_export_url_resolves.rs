@@ -416,3 +416,84 @@ async fn a_host_that_is_not_an_endpoint_is_not_announced() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_unusable_host_leaves_the_uri_authority_to_be_announced() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_over(&engine, false);
+
+    // The endpoint sources are read in order and the FIRST one that IS an endpoint is
+    // announced, so a `Host` this service cannot honour leaves the authority the request
+    // URI carries still to be read — not the loopback literal, which is for a request
+    // carrying no endpoint in EITHER source. The rows are the same unusable `Host` forms
+    // as the case above, each now beside an endpoint on the request URI.
+    const AUTHORITY: &str = "127.0.0.1:9297";
+    for forged in [
+        "elsewhere.example.com/v1/compliance-inquiry/download",
+        "elsewhere.example.com?x=1",
+        "user@elsewhere.example.com",
+        "elsewhere example com",
+        "",
+    ] {
+        let created = send(
+            &router,
+            "POST",
+            &format!("https://{AUTHORITY}/v1/compliance-inquiry/create"),
+            Some(forged),
+            true,
+            Bytes::from(
+                json!({
+                    "name": "Unusable host over a URI endpoint",
+                    "inquiryContent": { "query": "Does the SOC 2 report cover this region?" },
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {forged:?}: the create must succeed, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = created.body["complianceInquirySummary"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let exported = send(
+            &router,
+            "POST",
+            &format!("https://{AUTHORITY}/v1/compliance-inquiry/export"),
+            Some(forged),
+            true,
+            Bytes::from(json!({ "complianceInquiryId": id }).to_string()),
+        )
+        .await;
+        assert_eq!(
+            exported.status, 200,
+            "case {forged:?}: the export must succeed, got {} with {:?}",
+            exported.status, exported.body
+        );
+        let announced = exported.body["documentPresignedUrl"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let expected_prefix = format!("https://{AUTHORITY}{EXPORT_DOCUMENT_PATH_PREFIX}/{id}/");
+        assert!(
+            announced.starts_with(&expected_prefix),
+            "case {forged:?}: the endpoint the request carried on its URI must be announced, \
+             expected a URL under {expected_prefix:?}, got {announced:?}"
+        );
+
+        // And the URL it announced resolves, which is what announcing the caller's own
+        // endpoint is for.
+        let path = path_of(&announced, AUTHORITY, forged);
+        let fetched = send(&router, "GET", &path, Some(AUTHORITY), false, Bytes::new()).await;
+        assert_eq!(
+            fetched.status, 200,
+            "case {forged:?}: the announced URL must serve the document, got {} with {:?}",
+            fetched.status,
+            String::from_utf8_lossy(&fetched.bytes)
+        );
+    }
+}

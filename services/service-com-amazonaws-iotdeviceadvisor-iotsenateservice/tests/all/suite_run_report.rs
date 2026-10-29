@@ -33,7 +33,7 @@ use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 use super::suite_lifecycle::{run_configuration, thing_arn, Answer, Emulator, ROLE_ARN};
 
 /// The region every case below signs for, and so the host the harness addresses.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The endpoint the harness reaches the emulator on, which is the endpoint an announced
 /// report URL has to resolve back to.
@@ -47,7 +47,11 @@ fn past_completion() -> Duration {
 
 /// Create one suite definition, with `intendedForQualification` in the wire form the row
 /// asks for, and hand back its id.
-async fn definition(emulator: &Emulator, name: &str, qualification: Option<bool>) -> String {
+pub(crate) async fn definition(
+    emulator: &Emulator,
+    name: &str,
+    qualification: Option<bool>,
+) -> String {
     let mut configuration = json!({
         "suiteDefinitionName": name,
         "rootGroup": "g",
@@ -74,7 +78,7 @@ async fn definition(emulator: &Emulator, name: &str, qualification: Option<bool>
 /// including the successful ones a real qualifying run reaches — are only observable from a
 /// seeded store. What the cases built on it assert is the service's RULE about a stored
 /// run, never that this emulator produces that status.
-fn seed_run(emulator: &Emulator, definition_id: &str, status: &str) -> String {
+pub(crate) fn seed_run(emulator: &Emulator, definition_id: &str, status: &str) -> String {
     let state = iotdeviceadvisor::state::service_state(&*emulator.engine)
         .expect("the service's store is reachable from the shared engine");
     let mut store = state.lock();

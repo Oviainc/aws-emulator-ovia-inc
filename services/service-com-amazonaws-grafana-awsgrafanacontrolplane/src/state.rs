@@ -718,16 +718,23 @@ impl ServingEndpoint {
     ///
     /// A request that carries neither — only an in-process caller that builds a
     /// path-only URI with no `Host` — falls back to [`LOOPBACK_HOST`], so every
-    /// URL this service announces names an address this emulator serves.
+    /// URL this service announces names an address this emulator serves. Each
+    /// source is read on its own, in that order, and the FIRST one that names an
+    /// address wins: a `Host` header carrying nothing leaves the URI's authority
+    /// still to be read.
     pub fn from_request(parts: &::http::request::Parts) -> Self {
-        let authority = parts
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|host| host.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| parts.uri.authority().map(|a| a.as_str().to_string()))
-            .filter(|authority| !authority.is_empty())
-            .unwrap_or_else(|| LOOPBACK_HOST.to_string());
+        let authority = [
+            parts
+                .headers
+                .get(::http::header::HOST)
+                .and_then(|host| host.to_str().ok()),
+            parts.uri.authority().map(::http::uri::Authority::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|authority| !authority.is_empty())
+        .unwrap_or(LOOPBACK_HOST)
+        .to_string();
         let scheme = parts
             .uri
             .scheme_str()

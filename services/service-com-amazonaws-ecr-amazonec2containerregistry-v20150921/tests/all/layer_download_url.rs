@@ -150,90 +150,122 @@ async fn call_at(
     answered
 }
 
-/// How one case addresses the emulator: the endpoint it reached, and whether that
-/// endpoint travels in a `Host` header or on the request URI's authority.
+/// How one case addresses the emulator: what its `Host` header carries, what its request
+/// URI carries, and the endpoint the URL it is answered with has to name.
 struct Endpoint {
     label: &'static str,
-    /// The authority the request carries.
-    authority: &'static str,
-    /// True when the endpoint travels on the URI (absolute request form) instead of in a
-    /// `Host` header.
-    on_uri: bool,
-    /// The authority the URL this emulator announces must name: the one the request
-    /// carried, unless that value is not an endpoint at all.
+    /// The `Host` header the request sends, or `None` for a request that sends none (as
+    /// an HTTP/2 request does).
+    host: Option<&'static str>,
+    /// The authority the request URI carries in absolute form, or `None` for an
+    /// origin-form request URI, which carries none.
+    uri_authority: Option<&'static str>,
+    /// The authority the URL this emulator announces must name: the first source the
+    /// request carried that IS an endpoint, or the loopback literal when neither is.
     announced: &'static str,
 }
 
 impl Endpoint {
     /// The request URI for `path`, in whichever form this case carries.
     fn uri(&self, path: &str) -> String {
-        if self.on_uri {
-            format!("https://{}{path}", self.authority)
-        } else {
-            path.to_string()
+        match self.uri_authority {
+            Some(authority) => format!("https://{authority}{path}"),
+            None => path.to_string(),
         }
     }
 
     /// The `Host` header this case sends, if any.
     fn host_header(&self) -> Option<&str> {
-        (!self.on_uri).then_some(self.authority)
+        self.host
     }
 }
 
 /// The endpoints a caller can reach this emulator on. The rows differ along everything
-/// the rule generalises over: a service endpoint host, that host with an explicit port, a
-/// loopback socket, a loopback NAME with a port, an endpoint carried only on the request
-/// URI's authority, and three values that are not an endpoint at all — a host with a
-/// path, one with userinfo, and one with a space — which must not be reflected into a URL
-/// this registry hands out.
+/// the rule generalises over: which source carries the endpoint (a `Host` header, the
+/// request URI's authority, both, neither), the forms a bare authority takes (a service
+/// endpoint host, that host with an explicit port, a loopback socket, a loopback NAME with
+/// a port), and three values that are not an endpoint at all — a host with a path, one
+/// with userinfo, and one with a space — which must not be reflected into a URL this
+/// registry hands out, each of those also crossed with a request URI that carries the
+/// endpoint the caller really reached.
 fn endpoints() -> Vec<Endpoint> {
     vec![
         Endpoint {
             label: "this service's endpoint host",
-            authority: SERVICE_ENDPOINT,
-            on_uri: false,
+            host: Some(SERVICE_ENDPOINT),
+            uri_authority: None,
             announced: SERVICE_ENDPOINT,
         },
         Endpoint {
             label: "an endpoint host with a port",
-            authority: "api.ecr.eu-west-1.amazonaws.com:8443",
-            on_uri: false,
+            host: Some("api.ecr.eu-west-1.amazonaws.com:8443"),
+            uri_authority: None,
             announced: "api.ecr.eu-west-1.amazonaws.com:8443",
         },
         Endpoint {
             label: "the emulator's own socket",
-            authority: "127.0.0.1:9297",
-            on_uri: false,
+            host: Some("127.0.0.1:9297"),
+            uri_authority: None,
             announced: "127.0.0.1:9297",
         },
         Endpoint {
             label: "a loopback name with a port",
-            authority: "localhost:9297",
-            on_uri: false,
+            host: Some("localhost:9297"),
+            uri_authority: None,
             announced: "localhost:9297",
         },
         Endpoint {
             label: "an endpoint carried only on the request URI",
-            authority: "api.ecr.eu-west-1.amazonaws.com:9297",
-            on_uri: true,
+            host: None,
+            uri_authority: Some("api.ecr.eu-west-1.amazonaws.com:9297"),
             announced: "api.ecr.eu-west-1.amazonaws.com:9297",
         },
         Endpoint {
+            label: "both sources usable: the Host header is the one the caller addressed",
+            host: Some("localhost:9297"),
+            uri_authority: Some("127.0.0.1:443"),
+            announced: "localhost:9297",
+        },
+        Endpoint {
             label: "a host carrying a path",
-            authority: "elsewhere.example.com/ecr-layer-download",
-            on_uri: false,
+            host: Some("elsewhere.example.com/ecr-layer-download"),
+            uri_authority: None,
             announced: LOOPBACK_HOST,
         },
         Endpoint {
             label: "a host carrying userinfo",
-            authority: "user@elsewhere.example.com",
-            on_uri: false,
+            host: Some("user@elsewhere.example.com"),
+            uri_authority: None,
             announced: LOOPBACK_HOST,
         },
         Endpoint {
             label: "a host carrying a space",
-            authority: "elsewhere example com",
-            on_uri: false,
+            host: Some("elsewhere example com"),
+            uri_authority: None,
+            announced: LOOPBACK_HOST,
+        },
+        Endpoint {
+            label: "a host carrying a path, the endpoint on the request URI",
+            host: Some("elsewhere.example.com/ecr-layer-download"),
+            uri_authority: Some("127.0.0.1:9297"),
+            announced: "127.0.0.1:9297",
+        },
+        Endpoint {
+            label: "a host carrying userinfo, the endpoint on the request URI",
+            host: Some("user@elsewhere.example.com"),
+            uri_authority: Some("localhost:9297"),
+            announced: "localhost:9297",
+        },
+        Endpoint {
+            label: "a host carrying a space, the endpoint on the request URI",
+            host: Some("elsewhere example com"),
+            uri_authority: Some("api.ecr.eu-west-1.amazonaws.com:9297"),
+            announced: "api.ecr.eu-west-1.amazonaws.com:9297",
+        },
+        Endpoint {
+            label: "neither source carries an endpoint",
+            host: None,
+            uri_authority: None,
             announced: LOOPBACK_HOST,
         },
     ]
@@ -488,9 +520,11 @@ async fn a_download_url_serves_the_exact_layer_bytes() {
 /// The URL names the endpoint the CALLER reached this emulator on, and that URL resolves.
 ///
 /// The rows are [`endpoints`]: a service host, a host with a port, a loopback socket, a
-/// loopback name, an endpoint carried only on the request URI, and three values that are
-/// not an endpoint at all, which must be answered with the loopback literal rather than
-/// reflected into a URL this registry hands out.
+/// loopback name, an endpoint carried only on the request URI, a request carrying both,
+/// three values that are not an endpoint at all — which must be answered with the loopback
+/// literal rather than reflected into a URL this registry hands out — and those same three
+/// beside an endpoint on the request URI, which is then what the URL names, because the
+/// sources are read in order and the FIRST that is an endpoint wins.
 #[tokio::test]
 async fn a_download_url_names_the_endpoint_the_caller_reached() {
     let content = layer_bytes(7, 2_048);

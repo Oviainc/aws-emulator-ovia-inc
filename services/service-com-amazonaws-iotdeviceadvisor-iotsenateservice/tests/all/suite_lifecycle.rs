@@ -31,6 +31,17 @@ pub(crate) fn thing_arn(n: usize) -> String {
 /// The access key id a call presents unless the caller names another.
 pub(crate) const DEFAULT_AKID: &str = "AKIDEXAMPLE";
 
+/// The `Authorization` header a call presents: a SigV4 credential scope for `region`,
+/// which is both what the framework resolves the region from and the signal the router
+/// routes the request to this service by. Signed in scope only — authentication is off in
+/// these suites, and signature verification is the framework's own concern.
+fn authorization(akid: &str, region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential={akid}/20260101/{region}/iotdeviceadvisor/\
+         aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
+    )
+}
+
 /// The emulator, assembled in-process with authentication off: this suite asserts
 /// behaviour, and signature verification is the framework's own concern.
 pub(crate) struct Emulator {
@@ -175,16 +186,51 @@ impl Emulator {
             .uri(path_and_query)
             .header("host", format!("api.iotdeviceadvisor.{region}.amazonaws.com"))
             .header("content-type", "application/json")
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential={akid}/20260101/{region}/iotdeviceadvisor/\
-                     aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
-                ),
-            )
+            .header("authorization", authorization(akid, region))
             .body(payload)
             .expect("the request builds");
 
+        self.dispatch(request).await
+    }
+
+    /// Send one request addressed the way the caller asks, rather than through the one
+    /// endpoint form [`Emulator::call_as`] sends: `host` carries the RAW bytes of the
+    /// `Host` header (`None` sends no `Host` header at all, as an HTTP/2 request does),
+    /// and `authority` puts the endpoint on the request URI in absolute form, which is
+    /// where an HTTP/2 or SDK-built request carries it.
+    pub(crate) async fn call_addressed(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        region: &str,
+        host: Option<&[u8]>,
+        authority: Option<&str>,
+    ) -> Answer {
+        let uri = match authority {
+            Some(authority) => format!("https://{authority}{path_and_query}"),
+            None => path_and_query.to_string(),
+        };
+        let mut request = http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", authorization(DEFAULT_AKID, region));
+        if let Some(host) = host {
+            request = request.header(
+                http::header::HOST,
+                http::HeaderValue::from_bytes(host).expect("the Host header value is sendable"),
+            );
+        }
+        let request = request
+            .body(bytes::Bytes::new())
+            .expect("the request builds");
+
+        self.dispatch(request).await
+    }
+
+    /// Serve one already-built request and reduce the response to what a client branches
+    /// on.
+    async fn dispatch(&self, request: http::Request<bytes::Bytes>) -> Answer {
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
         let error_code = response

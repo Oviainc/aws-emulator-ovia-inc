@@ -1337,22 +1337,31 @@ const LOOPBACK_HOST: &str = "127.0.0.1";
 /// client to the real service. The value is the CALLER's, and it is interpolated into a
 /// URL this service announces, so only a bare authority is honoured.
 ///
+/// Each source is tested on its own, in that order, and the FIRST one carrying a bare
+/// authority is what the URL names: a `Host` this service cannot honour leaves the
+/// authority the URI carries still to be read, so the chain is the documented one for
+/// every unusable `Host` rather than only for one that is not even UTF-8.
+///
 /// The same rule, with the same two sources and the same filter, as
 /// `service-com-amazonaws-artifact-artifact`'s `document_url_host`: both services resolve
 /// the caller's own endpoint for a URL they announce, and this note is here so the two
 /// cannot drift apart unnoticed if either changes.
 pub fn report_url_host(parts: &::http::request::Parts) -> String {
-    parts
-        .headers
-        .get(::http::header::HOST)
+    [
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
         // The URI's AUTHORITY, not its host: a request that carries its endpoint on the
         // URI carries the port there too, and a URL announced without the port would not
         // resolve back to the socket the caller reached.
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
-        .filter(|candidate| is_bare_authority(candidate))
-        .unwrap_or(LOOPBACK_HOST)
-        .to_string()
+        parts.uri.authority().map(::http::uri::Authority::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| is_bare_authority(candidate))
+    .unwrap_or(LOOPBACK_HOST)
+    .to_string()
 }
 
 /// True when `value` is a bare authority: a host with an optional port and nothing else.

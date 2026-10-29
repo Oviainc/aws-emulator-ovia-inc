@@ -32,6 +32,9 @@ mod endpoint;
 #[path = "all/parallel_runs.rs"]
 mod parallel_runs;
 
+#[path = "all/report_url_endpoint.rs"]
+mod report_url_endpoint;
+
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 

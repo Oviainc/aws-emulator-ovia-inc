@@ -3716,18 +3716,26 @@ const LOOPBACK_HOST: &str = "127.0.0.1";
 /// `service-com-amazonaws-iotdeviceadvisor-iotsenateservice`'s `report_url_host`: each
 /// service resolves the caller's own endpoint for a URL it announces, and this note is
 /// here so the three cannot drift apart unnoticed if any of them changes.
+///
+/// Each source is tested on its own, in that order, and the FIRST one carrying a bare
+/// authority is what the URL names: a `Host` this registry cannot honour leaves the
+/// authority the URI carries still to be read, rather than standing in for it.
 pub fn layer_download_url_host(parts: &::http::request::Parts) -> String {
-    parts
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
+    [
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
         // The URI's AUTHORITY, not its host: a request that carries its endpoint on the
         // URI carries the PORT there too, and a URL announced without the port would not
         // resolve back to the socket the caller reached.
-        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
-        .filter(|candidate| is_bare_authority(candidate))
-        .unwrap_or(LOOPBACK_HOST)
-        .to_string()
+        parts.uri.authority().map(::http::uri::Authority::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| is_bare_authority(candidate))
+    .unwrap_or(LOOPBACK_HOST)
+    .to_string()
 }
 
 /// True when `value` is a bare authority: a host with an optional port and nothing else.

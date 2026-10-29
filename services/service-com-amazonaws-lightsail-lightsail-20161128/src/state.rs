@@ -16423,14 +16423,22 @@ pub fn domain_region_refusal(parts: &::http::request::Parts) -> Option<String> {
 /// the next client out of the emulator (and out of a sandboxed run) entirely.
 /// `None` when the request names no host at all, and then there is no endpoint
 /// to announce.
+///
+/// Each source is tested on its own, in that order, and the FIRST one carrying a value
+/// wins: a `Host` header that names nothing (an empty value) leaves the authority the URI
+/// carries still to be read, rather than standing in for it.
 pub fn request_endpoint(parts: &::http::request::Parts) -> Option<String> {
-    parts
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|host| host.to_str().ok())
-        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
-        .filter(|host| !host.is_empty())
-        .map(str::to_string)
+    [
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|host| host.to_str().ok()),
+        parts.uri.authority().map(::http::uri::Authority::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|host| !host.is_empty())
+    .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------

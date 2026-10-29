@@ -900,16 +900,23 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// that does send it back here is still routed to this service.
 pub fn request_host(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> String {
     let parts = ctx.parts();
-    parts
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|host| host.to_str().ok())
-        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
-        .filter(|host| !host.is_empty())
-        .map_or_else(
-            || format!("{ARN_NAMESPACE}.{region}.amazonaws.com"),
-            str::to_string,
-        )
+    // Each source is tested on its own, in that order, and the FIRST one carrying a value
+    // wins: a `Host` header that names nothing (an empty value) leaves the authority the
+    // URI carries still to be read, rather than standing in for it.
+    [
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|host| host.to_str().ok()),
+        parts.uri.authority().map(::http::uri::Authority::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|host| !host.is_empty())
+    .map_or_else(
+        || format!("{ARN_NAMESPACE}.{region}.amazonaws.com"),
+        str::to_string,
+    )
 }
 
 /// The key an application's name is unique under.
