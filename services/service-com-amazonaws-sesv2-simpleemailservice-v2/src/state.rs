@@ -784,6 +784,89 @@ pub fn tenant_suppression_preferences(
     Ok((reasons, scope))
 }
 
+/// The `SuppressionOptions` a write of ONE configuration set's suppression list
+/// preferences stores, from the members the request carried, or the refusal wording
+/// for a value outside a modelled value set.
+///
+/// Shared by every operation that writes a configuration set's suppression
+/// preferences, so the preferences a set ends up with do not depend on which one
+/// wrote them. Unlike an account's or a tenant's, a configuration set's
+/// `SuppressionOptions` is an OVERRIDE of the account's or the tenant's — the scope
+/// member "overrides the tenant or account suppression scope for emails sent using
+/// this configuration set" — so a member the request does not state is stored ABSENT
+/// rather than defaulted, leaving the set following the preferences it did not
+/// override. Every enum inside carries its value as a plain string, so the value set
+/// is enforced here, with the service's shared wording ([`modelled_enum_value`]).
+pub fn configuration_set_suppression_options(
+    options: crate::ops::types::SuppressionOptions,
+) -> Result<crate::ops::types::SuppressionOptions, String> {
+    let suppressed_reasons = match options.suppressed_reasons {
+        Some(reasons) => Some(
+            reasons
+                .into_iter()
+                .map(|reason| {
+                    modelled_enum_value(
+                        "SuppressedReasons",
+                        reason,
+                        crate::ops::types::SUPPRESSION_LIST_REASON_VALUES,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        None => None,
+    };
+    let suppression_scope = match options.suppression_scope {
+        Some(scope) => Some(modelled_enum_value(
+            "SuppressionScope",
+            scope,
+            crate::ops::types::SUPPRESSION_LIST_SCOPE_VALUES,
+        )?),
+        None => None,
+    };
+    let validation_options = match options.validation_options {
+        Some(validation) => Some(crate::ops::types::SuppressionValidationOptions {
+            condition_threshold: suppression_condition_threshold(validation.condition_threshold)?,
+        }),
+        None => None,
+    };
+    Ok(crate::ops::types::SuppressionOptions {
+        suppressed_reasons,
+        suppression_scope,
+        validation_options,
+    })
+}
+
+/// The `SuppressionConditionThreshold` a write of suppression validation settings
+/// stores, from the members the request carried, or the refusal wording for a value
+/// outside a modelled value set.
+///
+/// The same structure carries the validation settings of an account and of a
+/// configuration set, so both read it here: the switch is required and the confidence
+/// threshold is stored only where the request carried one.
+pub fn suppression_condition_threshold(
+    threshold: crate::ops::types::SuppressionConditionThreshold,
+) -> Result<crate::ops::types::SuppressionConditionThreshold, String> {
+    let condition_threshold_enabled = modelled_enum_value(
+        "ConditionThresholdEnabled",
+        threshold.condition_threshold_enabled,
+        crate::ops::types::FEATURE_STATUS_VALUES,
+    )?;
+    let overall_confidence_threshold = match threshold.overall_confidence_threshold {
+        Some(confidence) => Some(crate::ops::types::SuppressionConfidenceThreshold {
+            confidence_verdict_threshold: modelled_enum_value(
+                "ConfidenceVerdictThreshold",
+                confidence.confidence_verdict_threshold,
+                crate::ops::types::SUPPRESSION_CONFIDENCE_VERDICT_THRESHOLD_VALUES,
+            )?,
+        }),
+        None => None,
+    };
+    Ok(crate::ops::types::SuppressionConditionThreshold {
+        condition_threshold_enabled,
+        overall_confidence_threshold,
+    })
+}
+
 /// The AWS-Region this request executes in, which is also the region to stamp into
 /// the ARNs it mints: the SigV4 credential scope's region, else [`DEFAULT_REGION`].
 ///

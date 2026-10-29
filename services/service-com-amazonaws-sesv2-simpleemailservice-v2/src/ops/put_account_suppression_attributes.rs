@@ -163,34 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|reason| enum_value("SuppressedReasons", reason, SUPPRESSION_LIST_REASON_VALUES))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // The validation attributes carry two enums of their own, both checked the
-        // same way, and all of them before anything is persisted: a refused request
-        // leaves the account exactly as it was.
+        // The validation attributes carry two enums of their own, both checked through
+        // the shared projection of this structure, and all of them before anything is
+        // persisted: a refused request leaves the account exactly as it was.
         let validation_attributes = match input.validation_attributes {
-            Some(validation) => {
-                let threshold = validation.condition_threshold;
-                let condition_threshold_enabled = enum_value(
-                    "ConditionThresholdEnabled",
-                    threshold.condition_threshold_enabled,
-                    FEATURE_STATUS_VALUES,
-                )?;
-                let overall_confidence_threshold = match threshold.overall_confidence_threshold {
-                    Some(confidence) => Some(SuppressionConfidenceThreshold {
-                        confidence_verdict_threshold: enum_value(
-                            "ConfidenceVerdictThreshold",
-                            confidence.confidence_verdict_threshold,
-                            SUPPRESSION_CONFIDENCE_VERDICT_THRESHOLD_VALUES,
-                        )?,
-                    }),
-                    None => None,
-                };
-                Some(SuppressionValidationAttributes {
-                    condition_threshold: SuppressionConditionThreshold {
-                        condition_threshold_enabled,
-                        overall_confidence_threshold,
-                    },
-                })
-            }
+            Some(validation) => Some(SuppressionValidationAttributes {
+                condition_threshold: crate::state::suppression_condition_threshold(
+                    validation.condition_threshold,
+                )
+                .map_err(bad_request)?,
+            }),
             None => None,
         };
 
@@ -213,10 +195,14 @@ fn enum_value(
     value: String,
     allowed: &[&str],
 ) -> Result<String, PutAccountSuppressionAttributesError> {
-    crate::state::modelled_enum_value(member, value, allowed).map_err(|message| {
-        PutAccountSuppressionAttributesErrorModeled::BadRequestException(BadRequestException {
-            message: Some(message),
-        })
-        .into()
+    crate::state::modelled_enum_value(member, value, allowed).map_err(bad_request)
+}
+
+/// Refuse the request with this operation's input error — "the input you provided is
+/// invalid".
+fn bad_request(message: impl Into<String>) -> PutAccountSuppressionAttributesError {
+    PutAccountSuppressionAttributesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
     })
+    .into()
 }

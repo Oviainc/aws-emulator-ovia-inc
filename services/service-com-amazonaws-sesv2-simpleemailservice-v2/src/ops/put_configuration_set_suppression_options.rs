@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConfigurationSetSuppressionOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConfigurationSetSuppressionOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConfigurationSetSuppressionOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the suppression list preferences of the configuration set the path names —
+//! the suppressed reasons, the suppression scope that overrides the tenant's or the
+//! account's, and the validation options — as the request states them. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConfigurationSetSuppressionOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConfigurationSetSuppressionOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConfigurationSetSuppressionOptions"))
+        // Request metadata is not needed: a configuration set is keyed by name within
+        // the one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutConfigurationSetSuppressionOptions without the shared emulator state",
+            ));
+        };
+
+        let name = input.configuration_set_name;
+        if !crate::state::configuration_set_name_is_valid(&name) {
+            return Err(bad_request(crate::state::configuration_set_name_invalid(
+                &name,
+            )));
+        }
+
+        // The preferences this request states, with every enum inside them checked
+        // before anything is persisted: a refused request leaves the set exactly as it
+        // was. They are read through the shared projection, so the preferences a set
+        // ends up with do not depend on whether a create or this write stored them.
+        let requested = crate::state::configuration_set_suppression_options(SuppressionOptions {
+            suppressed_reasons: input.suppressed_reasons,
+            suppression_scope: input.suppression_scope,
+            validation_options: input.validation_options,
+        })
+        .map_err(bad_request)?;
+
+        let mut store = state.lock();
+        let Some(record) = store.configuration_sets.get_mut(&name) else {
+            // The preferences belong to a configuration set, so a name the account
+            // holds no set under is refused and nothing is stored under it.
+            return Err(
+                PutConfigurationSetSuppressionOptionsErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::configuration_set_not_found(&name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // This write states the set's suppression preferences WHOLE: a member it does
+        // not state is one the set no longer overrides, so the stored preferences are
+        // the requested ones rather than the requested ones laid over what was there.
+        // A request that states none at all leaves the set overriding nothing, which is
+        // the set holding no preferences of its own — exactly how a set created without
+        // them is stored.
+        let overrides_nothing = requested.suppressed_reasons.is_none()
+            && requested.suppression_scope.is_none()
+            && requested.validation_options.is_none();
+        record.suppression_options = if overrides_nothing {
+            None
+        } else {
+            Some(requested)
+        };
+
+        // `PutConfigurationSetSuppressionOptionsResponse` carries no members: what was
+        // persisted is read back with `GetConfigurationSet`.
+        Ok(PutConfigurationSetSuppressionOptionsOutput {})
     }
+}
+
+/// Refuse the request with this operation's input error — "the input you provided is
+/// invalid".
+fn bad_request(message: impl Into<String>) -> PutConfigurationSetSuppressionOptionsError {
+    PutConfigurationSetSuppressionOptionsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

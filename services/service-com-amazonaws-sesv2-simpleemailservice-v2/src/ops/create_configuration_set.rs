@@ -245,34 +245,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.sending_enabled = options.sending_enabled;
         }
         if let Some(options) = input.suppression_options {
-            let suppressed_reasons = match options.suppressed_reasons {
-                Some(reasons) => Some(
-                    reasons
-                        .into_iter()
-                        .map(|reason| {
-                            enum_value(
-                                "SuppressedReasons",
-                                reason,
-                                SUPPRESSION_LIST_REASON_VALUES,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-                None => None,
-            };
-            let suppression_scope = match options.suppression_scope {
-                Some(scope) => Some(enum_value(
-                    "SuppressionScope",
-                    scope,
-                    SUPPRESSION_LIST_SCOPE_VALUES,
-                )?),
-                None => None,
-            };
-            record.suppression_options = Some(SuppressionOptions {
-                suppressed_reasons,
-                suppression_scope,
-                validation_options: options.validation_options,
-            });
+            // The same shared projection every write of a set's suppression
+            // preferences goes through, so a create and a later write of them cannot
+            // read the request's members differently.
+            record.suppression_options = Some(
+                crate::state::configuration_set_suppression_options(options)
+                    .map_err(bad_request)?,
+            );
         }
         if let Some(options) = input.vdm_options {
             let dashboard_options = match options.dashboard_options {
