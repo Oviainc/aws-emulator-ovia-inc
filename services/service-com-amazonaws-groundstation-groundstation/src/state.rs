@@ -2504,6 +2504,35 @@ pub fn wrong_config_type_message(admissible: &[&str]) -> String {
 /// and the update so both answer one parameter name.
 pub const DATAFLOW_EDGES_PARAMETER: &str = "dataflowEdges";
 
+/// `names` as the sentence fragment a refusal lists them in, each quoted the way this
+/// service already quotes an endpoint name: `"alpha" and "beta"`, or `"alpha", "beta" and
+/// "gamma"`.
+fn quoted_endpoint_names(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("{name:?}")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, leading)) => format!("{} and {last}", leading.join(", ")),
+    }
+}
+
+/// What this service answers when the dataflow graph of a mission profile selects
+/// endpoints no ONE dataflow endpoint group holds: the names at fault, and the rule they
+/// break.
+///
+/// "When a contact uses multiple `DataflowEndpointConfig` objects, each `Config` must
+/// match a `DataflowEndpoint` in the same group" (`smithy_query(query="operation",
+/// operation="CreateDataflowEndpointGroup")`), so a graph whose endpoint selections cannot
+/// all be served by one group describes a contact that cannot be flown.
+pub fn dataflow_endpoints_of_different_groups_message(names: &[&str]) -> String {
+    format!(
+        "{} are endpoints of different dataflow endpoint groups; when a contact uses \
+         multiple dataflowEndpointConfig objects, each Config must match a DataflowEndpoint \
+         in the same group",
+        quoted_endpoint_names(names)
+    )
+}
+
 /// The ordered `(source, destination)` capability pairs a dataflow edge may join.
 ///
 /// A dataflow edge is one dataflow of a contact, so its two ends are the capability that
@@ -4733,6 +4762,118 @@ impl ComAmazonawsGroundstationGroundstationState {
             })
     }
 
+    /// The ids of the dataflow endpoint groups of this account that hold an endpoint named
+    /// `name`, in id order; empty when no group of this account holds one by that name.
+    ///
+    /// An endpoint name is unique only WITHIN one group ([`claim_endpoint_name`]), so a
+    /// name can be held by several groups, and which groups hold it is what decides
+    /// whether a graph selecting several names can be served by one group
+    /// ([`Self::dataflow_endpoint_group_fault`]). Sorted, so the answer is the same on
+    /// every call whatever order the map iterates in.
+    pub fn dataflow_endpoint_group_ids_holding(&self, name: &str) -> Vec<&str> {
+        let mut ids: Vec<&str> = self
+            .dataflow_endpoint_groups
+            .iter()
+            .filter(|(_, group)| {
+                group
+                    .endpoint_details
+                    .iter()
+                    .any(|details| endpoint_name(details) == Some(name))
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The endpoint names the dataflow graph `edges` selects, in the order the graph names
+    /// them and without repeats; empty when it selects none.
+    ///
+    /// An edge ends at the config its `ConfigArn` names and a `dataflowEndpointConfig`
+    /// selects an endpoint of this account by name (`dataflowEndpointName`), so those names
+    /// are what a contact flown through this graph is wired to. An end whose ARN resolves
+    /// to no config contributes nothing: that is a missing resource, answered by
+    /// [`Self::resolves_config`].
+    ///
+    /// Written against a graph rather than a stored profile, so the writes that take one
+    /// ([`Self::dataflow_endpoint_group_fault`]) and the reads of one that was stored
+    /// ([`Self::wired_dataflow_endpoint_names`]) resolve it the same way.
+    pub fn dataflow_endpoint_names_wired_by<'a>(&'a self, edges: &[Vec<String>]) -> Vec<&'a str> {
+        let mut names: Vec<&str> = Vec::new();
+        let selected = edges
+            .iter()
+            .flatten()
+            .filter_map(|arn| self.config_by_arn(arn))
+            .filter_map(|config| match &config.config_data {
+                ConfigTypeData::dataflowEndpointConfig(endpoint_config) => {
+                    Some(endpoint_config.dataflow_endpoint_name.as_str())
+                }
+                _ => None,
+            });
+        for name in selected {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Why the dataflow graph `edges` cannot be flown as ONE contact, as the modelled
+    /// `InvalidParameterException` (HTTP 431) to answer with; `None` when it can.
+    ///
+    /// "When a contact uses multiple `DataflowEndpointConfig` objects, each `Config` must
+    /// match a `DataflowEndpoint` in the same group" (`smithy_query(query="operation",
+    /// operation="CreateDataflowEndpointGroup")`), so the endpoints a graph selects
+    /// ([`Self::dataflow_endpoint_names_wired_by`]) have to be servable by a SINGLE group:
+    /// a graph for which no one group of this account holds every name it selects
+    /// describes a contact the service could not run, and is refused rather than stored.
+    /// The refusal names the selections that cannot share a group
+    /// ([`dataflow_endpoints_of_different_groups_message`]).
+    ///
+    /// A name no group of this account holds yet constrains nothing — an endpoint group
+    /// may be created after the config that selects its endpoint, so such a selection is
+    /// not yet in any group and says nothing about which group the contact runs through.
+    /// A name several groups hold ([`Self::dataflow_endpoint_group_ids_holding`]) narrows
+    /// the groups that could serve the graph without picking one, so a graph stays
+    /// acceptable while ANY group holds every name it selects.
+    ///
+    /// Shared by the create and the update, so a profile cannot be left holding a graph a
+    /// create would have refused.
+    pub fn dataflow_endpoint_group_fault(
+        &self,
+        edges: &[Vec<String>],
+    ) -> Option<InvalidParameterException> {
+        // The groups that hold every selection judged so far, and those selections.
+        let mut candidates: Vec<&str> = Vec::new();
+        let mut constrained: Vec<&str> = Vec::new();
+        for name in self.dataflow_endpoint_names_wired_by(edges) {
+            let holders = self.dataflow_endpoint_group_ids_holding(name);
+            if holders.is_empty() {
+                continue;
+            }
+            if constrained.is_empty() {
+                candidates = holders;
+                constrained.push(name);
+                continue;
+            }
+            let shared: Vec<&str> = candidates
+                .iter()
+                .copied()
+                .filter(|id| holders.contains(id))
+                .collect();
+            if shared.is_empty() {
+                constrained.push(name);
+                return Some(invalid_parameter(
+                    DATAFLOW_EDGES_PARAMETER,
+                    dataflow_endpoints_of_different_groups_message(&constrained),
+                ));
+            }
+            candidates = shared;
+            constrained.push(name);
+        }
+        None
+    }
+
     /// The endpoints of `group` as a read of it REPORTS them: what the create stored, with
     /// every member the endpoint's own agent decides taken from that agent
     /// ([`apply_agent_endpoint_health`]).
@@ -4927,23 +5068,14 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// resolution a read of the contact already takes when it reports the endpoint behind
     /// each edge end ([`dataflow_end`]), read from the profile rather than copied into the
     /// contact, so the in-use question and the read cannot disagree about what a pass is
-    /// wired to.
+    /// wired to. The graph is resolved by [`Self::dataflow_endpoint_names_wired_by`], the
+    /// one reader of a graph's endpoint selections, and the names are then sorted so a
+    /// refusal listing them reads the same on every call.
     pub fn wired_dataflow_endpoint_names(&self, mission_profile_arn: &str) -> Vec<&str> {
         let Some(profile) = self.mission_profile_by_arn(mission_profile_arn) else {
             return Vec::new();
         };
-        let mut names: Vec<&str> = profile
-            .dataflow_edges
-            .iter()
-            .flatten()
-            .filter_map(|arn| self.config_by_arn(arn))
-            .filter_map(|config| match &config.config_data {
-                ConfigTypeData::dataflowEndpointConfig(endpoint_config) => {
-                    Some(endpoint_config.dataflow_endpoint_name.as_str())
-                }
-                _ => None,
-            })
-            .collect();
+        let mut names = self.dataflow_endpoint_names_wired_by(&profile.dataflow_edges);
         names.sort_unstable();
         names.dedup();
         names

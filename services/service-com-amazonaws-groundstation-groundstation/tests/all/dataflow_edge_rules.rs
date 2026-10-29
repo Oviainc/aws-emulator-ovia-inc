@@ -159,7 +159,10 @@ async fn configs_of_every_type(router: &MultiServiceRouter) -> BTreeMap<&'static
 }
 
 /// `CreateMissionProfile` carrying `edges`, against `tracking_arn`.
-async fn create_profile(
+///
+/// `pub(crate)` so a sibling suite asserting another rule about the same graph posts it
+/// through one helper rather than a second copy of this body.
+pub(crate) async fn create_profile(
     router: &MultiServiceRouter,
     name: &str,
     tracking_arn: &str,
@@ -213,7 +216,10 @@ fn assert_edge_refused(case: &str, reply: &Reply, source_type: &str) {
 }
 
 /// The ids `ListMissionProfiles` holds, sorted.
-async fn listed_profile_ids(router: &MultiServiceRouter) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite asserting that a refused write stored nothing reads the
+/// store the same way.
+pub(crate) async fn listed_profile_ids(router: &MultiServiceRouter) -> Vec<String> {
     let list = send(router, "GET", "/missionprofile", None).await;
     assert_eq!(
         list.status, 200,

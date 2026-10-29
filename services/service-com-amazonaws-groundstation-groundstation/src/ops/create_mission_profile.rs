@@ -237,6 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The dataflows of a profile are flown as ONE contact, and a contact draws its
+        // dataflow endpoints from ONE dataflow endpoint group, so a graph whose endpoint
+        // selections no single group of this account can serve describes a contact that
+        // could not be flown and is refused rather than stored (see
+        // `state::dataflow_endpoint_group_fault`).
+        if let Some(refusal) = guard.dataflow_endpoint_group_fault(&input.dataflow_edges) {
+            return Err(CreateMissionProfileErrorModeled::InvalidParameterException(refusal).into());
+        }
+
         // The store this emulator keeps is bounded, so a caller cannot grow it without
         // limit; past the bound a create is refused the way the service refuses one that
         // runs past an account limit. Checked after the references above, so what the

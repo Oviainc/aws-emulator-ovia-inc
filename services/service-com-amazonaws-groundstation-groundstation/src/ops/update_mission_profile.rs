@@ -228,6 +228,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A graph this update carries is held to the group rule the create's is held to:
+        // the dataflows of a profile are flown as one contact, which draws its dataflow
+        // endpoints from one dataflow endpoint group, so an update cannot leave a profile
+        // holding a graph whose endpoint selections no single group can serve (see
+        // `state::dataflow_endpoint_group_fault`).
+        if let Some(edges) = input.dataflow_edges.as_deref() {
+            if let Some(refusal) = guard.dataflow_endpoint_group_fault(edges) {
+                return Err(
+                    UpdateMissionProfileErrorModeled::InvalidParameterException(refusal).into(),
+                );
+            }
+        }
+
         let stored = guard
             .mission_profiles
             .get_mut(&input.mission_profile_id)

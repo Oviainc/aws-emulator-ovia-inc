@@ -67,8 +67,9 @@ const WINDOW_STRIDE: i64 = 86_400;
 ///
 /// The body comes from [`endpoint_kinds`] — the one table in this target that lists every
 /// endpoint member `EndpointDetails` declares — with only the name replaced, which is what a
-/// `dataflowEndpointConfig` selects an endpoint by.
-fn endpoint_body(member: &str, name: &str) -> Value {
+/// `dataflowEndpointConfig` selects an endpoint by. `pub(crate)` so a sibling suite naming
+/// endpoints of a group describes them from the same table.
+pub(crate) fn endpoint_body(member: &str, name: &str) -> Value {
     let kinds = endpoint_kinds();
     let kind = kinds
         .iter()
@@ -88,7 +89,10 @@ fn endpoint_body(member: &str, name: &str) -> Value {
 ///
 /// Only a DATAFLOW endpoint is created with the security details Ground Station connects its
 /// stream with; an agent endpoint's stream is carried by the customer's own agent.
-async fn group_holding(
+///
+/// `pub(crate)` so a sibling suite that needs groups holding named endpoints creates them
+/// through this one helper.
+pub(crate) async fn group_holding(
     router: &MultiServiceRouter,
     case: &str,
     member: &str,
