@@ -28,13 +28,18 @@ use crate::rejection_rule_and_negative_paths::{epoch_seconds_from_now, harvest_b
 
 /// The header each of these four operations binds its `ETag` member to
 /// (`@httpHeader("x-amzn-update-if-match")`).
-const IF_MATCH: &str = "x-amzn-update-if-match";
+///
+/// `pub(crate)` with [`STALE_ETAG_MESSAGE`], [`read`], [`message`] and [`settle_job`]:
+/// they are this crate's ONE description of the shared precondition, so
+/// `entity_tag_precondition_precedence` drives it through them rather than carrying a
+/// second copy.
+pub(crate) const IF_MATCH: &str = "x-amzn-update-if-match";
 
 /// The fixed sentence a presented-but-not-committed entity tag is refused with. It is
 /// spelled out here rather than read back from the crate: the service's error text is
 /// fixed per rejection class and carries nothing from the request, so the sentence itself
 /// is part of the contract (note the typographic apostrophes).
-const STALE_ETAG_MESSAGE: &str = "You\u{2019}ve specified an entity tag with your request \
+pub(crate) const STALE_ETAG_MESSAGE: &str = "You\u{2019}ve specified an entity tag with your request \
     that does not match the resource\u{2019}s current entity tag. This can occur if the \
     resource has been updated by another request between the time you retrieved the ETag \
     and when you made your update request";
@@ -202,7 +207,7 @@ impl Writer {
 }
 
 /// Read the resource at `path` back through its own reader.
-async fn read(emulator: &Emulator, case: &str, path: &str) -> Value {
+pub(crate) async fn read(emulator: &Emulator, case: &str, path: &str) -> Value {
     let (status, body) = emulator.call("GET", path, None).await;
     assert_eq!(
         status, 200,
@@ -218,7 +223,7 @@ async fn read(emulator: &Emulator, case: &str, path: &str) -> Value {
 /// row must present a tag taken AFTER it: once the job is past `QUEUED` the next
 /// transition its schedule owes is an hour out, so the tag the row reads stays the
 /// committed one.
-async fn settle_job(emulator: &Emulator, path: &str) {
+pub(crate) async fn settle_job(emulator: &Emulator, path: &str) {
     for _ in 0..200u32 {
         let body = read(emulator, "setup", path).await;
         if body["Status"] != json!("QUEUED") {
@@ -230,7 +235,7 @@ async fn settle_job(emulator: &Emulator, path: &str) {
 }
 
 /// The `Message` member of an error envelope (`""` when absent).
-fn message(body: &Value) -> &str {
+pub(crate) fn message(body: &Value) -> &str {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)

@@ -120,3 +120,5 @@ mod request_refusal_precedence;
 mod restricted_channel_members;
 #[path = "all/channel_members_by_input_type.rs"]
 mod channel_members_by_input_type;
+#[path = "all/entity_tag_precondition_precedence.rs"]
+mod entity_tag_precondition_precedence;

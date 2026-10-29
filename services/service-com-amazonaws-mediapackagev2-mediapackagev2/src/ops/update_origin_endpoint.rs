@@ -8,8 +8,18 @@
 //! matching; a write that stored what was already there commits nothing and leaves both
 //! the tag and `ModifiedAt` as they were.
 //!
-//! What it refuses, before anything is written:
+//! What it refuses, before anything is written — the rules about the request alone
+//! first, then the precondition the moment the addressed endpoint is in hand, then the
+//! rules that read the stored endpoint and its parents:
 //!
+//! * a manifest set the new `ContainerType` cannot serve, no manifest at all, or more
+//!   manifests than [`crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — the same rules
+//!   `CreateOriginEndpoint` applies, because an update carries the whole manifest set;
+//! * an `ETag` precondition (`x-amzn-update-if-match`) that is not the endpoint's current
+//!   tag, which the model's doc says rejects the request — judged ahead of every rule
+//!   below, exactly as this service's other conditional writers judge it, because a
+//!   caller holding a tag that is no longer current lost a race over the very endpoint
+//!   those rules compare against;
 //! * a member the model documents as immutable after creation, when the request carries
 //!   a different value — `ContainerType` (`CONTAINER_TYPE_IMMUTABLE`),
 //!   `StreamNameOutputMode` (`STREAM_NAME_OUTPUT_MODE_IMMUTABLE`) and
@@ -20,15 +30,10 @@
 //!   `ONLY_NON_EPOCH_LOCKED_ALLOW_OUTPUT_TIMESTAMP_MODE` `CreateOriginEndpoint` answers,
 //!   because the restriction is read in one place
 //!   ([`crate::state::output_timestamp_mode_violation`]);
-//! * a manifest set the new `ContainerType` cannot serve, no manifest at all, or more
-//!   manifests than [`crate::state::MAX_MANIFESTS_PER_ORIGIN_ENDPOINT`] — the same rules
-//!   `CreateOriginEndpoint` applies, because an update carries the whole manifest set;
 //! * a `StreamNameOutputMode` named for an endpoint whose parent channel's `InputType` may
 //!   not carry the member at all
 //!   (`ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE`), off the same rule the create
-//!   reads ([`crate::state::stream_name_output_mode_input_type_violation`]);
-//! * an `ETag` precondition (`x-amzn-update-if-match`) that is not the endpoint's current
-//!   tag, which the model's doc says rejects the request.
+//!   reads ([`crate::state::stream_name_output_mode_input_type_violation`]).
 //!
 //! A group, channel or endpoint that does not resolve is a `ResourceNotFoundException`.
 //!
@@ -424,6 +429,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `ETag` is the precondition the caller read from an earlier response: "If the
+        // specified ETag does not match the resource's current entity tag, the update
+        // request will be rejected". The model declares no precondition error for this
+        // operation, and the resource having moved on under the caller is what
+        // `ConflictException` / `CONFLICTING_OPERATION` describes — which is the ONE rule
+        // every conditional writer of this service resolves through
+        // (`crate::state::stale_entity_tag_rejection`), so this operation judges the
+        // precondition and words the refusal exactly as they do: it is the FIRST thing
+        // decided once the addressed resource is in hand, before any rule of this
+        // operation's own that reads the stored resource or its parents. A caller whose
+        // tag is no longer current is holding a stale picture of the very resource those
+        // rules compare against, so the lost race is what it has to be told about; the
+        // request-only rules above are decided without the store at all and so cannot
+        // come after it.
+        if let Some(conflict) =
+            crate::state::stale_entity_tag_rejection(input.e_tag.as_deref(), &endpoint.etag)
+        {
+            return Err(UpdateOriginEndpointErrorModeled::ConflictException(conflict).into());
+        }
+
         // The immutable members: `ContainerType` is required on every update, so it is
         // compared always; `StreamNameOutputMode` and `Segment.OutputTimestampMode` only
         // when the request provides one, because an absent request value means "keep what
@@ -477,20 +502,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        // `ETag` is the precondition the caller read from an earlier response: "If the
-        // specified ETag does not match the resource's current entity tag, the update
-        // request will be rejected". The model declares no precondition error for this
-        // operation, and the resource having moved on under the caller is what
-        // `ConflictException` / `CONFLICTING_OPERATION` describes — which is the ONE rule
-        // every conditional writer of this service resolves through
-        // (`crate::state::stale_entity_tag_rejection`), so this operation judges the
-        // precondition and words the refusal exactly as they do.
-        if let Some(conflict) =
-            crate::state::stale_entity_tag_rejection(input.e_tag.as_deref(), &endpoint.etag)
-        {
-            return Err(UpdateOriginEndpointErrorModeled::ConflictException(conflict).into());
-        }
-
         // The URLs of the replacement manifests are rooted exactly where the endpoint's
         // own are: the parent group's egress domain and this resource path.
         let at = crate::state::ManifestLocation {
