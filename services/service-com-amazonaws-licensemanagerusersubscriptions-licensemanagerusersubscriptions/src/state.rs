@@ -664,6 +664,68 @@ pub struct LicenseServerEndpointRecord {
     pub deleted_due_at: Option<SystemTime>,
 }
 
+/// The status transition a stored record owes the clock, read off the record itself.
+///
+/// A record is in a non-terminal status exactly when its own status says so, and the
+/// instant that status falls due is a field of the same record — so the record, not its
+/// writer, is what knows whether anything is owed and when. Every writer that stores a
+/// record of one of these kinds asks it through
+/// [`schedule_record_transition`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::schedule_record_transition),
+/// which is the ONE place "store a record in a non-terminal status" is paired with
+/// "schedule the transition it owes": a new creating or teardown path gets the pending
+/// guard from the writer it stores through and cannot be written without it.
+pub trait OwedTransition {
+    /// When the clock next owes this record a status transition, or `None` when its status
+    /// is terminal (nothing falls due for it).
+    fn owed_transition_due_at(&self) -> Option<SystemTime>;
+}
+
+impl OwedTransition for IdentityProviderRecord {
+    fn owed_transition_due_at(&self) -> Option<SystemTime> {
+        if self.status == STATUS_REGISTERING {
+            Some(self.registered_due_at)
+        } else if deregistration_started(&self.status) {
+            self.deregistered_due_at
+        } else {
+            None
+        }
+    }
+}
+
+impl OwedTransition for InstanceUserRecord {
+    fn owed_transition_due_at(&self) -> Option<SystemTime> {
+        if self.status == STATUS_ASSOCIATING {
+            Some(self.associated_due_at)
+        } else if disassociation_started(&self.status) {
+            self.disassociated_due_at
+        } else {
+            None
+        }
+    }
+}
+
+impl OwedTransition for ProductUserRecord {
+    fn owed_transition_due_at(&self) -> Option<SystemTime> {
+        if unsubscribe_started(&self.status) {
+            self.unsubscribed_due_at
+        } else {
+            None
+        }
+    }
+}
+
+impl OwedTransition for LicenseServerEndpointRecord {
+    fn owed_transition_due_at(&self) -> Option<SystemTime> {
+        if self.provisioning_status == PROVISIONING_STATUS_PROVISIONING {
+            Some(self.provisioned_due_at)
+        } else if self.provisioning_status == PROVISIONING_STATUS_DELETING {
+            self.deleted_due_at
+        } else {
+            None
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-licensemanagerusersubscriptions-licensemanagerusersubscriptions. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState {
@@ -745,10 +807,11 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     /// [`materialise_due`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::materialise_due)
     /// runs on EVERY request, so it must not sweep every stored record every time: this
     /// is the O(1) guard that makes the sweep happen only when the clock actually owes
-    /// something. Every writer that stores a record in a non-terminal status calls
-    /// [`schedule_transition`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::schedule_transition)
-    /// with that record's due instant; forgetting to would delay the transition until
-    /// another record falls due, never corrupt a record.
+    /// something. It is written by the one writer of each record kind, which schedules
+    /// whatever the record it stores owes (the `schedule_record_transition` pairing over
+    /// [`OwedTransition`]), so no creating or teardown path can store a record in a
+    /// non-terminal status without this guard covering it; were one to, the transition
+    /// would be delayed until another record fell due, never corrupt a record.
     pub pending_transition_due_at: Option<SystemTime>,
     /// Source of the resource ids this service mints.
     pub next_id: u64,
@@ -987,14 +1050,34 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
 
     /// Record that a stored resource owes the clock a status transition at `due_at`.
     ///
-    /// Called by every writer that stores a record in a non-terminal status; keeping the
-    /// EARLIEST due instant is what lets [`materialise_due`](Self::materialise_due) skip
-    /// the sweep on a request that owes nothing.
-    pub fn schedule_transition(&mut self, due_at: SystemTime) {
+    /// Reached through [`schedule_record_transition`](Self::schedule_record_transition),
+    /// which is what every writer of a record uses; keeping the EARLIEST due instant is
+    /// what lets [`materialise_due`](Self::materialise_due) skip the sweep on a request
+    /// that owes nothing.
+    fn schedule_transition(&mut self, due_at: SystemTime) {
         self.pending_transition_due_at = Some(
             self.pending_transition_due_at
                 .map_or(due_at, |earliest| earliest.min(due_at)),
         );
+    }
+
+    /// Schedule whatever transition `record` owes the clock, and nothing when it owes none.
+    ///
+    /// The ONE pairing of "a record was stored" with "the transition that record owes is
+    /// scheduled": every writer of a record — the creating writers
+    /// ([`insert_identity_provider`](Self::insert_identity_provider),
+    /// [`insert_instance_user`](Self::insert_instance_user),
+    /// [`insert_product_user`](Self::insert_product_user),
+    /// [`insert_license_server_endpoint`](Self::insert_license_server_endpoint)) and the
+    /// teardown writers (the `begin_*` calls) alike — ends here, so the guard
+    /// ([`pending_transition_due_at`](Self::pending_transition_due_at)) is a consequence of
+    /// storing the record rather than a second step each caller has to remember. A record
+    /// in a terminal status owes nothing and schedules nothing, so a writer does not have
+    /// to know which of its records are pending either.
+    fn schedule_record_transition(&mut self, record: &impl OwedTransition) {
+        if let Some(due_at) = record.owed_transition_due_at() {
+            self.schedule_transition(due_at);
+        }
     }
 
     /// Whether `count` stored resources of one kind is already this emulator's limit.
@@ -1190,9 +1273,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
 
     /// Store one user association and index it everywhere it is reached from: by ARN, in
     /// association order, by its [`instance_user_key`] identity and under the instance it
-    /// names.
+    /// names — and schedule the transition the stored association owes the clock.
     ///
-    /// The ONE writer, so no two of those views of the same association can disagree.
+    /// The ONE writer, so no two of those views of the same association can disagree, and
+    /// so an association stored in a non-terminal status is stored together with the guard
+    /// its transition is swept on (see
+    /// [`pending_transition_due_at`](Self::pending_transition_due_at)).
     pub fn insert_instance_user(&mut self, record: InstanceUserRecord) {
         let arn = record.arn.clone();
         let index_key = instance_user_key(
@@ -1205,6 +1291,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .entry(record.instance_id.clone())
             .or_default()
             .push(arn.clone());
+        self.schedule_record_transition(&record);
         self.instance_users.insert(arn.clone(), record);
         self.instance_user_order.push(arn.clone());
         self.instance_user_index.insert(index_key, arn);
@@ -1347,8 +1434,34 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let disassociating = record.clone();
         self.tags.remove(arn);
         // The teardown the clock now owes, which is what stops reporting the association.
-        self.schedule_transition(due_at);
+        self.schedule_record_transition(&disassociating);
         Some(disassociating)
+    }
+
+    /// Store one license server endpoint and index it everywhere it is reached from: by
+    /// ARN, in creation order, and under the `(IdentityProviderArn, ServerType)` pair that
+    /// a repeat create resolves it by — and schedule the transition the stored endpoint
+    /// owes the clock.
+    ///
+    /// The ONE writer of an endpoint, exactly as the other kinds have
+    /// ([`insert_identity_provider`](Self::insert_identity_provider),
+    /// [`insert_instance_user`](Self::insert_instance_user)): the pair the endpoint is
+    /// indexed under is read off the record, so no view of one endpoint can disagree with
+    /// another, and a `PROVISIONING` endpoint cannot be stored without the guard its
+    /// transition is swept on (see
+    /// [`pending_transition_due_at`](Self::pending_transition_due_at)). The counterpart of
+    /// [`begin_license_server_endpoint_deletion`](Self::begin_license_server_endpoint_deletion)
+    /// and [`remove_license_server_endpoint`](Self::remove_license_server_endpoint).
+    pub fn insert_license_server_endpoint(&mut self, record: LicenseServerEndpointRecord) {
+        let arn = record.arn.clone();
+        let index_key = (
+            record.identity_provider_arn.clone(),
+            record.server_type.clone(),
+        );
+        self.schedule_record_transition(&record);
+        self.license_server_endpoints.insert(arn.clone(), record);
+        self.license_server_endpoint_order.push(arn.clone());
+        self.license_server_endpoint_index.insert(index_key, arn);
     }
 
     /// The license server endpoints in creation order.
@@ -1465,7 +1578,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .retain(|_, indexed| indexed != arn);
         self.tags.remove(arn);
         // The `DELETING` -> `DELETED` transition the clock now owes.
-        self.schedule_transition(due_at);
+        self.schedule_record_transition(&deleting);
         self.prune_deleted_license_server_endpoints();
         Some(deleting)
     }
@@ -1576,8 +1689,9 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Store a registration: hold it by ARN, keep it in registration order, index it
-    /// under the `(provider key, product)` pair that also addresses it, and recompute
-    /// every instance view the new registration changes.
+    /// under the `(provider key, product)` pair that also addresses it, schedule the
+    /// transition the stored registration owes the clock, and recompute every instance view
+    /// the new registration changes.
     ///
     /// The counterpart of
     /// [`begin_identity_provider_deregistration`](Self::begin_identity_provider_deregistration)
@@ -1587,7 +1701,9 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// ([`refresh_instance_view`](Self::refresh_instance_view)), so a registration ADDED
     /// for a directory changes those views exactly as one leaving that set does. One writer
     /// owns the whole write, so no handler can store a registration and leave an instance
-    /// reporting products the state no longer implies.
+    /// reporting products the state no longer implies, or leave a `REGISTERING`
+    /// registration with no sweep scheduled for it (see
+    /// [`pending_transition_due_at`](Self::pending_transition_due_at)).
     pub fn insert_identity_provider(
         &mut self,
         key: String,
@@ -1596,6 +1712,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     ) {
         let arn = record.arn.clone();
         let product = record.product.clone();
+        self.schedule_record_transition(&record);
         self.identity_providers.insert(arn.clone(), record);
         self.identity_provider_order.push(arn.clone());
         self.identity_provider_index.insert((key.clone(), product), arn);
@@ -1852,7 +1969,9 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Store one product user: the record, its place in the subscription order and the
-    /// [`product_user_key`] identity that reaches it.
+    /// [`product_user_key`] identity that reaches it — and schedule whatever transition the
+    /// stored subscription owes the clock (a live one owes none; see
+    /// [`pending_transition_due_at`](Self::pending_transition_due_at)).
     ///
     /// The ONE writer of a product user, so the record, the list order and the index that
     /// reaches it cannot disagree about what is subscribed, nor about which user a stored
@@ -1866,6 +1985,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         );
         self.product_user_order.push(record.arn.clone());
         self.product_user_index.insert(key, record.arn.clone());
+        self.schedule_record_transition(&record);
         self.product_users.insert(record.arn.clone(), record);
     }
 
@@ -2237,7 +2357,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         self.refresh_every_instance_view(now);
         self.tags.remove(arn);
         // The removal the clock now owes.
-        self.schedule_transition(due_at);
+        self.schedule_record_transition(&deregistering);
         Some(deregistering)
     }
 
@@ -2381,7 +2501,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         let ended = record.clone();
         self.tags.remove(arn);
         // The teardown the clock now owes, which is what stops reporting the subscription.
-        self.schedule_transition(due_at);
+        self.schedule_record_transition(&ended);
         Some(ended)
     }
 }

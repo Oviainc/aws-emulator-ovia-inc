@@ -8,8 +8,9 @@
 //! models `DELETING` and `DELETED` for — so the call does not drop the record: the
 //! endpoint enters `DELETING`, stays reported by `ListLicenseServerEndpoints` in that
 //! status, and reaches the terminal `DELETED` when the clock owes it (the way the
-//! `PROVISIONING -> PROVISIONED` transition is owed, through
-//! `schedule_transition`/`materialise_due`). What the call takes away at once is what
+//! `PROVISIONING -> PROVISIONED` transition is owed: the writer that stores the record
+//! schedules what the record owes, and `materialise_due` sweeps it). What the call takes
+//! away at once is what
 //! made the endpoint a LIVE resource: its `(IdentityProviderArn, ServerType)` index
 //! entry, so a create for the same pair mints a new endpoint, and its tags.
 //!

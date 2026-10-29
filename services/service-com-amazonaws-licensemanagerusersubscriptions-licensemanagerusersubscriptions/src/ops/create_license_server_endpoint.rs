@@ -16,7 +16,10 @@
 //!
 //! The endpoint is returned in the non-terminal `PROVISIONING` status; the `PROVISIONED`
 //! transition is owed by the clock (see `crate::state::materialise_due`) and
-//! materialises on any later read.
+//! materialises on any later read. The record is stored through
+//! `crate::state::insert_license_server_endpoint`, the one writer for an endpoint, which
+//! is also what schedules that owed transition — so the pending guard comes with the
+//! write rather than from a second call here.
 //!
 //! The license servers reached through the endpoint are provisioned here too — one host
 //! per subnet the resolved registration provisions into — and persisted with the record,
@@ -252,15 +255,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(tags) = input.tags.as_ref() {
             state.merge_tags(&arn, tags).map_err(invalid_tags)?;
         }
-        state
-            .license_server_endpoints
-            .insert(arn.clone(), record.clone());
-        state.license_server_endpoint_order.push(arn.clone());
-        state
-            .license_server_endpoint_index
-            .insert(key, arn.clone());
-        // The `PROVISIONING` -> `PROVISIONED` transition the clock now owes.
-        state.schedule_transition(record.provisioned_due_at);
+        // The ONE writer of an endpoint: it stores the record, the creation order and the
+        // `(IdentityProviderArn, ServerType)` entry a repeat create resolves it by, and
+        // schedules the `PROVISIONING` -> `PROVISIONED` transition the stored endpoint
+        // owes the clock.
+        state.insert_license_server_endpoint(record.clone());
 
         Ok(CreateLicenseServerEndpointOutput {
             identity_provider_arn: Some(record.identity_provider_arn),

@@ -51,6 +51,8 @@ mod license_servers_behind_an_endpoint;
 mod list_instances;
 #[path = "all/optional_settings_registration.rs"]
 mod optional_settings_registration;
+#[path = "all/pending_transition_comes_with_the_record.rs"]
+mod pending_transition_comes_with_the_record;
 #[path = "all/product_subscription_teardown.rs"]
 mod product_subscription_teardown;
 #[path = "all/product_user_removal_is_one_writer.rs"]

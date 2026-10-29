@@ -299,10 +299,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.merge_tags(&arn, tags).map_err(into_error)?;
         }
         // The ONE writer of an association: it stores the record and every index that
-        // reaches it, so no two views of the same association can disagree.
+        // reaches it, and schedules the `ASSOCIATING` -> `ASSOCIATED` transition the
+        // stored association owes the clock, so no two views of the same association can
+        // disagree and no sweep for it can be missing.
         state.insert_instance_user(record.clone());
-        // The `ASSOCIATING` -> `ASSOCIATED` transition the clock now owes.
-        state.schedule_transition(record.associated_due_at);
         // The association is also how an instance enters this service's view, which is
         // what `ListInstances` reports (see `crate::state::InstanceRecord`).
         state.refresh_instance_view(&record.instance_id, now);
