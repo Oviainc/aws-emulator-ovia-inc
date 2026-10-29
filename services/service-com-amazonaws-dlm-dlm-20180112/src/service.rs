@@ -54,9 +54,11 @@
 //! A request meets three layers before a handler runs, in this order:
 //!
 //! 1. **`iam:PassRole` for the `ExecutionRoleArn` it names.** Amazon Data
-//!    Lifecycle Manager assumes that role, so the authorization precedes even the
-//!    member-constraint walk: an ARN that denotes a principal the caller may not
-//!    pass is `AccessDeniedException` (403), not a shape refusal.
+//!    Lifecycle Manager assumes that role, so the authorization precedes every
+//!    refusal of the request's shape — the member-constraint walk and the read
+//!    that builds the input alike: an ARN that denotes a principal the caller may
+//!    not pass is `AccessDeniedException` (403), not a shape refusal, whatever
+//!    else the request is short of.
 //! 2. **The modelled input constraints.** A value outside a declared `@pattern`,
 //!    `@length` or `@range`, or a `@required` member absent, is this service's own
 //!    `InvalidRequestException` (400) — the error every operation that can refuse
@@ -109,6 +111,17 @@ const RESOURCE_NOT_FOUND_EXCEPTION_STATUS: u16 = 404;
 /// the element out of the collection.
 const COLLECTION_PATH_STEP: &str = "member";
 
+/// The input member that names the role Amazon Data Lifecycle Manager assumes.
+///
+/// `CreateLifecyclePolicy` and `UpdateLifecyclePolicy` each declare an
+/// `ExecutionRoleArn` member of their input, and no other operation of this
+/// service declares one (`smithy_query(query="digest")`). The authorization that
+/// reads it runs ahead of the walk that BUILDS an input, so it is read off the
+/// operation's input schema — which every operation has, whole, however the
+/// request reads — instead of a deserialized input, which a request missing any
+/// required member yields none of.
+const EXECUTION_ROLE_ARN_MEMBER: &str = "ExecutionRoleArn";
+
 /// The `message` member of the `AccessDeniedException` this service answers a
 /// denied `iam:PassRole` with.
 static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
@@ -154,37 +167,6 @@ impl SerializableStruct for AccessDeniedException {
         Ok(())
     }
 }
-
-/// An operation input of this service, as the request layer above the handlers
-/// reads it.
-///
-/// Only one fact is asked of it: the `ExecutionRoleArn` it names, when it names
-/// one. Amazon Data Lifecycle Manager assumes that role, so the two operations
-/// that take one must have `iam:PassRole` for it before they run; every other
-/// operation names none, which is this trait's default.
-trait DlmRequest {
-    /// The `ExecutionRoleArn` this request names, when it names one.
-    fn execution_role_arn(&self) -> Option<&str> {
-        None
-    }
-}
-
-impl DlmRequest for crate::ops::types::CreateLifecyclePolicyInput {
-    fn execution_role_arn(&self) -> Option<&str> {
-        Some(self.execution_role_arn.as_str())
-    }
-}
-
-impl DlmRequest for crate::ops::types::UpdateLifecyclePolicyInput {
-    fn execution_role_arn(&self) -> Option<&str> {
-        self.execution_role_arn.as_deref()
-    }
-}
-
-impl DlmRequest for crate::ops::types::GetLifecyclePoliciesInput {}
-impl DlmRequest for crate::ops::types::ListTagsForResourceInput {}
-impl DlmRequest for crate::ops::types::TagResourceInput {}
-impl DlmRequest for crate::ops::types::UntagResourceInput {}
 
 /// An operation input that addresses ONE lifecycle policy by the `PolicyId` in
 /// its URI, on an operation whose model declares no client error for a refused
@@ -288,10 +270,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// Two layers, in the order the real front door runs them:
 ///
 /// 1. `iam:PassRole` for the `ExecutionRoleArn` the request names. That is ahead
-///    of the member-constraint walk, so the denial reaches the caller even for an
-///    ARN the `ExecutionRoleArn` `@pattern` would otherwise refuse as malformed —
-///    and, because nothing has run yet, a denied create leaves no policy behind
-///    and a denied update leaves the stored policy as it was.
+///    of every refusal of the request's shape, so the denial reaches the caller
+///    for an ARN the `ExecutionRoleArn` `@pattern` would otherwise refuse as
+///    malformed, and for a body that is short of a required member as much as
+///    for a complete one — the ARN decides the answer, and nothing else the body
+///    holds does. Because nothing has run yet, a denied create leaves no policy
+///    behind and a denied update leaves the stored policy as it was.
 /// 2. The modelled input constraints, refused with this service's own
 ///    `InvalidRequestException`. The framework's pre-dispatch renderer gets the
 ///    status (400) right, but names the error type `ValidationException` — a shape
@@ -319,7 +303,6 @@ impl<O> InModelledEnvelope<O> {
 impl<O> ErasedOperation for InModelledEnvelope<O>
 where
     O: Operation + ErasedOperation,
-    O::Input: DlmRequest,
 {
     fn run<'r>(
         &'r self,
@@ -454,10 +437,13 @@ where
 /// serialized, which leaves that walk to refuse the request rather than answering
 /// with no reason at all.
 ///
-/// The request is read with the framework's own deserializer (the same one the
-/// walk uses) and WITHOUT the constraint walk, because `iam:PassRole` is
-/// authorized ahead of the member constraints: an ARN that does not denote a
-/// role the caller may pass is denied rather than refused as malformed.
+/// The two layers are asked IN ORDER and independently: the `iam:PassRole`
+/// authorization reads only the `ExecutionRoleArn` the request names (see
+/// [`execution_role_arn_named`]) and is answered before the request is built into
+/// an input at all, because it precedes every shape refusal — an absent required
+/// member as much as a value outside a declared `@pattern`. An ARN that does not
+/// denote a role the caller may pass is therefore denied rather than refused as
+/// malformed, and the class of the answer never turns on an unrelated member.
 ///
 /// A request this does not refuse is deserialized and walked a SECOND time by
 /// the generated `ErasedOperation::run`. That is the cost of stating the refusal
@@ -469,18 +455,19 @@ where
 fn refused_before_handling<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<RtResponse>
-where
-    O::Input: DlmRequest,
-{
+) -> Option<RtResponse> {
+    // Layer 1. Asked of the `ExecutionRoleArn` the REQUEST names, read straight
+    // off the request, so it is answered for every request that names one — a
+    // request this layer denies is one the caller may not make at all, whatever
+    // the rest of its body holds, and so is not reached by the shape refusals
+    // that follow.
+    if let Some(denied) = pass_role_denied(protocol, execution_role_arn_named::<O>(protocol, req)) {
+        return Some(denied);
+    }
+    // Layer 2.
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
     let violations = match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
-        Ok(input) => {
-            if let Some(denied) = pass_role_denied(protocol, input.execution_role_arn()) {
-                return Some(denied);
-            }
-            constraints::validate(&input, O::INPUT_SCHEMA)
-        }
+        Ok(input) => constraints::validate(&input, O::INPUT_SCHEMA),
         // Absence is found while READING the request and a bad value while
         // walking what was read; to a caller they are one refusal, so they are
         // one here.
@@ -492,6 +479,59 @@ where
         Err(_) => Vec::new(),
     };
     invalid_request(protocol, &violations)
+}
+
+/// The `ExecutionRoleArn` `req` names, when `O` declares that member and the
+/// request carries a readable value for it; `None` otherwise.
+///
+/// Read from the request with the framework's own deserializer, member by
+/// member, rather than from a deserialized input: a request that omits ANY
+/// member its input holds non-optionally yields no input at all (the build
+/// fails with [`SerdeError::MissingMember`]), and a role the caller may not pass
+/// is denied ahead of every shape refusal — including that one. Reading the
+/// members instead of the struct is what makes the answer depend on the ARN the
+/// request names and on nothing else it carries.
+///
+/// Every member the walk is handed and does not want is consumed as a document,
+/// which keeps the body reader in step with its own stream; a member bound to
+/// the URI or the headers is handed its own reader, so leaving that one unread
+/// costs nothing. A member the body cannot yield this way leaves the walk with
+/// whatever it has already read, because what the rest of the body holds is the
+/// business of the layer after this one.
+fn execution_role_arn_named<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<String> {
+    if !O::INPUT_SCHEMA.members().iter().any(|m| names_role(m)) {
+        return None;
+    }
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    let mut named: Option<String> = None;
+    let _ = deserializer.read_struct(O::INPUT_SCHEMA, &mut |member, values| {
+        if names_role(member) {
+            named = Some(values.read_string(member)?);
+        } else if !http_bound(member) {
+            values.read_document(member)?;
+        }
+        Ok(())
+    });
+    named
+}
+
+/// True when `member` is the one that names the role to authorize.
+fn names_role(member: &Schema) -> bool {
+    member.member_name() == Some(EXECUTION_ROLE_ARN_MEMBER)
+}
+
+/// True when `member` takes its value from the request's URI or headers rather
+/// than from the body the codec parses.
+fn http_bound(member: &Schema) -> bool {
+    member.http_label().is_some()
+        || member.http_query().is_some()
+        || member.http_query_params().is_some()
+        || member.http_header().is_some()
+        || member.http_prefix_headers().is_some()
+        || member.http_payload().is_some()
 }
 
 /// This service's `InvalidRequestException` for `violations`: HTTP 400 with the
@@ -603,9 +643,9 @@ fn upper_camel(segment: &str) -> String {
 /// and when the request names none.
 fn pass_role_denied(
     protocol: &dyn ServerHttpProtocol,
-    execution_role_arn: Option<&str>,
+    execution_role_arn: Option<String>,
 ) -> Option<RtResponse> {
-    let message = crate::state::pass_role_denial(execution_role_arn?)?;
+    let message = crate::state::pass_role_denial(&execution_role_arn?)?;
     protocol
         .serialize_error(
             &AccessDeniedException { message },

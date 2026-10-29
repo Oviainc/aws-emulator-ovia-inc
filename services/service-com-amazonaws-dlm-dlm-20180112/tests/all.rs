@@ -39,6 +39,8 @@ mod invalid_request_parameter_lists;
 mod lifecycle_policy_crud;
 #[path = "all/materialized_create_interval_round_trip.rs"]
 mod materialized_create_interval_round_trip;
+#[path = "all/pass_role_precedes_shape_refusals.rs"]
+mod pass_role_precedes_shape_refusals;
 #[path = "all/policy_configuration_validation.rs"]
 mod policy_configuration_validation;
 #[path = "all/policy_identity_immutability.rs"]
