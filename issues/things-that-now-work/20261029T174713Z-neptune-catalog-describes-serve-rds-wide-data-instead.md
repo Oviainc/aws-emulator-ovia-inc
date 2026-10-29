@@ -13,6 +13,24 @@ Issue-Commit: c5b0e480c5d08ce7c34e019fd56b1aa2c0c8407c
 
 # Neptune catalog describes serve RDS-wide data instead of the Neptune engine catalog
 
+> _Resolution: all three catalogs are served out of the Amazon RDS front door, which is
+> where a Neptune client's reads land (all three models publish one wire identity). The
+> structural causes are fixed: the graph engine now publishes its own release line across
+> its four DB parameter group families, with its own product name in each version
+> description, its own per-version global-database capability and an upgrade chain within
+> and across its families; every release that report calls available is now ORDERABLE, under
+> that engine's own `amazon-license` licence model (cause 3's `type_mismatch` is gone — the
+> member is a list of `OrderableDBInstanceOption` elements); and the event-category report
+> now publishes `custom-engine-version` and the two categories only a DB cluster publishes,
+> so the category SETS agree with the recording. DECLINED, and so still divergent on
+> replay: the IDENTITY, COUNT and ORDER of the recorded listings (the `DBEngineVersion[*]`,
+> `EventCategoriesMap[*]` and `OrderableDBInstanceOption[*]` keys), the release-revision
+> suffix of a recorded version description, and the three source types no citable category
+> table exists for. Those are a snapshot of AWS's live catalogue on the day of the recording
+> plus a per-response rendering of unordered sets — no rule produces either, so matching
+> them entry-for-entry would be fitting the recorded instance. This emulator publishes its
+> own reference data in AWS's forms, shapes and invariants instead._
+
 > _Note: this issue was identified against the code base at commit `c5b0e480c5d08ce7c34e019fd56b1aa2c0c8407c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

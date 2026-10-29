@@ -5716,12 +5716,17 @@ fn catalog_instant(iso: &str) -> Option<::aws_smithy_types::DateTime> {
 /// `EventCategories` argument out of this map and AWS accepts both for that source type;
 /// `db-cluster-snapshot` carries `notification` beside `backup` for the same reason.
 ///
-/// The model's `SourceType` enum (`smithy_query(query="shape",shape="SourceType")`)
-/// carries four further values — `custom-engine-version`, `blue-green-deployment`,
-/// `db-shard-group` and `zero-etl` — which this member's own documentation does not list
-/// and whose published categories this emulator does not have. It publishes no map for
-/// them rather than an invented one, and a request naming one is refused with the code a
-/// value this parameter does not accept gets, naming the set it is not in.
+/// A source type the model's `SourceType` enum
+/// (`smithy_query(query="shape",shape="SourceType")`) carries but this member's prose does
+/// not list is published too, at the position the enum declares it in, when this emulator
+/// can cite the categories that source type publishes: `custom-engine-version` is one —
+/// the published custom-engine-version event table carries a single `failure` event — and
+/// a client that subscribes to a source type has to be able to read its categories from
+/// this one map. The three remaining enum values — `blue-green-deployment`,
+/// `db-shard-group` and `zero-etl` — have no published category table this emulator can
+/// cite, so it publishes no map for them rather than an invented one, and a request naming
+/// one is refused with the code a value this parameter does not accept gets, naming the
+/// set it is not in.
 pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
     (
         "db-instance",
@@ -5754,7 +5759,13 @@ pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
             "failure",
             "global-failover",
             "maintenance",
+            // A cluster also publishes the events of the two things only a CLUSTER does:
+            // it is migrated onto the service (`migration`), and it runs serverless
+            // capacity (`serverless`). Both are rows of the published DB cluster event
+            // table and both are categories a cluster subscription may name.
+            "migration",
             "notification",
+            "serverless",
         ],
     ),
     ("db-parameter-group", &["configuration change"]),
@@ -5764,6 +5775,8 @@ pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
         &["creation", "deletion", "notification", "restoration"],
     ),
     ("db-cluster-snapshot", &["backup", "notification"]),
+    // The published custom-engine-version event table has one row, a failed CEV creation.
+    ("custom-engine-version", &["failure"]),
     (
         "db-proxy",
         &["configuration change", "creation", "deletion", "failure"],

@@ -111,6 +111,8 @@ mod modify_db_cluster_state_refusal;
 mod modify_db_shard_group;
 #[path = "all/modify_event_subscription.rs"]
 mod modify_event_subscription;
+#[path = "all/neptune_engine_catalog.rs"]
+mod neptune_engine_catalog;
 #[path = "all/not_found_paths.rs"]
 mod not_found_paths;
 #[path = "all/option_group_copy.rs"]

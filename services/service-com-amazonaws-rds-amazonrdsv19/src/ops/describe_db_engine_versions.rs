@@ -667,6 +667,18 @@ const DOCDB: VersionProfile = VersionProfile::provisioned()
 /// Amazon Neptune, the same kind of cluster engine with its own global database.
 const NEPTUNE: VersionProfile = DOCDB;
 
+/// An Amazon Neptune version from BEFORE that engine's global database: the same cluster
+/// member capabilities without `SupportsGlobalDatabases`.
+///
+/// A Neptune global database is offered from the 1.2 engine family on ("Neptune global
+/// database" in the Amazon Neptune User Guide states the 1.2.0.0 minimum engine version),
+/// so the earlier family reports the capability as absent rather than claiming one its
+/// clusters cannot join — which is exactly the per-version difference a
+/// [`VersionProfile`] carries.
+const NEPTUNE_WITHOUT_GLOBAL_DATABASE: VersionProfile = VersionProfile::provisioned()
+    .read_replica()
+    .certificate_rotation_without_restart();
+
 /// The lower Serverless v2 bound of an Aurora version that does NOT scale to zero: half
 /// an Aurora Capacity Unit, the smallest capacity a cluster of such a version can be
 /// configured with.
@@ -1021,7 +1033,10 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
     },
     EngineFacts {
         engine: "neptune",
-        product: "Amazon Neptune",
+        // The graph engine names ITSELF in a version description ("Neptune 1.3.4.0"),
+        // while `DBEngineDescription` is the product's own full name: the two members
+        // answer different questions, which is why they are separate columns here.
+        product: "Neptune",
         description: "Amazon Neptune",
         exportable_log_types: &["audit"],
         character_sets: &[],
@@ -1709,6 +1724,12 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     // The Amazon Neptune engine versions this front door publishes. Neptune writes the
     // parameter group family of its 1.1 versions as `neptune1`, and from 1.2 on as the
     // major version itself (`neptune1.2`).
+    //
+    // Neptune publishes its engine as a four-part release number and ships a release of
+    // every maintained minor family, so the rows of a family are that family's releases in
+    // ascending order rather than one sample of it: a client reads this report to pick the
+    // version it creates a cluster with, and to walk the upgrade chain from the version it
+    // runs, so a family that publishes one row would offer no minor upgrade at all.
     row(
         "neptune",
         "1.1.1.0",
@@ -1716,7 +1737,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "neptune1",
         STATUS_AVAILABLE,
         DefaultLevel::Neither,
-        &NEPTUNE,
+        &NEPTUNE_WITHOUT_GLOBAL_DATABASE,
     ),
     row(
         "neptune",
@@ -1725,6 +1746,33 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "neptune1",
         STATUS_AVAILABLE,
         DefaultLevel::Major,
+        &NEPTUNE_WITHOUT_GLOBAL_DATABASE,
+    ),
+    row(
+        "neptune",
+        "1.2.0.0",
+        "1.2",
+        "neptune1.2",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.2.0.1",
+        "1.2",
+        "neptune1.2",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.2.0.2",
+        "1.2",
+        "neptune1.2",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
         &NEPTUNE,
     ),
     row(
@@ -1733,7 +1781,43 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "1.2",
         "neptune1.2",
         STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.2.1.1",
+        "1.2",
+        "neptune1.2",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.2.1.2",
+        "1.2",
+        "neptune1.2",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.3.0.0",
+        "1.3",
+        "neptune1.3",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.3.1.0",
+        "1.3",
+        "neptune1.3",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
         &NEPTUNE,
     ),
     row(
@@ -1741,6 +1825,105 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "1.3.2.0",
         "1.3",
         "neptune1.3",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.3.3.0",
+        "1.3",
+        "neptune1.3",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.3.4.0",
+        "1.3",
+        "neptune1.3",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.0.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.1.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.2.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.3.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.4.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.5.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.6.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.7.0",
+        "1.4",
+        "neptune1.4",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &NEPTUNE,
+    ),
+    row(
+        "neptune",
+        "1.4.8.0",
+        "1.4",
+        "neptune1.4",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
         &NEPTUNE,

@@ -512,13 +512,21 @@ pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
 /// `LicenseModel` member documents them per engine ("`license-included`",
 /// "`bring-your-own-license`", "`general-public-license`", "`postgresql-license`",
 /// "`marketplace-license`").
+///
+/// An engine of another control plane this one front door serves is licensed by that
+/// control plane rather than by a database vendor, so its licence is the one THAT engine
+/// publishes and not a value from the list above.
 fn license_models(engine: &str) -> &'static [&'static str] {
     match engine {
         "postgres" | "aurora-postgresql" => &["postgresql-license"],
         "mysql" | "mariadb" | "aurora-mysql" => &["general-public-license"],
-        // The licence setting "doesn't apply to" the Amazon DocumentDB and Amazon
-        // Neptune engines, whose orderable options carry `na`.
-        "docdb" | "neptune" => &["na"],
+        // An engine AWS licenses itself is ordered under its own licence: the graph
+        // engine of the Amazon Neptune control plane this door serves reports
+        // `amazon-license`, the one licence a Neptune instance runs under.
+        "neptune" => &["amazon-license"],
+        // The licence setting "doesn't apply to" the Amazon DocumentDB engine, whose
+        // orderable options carry `na`.
+        "docdb" => &["na"],
         // Oracle Enterprise Edition is BYOL only; Standard Edition Two is offered both
         // ways.
         "oracle-ee" | "oracle-ee-cdb" => &["bring-your-own-license"],

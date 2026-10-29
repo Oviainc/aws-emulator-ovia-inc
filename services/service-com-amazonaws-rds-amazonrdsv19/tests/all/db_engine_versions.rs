@@ -383,13 +383,11 @@ async fn default_only_reports_one_default_per_engine_and_per_major_version() {
 async fn include_all_is_what_reports_a_version_that_is_not_available() {
     let router = emulator();
 
-    let (with_all, _) = describe(
-        &router,
-        "every version",
-        &[("IncludeAll", "true".to_string())],
-    )
-    .await;
-    let (available_only, _) = describe(&router, "available versions", &[]).await;
+    // The published catalogue is larger than the biggest page this operation serves, so
+    // each of the two reports is WALKED: comparing one page of each would compare two
+    // different windows onto the catalogue.
+    let with_all = walk_every_version(&router, "every version", 100).await;
+    let available_only = walk_report(&router, "available versions", 100, &[]).await;
 
     let all_keys: BTreeSet<(String, String)> = with_all
         .iter()
@@ -441,12 +439,7 @@ async fn include_all_is_what_reports_a_version_that_is_not_available() {
 async fn each_documented_filter_narrows_the_report_to_what_it_names() {
     let router = emulator();
 
-    let (all, _) = describe(
-        &router,
-        "every version",
-        &[("IncludeAll", "true".to_string())],
-    )
-    .await;
+    let all = walk_every_version(&router, "every version", 100).await;
     assert!(!all.is_empty(), "the report must carry versions to filter");
 
     // One row per filter name the `Filters` member documents, each with a value taken
@@ -484,9 +477,10 @@ async fn each_documented_filter_narrows_the_report_to_what_it_names() {
 
     for (name, value, member_of) in rows {
         let case = format!("filter {name}={value}");
-        let (reported, _) = describe(
+        let reported = walk_report(
             &router,
             &case,
+            100,
             &[
                 ("Filters.Filter.1.Name", name.to_string()),
                 ("Filters.Filter.1.Values.Value.1", value.clone()),
@@ -531,9 +525,12 @@ async fn the_engine_mode_filter_selects_by_supported_engine_mode() {
     // engine here runs, which must select nothing rather than everything.
     for mode in ["global", "multimaster", "parallelquery", "provisioned", "serverless"] {
         let case = format!("engine-mode={mode}");
-        let (reported, marker) = describe(
+        // `provisioned` selects nearly the whole catalogue, which is larger than one
+        // page, so the selection is walked rather than read off its first page.
+        let reported = walk_report(
             &router,
             &case,
+            100,
             &[
                 ("Filters.Filter.1.Name", "engine-mode".to_string()),
                 ("Filters.Filter.1.Values.Value.1", mode.to_string()),
@@ -541,10 +538,6 @@ async fn the_engine_mode_filter_selects_by_supported_engine_mode() {
             ],
         )
         .await;
-        assert_eq!(
-            marker, None,
-            "case {case:?}: the selection must fit the default page"
-        );
         for version in &reported {
             let modes = subtrees(&version.scalars, "SupportedEngineModes")
                 .into_iter()
@@ -638,13 +631,8 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
         }
     }
 
-    let (all, _) = describe(
-        &router,
-        "every version",
-        &[("IncludeAll", "true".to_string())],
-    )
-    .await;
-    let expected: Vec<(String, String)> = all
+    let expected: Vec<(String, String)> = walk_every_version(&router, "every version", 100)
+        .await
         .iter()
         .map(|version| (version.engine.clone(), version.engine_version.clone()))
         .collect();
@@ -681,14 +669,34 @@ pub(crate) async fn page_of_every_version(
     page_size: usize,
     marker: Option<&str>,
 ) -> (Vec<Version>, Option<String>) {
-    let mut params: Vec<(&str, String)> = vec![
-        ("MaxRecords", page_size.to_string()),
-        ("IncludeAll", "true".to_string()),
-    ];
+    page_of_report(
+        router,
+        case,
+        page_size,
+        marker,
+        &[("IncludeAll", "true".to_string())],
+    )
+    .await
+}
+
+/// One page of the report `params` asks for, resumed at `marker`.
+///
+/// The published catalogue is larger than the biggest page this operation serves
+/// (`MaxRecords` "maximum 100"), so a test that wants a WHOLE report — narrowed or not —
+/// has to page it; this is the one page reader every such walk is built on.
+async fn page_of_report(
+    router: &MultiServiceRouter,
+    case: &str,
+    page_size: usize,
+    marker: Option<&str>,
+    params: &[(&str, String)],
+) -> (Vec<Version>, Option<String>) {
+    let mut paged: Vec<(&str, String)> = vec![("MaxRecords", page_size.to_string())];
+    paged.extend(params.iter().cloned());
     if let Some(marker) = marker {
-        params.push(("Marker", marker.to_string()));
+        paged.push(("Marker", marker.to_string()));
     }
-    let (page, next) = describe(router, case, &params).await;
+    let (page, next) = describe(router, case, &paged).await;
     assert!(
         page.len() <= page_size,
         "case {case:?}: a page must hold at most MaxRecords={page_size} entries, got {}",
@@ -697,20 +705,23 @@ pub(crate) async fn page_of_every_version(
     (page, next)
 }
 
-/// The whole report, walked one page of `page_size` at a time: a page the report issued a
-/// `Marker` for carries entries, no page exceeds `MaxRecords`, and the walk terminates.
-pub(crate) async fn walk_every_version(
+/// The whole report `params` asks for, walked one page of `page_size` at a time: a page
+/// the report issued a `Marker` for carries entries, no page exceeds `MaxRecords`, and
+/// the walk terminates.
+pub(crate) async fn walk_report(
     router: &MultiServiceRouter,
     case: &str,
     page_size: usize,
+    params: &[(&str, String)],
 ) -> Vec<Version> {
     let mut seen: Vec<Version> = Vec::new();
     let mut marker: Option<String> = None;
     let mut pages = 0usize;
     loop {
-        let (page, next) = page_of_every_version(router, case, page_size, marker.as_deref()).await;
+        let (page, next) =
+            page_of_report(router, case, page_size, marker.as_deref(), params).await;
         assert!(
-            !page.is_empty(),
+            marker.is_none() || !page.is_empty(),
             "case {case:?}: a page the report issued a Marker for must carry entries"
         );
         seen.extend(page);
@@ -725,6 +736,21 @@ pub(crate) async fn walk_every_version(
         }
     }
     seen
+}
+
+/// The whole report with nothing narrowed and deprecated entries included.
+pub(crate) async fn walk_every_version(
+    router: &MultiServiceRouter,
+    case: &str,
+    page_size: usize,
+) -> Vec<Version> {
+    walk_report(
+        router,
+        case,
+        page_size,
+        &[("IncludeAll", "true".to_string())],
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

@@ -314,7 +314,7 @@ async fn the_published_event_categories_are_the_documented_ones() {
     // published table says, so a change to the catalog that drops or invents a category
     // fails here rather than agreeing with itself. Every published source type is a row,
     // including the ones no issue cited (`db-cluster`, `db-parameter-group`,
-    // `db-security-group`, `db-proxy`).
+    // `db-security-group`, `db-proxy`, `custom-engine-version`).
     let rows: Vec<(&str, Vec<&str>)> = vec![
         (
             "db-instance",
@@ -347,7 +347,11 @@ async fn the_published_event_categories_are_the_documented_ones() {
                 "failure",
                 "global-failover",
                 "maintenance",
+                // The two categories only a CLUSTER publishes: its migration onto the
+                // service, and its serverless capacity.
+                "migration",
                 "notification",
+                "serverless",
             ],
         ),
         ("db-parameter-group", vec!["configuration change"]),
@@ -357,6 +361,9 @@ async fn the_published_event_categories_are_the_documented_ones() {
             vec!["creation", "deletion", "notification", "restoration"],
         ),
         ("db-cluster-snapshot", vec!["backup", "notification"]),
+        // A source type the model's `SourceType` enum declares and this operation's own
+        // prose does not: its published event table has one row, a failed creation.
+        ("custom-engine-version", vec!["failure"]),
         (
             "db-proxy",
             vec!["configuration change", "creation", "deletion", "failure"],
@@ -416,7 +423,11 @@ async fn the_other_control_planes_this_front_door_serves_report_their_own_engine
     // what `aws docdb describe-db-engine-versions` and
     // `aws docdb describe-orderable-db-instance-options` read. Neither engine is a value
     // this model's own `Engine` member lists, which is exactly why they are a row here.
-    for engine in ["docdb", "neptune"] {
+    // (engine, the one licence model its orderable options are offered under). The
+    // licence setting "doesn't apply to" the document engine, whose options carry `na`;
+    // the graph engine is licensed by AWS itself and carries `amazon-license`, so the
+    // licence is read per engine rather than assumed to be the same for both.
+    for (engine, expected_license) in [("docdb", "na"), ("neptune", "amazon-license")] {
         let body = expect_ok(
             engine,
             call(
@@ -484,9 +495,9 @@ async fn the_other_control_planes_this_front_door_serves_report_their_own_engine
             );
             assert_eq!(
                 text(option, "LicenseModel"),
-                "na",
-                "case {engine:?}: the licence setting does not apply to this engine, got \
-                 {option}"
+                expected_license,
+                "case {engine:?}: expected every option to be offered under \
+                 {expected_license:?}, got {option}"
             );
         }
     }
