@@ -27,6 +27,8 @@ mod member_constraint_field_list;
 mod non_object_body_refusal;
 #[path = "all/one_constraint_refusal_path.rs"]
 mod one_constraint_refusal_path;
+#[path = "all/page_cursor_positions.rs"]
+mod page_cursor_positions;
 #[path = "all/pattern_refusal_rendering.rs"]
 mod pattern_refusal_rendering;
 #[path = "all/reported_account_color.rs"]

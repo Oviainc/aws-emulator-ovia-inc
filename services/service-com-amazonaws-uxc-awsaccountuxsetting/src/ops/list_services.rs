@@ -109,6 +109,21 @@ fn encode_page_token(offset: usize) -> String {
     ::aws_smithy_types::base64::encode(format!("{PAGE_TOKEN_PREFIX}{offset:0width$}"))
 }
 
+/// Whether `offset` is a position a page token may name, for a listing of
+/// `item_count` items.
+///
+/// The ONE statement of the cursor rule, asked by BOTH halves of it: the mint,
+/// which issues a token for the position a page ended at, and the guard, which
+/// admits a decoded cursor only at a position the mint could have issued. A page
+/// carries at least one item, so a resume position is past the listing's first
+/// item, and it has to name an item still to come, so it is strictly before the
+/// listing's end — which also makes an empty listing offer no resume position at
+/// all. Written once so the two halves cannot disagree at a boundary and admit a
+/// cursor only a forger could hold.
+fn is_resume_position(offset: usize, item_count: usize) -> bool {
+    (1..item_count).contains(&offset)
+}
+
 /// The offset a token issued by [`encode_page_token`] resumes at, or `None` when
 /// the token is not one this service minted.
 fn decode_page_token(token: &str) -> Option<usize> {
@@ -128,8 +143,8 @@ const PAGINATION_TOKEN_EXCEPTION_DETAIL: &str = "invalid payload wrapping schema
 
 /// The refusal for a continuation token that satisfies the modelled `NextToken`
 /// `@length`/`@pattern` but does not decode as a cursor issued for this listing
-/// (never minted here, tampered with, or naming a position the catalog no longer
-/// has).
+/// (never minted here, tampered with, or naming a position this listing issues no
+/// cursor for).
 ///
 /// A cursor-decode failure comes from the pagination framework, not from member
 /// validation: it names no member path, so it carries no `fieldList`, and its
@@ -238,10 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match decode_page_token(token) {
-                // A token that decodes but names a position past the catalog's end
-                // no longer resolves to a resume point, so it is refused like any
-                // other token this service did not issue for this listing.
-                Some(offset) if offset <= catalog.len() => offset,
+                // A token that decodes but names a position this listing can issue
+                // no cursor for does not resolve to a resume point, so it is refused
+                // like any other token this service did not issue for this listing.
+                Some(offset) if is_resume_position(offset, catalog.len()) => offset,
                 // The token cleared the member's own constraints at the boundary,
                 // so what failed here is the cursor decode: answer with the
                 // pagination framework's message, not the member-constraint one.
@@ -262,8 +277,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListServicesOutput {
             // "This value is null when no more results are available": a token is
-            // issued only while the catalog holds items past this page.
-            next_token: (end < catalog.len()).then(|| encode_page_token(end)),
+            // issued only for a position this listing can resume at, i.e. while the
+            // catalog holds items past this page.
+            next_token: is_resume_position(end, catalog.len()).then(|| encode_page_token(end)),
             services: Some(services),
         })
     }
