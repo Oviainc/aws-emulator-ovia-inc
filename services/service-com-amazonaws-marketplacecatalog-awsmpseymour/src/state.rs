@@ -822,7 +822,16 @@ impl ChangeSetRecord {
             start_time: Some(self.start_time.clone()),
             end_time: self.end_time.clone(),
             status: Some(self.status.clone()),
-            entity_id_list: Some(self.entity_ids()),
+            // `EntityIdList` is documented "a maximum of 20 entities. It must
+            // contain at least one entity", so a change set holding no entity
+            // id — a `VALIDATE` change set whose changes all create, since a
+            // validation reserves nothing — reports NO member rather than an
+            // empty list that bound excludes. The same decision `Tags` takes
+            // for its own `@length(min: 1 …)` list.
+            entity_id_list: {
+                let ids = self.entity_ids();
+                (!ids.is_empty()).then_some(ids)
+            },
             failure_code: self.failure_code.clone(),
         }
     }

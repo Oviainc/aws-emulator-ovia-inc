@@ -779,8 +779,10 @@ async fn a_validate_change_set_creates_no_entity() {
     let listed = list_change_sets(&router, json!({"Catalog": CATALOG})).await;
     let item = &listed.list("/ChangeSetSummaryList")[0];
     assert_eq!(
-        item["EntityIdList"], json!([]),
-        "a validation reserves no entity, got {item:?}"
+        item.get("EntityIdList"),
+        None,
+        "a validation reserves no entity, and EntityIdList must contain at least one \
+         entity, so the summary reports no such member at all, got {item:?}"
     );
     let entities = list_entities(&router, json!({"Catalog": CATALOG, "EntityType": "AmiProduct"}))
         .await;
