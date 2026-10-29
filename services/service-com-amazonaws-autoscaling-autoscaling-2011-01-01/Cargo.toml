@@ -27,8 +27,16 @@ tracing = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 # The EC2 store holds the account's subnets, and a subnet's Availability Zone is a fact
 # about that subnet: a group that names only `VPCZoneIdentifier` has its zones resolved
-# from EC2's own state (`state::ec2_subnets`) rather than asked of the caller.
+# from EC2's own state (`state::ec2_subnets`) rather than asked of the caller. It also
+# holds the account's launch templates, which a group launches its instances from.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# A launch template's `IamInstanceProfile` is a reference EC2 stores verbatim and this
+# service resolves when it consumes the template, so the account's own IAM instance
+# profiles are read from IAM's own state (`state::iam_instance_profiles`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# `service-common` carries the ONE reading of which IAM entity a caller-supplied IAM ARN
+# names, which that instance-profile ARN is read through.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

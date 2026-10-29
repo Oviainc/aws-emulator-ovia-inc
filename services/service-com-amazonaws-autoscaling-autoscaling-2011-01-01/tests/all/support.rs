@@ -82,6 +82,95 @@ pub async fn query(
     (status, text)
 }
 
+/// One `(key, value)` request parameter, for a suite whose values are built per case.
+pub fn p(key: &str, value: impl Into<String>) -> (String, String) {
+    (key.to_string(), value.into())
+}
+
+/// The owned parameters of a case, as the `&[(&str, &str)]` [`query`] takes.
+pub fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
+    params
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+/// The ec2Query API version a client sends in an Amazon EC2 request body.
+const EC2_API_VERSION: &str = "2016-11-15";
+
+/// The awsQuery API version a client sends in an IAM request body.
+const IAM_API_VERSION: &str = "2010-05-08";
+
+/// POST one ec2Query action, signed for Amazon EC2 in [`REGION`], and answer its status
+/// and body.
+///
+/// THE ONE COPY for every suite here that reaches the account's own Amazon EC2 resources
+/// over the wire: the subnets, launch templates and instances an Auto Scaling group is
+/// built from are EC2's, and this is how a client asks EC2 about them.
+pub async fn ec2_query(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(String, String)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
+    for (key, value) in params {
+        body.push('&');
+        body.push_str(key);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://ec2.{REGION}.amazonaws.com/"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/ec2/aws4_request, \
+                 SignedHeaders=host, Signature=abc"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a valid request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    (status, text)
+}
+
+/// POST one awsQuery action to IAM and answer its status and body.
+///
+/// IAM is a global service, so the request carries no Region in its endpoint host; the
+/// credential scope names the one every AWS SDK signs an IAM request for.
+pub async fn iam_query(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(String, String)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version={IAM_API_VERSION}");
+    for (key, value) in params {
+        body.push('&');
+        body.push_str(key);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://iam.amazonaws.com/")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/us-east-1/iam/aws4_request, \
+             SignedHeaders=host, Signature=abc",
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a valid request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    (status, text)
+}
+
 /// One subnet seeded into the account's own Amazon EC2 store: its id, and the zone EC2
 /// holds it in.
 #[derive(Debug, Clone)]

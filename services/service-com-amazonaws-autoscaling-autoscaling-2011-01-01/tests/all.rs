@@ -21,6 +21,8 @@ mod error_envelope;
 mod instance_refresh_lifecycle;
 #[path = "all/launch_configurations_are_unavailable.rs"]
 mod launch_configurations_are_unavailable;
+#[path = "all/launch_template_instance_profiles.rs"]
+mod launch_template_instance_profiles;
 #[path = "all/metric_collection_catalog.rs"]
 mod metric_collection_catalog;
 #[path = "all/reference_data_catalogs.rs"]

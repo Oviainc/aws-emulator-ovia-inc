@@ -51,6 +51,11 @@ pub mod ec2_subnets;
 /// the account, not one of this service's own invention.
 pub mod ec2_instances;
 
+/// The IAM instance profile the launch templates of a group name, resolved against the
+/// account's own IAM store: a reference Amazon EC2 stores verbatim and this service, as
+/// the consumer of the template, is what resolves.
+pub mod iam_instance_profiles;
+
 /// How long a lifecycle transition this service owes takes to come due.
 ///
 /// Amazon EC2 Auto Scaling reports a freshly launched instance as `Pending` and an

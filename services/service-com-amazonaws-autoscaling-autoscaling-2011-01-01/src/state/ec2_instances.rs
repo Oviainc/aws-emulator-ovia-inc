@@ -420,6 +420,23 @@ fn launch_parameters(
     }
 }
 
+/// The launch-template version `specification` names, read from the account's own Amazon
+/// EC2 store — the launch data itself, for a caller that needs more of it than a launch
+/// does.
+///
+/// `None` when the account holds no such template, or no such version of it, and when
+/// this engine carries no Amazon EC2 store at all: there is then no launch data to read.
+/// EC2's store lock is taken for the one lookup that answers this and released before the
+/// answer is returned, so no caller holds it.
+pub fn launch_template_data<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    specification: &LaunchTemplateSpecification,
+) -> Option<RequestLaunchTemplateData> {
+    let state = ec2::service_state(engine)?;
+    let store = state.lock();
+    template_data(&store, specification)
+}
+
 /// The launch parameters of the one launch-template version a group's specification
 /// names, from Amazon EC2's own launch-template store.
 ///

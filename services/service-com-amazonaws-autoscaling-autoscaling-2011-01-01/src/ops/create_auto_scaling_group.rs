@@ -506,6 +506,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The launch template a group launches from carries the IAM instance profile its
+        // instances run under. That is a reference to another service's resource, which
+        // Amazon EC2 stores without resolving and this service — the consumer of the
+        // template — resolves against the account's own IAM instance profiles, before
+        // anything is stored. Asked BEFORE this service's store is locked, so only one
+        // store is ever held at a time.
+        if let Some(refusal) = crate::state::iam_instance_profiles::unresolvable_profile_error(
+            &*self.engine,
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);

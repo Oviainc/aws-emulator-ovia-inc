@@ -31,10 +31,7 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
 
-use crate::support::{form_encode, query, seed_subnets, tag_value, tag_values, REGION};
-
-/// The ec2Query API version a client sends in an Amazon EC2 request body.
-const EC2_API_VERSION: &str = "2016-11-15";
+use crate::support::{ec2_query, p, query, seed_subnets, tag_value, tag_values, REGION};
 
 /// Wait until every clock-owed transition started before now has certainly fallen due —
 /// this service's own lifecycle span and Amazon EC2's, whichever is longer, plus a
@@ -55,44 +52,6 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
     router.register_service(ec2_service::EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
-}
-
-/// POST one ec2Query action, signed for Amazon EC2 in [`REGION`], and answer its status
-/// and body.
-async fn ec2_query(
-    router: &MultiServiceRouter,
-    action: &str,
-    params: &[(String, String)],
-) -> (u16, String) {
-    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
-    for (key, value) in params {
-        body.push('&');
-        body.push_str(key);
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://ec2.{REGION}.amazonaws.com/"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/ec2/aws4_request, \
-                 SignedHeaders=host, Signature=abc"
-            ),
-        )
-        .body(bytes::Bytes::from(body))
-        .expect("a valid request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let text = String::from_utf8_lossy(response.body()).to_string();
-    (status, text)
-}
-
-/// One `(key, value)` request parameter.
-fn p(key: &str, value: impl Into<String>) -> (String, String) {
-    (key.to_string(), value.into())
 }
 
 /// What Amazon EC2 reports for one instance, read out of a `DescribeInstances` answer

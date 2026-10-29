@@ -402,6 +402,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // A launch source the request REPLACES is resolved the way the create resolves
+        // the one it is given: the launch template carries the IAM instance profile the
+        // group's instances run under, and a template naming an instance profile the
+        // account does not hold cannot launch anything. Asked BEFORE this service's store
+        // is locked, so only one store is ever held at a time.
+        if let Some(refusal) = crate::state::iam_instance_profiles::unresolvable_profile_error(
+            &*self.engine,
+            input.launch_template.as_ref(),
+            input.mixed_instances_policy.as_ref(),
+        ) {
+            return Err(refusal);
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
