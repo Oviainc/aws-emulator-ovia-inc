@@ -985,6 +985,28 @@ impl ConfigurationSet {
         self.event_destinations.push(destination);
         true
     }
+
+    /// Take this set's event destination named `name` off it, and say whether
+    /// there was one to take.
+    ///
+    /// `false` when the set carries no destination of that name: the caller
+    /// refuses the request with the modelled `EventDestinationDoesNotExist`
+    /// rather than answering the removal of nothing. The destinations that
+    /// remain keep their order, which is the order every reader reports them in,
+    /// and the name is freed, so a later create may record one of that name
+    /// again. The comparison is exact, for the reason
+    /// [`Self::event_destination`] gives.
+    pub fn remove_event_destination(&mut self, name: &str) -> bool {
+        let Some(at) = self
+            .event_destinations
+            .iter()
+            .position(|held| held.name == name)
+        else {
+            return false;
+        };
+        self.event_destinations.remove(at);
+        true
+    }
 }
 
 /// A receipt rule set: a named, ordered collection of receipt rules.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConfigurationSetEventDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConfigurationSetEventDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConfigurationSetEventDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +131,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConfigurationSetEventDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConfigurationSetEventDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConfigurationSetEventDestination"))
+        // `ctx` carries only request metadata; this operation describes no
+        // destination of its own, so it needs none of it.
+        let _ = ctx;
+        let configuration_set_name = input.configuration_set_name;
+        let destination_name = input.event_destination_name;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteConfigurationSetEventDestination",
+            ));
+        };
+        let mut state = state.lock();
+
+        // The two resources the request names are judged in the order they
+        // nest: the set that would hold the destination first, then the
+        // destination it keys.
+        let Some(configuration_set) = state.configuration_sets.get_mut(&configuration_set_name)
+        else {
+            // "Indicates that the configuration set does not exist", in the
+            // wording every operation of this service uses for a set that is not
+            // there.
+            return Err(
+                DeleteConfigurationSetEventDestinationErrorModeled::ConfigurationSetDoesNotExistException(
+                    ConfigurationSetDoesNotExistException {
+                        configuration_set_name: Some(configuration_set_name.clone()),
+                        message: Some(format!(
+                            "Configuration set <{configuration_set_name}> does not exist."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Indicates that the event destination does not exist": the
+        // destination has to be there to be removed, so a set carrying none of
+        // that name is refused rather than answered as the delete of nothing —
+        // which is also what a second delete of one destination gets. Taking it
+        // off the set IS the delete, and it changes nothing else the set holds.
+        if !configuration_set.remove_event_destination(&destination_name) {
+            return Err(
+                DeleteConfigurationSetEventDestinationErrorModeled::EventDestinationDoesNotExistException(
+                    EventDestinationDoesNotExistException {
+                        configuration_set_name: Some(configuration_set_name.clone()),
+                        event_destination_name: Some(destination_name.clone()),
+                        message: Some(format!(
+                            "Event destination <{destination_name}> does not exist for \
+                             configuration set <{configuration_set_name}>."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `DeleteConfigurationSetEventDestinationResponse` has no members: what
+        // the call produced is the state it wrote, which
+        // `DescribeConfigurationSet` reports as `EventDestinations`.
+        Ok(DeleteConfigurationSetEventDestinationOutput {})
     }
 }
