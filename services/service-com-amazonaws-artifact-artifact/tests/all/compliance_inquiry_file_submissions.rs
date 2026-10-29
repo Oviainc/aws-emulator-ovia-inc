@@ -19,7 +19,9 @@
 //!   is pending, and everything else is `AI`-reviewed and reaches `COMPLETED` with
 //!   "Compliance inquiry processing is complete.";
 //! * the modelled internal-error state is reserved for a submission that carried NOTHING
-//!   to process (an upload with no bytes), which owns no query at all.
+//!   to process (an upload with no bytes); a submission that carried content reaches a
+//!   non-failure terminal status even when no unit of work of it could be reported inside
+//!   the modelled bounds of `QuerySummary$query`.
 //!
 //! No query ever carries a `response`: a compliance answer is model-generated text and no
 //! such engine runs in this emulator, so the member stays absent rather than carrying
@@ -345,8 +347,9 @@ fn cases() -> Vec<Case> {
             Some("FULL_SUPPORT"),
         ),
         // The rows for a handle the modelled `query` shape cannot report verbatim: it is
-        // reported inside that shape's bounds, and a handle nothing is left of reports no
-        // query at all.
+        // reported inside that shape's bounds, a handle nothing is left of reports no
+        // query at all, and reporting no query is not a processing failure — the inquiry
+        // still reaches the terminal status its submitted content and support mode select.
         Case {
             label: "an upload whose title carries characters the query shape excludes",
             body: file_body("Workbook <2026> edition", UPLOAD, &[], None),
@@ -368,8 +371,37 @@ fn cases() -> Vec<Case> {
             body: file_body("<>", UPLOAD, &[], None),
             owned: Vec::new(),
             review_type: "AI",
-            terminal: ("FAILED", INQUIRY_INTERNAL_ERROR),
+            terminal: ("COMPLETED", INQUIRY_COMPLETE),
             query_terminal: None,
+        },
+        Case {
+            label: "an upload submitted under no title at all",
+            body: file_body("", UPLOAD, &[], None),
+            owned: Vec::new(),
+            review_type: "AI",
+            terminal: ("COMPLETED", INQUIRY_COMPLETE),
+            query_terminal: None,
+        },
+        Case {
+            label: "an upload under FULL_SUPPORT whose title leaves no reportable handle",
+            body: file_body("<>", &long_upload(), &[], Some("FULL_SUPPORT")),
+            owned: Vec::new(),
+            review_type: "HUMAN",
+            terminal: ("HUMAN_REVIEW", INQUIRY_HUMAN_REVIEW),
+            query_terminal: None,
+        },
+        Case {
+            label: "an upload under no title that names its sections",
+            body: file_body(
+                "",
+                UPLOAD,
+                &["Sheet 1".to_string(), "Sheet 2".to_string()],
+                Some("AI_ONLY"),
+            ),
+            owned: vec!["Sheet 1".to_string(), "Sheet 2".to_string()],
+            review_type: "AI",
+            terminal: ("COMPLETED", INQUIRY_COMPLETE),
+            query_terminal: Some(("COMPLETED", QUERY_COMPLETE)),
         },
         // The contrast rows: a text submission owns the one query it carries, and it is
         // AI-reviewed — `FULL_SUPPORT` is "[o]nly supported for file upload mode", so a

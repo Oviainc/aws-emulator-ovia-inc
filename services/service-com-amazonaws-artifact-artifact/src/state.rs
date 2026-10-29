@@ -311,15 +311,8 @@ pub const INQUIRY_STATUS_HUMAN_REVIEW: &str = "HUMAN_REVIEW";
 /// `InquiryStatusMessage`'s value for an inquiry that is still being processed.
 pub const INQUIRY_MESSAGE_IN_PROGRESS: &str = "Compliance inquiry processing is in-progress.";
 
-/// `InquiryStatusMessage`'s value for an inquiry that is over and every query of which
-/// reached its terminal state without erroring.
+/// `InquiryStatusMessage`'s value for an inquiry whose processing is over.
 pub const INQUIRY_MESSAGE_COMPLETE: &str = "Compliance inquiry processing is complete.";
-
-/// `InquiryStatusMessage`'s value for an inquiry that is over with at least one query
-/// that failed.
-pub const INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS: &str =
-    "Compliance inquiry processing is complete. One or more queries encountered errors \
-     during processing.";
 
 /// `InquiryStatusMessage`'s value for an inquiry whose processing itself failed.
 pub const INQUIRY_MESSAGE_INTERNAL_ERROR: &str =
@@ -334,18 +327,11 @@ pub const QUERY_STATUS_PROCESSING: &str = "PROCESSING";
 /// `QueryStatus`'s value for a query whose processing is over.
 pub const QUERY_STATUS_COMPLETED: &str = "COMPLETED";
 
-/// `QueryStatus`'s value for a query whose processing could not be performed.
-pub const QUERY_STATUS_FAILED: &str = "FAILED";
-
 /// `QueryStatusMessage`'s value for a query that is still being processed.
 pub const QUERY_MESSAGE_IN_PROGRESS: &str = "Query processing is in-progress.";
 
 /// `QueryStatusMessage`'s value for a query whose processing is over.
 pub const QUERY_MESSAGE_COMPLETE: &str = "Query processing is complete.";
-
-/// `QueryStatusMessage`'s value for a query whose processing could not be performed.
-pub const QUERY_MESSAGE_INTERNAL_ERROR: &str =
-    "An internal error occurred while processing the query. Try again at a later time.";
 
 /// `QueryStatusMessage`'s value for a query whose own processing is over and which is
 /// waiting on the human expert review it was submitted for.
@@ -840,21 +826,41 @@ impl InquiryContentRecord {
     /// emulator, and no question text is invented for them (nor any response — see
     /// [`InquiryQuery::response`]).
     ///
-    /// An upload carrying NO BYTES submits nothing: there is no document to process, so
-    /// the inquiry owns no query and [`ComplianceInquiry::materialise`] reports its
-    /// processing as failed.
+    /// Content with [`nothing_to_process`](Self::nothing_to_process) submits NO unit: there
+    /// is nothing for a unit of work to be about, which is the one thing that makes an
+    /// inquiry own no work at all.
     pub fn work_units(&self, title: &str) -> Vec<String> {
+        if self.nothing_to_process() {
+            return Vec::new();
+        }
         match self {
             Self::Text(query) => vec![query.clone()],
-            Self::File { sections, content } => {
-                if content.is_empty() {
-                    Vec::new()
-                } else if sections.is_empty() {
+            Self::File { sections, .. } => {
+                if sections.is_empty() {
                     vec![title.to_string()]
                 } else {
                     sections.clone()
                 }
             }
+        }
+    }
+
+    /// Whether this content carries NOTHING to process — the one thing that is empty about
+    /// a submission, and the only reason an inquiry gets as far as no unit of work at all
+    /// ([`work_units`](Self::work_units) is empty for exactly this content and no other).
+    ///
+    /// `InquiryFileContent$content` is `@required` but the model bounds its length in no
+    /// other way, so an upload carrying zero bytes is a well-formed request with no
+    /// document behind it. A submission that DID carry something is processed whatever
+    /// handle its units of work turn out to be reportable under
+    /// ([`reportable_query_text`]): what a unit can be REPORTED as is a property of the
+    /// member that reports it, never of whether there was work to do — which is what
+    /// [`ComplianceInquiry::materialise`] reads this, rather than the reported query list,
+    /// to decide.
+    pub fn nothing_to_process(&self) -> bool {
+        match self {
+            Self::Text(query) => query.is_empty(),
+            Self::File { content, .. } => content.is_empty(),
         }
     }
 }
@@ -1015,8 +1021,9 @@ impl ComplianceInquiry {
     /// instant. A no-op otherwise, and a no-op for an inquiry already terminal, so
     /// calling it on every read is idempotent.
     ///
-    /// The terminal status is DERIVED from the queries': an inquiry is over when its
-    /// queries are, and the inquiry-level message says what became of them.
+    /// The terminal status says what became of the SUBMISSION: the inquiry is over when
+    /// the work its content submitted is, and the inquiry-level message says what became
+    /// of it.
     ///
     /// * a query the service's own model reviews ([`REVIEW_TYPE_AI`]) is processed by the
     ///   due instant, so it reaches `COMPLETED`, and an inquiry whose queries all did
@@ -1028,18 +1035,26 @@ impl ComplianceInquiry {
     /// * a query submitted for HUMAN expert review ([`REVIEW_TYPE_HUMAN`]) is not the
     ///   CLOCK's to finish — a human has to look at it, and nothing in this emulator
     ///   stands in for one — so it stays non-terminal and reports that it is waiting,
-    ///   and the inquiry RESTS in `HUMAN_REVIEW` while any of its queries does, rather
-    ///   than being moved on as though a review had happened. Nothing reads an inquiry
-    ///   only once it is terminal: every reader of one (`GetComplianceInquiryMetadata`,
-    ///   `ListComplianceInquiries`, `ListComplianceInquiryQueries`,
-    ///   `ExportComplianceInquiry`, `PutComplianceInquiryFeedback`) reports or records
-    ///   against it in whatever status it is in;
-    /// * a query that reached `FAILED` is what selects the inquiry-level "One or more
-    ///   queries encountered errors" message, so the two completion values are told
-    ///   apart by the queries rather than one of them being unreachable;
-    /// * an inquiry that owns NO query never got as far as one — a submission with
-    ///   nothing to process (see [`InquiryContentRecord::work_units`]) — and ends in the
-    ///   modelled FAILED state.
+    ///   and the inquiry RESTS in `HUMAN_REVIEW` while the review its support mode asked
+    ///   for is pending ([`review_type_for`], the one thing that decides the review every
+    ///   query of this inquiry carries), rather than being moved on as though a review had
+    ///   happened. Nothing reads an inquiry only once it is terminal: every reader of one
+    ///   (`GetComplianceInquiryMetadata`, `ListComplianceInquiries`,
+    ///   `ListComplianceInquiryQueries`, `ExportComplianceInquiry`,
+    ///   `PutComplianceInquiryFeedback`) reports or records against it in whatever status
+    ///   it is in;
+    /// * the modelled FAILED state is for a submission with NOTHING to process
+    ///   ([`InquiryContentRecord::nothing_to_process`]) — it never got as far as a unit of
+    ///   work. A submission that DID carry something to process is processed, so it reaches
+    ///   a non-failure terminal status whatever handle its units of work could be reported
+    ///   under: how many queries the inquiry can REPORT ([`reportable_query_text`]) is a
+    ///   property of the member that reports them, and reporting fewer than were submitted
+    ///   is not a processing failure.
+    ///
+    /// No query of an inquiry this emulator holds ever fails, so no inquiry reports the
+    /// modelled completed-with-query-errors message: a query is processed by reading the
+    /// submitted content, nothing here does that, and no failure is synthesised for work
+    /// nothing ran.
     pub fn materialise(&mut self, now: SystemTime) {
         let Some(due) = self.processing_due_at else {
             return;
@@ -1062,23 +1077,17 @@ impl ComplianceInquiry {
                 query.status_message = QUERY_MESSAGE_COMPLETE.to_string();
             }
         }
-        let awaiting_human_review = self
-            .queries
-            .iter()
-            .any(|query| query.status == QUERY_STATUS_PROCESSING);
-        let any_query_failed = self
-            .queries
-            .iter()
-            .any(|query| query.status == QUERY_STATUS_FAILED);
-        if self.queries.is_empty() {
+        // The review this submission is processed under, which is the review every query
+        // of it carries — so the inquiry and its queries cannot disagree about whether a
+        // human expert still has to look at it, and an inquiry that reports no query is
+        // still waiting on the review it was submitted for.
+        let awaiting_human_review = review_type_for(&self.support_mode) == REVIEW_TYPE_HUMAN;
+        if self.content.nothing_to_process() {
             self.status = INQUIRY_STATUS_FAILED.to_string();
             self.status_message = INQUIRY_MESSAGE_INTERNAL_ERROR.to_string();
         } else if awaiting_human_review {
             self.status = INQUIRY_STATUS_HUMAN_REVIEW.to_string();
             self.status_message = INQUIRY_MESSAGE_HUMAN_REVIEW.to_string();
-        } else if any_query_failed {
-            self.status = INQUIRY_STATUS_COMPLETED.to_string();
-            self.status_message = INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS.to_string();
         } else {
             self.status = INQUIRY_STATUS_COMPLETED.to_string();
             self.status_message = INQUIRY_MESSAGE_COMPLETE.to_string();

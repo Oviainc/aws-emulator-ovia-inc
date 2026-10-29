@@ -54,9 +54,13 @@
 //! * The inquiry's RESPONSES are model-generated compliance answers, and no such engine
 //!   runs in this emulator. Nothing is synthesised to look generated: no query ever
 //!   carries a `response`, and that absence is the signal — a query is reported under the
-//!   handle its submission gave it, never under question text nothing read — and only a
-//!   submission carrying nothing to process at all ends in the modelled failure state
-//!   (see `materialise`).
+//!   handle its submission gave it, never under question text nothing read — and no query
+//!   is failed for work nothing ran.
+//! * Only a submission carrying NOTHING to process ends in the modelled failure state
+//!   ([`crate::state::InquiryContentRecord::nothing_to_process`], read by `materialise`).
+//!   A unit of work whose handle this API's own `query` member cannot carry is reported as
+//!   no query, which is a limit of what can be REPORTED and not a processing failure, so
+//!   it leaves the inquiry's terminal status alone.
 //!
 //! ## Shape of an operation
 //!
@@ -365,7 +369,11 @@ fn content_record(content: InquiryContent) -> crate::state::InquiryContentRecord
 ///
 /// A unit whose handle cannot be reported inside the modelled bounds of
 /// `QuerySummary$query` ([`crate::state::reportable_query_text`]) yields no query, rather
-/// than one reported outside the shape the model declares for it.
+/// than one reported outside the shape the model declares for it — `query` is `@required`
+/// and `@length(min: 1)`, so there is no query to report a unit the submission gave no
+/// reportable handle, and no handle is invented for it. That is a bound on what this API
+/// can REPORT, so it decides neither whether the submission was processed nor what became
+/// of it (see [`crate::state::ComplianceInquiry::materialise`]).
 ///
 /// No query carries a `response`: see [`crate::state::InquiryQuery::response`].
 fn enumerate_queries(
