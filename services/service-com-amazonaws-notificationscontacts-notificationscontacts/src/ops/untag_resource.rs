@@ -151,10 +151,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // malformed ARN is already a 400 before this body runs. `tagKeys`' ELEMENT
         // pattern is not — the walk cannot compile its leading look-ahead and treats it
         // as matching every value — so this handler applies it (see
-        // `crate::state::tag_key_rejection`) before anything else: an input the shape
-        // refuses is a 400 whatever resource the request names.
+        // `crate::state::satisfies_tag_key_pattern`) before anything else: an input the
+        // shape refuses is a 400 whatever resource the request names.
         let _ = ctx;
-        crate::state::check_tag_keys("tagKeys", input.tag_keys.iter().map(String::as_str))
+        crate::state::check_tag_key_list("tagKeys", input.tag_keys.iter().map(String::as_str))
             .map_err(UntagResourceErrorModeled::ValidationException)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

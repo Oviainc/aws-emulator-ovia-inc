@@ -152,10 +152,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled in a form the centralized walk applies, so anything outside them is
         // already a 400 before this body runs. The KEY pattern is not: the walk captures
         // no map-key constraints and could not compile this one anyway, so this handler
-        // applies it (see `crate::state::tag_key_rejection`) before anything else — an
-        // input the shape refuses is a 400 whatever resource the request names.
+        // applies it (see `crate::state::satisfies_tag_key_pattern`) before anything
+        // else — an input the shape refuses is a 400 whatever resource the request names.
         let _ = ctx;
-        crate::state::check_tag_keys("tags", input.tags.keys().map(String::as_str))
+        crate::state::check_tag_map_keys("tags", input.tags.keys().map(String::as_str))
             .map_err(TagResourceErrorModeled::ValidationException)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

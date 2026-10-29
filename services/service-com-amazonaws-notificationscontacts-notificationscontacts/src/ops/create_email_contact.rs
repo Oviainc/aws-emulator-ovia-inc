@@ -160,14 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // class the walk's regex engine cannot compile either — and a pattern it cannot
         // compile is treated there as matching every value. So this handler applies both
         // (see `crate::state::check_email_contact_name` and
-        // `crate::state::tag_key_rejection`) before it touches the store, because a
-        // create the shape refuses persists nothing. `name` is judged first, the order
-        // the walk visits the input's members in.
+        // `crate::state::satisfies_tag_key_pattern`) before it touches the store,
+        // because a create the shape refuses persists nothing. `name` is judged first,
+        // the order the walk visits the input's members in.
         let _ = ctx;
         crate::state::check_email_contact_name("name", &input.name)
             .map_err(CreateEmailContactErrorModeled::ValidationException)?;
         if let Some(tags) = input.tags.as_ref() {
-            crate::state::check_tag_keys("tags", tags.keys().map(String::as_str))
+            crate::state::check_tag_map_keys("tags", tags.keys().map(String::as_str))
                 .map_err(CreateEmailContactErrorModeled::ValidationException)?;
         }
 

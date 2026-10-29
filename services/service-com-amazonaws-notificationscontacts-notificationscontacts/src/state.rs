@@ -99,7 +99,8 @@ pub const MAX_TAGS_PER_CONTACT: usize = 200;
 /// The modelled `TagKey` pattern, verbatim
 /// (`smithy_query(query="shape",shape="TagKey")`).
 ///
-/// Stated here because it has to be applied by hand: see [`tag_key_rejection`].
+/// Stated here because it has to be applied by hand: see
+/// [`satisfies_tag_key_pattern`].
 pub const TAG_KEY_PATTERN: &str = r"^(?!aws:).{1,128}$";
 
 /// The tag-key prefix [`TAG_KEY_PATTERN`]'s leading negative lookahead excludes: the
@@ -122,7 +123,7 @@ pub const MAX_TAG_KEY_LEN: usize = 128;
 /// however many characters it has.
 pub const TAG_KEY_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
 
-/// Why `key` is not a `TagKey`, or `None` when it satisfies [`TAG_KEY_PATTERN`].
+/// Whether `key` satisfies the modelled `TagKey` `@pattern` ([`TAG_KEY_PATTERN`]).
 ///
 /// This one modelled constraint cannot be left to the framework's centralized
 /// constraint walk, for two independent reasons, both in
@@ -142,51 +143,80 @@ pub const TAG_KEY_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}
 /// (`AWS:` is admitted by it). What remains is `.{1,128}` anchored at both ends: 1 to
 /// 128 characters, counted as the Unicode scalar values `.` matches, none of them one of
 /// the [`TAG_KEY_EXCLUDED_CHARS`] it does not.
-pub fn tag_key_rejection(key: &str) -> Option<String> {
-    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
-        return Some(format!(
-            "must not begin with the reserved prefix {RESERVED_TAG_KEY_PREFIX}"
-        ));
-    }
-    let len = key.chars().count();
-    if !(MIN_TAG_KEY_LEN..=MAX_TAG_KEY_LEN).contains(&len) {
-        return Some(format!(
-            "must carry between {MIN_TAG_KEY_LEN} and {MAX_TAG_KEY_LEN} characters, not {len}"
-        ));
-    }
-    if let Some(excluded) = key.chars().find(|c| TAG_KEY_EXCLUDED_CHARS.contains(c)) {
-        return Some(format!(
-            "must not carry the line terminator U+{:04X}",
-            excluded as u32
-        ));
-    }
-    None
+///
+/// WHICH of those parts a key broke is deliberately not reported: the model declares ONE
+/// expression for this member, so a key outside it is refused with that expression —
+/// see [`pattern_validation_failure`] — exactly as a `@pattern` the walk could apply is.
+pub fn satisfies_tag_key_pattern(key: &str) -> bool {
+    !key.starts_with(RESERVED_TAG_KEY_PREFIX)
+        && (MIN_TAG_KEY_LEN..=MAX_TAG_KEY_LEN).contains(&key.chars().count())
+        && !key.chars().any(|c| TAG_KEY_EXCLUDED_CHARS.contains(&c))
 }
 
-/// `Ok` when every key in `keys` satisfies [`TAG_KEY_PATTERN`], else the modelled 400
-/// for the offending one.
+/// `Ok` when every KEY of a `TagMap` member in `keys` satisfies [`TAG_KEY_PATTERN`],
+/// else the modelled 400 for the offending one.
 ///
-/// `member` is the input member the keys arrived through (`tags`, `tagKeys`), so the
-/// refusal blames what the caller named rather than the shape behind it. A request
-/// carrying several bad keys is refused for the lexicographically first of them, so one
-/// request always reads the same way however the map happened to be ordered.
-pub fn check_tag_keys<'a, I>(member: &str, keys: I) -> Result<(), ValidationException>
+/// `member` is the map member the keys arrived through (`tags`), and that member is the
+/// path the refusal blames: the centralized walk visits no map key at all, so there is
+/// no element position of its spelling to name, and the key itself is the value the
+/// clause echoes. A request carrying several bad keys is refused for the
+/// lexicographically first of them, so one request always reads the same way however the
+/// map happened to hand its keys over.
+pub fn check_tag_map_keys<'a, I>(member: &str, keys: I) -> Result<(), ValidationException>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let mut refused: Option<(&str, String)> = None;
-    for key in keys {
-        if let Some(why) = tag_key_rejection(key) {
-            if refused.as_ref().is_none_or(|(held, _)| key < *held) {
-                refused = Some((key, why));
-            }
-        }
-    }
-    match refused {
-        Some((_, why)) => Err(field_validation_failure(
-            member,
-            &format!("names a tag key that {why}"),
-        )),
+    let refused = keys
+        .into_iter()
+        .filter(|key| !satisfies_tag_key_pattern(key))
+        .min();
+    refuse_outside_pattern(
+        TAG_KEY_PATTERN,
+        refused.map(|key| (member.to_string(), key)),
+    )
+}
+
+/// `Ok` when every ELEMENT of a `TagKeys` member in `keys` satisfies
+/// [`TAG_KEY_PATTERN`], else the modelled 400 for the first offending one.
+///
+/// A list arrives in the order the caller wrote it, and the centralized walk names a list
+/// element by the member, its 1-based position and the step into the collection
+/// (`names.2.member`), so the refusal blames the position the request wrote the key at —
+/// the same position the walk would have named had it been able to apply this pattern.
+pub fn check_tag_key_list<'a, I>(member: &str, keys: I) -> Result<(), ValidationException>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let refused = keys
+        .into_iter()
+        .enumerate()
+        .find(|(_, key)| !satisfies_tag_key_pattern(key));
+    refuse_outside_pattern(
+        TAG_KEY_PATTERN,
+        refused.map(|(index, key)| (element_path(member, index + 1), key)),
+    )
+}
+
+/// The path the framework's own path spelling gives the `position`-th (1-based) element
+/// of the list member `member`.
+fn element_path(member: &str, position: usize) -> String {
+    ::aws_smithy_schema_server::constraints::path::join(&[
+        member.to_string(),
+        ::aws_smithy_schema_server::constraints::path::element(position),
+    ])
+}
+
+/// `Ok` when `offender` is `None`, else the modelled 400 that
+/// [`pattern_validation_failure`] words for the `(path, value)` it carries.
+///
+/// The ONE refusal path for a `@pattern` this service has to apply by hand, so no caller
+/// of it can word such a refusal its own way.
+fn refuse_outside_pattern(
+    pattern: &str,
+    offender: Option<(String, &str)>,
+) -> Result<(), ValidationException> {
+    match offender {
+        Some((path, value)) => Err(pattern_validation_failure(&path, pattern, value)),
         None => Ok(()),
     }
 }
@@ -242,14 +272,10 @@ pub fn satisfies_email_contact_name_pattern(name: &str) -> bool {
 /// `member` is the member the caller named, so the refusal blames what the request wrote
 /// rather than the shape behind it.
 pub fn check_email_contact_name(member: &str, name: &str) -> Result<(), ValidationException> {
-    if satisfies_email_contact_name_pattern(name) {
-        return Ok(());
-    }
-    Err(pattern_validation_failure(
-        member,
+    refuse_outside_pattern(
         EMAIL_CONTACT_NAME_PATTERN,
-        name,
-    ))
+        (!satisfies_email_contact_name_pattern(name)).then(|| (member.to_string(), name)),
+    )
 }
 
 /// The most email contacts one account may hold: the service's PUBLISHED per-account
@@ -575,6 +601,33 @@ pub fn field_validation_failure(member: &str, why: &str) -> ValidationException 
 /// requirement that value broke, so the requirement half can be read back off it.
 const CONSTRAINT_CLAUSE_SEPARATOR: &str = " failed to satisfy constraint: ";
 
+/// Ceiling on a refused value as a refusal ECHOES it, in bytes.
+///
+/// A `@pattern` applied by hand is applied to a value nothing else bounds the length of —
+/// `TagKey` declares its 1..128 bound INSIDE the very pattern the centralized walk could
+/// not apply, so a key of any size reaches a handler — and the clause interpolates that
+/// value, so without a ceiling one request would choose the size of its own error
+/// response. The echo is there for the caller to see WHAT was refused, which a prefix
+/// satisfies: twice the longest value any pattern applied here admits
+/// ([`MAX_TAG_KEY_LEN`] characters) already shows a value no such pattern could match.
+const MAX_ECHOED_VALUE_BYTES: usize = 2 * MAX_TAG_KEY_LEN;
+
+/// `value` as a clause should interpolate it: itself when short, else a prefix cut on a
+/// character boundary followed by the size of what was sent.
+///
+/// RENDERING ONLY. A pattern is applied to the value the request sent, never to this: a
+/// value judged in its elided form would be judged against text the caller never wrote.
+fn echoed(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.len() <= MAX_ECHOED_VALUE_BYTES {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut end = MAX_ECHOED_VALUE_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}... [{} bytes]", &value[..end], value.len()))
+}
+
 /// The modelled 400 for a `value` outside the `@pattern` its member declares.
 ///
 /// The sentence is NOT written here: the violation is handed to the framework's own
@@ -583,18 +636,20 @@ const CONSTRAINT_CLAUSE_SEPARATOR: &str = " failed to satisfy constraint: ";
 /// member path, the value the request submitted and the expression the model declares —
 /// and `fieldList` blames the member with the requirement half of that same clause.
 ///
-/// The echoed value is bounded by the member's own modelled `@length` maximum, which the
-/// walk has already applied by the time a handler runs, so one clause cannot carry
-/// request-sized content.
+/// `path` is that member path, spelled the way the framework spells one: a member names
+/// itself, and a collection element names its position too (see [`element_path`]).
+///
+/// The echoed value is elided at [`MAX_ECHOED_VALUE_BYTES`], so one clause cannot carry
+/// request-sized content whatever the member's own modelled bounds are.
 pub fn pattern_validation_failure(
-    member: &str,
+    path: &str,
     pattern: &str,
     value: &str,
 ) -> ValidationException {
     let violation = ::aws_smithy_schema_server::Violation {
-        path: member.to_string(),
+        path: path.to_string(),
         kind: ::aws_smithy_schema_server::ViolationKind::Pattern(pattern.to_string()),
-        value: Some(value.to_string()),
+        value: Some(echoed(value).into_owned()),
     };
     let clause = violation.message();
     let requirement = clause
@@ -606,7 +661,7 @@ pub fn pattern_validation_failure(
             .unwrap_or(clause),
         reason: VALIDATION_REASON_FIELD.to_string(),
         field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
+            name: path.to_string(),
             message: requirement,
         }]),
     }
