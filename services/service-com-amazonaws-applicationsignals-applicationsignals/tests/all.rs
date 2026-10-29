@@ -123,3 +123,5 @@ mod unissued_next_token;
 mod untag_resource_kinds;
 #[path = "all/window_instant_resolution.rs"]
 mod window_instant_resolution;
+#[path = "all/windowed_read_page_bound.rs"]
+mod windowed_read_page_bound;

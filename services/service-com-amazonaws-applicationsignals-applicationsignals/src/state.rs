@@ -129,6 +129,33 @@ pub const MAX_TAGS_PER_LIST: usize = 200;
 /// operation. If you omit this parameter, the default of 10 is used."
 pub const DEFAULT_AUDIT_FINDING_PAGE: i32 = 10;
 
+/// The page `ListServices` serves a caller who names no `MaxResults`: the `@default` the
+/// member's own model carries (`smithy_query(query="operation",operation="ListServices")` ->
+/// `MaxResults {default: 50, range 1..100}`), which its documentation states too ("If you
+/// omit this parameter, the default of 50 is used").
+pub const DEFAULT_SERVICE_PAGE: i32 = 50;
+
+/// The page `ListServiceOperations` serves a caller who names no `MaxResults`: the `@default`
+/// the member's own model carries (`smithy_query(query="operation",
+/// operation="ListServiceOperations")` -> `MaxResults {default: 20, range 1..100}`), which is
+/// the value the request walk fills an absent member in with.
+pub const DEFAULT_SERVICE_OPERATION_PAGE: i32 = 20;
+
+/// The page `ListServiceDependencies` serves a caller who names no `MaxResults`: the
+/// `@default` the member's own model carries (`smithy_query(query="operation",
+/// operation="ListServiceDependencies")` -> `MaxResults {default: 20, range 1..100}`).
+pub const DEFAULT_SERVICE_DEPENDENCY_PAGE: i32 = 20;
+
+/// The page `ListServiceDependents` serves a caller who names no `MaxResults`: the `@default`
+/// the member's own model carries (`smithy_query(query="operation",
+/// operation="ListServiceDependents")` -> `MaxResults {default: 20, range 1..100}`).
+pub const DEFAULT_SERVICE_DEPENDENT_PAGE: i32 = 20;
+
+/// The page `ListEntityEvents` serves a caller who names no `MaxResults`: the `@default` the
+/// member's own model carries (`smithy_query(query="operation",operation="ListEntityEvents")`
+/// -> `MaxResults {default: 20, range 1..250}`).
+pub const DEFAULT_ENTITY_EVENT_PAGE: i32 = 20;
+
 /// `Goal.Interval` when omitted. Model doc: "If you omit this parameter, a rolling
 /// interval of 7 days is used."
 const DEFAULT_ROLLING_INTERVAL_DURATION: i32 = 7;

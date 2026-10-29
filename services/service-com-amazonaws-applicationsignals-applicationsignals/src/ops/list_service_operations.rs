@@ -195,8 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `MaxResults` carries the model's own `@default` of 20 and its `range 1..100` is
-        // refused before this handler runs, so the bound is read straight off the input.
+        // `MaxResults` carries both its range and a documented `@default`, so the page size is
+        // the one rule this service words once for such a member
+        // ([`crate::state::defaulted_page_bound`]).
+        let page_size = crate::state::defaulted_page_bound(
+            input.max_results,
+            crate::state::DEFAULT_SERVICE_OPERATION_PAGE,
+        );
+
         let observed = state
             .lock()
             .observed_operations(&input.key_attributes, &input.start_time, &input.end_time);
@@ -214,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             observed,
             &token_tag,
             input.next_token.as_deref(),
-            input.max_results.max(0) as usize,
+            page_size,
         )
         .map_err(refused)?;
 
