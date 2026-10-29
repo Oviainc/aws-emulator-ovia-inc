@@ -123,6 +123,12 @@ mod notification_channel_regions;
 #[path = "all/resource_set_batch_basis.rs"]
 mod resource_set_batch_basis;
 
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
+#[path = "all/put_admin_account_during_offboarding.rs"]
+mod put_admin_account_during_offboarding;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

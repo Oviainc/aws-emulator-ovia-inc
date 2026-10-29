@@ -300,6 +300,38 @@ impl OrganizationAdminRecord {
         self.status_at(now) != ORGANIZATION_STATUS_OFFBOARDING_COMPLETE
     }
 
+    /// Whether this account's administrator role is GONE OR GOING AT `now`: the
+    /// removal [`Self::start_offboarding`] started has completed
+    /// ([`ORGANIZATION_STATUS_OFFBOARDING_COMPLETE`]), or it is still under way
+    /// ([`ORGANIZATION_STATUS_OFFBOARDING`]) with the clock still owing the
+    /// completion.
+    ///
+    /// Such a record holds no administrator role a writer could update: the
+    /// account is being removed as one, so the only thing a writer can do with
+    /// it is designate the account again ([`Self::start_onboarding`]).
+    ///
+    /// Derived from [`Self::status_at`], so the CLOCK decides it, exactly as
+    /// [`Self::is_administrator_at`] is.
+    pub fn is_leaving_at(&self, now: SystemTime) -> bool {
+        let status = self.status_at(now);
+        status == ORGANIZATION_STATUS_OFFBOARDING
+            || status == ORGANIZATION_STATUS_OFFBOARDING_COMPLETE
+    }
+
+    /// Designate this account as an administrator AGAIN from `now`, with
+    /// `admin_scope`: the record becomes a fresh [`Self::onboarding`], so the
+    /// status the clock completes is the one THIS call started and nothing of
+    /// the role the account used to hold carries over.
+    ///
+    /// A removal still in flight is SUPERSEDED rather than waited for — the
+    /// mirror of [`Self::start_offboarding`] superseding an onboarding still in
+    /// flight — so the completion of a removal the clock still owed can never
+    /// undo the designation this call made.
+    pub fn start_onboarding(&mut self, admin_scope: AdminScope, now: SystemTime) {
+        let account_id = self.account_id.clone();
+        *self = Self::onboarding(&account_id, admin_scope, now);
+    }
+
     /// Start removing this account as an administrator: the status becomes
     /// `OFFBOARDING` now and the clock owes `OFFBOARDING_COMPLETE`
     /// [`ADMIN_OFFBOARDING_SPAN`] later — the removal side of the same pending

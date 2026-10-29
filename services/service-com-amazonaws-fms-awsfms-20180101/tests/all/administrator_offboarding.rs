@@ -49,18 +49,25 @@ use crate::policy_lifecycle::{call, emulator, error_code, ACCOUNT, REGION};
 /// [`crate::admin_account_scopes::wait_out_the_onboarding`] states: this
 /// workspace's `tokio` is built without the `time` feature, so
 /// `tokio::time::sleep` is not available here.
-fn wait_out_the_offboarding() {
+///
+/// `pub(crate)` so the sibling suite that designates an administrator again
+/// while its removal is in flight waits out the SAME span rather than keeping a
+/// second copy of the wait rule.
+pub(crate) fn wait_out_the_offboarding() {
     sleep(OFFBOARDING_SPAN + Duration::from_millis(250));
 }
 
 /// How long an administrator stays `OFFBOARDING`, from the service's own
 /// constant — the span a removal's due instant is set from.
-const OFFBOARDING_SPAN: Duration =
+pub(crate) const OFFBOARDING_SPAN: Duration =
     service_com_amazonaws_fms_awsfms_20180101::state::ADMIN_OFFBOARDING_SPAN;
 
 /// A fraction of the removal span, after which a repeat of the request is still
 /// a repeat of one under way.
-fn part_way_in() -> Duration {
+///
+/// `pub(crate)` so the sibling suite that acts PART WAY into a removal reaches
+/// that instant through the same fraction of the service's own span.
+pub(crate) fn part_way_in() -> Duration {
     OFFBOARDING_SPAN * 2 / 5
 }
 
@@ -138,7 +145,11 @@ fn cases() -> Vec<Case> {
 }
 
 /// Make `account` the organization's default administrator.
-async fn associate(router: &MultiServiceRouter, case: &str, account: &str) {
+///
+/// `pub(crate)` so the sibling suite that needs the CALLER to hold a delegated
+/// administrator role — which it does only while some OTHER account holds the
+/// default-administrator association — opens the gate through the same helper.
+pub(crate) async fn associate(router: &MultiServiceRouter, case: &str, account: &str) {
     let (status, body) = call(
         router,
         "AssociateAdminAccount",
@@ -153,7 +164,10 @@ async fn associate(router: &MultiServiceRouter, case: &str, account: &str) {
 
 /// The administrator accounts `ListAdminsManagingAccount` reports for the
 /// calling account, in the order it reports them.
-async fn managing_administrators(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the sibling suite that checks a re-designated administrator
+/// manages accounts again reads the same enumeration through this one reader.
+pub(crate) async fn managing_administrators(router: &MultiServiceRouter, case: &str) -> Vec<String> {
     let (status, body) = call(router, "ListAdminsManagingAccount", &json!({})).await;
     assert_eq!(
         status, 200,

@@ -25,10 +25,19 @@
 //! * a CREATE records the account with the scope sent (an absent `AdminScope`
 //!   grants nothing yet) and starts it `ONBOARDING`, the non-terminal
 //!   `OrganizationStatus` the clock completes
-//!   ([`crate::state::ADMIN_ONBOARDING_SPAN`]) — and an account that
-//!   `DisassociateAdminAccount` has already REMOVED as an administrator is
-//!   created again this way rather than updated, since it is no administrator
-//!   for this call to update;
+//!   ([`crate::state::ADMIN_ONBOARDING_SPAN`]) — and an account whose
+//!   administrator role is gone or going, because
+//!   `DisassociateAdminAccount` removed it or is still removing it
+//!   ([`crate::state::OrganizationAdminRecord::is_leaving_at`]), is created
+//!   again this way rather than updated, since it holds no administrator role
+//!   for this call to update. Designating it again SUPERSEDES the removal the
+//!   clock still owed it
+//!   ([`crate::state::OrganizationAdminRecord::start_onboarding`]), the mirror
+//!   of `DisassociateAdminAccount` superseding an onboarding still in flight:
+//!   the status reported is "the current status of the request to onboard a
+//!   member account as an Firewall Manager administrator"
+//!   (`AdminAccountSummary$Status`), so it is THIS request's, and no
+//!   transition the clock still owed can undo what this call created;
 //! * an UPDATE replaces the stored scope, leaves the account's onboarding and
 //!   its `onboarded_at` alone, and — following this service's convention for an
 //!   absent optional member of a `Put` payload — treats an absent `AdminScope`
@@ -281,9 +290,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .values()
             .filter(|admin| admin.is_administrator_at(now))
             .count();
-        // The bound is on CREATING an administrator — whether this account was
-        // never one or was one and has been removed — not on updating the scope
-        // of one the organization already holds, which adds no administrator.
+        // The bound is on an account this call ADDS to that count — one that was
+        // never an administrator, or was one and has been removed as one — not
+        // on one the organization already holds AS an administrator, whose
+        // designation this call either updates or restarts without adding an
+        // administrator to the organization.
         let creating = store
             .organization_admins
             .get(&input.admin_account)
@@ -300,23 +311,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         match store.organization_admins.get_mut(&input.admin_account) {
-            // CREATE AGAIN: the account was an administrator and HAS BEEN
-            // REMOVED as one (`DisassociateAdminAccount` took it out, and the
-            // clock completed the removal), so there is no administrator here
-            // for this call to update — it creates one, which onboards from the
-            // start exactly as a first-time create does. The record that was
-            // left behind reports what became of the previous role and does not
-            // carry over into the new one.
-            Some(existing) if !existing.is_administrator_at(now) => {
-                *existing = crate::state::OrganizationAdminRecord::onboarding(
-                    &input.admin_account,
-                    input.admin_scope.clone().unwrap_or_default(),
-                    now,
-                );
+            // CREATE AGAIN: this account's administrator role is GONE OR GOING
+            // — `DisassociateAdminAccount` took it out and the clock completed
+            // the removal, or the removal is still under way with the
+            // completion owed — so there is no administrator role here for this
+            // call to update. It designates one instead, which onboards from
+            // the start exactly as a first-time create does, and SUPERSEDES the
+            // removal the clock still owed, so that removal cannot complete
+            // later and undo what this call just created. Nothing of the role
+            // the account used to hold carries over into the new one.
+            Some(existing) if existing.is_leaving_at(now) => {
+                existing.start_onboarding(input.admin_scope.clone().unwrap_or_default(), now);
             }
-            // UPDATE: this account already is an administrator, so only its
-            // scope changes; an absent `AdminScope` leaves the stored one as it
-            // is, which is what makes a repeated call idempotent.
+            // UPDATE: this account already is an administrator and is not on its
+            // way out, so only its scope changes; an absent `AdminScope` leaves
+            // the stored one as it is, which is what makes a repeated call
+            // idempotent.
             Some(existing) => {
                 if let Some(scope) = input.admin_scope.clone() {
                     existing.admin_scope = scope;
