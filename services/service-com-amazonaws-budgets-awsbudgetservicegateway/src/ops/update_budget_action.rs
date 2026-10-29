@@ -211,6 +211,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
+        // "Roles and actions must be in the same account" (`Action$ExecutionRoleArn`) —
+        // a rule over two members of the request, which no constraint trait can express,
+        // so a replacement role is held to it exactly as the role a create establishes
+        // is. Checked before the action is looked up, so a request that is malformed in
+        // itself is refused the same way whichever action it names.
+        if let Some(execution_role_arn) = &input.execution_role_arn {
+            crate::state::validate_execution_role_account(&input.account_id, execution_role_arn)
+                .map_err(|message| {
+                    UpdateBudgetActionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                        },
+                    )
+                })?;
+        }
+
+        // A replacement subscriber set is held to the same per-type split as the set a
+        // create establishes ("one SNS subscriber and up to 10 email subscribers, for a
+        // total of 11"), so an update cannot leave an action holding a set a create
+        // would have been refused. This operation models no
+        // `CreationLimitExceededException`, so the refusal is the client-error it does
+        // model — "the cause is an invalid input value"
+        // (`InvalidParameterException`). Both rules below are carried by the request
+        // alone, so they are applied before the action is looked up and before anything
+        // is written: a refused update leaves the stored action exactly as it was.
+        if let Some(subscribers) = &input.subscribers {
+            // Every address in a replacement set is held to the form its own
+            // `SubscriptionType` names, exactly as the set a create establishes is: "either
+            // an Amazon SNS topic or an email address" (`Subscriber`), with no line breaks
+            // (`Subscriber$Address`).
+            crate::state::subscriber_address_violation(subscribers).map_err(|message| {
+                UpdateBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+            crate::state::subscriber_limit_violation(subscribers).map_err(|message| {
+                UpdateBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = crate::state::store_at(&state, now);
         let held = store
@@ -248,7 +294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ActionType` is not an input of this operation, so the action keeps the type it
         // was created with — and "the type of action ... determines the format for
         // definition" (`Action$ActionType`), so a replacement `Definition` is checked
-        // against THAT type.
+        // against THAT type. This is the one rule here the request does NOT carry by
+        // itself, so it is the one checked after the lookup — and still before anything is
+        // written.
         if let Some(definition) = &input.definition {
             crate::state::validate_action_definition(&old_action.action_type, definition).map_err(
                 |message| {
@@ -259,51 +307,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 },
             )?;
-        }
-
-        // "Roles and actions must be in the same account" (`Action$ExecutionRoleArn`) —
-        // a rule over two members of the request, which no constraint trait can express,
-        // so a replacement role is held to it exactly as the role a create establishes
-        // is.
-        if let Some(execution_role_arn) = &input.execution_role_arn {
-            crate::state::validate_execution_role_account(&input.account_id, execution_role_arn)
-                .map_err(|message| {
-                    UpdateBudgetActionErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(message),
-                        },
-                    )
-                })?;
-        }
-
-        // A replacement subscriber set is held to the same per-type split as the set a
-        // create establishes ("one SNS subscriber and up to 10 email subscribers, for a
-        // total of 11"), so an update cannot leave an action holding a set a create
-        // would have been refused. This operation models no
-        // `CreationLimitExceededException`, so the refusal is the client-error it does
-        // model — "the cause is an invalid input value"
-        // (`InvalidParameterException`). Checked before anything is written, so a
-        // refused update leaves the stored action exactly as it was.
-        if let Some(subscribers) = &input.subscribers {
-            // Every address in a replacement set is held to the form its own
-            // `SubscriptionType` names, exactly as the set a create establishes is: "either
-            // an Amazon SNS topic or an email address" (`Subscriber`), with no line breaks
-            // (`Subscriber$Address`). Checked before anything is written, so a refused
-            // update leaves the stored action's subscribers as they were.
-            crate::state::subscriber_address_violation(subscribers).map_err(|message| {
-                UpdateBudgetActionErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-            })?;
-            crate::state::subscriber_limit_violation(subscribers).map_err(|message| {
-                UpdateBudgetActionErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
-            })?;
         }
 
         // Every member this operation takes is optional: one the caller named replaces

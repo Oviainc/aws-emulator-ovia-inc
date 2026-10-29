@@ -202,6 +202,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
+        // The window the caller asked about has to hold together — "The start date must
+        // come before the end date" (`TimePeriod`) — and one that does not is an invalid
+        // input value, not an empty history. Checked before the store is looked in, so a
+        // request that is malformed in itself is refused the same way whichever action it
+        // names.
+        if input
+            .time_period
+            .as_ref()
+            .is_some_and(|window| !crate::state::time_period_ordered(window))
+        {
+            return Err(
+                DescribeBudgetActionHistoriesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "Unable to get budget action history: TimePeriod Start must come \
+                             before End."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = crate::state::store_at(&state, now);
         // The lookup materialises any settle the clock had already made due, so the
@@ -222,21 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        // The window the caller asked for, if any. Its bounds have to hold together —
-        // "The start date must come before the end date" (`TimePeriod`) — and a period
-        // that does not is an invalid input value, not an empty history.
-        let records = crate::state::action_history_in_period(held, input.time_period.as_ref())
-            .ok_or_else(|| {
-                DescribeBudgetActionHistoriesErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            "Unable to get budget action history: TimePeriod Start must come \
-                             before End."
-                                .to_string(),
-                        ),
-                    },
-                )
-            })?;
+        // The records the window the caller asked for covers, oldest first; a caller that
+        // named no window gets the whole history.
+        let records = crate::state::action_history_in_period(held, input.time_period.as_ref());
 
         let (page, next_token) = crate::state::page(
             &records,

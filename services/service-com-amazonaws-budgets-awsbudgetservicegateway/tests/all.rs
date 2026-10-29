@@ -81,6 +81,8 @@ mod notification_lifecycle;
 mod notification_update;
 #[path = "all/percentage_budget_limit_amount.rs"]
 mod percentage_budget_limit_amount;
+#[path = "all/request_borne_refusal_precedence.rs"]
+mod request_borne_refusal_precedence;
 #[path = "all/resource_tag_deletion.rs"]
 mod resource_tag_deletion;
 #[path = "all/resource_tag_reads.rs"]

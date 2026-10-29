@@ -2289,30 +2289,25 @@ pub fn record_action_event(
     }
 }
 
-/// The history records of `stored` that `period` covers, oldest first.
+/// The history records of `stored` that `period` covers, oldest first; a caller that
+/// named no period gets the whole history.
 ///
-/// `None` for a `period` whose bounds are the wrong way round, which the caller refuses
-/// with the modelled `InvalidParameterException`; a caller that named no period gets the
-/// whole history.
+/// Filtering only. The ordering rule every `TimePeriod` carries ([`time_period_ordered`])
+/// is decided by the request alone, so the calling handler refuses a window that breaks
+/// it — with the modelled `InvalidParameterException` — before it ever looks a resource
+/// up, which is where every other rule a request carries in itself is applied too.
 pub fn action_history_in_period(
     stored: &StoredAction,
     period: Option<&TimePeriod>,
-) -> Option<Vec<ActionHistory>> {
+) -> Vec<ActionHistory> {
     match period {
-        None => Some(stored.history.clone()),
-        Some(period) => {
-            if !time_period_ordered(period) {
-                return None;
-            }
-            Some(
-                stored
-                    .history
-                    .iter()
-                    .filter(|record| within_time_period(&record.timestamp, period))
-                    .cloned()
-                    .collect(),
-            )
-        }
+        None => stored.history.clone(),
+        Some(period) => stored
+            .history
+            .iter()
+            .filter(|record| within_time_period(&record.timestamp, period))
+            .cloned()
+            .collect(),
     }
 }
 
