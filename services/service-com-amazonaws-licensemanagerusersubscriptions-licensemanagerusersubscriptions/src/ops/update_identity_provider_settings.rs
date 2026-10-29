@@ -23,8 +23,12 @@
 //! validation failure here.
 //!
 //! Only then is the payload applied, by [`crate::state::apply_update_settings`]: a
-//! subnet in both `AddSubnets` and `RemoveSubnets`, or a payload that would leave the
-//! registration with no subnet at all, is refused as invalid rather than half-applied.
+//! subnet in both `AddSubnets` and `RemoveSubnets`, or a payload that takes away the last
+//! subnet the registration carries, is refused as invalid rather than half-applied. A
+//! registration stored with no subnet (`Settings` is optional on registration) is not
+//! taken below the minimum by a payload that removes nothing, so a security-group-only
+//! update of one is applied, and a payload naming nothing is the no-op the operation's
+//! `@idempotent` trait asks for.
 //!
 //! The settings that payload WOULD store are then resolved against what the account has,
 //! asked of the service that owns those resources

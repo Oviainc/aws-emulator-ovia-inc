@@ -2536,8 +2536,16 @@ pub fn iso8601(at: SystemTime) -> String {
 ///
 /// * a subnet in BOTH `AddSubnets` and `RemoveSubnets` asks for two contradictory things
 ///   at once, so there is no resulting set;
-/// * a payload that would leave no subnet at all contradicts `Settings$Subnets`, which
-///   the model declares `@required` with `@length(min: 1)`.
+/// * a payload that TAKES AWAY the last subnet the registration carries contradicts
+///   `Settings$Subnets`, which the model declares `@required` with `@length(min: 1)`.
+///
+/// That minimum is something an update can only violate by taking the registration below
+/// it. A registration stored with no subnet at all is already below it — `Settings` is
+/// optional on `RegisterIdentityProvider`, so a registration that provisions no
+/// activation-server VPC endpoints carries the empty configuration — and a payload that
+/// removes nothing from it leaves its subnets exactly as they were, which is not a
+/// violation this request commits: such a payload is applied, so the `SecurityGroupId` of
+/// a registration that holds no subnet can be set at all.
 ///
 /// Order is preserved and duplicates collapse, so the result is the SET the caller asked
 /// for however the payload spelled it; removing a subnet the registration does not carry
@@ -2587,7 +2595,9 @@ pub fn apply_update_settings(
             subnets.push(subnet.clone());
         }
     }
-    if subnets.is_empty() {
+    // Only a fold that EMPTIED a non-empty set took the last subnet away; a result that is
+    // empty because the registration held none is the state the store already carries.
+    if subnets.is_empty() && !settings.subnets.is_empty() {
         return Err(StateError::Validation(
             "UpdateSettings would leave the registration with no subnet, and \
              Settings.Subnets requires at least one"
