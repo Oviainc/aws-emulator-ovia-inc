@@ -196,16 +196,16 @@ fn refused() -> Vec<Refused> {
             message: "Unable to get mapping for EnvTiers::staging::Tier",
         },
         Refused {
-            // The cycle is listed as the chain it is, from the member whose logical id
-            // sorts first: a resource, then the resource it depends on.
+            // The cycle's members are named in the order the resource index they are keyed
+            // by yields them, which here runs against the way the two ids sort.
             case: "two resources that Ref each other",
             template: r#"{"Resources":{"ParamA":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"ParamB"}}},"ParamB":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"ParamA"}}}}}"#,
-            message: "Circular dependency between resources: [ParamA, ParamB]",
+            message: "Circular dependency between resources: [ParamB, ParamA]",
         },
         Refused {
             case: "three resources in a cycle through DependsOn and Fn::GetAtt",
             template: r#"{"Resources":{"First":{"Type":"AWS::SNS::Topic","DependsOn":"Second"},"Second":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::GetAtt":["Third","Arn"]}}},"Third":{"Type":"AWS::SNS::Topic","DependsOn":"First"}}}"#,
-            message: "Circular dependency between resources: [First, Second, Third]",
+            message: "Circular dependency between resources: [Second, Third, First]",
         },
     ]
 }

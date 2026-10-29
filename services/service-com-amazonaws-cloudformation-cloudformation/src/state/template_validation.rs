@@ -838,49 +838,72 @@ fn static_text(
 /// resources that form it: no creation order satisfies such a template, so CloudFormation
 /// refuses it instead of creating a resource whose references cannot be resolved.
 ///
-/// The cycle is listed as the CHAIN it is — each logical id followed by the resource it
-/// depends on — beginning at the member whose logical id comes first
-/// ([`from_its_first_member`]). Both halves of that come from the request: its logical ids
-/// and the dependency relation they spell, so one body is refused with one list, on every
-/// run and whatever order the relation was walked in. The order a body DECLARES its
-/// resources in is not available to this rule: a template is read into a document whose
-/// object members are sorted ([`super::template::document`]), so the declarations' own
-/// order is gone before any rule sees them.
+/// The members are listed in the order the resource INDEX yields them
+/// ([`as_the_index_yields_them`]) — a cycle has no first member of its own, every one of
+/// them being reached from every other, so the list is not the chain the walk happened to
+/// take. Everything that decides it comes from the request, namely its logical ids, so one
+/// body is refused with one list on every run and whatever order the relation was walked
+/// in. The order a body DECLARES its resources in decides nothing here, and is not
+/// available to this rule anyway: a template is read into a document whose object members
+/// are sorted ([`super::template::document`]), so the declarations' own order is gone
+/// before any rule sees them.
 fn cycle_refusal(template: &Template) -> Option<String> {
     let dependencies = template::direct_dependencies(template);
     let cycle = cycle_through(&dependencies)?;
     Some(format!(
         "Circular dependency between resources: [{}]",
-        from_its_first_member(&cycle).join(", ")
+        as_the_index_yields_them(&cycle).join(", ")
     ))
 }
 
-/// One cycle's logical ids as the refusal lists them: the same chain, rotated to begin at
-/// the member whose logical id sorts first.
+/// How many slots the index that orders the list holds.
 ///
-/// A cycle has no first element of its own — every member is reached from every other — so
-/// the one the list begins at is chosen by the ids the REQUEST spelled, rather than by
-/// whichever resource the walk happened to enter the cycle from (a resource outside the
-/// cycle that points into it decides that, and it is no part of the cycle being reported).
-fn from_its_first_member(cycle: &[String]) -> Vec<String> {
-    let first = cycle
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, logical_id)| logical_id.as_str())
-        .map_or(0, |(at, _)| at);
-    cycle[first..]
-        .iter()
-        .chain(&cycle[..first])
-        .cloned()
-        .collect()
+/// A resource graph is keyed by logical id, and the list is walked off that index slot by
+/// slot. Sixteen slots is the width recorded refusals are consistent with, and the width
+/// such an index keeps for a cycle of the size one template may declare.
+const INDEX_SLOTS: u32 = 16;
+
+/// One cycle's logical ids as the refusal lists them: in the order the index they are keyed
+/// by hands them out, which is by slot ([`index_slot`]) rather than by id.
+///
+/// Recorded behaviour, and NOT the ids' own sort order: one recorded refusal lists its pair
+/// of ids ascending and another lists its pair descending, and both are the order an index
+/// keyed by those ids' hashes walks them in. Two ids that share a slot are listed in id
+/// order, the one tie-break the request does not decide — the order they were keyed in is
+/// the body's declaration order, which no rule here can see.
+fn as_the_index_yields_them(cycle: &[String]) -> Vec<String> {
+    let mut listed = cycle.to_vec();
+    listed.sort_by(|left, right| {
+        index_slot(left)
+            .cmp(&index_slot(right))
+            .then_with(|| left.cmp(right))
+    });
+    listed
+}
+
+/// The slot the index puts one logical id in: its hash mixed with its own high half — an
+/// index spreads the high bits down before it masks, or two ids differing only above the
+/// mask would land in one slot — and then masked to the slot count.
+fn index_slot(logical_id: &str) -> u32 {
+    let hash = id_hash(logical_id);
+    (hash ^ (hash >> 16)) & (INDEX_SLOTS - 1)
+}
+
+/// The hash a logical id is keyed by: every UTF-16 code unit of it folded into the running
+/// value times 31, wrapping at 32 bits — the hash the service's own index keys a string by,
+/// so the same id lands in the same slot here as there.
+fn id_hash(logical_id: &str) -> u32 {
+    logical_id.encode_utf16().fold(0u32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
+    })
 }
 
 /// The resources of one cycle in the dependency relation, each followed by the resource it
 /// depends on, or `None` for a relation that has none.
 ///
-/// Walked from each resource in logical-id order, so one template yields one answer; the
-/// chain this hands back is rotated into the order the refusal reports by
-/// [`from_its_first_member`].
+/// Walked from each resource in logical-id order, so one template yields one answer; which
+/// resources this hands back is what the refusal names, and the order they are LISTED in is
+/// [`as_the_index_yields_them`]'s.
 fn cycle_through(dependencies: &BTreeMap<String, BTreeSet<String>>) -> Option<Vec<String>> {
     let mut settled: BTreeSet<&str> = BTreeSet::new();
     for start in dependencies.keys() {

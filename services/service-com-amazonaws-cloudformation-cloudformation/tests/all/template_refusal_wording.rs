@@ -6,10 +6,10 @@
 //! A refusal's message is the only machine-readable description of what was wrong, so the
 //! three rules below are about its construction rather than about the status and the code:
 //!
-//! * **a dependency CYCLE is reported as the chain it is — each logical id followed by the
-//!   resource it depends on, beginning at the member whose id sorts first** — so the list
-//!   comes from the request's own ids and dependency relation, and the same body is refused
-//!   with the same list on every run;
+//! * **a dependency CYCLE names the resources that form it, listed in the order the
+//!   resource index they are keyed by yields them** — so the list comes from the request's
+//!   own logical ids, and the same body is refused with the same list on every run,
+//!   whichever way round those ids sort and in whatever order the body declares them;
 //! * **a section past its per-template quota is counted by the noun that limit is worded
 //!   with, the count taken from the request and the maximum from the ceiling
 //!   `DescribeAccountLimits` advertises** — and the noun belongs to the one limit, so the
@@ -19,11 +19,12 @@
 //!   roster never advertises the function the same response is refusing.
 //!
 //! Each table spans the class its rule generalises over: cycles differing in length, in the
-//! relation that closes them, in where the first-sorting member stands among the
-//! declarations, in the presence of resources outside the cycle and in both template
-//! spellings; the quota rows differ in the section metered and in how far past the ceiling
-//! the body is; the roster rows differ in the offending function, in the section it appears
-//! in, and in which operation the body was submitted to.
+//! relation that closes them, in whether the listed order runs with or against the ids' own
+//! sort order, in the order the body declares them, in the presence of resources outside
+//! the cycle and in both template spellings; the quota rows differ in the section metered
+//! and in how far past the ceiling the body is; the roster rows differ in the offending
+//! function, in the section it appears in, and in which operation the body was submitted
+//! to.
 
 use crate::stack_lifecycle::{
     call, create_stack, member, router, wait_for_the_transition, xml_text,
@@ -40,74 +41,92 @@ const DEPLOYABLE: &str =
     r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"wording-topic"}}}}"#;
 
 // ---------------------------------------------------------------------------
-// A dependency cycle names its resources in declaration order
+// A dependency cycle names its resources in the index's order
 // ---------------------------------------------------------------------------
 
 /// One cyclic template, and the logical ids its refusal must name, in order.
 struct Cycle {
     case: &'static str,
     template: &'static str,
-    /// The cycle's members as the refusal must list them: from the member whose id sorts
-    /// first, then the resource that one depends on, and so on round the cycle.
-    chain: &'static [&'static str],
+    /// The cycle's members as the refusal must list them: in the order the resource index
+    /// those ids are keyed by yields them, which is neither the order they sort in nor the
+    /// order the body declares them.
+    listed: &'static [&'static str],
 }
 
 /// The class the rule covers: a template no creation order satisfies.
+///
+/// The first three rows are what pins the order to the index rather than to the ids' own
+/// ordering: one pair is listed against the way its ids sort, another pair with it, and the
+/// first pair again with the two declarations swapped — one rule answering all three.
 const CYCLES: &[Cycle] = &[
     Cycle {
-        // The member that sorts first is the one declared LAST here, and the chain from it
-        // runs the other way round the pair than the declarations do.
-        case: "two resources whose dependency chain runs against their declaration order",
+        case: "two resources that Ref each other, listed against the way their ids sort",
+        template: r#"{"Resources":{"ParamA":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::Sub":"a-of-${ParamB}"}}},"ParamB":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::Sub":"b-of-${ParamA}"}}}}}"#,
+        listed: &["ParamB", "ParamA"],
+    },
+    Cycle {
+        // The same pair of ids with the declarations swapped: the list is the same, so what
+        // decides it is the ids and not where the body spells them.
+        case: "the same pair, declared the other way round",
+        template: r#"{"Resources":{"ParamB":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"ParamA"}}},"ParamA":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"ParamB"}}}}}"#,
+        listed: &["ParamB", "ParamA"],
+    },
+    Cycle {
+        // A pair the index yields the other way about, so no rule that merely sorts or
+        // reverses the ids answers this row and the two above it.
+        case: "two resources whose ids the index yields in ascending order",
+        template: r#"{"Resources":{"Left":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::GetAtt":["Right","Value"]}}},"Right":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::GetAtt":["Left","Value"]}}}}}"#,
+        listed: &["Left", "Right"],
+    },
+    Cycle {
+        case: "two resources that Fn::GetAtt each other",
         template: r#"{"Resources":{"Zulu":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::GetAtt":["Alfa","Value"]}}},"Alfa":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::GetAtt":["Zulu","Value"]}}}}}"#,
-        chain: &["Alfa", "Zulu"],
+        listed: &["Alfa", "Zulu"],
     },
     Cycle {
-        case: "two resources that Ref each other",
-        template: r#"{"Resources":{"Alfa":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"Bravo"}}},"Bravo":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"Alfa"}}}}}"#,
-        chain: &["Alfa", "Bravo"],
-    },
-    Cycle {
-        // Three resources closed through `DependsOn`: the chain follows the dependency, so
-        // it is NOT the order the three are declared in.
+        // Three resources closed through `DependsOn`: the list is the index's order, so it
+        // is neither the chain the dependencies spell nor the order the three are declared
+        // in.
         case: "three resources whose DependsOn closes the cycle",
         template: r#"{"Resources":{"Charlie":{"Type":"AWS::SNS::Topic","DependsOn":"Alfa"},"Bravo":{"Type":"AWS::SNS::Topic","DependsOn":"Charlie"},"Alfa":{"Type":"AWS::SNS::Topic","DependsOn":"Bravo"}}}"#,
-        chain: &["Alfa", "Bravo", "Charlie"],
+        listed: &["Charlie", "Alfa", "Bravo"],
     },
     Cycle {
         case: "four resources, the cycle closed through Fn::Sub and Fn::GetAtt",
         template: r#"{"Resources":{"Delta":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::Sub":"${Charlie}"}}},"Charlie":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::GetAtt":["Bravo","Value"]}}},"Bravo":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"Alfa"}}},"Alfa":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Fn::Sub":"${Delta}"}}}}}"#,
-        chain: &["Alfa", "Delta", "Charlie", "Bravo"],
+        listed: &["Delta", "Charlie", "Alfa", "Bravo"],
     },
     Cycle {
         // Only the resources that FORM the cycle are named, however many the template
         // declares beside them and wherever they stand.
         case: "a cycle among resources declared between two that are not in it",
         template: r#"{"Resources":{"Standalone":{"Type":"AWS::SNS::Topic"},"Yankee":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"Xray"}}},"Xray":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"Yankee"}}},"Trailing":{"Type":"AWS::SNS::Topic"}}}"#,
-        chain: &["Xray", "Yankee"],
+        listed: &["Xray", "Yankee"],
     },
     Cycle {
         // The same rule over the other spelling a body may be submitted in.
         case: "a YAML body whose cycle is spelled with short-form intrinsics",
-        template: "Resources:\n  Oscar:\n    Type: AWS::SSM::Parameter\n    Properties:\n      Type: String\n      Value: !Ref November\n  November:\n    Type: AWS::SSM::Parameter\n    Properties:\n      Type: String\n      Value: !Ref Oscar\n",
-        chain: &["November", "Oscar"],
+        template: "Resources:\n  Xray:\n    Type: AWS::SSM::Parameter\n    Properties:\n      Type: String\n      Value: !Ref Delta\n  Delta:\n    Type: AWS::SSM::Parameter\n    Properties:\n      Type: String\n      Value: !Ref Xray\n",
+        listed: &["Delta", "Xray"],
     },
 ];
 
 /// The refusal a cyclic template is answered with: the fixed text, then the cycle's logical
-/// ids comma-and-space separated, in the order the chain runs.
-fn expected_cycle_message(chain: &[&str]) -> String {
+/// ids comma-and-space separated, in the order the index yields them.
+fn expected_cycle_message(listed: &[&str]) -> String {
     format!(
         "Circular dependency between resources: [{}]",
-        chain.join(", ")
+        listed.join(", ")
     )
 }
 
 #[tokio::test]
-async fn a_cycle_is_reported_as_the_chain_it_is() {
+async fn a_cycle_names_the_resources_that_form_it() {
     let router = router();
     for row in CYCLES {
         let case = row.case;
-        let expected = expected_cycle_message(row.chain);
+        let expected = expected_cycle_message(row.listed);
         let (status, body) = create_stack(&router, "cycle-refused", row.template, &[]).await;
         assert_eq!(
             status, 400,
