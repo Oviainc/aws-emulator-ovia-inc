@@ -6,6 +6,11 @@
 //! `jobTemplateData` tree the request carried, so `DescribeJobTemplate` and
 //! `ListJobTemplates` read it back.
 //!
+//! A template is stored only if it can produce a job run: `jobTemplateData.jobDriver`
+//! has to name exactly one of the two drivers the model declares, and one naming neither
+//! or both is refused with the modelled `ValidationException`
+//! ([`crate::state::job_driver_refusal`]).
+//!
 //! `clientToken` is `@idempotencyToken`, so a token already spent on this operation does
 //! NOT mint a second template: the same request replayed — concurrently or later —
 //! answers with the template the first call minted, and the same token carrying a
@@ -167,6 +172,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx);
+        // A job template exists to produce job runs, so what it stores has to be able to
+        // BE one: `jobTemplateData.jobDriver` must name the one driver the run runs on
+        // ([`crate::state::job_driver_refusal`]). The model leaves both `JobDriver`
+        // members optional, so the boundary admits a value naming neither or both, and a
+        // template holding one of those would mint runs with no driver. Judged from the
+        // request alone, before the store is touched, so a refused create stores nothing
+        // and spends no `clientToken`.
+        if let Some(message) = crate::state::job_driver_refusal(
+            "jobTemplateData.jobDriver",
+            &input.job_template_data.job_driver,
+        ) {
+            return Err(CreateJobTemplateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // Computed from the request BEFORE the store is locked: it depends on nothing in
         // state, and the lock is what serialises racing creates that share one token.
         let fingerprint = crate::state::request_fingerprint(&input);

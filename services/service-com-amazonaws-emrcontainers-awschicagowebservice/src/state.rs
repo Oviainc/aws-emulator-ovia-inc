@@ -214,6 +214,30 @@ pub fn configured_scheduler_limits(
     })
 }
 
+/// The refusal a `JobDriver` that does not name the one driver its job runs on earns,
+/// and `None` when it names exactly one.
+///
+/// `JobDriver` is documented as "Specify the driver that the job runs on. Exactly one of
+/// the two available job drivers is required, either sparkSqlJobDriver or
+/// sparkSubmitJobDriver" (smithy_query: shape `JobDriver`), while BOTH of its members are
+/// optional in the model — so the boundary's constraint walk admits a value that names
+/// neither driver and one that names both, and neither can run. The rule belongs to the
+/// shape, so it is checked here, once, and applied by every operation that accepts a
+/// `JobDriver`: the submission that carries one, and the job template that stores one for
+/// a later submission to run.
+///
+/// `member` is where the value sits in the request, so the refusal says which one it is
+/// about.
+pub fn job_driver_refusal(member: &str, driver: &JobDriver) -> Option<String> {
+    let named = usize::from(driver.spark_submit_job_driver.is_some())
+        + usize::from(driver.spark_sql_job_driver.is_some());
+    (named != 1).then(|| {
+        format!(
+            "{member} must specify exactly one of the two available job drivers, either sparkSqlJobDriver or sparkSubmitJobDriver."
+        )
+    })
+}
+
 /// The alphabet a minted id is drawn from: `ResourceIdString` is
 /// `^[0-9a-z]+$` (len 1..64), so base-36 over `0-9a-z` is exactly its character set.
 const ID_ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";

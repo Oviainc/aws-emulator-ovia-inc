@@ -11,7 +11,9 @@
 //! state with a `finishedAt` without anybody cancelling it. A
 //! submission into a queue that is already `maxInQueueJobRuns` deep is refused, and so is
 //! one that names no job template and does not itself carry the `executionRoleArn`,
-//! `releaseLabel` and `jobDriver` a run cannot exist without.
+//! `releaseLabel` and `jobDriver` a run cannot exist without, and one whose `jobDriver` —
+//! the request's or the named template's — names neither of the two drivers the model
+//! declares, or both ([`crate::state::job_driver_refusal`]).
 //!
 //! `clientToken` is `@idempotencyToken`, so a token already spent on this cluster does
 //! NOT submit the same work twice: the same submission replayed answers with the run the
@@ -384,6 +386,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &candidate,
                 super::types::START_JOB_RUN_INPUT_SCHEMA,
             ) {
+                return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+                .into());
+            }
+        }
+        // The run has to name the one driver it runs on: the constraint walk above reads
+        // the model's `@length`, `@pattern` and bounds, and both `JobDriver` members are
+        // optional there, so a driver naming neither of the two or both passes it and
+        // still cannot run ([`crate::state::job_driver_refusal`]). Judged on the driver
+        // the run WOULD carry — the request's, or the one the named template resolved to —
+        // so the rule does not depend on where the value came from, and judged before
+        // anything in the store is touched.
+        if let Some(driver) = candidate.job_driver.as_ref() {
+            if let Some(message) = crate::state::job_driver_refusal("jobDriver", driver) {
                 return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
                     message: Some(message),
                 })
