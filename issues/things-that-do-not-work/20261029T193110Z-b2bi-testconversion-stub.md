@@ -1,0 +1,34 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: b2bi.test-conversion-json-to-x12-roundtrip
+Issue-Shape-Id: com.amazonaws.b2bi#B2BI
+Issue-Key: b2bi|TestConversion|NotImplemented
+Issue-Commit: 24dcbcf55b45bb9d0573a38e9c06262a825c087d
+
+# Implement b2bi TestConversion: unimplemented scaffold stub
+
+> _Note: this issue was identified against the code base at commit `24dcbcf55b45bb9d0573a38e9c06262a825c087d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+TestConversion
+
+## Description
+`TestConversion` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-b2bi-b2bi/src/ops/test_conversion.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
+
+That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.
+
+1 recorded unit(s) fail on their `TestConversion` call, so each one unblocks only when `TestConversion` works: `b2bi.test-conversion-json-to-x12-roundtrip`.
+
+## Evidence
+The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at the top of `services/service-com-amazonaws-b2bi-b2bi/src/ops/test_conversion.rs`. Replaying the corpus, the emulator refused the `TestConversion` call: File "context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the TestConversion operation: operation TestConversion is scaffolded but not implemented in this emulator
+
+## Steps to Reproduce
+Boot the b2bi emulator
+Call TestConversion and observe HTTP 501 with no state persisted
+Replay any of the blocked units above and observe it fail on that refusal
