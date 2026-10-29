@@ -22,6 +22,12 @@
 //! removal (the resource's own delete, the delete of the member that owns it, an approved
 //! removal proposal), and both stages a removal is reported in (`DELETING`/
 //! `PENDING_DELETION`, then `DELETED`).
+//!
+//! The sweep a delete makes is also PER RECORD: it releases the token of the create that
+//! minted the resource being removed, and leaves every other create's token replaying what
+//! IT minted — pinned over the accessor class (every `AccessorNetworkType`, both published
+//! `ClientRequestToken` length bounds) and, from the other side, over a create that minted
+//! several ids.
 
 use std::time::SystemTime;
 
@@ -519,6 +525,184 @@ async fn an_accessor_create_token_mints_afresh_once_its_accessor_is_being_remove
             matches!(status.as_str(), "PENDING_DELETION" | "DELETED"),
             "case {case:?}: expected the removed accessor to keep reporting its removal, got \
              {status:?} {:?}",
+            read.body
+        );
+    }
+}
+
+/// Every `AccessorNetworkType` the model declares (smithy_query: shape
+/// AccessorNetworkType = ETHEREUM_GOERLI | ETHEREUM_MAINNET | ETHEREUM_MAINNET_AND_GOERLI
+/// | POLYGON_MAINNET | POLYGON_MUMBAI).
+const ACCESSOR_NETWORK_TYPES: &[&str] = &[
+    "ETHEREUM_GOERLI",
+    "ETHEREUM_MAINNET",
+    "ETHEREUM_MAINNET_AND_GOERLI",
+    "POLYGON_MAINNET",
+    "POLYGON_MUMBAI",
+];
+
+/// One row of the accessor-sweep table: the accessor whose delete releases its create's
+/// token, and the SIBLING accessor standing beside it whose own token must survive that
+/// delete untouched.
+#[derive(Debug)]
+struct AccessorSweepRow {
+    /// The token that minted the accessor this row deletes.
+    deleted_token: String,
+    /// The token that minted the accessor this row leaves alone.
+    sibling_token: String,
+    /// The `NetworkType` the deleted accessor was created with.
+    network_type: &'static str,
+    /// A different `NetworkType`, named by the retry, so a 200 answering from the stored
+    /// record rather than minting afresh is visible in the body as well as in the id.
+    retry_network_type: &'static str,
+}
+
+/// The ledger sweep a delete makes is PER RECORD: `DeleteAccessor` releases the token of
+/// the create that minted THAT accessor, and every other create's token keeps replaying
+/// the accessor it minted.
+///
+/// The companion of the accessor case above, over the class the rule generalises over:
+/// every `AccessorNetworkType` the model declares and `ClientRequestTokenString`'s
+/// published `@length(1, 64)` bounds, so neither the released token nor the surviving one
+/// depends on the shape of the request that minted it.
+#[tokio::test]
+async fn deleting_an_accessor_releases_only_its_own_create_token() {
+    // Token lengths span `ClientRequestTokenString`'s `@length(1, 64)`: the
+    // one-character minimum and the 64-character maximum are rows, on both the released
+    // and the surviving side, and the remaining rows are ordinary tokens in between.
+    let rows: Vec<AccessorSweepRow> = ACCESSOR_NETWORK_TYPES
+        .iter()
+        .enumerate()
+        .map(|(index, network_type)| AccessorSweepRow {
+            deleted_token: match index {
+                0 => "d".to_string(),
+                1 => "d".repeat(64),
+                _ => format!("deleted-accessor-token-{index}"),
+            },
+            sibling_token: match index {
+                0 => "s".repeat(64),
+                1 => "s".to_string(),
+                _ => format!("sibling-accessor-token-{index}"),
+            },
+            network_type,
+            retry_network_type: ACCESSOR_NETWORK_TYPES[(index + 1) % ACCESSOR_NETWORK_TYPES.len()],
+        })
+        .collect();
+
+    for row in &rows {
+        // A store of its own per row, so a row's tokens are first calls whatever the rows
+        // before it did.
+        let router = new_router();
+
+        let sibling =
+            create_accessor(&router, &row.sibling_token, Some(row.retry_network_type), 1).await;
+        assert_eq!(
+            sibling.status, 200,
+            "case {row:?}: expected the sibling CreateAccessor 200, got {} {:?}",
+            sibling.status, sibling.body
+        );
+        let sibling_id = sibling.text(&["AccessorId"]);
+
+        let first = create_accessor(&router, &row.deleted_token, Some(row.network_type), 0).await;
+        assert_eq!(
+            first.status, 200,
+            "case {row:?}: expected CreateAccessor 200, got {} {:?}",
+            first.status, first.body
+        );
+        let first_id = first.text(&["AccessorId"]);
+
+        let answer = delete_accessor(&router, &first_id).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {row:?}: expected DeleteAccessor 200, got {} {:?}",
+            answer.status, answer.body
+        );
+
+        // The deleted accessor stays readable, on its way out, with the billing token its
+        // create minted: the delete released a LEDGER record, not the resource's data.
+        let read = get_accessor(&router, &first_id).await;
+        assert_eq!(
+            (read.status, status_of(&read, "Accessor")),
+            (200, "PENDING_DELETION".to_string()),
+            "case {row:?}: expected the deleted accessor PENDING_DELETION, got {} {:?}",
+            read.status,
+            read.body
+        );
+        assert_eq!(
+            read.text(&["Accessor", "BillingToken"]),
+            first.text(&["BillingToken"]),
+            "case {row:?}: expected the deleted accessor to keep its own billing token, got {:?}",
+            read.body
+        );
+
+        // Its token is a first call again: a fresh accessor, with its own id and billing
+        // token, carrying the NETWORK TYPE THIS request named rather than the stored
+        // record's.
+        let second =
+            create_accessor(&router, &row.deleted_token, Some(row.retry_network_type), 2).await;
+        assert_eq!(
+            second.status, 200,
+            "case {row:?}: expected the released token to mint an accessor, got {} {:?}",
+            second.status, second.body
+        );
+        let second_id = second.text(&["AccessorId"]);
+        assert_ne!(
+            second_id, first_id,
+            "case {row:?}: expected a freshly minted accessor id, got the deleted {first_id:?}"
+        );
+        assert_ne!(
+            second.text(&["BillingToken"]),
+            first.text(&["BillingToken"]),
+            "case {row:?}: expected the fresh accessor to carry its own billing token, got the \
+             deleted accessor's {:?}",
+            second.body
+        );
+        assert_eq!(
+            second.text(&["NetworkType"]),
+            row.retry_network_type,
+            "case {row:?}: expected the fresh accessor to report the NetworkType this request \
+             named, got {:?}",
+            second.body
+        );
+        let read = get_accessor(&router, &second_id).await;
+        assert_eq!(
+            (read.status, status_of(&read, "Accessor")),
+            (200, "AVAILABLE".to_string()),
+            "case {row:?}: expected GetAccessor 200 AVAILABLE for the fresh accessor, got {} {:?}",
+            read.status,
+            read.body
+        );
+
+        // The sibling's record was not swept with it: its token still replays the accessor
+        // IT minted, under a body naming a different network type and tag count, which is
+        // what makes a replay distinguishable from a fresh create.
+        let replayed = create_accessor(&router, &row.sibling_token, Some(row.network_type), 0).await;
+        assert_eq!(
+            (replayed.status, replayed.text(&["AccessorId"])),
+            (200, sibling_id.clone()),
+            "case {row:?}: expected the sibling token to keep replaying {sibling_id}, got {} {:?}",
+            replayed.status,
+            replayed.body
+        );
+        assert_eq!(
+            replayed.text(&["BillingToken"]),
+            sibling.text(&["BillingToken"]),
+            "case {row:?}: expected the sibling replay to answer with its first billing token, \
+             got {:?}",
+            replayed.body
+        );
+        assert_eq!(
+            replayed.text(&["NetworkType"]),
+            row.retry_network_type,
+            "case {row:?}: expected the sibling replay to report the STORED NetworkType, got {:?}",
+            replayed.body
+        );
+        let read = get_accessor(&router, &sibling_id).await;
+        assert_eq!(
+            (read.status, status_of(&read, "Accessor")),
+            (200, "AVAILABLE".to_string()),
+            "case {row:?}: expected the sibling accessor untouched and AVAILABLE, got {} {:?}",
+            read.status,
             read.body
         );
     }
