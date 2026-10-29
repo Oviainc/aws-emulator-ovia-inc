@@ -214,11 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
 
-        // The request's own fingerprint: every member it carried EXCEPT the token that
-        // identifies the attempt. A retry of this create has the same fingerprint; a
-        // different create under the same token does not.
+        // The tag map the request carries is read by nothing but the request, so the two
+        // tag rules are decided before the store is consulted at all: a request that
+        // breaks one is malformed whatever the store holds, and is told so rather than
+        // being answered with whatever the lookups below would have decided.
         let tags = input.tags.unwrap_or_default();
         // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
         // judged against the same bounds before anything is stored.
@@ -234,6 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateChannelGroupErrorModeled::ValidationException(rejection).into());
         }
+
+        let mut store = state.lock();
+
+        // The request's own fingerprint: every member it carried EXCEPT the token that
+        // identifies the attempt. A retry of this create has the same fingerprint; a
+        // different create under the same token does not.
+        //
         // The optional `Description` is rendered so that ABSENT and present-but-empty stay
         // apart (`ResourceDescription` is `@length 0..1024`, so `""` is a value a request
         // may carry, and the two store different groups), which is what makes a repeat

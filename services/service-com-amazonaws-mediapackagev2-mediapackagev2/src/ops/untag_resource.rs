@@ -179,11 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let mut store = state.lock();
-        let at = crate::state::now();
         // AWS owns the `aws:` tag-key namespace: a caller can neither edit nor DELETE a
-        // tag in it, so naming one here is refused rather than silently ignored. `tagKeys`
-        // is the wire name of the member (`@httpQuery("tagKeys")` on
+        // tag in it, so naming one here is refused rather than silently ignored — and,
+        // like the ARN above, that is decided from the request alone, before the store is
+        // consulted, so the refusal is the same whether or not the ARN it addresses
+        // resolves. `tagKeys` is the wire name of the member (`@httpQuery("tagKeys")` on
         // `UntagResourceRequest$TagKeys`).
         if let Some(rejection) = crate::state::reserved_tag_key_rejection(
             "tagKeys",
@@ -191,6 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(UntagResourceErrorModeled::ValidationException(rejection).into());
         }
+
+        let mut store = state.lock();
+        let at = crate::state::now();
         let untagged = store.with_tags_mut(&region, &target, at, |tags| {
             // A key the resource does not carry is not an error: the state this call
             // promises is "these keys are absent".

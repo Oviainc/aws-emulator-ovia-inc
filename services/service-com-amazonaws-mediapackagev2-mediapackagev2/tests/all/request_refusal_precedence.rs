@@ -33,12 +33,23 @@
 //! The second test is the same rule at the other request-level refusal this service makes
 //! that an addressing operation can earn — a multiview list that repeats an entry — on the
 //! create and the update that both write that member.
+//!
+//! The third and fourth tests vary the OTHER half of the rule: resolving the addressed
+//! names is only one of the things the store decides, so they put the same faults against
+//! every refusal a create can earn from what is already stored rather than from its own
+//! face — a name already taken and a client token already spent on a different request
+//! ([`Decided::ALL`]), over all FOUR creates that accept tags ([`Create::ALL`]), and the
+//! resource-count quota of a collection at its ceiling. Each of those answers a different
+//! class (409 `ConflictException` with either discriminator, 402
+//! `ServiceQuotaExceededException`), and none of them may be what a malformed request is
+//! told.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_mediapackagev2_mediapackagev2::state::{
-    MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, RESERVED_TAG_KEY_PREFIX,
+    MAX_CHANNELS_PER_GROUP, MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
+    RESERVED_TAG_KEY_PREFIX,
 };
 
 // The crate's shared test harness: the control-plane client with the error-envelope reader
@@ -86,6 +97,13 @@ fn message(body: &Value) -> &str {
 /// The `ValidationExceptionType` discriminator of an error envelope.
 fn validation_type(body: &Value) -> &str {
     body.get("ValidationExceptionType")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+/// The `ConflictExceptionType` discriminator of an error envelope.
+fn conflict_type(body: &Value) -> &str {
+    body.get("ConflictExceptionType")
         .and_then(Value::as_str)
         .unwrap_or("")
 }
@@ -664,4 +682,242 @@ async fn a_request_level_list_refusal_outranks_resolving_the_addressed_names() {
             "case {where_:?}: expected ResourceNotFoundException, got {body}"
         );
     }
+}
+
+/// An operation that MINTS a resource and takes a tag map with it: the four creates of this
+/// service, which between them earn every refusal the store decides for a create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Create {
+    ChannelGroup,
+    Channel,
+    OriginEndpoint,
+    HarvestJob,
+}
+
+impl Create {
+    const ALL: [Create; 4] = [
+        Create::ChannelGroup,
+        Create::Channel,
+        Create::OriginEndpoint,
+        Create::HarvestJob,
+    ];
+
+    /// The wire name of the create's tag member: `@jsonName("tags")` on
+    /// `CreateChannelGroupRequest$Tags` and `CreateChannelRequest$Tags`, and the member's own
+    /// name on `CreateOriginEndpointRequest$Tags` and `CreateHarvestJobRequest$Tags` (source:
+    /// `smithy_query(query="operation", operation="CreateChannelGroup,CreateChannel,
+    /// CreateOriginEndpoint,CreateHarvestJob")`).
+    fn tags_member(self) -> &'static str {
+        match self {
+            Self::ChannelGroup | Self::Channel => "tags",
+            Self::OriginEndpoint | Self::HarvestJob => "Tags",
+        }
+    }
+
+    /// A short label keeping the resource names of the rows apart.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::ChannelGroup => "grp",
+            Self::Channel => "chn",
+            Self::OriginEndpoint => "oep",
+            Self::HarvestJob => "hjb",
+        }
+    }
+}
+
+/// A refusal only the STORE can decide — one a create earns from the resources already
+/// there rather than from its own face — and so one a malformed request must never be
+/// answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decided {
+    /// The name the create would mint is already taken at that level.
+    NameTaken,
+    /// An earlier create spent the same `ClientToken` on a different request face.
+    TokenMismatch,
+}
+
+impl Decided {
+    const ALL: [Decided; 2] = [Decided::NameTaken, Decided::TokenMismatch];
+
+    /// The `ConflictExceptionType` the service answers this one with (`state::
+    /// resource_already_exists` and `state::idempotent_parameter_mismatch`).
+    fn conflict_type(self) -> &'static str {
+        match self {
+            Self::NameTaken => "RESOURCE_ALREADY_EXISTS",
+            Self::TokenMismatch => "IDEMPOTENT_PARAMETER_MISMATCH",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::NameTaken => "taken",
+            Self::TokenMismatch => "token",
+        }
+    }
+}
+
+/// `create` addressed at the LIVE hierarchy, minting `name`, carrying `tags` when there are
+/// any and `token` on the member's own `x-amzn-client-token` header when there is one.
+async fn mint(
+    emulator: &Emulator,
+    create: Create,
+    name: &str,
+    tags: Option<&BTreeMap<String, String>>,
+    token: Option<&str>,
+) -> (u16, Value) {
+    let (path, mut body) = match create {
+        Create::ChannelGroup => (
+            "/channelGroup".to_string(),
+            json!({"ChannelGroupName": name}),
+        ),
+        Create::Channel => (
+            format!("/channelGroup/{LIVE_GROUP}/channel"),
+            json!({"ChannelName": name}),
+        ),
+        Create::OriginEndpoint => {
+            let mut body = minimal_endpoint("TS");
+            body["OriginEndpointName"] = json!(name);
+            (
+                format!("/channelGroup/{LIVE_GROUP}/channel/{LIVE_CHANNEL}/originEndpoint"),
+                body,
+            )
+        }
+        Create::HarvestJob => {
+            let start = epoch_seconds_from_now(60.0);
+            let mut body = harvest_body(start, start + 600.0, &[PUBLISHED_MANIFEST]);
+            body["HarvestJobName"] = json!(name);
+            (
+                format!(
+                    "/channelGroup/{LIVE_GROUP}/channel/{LIVE_CHANNEL}/originEndpoint\
+                     /{LIVE_ENDPOINT}/harvestJob"
+                ),
+                body,
+            )
+        }
+    };
+    if let Some(tags) = tags {
+        body[create.tags_member()] = json!(tags);
+    }
+    let headers: Vec<(&str, &str)> = token
+        .map(|token| vec![("x-amzn-client-token", token)])
+        .unwrap_or_default();
+    emulator
+        .call_with_headers("POST", &path, Some(body), &headers)
+        .await
+}
+
+/// RULE, against the rest of what the store decides: resolving the addressed names is not
+/// the only answer a create reads out of the store, and a request-level tag refusal outranks
+/// every one of them — at each of the four creates, against a name already taken and against
+/// a client token already spent, with the control on every row showing that the stored
+/// outcome is really there to be pre-empted.
+#[tokio::test]
+async fn a_request_level_tag_refusal_outranks_every_refusal_the_store_decides() {
+    let emulator = live_hierarchy().await;
+
+    for (index, fault) in Fault::ALL.iter().enumerate() {
+        for create in Create::ALL {
+            for decided in Decided::ALL {
+                let label = format!("{fault:?} at {create:?}, {decided:?} already stored");
+                let stem = format!("{}-{index}-{}", create.slug(), decided.slug());
+                let token = format!("tok-{stem}");
+                // The stored state that decides the outcome: for a taken name, the resource
+                // holding it; for a spent token, an accepted create carrying it.
+                let (seeded, carried) = match decided {
+                    Decided::NameTaken => (stem.clone(), None),
+                    Decided::TokenMismatch => (format!("{stem}-seed"), Some(token.as_str())),
+                };
+                let (status, body) = mint(&emulator, create, &seeded, None, carried).await;
+                assert_eq!(
+                    status, 200,
+                    "case {label:?}: seeding {seeded} expected 200, got {status} {body}"
+                );
+
+                // The faulty request, addressed so that the stored outcome is what it would
+                // otherwise earn: the same name for a taken name, and the same token with
+                // another name (so another request face) for a spent token.
+                let faulty = match decided {
+                    Decided::NameTaken => seeded.clone(),
+                    Decided::TokenMismatch => format!("{stem}-faulty"),
+                };
+                let tags = fault.tags();
+                let (status, body) = mint(&emulator, create, &faulty, Some(&tags), carried).await;
+                assert_request_level_refusal(&label, *fault, status, &body);
+
+                // Control: the same request CLEAN is answered with the stored outcome, so
+                // the 400 above pre-empted a refusal that was really waiting there, and the
+                // fault swallowed no conflict.
+                let clean = match decided {
+                    Decided::NameTaken => seeded.clone(),
+                    Decided::TokenMismatch => format!("{stem}-clean"),
+                };
+                let (status, body) = mint(&emulator, create, &clean, None, carried).await;
+                assert_eq!(
+                    status, 409,
+                    "case {label:?}: a clean request against the same stored state must be \
+                     the conflict class, got {status} {body}"
+                );
+                assert_eq!(
+                    error_type(&body),
+                    "ConflictException",
+                    "case {label:?}: expected ConflictException, got {body}"
+                );
+                assert_eq!(
+                    conflict_type(&body),
+                    decided.conflict_type(),
+                    "case {label:?}: expected {}, got {body}",
+                    decided.conflict_type()
+                );
+            }
+        }
+    }
+}
+
+/// RULE, at the deepest answer the store decides for a create: a collection already at its
+/// ceiling refuses the next create with the quota class (402), and a request-level tag
+/// refusal outranks that too — the request is told what is wrong with it rather than told
+/// about an account quota it never reached.
+#[tokio::test]
+async fn a_request_level_tag_refusal_outranks_the_quota_the_store_decides() {
+    let emulator = live_hierarchy().await;
+
+    // `live_hierarchy` already stored one channel, so the group reaches exactly the ceiling
+    // the handler judges against (`state::MAX_CHANNELS_PER_GROUP`).
+    for index in 1..MAX_CHANNELS_PER_GROUP {
+        let name = format!("fill-{index}");
+        let (status, body) = mint(&emulator, Create::Channel, &name, None, None).await;
+        assert_eq!(
+            status, 200,
+            "case \"filling channel {index} of {MAX_CHANNELS_PER_GROUP}\": expected 200, got \
+             {status} {body}"
+        );
+    }
+
+    for (index, fault) in Fault::ALL.iter().enumerate() {
+        let label = format!("{fault:?} at a channel collection already at its ceiling");
+        let tags = fault.tags();
+        let (status, body) = mint(
+            &emulator,
+            Create::Channel,
+            &format!("over-{index}"),
+            Some(&tags),
+            None,
+        )
+        .await;
+        assert_request_level_refusal(&label, *fault, status, &body);
+    }
+
+    // Control: the same create CLEAN is still the quota refusal, so the 400s above
+    // pre-empted an answer that was really waiting there.
+    let (status, body) = mint(&emulator, Create::Channel, "one-too-many", None, None).await;
+    assert_eq!(
+        status, 402,
+        "case \"a clean create past the ceiling\": expected 402, got {status} {body}"
+    );
+    assert_eq!(
+        error_type(&body),
+        "ServiceQuotaExceededException",
+        "case \"a clean create past the ceiling\": expected ServiceQuotaExceededException, \
+         got {body}"
+    );
 }
