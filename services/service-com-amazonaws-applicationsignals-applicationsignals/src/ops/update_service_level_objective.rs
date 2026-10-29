@@ -158,11 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// request whose config is of the other kind is refused with `ValidationException` and
     /// nothing of the record is written.
     ///
-    /// A supplied `Goal` REPLACES the stored goal wholesale: each of its own members the
-    /// request omits takes the default the model documents for it, not the value the stored
-    /// goal happened to carry. The same holds for the SLI configs and the burn-rate list —
-    /// each is one structure the request either replaces or leaves alone, so "only the
-    /// supplied members change" is at the granularity of these top-level members.
+    /// A supplied `Goal` is MERGED into the stored goal: its members are parameters in their
+    /// own right (each documents its own behaviour for being omitted), so only the ones the
+    /// request names change and every other keeps the value the stored goal carries — the
+    /// documented default is what an omitted parameter falls back to only when nothing is
+    /// stored for it. The SLI configs and the burn-rate list have no such per-member
+    /// parameters: each is one structure the request either replaces or leaves alone.
     async fn handle(
         &self,
         input: Self::Input,
@@ -242,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         if let Some(goal) = input.goal.as_ref() {
-            slo.goal = crate::state::goal_with_defaults(Some(goal));
+            slo.goal = crate::state::goal_merged(&slo.goal, goal);
         }
         if let Some(configurations) = input.burn_rate_configurations.as_ref() {
             slo.burn_rate_configurations = Some(configurations.clone());

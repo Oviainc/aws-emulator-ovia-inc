@@ -874,6 +874,29 @@ pub fn goal_with_defaults(requested: Option<&Goal>) -> Goal {
     }
 }
 
+/// The `Goal` an UPDATE stores, given the goal the record already carries and the goal the
+/// request supplied.
+///
+/// `Goal`'s members are parameters in their own right — each documents its own behaviour
+/// for being left out (`smithy_query(query="shape",shape="Goal")`: `Interval` "If you omit
+/// this parameter, a rolling interval of 7 days is used", `WarningThreshold` "If you omit
+/// this parameter, the default of 50.0 is used") — so an update that supplies the structure
+/// changes only the members it NAMES and retains the stored value of each one it omits. The
+/// documented default is what an omitted parameter falls back to when there is nothing
+/// stored to retain, which is the create case, so [`goal_with_defaults`] still fills any
+/// member neither side carries.
+pub fn goal_merged(stored: &Goal, requested: &Goal) -> Goal {
+    let retained = Goal {
+        interval: requested
+            .interval
+            .clone()
+            .or_else(|| stored.interval.clone()),
+        attainment_goal: requested.attainment_goal.or(stored.attainment_goal),
+        warning_threshold: requested.warning_threshold.or(stored.warning_threshold),
+    };
+    goal_with_defaults(Some(&retained))
+}
+
 /// The `MetricType` the indicator of a stored SLO reports, from the config that built it.
 ///
 /// Both indicator shapes document the member identically
