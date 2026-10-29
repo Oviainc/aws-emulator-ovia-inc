@@ -206,6 +206,9 @@ mod input_device_update;
 #[path = "all/input_endpoint_release.rs"]
 mod input_endpoint_release;
 
+#[path = "all/input_idempotency_after_delete.rs"]
+mod input_idempotency_after_delete;
+
 #[path = "all/input_idempotency_token_scope.rs"]
 mod input_idempotency_token_scope;
 

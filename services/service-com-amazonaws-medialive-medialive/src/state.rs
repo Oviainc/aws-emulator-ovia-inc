@@ -2465,8 +2465,19 @@ impl ComAmazonawsMedialiveMedialiveState {
         for id in just_deleted {
             self.channel_tokens.forget(&id);
         }
-        for input in self.inputs.values_mut() {
-            input.settle(now);
+        // Collected and forgotten on the same terms as the channel tokens
+        // above: only an input that settles into `DELETED` on THIS call is
+        // collected, and a token never outlives the input it minted, so a
+        // retried create mints a new input rather than answering with a
+        // deleted one.
+        let mut deleted_inputs: Vec<String> = Vec::new();
+        for (id, input) in &mut self.inputs {
+            if input.settle(now) {
+                deleted_inputs.push(id.clone());
+            }
+        }
+        for id in deleted_inputs {
+            self.input_tokens.forget(&id);
         }
         for signal_map in self.signal_maps.values_mut() {
             signal_map.settle(now);
@@ -3495,18 +3506,24 @@ impl ComAmazonawsMedialiveMedialiveState {
     }
 
     /// The input a stored `RequestId` created for the create described by
-    /// `partner_of`, if that input still exists and is still the input that
-    /// create asks for.
+    /// `partner_of`, if that input is still one a caller may use and is still
+    /// the input that create asks for.
     ///
     /// The scope is part of the key AND re-checked on the record, so a token
     /// spent on a different create resolves to nothing here: the create it
     /// named is not the one this request describes.
+    ///
+    /// LIVENESS is part of the lookup, through the same [`Self::live_input`] a
+    /// mutation of an input resolves its id by: a delete keeps the record
+    /// readable, but a token's idempotency window is over once this service has
+    /// accepted the delete of the input the token minted, so the retried create
+    /// mints a new input rather than answering with one the caller could
+    /// neither use nor change.
     pub fn input_for_token(&self, partner_of: Option<&str>, request_id: &str) -> Option<&str> {
         let id = self
             .input_tokens
             .created(&input_token_key(partner_of, request_id))?;
-        self.inputs
-            .get(id)
+        self.live_input(id)
             .filter(|input| input.partner_of.as_deref() == partner_of)
             .map(|input| input.id.as_str())
     }
@@ -5614,14 +5631,17 @@ impl InputRecord {
         self.is_deleting() || self.is_deleted()
     }
 
-    /// Materialise the deletion the clock has already made due. Owed at the
-    /// stored instant whether or not anybody called, so applying it in a
-    /// reporting operation changes nothing a later caller would have seen.
-    fn settle(&mut self, now: SystemTime) {
+    /// Materialise the deletion the clock has already made due, answering
+    /// whether THIS call is the one that settled it. Owed at the stored instant
+    /// whether or not anybody called, so applying it in a reporting operation
+    /// changes nothing a later caller would have seen.
+    fn settle(&mut self, now: SystemTime) -> bool {
         if self.deletion_due.is_some_and(|due| now >= due) {
             self.deletion_due = None;
             self.deleted = true;
+            return true;
         }
+        false
     }
 
     /// Whether this input is ingested by an upstream system PUSHING to an

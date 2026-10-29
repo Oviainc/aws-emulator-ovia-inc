@@ -163,13 +163,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether or not this create ran.
         state.settle(::std::time::SystemTime::now());
 
+        // The partner is created FOR the input the path named, so that input must
+        // be one this account still holds and may still change: a delete this
+        // service has accepted leaves the record readable, but the id no longer
+        // names an input a caller may give a partner. This operation models no
+        // not-found error (`smithy_query(query="operation",
+        // operation="CreatePartnerInput")` lists only BadRequest, Forbidden,
+        // TooManyRequests and the server-side three), so the refusal is its own
+        // modelled client error. The message tells the two cases apart; the
+        // status and the code do not.
+        //
+        // Checked BEFORE the idempotency replay below: carrying a `RequestId`
+        // does not turn a request this operation refuses into one it serves, so
+        // a retry aimed at an input the account may no longer change is answered
+        // with the same refusal the first attempt would get today.
+        let Some(primary) = state.live_input(&input.input_id).cloned() else {
+            let message = if state.inputs.contains_key(&input.input_id) {
+                crate::state::already_deleted_message(&crate::state::deleted_input_subject(
+                    &input.input_id,
+                ))
+            } else {
+                crate::state::not_found_message("Input", &input.input_id)
+            };
+            return Err(bad_request(&message));
+        };
+
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
         // partner input the first one created, not a second one. The token map is
         // the input store's, shared with `CreateInput`, so a replay counts only
         // when the token was spent creating a partner OF THE INPUT THIS REQUEST
         // NAMES (the scope passed below): a token spent on some other create
         // names an input this call was not asked for, and answering with it
-        // would report a resource the request did not ask to exist.
+        // would report a resource the request did not ask to exist. A partner
+        // whose own delete this service has accepted is no longer such an
+        // answer either, which is why the lookup resolves only a LIVE input.
         if let Some(existing) = input
             .request_id
             .as_deref()
@@ -181,26 +208,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input: Some(created),
             });
         }
-
-        // The partner is created FOR the input the path named, so that input must
-        // be one this account still holds and may still change: a delete this
-        // service has accepted leaves the record readable, but the id no longer
-        // names an input a caller may give a partner. This operation models no
-        // not-found error (`smithy_query(query="operation",
-        // operation="CreatePartnerInput")` lists only BadRequest, Forbidden,
-        // TooManyRequests and the server-side three), so the refusal is its own
-        // modelled client error. The message tells the two cases apart; the
-        // status and the code do not.
-        let Some(primary) = state.live_input(&input.input_id).cloned() else {
-            let message = if state.inputs.contains_key(&input.input_id) {
-                crate::state::already_deleted_message(&crate::state::deleted_input_subject(
-                    &input.input_id,
-                ))
-            } else {
-                crate::state::not_found_message("Input", &input.input_id)
-            };
-            return Err(bad_request(&message));
-        };
 
         // The store is bounded, so a create loop cannot grow the emulator's heap
         // without limit: once it is full the operation's own modelled throttle is
