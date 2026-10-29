@@ -155,16 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An `OrderId` is a bare id — the modelled `@httpLabel` pattern
         // (`^oo-[a-f0-9]{17}$`) admits no ARN form — so it names a stored order
         // directly. One the store holds none for is the not-found error this
-        // operation models, worded as the identifier echo of the value as supplied.
+        // operation models, worded as every refusal about an order this service
+        // holds none of is ([`crate::state::order_not_found`]).
         let order = store
             .order(&region, &input.order_id)
             .map(|record| record.order.clone())
             .ok_or_else(|| {
                 GetOrderErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::ORDER_ID_MEMBER,
-                        &input.order_id,
-                    )),
+                    message: Some(crate::state::order_not_found(&input.order_id)),
                 })
             })?;
 

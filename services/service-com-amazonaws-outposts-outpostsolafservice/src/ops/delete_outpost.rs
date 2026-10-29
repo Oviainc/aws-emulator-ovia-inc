@@ -148,13 +148,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved — one region's endpoint cannot delete another region's Outpost.
         let region = crate::state::request_region(ctx.parts());
         // How this operation states that the `OutpostId` names no Outpost this
-        // endpoint holds: the identifier echo of the value AS SUPPLIED — not of the
-        // bare id an ARN resolved to.
+        // endpoint holds: this path resolves the identifier to the Outpost's ARN
+        // before it looks anything up, and it is that resolved ARN the refusal
+        // names ([`crate::state::outpost_arn_not_found`]) — the ARN the request
+        // supplied, or the one this endpoint mints for a bare id.
         let not_found = || {
             DeleteOutpostErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::OUTPOST_ID_MEMBER,
+                message: Some(crate::state::outpost_arn_not_found(
                     &input.outpost_id,
+                    &region,
                 )),
             })
         };

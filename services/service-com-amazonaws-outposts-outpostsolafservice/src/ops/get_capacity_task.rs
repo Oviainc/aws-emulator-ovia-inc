@@ -191,12 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint's names no Outpost it holds.
         let outpost_not_found = || {
             GetCapacityTaskErrorModeled::NotFoundException(NotFoundException {
-                // The identifier echo, of the value AS SUPPLIED — not of
-                // `outpost_id`, which is the bare id an ARN resolved to.
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                    &input.outpost_identifier,
-                )),
+                // Worded as every capacity refusal about an Outpost this service
+                // holds none of is: the sentence names the Outpost's own bare id,
+                // whichever identifier form the request supplied.
+                message: Some(crate::state::outpost_not_found(&input.outpost_identifier)),
             })
         };
         let outpost_id = crate::state::resolve_outpost_id(&input.outpost_identifier, &region)

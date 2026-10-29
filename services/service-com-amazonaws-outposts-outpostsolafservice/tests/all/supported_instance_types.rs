@@ -669,10 +669,10 @@ async fn a_scope_this_store_does_not_hold_is_refused() {
     // An order id the modelled `OrderId` pattern (`^oo-[a-f0-9]{17}$`) accepts.
     let order_id = "oo-0123456789abcdef0";
 
-    // The identifier echo: the member the identifier arrived in, and the value as
-    // supplied — for the Outpost by both identifier forms, for an asset of it, and for
-    // an order.
-    let echoes: Vec<(&str, String, String)> = vec![
+    // Each refusal carries the wording the KIND of resource it is about: the echo of
+    // the Outpost identifier as supplied on this read route, the asset sentence for an
+    // asset of it, and the order sentence for an order.
+    let bodies: Vec<(&str, String, String)> = vec![
         (
             "an Outpost nothing holds, by bare id",
             route(ABSENT_OUTPOST_ID, ""),
@@ -686,12 +686,12 @@ async fn a_scope_this_store_does_not_hold_is_refused() {
         (
             "an AssetId none of its assets carries",
             route(&outpost_id, "?AssetId=9999999999"),
-            "assetId=9999999999".to_string(),
+            "No such asset id 9999999999 found.".to_string(),
         ),
         (
             "an order this store holds no record of",
             route(&outpost_id, &format!("?OrderId={order_id}")),
-            format!("orderId={order_id}"),
+            format!("No such order for order id {order_id}"),
         ),
         (
             "an order named beside an asset that does exist",
@@ -699,10 +699,10 @@ async fn a_scope_this_store_does_not_hold_is_refused() {
                 &outpost_id,
                 &format!("?OrderId={order_id}&AssetId=3000000001"),
             ),
-            format!("orderId={order_id}"),
+            format!("No such order for order id {order_id}"),
         ),
     ];
-    for (case, path, expected) in &echoes {
+    for (case, path, expected) in &bodies {
         let reply = outposts.call("GET", path, None).await;
         assert_eq!(
             (reply.status, reply.error_code.as_str()),
@@ -715,7 +715,7 @@ async fn a_scope_this_store_does_not_hold_is_refused() {
         assert_eq!(
             text(&reply.body, "Message"),
             *expected,
-            "case {case:?}: expected the identifier echo {expected:?}, got {:?}",
+            "case {case:?}: expected $.Message {expected:?}, got {:?}",
             reply.body
         );
     }

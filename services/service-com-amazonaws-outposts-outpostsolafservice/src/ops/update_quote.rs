@@ -161,14 +161,11 @@ enum Association {
 ///
 /// Stated in one place because both the check that the quote exists and the borrow
 /// that changes it report it, and the two cannot be allowed to word it differently.
-/// `supplied` is the identifier AS SENT, which is what the echo reads back — not the
+/// `supplied` is the identifier AS SENT, which is what the wording names — not the
 /// bare id an ARN resolved to.
 fn quote_not_found(supplied: &str) -> UpdateQuoteError {
     UpdateQuoteErrorModeled::NotFoundException(NotFoundException {
-        message: Some(crate::state::identifier_not_found(
-            crate::state::QUOTE_IDENTIFIER_MEMBER,
-            supplied,
-        )),
+        message: Some(crate::state::quote_not_found(supplied)),
     })
     .into()
 }

@@ -248,8 +248,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(outpost_not_found)?;
         // An order scopes the report to the hardware THAT order is for, so it has to
         // be an order of this Outpost: one this store holds no record of, or one
-        // placed against another Outpost, names no hardware here and is the same
-        // not-found error, echoed on the member it arrived in. An order it does hold
+        // placed against another Outpost, names no hardware here and is the
+        // not-found error, worded as every refusal about an order this service holds
+        // none of is. An order it does hold
         // narrows nothing — what an order would narrow by is the catalog items its
         // line items name, and the published catalog reports which instance FAMILIES
         // a configuration carries capacity of rather than the instance types the
@@ -264,10 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
                         NotFoundException {
-                            message: Some(crate::state::identifier_not_found(
-                                crate::state::ORDER_ID_MEMBER,
-                                order_id,
-                            )),
+                            message: Some(crate::state::order_not_found(order_id)),
                         },
                     )
                     .into(),
@@ -276,8 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The hardware the request scopes the report to: one named asset of this
         // Outpost, or the Outpost itself. An `AssetId` is resolved among the assets
-        // of the Outpost in hand, and one that names none of them is the same
-        // not-found error, echoed on the member it arrived in.
+        // of the Outpost in hand, and one that names none of them is the not-found
+        // error, worded as every refusal about an asset this service holds none of
+        // is.
         let hardware = match input.asset_id.as_deref().filter(|id| !id.is_empty()) {
             Some(asset_id) => {
                 let asset = store
@@ -285,10 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .ok_or_else(|| {
                         GetOutpostSupportedInstanceTypesErrorModeled::NotFoundException(
                             NotFoundException {
-                                message: Some(crate::state::identifier_not_found(
-                                    crate::state::ASSET_ID_MEMBER,
-                                    asset_id,
-                                )),
+                                message: Some(crate::state::asset_not_found(asset_id)),
                             },
                         )
                     })?;

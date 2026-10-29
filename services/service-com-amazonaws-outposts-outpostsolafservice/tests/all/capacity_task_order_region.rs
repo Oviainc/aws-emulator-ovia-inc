@@ -10,7 +10,8 @@
 //! to, because a resource belongs to the region it was created in and to no other —
 //! so an `OrderId` on `StartCapacityTask` names an order of THIS region's inventory,
 //! and one that names an order of another region is as absent as one nothing ever
-//! minted: 404 `NotFoundException` with the identifier echo of the value as supplied,
+//! minted: 404 `NotFoundException` worded as every refusal about an order this service
+//! holds none of is,
 //! and no task stored carrying it. The one-active-capacity-task-per-order rule reads
 //! the same scope, so the 409 `ConflictException` it states is only ever about a task
 //! of the inventory the caller's endpoint serves.
@@ -23,7 +24,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    capacity_task_conflict, identifier_not_found, ORDER_ID_MEMBER, RESOURCE_TYPE_ORDER,
+    capacity_task_conflict, order_not_found, RESOURCE_TYPE_ORDER,
 };
 
 use crate::capacity_task_lifecycle::{capacity_route, pool, task_route, ABSENT_ORDER_ID};
@@ -206,8 +207,8 @@ async fn a_capacity_task_resolves_its_order_id_in_the_request_region() {
                     );
                     assert_eq!(
                         text(&reply.body, "Message"),
-                        identifier_not_found(ORDER_ID_MEMBER, order_id),
-                        "case {case:?}: expected the identifier echo of the value as \
+                        order_not_found(order_id),
+                        "case {case:?}: expected the order not-found wording for the id \
                          supplied, got {}",
                         reply.body
                     );
@@ -376,8 +377,8 @@ async fn the_one_active_task_per_order_rule_is_about_this_regions_order() {
             );
             assert_eq!(
                 text(&reply.body, "Message"),
-                identifier_not_found(ORDER_ID_MEMBER, &holder.order_id),
-                "case {case:?}: expected the identifier echo of the value as supplied, \
+                order_not_found(&holder.order_id),
+                "case {case:?}: expected the order not-found wording for the id supplied, \
                  got {}",
                 reply.body
             );

@@ -7,7 +7,7 @@
 //! is not a condition of the delete (this operation models no conflict), and the order
 //! submitted from a quote is left as it was. An identifier this region holds no quote
 //! for is `NotFoundException` (404), worded by
-//! [`crate::state::identifier_not_found`]; one that is no quote identifier at all is
+//! [`crate::state::quote_not_found`]; one that is no quote identifier at all is
 //! `ValidationException` (400), worded by
 //! [`crate::state::quote_identifier_pattern_report`].
 //!
@@ -154,12 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no quote it holds — so it deletes nothing here.
         let not_found = || {
             DeleteQuoteErrorModeled::NotFoundException(NotFoundException {
-                // The identifier echo, of the value AS SUPPLIED — not of `quote_id`,
-                // which is the bare id an ARN resolved to.
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::QUOTE_IDENTIFIER_MEMBER,
-                    &input.quote_identifier,
-                )),
+                // Worded as every refusal about a quote this service holds none of
+                // is, naming the identifier AS SUPPLIED — not `quote_id`, which is
+                // the bare id an ARN resolved to.
+                message: Some(crate::state::quote_not_found(&input.quote_identifier)),
             })
         };
         let quote_id = crate::state::resolve_quote_id(&input.quote_identifier, &region)

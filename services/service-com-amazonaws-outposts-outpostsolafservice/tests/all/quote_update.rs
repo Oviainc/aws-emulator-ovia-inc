@@ -547,20 +547,21 @@ async fn an_update_of_an_absent_quote_or_outpost_is_refused() {
         reply.body
     );
 
-    // The refusal's message half: the identifier echo of the value AS SUPPLIED, under
-    // the member it arrived in.
-    let echoes: Vec<(&str, String, Value, String)> = vec![
+    // The refusal's message half: the quote not-found wording for the quote being
+    // updated, naming the identifier AS SUPPLIED, and the Outpost echo for the
+    // association the body asks for.
+    let bodies: Vec<(&str, String, Value, String)> = vec![
         (
             "the quote identifier, by bare id",
             format!("/quotes/{ABSENT_QUOTE_ID}"),
             json!({ "Description": "no such quote" }),
-            format!("quoteIdentifier={ABSENT_QUOTE_ID}"),
+            format!("Could not find Quote with identifier {ABSENT_QUOTE_ID}"),
         ),
         (
             "the quote identifier, by ARN",
             format!("/quotes/{}", segment(&absent_quote_arn)),
             json!({ "Description": "no such quote" }),
-            format!("quoteIdentifier={absent_quote_arn}"),
+            format!("Could not find Quote with identifier {absent_quote_arn}"),
         ),
         (
             "the Outpost identifier, by bare id",
@@ -576,7 +577,7 @@ async fn an_update_of_an_absent_quote_or_outpost_is_refused() {
         ),
     ];
 
-    for (case, path, body, expected) in &echoes {
+    for (case, path, body, expected) in &bodies {
         let reply = outposts.call("PATCH", path, Some(body)).await;
         assert_eq!(
             (reply.status, reply.error_code.as_str()),
@@ -594,7 +595,7 @@ async fn an_update_of_an_absent_quote_or_outpost_is_refused() {
             .unwrap_or_default();
         assert_eq!(
             actual, expected,
-            "case {case:?}: expected the identifier echo {expected:?}, got {actual:?}"
+            "case {case:?}: expected $.Message {expected:?}, got {actual:?}"
         );
     }
 }

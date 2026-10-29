@@ -46,8 +46,9 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::AssetInfo;
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    store_full, CapacityTaskRecord, CAPACITY_TASK_COMPLETED, CAPACITY_TASK_IN_PROGRESS,
-    CAPACITY_TASK_REQUESTED, CAPACITY_TASK_STEP, MAX_RESOURCES,
+    asset_not_found, order_not_found, outpost_not_found, store_full, CapacityTaskRecord,
+    CAPACITY_TASK_COMPLETED, CAPACITY_TASK_IN_PROGRESS, CAPACITY_TASK_REQUESTED,
+    CAPACITY_TASK_STEP, MAX_RESOURCES,
 };
 
 use crate::outpost_assets::{asset, compute, record};
@@ -748,14 +749,14 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
     let elsewhere_order_id = an_order(&outposts, &elsewhere).await;
 
     // The refusals. Each row names a reference that resolves to nothing, and the
-    // identifier echo the refusal must carry: the member it arrived in, and the value
-    // exactly as supplied.
+    // wording the refusal must carry: the one AWS words that KIND of resource's
+    // not-found by, with the identifier as its only variable part.
     let refused: Vec<(&str, &str, Value, String)> = vec![
         (
             "an OrderId this store holds no order for",
             &outpost_id,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": ABSENT_ORDER_ID }),
-            format!("orderId={ABSENT_ORDER_ID}"),
+            order_not_found(ABSENT_ORDER_ID),
         ),
         (
             "an OrderId that names nothing, beside an asset that exists",
@@ -765,19 +766,19 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
                 "OrderId": ABSENT_ORDER_ID,
                 "AssetId": INSTALLED[0],
             }),
-            format!("orderId={ABSENT_ORDER_ID}"),
+            order_not_found(ABSENT_ORDER_ID),
         ),
         (
             "an AssetId none of the Outpost's assets carries",
             &outpost_id,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)], "AssetId": ABSENT_ASSET_ID }),
-            format!("assetId={ABSENT_ASSET_ID}"),
+            asset_not_found(ABSENT_ASSET_ID),
         ),
         (
             "an AssetId installed on another Outpost",
             &outpost_id,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)], "AssetId": ELSEWHERE_ASSET_ID }),
-            format!("assetId={ELSEWHERE_ASSET_ID}"),
+            asset_not_found(ELSEWHERE_ASSET_ID),
         ),
         (
             "an AssetId beside an order that does resolve",
@@ -787,13 +788,13 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
                 "OrderId": order_id,
                 "AssetId": ABSENT_ASSET_ID,
             }),
-            format!("assetId={ABSENT_ASSET_ID}"),
+            asset_not_found(ABSENT_ASSET_ID),
         ),
         (
             "an asset of this Outpost named on an Outpost with no hardware recorded",
             &bare,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)], "AssetId": INSTALLED[0] }),
-            format!("assetId={}", INSTALLED[0]),
+            asset_not_found(INSTALLED[0]),
         ),
         (
             "both references dangling: the coarser member is the one named",
@@ -803,7 +804,7 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
                 "OrderId": ABSENT_ORDER_ID,
                 "AssetId": ABSENT_ASSET_ID,
             }),
-            format!("orderId={ABSENT_ORDER_ID}"),
+            order_not_found(ABSENT_ORDER_ID),
         ),
     ];
     for (case, outpost_identifier, request, expected) in &refused {
@@ -819,7 +820,7 @@ async fn a_capacity_task_resolves_the_order_and_the_asset_it_names() {
         assert_eq!(
             text(&reply.body, "Message"),
             *expected,
-            "case {case:?}: expected the identifier echo {expected:?}, got {}",
+            "case {case:?}: expected $.Message {expected:?}, got {}",
             reply.body
         );
     }
@@ -928,7 +929,7 @@ async fn capacity_task_refusals_name_the_identifier_and_the_constraint() {
             body: None,
             status: 404,
             code: "NotFoundException",
-            message: Some(format!("outpostIdentifier={ABSENT_OUTPOST_ID}")),
+            message: Some(outpost_not_found(ABSENT_OUTPOST_ID)),
         },
         Refused {
             case: "GetCapacityTask on an Outpost nothing holds, by ARN",
@@ -937,7 +938,7 @@ async fn capacity_task_refusals_name_the_identifier_and_the_constraint() {
             body: None,
             status: 404,
             code: "NotFoundException",
-            message: Some(format!("outpostIdentifier={absent_outpost_arn}")),
+            message: Some(outpost_not_found(&absent_outpost_arn)),
         },
         Refused {
             case: "GetCapacityTask on a task id nothing holds",
@@ -987,7 +988,7 @@ async fn capacity_task_refusals_name_the_identifier_and_the_constraint() {
             body: Some(request.clone()),
             status: 404,
             code: "NotFoundException",
-            message: Some(format!("outpostIdentifier={ABSENT_OUTPOST_ID}")),
+            message: Some(outpost_not_found(ABSENT_OUTPOST_ID)),
         },
         Refused {
             case: "StartCapacityTask with an instance type outside its pattern",
@@ -1179,8 +1180,8 @@ async fn deleting_an_outpost_takes_its_capacity_tasks_with_it() {
     );
     assert_eq!(
         text(&gone.body, "Message"),
-        format!("outpostIdentifier={doomed}"),
-        "the echo names the Outpost the caller asked under, got {}",
+        outpost_not_found(&doomed),
+        "the refusal names the Outpost the caller asked under, got {}",
         gone.body
     );
     let kept = get_ok(&outposts, &keeper, &kept_task).await;

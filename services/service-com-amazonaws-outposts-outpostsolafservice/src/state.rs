@@ -25,8 +25,9 @@
 //! Outpost's orders hold, and recording the contract a renewal of it is bought
 //! under, as well as the configuration-and-pricing options a quote is answered with
 //! and the checks that must pass before an order can be submitted from it, and
-//! the two rules this service words its refusals by — the `NotFoundException`
-//! identifier echo and the value-omitting `ValidationException` report.
+//! the two rules this service words its refusals by — the per-resource-kind
+//! `NotFoundException` wordings and the value-omitting `ValidationException`
+//! report.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -4953,7 +4954,7 @@ pub fn resolve_id(
     prefix: &str,
     region: &str,
 ) -> Option<ResolvedIdentifier> {
-    if !identifier.starts_with("arn:") {
+    if !identifier.starts_with(ARN_SCHEME) {
         let resource_id = bare_id(identifier, prefix)?;
         return Some(ResolvedIdentifier::Here(resource_id.to_string()));
     }
@@ -5400,8 +5401,14 @@ pub fn apply<T>(stored: &mut Option<T>, update: Option<T>) {
 // Two rules, each applied to every operation in this crate that states that
 // class of failure, so no handler can word one its own way:
 //
-// * `NotFoundException` — the body is the IDENTIFIER ECHO
-//   `<member>=<value as supplied>`. See [`identifier_not_found`].
+// * `NotFoundException` — the body is the wording Amazon Web Services Outposts
+//   answers with on the path that could not resolve the identifier: ONE fixed
+//   text per kind of resource, whose only variable part is the identifier taken
+//   from the request. The texts are [`order_not_found`], [`quote_not_found`],
+//   [`asset_not_found`], [`outpost_not_found`] and [`outpost_arn_not_found`] for
+//   the kinds that are worded as a sentence or by the resolved ARN, and the
+//   identifier ECHO `<member>=<value as supplied>` on the site and Outpost
+//   registry paths that answer it ([`identifier_not_found`]).
 // * `ValidationException` — the body is the standard AWS validation report, and
 //   it never renders the offending value. See [`validation_report`].
 //
@@ -5438,13 +5445,20 @@ fn echoes<const N: usize>(fixed: usize, parts: [&str; N]) -> [String; N] {
     parts.map(|part| clip(part, room))
 }
 
-/// How this service states that an identifier names no resource it holds.
+/// How the site and Outpost REGISTRY paths of this service state that an
+/// identifier names no resource they hold.
 ///
 /// The body is the identifier ECHO: the name of the input member the identifier
 /// arrived in, `=`, and the value as the client sent it — so a caller that sent
 /// the ARN form reads its ARN back, not the bare id the service resolved it to,
 /// and a caller can parse the identifier it sent out of the message. It is not an
 /// English sentence, and it never normalises the value.
+///
+/// This is the wording of ONE group of paths, not of the whole API: the kind of
+/// resource that could not be resolved is what fixes a not-found text, and the
+/// order, quote, asset and capacity paths word theirs differently
+/// ([`order_not_found`], [`quote_not_found`], [`asset_not_found`],
+/// [`outpost_not_found`], [`outpost_arn_not_found`]).
 ///
 /// The one thing it does to the value is FIT it: the echo is cut to the room
 /// `<member>=` leaves inside [`ERROR_MESSAGE_MAX`] ([`echoes`]), so an identifier
@@ -5458,6 +5472,86 @@ pub fn identifier_not_found(member: &str, supplied: &str) -> String {
     let [supplied] = echoes(member.len() + SEPARATOR.len(), [supplied]);
     format!("{member}{SEPARATOR}{supplied}")
 }
+
+/// How a refusal states that no ORDER is held under the id a request named:
+/// `No such order for order id <orderId>`.
+///
+/// The fixed text is AWS's own, and the only variable part is the order id the
+/// request supplied — a bare `oo-…` id in every operation that takes one, since
+/// `OrderId` is modelled `^oo-[a-f0-9]{17}$` with no ARN form. The id is cut to
+/// the room that fixed text leaves inside [`ERROR_MESSAGE_MAX`] ([`echoes`]), as
+/// every wording of a refusal here is.
+pub fn order_not_found(order_id: &str) -> String {
+    const FIXED: &str = "No such order for order id ";
+    let [order_id] = echoes(FIXED.len(), [order_id]);
+    format!("{FIXED}{order_id}")
+}
+
+/// How a refusal states that no QUOTE is held under the identifier a request
+/// named: `Could not find Quote with identifier <quoteIdentifier>`.
+///
+/// The variable part is the identifier AS SUPPLIED — `QuoteIdentifier` accepts
+/// the bare id or the full quote ARN, and a caller that named the quote by ARN
+/// reads that ARN back. See [`order_not_found`] for the bound.
+pub fn quote_not_found(supplied: &str) -> String {
+    const FIXED: &str = "Could not find Quote with identifier ";
+    let [supplied] = echoes(FIXED.len(), [supplied]);
+    format!("{FIXED}{supplied}")
+}
+
+/// How a refusal states that no installed ASSET carries the id a request named:
+/// `No such asset id <assetId> found.`
+///
+/// The trailing period is part of AWS's text. The variable part is the `AssetId`
+/// the request supplied, which is a bare hardware id in every operation that
+/// takes one. See [`order_not_found`] for the bound.
+pub fn asset_not_found(asset_id: &str) -> String {
+    const OPENING: &str = "No such asset id ";
+    const CLOSING: &str = " found.";
+    let [asset_id] = echoes(OPENING.len() + CLOSING.len(), [asset_id]);
+    format!("{OPENING}{asset_id}{CLOSING}")
+}
+
+/// How the CAPACITY paths of this service state that no Outpost is held under
+/// the identifier a request named: `No Outpost with outpostId=<outpostId>`.
+///
+/// AWS names the member `outpostId` here whichever member the identifier arrived
+/// in ([`OUTPOST_ID_MEMBER`]), and the value is the bare `op-…` id — read out of
+/// the ARN when the request named the Outpost by one, since the sentence reports
+/// the Outpost rather than echoing the request. See [`order_not_found`] for the
+/// bound.
+pub fn outpost_not_found(identifier: &str) -> String {
+    const OPENING: &str = "No Outpost with ";
+    const SEPARATOR: &str = "=";
+    let outpost_id = outpost_id_in_arn(identifier).unwrap_or(identifier);
+    let [outpost_id] = echoes(
+        OPENING.len() + OUTPOST_ID_MEMBER.len() + SEPARATOR.len(),
+        [outpost_id],
+    );
+    format!("{OPENING}{OUTPOST_ID_MEMBER}{SEPARATOR}{outpost_id}")
+}
+
+/// How the order and Outpost MANAGEMENT paths of this service state that no
+/// Outpost is held under the identifier a request named: `outpostId=<the Outpost
+/// ARN that identifier resolves to>`.
+///
+/// These paths resolve the identifier to an Outpost ARN before looking anything
+/// up, and it is that resolved ARN the refusal names: an identifier that arrived
+/// AS an ARN already states the partition, Region and account it names a resource
+/// of, while a bare id names one of the endpoint the request reached, so the ARN
+/// of a bare id is the one [`outpost_arn`] mints for `region` — the same builder
+/// the success path reports an Outpost's `OutpostArn` from.
+pub fn outpost_arn_not_found(identifier: &str, region: &str) -> String {
+    let arn = match identifier.starts_with(ARN_SCHEME) {
+        true => identifier.to_string(),
+        false => outpost_arn(region, identifier),
+    };
+    identifier_not_found(OUTPOST_ID_MEMBER, &arn)
+}
+
+/// What every ARN starts with, and so what tells an identifier supplied in the
+/// ARN form from one supplied as the bare resource id.
+const ARN_SCHEME: &str = "arn:";
 
 /// The validation-path name of the `SiteId` input member.
 ///

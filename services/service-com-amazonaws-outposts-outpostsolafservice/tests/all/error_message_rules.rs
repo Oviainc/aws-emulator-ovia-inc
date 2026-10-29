@@ -4,12 +4,17 @@
 //! over the wire through `MultiServiceRouter::dispatch` exactly as a signed
 //! `aws outposts` call arrives.
 //!
-//! Rule A — `NotFoundException` (HTTP 404): the body is the IDENTIFIER ECHO
+//! Rule A — `NotFoundException` (HTTP 404): the message is the wording Amazon Web
+//! Services Outposts answers with for the KIND of resource the request named and
+//! could not be resolved, whose only variable part is the identifier. On the site
+//! and Outpost REGISTRY paths covered here that wording is the IDENTIFIER ECHO
 //! `<member>=<value as supplied>`, where `<member>` is the validation-path name of
 //! the input member the identifier arrived in and the value is what the client
-//! sent, verbatim. Not an English sentence, and never normalised: a request that
-//! named a resource by ARN reads its ARN back, not the bare id the service
-//! resolved it to. The one thing done to a value is FITTING it to the modelled
+//! sent, verbatim: not an English sentence, and never normalised, so a request that
+//! named a resource by ARN reads its ARN back. `DeleteOutpost` resolves the
+//! identifier to the Outpost's ARN before it looks anything up, so its refusal
+//! names that resolved ARN whichever form the request supplied. The one thing done
+//! to a value is FITTING it to the modelled
 //! message bound, which is stated and exercised in [`crate::error_message_bound`];
 //! every identifier here is well inside it, so these rows read it back whole.
 //!
@@ -63,21 +68,18 @@ const FOREIGN_OUTPOST_ARN: &str =
     "arn:aws-cn:outposts:cn-north-1:123456789012:outpost/op-2222222222222222a";
 
 /// One rule-A case: a call that names a resource the store does not hold, and
-/// the input member plus the exact value it named it with.
+/// the exact `$.Message` rule A requires for it.
 struct NotFound {
     case: &'static str,
     method: &'static str,
     path: String,
     body: Option<Value>,
-    member: &'static str,
-    supplied: String,
+    expected: String,
 }
 
-/// The `$.Message` rule A requires for this case.
-impl NotFound {
-    fn expected(&self) -> String {
-        format!("{}={}", self.member, self.supplied)
-    }
+/// The echo of an identifier that arrived in `member`, as supplied.
+fn echo(member: &str, supplied: &str) -> String {
+    format!("{member}={supplied}")
 }
 
 /// A `GET`/`DELETE` case whose identifier travels in the URI.
@@ -93,8 +95,7 @@ fn by_label(
         method,
         path: format!("/{collection}/{}", segment(supplied)),
         body: None,
-        member,
-        supplied: supplied.to_string(),
+        expected: echo(member, supplied),
     }
 }
 
@@ -103,7 +104,7 @@ fn by_label(
 /// emulator would never mint, which is what shows the echo is the value as
 /// supplied rather than anything the service reconstructed.
 #[tokio::test]
-async fn not_found_bodies_echo_the_identifier_the_request_supplied() {
+async fn not_found_bodies_carry_the_wording_of_the_path_that_refused_them() {
     let outposts = Outposts::new();
     let absent_site_arn = format!("{SITE_ARN_PREFIX}{ABSENT_SITE_ID}");
     let absent_outpost_arn = format!("{OUTPOST_ARN_PREFIX}{ABSENT_OUTPOST_ID}");
@@ -165,20 +166,30 @@ async fn not_found_bodies_echo_the_identifier_the_request_supplied() {
             OUTPOST_ID_MEMBER,
             FOREIGN_OUTPOST_ARN,
         ),
-        by_label(
-            "DeleteOutpost by bare id",
-            "DELETE",
-            "outposts",
-            OUTPOST_ID_MEMBER,
-            ABSENT_OUTPOST_ID,
-        ),
-        by_label(
-            "DeleteOutpost by Outpost ARN",
-            "DELETE",
-            "outposts",
-            OUTPOST_ID_MEMBER,
-            &absent_outpost_arn,
-        ),
+        // `DeleteOutpost` resolves the identifier to the Outpost's ARN first, so
+        // its refusal names that ARN: the one the request supplied, or the one this
+        // endpoint mints for a bare id.
+        NotFound {
+            case: "DeleteOutpost by bare id",
+            method: "DELETE",
+            path: format!("/outposts/{ABSENT_OUTPOST_ID}"),
+            body: None,
+            expected: echo(OUTPOST_ID_MEMBER, &absent_outpost_arn),
+        },
+        NotFound {
+            case: "DeleteOutpost by Outpost ARN",
+            method: "DELETE",
+            path: format!("/outposts/{}", segment(&absent_outpost_arn)),
+            body: None,
+            expected: echo(OUTPOST_ID_MEMBER, &absent_outpost_arn),
+        },
+        NotFound {
+            case: "DeleteOutpost by an Outpost ARN from another partition",
+            method: "DELETE",
+            path: format!("/outposts/{}", segment(FOREIGN_OUTPOST_ARN)),
+            body: None,
+            expected: echo(OUTPOST_ID_MEMBER, FOREIGN_OUTPOST_ARN),
+        },
         // The identifier here arrives in the BODY, and names the site the new
         // Outpost would live at — so the echo names `siteId`, the member the
         // absent identifier came in, not the resource being created.
@@ -187,16 +198,14 @@ async fn not_found_bodies_echo_the_identifier_the_request_supplied() {
             method: "POST",
             path: "/outposts".to_string(),
             body: Some(json!({ "Name": "orphan", "SiteId": ABSENT_SITE_ID })),
-            member: SITE_ID_MEMBER,
-            supplied: ABSENT_SITE_ID.to_string(),
+            expected: echo(SITE_ID_MEMBER, ABSENT_SITE_ID),
         },
         NotFound {
             case: "CreateOutpost at a site nothing holds, by site ARN",
             method: "POST",
             path: "/outposts".to_string(),
             body: Some(json!({ "Name": "orphan", "SiteId": absent_site_arn })),
-            member: SITE_ID_MEMBER,
-            supplied: absent_site_arn.clone(),
+            expected: echo(SITE_ID_MEMBER, &absent_site_arn),
         },
         // The three PATCH updates state rule A on the same identifier members, and
         // a PATCH carries a body, so these rows also show the echo is of the LABEL
@@ -206,32 +215,28 @@ async fn not_found_bodies_echo_the_identifier_the_request_supplied() {
             method: "PATCH",
             path: format!("/sites/{ABSENT_SITE_ID}"),
             body: Some(json!({ "Name": "renamed" })),
-            member: SITE_ID_MEMBER,
-            supplied: ABSENT_SITE_ID.to_string(),
+            expected: echo(SITE_ID_MEMBER, ABSENT_SITE_ID),
         },
         NotFound {
             case: "UpdateSite on a site nothing holds, by site ARN",
             method: "PATCH",
             path: format!("/sites/{}", segment(&absent_site_arn)),
             body: Some(json!({ "Description": "re-described" })),
-            member: SITE_ID_MEMBER,
-            supplied: absent_site_arn.clone(),
+            expected: echo(SITE_ID_MEMBER, &absent_site_arn),
         },
         NotFound {
             case: "UpdateSite by a site ARN from another partition",
             method: "PATCH",
             path: format!("/sites/{}", segment(FOREIGN_SITE_ARN)),
             body: Some(json!({ "Notes": "noted" })),
-            member: SITE_ID_MEMBER,
-            supplied: FOREIGN_SITE_ARN.to_string(),
+            expected: echo(SITE_ID_MEMBER, FOREIGN_SITE_ARN),
         },
         NotFound {
             case: "UpdateSiteRackPhysicalProperties on a site nothing holds, by bare id",
             method: "PATCH",
             path: format!("/sites/{ABSENT_SITE_ID}/rackPhysicalProperties"),
             body: Some(json!({ "PowerPhase": "THREE_PHASE" })),
-            member: SITE_ID_MEMBER,
-            supplied: ABSENT_SITE_ID.to_string(),
+            expected: echo(SITE_ID_MEMBER, ABSENT_SITE_ID),
         },
         NotFound {
             case: "UpdateSiteRackPhysicalProperties on a site nothing holds, by site ARN",
@@ -241,32 +246,28 @@ async fn not_found_bodies_echo_the_identifier_the_request_supplied() {
                 segment(&absent_site_arn)
             ),
             body: Some(json!({ "UplinkGbps": "UPLINK_10G" })),
-            member: SITE_ID_MEMBER,
-            supplied: absent_site_arn.clone(),
+            expected: echo(SITE_ID_MEMBER, &absent_site_arn),
         },
         NotFound {
             case: "UpdateOutpost on an Outpost nothing holds, by bare id",
             method: "PATCH",
             path: format!("/outposts/{ABSENT_OUTPOST_ID}"),
             body: Some(json!({ "Description": "re-described" })),
-            member: OUTPOST_ID_MEMBER,
-            supplied: ABSENT_OUTPOST_ID.to_string(),
+            expected: echo(OUTPOST_ID_MEMBER, ABSENT_OUTPOST_ID),
         },
         NotFound {
             case: "UpdateOutpost on an Outpost nothing holds, by Outpost ARN",
             method: "PATCH",
             path: format!("/outposts/{}", segment(&absent_outpost_arn)),
             body: Some(json!({ "Name": "renamed" })),
-            member: OUTPOST_ID_MEMBER,
-            supplied: absent_outpost_arn.clone(),
+            expected: echo(OUTPOST_ID_MEMBER, &absent_outpost_arn),
         },
         NotFound {
             case: "UpdateOutpost by an Outpost ARN from another partition",
             method: "PATCH",
             path: format!("/outposts/{}", segment(FOREIGN_OUTPOST_ARN)),
             body: Some(json!({ "SupportedHardwareType": "SERVER" })),
-            member: OUTPOST_ID_MEMBER,
-            supplied: FOREIGN_OUTPOST_ARN.to_string(),
+            expected: echo(OUTPOST_ID_MEMBER, FOREIGN_OUTPOST_ARN),
         },
     ];
 
@@ -285,21 +286,19 @@ async fn not_found_bodies_echo_the_identifier_the_request_supplied() {
         );
         let actual = message(&reply.body, "Message");
         assert_eq!(
-            actual,
-            expected.expected(),
+            actual, expected.expected,
             "case {:?}: expected $.Message {:?}, got {:?}",
-            expected.case,
-            expected.expected(),
-            actual
+            expected.case, expected.expected, actual
         );
     }
 }
 
 /// Rule A reports what the STORE holds, not a constant: the same identifier is a
-/// 200 while the resource exists and the echo once it is gone, in whichever form
-/// the later call names it.
+/// 200 while the resource exists and the refusal once it is gone — the echo of
+/// the form the later call named it in on the read path, and the Outpost's
+/// resolved ARN on the delete path, whichever form that call supplied.
 #[tokio::test]
-async fn a_deleted_resource_is_echoed_back_in_the_form_the_later_call_named_it() {
+async fn a_deleted_resource_is_refused_by_the_wording_of_the_path_that_asked_for_it() {
     let outposts = Outposts::new();
     let site = outposts
         .create_site(&json!({ "Name": "decommission-site" }))
@@ -334,7 +333,8 @@ async fn a_deleted_resource_is_echoed_back_in_the_form_the_later_call_named_it()
         deleted.status, deleted.body
     );
 
-    // Now gone. Each later call echoes the identifier IT supplied.
+    // Now gone. The delete path names the Outpost's resolved ARN either way, while
+    // the read path echoes the identifier IT supplied.
     let gone: Vec<(&str, &str, String, String)> = vec![
         (
             "DeleteOutpost again, by the same ARN",
@@ -346,7 +346,7 @@ async fn a_deleted_resource_is_echoed_back_in_the_form_the_later_call_named_it()
             "DeleteOutpost again, by bare id",
             "DELETE",
             format!("/outposts/{}", segment(&outpost_id)),
-            format!("{OUTPOST_ID_MEMBER}={outpost_id}"),
+            format!("{OUTPOST_ID_MEMBER}={outpost_arn}"),
         ),
         (
             "GetOutpost after the delete, by ARN",

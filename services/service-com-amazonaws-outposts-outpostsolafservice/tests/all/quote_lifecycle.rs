@@ -551,12 +551,12 @@ async fn an_absent_quote_is_not_found_and_a_malformed_identifier_is_refused() {
     outposts.expect_refusals(&cases).await;
 }
 
-/// Rule 4's message half: a not-found refusal is the identifier ECHO
-/// `<member>=<value as supplied>` — the ARN form reads its ARN back, not the bare id
-/// the service resolved it to, and the member named is the one the identifier
-/// arrived in.
+/// Rule 4's message half: a not-found refusal carries the wording the kind of
+/// resource it is about is refused by — the quote sentence naming the identifier as
+/// supplied, so the ARN form reads its ARN back rather than the bare id the service
+/// resolved it to, and the Outpost echo for the Outpost a quote names.
 #[tokio::test]
-async fn a_not_found_quote_echoes_the_identifier_the_request_supplied() {
+async fn a_not_found_quote_states_the_wording_of_the_resource_it_is_about() {
     let outposts = Outposts::new();
     let absent_outpost_arn =
         format!("arn:aws:outposts:us-east-1:{ACCOUNT_ID}:outpost/{ABSENT_OUTPOST_ID}");
@@ -566,14 +566,16 @@ async fn a_not_found_quote_echoes_the_identifier_the_request_supplied() {
             "GET",
             format!("/quotes/{ABSENT_QUOTE_ID}"),
             None,
-            format!("quoteIdentifier={ABSENT_QUOTE_ID}"),
+            format!("Could not find Quote with identifier {ABSENT_QUOTE_ID}"),
         ),
         (
             "GetQuote by ARN",
             "GET",
             format!("/quotes/{}", segment(&format!("{QUOTE_ARN_PREFIX}{ABSENT_QUOTE_ID}"))),
             None,
-            format!("quoteIdentifier={QUOTE_ARN_PREFIX}{ABSENT_QUOTE_ID}"),
+            format!(
+                "Could not find Quote with identifier {QUOTE_ARN_PREFIX}{ABSENT_QUOTE_ID}"
+            ),
         ),
         (
             "CreateQuote naming an absent Outpost by bare id",
@@ -617,7 +619,7 @@ async fn a_not_found_quote_echoes_the_identifier_the_request_supplied() {
             .unwrap_or_default();
         assert_eq!(
             actual, expected,
-            "case {case:?}: expected the identifier echo {expected:?}, got {actual:?}"
+            "case {case:?}: expected $.Message {expected:?}, got {actual:?}"
         );
     }
 }

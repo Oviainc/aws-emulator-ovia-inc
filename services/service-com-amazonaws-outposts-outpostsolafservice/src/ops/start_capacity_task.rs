@@ -244,10 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // task on.
         let outpost_not_found = || {
             StartCapacityTaskErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                    &input.outpost_identifier,
-                )),
+                // Worded as every capacity refusal about an Outpost this service
+                // holds none of is: the sentence names the Outpost's own bare id,
+                // whichever identifier form the request supplied.
+                message: Some(crate::state::outpost_not_found(&input.outpost_identifier)),
             })
         };
         let outpost_id = crate::state::resolve_outpost_id(&input.outpost_identifier, &region)
@@ -267,16 +267,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller read out of `ListAssets` are the ones it can name here.
         store.settle_outposts();
         // A capacity task runs ON an Outpost, so an Outpost the store does not hold
-        // cannot take one: the not-found error this operation models, worded as the
-        // identifier echo of the value AS SUPPLIED.
+        // cannot take one: the not-found error this operation models.
         if store.outpost(&region, &outpost_id).is_none() {
             return Err(outpost_not_found().into());
         }
         // The two OPTIONAL references a capacity task carries name other resources
         // of this service, so each is resolved against what the store holds before
         // anything is created: a reference that resolves to nothing is the not-found
-        // error this operation models, worded as the identifier echo of the member it
-        // arrived in, and no task is stored carrying it. Each is resolved in the scope
+        // error this operation models, worded as every refusal about that KIND of
+        // resource is, and no task is stored carrying it. Each is resolved in the scope
         // the model gives it, coarsest member first:
         //
         // * an `OrderId` names an Amazon Web Services Outposts ORDER, which is a
@@ -297,10 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.order(&region, order_id).is_none() {
                 return Err(StartCapacityTaskErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(crate::state::identifier_not_found(
-                            crate::state::ORDER_ID_MEMBER,
-                            order_id,
-                        )),
+                        message: Some(crate::state::order_not_found(order_id)),
                     },
                 )
                 .into());
@@ -311,10 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.asset_of_outpost(&outpost_id, asset_id).is_none() {
                 return Err(StartCapacityTaskErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(crate::state::identifier_not_found(
-                            crate::state::ASSET_ID_MEMBER,
-                            asset_id,
-                        )),
+                        message: Some(crate::state::asset_not_found(asset_id)),
                     },
                 )
                 .into());

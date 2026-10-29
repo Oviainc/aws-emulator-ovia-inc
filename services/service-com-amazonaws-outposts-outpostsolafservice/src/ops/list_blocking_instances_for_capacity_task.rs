@@ -175,10 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let outpost_not_found = || {
             ListBlockingInstancesForCapacityTaskErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                        &input.outpost_identifier,
-                    )),
+                    // Worded as every capacity refusal about an Outpost this service
+                    // holds none of is: the sentence names the Outpost's own bare id,
+                    // whichever identifier form the request supplied.
+                    message: Some(crate::state::outpost_not_found(&input.outpost_identifier)),
                 },
             )
         };
@@ -220,8 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The list is nested under an Outpost
         // (`/outposts/{OutpostIdentifier}/capacity/{CapacityTaskId}/blockingInstances`),
         // so the parent is resolved first: an Outpost the store does not hold cannot be
-        // asked about the instances running on it. The refusal is the identifier echo of
-        // the value AS SUPPLIED — not of the bare id an ARN resolved to.
+        // asked about the instances running on it.
         let record = store
             .outpost(&region, &outpost_id)
             .ok_or_else(outpost_not_found)?;

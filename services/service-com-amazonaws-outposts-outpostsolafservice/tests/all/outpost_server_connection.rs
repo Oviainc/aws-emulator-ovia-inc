@@ -651,31 +651,30 @@ async fn refusals_are_classified_and_persist_nothing() {
 
     outposts.expect_refusals(&cases).await;
 
-    // The 404 bodies are this service's identifier echo: the member the identifier
-    // arrived in and the value exactly as supplied.
-    for (case, method, path, member, supplied, payload) in [
+    // The 404 bodies each carry the wording the KIND of resource that could not be
+    // resolved is refused by: the identifier echo for a connection, and the asset
+    // sentence for an `AssetId` no Outpost's hardware carries.
+    for (case, method, path, expected, payload) in [
         (
             "an absent ConnectionId",
             "GET",
             route(&absent),
-            "connectionId",
-            absent.clone(),
+            format!("connectionId={absent}"),
             None,
         ),
         (
             "an asset no Outpost holds",
             "POST",
             START_ROUTE.to_string(),
-            "assetId",
-            ABSENT_ASSET_ID.to_string(),
+            format!("No such asset id {ABSENT_ASSET_ID} found."),
             Some(start_request(ABSENT_ASSET_ID, &key, None, Some(0))),
         ),
     ] {
         let reply = outposts.call(method, &path, payload.as_ref()).await;
         assert_eq!(
             text(&reply.body, "Message"),
-            format!("{member}={supplied}"),
-            "case {case:?}: the 404 body must echo the identifier as supplied, got {}",
+            expected,
+            "case {case:?}: expected $.Message {expected:?}, got {}",
             reply.body
         );
     }

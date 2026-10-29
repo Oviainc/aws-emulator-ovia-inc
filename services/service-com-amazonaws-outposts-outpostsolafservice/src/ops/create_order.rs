@@ -181,9 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let outpost_identifier = input.outpost_identifier;
         let outpost_not_found = || {
             CreateOrderErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                // This path resolves the identifier to the Outpost's ARN before it
+                // looks anything up, and it is that resolved ARN the refusal names
+                // ([`crate::state::outpost_arn_not_found`]).
+                message: Some(crate::state::outpost_arn_not_found(
                     &outpost_identifier,
+                    &region,
                 )),
             })
         };
@@ -210,10 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .here()
                     .ok_or_else(|| {
                         CreateOrderErrorModeled::NotFoundException(NotFoundException {
-                            message: Some(crate::state::identifier_not_found(
-                                crate::state::QUOTE_IDENTIFIER_MEMBER,
-                                identifier,
-                            )),
+                            message: Some(crate::state::quote_not_found(identifier)),
                         })
                     })?
                     .to_string(),
@@ -261,8 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_quotes();
         // An order is placed ON an Outpost, so an identifier the store holds no
         // Outpost for cannot take one: the not-found error this operation models,
-        // worded as the identifier echo of the value AS SUPPLIED — not of the bare id
-        // an ARN resolved to.
+        // naming the Outpost by the ARN the identifier resolves to.
         // The site that Outpost belongs to is read here, while the Outpost is: an
         // order is placed AT that site through the Outpost, and the site is what the
         // limit on changing a site address is stated against (see
@@ -291,10 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let record = store.quote(&region, quote_id).ok_or_else(|| {
                 CreateOrderErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::QUOTE_IDENTIFIER_MEMBER,
-                        supplied,
-                    )),
+                    message: Some(crate::state::quote_not_found(supplied)),
                 })
             })?;
             let status = record.quote.quote_status.clone().unwrap_or_default();

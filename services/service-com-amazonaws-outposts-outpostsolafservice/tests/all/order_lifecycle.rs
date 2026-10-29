@@ -737,8 +737,8 @@ async fn an_outstanding_order_is_read_by_the_operations_that_name_one() {
         );
         assert_eq!(
             text(&reply.body, "Message"),
-            format!("orderId={order}"),
-            "case {case:?}: expected the identifier echo, got {}",
+            format!("No such order for order id {order}"),
+            "case {case:?}: expected the order not-found wording, got {}",
             reply.body
         );
     }
@@ -936,12 +936,12 @@ async fn absent_identifiers_are_not_found_and_bad_orders_are_refused() {
     outposts.expect_refusals(&cases).await;
 }
 
-/// Rule 5's message half: a not-found refusal is the identifier ECHO
-/// `<member>=<value as supplied>` — the ARN form reads its ARN back, not the bare id
-/// the service resolved it to, and the member named is the one the identifier arrived
-/// in.
+/// Rule 5's message half: a not-found refusal carries the wording the kind of
+/// resource it is about is refused by — the order sentence for an order, the quote
+/// sentence for a quote (naming the identifier as supplied, ARN form included), and
+/// the resolved Outpost ARN for the Outpost an order would be placed on.
 #[tokio::test]
-async fn a_not_found_order_echoes_the_identifier_the_request_supplied() {
+async fn a_not_found_order_states_the_wording_of_the_resource_it_is_about() {
     let outposts = Outposts::new();
     let (outpost_id, _) = outposts.site_and_outpost("order-echoes").await;
     let absent_outpost_arn = format!("{OUTPOST_ARN_PREFIX}{ABSENT_OUTPOST_ID}");
@@ -953,7 +953,7 @@ async fn a_not_found_order_echoes_the_identifier_the_request_supplied() {
             "GET",
             format!("/orders/{ABSENT_ORDER_ID}"),
             None,
-            format!("orderId={ABSENT_ORDER_ID}"),
+            format!("No such order for order id {ABSENT_ORDER_ID}"),
         ),
         (
             "CreateOrder naming an absent Outpost by bare id",
@@ -964,7 +964,7 @@ async fn a_not_found_order_echoes_the_identifier_the_request_supplied() {
                 "ALL_UPFRONT",
                 one_item.clone(),
             )),
-            format!("outpostIdentifier={ABSENT_OUTPOST_ID}"),
+            format!("outpostId={absent_outpost_arn}"),
         ),
         (
             "CreateOrder naming an absent Outpost by ARN",
@@ -975,7 +975,7 @@ async fn a_not_found_order_echoes_the_identifier_the_request_supplied() {
                 "ALL_UPFRONT",
                 one_item.clone(),
             )),
-            format!("outpostIdentifier={absent_outpost_arn}"),
+            format!("outpostId={absent_outpost_arn}"),
         ),
         (
             "CreateOrder naming an absent quote by bare id",
@@ -986,7 +986,7 @@ async fn a_not_found_order_echoes_the_identifier_the_request_supplied() {
                 "ALL_UPFRONT",
                 json!({ "QuoteIdentifier": ABSENT_QUOTE_ID }),
             )),
-            format!("quoteIdentifier={ABSENT_QUOTE_ID}"),
+            format!("Could not find Quote with identifier {ABSENT_QUOTE_ID}"),
         ),
         (
             "CreateOrder naming an absent quote by ARN",
@@ -997,7 +997,7 @@ async fn a_not_found_order_echoes_the_identifier_the_request_supplied() {
                 "ALL_UPFRONT",
                 json!({ "QuoteIdentifier": absent_quote_arn.clone() }),
             )),
-            format!("quoteIdentifier={absent_quote_arn}"),
+            format!("Could not find Quote with identifier {absent_quote_arn}"),
         ),
     ];
 
@@ -1019,7 +1019,7 @@ async fn a_not_found_order_echoes_the_identifier_the_request_supplied() {
             .unwrap_or_default();
         assert_eq!(
             actual, expected,
-            "case {case:?}: expected the identifier echo {expected:?}, got {actual:?}"
+            "case {case:?}: expected $.Message {expected:?}, got {actual:?}"
         );
     }
 }

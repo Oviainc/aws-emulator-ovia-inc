@@ -178,14 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_outposts();
         // A connection installs one Outpost SERVER, named by the `AssetId` of that
         // unit of hardware, so an asset no Outpost of this store holds has no
-        // connection to start: the not-found error this call models, worded by the
-        // identifier echo of the value as supplied.
+        // connection to start: the not-found error this call models, worded as every
+        // refusal about an asset this service holds none of is.
         if store.outpost_with_asset(&region, &input.asset_id).is_none() {
             return Err(StartConnectionErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::ASSET_ID_MEMBER,
-                    &input.asset_id,
-                )),
+                message: Some(crate::state::asset_not_found(&input.asset_id)),
             })
             .into());
         }

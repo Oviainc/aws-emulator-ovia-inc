@@ -9,8 +9,9 @@
 //! the name — so an identifier supplied in ARN form names a resource of the endpoint
 //! being called only when all three are that endpoint's own. One that differs in any
 //! of them names no resource the endpoint holds, so every operation naming it answers
-//! the modelled `NotFoundException` (404) with the identifier echoed exactly as
-//! supplied and persists nothing; a filter naming one simply matches nothing. The
+//! the modelled `NotFoundException` (404) — in the wording that route refuses an
+//! unresolvable identifier of that kind with — and persists nothing; a filter naming
+//! one simply matches nothing. The
 //! bare id and the endpoint's OWN ARN keep naming the resource.
 //!
 //! The rows differ along everything the rule generalises over: which ARN segment the
@@ -133,7 +134,7 @@ struct Created {
 
 /// One call that names a resource by identifier: the request, plus the input member
 /// the identifier arrived in and the value it carried, which is what a not-found body
-/// echoes.
+/// echoes on the routes that word their refusal that way.
 struct Call {
     case: String,
     method: &'static str,
@@ -141,6 +142,7 @@ struct Call {
     body: Option<Value>,
     member: &'static str,
     supplied: String,
+    worded: Option<String>,
 }
 
 impl Call {
@@ -159,14 +161,41 @@ impl Call {
             body,
             member,
             supplied: supplied.to_string(),
+            worded: None,
         }
     }
 
-    /// The `$.Message` this service's not-found rule states for the call: the member
-    /// the identifier arrived in, `=`, and the value exactly as supplied.
-    fn echo(&self) -> String {
-        format!("{}={}", self.member, self.supplied)
+    /// The wording this route states instead of the echo, for a kind of resource
+    /// AWS refuses by a sentence of its own or by the identifier it resolved.
+    fn worded(mut self, message: String) -> Self {
+        self.worded = Some(message);
+        self
     }
+
+    /// The `$.Message` this service's not-found rule states for the call: this
+    /// route's own wording, or — on the registry routes that echo — the member the
+    /// identifier arrived in, `=`, and the value exactly as supplied.
+    fn expected(&self) -> String {
+        self.worded
+            .clone()
+            .unwrap_or_else(|| format!("{}={}", self.member, self.supplied))
+    }
+}
+
+/// The bare `op-…` id an Outpost identifier carries, whichever of the two modelled
+/// forms it arrived in: the resource part of an ARN, or the value itself.
+fn bare_outpost_id(identifier: &str) -> &str {
+    identifier.rsplit_once('/').map_or(identifier, |(_, id)| id)
+}
+
+/// The sentence the capacity routes refuse an Outpost they hold none of with.
+fn no_outpost_with(identifier: &str) -> String {
+    format!("No Outpost with outpostId={}", bare_outpost_id(identifier))
+}
+
+/// The sentence the quote routes refuse a quote they hold none of with.
+fn no_quote_with(identifier: &str) -> String {
+    format!("Could not find Quote with identifier {identifier}")
 }
 
 /// Create, through `region`'s endpoint, one of each resource an identifier member of
@@ -387,7 +416,8 @@ fn outpost_calls(outpost: &str, capacity_task_id: &str) -> Vec<Call> {
             None,
             "outpostIdentifier",
             outpost,
-        ),
+        )
+        .worded(no_outpost_with(outpost)),
         Call::new(
             format!("CancelCapacityTask {outpost}"),
             "POST",
@@ -395,7 +425,8 @@ fn outpost_calls(outpost: &str, capacity_task_id: &str) -> Vec<Call> {
             None,
             "outpostIdentifier",
             outpost,
-        ),
+        )
+        .worded(no_outpost_with(outpost)),
         Call::new(
             format!("ListBlockingInstancesForCapacityTask {outpost}"),
             "GET",
@@ -403,7 +434,8 @@ fn outpost_calls(outpost: &str, capacity_task_id: &str) -> Vec<Call> {
             None,
             "outpostIdentifier",
             outpost,
-        ),
+        )
+        .worded(no_outpost_with(outpost)),
         Call::new(
             format!("StartCapacityTask {outpost}"),
             "POST",
@@ -411,7 +443,8 @@ fn outpost_calls(outpost: &str, capacity_task_id: &str) -> Vec<Call> {
             Some(json!({ "InstancePools": [pool("m5.4xlarge", 1)] })),
             "outpostIdentifier",
             outpost,
-        ),
+        )
+        .worded(no_outpost_with(outpost)),
         Call::new(
             format!("StartOutpostDecommission {outpost}"),
             "POST",
@@ -454,7 +487,10 @@ fn outpost_calls(outpost: &str, capacity_task_id: &str) -> Vec<Call> {
             })),
             "outpostIdentifier",
             outpost,
-        ),
+        )
+        // This route resolves the Outpost to its ARN first, and names that ARN —
+        // which, for an identifier that arrived AS an ARN, is the one supplied.
+        .worded(format!("outpostId={outpost}")),
         Call::new(
             format!("CreateRenewal for {outpost}"),
             "POST",
@@ -482,7 +518,8 @@ fn quote_calls(quote: &str) -> Vec<Call> {
             None,
             "quoteIdentifier",
             quote,
-        ),
+        )
+        .worded(no_quote_with(quote)),
         Call::new(
             format!("UpdateQuote {quote}"),
             "PATCH",
@@ -490,7 +527,8 @@ fn quote_calls(quote: &str) -> Vec<Call> {
             Some(json!({ "CountryCode": "DE" })),
             "quoteIdentifier",
             quote,
-        ),
+        )
+        .worded(no_quote_with(quote)),
         Call::new(
             format!("DeleteQuote {quote}"),
             "DELETE",
@@ -498,7 +536,8 @@ fn quote_calls(quote: &str) -> Vec<Call> {
             None,
             "quoteIdentifier",
             quote,
-        ),
+        )
+        .worded(no_quote_with(quote)),
     ]
 }
 
@@ -520,7 +559,8 @@ fn quote_reference_calls(created: &Created, outpost: &str, quote: &str) -> Vec<C
             })),
             "quoteIdentifier",
             quote,
-        ),
+        )
+        .worded(no_quote_with(quote)),
         Call::new(
             format!("UpdateQuote associating {outpost}"),
             "PATCH",
@@ -543,7 +583,7 @@ fn calls_naming(created: &Created, forged_site: &str, forged_outpost: &str, forg
 
 /// The rule itself: at each endpoint, every route that names a site, an Outpost or a
 /// quote by an ARN of another partition, Region or account answers 404
-/// `NotFoundException` with the identifier echoed as supplied — and the endpoint's own
+/// `NotFoundException` in that route's own not-found wording — and the endpoint's own
 /// inventory is left exactly as it was.
 #[tokio::test]
 async fn an_identifier_arn_of_another_endpoint_names_no_resource_here() {
@@ -616,12 +656,12 @@ async fn an_identifier_arn_of_another_endpoint_names_no_resource_here() {
                 let message = text(&reply.body, "Message");
                 assert_eq!(
                     message,
-                    call.echo(),
-                    "case {case:?} at {} ({:?}): the body echoes the identifier as supplied, \
-                     expected {:?}, got {message:?}",
+                    call.expected(),
+                    "case {case:?} at {} ({:?}): the body states this route's not-found \
+                     wording, expected {:?}, got {message:?}",
                     endpoint.region,
                     call.case,
-                    call.echo()
+                    call.expected()
                 );
             }
         }

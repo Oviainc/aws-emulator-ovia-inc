@@ -36,9 +36,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::CAPACITY_TASK_STATUS_VALUES;
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
     capacity_task_conflict, capacity_task_status_conflict, identifier_not_found,
-    CAPACITY_TASK_CANCELLATION_IN_PROGRESS, CAPACITY_TASK_CANCELLED, CAPACITY_TASK_COMPLETED,
-    CAPACITY_TASK_FAILED, CAPACITY_TASK_ID_MEMBER, CAPACITY_TASK_IN_PROGRESS,
-    CAPACITY_TASK_REQUESTED, CAPACITY_TASK_STEP, OUTPOST_IDENTIFIER_MEMBER, RESOURCE_TYPE_OUTPOST,
+    outpost_not_found, CAPACITY_TASK_CANCELLATION_IN_PROGRESS, CAPACITY_TASK_CANCELLED,
+    CAPACITY_TASK_COMPLETED, CAPACITY_TASK_FAILED, CAPACITY_TASK_ID_MEMBER,
+    CAPACITY_TASK_IN_PROGRESS, CAPACITY_TASK_REQUESTED, CAPACITY_TASK_STEP,
+    OUTPOST_IDENTIFIER_MEMBER, RESOURCE_TYPE_OUTPOST,
 };
 
 use crate::capacity_task_lifecycle::{
@@ -548,7 +549,8 @@ async fn an_identifier_this_region_holds_nothing_for_is_not_found() {
         "the other region's task",
     );
 
-    // (case, the Outpost identifier sent, the task id sent, the member the echo names)
+    // (case, the Outpost identifier sent, the task id sent, the member the refusal is
+    // about)
     let rows: Vec<(&str, String, String, &str)> = vec![
         (
             "a CapacityTaskId this emulator never minted",
@@ -592,14 +594,17 @@ async fn an_identifier_this_region_holds_nothing_for_is_not_found() {
             reply.error_code,
             reply.body
         );
-        let supplied = match *member == CAPACITY_TASK_ID_MEMBER {
-            true => capacity_task_id,
-            false => outpost_identifier,
+        // Each refusal carries the wording of the kind of resource it is about: the
+        // capacity-task identifier echo for a task, and the Outpost sentence — which
+        // names the Outpost's own bare id — for the parent Outpost.
+        let expected = match *member == CAPACITY_TASK_ID_MEMBER {
+            true => identifier_not_found(member, capacity_task_id),
+            false => outpost_not_found(outpost_identifier),
         };
         assert_eq!(
             text(&reply.body, "Message"),
-            identifier_not_found(member, supplied),
-            "case {case:?}: expected the identifier echo of the value as supplied, got {}",
+            expected,
+            "case {case:?}: expected $.Message {expected:?}, got {}",
             reply.body
         );
     }

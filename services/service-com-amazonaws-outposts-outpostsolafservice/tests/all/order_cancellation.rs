@@ -29,9 +29,9 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    identifier_not_found, order_status_conflict, DECOMMISSION_STATUS_BLOCKED,
+    order_not_found, order_status_conflict, DECOMMISSION_STATUS_BLOCKED,
     DECOMMISSION_STATUS_REQUESTED, LINE_ITEM_STATUS_BUILDING, LINE_ITEM_STATUS_CANCELLED,
-    LINE_ITEM_STATUS_PREPARING, ORDER_ID_MEMBER, ORDER_PREPARATION, ORDER_STATUS_CANCELLED,
+    LINE_ITEM_STATUS_PREPARING, ORDER_PREPARATION, ORDER_STATUS_CANCELLED,
     ORDER_STATUS_COMPLETED, ORDER_STATUS_IN_PROGRESS, ORDER_STATUS_PREPARING, ORDER_STATUS_SETTLED,
     QUOTE_STATUS_ORDER_SUBMITTED, RESOURCE_TYPE_ORDER,
 };
@@ -649,8 +649,8 @@ async fn an_order_id_this_region_holds_nothing_for_is_not_found() {
         );
         assert_eq!(
             text(&reply.body, "Message"),
-            identifier_not_found(ORDER_ID_MEMBER, order_id),
-            "case {case:?}: expected the identifier echo of the value as supplied, got {}",
+            order_not_found(order_id),
+            "case {case:?}: expected the order not-found wording for the id supplied, got {}",
             reply.body
         );
     }

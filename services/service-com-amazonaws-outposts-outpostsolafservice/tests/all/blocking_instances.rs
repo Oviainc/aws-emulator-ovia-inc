@@ -888,11 +888,13 @@ async fn an_absent_outpost_or_task_is_not_found_and_bad_input_is_refused() {
     outposts.expect_refusals(&cases).await;
 }
 
-/// Rule 4's message half: a not-found refusal is the identifier ECHO
-/// `<member>=<value as supplied>` — of the member the identifier arrived in, and of the
-/// ARN form when that is what the caller sent.
+/// Rule 4's message half: a not-found refusal carries the wording the kind of
+/// resource that could not be resolved is refused by — `No Outpost with
+/// outpostId=<the Outpost's own bare id>` for the parent Outpost of this nested
+/// list, whichever identifier form the caller sent, and the identifier echo
+/// `capacityTaskId=<value as supplied>` for the task itself.
 #[tokio::test]
-async fn a_not_found_refusal_echoes_the_identifier_the_request_supplied() {
+async fn a_not_found_refusal_states_the_wording_of_the_resource_it_is_about() {
     let outposts = Outposts::new();
     let live = an_outpost(&outposts, "echo").await;
     let live_task = a_task(&outposts, &live, &Exclude::default()).await;
@@ -904,12 +906,12 @@ async fn a_not_found_refusal_echoes_the_identifier_the_request_supplied() {
         (
             "an absent Outpost named by bare id",
             route(ABSENT_OUTPOST_ID, &live_task, ""),
-            format!("outpostIdentifier={ABSENT_OUTPOST_ID}"),
+            format!("No Outpost with outpostId={ABSENT_OUTPOST_ID}"),
         ),
         (
             "an absent Outpost named by ARN",
             route(&absent_arn, &live_task, ""),
-            format!("outpostIdentifier={absent_arn}"),
+            format!("No Outpost with outpostId={ABSENT_OUTPOST_ID}"),
         ),
         (
             "an absent capacity task",
@@ -941,7 +943,7 @@ async fn a_not_found_refusal_echoes_the_identifier_the_request_supplied() {
             .unwrap_or_default();
         assert_eq!(
             actual, expected,
-            "case {case:?}: expected the identifier echo {expected:?}, got {actual:?}"
+            "case {case:?}: expected $.Message {expected:?}, got {actual:?}"
         );
     }
 }

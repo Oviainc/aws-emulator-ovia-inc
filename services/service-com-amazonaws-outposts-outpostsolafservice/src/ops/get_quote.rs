@@ -153,12 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no quote it holds.
         let not_found = || {
             GetQuoteErrorModeled::NotFoundException(NotFoundException {
-                // The identifier echo, of the value AS SUPPLIED — not of
-                // `quote_id`, which is the bare id an ARN resolved to.
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::QUOTE_IDENTIFIER_MEMBER,
-                    &input.quote_identifier,
-                )),
+                // Worded as every refusal about a quote this service holds none of
+                // is, naming the identifier AS SUPPLIED — not `quote_id`, which is
+                // the bare id an ARN resolved to.
+                message: Some(crate::state::quote_not_found(&input.quote_identifier)),
             })
         };
         let quote_id = crate::state::resolve_quote_id(&input.quote_identifier, &region)

@@ -11,8 +11,8 @@
 //!
 //! 1. Resolving the resources a request names comes BEFORE the work the request asks
 //!    for, so a reference that resolves to nothing is refused 404 `NotFoundException`
-//!    with the identifier echo of the member it arrived in whatever else the request
-//!    asked for — asking for a dry run does not change which refusal applies.
+//!    with the wording of the kind of resource it could not resolve, whatever else the
+//!    request asked for — asking for a dry run does not change which refusal applies.
 //! 2. A dry run is a normal, successful call: it is answered 200 from a projection of
 //!    the request that nothing is stored for — the plan echoed back, `DryRun` true, no
 //!    `CapacityTaskId`, and a terminal `CapacityTaskStatus` carrying the verdict — and
@@ -38,7 +38,8 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::AssetInfo;
 use service_com_amazonaws_outposts_outpostsolafservice::state::{
-    capacity_above_available, instance_type_not_run, CAPACITY_TASK_COMPLETED, CAPACITY_TASK_FAILED,
+    asset_not_found, capacity_above_available, instance_type_not_run, order_not_found,
+    outpost_not_found, CAPACITY_TASK_COMPLETED, CAPACITY_TASK_FAILED,
     CAPACITY_TASK_FAILURE_UNSUPPORTED_CONFIGURATION, CAPACITY_TASK_STATUS_REASON_MAX,
 };
 
@@ -98,27 +99,27 @@ async fn a_dry_run_is_refused_for_a_reference_that_resolves_to_nothing() {
     let absent_outpost_arn = format!("{OUTPOST_ARN_PREFIX}{ABSENT_OUTPOST_ID}");
 
     // Each row: the Outpost the call is addressed to, the request without its `DryRun`
-    // member, and the exact refusal body. The echoed member names are the
-    // validation-path names of the modelled input members `OutpostIdentifier`,
-    // `OrderId` and `AssetId`.
+    // member, and the exact refusal body — the wording of the KIND of resource the row
+    // could not resolve: the Outpost sentence, the order sentence, or the asset
+    // sentence.
     let cases: Vec<(&str, &str, Value, String)> = vec![
         (
             "an Outpost nothing holds, named by bare id",
             ABSENT_OUTPOST_ID,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)] }),
-            format!("outpostIdentifier={ABSENT_OUTPOST_ID}"),
+            outpost_not_found(ABSENT_OUTPOST_ID),
         ),
         (
             "an Outpost nothing holds, named by full ARN",
             &absent_outpost_arn,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)] }),
-            format!("outpostIdentifier={absent_outpost_arn}"),
+            outpost_not_found(&absent_outpost_arn),
         ),
         (
             "an OrderId this store holds no order for",
             &outpost_id,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": ABSENT_ORDER_ID }),
-            format!("orderId={ABSENT_ORDER_ID}"),
+            order_not_found(ABSENT_ORDER_ID),
         ),
         (
             "an OrderId that names nothing, beside an asset that resolves",
@@ -128,19 +129,19 @@ async fn a_dry_run_is_refused_for_a_reference_that_resolves_to_nothing() {
                 "OrderId": ABSENT_ORDER_ID,
                 "AssetId": INSTALLED[0],
             }),
-            format!("orderId={ABSENT_ORDER_ID}"),
+            order_not_found(ABSENT_ORDER_ID),
         ),
         (
             "an AssetId no Outpost of this store holds",
             &outpost_id,
             json!({ "InstancePools": [], "AssetId": ABSENT_ASSET_ID }),
-            format!("assetId={ABSENT_ASSET_ID}"),
+            asset_not_found(ABSENT_ASSET_ID),
         ),
         (
             "an AssetId installed on another Outpost",
             &outpost_id,
             json!({ "InstancePools": [pool("m5.4xlarge", 1)], "AssetId": ELSEWHERE_ASSET_ID }),
-            format!("assetId={ELSEWHERE_ASSET_ID}"),
+            asset_not_found(ELSEWHERE_ASSET_ID),
         ),
         (
             "an AssetId that names nothing, beside an order that resolves",
@@ -150,7 +151,7 @@ async fn a_dry_run_is_refused_for_a_reference_that_resolves_to_nothing() {
                 "OrderId": order_id,
                 "AssetId": ABSENT_ASSET_ID,
             }),
-            format!("assetId={ABSENT_ASSET_ID}"),
+            asset_not_found(ABSENT_ASSET_ID),
         ),
     ];
 
@@ -174,7 +175,7 @@ async fn a_dry_run_is_refused_for_a_reference_that_resolves_to_nothing() {
             assert_eq!(
                 &text(&reply.body, "Message"),
                 expected,
-                "case {case:?}: expected the identifier echo {expected:?}, got {}",
+                "case {case:?}: expected $.Message {expected:?}, got {}",
                 reply.body
             );
         }

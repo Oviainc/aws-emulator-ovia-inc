@@ -13,7 +13,8 @@
 //!    own status is not a condition of the delete — this operation models no conflict
 //!    to refuse one with.
 //! 2. An identifier this region's inventory holds no quote for is 404
-//!    `NotFoundException`, with the identifier echo of the value AS SUPPLIED; one that
+//!    `NotFoundException`, with the quote not-found wording naming the identifier AS
+//!    SUPPLIED; one that
 //!    is no quote identifier at all is 400 `ValidationException`. A refused delete
 //!    removes nothing.
 //! 3. A quote belongs to the region it was created in, so another region's endpoint
@@ -473,12 +474,12 @@ async fn deleting_an_absent_quote_is_not_found_and_a_malformed_identifier_is_ref
     outposts.expect_refusals(&cases).await;
 }
 
-/// Rule 2's message half, and its "removes nothing" half: a not-found delete is the
-/// identifier ECHO `<member>=<value as supplied>` — the ARN form reads its ARN back,
-/// not the bare id the service resolved it to — and the store it refused is exactly
-/// what it was.
+/// Rule 2's message half, and its "removes nothing" half: a not-found delete states
+/// the quote not-found wording `Could not find Quote with identifier <value as
+/// supplied>` — the ARN form reads its ARN back, not the bare id the service resolved
+/// it to — and the store it refused is exactly what it was.
 #[tokio::test]
-async fn a_refused_delete_echoes_the_identifier_supplied_and_removes_nothing() {
+async fn a_refused_delete_states_the_quote_wording_and_removes_nothing() {
     let outposts = Outposts::new();
     let kept = create_quote(
         &outposts,
@@ -495,12 +496,14 @@ async fn a_refused_delete_echoes_the_identifier_supplied_and_removes_nothing() {
         (
             "an absent quote by bare id",
             ABSENT_QUOTE_ID.to_string(),
-            format!("quoteIdentifier={ABSENT_QUOTE_ID}"),
+            format!("Could not find Quote with identifier {ABSENT_QUOTE_ID}"),
         ),
         (
             "an absent quote by ARN",
             format!("{QUOTE_ARN_PREFIX}{ABSENT_QUOTE_ID}"),
-            format!("quoteIdentifier={QUOTE_ARN_PREFIX}{ABSENT_QUOTE_ID}"),
+            format!(
+                "Could not find Quote with identifier {QUOTE_ARN_PREFIX}{ABSENT_QUOTE_ID}"
+            ),
         ),
     ];
 
@@ -517,7 +520,7 @@ async fn a_refused_delete_echoes_the_identifier_supplied_and_removes_nothing() {
         let actual = message(&reply.body);
         assert_eq!(
             &actual, expected,
-            "case {case:?}: expected the identifier echo {expected:?}, got {actual:?}"
+            "case {case:?}: expected $.Message {expected:?}, got {actual:?}"
         );
     }
 
