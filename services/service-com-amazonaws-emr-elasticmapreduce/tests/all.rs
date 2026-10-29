@@ -39,6 +39,8 @@ mod notebook_executions;
 mod persistent_app_ui;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
+#[path = "all/release_label_application_names.rs"]
+mod release_label_application_names;
 #[path = "all/release_label_catalog.rs"]
 mod release_label_catalog;
 #[path = "all/release_labels.rs"]

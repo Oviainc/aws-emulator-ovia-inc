@@ -407,10 +407,17 @@ async fn the_application_filter_agrees_with_describe_release_label() {
     // One application that every release bundles, one that arrives part way through
     // the catalog, and one Amazon EMR dropped: each must be kept by the filter for
     // exactly the releases `DescribeReleaseLabel` reports it for.
+    // The filter is spelled the way its doc example is (lower case) while
+    // `DescribeReleaseLabel` reports Amazon EMR's own identifier, so the two are matched
+    // up without regard to case — which is exactly the filter's own rule.
     for application in ["hadoop", "trino", "iceberg", "ganglia", "jupyterhub"] {
         let expected: Vec<String> = bundles
             .iter()
-            .filter(|(_, applications)| applications.iter().any(|name| name == application))
+            .filter(|(_, applications)| {
+                applications
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(application))
+            })
             .map(|(label, _)| label.clone())
             .collect();
         let (reported, _) = page(

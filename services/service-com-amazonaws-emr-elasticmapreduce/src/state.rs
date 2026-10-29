@@ -1623,9 +1623,18 @@ pub fn caller_arn(parts: &::http::request::Parts) -> String {
 //
 // Source for the labels, the application versions and which release first (or last)
 // bundles an application: the Amazon EMR Release Guide's release-version and
-// "Application versions" tables. Application names are spelled as
-// `SimplifiedApplication$Name` documents them ("For example, `hadoop`") and as
-// `ReleaseLabelFilter$Application` filters on them ("For example, `spark@2.1.0`").
+// "Application versions" tables, which also give each application's name.
+//
+// An application name is an IDENTIFIER, not prose: the catalog carries the one
+// spelling Amazon EMR publishes for each application — the same spelling
+// `RunJobFlow`'s `Application$Name` accepts and `DescribeCluster` reports back — and
+// reports it verbatim. That spelling is per application rather than a transform of a
+// lower-cased name (`HBase`, `ZooKeeper`, `JupyterHub` and `JupyterEnterpriseGateway`
+// capitalize inside the word), so it can only come from the table below. The
+// lower-case spellings `SimplifiedApplication$Name` and
+// `ReleaseLabelFilter$Application` use in their doc EXAMPLES are a caller's input
+// form, which is why `release_bundles_application` compares names without regard to
+// case; they are not what the catalog reports.
 
 /// One Amazon EMR release line (`emr-<major>.<minor>`) and the patch releases published
 /// on it. The labels the catalog offers are exactly these `(line, patch)` pairs.
@@ -1672,7 +1681,8 @@ pub const RELEASE_LINES: &[ReleaseLine] = &[
 /// One application in the catalog.
 #[derive(Debug, Clone, Copy)]
 pub struct CatalogApplication {
-    /// `SimplifiedApplication$Name`, as the service spells it.
+    /// `SimplifiedApplication$Name`: the one identifier Amazon EMR publishes for this
+    /// application, reported verbatim and never case-folded.
     pub name: &'static str,
     /// The version this application carries from a release line onward: a row applies
     /// to every release at or after its line, up to the next row's line. Rows are in
@@ -1701,7 +1711,7 @@ impl CatalogApplication {
 /// The applications Amazon EMR bundles, with the version each release line carries.
 pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
     CatalogApplication {
-        name: "flink",
+        name: "Flink",
         versions: &[
             ((5, 30), "1.10.0"),
             ((5, 33), "1.12.1"),
@@ -1718,13 +1728,13 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "ganglia",
+        name: "Ganglia",
         versions: &[((5, 30), "3.7.2"), ((6, 0), "3.7.2")],
         // Amazon EMR 7.0.0 no longer bundles Ganglia.
         removed_from: Some((7, 0)),
     },
     CatalogApplication {
-        name: "hadoop",
+        name: "Hadoop",
         versions: &[
             ((5, 30), "2.8.5"),
             ((5, 31), "2.10.0"),
@@ -1737,7 +1747,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "hbase",
+        name: "HBase",
         versions: &[
             ((5, 30), "1.4.13"),
             ((6, 0), "2.2.3"),
@@ -1749,7 +1759,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "hive",
+        name: "Hive",
         versions: &[
             ((5, 30), "2.3.6"),
             ((5, 33), "2.3.7"),
@@ -1760,7 +1770,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "hudi",
+        name: "Hudi",
         versions: &[
             ((5, 30), "0.5.2"),
             ((5, 36), "0.10.0"),
@@ -1774,7 +1784,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "hue",
+        name: "Hue",
         versions: &[
             ((5, 30), "4.6.0"),
             ((5, 36), "4.10.0"),
@@ -1785,7 +1795,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "iceberg",
+        name: "Iceberg",
         // Amazon EMR offers Iceberg from 6.5.0 onward.
         versions: &[
             ((6, 5), "0.11.0"),
@@ -1798,22 +1808,22 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "jupyterenterprisegateway",
+        name: "JupyterEnterpriseGateway",
         versions: &[((6, 0), "2.1.0"), ((6, 9), "2.6.0")],
         removed_from: None,
     },
     CatalogApplication {
-        name: "jupyterhub",
+        name: "JupyterHub",
         versions: &[((5, 30), "1.1.0"), ((5, 36), "1.4.1"), ((6, 0), "1.1.0"), ((6, 6), "1.4.1")],
         removed_from: None,
     },
     CatalogApplication {
-        name: "livy",
+        name: "Livy",
         versions: &[((5, 30), "0.7.0"), ((5, 36), "0.7.1"), ((6, 0), "0.7.0"), ((6, 6), "0.7.1")],
         removed_from: None,
     },
     CatalogApplication {
-        name: "oozie",
+        name: "Oozie",
         versions: &[
             ((5, 30), "5.2.0"),
             ((5, 36), "5.2.1"),
@@ -1824,7 +1834,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "phoenix",
+        name: "Phoenix",
         versions: &[
             ((5, 30), "4.14.3"),
             ((6, 0), "5.0.0"),
@@ -1834,12 +1844,12 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "pig",
+        name: "Pig",
         versions: &[((5, 30), "0.17.0"), ((6, 0), "0.17.0")],
         removed_from: None,
     },
     CatalogApplication {
-        name: "presto",
+        name: "Presto",
         versions: &[
             ((5, 30), "0.232"),
             ((5, 36), "0.267"),
@@ -1852,7 +1862,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "spark",
+        name: "Spark",
         versions: &[
             ((5, 30), "2.4.5"),
             ((5, 33), "2.4.7"),
@@ -1871,12 +1881,12 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "tez",
+        name: "Tez",
         versions: &[((5, 30), "0.9.2"), ((6, 0), "0.9.2"), ((6, 9), "0.10.2")],
         removed_from: None,
     },
     CatalogApplication {
-        name: "trino",
+        name: "Trino",
         // Amazon EMR offers Trino under that name from 6.4.0 onward.
         versions: &[
             ((6, 4), "359"),
@@ -1889,7 +1899,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "zeppelin",
+        name: "Zeppelin",
         versions: &[
             ((5, 30), "0.8.2"),
             ((5, 36), "0.10.0"),
@@ -1900,7 +1910,7 @@ pub const APPLICATION_CATALOG: &[CatalogApplication] = &[
         removed_from: None,
     },
     CatalogApplication {
-        name: "zookeeper",
+        name: "ZooKeeper",
         versions: &[((5, 30), "3.4.14"), ((6, 0), "3.4.14"), ((6, 6), "3.5.10"), ((7, 0), "3.9.1")],
         removed_from: None,
     },
