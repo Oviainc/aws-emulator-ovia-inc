@@ -40,14 +40,14 @@ const GUARD_MESSAGE: &str = "Cannot delete entity with associations.";
 /// Source: `AssociationEntityArn`'s modelled pattern
 /// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:(experiment|experiment-trial-component|artifact|action|context)/`,
 /// `smithy_query(query="shape",shape="AssociationEntityArn")`) intersected with the deletes
-/// this crate implements: `DeleteArtifact`, `DeleteAction`, `DeleteContext` and
-/// `DeleteTrialComponent`. The `experiment` kind is left out because `DeleteExperiment` is
-/// still scaffolded, so there is no delete of one to refuse yet.
+/// this crate implements: `DeleteArtifact`, `DeleteAction`, `DeleteContext`,
+/// `DeleteTrialComponent` and `DeleteExperiment` — every kind the pattern admits.
 const DELETABLE_KINDS: &[&str] = &[
     "artifact",
     "action",
     "context",
     "experiment-trial-component",
+    "experiment",
 ];
 
 /// Every member of the modelled `AssociationEdgeType` enum, in the order the model lists
@@ -172,6 +172,11 @@ async fn create_entity(
             json!({ "TrialComponentName": label }),
             "TrialComponentArn",
         ),
+        "experiment" => (
+            "CreateExperiment",
+            json!({ "ExperimentName": label }),
+            "ExperimentArn",
+        ),
         other => panic!("case {other}: no implemented create for this lineage entity kind"),
     };
     let created = emulator.ok_in(region, target, &body).await;
@@ -194,6 +199,10 @@ fn delete_request(entity: &Entity) -> (&'static str, Value) {
             "DeleteTrialComponent",
             json!({ "TrialComponentName": entity.name }),
         ),
+        "experiment" => (
+            "DeleteExperiment",
+            json!({ "ExperimentName": entity.name }),
+        ),
         other => panic!("case {other}: no implemented delete for this lineage entity kind"),
     }
 }
@@ -208,6 +217,10 @@ fn describe_request(entity: &Entity) -> (&'static str, Value) {
         "experiment-trial-component" => (
             "DescribeTrialComponent",
             json!({ "TrialComponentName": entity.name }),
+        ),
+        "experiment" => (
+            "DescribeExperiment",
+            json!({ "ExperimentName": entity.name }),
         ),
         other => panic!("case {other}: no implemented reader for this lineage entity kind"),
     }

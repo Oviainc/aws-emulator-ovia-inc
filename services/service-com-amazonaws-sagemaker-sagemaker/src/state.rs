@@ -3400,6 +3400,24 @@ pub const PIPELINE_EXECUTION_ENTITY: &str = "Pipeline execution";
 /// The entity label [`does_not_exist`] names an experiment trial by.
 pub const TRIAL_ENTITY: &str = "Trial";
 
+/// The entity label [`does_not_exist`] names an experiment by.
+pub const EXPERIMENT_ENTITY: &str = "Experiment";
+
+/// How every operation that cannot resolve the experiment a request names states it: the
+/// [`does_not_exist`] sentence over the experiment's ARN, resolved from the requested
+/// `ExperimentName` against the Region the request signed for.
+///
+/// The same template as [`trial_does_not_exist`], because an experiment is addressed the
+/// same way its trials are — by NAME only (`ExperimentEntityName`) — so the ARN in the
+/// message is one [`resource_arn`] resolves rather than the name echoed, and a consumer
+/// cuts the same identifier out of the refusal that a successful call would have answered.
+pub fn experiment_does_not_exist(region: &str, experiment_name: &str) -> String {
+    does_not_exist(
+        EXPERIMENT_ENTITY,
+        &resource_arn(region, EXPERIMENT_KIND, experiment_name),
+    )
+}
+
 /// The ARN resource kind an experiment trial carries, i.e. the `<kind>` in
 /// [`resource_arn`]. Fixed by `TrialArn`'s modelled pattern
 /// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:experiment-trial/`), and named once
@@ -6121,6 +6139,25 @@ impl ComAmazonawsSagemakerSagemakerState {
             .collect()
     }
 
+    /// The [`entity_key`]s of the trials that belong to the experiment `experiment_name`
+    /// names, read out of [`Self::trials`].
+    ///
+    /// A trial names the experiment it belongs to ([`Trial::experiment_name`]), so the
+    /// experiment's membership is read off the trial records rather than kept a second
+    /// time beside them. Both names are folded the way the stores fold them, so a caller
+    /// spelling the experiment in another case selects the same trials. What
+    /// `DeleteExperiment` tests the documented "all trials associated with the experiment
+    /// must be deleted first" precondition by, and the first step of
+    /// [`Self::trial_component_keys_in_experiment`].
+    pub fn trial_keys_in_experiment(&self, experiment_name: &str) -> BTreeSet<String> {
+        let experiment = entity_key(experiment_name);
+        self.trials
+            .values()
+            .filter(|trial| entity_key(&trial.experiment_name) == experiment)
+            .map(|trial| entity_key(&trial.name))
+            .collect()
+    }
+
     /// The [`entity_key`]s of the trial components that are part of ANY trial of the
     /// experiment `experiment_name` names.
     ///
@@ -6128,13 +6165,7 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// it belongs to ([`Trial::experiment_name`]) and a component is attached to a trial —
     /// so this is the membership of the experiment's trials taken together.
     pub fn trial_component_keys_in_experiment(&self, experiment_name: &str) -> BTreeSet<String> {
-        let experiment = entity_key(experiment_name);
-        let trials: BTreeSet<String> = self
-            .trials
-            .values()
-            .filter(|trial| entity_key(&trial.experiment_name) == experiment)
-            .map(|trial| entity_key(&trial.name))
-            .collect();
+        let trials = self.trial_keys_in_experiment(experiment_name);
         self.trial_component_trials
             .iter()
             .filter(|(member_of, _)| trials.contains(member_of))
@@ -6187,7 +6218,8 @@ pub fn entity_name_from_name_or_arn<'v>(
 }
 
 // ---------------------------------------------------------------------------
-// The experiment-management slice: `CreateExperiment` and `DescribeExperiment`. Kept
+// The experiment-management slice: `CreateExperiment`, `DescribeExperiment` and the
+// `DeleteExperiment` that releases one. Kept
 // together as one span, the way the slices above are, so this one resource kind reads
 // as one block. The store key is [`entity_key`], shared with the experiment-tracking
 // slice: an `ExperimentEntityName` is unique per account and not case-sensitive.

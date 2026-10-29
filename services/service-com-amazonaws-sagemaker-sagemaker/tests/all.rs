@@ -55,8 +55,12 @@ mod custom_images;
 mod endpoint_config_deletion;
 #[path = "all/endpoint_hosting_quota.rs"]
 mod endpoint_hosting_quota;
+#[path = "all/experiment_deletion.rs"]
+mod experiment_deletion;
 #[path = "all/experiment_lifecycle.rs"]
 mod experiment_lifecycle;
+#[path = "all/experiment_not_found_refusal.rs"]
+mod experiment_not_found_refusal;
 #[path = "all/feature_group_lifecycle.rs"]
 mod feature_group_lifecycle;
 #[path = "all/hub_contents_listing.rs"]

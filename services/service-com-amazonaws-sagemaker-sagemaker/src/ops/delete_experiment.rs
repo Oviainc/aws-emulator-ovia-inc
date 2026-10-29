@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteExperiment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteExperiment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteExperiment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: releases the experiment `CreateExperiment` stored in `crate::state`, so a
+//! later `DescribeExperiment` cannot find it and the name is free again, and answers the
+//! ARN the deleted record carried. An experiment the account does not hold gets the
+//! modelled `ResourceNotFound`, one that still has trials associated with it is refused,
+//! because SageMaker documents deleting those trials first as this operation's
+//! precondition, and one that is still the source of a lineage association is refused the
+//! way every other lineage-entity delete refuses that. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +139,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteExperiment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteExperimentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteExperiment"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ExperimentName` here is an `ExperimentEntityName` — a name, never an ARN — and
+        // the name is not case-sensitive, so the record is addressed through the same
+        // case-folded key `CreateExperiment` stored it under.
+        let region = crate::state::request_region(ctx);
+        let key = crate::state::entity_key(&input.experiment_name);
+
+        let mut store = state.lock();
+        // Nothing stored under the name means there is nothing to release: the modelled
+        // not-found failure, never a 200 recording the deletion of nothing. Worded through
+        // the one template this family of resources records — the entity kind, then the
+        // identifier RESOLVED to its ARN in the Region the request signed for — the same
+        // way the trial readers and the trial delete word the same fact.
+        let Some(arn) = store
+            .experiments
+            .get(&key)
+            .map(|experiment| experiment.arn.clone())
+        else {
+            return Err(DeleteExperimentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::experiment_does_not_exist(
+                    &region,
+                    &input.experiment_name,
+                )),
+            })
+            .into());
+        };
+
+        // "All trials associated with the experiment must be deleted first" (this
+        // operation's model doc, smithy_query query=doc shape=DeleteExperiment), so an
+        // experiment trials still belong to is REFUSED rather than deleted out from under
+        // the trials that name it — otherwise `DescribeTrial` reports a trial whose
+        // experiment no reader can describe. The operation models no error for a
+        // precondition the caller can satisfy itself (with `DeleteTrial`, over the trials
+        // `ListTrials` reports), so this is the 400 `ValidationException`, and its fixed
+        // text is that documented sentence. The ARN and the count are read off the stored
+        // record and the trial store, so the refusal carries nothing fixed here but the
+        // sentence. The membership is read by the SAME folded key the record is addressed
+        // by, so the precondition and the lookup can never disagree about which experiment
+        // is meant.
+        let trials = store.trial_keys_in_experiment(&key).len();
+        if trials > 0 {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Unable to delete experiment {arn} because it has {trials} trial(s) \
+                 associated with it. All trials associated with the experiment must be \
+                 deleted first."
+            )));
+        }
+
+        // A lineage entity that is still the SOURCE of an association is REFUSED rather
+        // than released, exactly as the other lineage-entity deletes refuse one (an
+        // `AssociationEntityArn` names an experiment too): deleting it would leave the
+        // graph recording an edge out of an entity no reader can describe. The caller
+        // clears the condition itself with `DeleteAssociation`, so this too is the 400
+        // `ValidationException` and the store is left untouched.
+        if store.is_association_source(&arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ENTITY_WITH_ASSOCIATIONS,
+            ));
+        }
+
+        // No trial belongs to the experiment any more, so the record itself is all there is
+        // to release: the name is free for another create from here on, and every reader of
+        // the experiment answers its not-found failure.
+        store.experiments.remove(&key);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        // The ARN the deleted experiment carried, so the caller reads back the same ARN
+        // `CreateExperiment` minted rather than one rebuilt from this request — the two
+        // differ whenever the experiment was created in another Region or spelled in
+        // another case.
+        Ok(DeleteExperimentOutput {
+            experiment_arn: Some(arn),
+        })
     }
 }

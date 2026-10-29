@@ -171,10 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .experiment(&input.experiment_name)
             .map(|experiment| experiment.name.clone())
         else {
-            let experiment_arn =
-                crate::state::resource_arn(&region, "experiment", &input.experiment_name);
+            // One wording of one fact: the entity kind, then the identifier RESOLVED to
+            // its ARN in the Region the request signed for, as every operation that
+            // cannot resolve an experiment states it.
             return Err(CreateTrialErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Experiment {experiment_arn} does not exist.")),
+                message: Some(crate::state::experiment_does_not_exist(
+                    &region,
+                    &input.experiment_name,
+                )),
             })
             .into());
         };

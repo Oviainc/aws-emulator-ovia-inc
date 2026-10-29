@@ -145,19 +145,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let store = state.lock();
         let Some(experiment) = store.experiment(&input.experiment_name) else {
-            // `ResourceNotFound` is the modelled failure for a name that names nothing;
-            // the message quotes the name the request supplied.
+            // `ResourceNotFound` is the modelled failure for a name that names nothing, and
+            // this family of resources words that fact one way: the entity kind, then the
+            // identifier RESOLVED to its ARN in the Region the request signed for, so a
+            // consumer cuts the same identifier out of the refusal that a successful call
+            // would have answered.
             return Err(DescribeExperimentErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Experiment \"{}\" does not exist.",
-                    input.experiment_name
+                message: Some(crate::state::experiment_does_not_exist(
+                    &crate::state::request_region(ctx),
+                    &input.experiment_name,
                 )),
             })
             .into());
