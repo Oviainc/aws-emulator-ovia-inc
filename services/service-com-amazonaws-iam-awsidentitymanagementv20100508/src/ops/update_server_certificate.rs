@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServerCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServerCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServerCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Renames and/or re-paths the stored server certificate the request names: the SAME
+//! certificate keeps the id its upload minted, the instant it was uploaded and the PEM
+//! material and tags it holds, carries the name and path the request leaves it under, and
+//! takes the ARN those two spell.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +184,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServerCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServerCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServerCertificate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateServerCertificateErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A mutation: it "updates the name and/or the path of the specified server
+        // certificate stored in IAM", so the lock is held for write across the lookup, the
+        // uniqueness check and the re-keying.
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the certificate is found
+        // under the case-folded name whatever case the request spells it in — the key
+        // `UploadServerCertificate` stored it under.
+        let key = crate::state::name_key(&input.server_certificate_name);
+
+        // The certificate the request addresses, if the account holds one. The LOOKUP comes
+        // first but the answer to it is withheld until the call has been authorized,
+        // because IAM decides a call against the caller's policies before it reads the
+        // resource.
+        let held = store.server_certificates.get(&key).cloned();
+
+        // "Include this only if you are updating the server certificate's name" / "path":
+        // an absent member leaves that half of the certificate's identity as the account
+        // HOLDS it, down to the case the stored name is spelled in — the request's own
+        // spelling of the addressed name identifies the certificate, it does not re-spell
+        // it — so a request naming neither member leaves the certificate exactly as it was.
+        let new_server_certificate_name: String =
+            match (&input.new_server_certificate_name, &held) {
+                (Some(new_name), _) => new_name.clone(),
+                (None, Some(certificate)) => {
+                    certificate.metadata.server_certificate_name.clone()
+                }
+                (None, None) => input.server_certificate_name.clone(),
+            };
+        let new_path: String = match (&input.new_path, &held) {
+            (Some(new_path), _) => new_path.clone(),
+            (None, Some(certificate)) => certificate.metadata.path.clone(),
+            (None, None) => crate::state::DEFAULT_PATH.to_string(),
+        };
+
+        // IAM authorizes its own API, and this call is decided against BOTH names: the
+        // principal "must have permission to change the server certificate with the old
+        // name and the new name", so a caller allowed to change only one of the two is
+        // refused — before the store changes and before the lookup's answer is given away.
+        // Each decision is made on the ARN the certificate carries under that name: the
+        // held certificate's own ARN, and the one the update would leave it under; for a
+        // name the account holds no certificate under, that is the ARN the name would carry
+        // at the default path, since there is no other path to attribute it to. A refusal
+        // names the certificate as the request named it rather than by ARN.
+        let addressed = held.as_ref().map_or_else(
+            || {
+                crate::state::server_certificate_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.server_certificate_name,
+                )
+            },
+            |certificate| certificate.metadata.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_SERVER_CERTIFICATE,
+            &addressed,
+            &format!("server certificate {}", input.server_certificate_name),
+        )?;
+        let requested =
+            crate::state::server_certificate_arn(&new_path, &new_server_certificate_name);
+        if requested != addressed {
+            crate::state::authorization::authorize_named(
+                &store,
+                ctx,
+                crate::state::authorization::UPDATE_SERVER_CERTIFICATE,
+                &requested,
+                &format!("server certificate {new_server_certificate_name}"),
+            )?;
+        }
+
+        // Only a certificate the account holds can be updated: a name it holds none under
+        // "referenced a resource entity that does not exist" (`NoSuchEntityException`),
+        // worded as every operation naming a server certificate by name words that absence.
+        let Some(mut certificate) = held else {
+            return Err(
+                UpdateServerCertificateErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "The Server Certificate with name {} cannot be found.",
+                            input.server_certificate_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The name is unique within the account and not distinguished by case, so the
+        // case-folded name is the identity a rename competes for: a new name ANOTHER
+        // certificate is already held under "attempted to create a resource that already
+        // exists" (`EntityAlreadyExistsException`) and is refused rather than replacing
+        // that certificate, while a new name that folds to this certificate's own key only
+        // re-spells its own name and is applied to it.
+        let new_key = crate::state::name_key(&new_server_certificate_name);
+        let renamed = new_key != key;
+        if renamed && store.server_certificates.contains_key(&new_key) {
+            return Err(
+                UpdateServerCertificateErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!(
+                            "The Server Certificate with name \
+                             {new_server_certificate_name} already exists."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The same certificate under the name and path it now carries: the minted id, the
+        // upload date, the expiration read out of the certificate, its PEM material and its
+        // tags all belong to the certificate over its lifetime and are NOT reminted, while
+        // the ARN is spelled from the path and the name it carries from here on.
+        certificate.metadata.server_certificate_name = new_server_certificate_name;
+        certificate.metadata.path = new_path;
+        certificate.metadata.arn = requested;
+
+        if renamed {
+            // The rename MOVES the one record rather than copying it, so the name the
+            // certificate released names nothing: left behind, the old entry would report
+            // a certificate the account no longer holds under that name — and would
+            // reappear under a later certificate uploaded with the old name.
+            store.server_certificates.remove(&key);
+        }
+        let server_certificate_name = certificate.metadata.server_certificate_name.clone();
+        store.server_certificates.insert(new_key, certificate);
+
+        // Audit record for the change: the acting principal, the operation and the
+        // certificate it left behind, so a state-changing call leaves a local record. The
+        // PEM material the certificate carries is not logged.
+        ::tracing::info!(
+            audit = true,
+            operation = "UpdateServerCertificate",
+            outcome = "updated",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            server_certificate_name = %server_certificate_name,
+            "a server certificate was updated"
+        );
+
+        // The output shape is `Unit`: the operation reports nothing, and the certificate's
+        // new name and path are read back through `GetServerCertificate`.
+        Ok(UpdateServerCertificateOutput)
     }
 }

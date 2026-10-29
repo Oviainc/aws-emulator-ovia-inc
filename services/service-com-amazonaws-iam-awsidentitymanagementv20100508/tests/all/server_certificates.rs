@@ -199,7 +199,10 @@ impl UploadCase {
 /// A server certificate ARN is `arn:aws:iam::<account>:server-certificate<path><name>` —
 /// IAM is global, so the region segment is EMPTY, and the path already begins and ends
 /// with a slash.
-fn expected_arn(path: &str, name: &str) -> String {
+///
+/// `pub(crate)` because every suite that drives a server-certificate call checks the ARN
+/// the service spells against the same grammar.
+pub(crate) fn expected_arn(path: &str, name: &str) -> String {
     format!(
         "arn:aws:iam::{}:server-certificate{path}{name}",
         account_id()

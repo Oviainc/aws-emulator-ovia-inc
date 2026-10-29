@@ -153,6 +153,9 @@ pub const GET_USER: &str = "iam:GetUser";
 /// `iam:UpdateUser`.
 pub const UPDATE_USER: &str = "iam:UpdateUser";
 
+/// `iam:UpdateServerCertificate`.
+pub const UPDATE_SERVER_CERTIFICATE: &str = "iam:UpdateServerCertificate";
+
 /// `iam:GetUserPolicy`.
 pub const GET_USER_POLICY: &str = "iam:GetUserPolicy";
 
