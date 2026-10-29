@@ -188,19 +188,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // token: the retry answers it instead of the 404 an
                     // independent second delete gets, and removes nothing of its
                     // own.
-                    let Some(version) = recorded.answered(crate::state::POLICY_VERSION_MEMBER)
-                    else {
-                        // A recorded delete always keeps the version it removed,
-                        // so there is nothing to serve here and nothing this
-                        // request may remove in its place.
-                        return Err(DeleteClusterPolicyErrorModeled::InternalServerException(
-                            crate::state::recorded_result_unavailable(),
-                        )
-                        .into());
-                    };
-                    return Ok(DeleteClusterPolicyOutput {
-                        policy_version: version.to_string(),
-                    });
+                    //
+                    // The version comes off the record through the one codec
+                    // both policy writers share
+                    // ([`crate::state::RecordedPolicyWrite`]); `None` is a
+                    // record missing the member a served write always keeps, so
+                    // there is nothing to serve here and nothing this request
+                    // may remove in its place.
+                    return crate::state::RecordedPolicyWrite::from_record(&recorded)
+                        .map(|answered| DeleteClusterPolicyOutput {
+                            policy_version: answered.policy_version,
+                        })
+                        .ok_or_else(|| {
+                            DeleteClusterPolicyErrorModeled::InternalServerException(
+                                crate::state::recorded_result_unavailable(),
+                            )
+                            .into()
+                        });
                 }
                 crate::state::TokenVerdict::Mismatch => {
                     return Err(DeleteClusterPolicyErrorModeled::ConflictException(
@@ -263,8 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .record(
                     token,
                     fingerprint,
-                    crate::state::RecordedCall::new(&input.identifier)
-                        .answering(crate::state::POLICY_VERSION_MEMBER, &attached),
+                    crate::state::RecordedPolicyWrite {
+                        policy_version: attached.clone(),
+                    }
+                    .into_record(&input.identifier),
                 );
         }
         Ok(DeleteClusterPolicyOutput {

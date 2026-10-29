@@ -27,8 +27,11 @@
 //! ([`RecordedDelete`]) lives here for the same reason: both deletes record and
 //! read back the same members, so the encoding and the refusal of an incomplete
 //! record are one implementation, parameterised by the output each handler
-//! builds. The answer a served `CreateCluster` keeps
-//! ([`RecordedClusterCreation`]) lives here on the same terms, as does the
+//! builds. The answer a served policy write keeps
+//! ([`RecordedPolicyWrite`]) lives here on the same terms — both policy writers
+//! record and read back the same version member — and so does the answer a
+//! served `CreateCluster` keeps
+//! ([`RecordedClusterCreation`]), as does the
 //! refusal every replay path gives for a record that does not hold a member the
 //! original call answered ([`recorded_result_unavailable`]), so no two of them
 //! can decide that case differently.
@@ -2461,6 +2464,43 @@ impl RecordedDelete {
             arn: recorded.answered(ARN_MEMBER)?.to_string(),
             status: recorded.answered(STATUS_MEMBER)?.to_string(),
             creation_time: decode_instant(recorded.answered(CREATION_TIME_MEMBER)?)?,
+        })
+    }
+}
+
+/// What a served policy write — an attach or a removal — answered, as its
+/// `clientToken` ledger keeps it.
+///
+/// A policy write's answer cannot be re-derived when its retry arrives: a later
+/// write supersedes the version the call issued and a removal drops it
+/// altogether, and neither the version attached by then nor the absence of one
+/// is what that request answered. So the one member both policy writers answer
+/// ([`POLICY_VERSION_MEMBER`]) is kept on the record, and this is the one codec
+/// that writes and reads it: [`Self::into_record`] on the call that serves the
+/// write, [`Self::from_record`] on its retry. Each handler keeps only the shape
+/// of its own output and lifts the missing-member refusal into its own error
+/// channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedPolicyWrite {
+    /// The policy version the call answered — the one it issued, for an attach,
+    /// or the one it removed, for a removal.
+    pub policy_version: String,
+}
+
+impl RecordedPolicyWrite {
+    /// This answer as the ledger stores it, against the cluster `resource` whose
+    /// policy the call wrote.
+    pub fn into_record(self, resource: &str) -> RecordedCall {
+        RecordedCall::new(resource).answering(POLICY_VERSION_MEMBER, &self.policy_version)
+    }
+
+    /// The answer `recorded` holds, or `None` when it does not hold the member a
+    /// served policy write records — a record a handler has to refuse over
+    /// rather than answer an empty version from, since a served policy write
+    /// always records the version it answered.
+    pub fn from_record(recorded: &RecordedCall) -> Option<Self> {
+        Some(Self {
+            policy_version: recorded.answered(POLICY_VERSION_MEMBER)?.to_string(),
         })
     }
 }

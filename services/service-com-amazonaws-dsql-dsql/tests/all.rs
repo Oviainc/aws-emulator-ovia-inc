@@ -73,6 +73,8 @@ mod retired_cluster_token_cleanup;
 mod shared_page_walk;
 #[path = "all/shared_recorded_delete.rs"]
 mod shared_recorded_delete;
+#[path = "all/shared_recorded_policy_write.rs"]
+mod shared_recorded_policy_write;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_deletion.rs"]

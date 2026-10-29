@@ -208,19 +208,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // this request produced. Returning here is also what keeps
                     // the retry free of effect: it never reaches the attach
                     // below.
-                    let Some(version) = recorded.answered(crate::state::POLICY_VERSION_MEMBER)
-                    else {
-                        // A recorded write always keeps the version it issued,
-                        // so there is nothing to serve here and nothing this
-                        // request may attach in its place.
-                        return Err(PutClusterPolicyErrorModeled::InternalServerException(
-                            crate::state::recorded_result_unavailable(),
-                        )
-                        .into());
-                    };
-                    return Ok(PutClusterPolicyOutput {
-                        policy_version: version.to_string(),
-                    });
+                    //
+                    // The version comes off the record through the one codec
+                    // both policy writers share
+                    // ([`crate::state::RecordedPolicyWrite`]); `None` is a
+                    // record missing the member a served write always keeps, so
+                    // there is nothing to serve here and nothing this request
+                    // may attach in its place.
+                    return crate::state::RecordedPolicyWrite::from_record(&recorded)
+                        .map(|answered| PutClusterPolicyOutput {
+                            policy_version: answered.policy_version,
+                        })
+                        .ok_or_else(|| {
+                            PutClusterPolicyErrorModeled::InternalServerException(
+                                crate::state::recorded_result_unavailable(),
+                            )
+                            .into()
+                        });
                 }
                 crate::state::TokenVerdict::Mismatch => {
                     return Err(PutClusterPolicyErrorModeled::ConflictException(
@@ -292,8 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.tokens(crate::state::TokenScope::PutClusterPolicy).record(
                 token,
                 fingerprint,
-                crate::state::RecordedCall::new(&input.identifier)
-                    .answering(crate::state::POLICY_VERSION_MEMBER, &version),
+                crate::state::RecordedPolicyWrite {
+                    policy_version: version.clone(),
+                }
+                .into_record(&input.identifier),
             );
         }
         Ok(PutClusterPolicyOutput {
