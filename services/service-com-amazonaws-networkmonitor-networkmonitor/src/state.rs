@@ -1018,6 +1018,47 @@ impl Probe {
     }
 }
 
+/// Project a STORED [`Probe`] record onto one of the structurally identical
+/// per-operation probe response shapes — `GetProbeOutput`, `CreateProbeOutput`,
+/// `UpdateProbeOutput` and the modelled `Probe` a monitor lists — named at the
+/// call site as `$out`.
+///
+/// ONE projection rather than a hand-written copy of the same member moves per
+/// operation: every member is read out of the record, so what `CreateProbe`
+/// answers is what `GetProbe` reads back and what `GetMonitor` lists, and a
+/// change to how a probe is reported lands in every read path at once. The four
+/// shapes model the same 13 members (`smithy_query(query="shape",
+/// shape="GetProbeOutput,CreateProbeOutput,UpdateProbeOutput,Probe")`), so the
+/// only thing that differs between the call sites is the type's name.
+macro_rules! probe_report {
+    ($out:ident, $probe:expr) => {{
+        let probe: &$crate::state::Probe = $probe;
+        $out {
+            probe_id: Some(probe.probe_id.clone()),
+            probe_arn: Some(probe.probe_arn.clone()),
+            source_arn: probe.source_arn.clone(),
+            destination: probe.destination.clone(),
+            destination_port: probe.destination_port,
+            protocol: probe.protocol.clone(),
+            packet_size: probe.packet_size,
+            address_family: Some(probe.address_family.clone()),
+            vpc_id: probe.vpc_id.clone(),
+            state: Some(probe.state.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(probe.created_at)),
+            modified_at: Some(::aws_smithy_types::DateTime::from(probe.modified_at)),
+            tags: Some(
+                probe
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        }
+    }};
+}
+
+pub(crate) use probe_report;
+
 /// A monitor: the container `CreateMonitor` inserts, holding its own probes.
 #[derive(Debug, Clone)]
 pub struct Monitor {

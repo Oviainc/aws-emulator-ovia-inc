@@ -120,29 +120,11 @@ impl From<GetMonitorErrorModeled> for GetMonitorError {
     }
 }
 
-/// The modelled `Probe` a stored probe record reports as.
-pub(crate) fn probe_of(probe: &crate::state::Probe) -> Probe {
-    Probe {
-        probe_id: Some(probe.probe_id.clone()),
-        probe_arn: Some(probe.probe_arn.clone()),
-        source_arn: probe.source_arn.clone(),
-        destination: probe.destination.clone(),
-        destination_port: probe.destination_port,
-        protocol: probe.protocol.clone(),
-        packet_size: probe.packet_size,
-        address_family: Some(probe.address_family.clone()),
-        vpc_id: probe.vpc_id.clone(),
-        state: Some(probe.state.clone()),
-        created_at: Some(::aws_smithy_types::DateTime::from(probe.created_at)),
-        modified_at: Some(::aws_smithy_types::DateTime::from(probe.modified_at)),
-        tags: Some(
-            probe
-                .tags
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        ),
-    }
+/// The modelled `Probe` a stored probe record reports as, read out of the
+/// record through the one projection every probe read path shares
+/// ([`crate::state::probe_report`]).
+fn probe_of(probe: &crate::state::Probe) -> Probe {
+    crate::state::probe_report!(Probe, probe)
 }
 
 /// The `GetMonitor` operation.

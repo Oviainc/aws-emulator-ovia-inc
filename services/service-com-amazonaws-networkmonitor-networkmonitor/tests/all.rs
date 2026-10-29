@@ -31,6 +31,8 @@ mod monitor_lifecycle_and_front_door;
 mod monitor_modified_at_follows_probe_writes;
 #[path = "all/monitor_state_follows_probe_activation.rs"]
 mod monitor_state_follows_probe_activation;
+#[path = "all/probe_report_projection.rs"]
+mod probe_report_projection;
 #[path = "all/probe_rules_precede_count_ceilings.rs"]
 mod probe_rules_precede_count_ceilings;
 #[path = "all/probe_subnet_identity.rs"]
