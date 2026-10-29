@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::ops::types::TYPE_VALUES;
 use service_com_amazonaws_schemas_schemas::state::{
-    aws_managed_schemas, AWS_MANAGED_REGISTRY, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF,
+    aws_managed_schemas, AWS_MANAGED_REGISTRY, EVENT_ENVELOPE_COMPONENT, JSON_SCHEMA_DRAFT4_URI,
+    OPENAPI_COMPONENT_REF,
 };
 
 use crate::registry_schema_lifecycle::{create_registry, export_uri, schema_uri, Emulator};
@@ -146,9 +147,9 @@ fn member_names(value: &Value, case: &str, what: &str) -> BTreeSet<String> {
 /// RULE: `ExportSchema` renders the stored document of ANY schema the caller can
 /// read — the registry's owner is never consulted — so an `OpenApi3` version converts
 /// to one JSON Schema draft-4 document computed from it: draft-04 named at the root,
-/// the source's title carried over, every component a definition, every component
-/// `$ref` pointing into those definitions and every `nullable` member a draft-04 type
-/// union.
+/// the source's title carried over, the component the document roots at promoted to the
+/// root, every other component a definition, every component `$ref` pointing into those
+/// definitions and every `nullable` member a draft-04 type union.
 #[tokio::test]
 async fn an_openapi_3_schema_converts_wherever_it_is_stored() {
     assert!(
@@ -285,8 +286,43 @@ async fn an_openapi_3_schema_converts_wherever_it_is_stored() {
             "case {case:?}: expected the root to name draft-04, got {:?}",
             converted["$schema"]
         );
-        let components = member_names(&source["components"]["schemas"], case, "components.schemas");
-        let definitions = member_names(&converted["definitions"], case, "definitions");
+        // A document that roots at the event envelope has that component's keywords at
+        // the export's root and the components left over as definitions; one that names
+        // no root among its co-equal components has all of them as definitions.
+        let mut components =
+            member_names(&source["components"]["schemas"], case, "components.schemas");
+        let promoted = components.remove(EVENT_ENVELOPE_COMPONENT);
+        if promoted {
+            let envelope = &source["components"]["schemas"][EVENT_ENVELOPE_COMPONENT];
+            for keyword in member_names(envelope, case, EVENT_ENVELOPE_COMPONENT) {
+                assert!(
+                    !converted[&keyword].is_null(),
+                    "case {case:?}: expected the promoted component's {keyword:?} at the \
+                     root, got {converted:?}"
+                );
+            }
+            assert!(
+                converted["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
+                "case {case:?}: expected the promoted component not to be a definition \
+                 too, got {converted:?}"
+            );
+        } else {
+            assert!(
+                converted["type"].is_null() && converted["properties"].is_null(),
+                "case {case:?}: expected no root schema where the document names no \
+                 root component, got {converted:?}"
+            );
+        }
+        let definitions = if components.is_empty() {
+            assert!(
+                converted["definitions"].is_null(),
+                "case {case:?}: expected no definitions where no component is left to \
+                 define, got {converted:?}"
+            );
+            BTreeSet::new()
+        } else {
+            member_names(&converted["definitions"], case, "definitions")
+        };
         assert_eq!(
             definitions, components,
             "case {case:?}: expected a definition per component {components:?}, got \

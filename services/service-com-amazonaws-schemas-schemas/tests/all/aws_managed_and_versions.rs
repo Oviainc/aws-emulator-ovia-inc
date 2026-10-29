@@ -19,7 +19,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
     aws_managed_schemas, schema_name_order_key, ManagedSchema, AWS_MANAGED_REGISTRY,
-    AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES,
+    AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES, EVENT_ENVELOPE_COMPONENT,
 };
 
 use crate::registry_schema_lifecycle::{
@@ -312,8 +312,8 @@ fn sample_of(catalogue: &[ManagedSchema]) -> Vec<ManagedSchema> {
 
 /// RULE: `ExportSchema(Type='JSONSchemaDraft4')` renders an AWS-managed OpenAPI 3
 /// schema as one JSON Schema draft-4 document computed from the stored one — draft-04
-/// named in `$schema`, the other components under `definitions`, and every component
-/// `$ref` pointing into them.
+/// named in `$schema`, the component the document roots at promoted to the root, the
+/// other components under `definitions`, and every component `$ref` pointing into them.
 #[tokio::test]
 async fn exporting_an_aws_managed_schema_converts_it_to_draft_4() {
     let emulator = Emulator::new();
@@ -365,28 +365,40 @@ async fn exporting_an_aws_managed_schema_converts_it_to_draft_4() {
             "case {schema:?}: no OpenAPI component ref may survive the conversion: {content:?}"
         );
 
-        // EVERY component of the source document is a definition of the export — an
-        // OpenAPI document names no root among its components — and the refs between
-        // them follow.
+        // EVERY component of the source document but the one the document roots at is a
+        // definition of the export; the envelope's keywords are the export's own root,
+        // and the refs between them follow.
         let source: Value = serde_json::from_str(&entry.content)
             .unwrap_or_else(|e| panic!("case {schema:?}: the source must be JSON: {e}"));
         let components = source["components"]["schemas"]
             .as_object()
             .unwrap_or_else(|| panic!("case {schema:?}: the source has components"));
-        for name in components.keys() {
+        for name in components
+            .keys()
+            .filter(|name| *name != EVENT_ENVELOPE_COMPONENT)
+        {
             assert!(
                 content["definitions"][name].is_object(),
                 "case {schema:?}: component {name:?} must be a definition, got {content:?}"
             );
         }
+        assert!(
+            content["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
+            "case {schema:?}: the envelope is the root, not a definition, got {content:?}"
+        );
         assert_eq!(
-            content["definitions"]["AWSEvent"]["properties"]["detail"]["$ref"],
+            content["type"],
+            source["components"]["schemas"][EVENT_ENVELOPE_COMPONENT]["type"],
+            "case {schema:?}: the envelope's keywords must be the export's root"
+        );
+        assert_eq!(
+            content["properties"]["detail"]["$ref"],
             json!(format!("#/definitions/{schema_detail}", schema_detail = source
-                ["components"]["schemas"]["AWSEvent"]["properties"]["detail"]["$ref"]
+                ["components"]["schemas"][EVENT_ENVELOPE_COMPONENT]["properties"]["detail"]["$ref"]
                 .as_str()
                 .unwrap_or_default()
                 .trim_start_matches("#/components/schemas/"))),
-            "case {schema:?}: the envelope's detail ref must point into definitions"
+            "case {schema:?}: the root's detail ref must point into definitions"
         );
         assert_eq!(
             content["title"], source["info"]["title"],

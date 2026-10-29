@@ -18,7 +18,7 @@ use serde_json::Value;
 use service_com_amazonaws_schemas_schemas::state::{
     aws_managed_schemas, schema_name_order_key, ManagedSchema, AWS_EVENT_SOURCES,
     AWS_MANAGED_REGISTRY, AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES, CLOUD_TRAIL_EVENT_NAME,
-    MAX_PAGE_SIZE,
+    EVENT_ENVELOPE_COMPONENT, MAX_PAGE_SIZE,
 };
 
 use crate::registry_schema_lifecycle::{
@@ -202,7 +202,7 @@ async fn every_catalogue_member_is_described_from_the_seeded_document() {
 
 /// RULE: every member of the catalogue exports — as the `OpenApi3` it is stored as
 /// (the stored document itself) and as the `JSONSchemaDraft4` the service converts it
-/// to (draft-04 named at the root).
+/// to (draft-04 named at the root, which is the envelope the document roots at).
 #[tokio::test]
 async fn every_catalogue_member_exports_in_both_schema_languages() {
     let emulator = Emulator::new();
@@ -256,13 +256,19 @@ async fn every_catalogue_member_exports_in_both_schema_languages() {
         );
         let event_name = name.split_once('@').map(|(_, event)| event).unwrap_or("");
         assert_eq!(
-            content["definitions"]["AWSEvent"]["properties"]["detail"]["$ref"],
+            content["properties"]["detail"]["$ref"],
             serde_json::json!(format!("#/definitions/{event_name}")),
-            "case {name:?}: the detail ref must point into definitions, got {content:?}"
+            "case {name:?}: the root's detail ref must point into definitions, got {content:?}"
         );
         assert!(
             content["definitions"][event_name].is_object(),
-            "case {name:?}: every component of the source is a definition, got {content:?}"
+            "case {name:?}: every component but the promoted envelope is a definition, \
+             got {content:?}"
+        );
+        assert!(
+            content["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
+            "case {name:?}: the envelope the document roots at is the export's root, \
+             got {content:?}"
         );
     }
 }

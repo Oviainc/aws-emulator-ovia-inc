@@ -72,11 +72,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+
 // Shared with the seeded AWS-managed catalogue in `crate::state`: it WRITES the
 // documents these constants describe (the event envelope and the component refs that
 // point at it) and this operation converts them, so one definition keeps the writer
 // and the reader from drifting apart.
-use crate::state::{JsonNode, SchemaType, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF};
+use crate::state::{
+    JsonNode, SchemaType, EVENT_ENVELOPE_COMPONENT, JSON_SCHEMA_DRAFT4_URI, OPENAPI_COMPONENT_REF,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -256,28 +260,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Where a JSON Schema draft-4 document keeps the same, as a `$ref` names one.
 const DRAFT4_DEFINITION_REF: &str = "#/definitions/";
 
+/// What a `$ref` names the document's OWN root schema by: the empty fragment, which
+/// JSON Schema draft-04 section 7 resolves to the document root. This is where the
+/// promoted component ([`to_json_schema_draft4`]) now lives, so a reference the source
+/// document made to it keeps naming the same schema.
+const DRAFT4_ROOT_REF: &str = "#";
+
 /// Render the OpenAPI 3 document `openapi` as one JSON Schema draft-4 document.
 ///
-/// The conversion is structural and computed entirely from the stored document:
+/// A draft-04 document IS a schema: its keywords constrain the instance, and
+/// `definitions` is "a standardized location for schema authors to inline re-usable
+/// JSON Schemas" that "plays no role in validation per se" (JSON Schema draft-04
+/// validation, section 5.5.7). A translation that left every component in
+/// `definitions` would therefore be a document that constrains nothing — it validates
+/// every instance — so the conversion roots the document at the schema the source
+/// document roots at, and is otherwise structural and computed entirely from the
+/// stored document:
 ///
-/// * the document's `components.schemas` become the draft-4 `definitions`, every one of
-///   them — an OpenAPI document's components are co-equal reusable schemas, with no one
-///   of them marked as the document's root, so promoting one would be this emulator
-///   choosing a root the source document does not name;
-/// * every `$ref` into `#/components/schemas/` is rewritten to the `#/definitions/`
-///   that now holds it;
+/// * the component the source document roots at — the event envelope every event
+///   schema of this registry describes its event through, named once in
+///   `crate::state` as [`EVENT_ENVELOPE_COMPONENT`] and WRITTEN under that name by the
+///   catalogue and by schema discovery — is promoted to the root: its keywords are the
+///   document's own, which is what makes the translation say what the source says;
+/// * the remaining components become the draft-4 `definitions`, reachable from the
+///   root by reference. A document that defines no envelope component names no root
+///   among its co-equal components, so none is promoted and all of them stay
+///   definitions: choosing one there would be this emulator picking a root the source
+///   document does not name;
+/// * every `$ref` into `#/components/schemas/` is rewritten to where the conversion
+///   put that component: the `#/definitions/` holding it, or [`DRAFT4_ROOT_REF`] for
+///   the promoted one;
 /// * `nullable: true`, OpenAPI 3.0's way of saying a member may be null, becomes
 ///   draft-04's way of saying it: the member's `type` turns into the union of that type
 ///   and `"null"`, and the keyword itself — which draft-04 does not define — goes;
 /// * the root carries draft-04's `$schema` and the source document's `info.title`, so
-///   the translation says which event it describes.
+///   the translation says which event it describes. A JSON object carries one member
+///   per name, so a keyword the root already states this way is not restated by the
+///   promoted component.
 ///
 /// The MEMBER ORDER of the rendered document is part of it — `Content` is text a client
 /// caches, diffs and hashes — so both levels of it are rendered deliberately, through
-/// [`JsonNode`]: the root opens with `$schema`, then the `title`, then the
-/// `definitions`, and every definition is rendered in NAME order, which is the order
-/// the draft-04 export publishes a schema's keywords and property names in
-/// (`properties` before `required` before `type`).
+/// [`JsonNode`]: the root opens with `$schema`, then the `title`, then the promoted
+/// component's keywords, then the `definitions`, and every schema in it is rendered in
+/// NAME order, which is the order the draft-04 export publishes a schema's keywords and
+/// property names in (`properties` before `required` before `type`).
 ///
 /// Neither order may be left to the map a document passes through.
 /// [`serde_json::Map`] is sorted or insertion-ordered depending on whether anything in
@@ -291,10 +317,20 @@ fn to_json_schema_draft4(openapi: &str) -> Option<String> {
     let document: ::serde_json::Value = ::serde_json::from_str(openapi).ok()?;
     let components = document.get("components")?.get("schemas")?.as_object()?;
 
+    // The component this document roots at, where it defines one as a schema: that is
+    // the one the root is built from, and the one no longer reached through
+    // `definitions`.
+    let envelope = components
+        .get(EVENT_ENVELOPE_COMPONENT)
+        .filter(|component| component.is_object())
+        .map(|component| (EVENT_ENVELOPE_COMPONENT, component));
+    let rooted_at = envelope.map(|(name, _)| name);
+
     let definitions: Vec<(String, JsonNode)> = in_name_order(
         components
             .iter()
-            .map(|(name, schema)| (name.clone(), to_draft4(schema)))
+            .filter(|(name, _)| Some(name.as_str()) != rooted_at)
+            .map(|(name, schema)| (name.clone(), to_draft4(schema, rooted_at)))
             .collect(),
     );
 
@@ -307,8 +343,33 @@ fn to_json_schema_draft4(openapi: &str) -> Option<String> {
     {
         root.push(("title".to_string(), JsonNode::text(title)));
     }
-    root.push(("definitions".to_string(), JsonNode::Object(definitions)));
-    Some(JsonNode::Object(root).to_json())
+    let promoted = match envelope.map(|(_, component)| to_draft4(component, rooted_at)) {
+        Some(JsonNode::Object(keywords)) => keywords,
+        _ => Vec::new(),
+    };
+    // The keywords the translated document states of its OWN accord, collected BEFORE
+    // the promotion: a JSON object carries one member per name, so the document's
+    // dialect and its `info.title` are the ones it keeps, and a promoted keyword of
+    // either name is dropped rather than written twice. The set is this document's two
+    // keywords whatever the stored component carries, so the check below costs one
+    // lookup per promoted keyword rather than a scan of what has been promoted so far —
+    // the component's member count is the caller's, and the names in it are distinct
+    // already, being the members of one JSON object.
+    let stated: BTreeSet<String> = root.iter().map(|(name, _)| name.clone()).collect();
+    for (keyword, value) in promoted {
+        if stated.contains(&keyword) {
+            continue;
+        }
+        root.push((keyword, value));
+    }
+
+    let mut rendered = JsonNode::Object(root);
+    // Last, and only where a component is left to define: a `definitions` with nothing
+    // in it would say nothing about the instance and nothing about the source document.
+    if !definitions.is_empty() {
+        rendered.set_member("definitions", JsonNode::Object(definitions));
+    }
+    Some(rendered.to_json())
 }
 
 /// `members` in the order the draft-04 export renders an object's members: by name.
@@ -318,18 +379,19 @@ fn in_name_order(mut members: Vec<(String, JsonNode)>) -> Vec<(String, JsonNode)
 }
 
 /// Translate one OpenAPI 3 schema value into the draft-4 value that says the same
-/// thing, recursively: `$ref`s follow the components this conversion moved into
-/// `definitions`, and `nullable` becomes a type union. Everything else is left as it
-/// stands — the two drafts share it — and the members are rendered in name order, as the
-/// published export renders them.
+/// thing, recursively: `$ref`s follow the components this conversion moved — into
+/// `definitions`, or to the document root for the one it promoted (`rooted_at`) — and
+/// `nullable` becomes a type union. Everything else is left as it stands — the two
+/// drafts share it — and the members are rendered in name order, as the published
+/// export renders them.
 ///
 /// A `$ref` to anything other than a component of this document (an external document,
 /// say) is left alone: it names nothing this conversion moved.
-fn to_draft4(value: &::serde_json::Value) -> JsonNode {
+fn to_draft4(value: &::serde_json::Value, rooted_at: Option<&str>) -> JsonNode {
     let ::serde_json::Value::Object(members) = value else {
         return match value {
             ::serde_json::Value::Array(items) => {
-                JsonNode::List(items.iter().map(to_draft4).collect())
+                JsonNode::List(items.iter().map(|item| to_draft4(item, rooted_at)).collect())
             }
             other => JsonNode::from_value(other),
         };
@@ -349,10 +411,12 @@ fn to_draft4(value: &::serde_json::Value) -> JsonNode {
                 .as_str()
                 .and_then(|target| target.strip_prefix(OPENAPI_COMPONENT_REF))
             {
-                translated.push((
-                    key.clone(),
-                    JsonNode::Text(format!("{DRAFT4_DEFINITION_REF}{name}")),
-                ));
+                let target = if Some(name) == rooted_at {
+                    DRAFT4_ROOT_REF.to_string()
+                } else {
+                    format!("{DRAFT4_DEFINITION_REF}{name}")
+                };
+                translated.push((key.clone(), JsonNode::Text(target)));
                 continue;
             }
         }
@@ -368,7 +432,7 @@ fn to_draft4(value: &::serde_json::Value) -> JsonNode {
                 continue;
             }
         }
-        translated.push((key.clone(), to_draft4(member)));
+        translated.push((key.clone(), to_draft4(member, rooted_at)));
     }
     JsonNode::Object(in_name_order(translated))
 }
@@ -383,11 +447,12 @@ const DRAFT4_NULL_TYPE: &str = "null";
 mod tests {
     use super::*;
 
-    /// The conversion is computed from the document it is given: every component
-    /// becomes a definition, references follow them, the title travels, and
-    /// `nullable` becomes draft-04's type union.
+    /// The conversion is computed from the document it is given: the component the
+    /// document roots at carries the root's keywords, the remaining components become
+    /// definitions, references follow them, the title travels, and `nullable` becomes
+    /// draft-04's type union.
     #[test]
-    fn the_conversion_moves_every_component_into_definitions() {
+    fn the_conversion_roots_the_document_at_the_component_it_is_rooted_at() {
         let openapi = r##"{"openapi":"3.0.0","info":{"title":"Order Placed published by my.orders"},
             "components":{"schemas":{
             "AWSEvent":{"type":"object","properties":{
@@ -410,14 +475,20 @@ mod tests {
             "the source document's title must travel, got {converted:?}"
         );
         assert_eq!(
-            converted["definitions"]["AWSEvent"]["properties"]["detail"]["$ref"],
-            "#/definitions/Detail",
-            "a component ref must point into definitions, got {converted:?}"
+            converted["properties"]["detail"]["$ref"], "#/definitions/Detail",
+            "the promoted component's ref must point into definitions, got {converted:?}"
         );
         assert_eq!(
-            converted["definitions"]["AWSEvent"]["properties"]["resources"]["items"]["$ref"],
-            "#/definitions/Resource",
+            converted["properties"]["resources"]["items"]["$ref"], "#/definitions/Resource",
             "a nested component ref must be rewritten too, got {converted:?}"
+        );
+        assert_eq!(
+            converted["type"], "object",
+            "the promoted component's keywords must be the root's, got {converted:?}"
+        );
+        assert!(
+            converted["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
+            "the promoted component is the root, not a definition, got {converted:?}"
         );
         assert_eq!(
             converted["definitions"]["Detail"]["properties"]["extra"]["type"],
@@ -428,21 +499,55 @@ mod tests {
             converted["definitions"]["Detail"]["properties"]["extra"]["nullable"].is_null(),
             "draft-04 has no `nullable` keyword, got {converted:?}"
         );
-        assert!(
-            converted["definitions"]["Resource"]["type"] == "string"
-                && converted["properties"].is_null(),
-            "every component is a definition and none is promoted to the root, \
-             got {converted:?}"
+        assert_eq!(
+            converted["definitions"]["Resource"]["type"], "string",
+            "every component but the promoted one is a definition, got {converted:?}"
+        );
+    }
+
+    /// A reference the source document made to the component that gets promoted keeps
+    /// naming that schema: it is the document's root now, which draft-04 addresses as
+    /// `#`.
+    #[test]
+    fn a_reference_to_the_promoted_component_names_the_document_root() {
+        let openapi = r##"{"info":{"title":"Order Placed"},"components":{"schemas":{
+            "AWSEvent":{"type":"object","properties":{
+                "detail":{"$ref":"#/components/schemas/Detail"},
+                "cause":{"$ref":"#/components/schemas/AWSEvent"}}},
+            "Detail":{"type":"object","properties":{
+                "replaces":{"$ref":"#/components/schemas/AWSEvent"},
+                "external":{"$ref":"https://example.invalid/schema#/Other"}}}}}}"##;
+        let converted = to_json_schema_draft4(openapi).expect("an OpenAPI 3 document converts");
+        let converted: ::serde_json::Value =
+            ::serde_json::from_str(&converted).expect("the conversion is JSON");
+
+        assert_eq!(
+            converted["properties"]["cause"]["$ref"], DRAFT4_ROOT_REF,
+            "a self-reference of the promoted component names the root, got {converted:?}"
+        );
+        assert_eq!(
+            converted["definitions"]["Detail"]["properties"]["replaces"]["$ref"],
+            DRAFT4_ROOT_REF,
+            "a definition's reference to the promoted component names the root, got \
+             {converted:?}"
+        );
+        assert_eq!(
+            converted["definitions"]["Detail"]["properties"]["external"]["$ref"],
+            "https://example.invalid/schema#/Other",
+            "a ref naming no component of this document is left alone, got {converted:?}"
         );
     }
 
     /// The conversion renders the document as the draft-04 export is published: the
-    /// dialect first, then the source document's title, then the definitions — and every
-    /// schema in it in name order, which a sorted root could not express.
+    /// dialect first, then the source document's title, then the promoted component's
+    /// keywords, then the definitions — and every schema in it in name order, which a
+    /// sorted root could not express.
     #[test]
-    fn the_export_opens_with_the_dialect_then_the_title_then_the_definitions() {
+    fn the_export_opens_with_the_dialect_then_the_title_then_the_root_schema() {
         // Rows: a document with a title and one without (the title is the only optional
-        // root member), and one whose components are written out of name order.
+        // root member), one whose components are written out of name order, a document
+        // rooted at the envelope component beside another component, and one rooted at
+        // the envelope alone (nothing left to define).
         let cases = [
             (
                 "titled",
@@ -463,6 +568,26 @@ mod tests {
                     r#""definitions":{"Solo":{"properties":{"a":{"type":"string"},"#,
                     r#""b":{"type":"string"}},"type":"object"}}}"#
                 ),
+            ),
+            (
+                "rooted at the envelope",
+                r##"{"info":{"title":"Order Placed published by my.orders"},
+                    "components":{"schemas":{
+                    "AWSEvent":{"type":"object","required":["detail"],
+                        "properties":{"detail":{"$ref":"#/components/schemas/Detail"}}},
+                    "Detail":{"type":"string"}}}}"##,
+                concat!(
+                    r#"{"$schema":"http://json-schema.org/draft-04/schema#","#,
+                    r#""title":"Order Placed published by my.orders","#,
+                    r##""properties":{"detail":{"$ref":"#/definitions/Detail"}},"##,
+                    r#""required":["detail"],"type":"object","#,
+                    r#""definitions":{"Detail":{"type":"string"}}}"#
+                ),
+            ),
+            (
+                "the envelope alone",
+                r#"{"components":{"schemas":{"AWSEvent":{"type":"object"}}}}"#,
+                r#"{"$schema":"http://json-schema.org/draft-04/schema#","type":"object"}"#,
             ),
         ];
 
@@ -486,7 +611,8 @@ mod tests {
             ::serde_json::from_str(&converted).expect("the conversion is JSON");
         assert_eq!(
             converted["definitions"]["Solo"]["type"], "object",
-            "the only component is a definition like any other, got {converted:?}"
+            "a lone component the document does not root at stays a definition, got \
+             {converted:?}"
         );
         assert!(
             converted["title"].is_null(),
@@ -499,7 +625,25 @@ mod tests {
             ::serde_json::from_str(&converted).expect("the conversion is JSON");
         assert!(
             converted["definitions"]["A"].is_object() && converted["definitions"]["B"].is_object(),
-            "co-equal components are all definitions under a bare root, got {converted:?}"
+            "co-equal components the document names no root among are all definitions, \
+             got {converted:?}"
+        );
+        assert!(
+            converted["type"].is_null() && converted["properties"].is_null(),
+            "no component is promoted where the document names no root, got {converted:?}"
+        );
+
+        // A document whose envelope component is not a schema at all names no root
+        // either: there are no keywords to promote.
+        let envelope_not_a_schema =
+            r#"{"components":{"schemas":{"AWSEvent":"not a schema","Other":{"type":"object"}}}}"#;
+        let converted =
+            to_json_schema_draft4(envelope_not_a_schema).expect("the other component converts");
+        let converted: ::serde_json::Value =
+            ::serde_json::from_str(&converted).expect("the conversion is JSON");
+        assert_eq!(
+            converted["definitions"][EVENT_ENVELOPE_COMPONENT], "not a schema",
+            "a component that is no schema stays where it was written, got {converted:?}"
         );
 
         for case in [

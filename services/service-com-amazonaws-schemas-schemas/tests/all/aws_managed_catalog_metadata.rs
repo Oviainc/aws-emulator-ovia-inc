@@ -12,8 +12,9 @@
 //!    publishes for it, and every one of them is readable;
 //! 4. a schema AWS publishes is no customer resource, so it carries no ARN;
 //! 5. a published document titles the EVENT it describes, and the draft-04 export
-//!    carries that title, every component as a definition, and OpenAPI's `nullable`
-//!    lowered to a draft-04 type union.
+//!    carries that title, the component the document roots at as its own root, every
+//!    other component as a definition, and OpenAPI's `nullable` lowered to a draft-04
+//!    type union.
 //!
 //! Every case drives the real wire path, through the harness in
 //! `registry_schema_lifecycle.rs` — nothing here touches the state struct directly.
@@ -24,7 +25,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
     aws_managed_schemas, managed_schema_title, managed_version_count, ManagedSchema,
     AWS_MANAGED_REGISTRY, AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES,
-    CLOUD_TRAIL_EVENT_FAMILY,
+    CLOUD_TRAIL_EVENT_FAMILY, EVENT_ENVELOPE_COMPONENT,
 };
 
 use crate::registry_schema_lifecycle::{
@@ -468,9 +469,10 @@ async fn a_schema_aws_publishes_carries_no_arn() {
 
 /// RULE: a published document titles the EVENT it describes — the event's `detail-type`
 /// and the source publishing it — and the draft-04 export is computed from that
-/// document: draft-04 named at the root, the source's title carried onto it, every
-/// component a definition with its references following, and OpenAPI 3.0's `nullable`
-/// lowered to draft-04's union of the member's type with `"null"`.
+/// document: draft-04 named at the root, the source's title carried onto it, the
+/// component the document roots at promoted to the root, every other component a
+/// definition with its references following, and OpenAPI 3.0's `nullable` lowered to
+/// draft-04's union of the member's type with `"null"`.
 #[tokio::test]
 async fn the_published_document_titles_its_event_and_exports_to_draft_4() {
     let emulator = Emulator::new();
@@ -544,13 +546,27 @@ async fn the_published_document_titles_its_event_and_exports_to_draft_4() {
         let components = document["components"]["schemas"]
             .as_object()
             .unwrap_or_else(|| panic!("case {name:?}: the document has components"));
-        for component in components.keys() {
+        for component in components
+            .keys()
+            .filter(|component| *component != EVENT_ENVELOPE_COMPONENT)
+        {
             assert!(
                 converted["definitions"][component].is_object(),
                 "case {name:?}: component {component:?} must be a definition, \
                  got {converted:?}"
             );
         }
+        assert_eq!(
+            converted["required"],
+            document["components"]["schemas"][EVENT_ENVELOPE_COMPONENT]["required"],
+            "case {name:?}: the export must be rooted at the component the document is \
+             rooted at, got {converted:?}"
+        );
+        assert!(
+            converted["definitions"][EVENT_ENVELOPE_COMPONENT].is_null(),
+            "case {name:?}: the promoted component is the root, not a definition, \
+             got {converted:?}"
+        );
         let rendered = serde_json::to_string(&converted).unwrap_or_default();
         assert!(
             !rendered.contains("#/components/schemas/"),
@@ -563,13 +579,19 @@ async fn the_published_document_titles_its_event_and_exports_to_draft_4() {
         );
 
         // Every member the source marked nullable is a union with "null" in the
-        // export, and every member it did not keeps its single type.
+        // export, and every member it did not keeps its single type — in a definition
+        // as at the root the promoted component became.
         for (component, schema) in components {
             let Some(properties) = schema["properties"].as_object() else {
                 continue;
             };
+            let rendered = if component == EVENT_ENVELOPE_COMPONENT {
+                &converted
+            } else {
+                &converted["definitions"][component]
+            };
             for (member, declared) in properties {
-                let exported_member = &converted["definitions"][component]["properties"][member];
+                let exported_member = &rendered["properties"][member];
                 let Some(declared_type) = declared["type"].as_str() else {
                     continue;
                 };

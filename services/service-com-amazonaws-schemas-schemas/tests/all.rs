@@ -43,6 +43,8 @@ mod empty_result_statuses;
 mod error_body_codes;
 #[path = "all/export_reads_the_stored_schema.rs"]
 mod export_reads_the_stored_schema;
+#[path = "all/export_roots_the_draft4_document.rs"]
+mod export_roots_the_draft4_document;
 #[path = "all/iso8601_timestamps.rs"]
 mod iso8601_timestamps;
 #[path = "all/json_refusal_diagnostics.rs"]
