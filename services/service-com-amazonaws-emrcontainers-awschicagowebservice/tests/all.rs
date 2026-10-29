@@ -21,6 +21,8 @@ mod job_run_outcome;
 mod job_template_idempotency;
 #[path = "all/job_template_lifecycle.rs"]
 mod job_template_lifecycle;
+#[path = "all/list_cursor_canonical_spelling.rs"]
+mod list_cursor_canonical_spelling;
 #[path = "all/managed_endpoint_create_admission.rs"]
 mod managed_endpoint_create_admission;
 #[path = "all/managed_endpoint_delete.rs"]

@@ -417,6 +417,13 @@ pub fn encode_list_cursor(scope: &str, created_at_millis: i64, sequence: u64) ->
 ///
 /// `None` — refused as an invalid request — when the token is not a cursor this `scope`
 /// issued, so a token cannot be carried from one listing to another's.
+///
+/// A token is one this `scope` issued only when it is byte for byte what
+/// [`encode_list_cursor`] writes for the position it decodes to. Parsing a decimal is
+/// laxer than writing one — `str::parse` also reads a leading `+`, leading zeros and a
+/// signed zero, none of which the encoder can ever produce — so the decoded position is
+/// re-encoded and compared with the token the client sent: every spelling but the
+/// canonical one is a fabrication, and is refused rather than read as a page position.
 pub fn decode_list_cursor(scope: &str, token: &str) -> Option<(i64, u64)> {
     let rest = token.strip_prefix(scope)?.strip_prefix(':')?;
     let mut parts = rest.split(':');
@@ -424,7 +431,8 @@ pub fn decode_list_cursor(scope: &str, token: &str) -> Option<(i64, u64)> {
     else {
         return None;
     };
-    Some((created_at_millis.parse().ok()?, sequence.parse().ok()?))
+    let position: (i64, u64) = (created_at_millis.parse().ok()?, sequence.parse().ok()?);
+    (encode_list_cursor(scope, position.0, position.1) == token).then_some(position)
 }
 
 /// The scope [`encode_list_cursor`] tags a `ListJobTemplates` cursor with.
