@@ -491,7 +491,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (None, document) => document,
             };
             if let Some(value) = details.as_ref() {
-                if !value.is_object() {
+                let Some(members) = value.as_object() else {
                     return Err(StartChangeSetErrorModeled::ValidationException(
                         crate::state::validation(
                             "ChangeSet.Details",
@@ -499,7 +499,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     )
                     .into());
-                }
+                };
                 // A details value nested without limit would be walked once per
                 // level by every later conversion and report, so the depth this
                 // service stores is bounded.
@@ -512,6 +512,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 crate::state::MAX_DETAILS_DEPTH
                             ),
                         ),
+                    )
+                    .into());
+                }
+                // A details value is reported back as the modelled `Json`
+                // string — by `DescribeChangeSet` as this change submitted it
+                // and by `DescribeEntity` as the entity accumulated it — so the
+                // length `Json` declares is judged on the value itself,
+                // whichever member carried it: `Change$Details` states that
+                // length and the boundary enforces it, while
+                // `Change$DetailsDocument` carries the same details as a
+                // document the model bounds in no way at all. A value past it
+                // could not be read back, so it is refused rather than stored.
+                let length = crate::state::details_json_length(members);
+                if length > crate::state::DETAILS_JSON_LIMIT {
+                    let field = if change.details.is_some() {
+                        "ChangeSet.Details"
+                    } else {
+                        "ChangeSet.DetailsDocument"
+                    };
+                    return Err(StartChangeSetErrorModeled::ValidationException(
+                        crate::state::details_too_long(field, length),
                     )
                     .into());
                 }

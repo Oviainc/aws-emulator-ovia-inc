@@ -206,8 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entity_arn: Some(entity.arn.clone()),
             last_modified_date: Some(entity.last_modified_date.clone()),
             // `Details` and `DetailsDocument` are the same details, as a JSON
-            // string and as a document. The conversion is bounded, and `None`
-            // is unreachable: nothing deeper than the stored bound was accepted.
+            // string and as a document. Both are bounded, and `None` is
+            // unreachable: nothing deeper than the stored depth bound was
+            // accepted, and no change set whose merge would take the stored
+            // details past the length `Json` declares was applied, so the
+            // string reported here is inside that length.
             details: Some(entity.details_json()),
             details_document: crate::state::json_to_document(&entity.details),
         })

@@ -909,6 +909,12 @@ impl EntityRecord {
     }
 
     /// The accumulated details as the `Json` string `Details` is modelled as.
+    ///
+    /// Inside `Json`'s `@length(max)` ([`DETAILS_JSON_LIMIT`]) for every record
+    /// this store holds: a change set is applied only once the merge its
+    /// changes describe has been judged against that bound
+    /// ([`ComAmazonawsMarketplacecatalogAwsmpseymourState::judge_change_set`]),
+    /// so nothing longer is ever written here to report.
     pub fn details_json(&self) -> String {
         self.details.to_string()
     }
@@ -1743,11 +1749,40 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         // one that reports it. A SET, so merging one change's tags costs one
         // lookup per tag rather than a scan of the keys already held.
         let mut tag_keys: HashMap<String, HashSet<String>> = HashMap::new();
+        // The details each entity this change set touches would end up holding,
+        // carried across the changes the same way, for the same reason: the
+        // merge is what a `Json` member has to report afterwards, so the change
+        // that takes it past the bound is the one that reports it.
+        let mut entity_details: HashMap<String, Map<String, Value>> = HashMap::new();
         for (index, change) in record.changes.iter().enumerate() {
-            verdict.change_errors[index] = details_defects(change.details_value().as_ref());
+            let details = change.details_value();
+            verdict.change_errors[index] = details_defects(details.as_ref());
             let Some(entity_id) = change.entity_id.as_deref() else {
                 continue;
             };
+            let merged = entity_details.entry(entity_id.to_string()).or_insert_with(|| {
+                self.entities
+                    .get(entity_id)
+                    .and_then(|entity| entity.details.as_object().cloned())
+                    .unwrap_or_default()
+            });
+            if let Some(members) = details.as_ref().and_then(Value::as_object) {
+                for (key, member) in members {
+                    merged.insert(key.clone(), member.clone());
+                }
+            }
+            // What the entity would report: the merge, plus the ids applying
+            // assigns to the delivery options it carries that have none yet.
+            let length = details_json_length(merged).saturating_add(applied_details_growth(merged));
+            if length > DETAILS_JSON_LIMIT {
+                verdict.change_errors[index].push(ErrorDetail {
+                    error_code: Some(ERROR_CODE_LIMIT_EXCEEDED.to_string()),
+                    error_message: Some(format!(
+                        "Details: an entity holds at most {DETAILS_JSON_LIMIT} characters of \
+                         details, and this change would leave {entity_id} with {length}"
+                    )),
+                });
+            }
             let held = tag_keys.entry(entity_id.to_string()).or_insert_with(|| {
                 self.entities
                     .get(entity_id)
@@ -2889,6 +2924,85 @@ pub fn encode_page_token(prefix: &str, offset: usize) -> String {
 pub fn decode_page_token(prefix: &str, token: &str) -> Option<usize> {
     let rest = token.strip_prefix(prefix)?.strip_prefix('-')?;
     usize::from_str_radix(rest, 16).ok()
+}
+
+/// How long a details value this service stores and reports may be.
+///
+/// `Json` — the shape of every member that carries a details value as a string,
+/// on the way in (`Change$Details`) and on the way out
+/// (`DescribeEntityResponse$Details`, `ChangeSummary$Details`) — is
+/// `@length(min: 2, max: 16384)`
+/// (`smithy_query(query="shape", shape="Json")`). `JsonDocumentType` carries the
+/// SAME details as a document and bounds nothing, so this is the bound a details
+/// value is judged against whichever member carried it: a value this service
+/// accepted and accumulated has to stay reportable as that string.
+pub const DETAILS_JSON_LIMIT: usize = 16_384;
+
+/// How many characters the `Json` string a details value is reported as takes —
+/// [`EntityRecord::details_json`]'s own serialization, which writes no
+/// insignificant whitespace, so the count is the length of the string a reader
+/// receives.
+///
+/// A map of JSON values has no serialization failure to report, and the
+/// unreachable case counts as PAST the bound rather than inside it: a length
+/// nothing could measure is not one this service may report.
+pub fn details_json_length(members: &Map<String, Value>) -> usize {
+    serde_json::to_string(members).map_or(usize::MAX, |text| text.len())
+}
+
+/// How many characters an id the catalog assigns adds to one delivery option:
+/// the quoted member name, the colon and the quoted id — every minted id is
+/// [`DELIVERY_OPTION_ID_PREFIX`] and twelve hex digits
+/// ([`ComAmazonawsMarketplacecatalogAwsmpseymourState::mint_delivery_option_id`])
+/// — plus the comma separating it from the members the option already carried.
+/// An option that carries nothing else needs no comma, so counting it is
+/// conservative by that one character rather than short by it.
+const MINTED_DELIVERY_OPTION_ID_LENGTH: usize =
+    DELIVERY_OPTION_ID_MEMBER.len() + DELIVERY_OPTION_ID_PREFIX.len() + 12 + 6;
+
+/// How much longer than `details` the value applying a change STORES will be: a
+/// delivery option that carries no id is given one before the entity is
+/// written, which is a member the document does not carry yet. Minted ids are
+/// fixed-width, so this growth is known before the change runs — which is what
+/// lets the merge be judged against [`DETAILS_JSON_LIMIT`] while the change set
+/// is still only a plan.
+///
+/// Measured on the MERGED details rather than on one change's own, because a
+/// change carrying [`DELIVERY_OPTIONS_DETAIL_MEMBER`] replaces the list the
+/// merge held: what still needs ids is whatever the merge carries at that
+/// point, and an option already holding an id grows by nothing.
+pub fn applied_details_growth(details: &Map<String, Value>) -> usize {
+    let Some(options) = details
+        .get(DELIVERY_OPTIONS_DETAIL_MEMBER)
+        .and_then(Value::as_array)
+    else {
+        return 0;
+    };
+    options
+        .iter()
+        .take(MAX_DELIVERY_OPTIONS_PER_CHANGE)
+        .filter(|option| {
+            option.is_object()
+                && option
+                    .get(DELIVERY_OPTION_ID_MEMBER)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        })
+        .count()
+        * MINTED_DELIVERY_OPTION_ID_LENGTH
+}
+
+/// The modelled `ValidationException` payload for a change whose details are
+/// longer than [`DETAILS_JSON_LIMIT`] — built from the request: the member that
+/// carried them, the length it sent and the bound it passed.
+pub fn details_too_long(field: &str, length: usize) -> ValidationException {
+    validation(
+        field,
+        format!(
+            "the details of a change are at most {DETAILS_JSON_LIMIT} characters of JSON, \
+             not {length}"
+        ),
+    )
 }
 
 /// The deepest `Details` / `DetailsDocument` this service accepts.

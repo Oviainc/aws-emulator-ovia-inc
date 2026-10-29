@@ -31,6 +31,8 @@ mod change_type_validation;
 mod default_page_size;
 #[path = "all/delete_resource_policy_existence.rs"]
 mod delete_resource_policy_existence;
+#[path = "all/details_length_bound.rs"]
+mod details_length_bound;
 #[path = "all/documented_entity_types.rs"]
 mod documented_entity_types;
 #[path = "all/entity_id_list_contract.rs"]
