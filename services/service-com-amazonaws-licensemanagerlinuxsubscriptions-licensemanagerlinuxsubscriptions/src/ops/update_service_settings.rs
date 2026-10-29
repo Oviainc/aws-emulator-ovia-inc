@@ -167,6 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The home Region this update records is the Region the request is served in, and
+        // that is held to the SAME Region catalog as the `SourceRegions` entries below:
+        // `crate::state::request_region` takes the signed scope's Region only when it
+        // names an AWS Region, so `home_regions` can never come to hold a Region code the
+        // catalog does not have.
         let region = crate::state::request_region(&ctx.parts().headers);
         let mut state = state.lock();
 

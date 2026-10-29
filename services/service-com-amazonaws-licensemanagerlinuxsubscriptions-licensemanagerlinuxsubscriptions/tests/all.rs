@@ -35,6 +35,8 @@ mod shared_harness;
 mod shared_tag_merge;
 #[path = "all/shared_tag_projection.rs"]
 mod shared_tag_projection;
+#[path = "all/signed_region_catalog.rs"]
+mod signed_region_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/subscription_provider_registration.rs"]

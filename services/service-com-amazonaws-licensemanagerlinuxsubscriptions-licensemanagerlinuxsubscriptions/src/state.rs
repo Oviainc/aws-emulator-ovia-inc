@@ -793,23 +793,31 @@ pub fn reported_service_settings(
     }
 }
 
-/// The region this request was signed for, or the emulator's default when the request
-/// carries no usable SigV4 credential scope.
+/// The Region a request addressed to this service is served in: the Region its SigV4
+/// credential scope names, or [`DEFAULT_REGION`] when the request carries no USABLE
+/// scope.
 ///
-/// Values outside the ARN grammar's region segment (`[a-z0-9-.]{1,63}`) are ignored, so
-/// a minted ARN always satisfies the modelled `SubscriptionProviderArn` pattern.
+/// The scope is caller-supplied text, and this is what the service then RECORDS — the
+/// account's home Region and the Region segment of every minted
+/// `SubscriptionProviderArn` — so a scope is usable only when its Region names an AWS
+/// Region ([`is_known_region`]), exactly the set a Region-valued member of this service
+/// may name. A scope naming anything else resolves to [`DEFAULT_REGION`], like a request
+/// carrying no scope at all: nothing the store holds, and nothing an ARN carries, is then
+/// a Region code that does not exist. The catalog's codes are also inside the ARN
+/// grammar's region segment (`[a-z0-9-.]{1,63}`), so a minted ARN still satisfies the
+/// modelled `SubscriptionProviderArn` pattern.
 pub fn request_region(headers: &::http::HeaderMap) -> String {
     ::emulator_server::sigv4_credential_scope(headers)
         .map(|scope| scope.region)
-        .filter(|region| {
-            !region.is_empty()
-                && region.len() <= 63
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
-        })
-        .unwrap_or_else(|| "us-east-1".to_string())
+        .filter(|region| is_known_region(region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
+
+/// The Region a request that resolves to none of its own is served in.
+///
+/// It is a Region of the catalog [`is_known_region`] checks, so the fallback itself
+/// cannot put a Region code the catalog does not hold into the store.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// Whether `region` names an AWS Region.
 ///
