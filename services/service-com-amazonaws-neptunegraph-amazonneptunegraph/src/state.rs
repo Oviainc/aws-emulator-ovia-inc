@@ -1535,10 +1535,10 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         // carried out against what the store already holds.
         if self.snapshots.len() >= MAX_SNAPSHOTS {
             return Err(format!(
-                "a final snapshot of graph {} cannot be taken because this emulator \
-                 holds at most {MAX_SNAPSHOTS} graph snapshots; delete a snapshot or \
-                 pass skipSnapshot=true",
-                graph.id
+                "a final snapshot of graph {} cannot be taken because {}; delete a \
+                 snapshot or pass skipSnapshot=true",
+                graph.id,
+                store_ceiling_clause("graph snapshots", MAX_SNAPSHOTS)
             ));
         }
         // The request carries no name for the snapshot, so the service names it after
@@ -1741,9 +1741,7 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
             .get(&query.graph_id)
             .is_some_and(|queries| queries.contains_key(&query.id));
         if !replaces_an_entry && self.query_count() >= MAX_QUERIES {
-            return Err(format!(
-                "this emulator holds at most {MAX_QUERIES} queries in flight"
-            ));
+            return Err(store_ceiling_clause("queries in flight", MAX_QUERIES));
         }
         self.queries
             .entry(query.graph_id.clone())
@@ -2928,6 +2926,44 @@ pub fn graph_name_conflict(graph_name: &str) -> ConflictException {
 /// snapshot namespace's half of the same rule [`graph_name_conflict`] states for graphs.
 pub fn snapshot_name_conflict(snapshot_name: &str) -> ConflictException {
     duplicate_name_conflict("Snapshot", snapshot_name)
+}
+
+/// The ONE clause this service words a reached store ceiling with: how many records of
+/// that kind this emulator keeps at most.
+///
+/// `records` names what the ceiling counts, in the plural the refusal reads in ("import
+/// tasks", "export tasks", "graph snapshots"), and `ceiling` is the bound that was met.
+/// Written once here so a caller cannot tell one full store from another by the wording
+/// of its refusal.
+fn store_ceiling_clause(records: &str, ceiling: usize) -> String {
+    format!("this emulator holds at most {ceiling} {records}")
+}
+
+/// The modelled `ConflictException` for a growth call that met a FULL store, raised by
+/// every operation that mints a record and models no quota error.
+///
+/// Which modelled error reports a reached ceiling follows from the operation's own error
+/// set: an operation that models `ServiceQuotaExceededException` (402) reports it there
+/// (`CreateGraph`, `CreateGraphSnapshot`, `RestoreGraphFromSnapshot`,
+/// `CreateGraphUsingImportTask`, `CreatePrivateGraphEndpoint`), and an operation that
+/// models none reports it as the conflict it is — the request cannot be carried out
+/// against what the store already holds — through the `ConflictException` (409) it does
+/// model. A full store is never a `ValidationException`: every member of such a request
+/// is well formed and accepted, so nothing about the INPUT was invalid, and a reason
+/// value that names a bad input would tell a caller to change a request that has nothing
+/// wrong with it.
+///
+/// Worded by [`store_ceiling_clause`], so the ceiling reads the same whichever store was
+/// full.
+pub fn store_ceiling_conflict(records: &str, ceiling: usize) -> ConflictException {
+    ConflictException {
+        message: store_ceiling_clause(records, ceiling),
+        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`
+        // (`smithy_query(query="shape",shape="ConflictExceptionReason")`), and a store
+        // that is simply full is not a concurrent modification of anything, so the
+        // member is left absent.
+        reason: None,
+    }
 }
 
 /// The ONE grammar this service words a refused precondition with: what the call could

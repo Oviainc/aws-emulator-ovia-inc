@@ -287,17 +287,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is shared and grows by one task per call, and a task is never
         // reclaimed, so it has a ceiling (`crate::state::MAX_IMPORT_TASKS`). This
         // operation models no quota error, so reaching the ceiling is reported with the
-        // `ConflictException` it does model: the request conflicts with what the store
-        // already holds.
+        // `ConflictException` it does model, by the one builder every full-store refusal
+        // in this crate reaches (`crate::state::store_ceiling_conflict`): the request
+        // conflicts with what the store already holds.
         if store.import_tasks.len() >= crate::state::MAX_IMPORT_TASKS {
             return Err(StartImportTaskErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "this emulator holds at most {} import tasks",
-                        crate::state::MAX_IMPORT_TASKS
-                    ),
-                    reason: None,
-                },
+                crate::state::store_ceiling_conflict(
+                    "import tasks",
+                    crate::state::MAX_IMPORT_TASKS,
+                ),
             )
             .into());
         }
