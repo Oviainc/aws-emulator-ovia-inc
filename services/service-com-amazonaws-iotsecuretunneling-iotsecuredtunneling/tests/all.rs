@@ -21,6 +21,8 @@ mod destination_service_limit;
 mod limit_refusals;
 #[path = "all/member_update_stamp.rs"]
 mod member_update_stamp;
+#[path = "all/owed_close_settled_by_every_entry_point.rs"]
+mod owed_close_settled_by_every_entry_point;
 #[path = "all/record_eviction_order.rs"]
 mod record_eviction_order;
 #[path = "all/reserved_tag_keys.rs"]
