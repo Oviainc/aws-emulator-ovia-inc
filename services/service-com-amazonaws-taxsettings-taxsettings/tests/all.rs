@@ -21,6 +21,8 @@ mod additional_info_blocks;
 mod address_country_requirements;
 #[path = "all/batch_get_tax_exemptions_failed_accounts.rs"]
 mod batch_get_tax_exemptions_failed_accounts;
+#[path = "all/batch_row_error_codes.rs"]
+mod batch_row_error_codes;
 #[path = "all/batch_tax_registration.rs"]
 mod batch_tax_registration;
 #[path = "all/country_requirements.rs"]

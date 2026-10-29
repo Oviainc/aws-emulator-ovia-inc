@@ -231,8 +231,9 @@ fn assert_refused(case: &str, writer: &str, answer: &Answer, account_id: &str) {
             "case {case:?}: the batch must report exactly the conflicting account, got {rows:?}"
         );
         assert_eq!(
-            rows[0].1, "ConflictException",
-            "case {case:?}: the row must carry the code the write failed with, got {rows:?}"
+            rows[0].1, "",
+            "case {case:?}: this service publishes no code for a conflict, so the row must carry \
+             none, got {rows:?}"
         );
         assert!(
             !rows[0].2.is_empty(),
@@ -557,9 +558,9 @@ async fn a_batch_reports_each_outstanding_account_and_stores_the_rest() {
         );
         for (account_id, code, message) in &error_list {
             assert_eq!(
-                code, "ConflictException",
-                "case {case:?}: {account_id}'s row must carry the code the write failed with, got \
-                 {error_list:?}"
+                code, "",
+                "case {case:?}: this service publishes no code for a conflict, so {account_id}'s \
+                 row must carry none, got {error_list:?}"
             );
             assert!(
                 !message.is_empty(),

@@ -135,6 +135,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::BatchRowErrorCode;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -245,14 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // about the entry the whole call carries, so it is judged here, per
             // account, and reported against the account it refused. The `code`
             // of such a row is the refusal's own `errorCode`, the discriminator
-            // the service publishes for a validation refusal; a
-            // `ConflictException` publishes none, so for those rows the
-            // exception's name is the only code there is.
+            // the service publishes for a validation refusal — see
+            // [`crate::state::BatchRowErrorCode`], which is where what this
+            // member carries is stated for every batch row of this service.
             if let Err(refusal) = store.check_registration_type_against_stored(account_id, entry) {
                 errors.push(BatchPutTaxRegistrationError2 {
                     account_id: account_id.to_string(),
+                    code: refusal.row_error_code(),
                     message: refusal.message,
-                    code: Some(refusal.error_code),
                 });
                 continue;
             }
@@ -260,11 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(status) => stored_status = Some(status),
                 Err(conflict) => errors.push(BatchPutTaxRegistrationError2 {
                     account_id: account_id.to_string(),
+                    // Both refusals are the `ConflictException`
+                    // `PutTaxRegistration` answers this account's own write
+                    // with, and this service publishes no code for a state
+                    // conflict, so the row carries none.
+                    code: conflict.row_error_code(),
                     message: conflict.message,
-                    // The code this account's own single-account write would
-                    // have failed with: `PutTaxRegistration` answers both
-                    // refusals with its modelled `ConflictException`.
-                    code: Some("ConflictException".to_string()),
                 }),
             }
         }

@@ -270,9 +270,11 @@ async fn a_carved_out_jurisdictions_registration_is_not_deleted_by_the_api() {
 }
 
 /// RULE (batch path): the same record is refused in a batch delete — reported in
-/// `errors` with the code the single-account delete raises and left in place —
-/// while the deletable accounts of the same batch are still removed and an
-/// account holding nothing is still reported not found.
+/// `errors` with the service-defined code the refusal the single-account delete
+/// raises publishes, and left in place — while the deletable accounts of the
+/// same batch are still removed and an account holding nothing is still
+/// reported, with no code, because this service publishes none for a missing
+/// registration.
 #[tokio::test]
 async fn a_carved_out_jurisdictions_registration_is_not_deleted_by_the_batch() {
     const DELETABLE_IN_BATCH: &str = "000000000021";
@@ -331,11 +333,8 @@ async fn a_carved_out_jurisdictions_registration_is_not_deleted_by_the_batch() {
         assert_eq!(
             reported,
             vec![
-                (carved.clone(), "ValidationException".to_string()),
-                (
-                    HOLDS_NOTHING.to_string(),
-                    "ResourceNotFoundException".to_string()
-                ),
+                (carved.clone(), ERROR_CODE_FIELD_VALIDATION_FAILED.to_string()),
+                (HOLDS_NOTHING.to_string(), String::new()),
             ],
             "case {case:?}: expected the carved-out account refused and the empty one not found, \
              got {:?}",
@@ -682,13 +681,17 @@ fn expected_rows(batch: &Batch, already_deleted: bool) -> Vec<(String, String)> 
             continue;
         }
         seen.push(account_id);
-        let code = match batch.holding(account_id) {
-            // The code this account's own single-account delete answers.
-            None => Some("ResourceNotFoundException"),
+        // The code the refusal this account's own single-account delete answers
+        // publishes: the validation refusal's own one for a carved-out
+        // jurisdiction, and none at all for an account holding nothing, which is
+        // an absent member read back as the empty string. `None` here is an
+        // account the batch deleted, which is reported in no row at all.
+        let code: Option<&str> = match batch.holding(account_id) {
+            None => Some(""),
             Some(holding) if non_api_delete_country(held_in(holding)).is_some() => {
-                Some("ValidationException")
+                Some(ERROR_CODE_FIELD_VALIDATION_FAILED)
             }
-            Some(_) if already_deleted => Some("ResourceNotFoundException"),
+            Some(_) if already_deleted => Some(""),
             Some(_) => None,
         };
         if let Some(code) = code {
@@ -743,8 +746,9 @@ async fn listed_accounts(router: &MultiServiceRouter) -> BTreeSet<String> {
 
 /// RULE (the batch path, over the class): a batch delete removes the
 /// registration of every account it names EXCEPT one held in a carved-out
-/// jurisdiction, which it reports in `errors` with the code the single-account
-/// delete raises and a message naming that jurisdiction, and leaves readable —
+/// jurisdiction, which it reports in `errors` with the service-defined code the
+/// refusal the single-account delete raises publishes and a message naming that
+/// jurisdiction, and leaves readable —
 /// wherever the account sits in the list, however the record's jurisdiction was
 /// established, and however many of the named accounts are carved out. Running
 /// the same request again answers the same way for those accounts, so the
@@ -799,7 +803,7 @@ async fn the_batch_deletes_everything_it_names_except_the_carved_out_jurisdictio
             // A refused row states the jurisdiction the record it names is held
             // in, so a client learns which carve-out it hit.
             for (account_id, code, message) in &reported {
-                if code != "ValidationException" {
+                if code != ERROR_CODE_FIELD_VALIDATION_FAILED {
                     continue;
                 }
                 let country = batch

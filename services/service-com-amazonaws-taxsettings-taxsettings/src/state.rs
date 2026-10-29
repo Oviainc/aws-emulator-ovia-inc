@@ -3283,7 +3283,8 @@ pub fn check_registration_deletable(
 /// It names the modelled error `DeleteTaxRegistration` raises, which is what each
 /// caller renders on its own channel: the single-account delete returns that
 /// error, and the batch reports a per-account row of its `errors` list carrying
-/// the same code and message. So a refusal added to the decision reaches both
+/// the same message and the code that error publishes (see
+/// [`BatchRowErrorCode`]). So a refusal added to the decision reaches both
 /// paths, and neither path decides on its own what a delete of one record
 /// answers.
 #[derive(Debug)]
@@ -3296,24 +3297,65 @@ pub enum RegistrationDeleteRefusal {
 }
 
 impl RegistrationDeleteRefusal {
-    /// The name of the modelled error `DeleteTaxRegistration` answers this
-    /// refusal with — the `code` the batch's per-account row carries, because a
-    /// row reports what that account's own single-account delete would have
-    /// failed with. Neither exception publishes a service-defined `errorCode`
-    /// for this refusal, so the exception's name is the only code there is.
-    pub const fn error_name(&self) -> &'static str {
-        match self {
-            Self::NotFound(_) => "ResourceNotFoundException",
-            Self::NotDeletable(_) => "ValidationException",
-        }
-    }
-
     /// The refusal's message, as the modelled exception carries it: one wording
     /// per refusal, whichever path renders it.
     pub fn into_message(self) -> String {
         match self {
             Self::NotFound(error) => error.message,
             Self::NotDeletable(error) => error.message,
+        }
+    }
+}
+
+/// The `code` a batch operation reports in the per-account `errors[]` row that
+/// renders this refusal.
+///
+/// Both batch error shapes target their `code` at the model's free-form
+/// `ErrorCode` — the very shape this service's exceptions target their
+/// `errorCode` at — so the member carries a SERVICE-DEFINED code and never an
+/// exception's own shape name: the wire already carries that in
+/// `x-amzn-errortype` / `__type`, and a client reading `code` to classify a
+/// failure would take a shape name for a service code. A refusal class this
+/// service publishes no code for therefore leaves the member off the wire,
+/// exactly as those exceptions leave `errorCode` off it (see
+/// `ops/types/shared_types.rs`); `code` is optional in both shapes, so there is
+/// nothing to invent.
+pub trait BatchRowErrorCode {
+    /// The code to report, or `None` when this refusal class publishes none.
+    fn row_error_code(&self) -> Option<String>;
+}
+
+/// A validation refusal publishes its own code, the discriminator this service
+/// reports for the class of refusal it is (see [`validation`]).
+impl BatchRowErrorCode for ValidationException {
+    fn row_error_code(&self) -> Option<String> {
+        (!self.error_code.is_empty()).then(|| self.error_code.clone())
+    }
+}
+
+/// This service publishes no code for a state conflict — the member is
+/// unsupported on the exception for that reason.
+impl BatchRowErrorCode for ConflictException {
+    fn row_error_code(&self) -> Option<String> {
+        None
+    }
+}
+
+/// This service publishes no code for a missing resource, for the reason
+/// [`no_tax_registration`] states.
+impl BatchRowErrorCode for ResourceNotFoundException {
+    fn row_error_code(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A per-account delete refusal reports the code of the exception it renders, so
+/// the batch row and the single-account delete publish the same discriminator.
+impl BatchRowErrorCode for RegistrationDeleteRefusal {
+    fn row_error_code(&self) -> Option<String> {
+        match self {
+            Self::NotFound(error) => error.row_error_code(),
+            Self::NotDeletable(error) => error.row_error_code(),
         }
     }
 }

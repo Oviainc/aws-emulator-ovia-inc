@@ -543,11 +543,13 @@ async fn a_batch_delete_removes_every_registered_account_it_names() {
             "case {case:?}: exactly the accounts holding nothing must be reported, got {errors:?}"
         );
         for error in &errors {
+            // This service publishes no service-defined code for a missing
+            // registration, so the row carries none rather than the exception's
+            // shape name.
             assert_eq!(
                 error.get("code").and_then(Value::as_str),
-                Some("ResourceNotFoundException"),
-                "case {case:?}: the error must carry the code that delete failed with, got \
-                 {error:?}"
+                None,
+                "case {case:?}: the error must carry no code, got {error:?}"
             );
         }
 
@@ -727,9 +729,9 @@ async fn an_account_the_batch_could_not_write_is_reported_against_that_account()
     );
     assert_eq!(
         errors[0].get("code").and_then(Value::as_str),
-        Some("ConflictException"),
-        "case \"store at its bound\": the error must carry the code that write failed with, got \
-         {errors:?}"
+        None,
+        "case \"store at its bound\": this service publishes no code for a state conflict, so the \
+         row must carry none, got {errors:?}"
     );
     assert!(
         errors[0]

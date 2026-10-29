@@ -10,9 +10,9 @@
 //! `DeleteTaxRegistration` and the per-account loop of
 //! `BatchDeleteTaxRegistration` both take that one decision, each only rendering
 //! its refusal on its own channel: a modelled error response, or a row of the
-//! batch's `errors` list carrying the same code and the same message. So the two
-//! paths cannot answer for one record differently, and cannot leave the store in
-//! different states.
+//! batch's `errors` list carrying the same message and the service-defined code
+//! that refusal publishes. So the two paths cannot answer for one record
+//! differently, and cannot leave the store in different states.
 //!
 //! The rows span what the decision generalises over: whether the account holds a
 //! record at all, whether the jurisdiction it is held in is carved out of the API
@@ -37,6 +37,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     non_api_delete_country, COUNTRIES_WITH_NON_API_REGISTRATION_DELETE,
+    ERROR_CODE_FIELD_VALIDATION_FAILED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -65,14 +66,24 @@ enum Decision {
 
 impl Decision {
     /// The name of the modelled error `DeleteTaxRegistration` renders this
-    /// decision as, which is also the `code` of the batch's per-account row.
-    /// Empty when the record is removed, because a removal is refused by
-    /// neither path.
-    const fn code(self) -> &'static str {
+    /// decision as, on the wire's error-type channel. Empty when the record is
+    /// removed, because a removal is refused by neither path.
+    const fn error_name(self) -> &'static str {
         match self {
             Self::Removed => "",
             Self::MissingResource => "ResourceNotFoundException",
             Self::NotDeletable => "ValidationException",
+        }
+    }
+
+    /// The service-defined code the batch's per-account row carries for this
+    /// decision: the refusal's own one, and empty where the refusal class
+    /// publishes none — this service publishes none for a missing resource, and
+    /// a removal is reported in no row at all.
+    const fn row_code(self) -> &'static str {
+        match self {
+            Self::Removed | Self::MissingResource => "",
+            Self::NotDeletable => ERROR_CODE_FIELD_VALIDATION_FAILED,
         }
     }
 
@@ -235,8 +246,9 @@ fn rows() -> Vec<Row> {
 }
 
 /// What one delete answered, in the terms both paths share: the code the refusal
-/// carries (empty when the record was removed), its message, and the
-/// registration type the account still reports afterwards.
+/// carries on that path's own channel (empty when the record was removed, and
+/// empty where the refusal class publishes no code for the batch's row), its
+/// message, and the registration type the account still reports afterwards.
 #[derive(Debug, PartialEq, Eq)]
 struct Outcome {
     code: String,
@@ -335,11 +347,18 @@ async fn both_delete_paths_take_the_one_delete_decision() {
             for (attempt, decision) in decisions.iter().copied().enumerate() {
                 let case = format!("{} deleted through {path} (delete {attempt})", row.case);
                 let outcome = delete_through(&router, path, &case).await;
+                // Each path reports the refusal class on its OWN channel: the
+                // single-account delete on the wire's error type, the batch row
+                // on the service-defined `code` its refusal publishes.
+                let expected_code = if *path == "BatchDeleteTaxRegistration" {
+                    decision.row_code()
+                } else {
+                    decision.error_name()
+                };
                 assert_eq!(
-                    outcome.code,
-                    decision.code(),
-                    "case {case:?}: expected the {decision:?} code {:?}, got {outcome:?}",
-                    decision.code()
+                    outcome.code, expected_code,
+                    "case {case:?}: expected the {decision:?} code {expected_code:?}, got \
+                     {outcome:?}"
                 );
                 let expected_held = decision
                     .leaves_record()
@@ -371,8 +390,18 @@ async fn both_delete_paths_take_the_one_delete_decision() {
             }
             per_path.push(outcomes);
         }
+        // The message and the post-state are the decision itself, so they must
+        // match across the paths; the code member each path reports them on is
+        // asserted per path above.
+        let shared = |outcomes: &Vec<Outcome>| -> Vec<(String, Option<String>)> {
+            outcomes
+                .iter()
+                .map(|outcome| (outcome.message.clone(), outcome.still_held.clone()))
+                .collect()
+        };
         assert_eq!(
-            per_path[0], per_path[1],
+            shared(&per_path[0]),
+            shared(&per_path[1]),
             "case {:?}: both delete paths must answer for one record identically, got {per_path:?}",
             row.case
         );
@@ -404,9 +433,9 @@ async fn the_single_account_path_renders_each_decision_on_its_own_status() {
         );
         assert_eq!(
             answer.error_code,
-            decision.code(),
+            decision.error_name(),
             "case {case:?}: expected the error code {:?}, got {:?}",
-            decision.code(),
+            decision.error_name(),
             answer.error_code
         );
         if matches!(decision, Decision::Removed) {

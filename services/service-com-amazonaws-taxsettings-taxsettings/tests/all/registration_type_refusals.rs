@@ -48,7 +48,11 @@ use crate::tax_registration_lifecycle::{
 /// Every value of the model's `ValidationExceptionErrorCode` enum
 /// (`smithy_query(query="shape", shape="ValidationExceptionErrorCode")`), which
 /// is the closed set `ValidationException$errorCode` is reported from.
-const VALIDATION_EXCEPTION_ERROR_CODES: &[&str] = &[
+///
+/// `pub(crate)` because `tests/all/batch_row_error_codes.rs` asserts that a
+/// batch row's `code` is one of them: one catalog, so two suites cannot disagree
+/// about which codes this service publishes.
+pub(crate) const VALIDATION_EXCEPTION_ERROR_CODES: &[&str] = &[
     "MalformedToken",
     "ExpiredToken",
     "InvalidToken",
@@ -88,7 +92,11 @@ fn address_in(country_code: &str) -> Value {
 
 /// An entry of `registration_type`, with the legal address of `country_code` or
 /// with none at all.
-fn entry_of(registration_type: &str, country_code: Option<&str>) -> Value {
+///
+/// `pub(crate)` because `tests/all/batch_row_error_codes.rs` stores and submits
+/// the same entries: one builder, so the two suites cannot submit two different
+/// entries for one type.
+pub(crate) fn entry_of(registration_type: &str, country_code: Option<&str>) -> Value {
     let mut entry = json!({
         "registrationId": format!("{registration_type}-0000000001"),
         "registrationType": registration_type,

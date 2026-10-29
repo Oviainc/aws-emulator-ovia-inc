@@ -11,9 +11,11 @@
 //! is what `DeleteTaxRegistration` answers 404 for, or one whose registration is
 //! held in a jurisdiction this API cannot remove one from, which
 //! `DeleteTaxRegistration` refuses with its modelled `ValidationException` — is
-//! reported in the response's `errors` list naming that account with the code
-//! that single-account delete would have failed with, its record left in place,
-//! and the rest of the batch is still deleted.
+//! reported in the response's `errors` list naming that account, with the
+//! message that single-account delete would have failed with and the
+//! service-defined code that refusal publishes (none for a missing
+//! registration), its record left in place, and the rest of the batch is still
+//! deleted.
 //! `accountIds` carries the model's `@length` 1..=5, which the
 //! boundary validator refuses outside of before this handler runs, and is a list
 //! of UNIQUE account identifiers: an id named more than once names one account
@@ -82,6 +84,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::BatchRowErrorCode;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -172,15 +175,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deletion cannot be decided two different ways: the one decision in
             // `state` answers whether this account's record is removed, and this
             // handler only renders a refusal on its own channel — a row naming
-            // the account with the code that single-account delete would have
-            // failed with, the record left in place, and the rest of the batch
-            // still deleted.
+            // the account, the message that account's single-account delete
+            // would have failed with and the code that refusal publishes (see
+            // [`crate::state::BatchRowErrorCode`]), the record left in place,
+            // and the rest of the batch still deleted.
             if let Err(refusal) = store.delete_registration(account_id) {
-                let code = refusal.error_name().to_string();
+                let code = refusal.row_error_code();
                 errors.push(BatchDeleteTaxRegistrationError2 {
                     account_id: account_id.to_string(),
                     message: refusal.into_message(),
-                    code: Some(code),
+                    code,
                 });
             }
         }
