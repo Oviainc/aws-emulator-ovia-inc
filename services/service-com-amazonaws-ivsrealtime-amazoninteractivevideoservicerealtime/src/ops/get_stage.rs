@@ -149,7 +149,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(GetStageErrorModeled::InternalServerException)
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // A stage reports the session it has running, which a replica leaving can end: a
+        // replication runs only while the publisher it replicates is connected, so the end
+        // the clock already owes one whose publisher's reconnect window has run out is
+        // written down first and this reports the stage a caller reading at this instant
+        // sees.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         let record = store.stage_in(&region, &input.arn).ok_or_else(|| {
             crate::state::resource_not_found(
                 GetStageErrorModeled::ResourceNotFoundException,

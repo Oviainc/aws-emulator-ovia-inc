@@ -2479,9 +2479,18 @@ pub struct ParticipantReplicaRecord {
     pub replication_state: String,
     /// The window a disconnected publisher may reconnect in before replication ends,
     /// or [`DEFAULT_REPLICATION_RECONNECT_WINDOW_SECONDS`] when the request omitted it.
-    /// Nothing disconnects an emulated publisher, so no clock reads it yet; it is
-    /// recorded because it is what the caller asked replication to do.
+    /// It is the span the clock measures [`Self::reconnect_deadline`] with, which is what
+    /// the caller asked replication to do.
     pub reconnect_window_seconds: i32,
+    /// The instant the clock ends this replication at, because the publisher it
+    /// replicates has left the session it publishes in and its reconnect window runs out
+    /// then — `None` while that publisher is connected, which is every replication of a
+    /// publisher that has not gone away.
+    ///
+    /// Written only by [`observe_replication_publisher`], the one place a publisher's
+    /// connection is observed, and read only by [`materialize_due_replications`], the
+    /// clock that acts on it.
+    pub reconnect_deadline: Option<SystemTime>,
     /// The attributes the replica participant carries in the destination stage: the
     /// source participant's own, with the starting request's merged over them — the rule
     /// `StartParticipantReplicationRequest$attributes` states ("These attributes are
@@ -2500,6 +2509,24 @@ pub struct ParticipantReplicaRecord {
 }
 
 impl ParticipantReplicaRecord {
+    /// Move this replication to its stopped state.
+    ///
+    /// The ONE place a replication stops, whichever way it ended — a caller's
+    /// `StopParticipantReplication`, a stage it names going away
+    /// ([`end_replications_of_stage`]), or its publisher staying away for its whole
+    /// reconnect window ([`materialize_due_replications`]) — so every end leaves the same
+    /// record: [`REPLICATION_STATE_STOPPED`], which is what every reader reports from here
+    /// on, and no deadline, because a replication that has ended is owed no further end.
+    pub fn stop(&mut self) {
+        self.replication_state = REPLICATION_STATE_STOPPED.to_string();
+        self.reconnect_deadline = None;
+    }
+
+    /// Whether this replication is still running ([`REPLICATION_STATE_ACTIVE`]).
+    pub fn is_active(&self) -> bool {
+        self.replication_state == REPLICATION_STATE_ACTIVE
+    }
+
     /// The modelled `ParticipantReplica` this record reports. Every member of the shape
     /// is `@required`, so each one is reported from the record and none is optional.
     pub fn to_participant_replica(&self) -> ParticipantReplica {
@@ -2763,6 +2790,17 @@ pub fn join_stage_session(
             occurrence(EVENT_PUBLISH_STARTED),
         );
     }
+    // A publisher that is back is publishing again, so every replication it sources is
+    // owed no end: "if the participant disconnects and then reconnects within the
+    // specified interval, replication will continue to be `ACTIVE`", through the one place
+    // a publisher's connection is observed.
+    observe_replication_publisher(
+        state,
+        stage_arn,
+        &session_id,
+        &participant_id,
+        SystemTime::now(),
+    );
     // The stage now has somebody in it, so no composition of it is counting out the
     // empty-stage timeout the model's `StartComposition` doc ends a composition on.
     state.observe_stage_occupancy(stage_arn, SystemTime::now());
@@ -2904,6 +2942,12 @@ pub fn leave_stage_session(
             }
         }
     }
+    // A replication replicates a PUBLISHING participant, so a publisher leaving puts every
+    // replication it sources from this session on the reconnect deadline its own window
+    // earns it, through the one place a publisher's connection is observed. The end itself
+    // is the clock's ([`materialize_due_replications`]), so this records a deadline and
+    // nothing else.
+    observe_replication_publisher(state, stage_arn, session_id, participant_id, SystemTime::now());
     // A departure can leave the stage with no participant in it at all, which is when the
     // timeout the model's `StartComposition` doc ends a composition on starts running for
     // every composition of that stage ("After a 1-minute timeout, when all participants
@@ -2972,7 +3016,7 @@ pub fn release_ended_replica(
         replica.participant_id == ended.participant_id
             && replica.destination_stage_arn == ended.destination_stage_arn
             && replica.destination_session_id == ended.destination_session_id
-            && replica.replication_state == REPLICATION_STATE_ACTIVE
+            && replica.is_active()
     });
     if still_replicated {
         return false;
@@ -2983,6 +3027,119 @@ pub fn release_ended_replica(
         &ended.destination_session_id,
         &ended.participant_id,
     )
+}
+
+/// Tell the replications that `participant_id` SOURCES from the session `session_id` of
+/// `stage_arn` what that publisher's connection is at `now`.
+///
+/// A replication replicates "a publishing participant", so it runs only while that
+/// publisher is in the session it publishes in: the model states the rule on
+/// `StartParticipantReplicationRequest$reconnectWindowSeconds` — "If the participant
+/// disconnects and then reconnects within the specified interval, replication will continue
+/// to be `ACTIVE`" — so a publisher that has left owes each replication it sources its end
+/// one window after it went, and the same publisher back inside that window takes that
+/// deadline away again and the replication goes on running.
+///
+/// Called from the two places a participant's connection changes ([`join_stage_session`] and
+/// [`leave_stage_session`]), so every way a publisher goes or comes back decides the
+/// deadline in one place. It is the publisher of THAT session this answers about: a
+/// replication names the source session its publisher publishes in, which
+/// `ParticipantReplica$sourceSessionId` reports and which no later call changes, and a
+/// session "ends after the last participant leaves the stage" — so a departure that ended
+/// the session left no session to come back to and the end stands.
+///
+/// Recording the deadline is all this does — the end itself is the clock's, written down by
+/// [`materialize_due_replications`], which is also what takes the replica out of the
+/// destination stage — so this is never the call that ends a replication and cannot
+/// re-enter the departure it is called from.
+fn observe_replication_publisher(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    session_id: &str,
+    participant_id: &str,
+    now: SystemTime,
+) {
+    let connected = session_participant(state, stage_arn, session_id, participant_id)
+        .is_some_and(|participant| participant.state == PARTICIPANT_STATE_CONNECTED);
+    // The replications SOURCED from this stage are the ones this stage's key holds; a
+    // replication INTO it is a replication of another stage's publisher, whose connection
+    // this says nothing about.
+    let Some(sourced) = state.participant_replicas.get_mut(stage_arn) else {
+        return;
+    };
+    for replication in sourced.iter_mut().filter(|replication| {
+        replication.participant_id == participant_id
+            && replication.source_session_id == session_id
+            && replication.is_active()
+    }) {
+        if connected {
+            replication.reconnect_deadline = None;
+        } else if replication.reconnect_deadline.is_none() {
+            // The window is the one the start asked for, so a replication whose caller
+            // asked for none is owed its end at the instant the publisher went.
+            let window =
+                Duration::from_secs(u64::try_from(replication.reconnect_window_seconds).unwrap_or(
+                    u64::try_from(DEFAULT_REPLICATION_RECONNECT_WINDOW_SECONDS).unwrap_or(0),
+                ));
+            replication.reconnect_deadline = Some(now + window);
+        }
+    }
+}
+
+/// Write down the end of every replication the clock has already made due at `now`.
+///
+/// A replication whose publisher has been gone for its whole reconnect window is over —
+/// the rule the model states on `reconnectWindowSeconds`, read off the deadline
+/// [`observe_replication_publisher`] recorded — and it ends exactly as a caller's stop ends
+/// it: the record reaches its stopped state ([`ParticipantReplicaRecord::stop`]), the end is
+/// an occurrence of the publisher's session ([`record_replication_stopped`]) and the replica
+/// leaves the destination stage ([`release_ended_replica`]).
+///
+/// Each of those ends was owed at that deadline whether or not anybody called, so this
+/// changes nothing a caller reading at the same instant would have seen differently — which
+/// is why a reporting operation may call it, exactly as it may materialise what the clock
+/// owes a composition
+/// ([`ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`]).
+pub fn materialize_due_replications(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    now: SystemTime,
+) {
+    // Ending one replication takes its replica out of the destination stage, and that
+    // replica can itself be the publisher of a FURTHER replication sourced from that stage,
+    // whose own deadline is then recorded and can already be due — so the walk repeats
+    // until this store holds no due replication. Every pass ends at least one of the
+    // finitely many running replications, so it terminates.
+    loop {
+        let mut due: Vec<ParticipantReplicaRecord> = Vec::new();
+        for replication in state.participant_replicas.values_mut().flatten() {
+            let owed = replication.is_active()
+                && replication
+                    .reconnect_deadline
+                    .is_some_and(|deadline| deadline <= now);
+            if owed {
+                replication.stop();
+                due.push(replication.clone());
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
+        // Start order, so what this writes down does not depend on the order this store
+        // happens to hold its replications in: the occurrences of one session are in
+        // occurrence order, and two replications ending at the same instant are recorded in
+        // the order they were started.
+        due.sort_by_key(|ended| ended.sequence);
+        // Each end is written over a store in which every replication ending in this pass
+        // has ALREADY stopped, which is the premise both of these take: no replication
+        // still running is reported as having ended, and a replica stays in the destination
+        // stage while any other replication still puts it there.
+        for ended in &due {
+            record_replication_stopped(state, ended);
+        }
+        for ended in &due {
+            release_ended_replica(state, ended);
+        }
+    }
 }
 
 /// End every replication the stage `stage_arn` is an end of, and drop the records of them.
@@ -3010,11 +3167,8 @@ pub fn end_replications_of_stage(
     // members off.
     let mut sourced_here: Vec<ParticipantReplicaRecord> = Vec::new();
     if let Some(sourced) = state.participant_replicas.get_mut(stage_arn) {
-        for replication in sourced
-            .iter_mut()
-            .filter(|replication| replication.replication_state == REPLICATION_STATE_ACTIVE)
-        {
-            replication.replication_state = REPLICATION_STATE_STOPPED.to_string();
+        for replication in sourced.iter_mut().filter(|replication| replication.is_active()) {
+            replication.stop();
             sourced_here.push(replication.clone());
         }
     }
@@ -3024,10 +3178,9 @@ pub fn end_replications_of_stage(
     let mut into_here: Vec<ParticipantReplicaRecord> = Vec::new();
     for replications in state.participant_replicas.values_mut() {
         for replication in replications.iter_mut().filter(|replication| {
-            replication.destination_stage_arn == stage_arn
-                && replication.replication_state == REPLICATION_STATE_ACTIVE
+            replication.destination_stage_arn == stage_arn && replication.is_active()
         }) {
-            replication.replication_state = REPLICATION_STATE_STOPPED.to_string();
+            replication.stop();
             into_here.push(replication.clone());
         }
     }

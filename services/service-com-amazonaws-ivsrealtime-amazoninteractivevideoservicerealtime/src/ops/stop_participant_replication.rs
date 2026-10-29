@@ -189,6 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // A replication of a publisher that has stayed away for its whole reconnect window
+        // has already ended, so what the clock owes is written down before this resolves
+        // the RUNNING replication below: a stop names the replication a caller reading at
+        // this instant is told is `ACTIVE`.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         // Both stages the request names are resources of this service, so neither being
         // held in this request's own region's view of the account is the modelled
         // `ResourceNotFoundException` (HTTP 404) — the same two lookups, in the same
@@ -216,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 replicas.iter_mut().find(|replica| {
                     replica.participant_id == input.participant_id
                         && replica.destination_stage_arn == input.destination_stage_arn
-                        && replica.replication_state == crate::state::REPLICATION_STATE_ACTIVE
+                        && replica.is_active()
                 })
             });
         let Some(replication) = running else {
@@ -230,10 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // The stop takes effect now: `ReplicationState` carries no value between its two,
-        // so the replication every reader reports is stopped from here on. The record
-        // itself stays — that state is what `ListParticipantReplicas` reports for a replica
-        // whose replication has ended.
-        replication.replication_state = crate::state::REPLICATION_STATE_STOPPED.to_string();
+        // so the replication every reader reports is stopped from here on — through the one
+        // place a replication stops (`crate::state::ParticipantReplicaRecord::stop`), which
+        // also takes away any end the clock was owed it. The record itself stays — that
+        // state is what `ListParticipantReplicas` reports for a replica whose replication
+        // has ended.
+        replication.stop();
         let stopped = replication.clone();
 
         // Replication stopping is an occurrence during the session the replicated publisher

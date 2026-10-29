@@ -228,6 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // A replication of a publisher that has stayed away for its whole reconnect window
+        // has ended, so what the clock already owes is written down before this resolves
+        // what is running: the replication a start would conflict with is one a caller
+        // reading at this instant is told is `ACTIVE`.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         // Both stages have to exist in this request's own region's view of the account:
         // one to publish in, one to replicate into.
         for stage_arn in [&input.source_stage_arn, &input.destination_stage_arn] {
@@ -277,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 replicas.iter().any(|replica| {
                     replica.participant_id == input.participant_id
                         && replica.destination_stage_arn == input.destination_stage_arn
-                        && replica.replication_state == crate::state::REPLICATION_STATE_ACTIVE
+                        && replica.is_active()
                 })
             });
         if already_replicated {
@@ -346,6 +351,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reconnect_window_seconds: input
                 .reconnect_window_seconds
                 .unwrap_or(crate::state::DEFAULT_REPLICATION_RECONNECT_WINDOW_SECONDS),
+            // The publisher is in the stage it publishes in — checked above — so this
+            // replication is owed no end: the deadline is what its publisher LEAVING
+            // earns it (`crate::state::leave_stage_session`).
+            reconnect_deadline: None,
             attributes,
             started_at: ::std::time::SystemTime::now(),
             sequence,

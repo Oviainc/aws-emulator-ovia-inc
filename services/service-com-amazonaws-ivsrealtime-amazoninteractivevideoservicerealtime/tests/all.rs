@@ -97,6 +97,8 @@ mod region_scoped_resources;
 mod replicated_participant_views;
 #[path = "all/replication_end_recorded_in_source_session.rs"]
 mod replication_end_recorded_in_source_session;
+#[path = "all/replication_follows_publisher_connection.rs"]
+mod replication_follows_publisher_connection;
 #[path = "all/response_headers.rs"]
 mod response_headers;
 #[path = "all/signing_name_routing.rs"]

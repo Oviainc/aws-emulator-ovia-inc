@@ -208,7 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // page size of zero can never make pagination loop forever.
             .max(1);
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A session ends when its last participant leaves, which a replica leaving can be:
+        // a replication runs only while the publisher it replicates is connected, so the
+        // end the clock already owes one whose publisher's reconnect window has run out is
+        // written down first and a page carries the sessions a caller reading at this
+        // instant sees.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         // Start order, so a session beginning or ending mid-pagination cannot shift a
         // later page onto an already-returned one. A stage this request's region holds no
         // session for — one with no participant yet, one never created, or one of another

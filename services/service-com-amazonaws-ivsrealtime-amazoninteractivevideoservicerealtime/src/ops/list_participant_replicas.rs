@@ -195,7 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // page size of zero can never make pagination loop forever.
             .max(1);
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A replication runs only while the publisher it replicates is connected, so the
+        // end the clock already owes one whose publisher's reconnect window has run out is
+        // written down before this reports it: what a page carries is then what a caller
+        // reading at this instant sees, and nothing a reader at that instant would not
+        // have seen is changed.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         // The replicas of this participant, in the order replication started them — the
         // stable key a page resumes from, so starting a further replication
         // mid-pagination cannot shift a later page onto an already-returned one.

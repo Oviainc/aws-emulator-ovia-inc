@@ -173,7 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(GetParticipantErrorModeled::InternalServerException)
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // A replication runs only while the publisher it replicates is connected, and this
+        // reports both what a participant's replication is and whether a replica is still
+        // in the stage, so the end the clock already owes a replication whose publisher's
+        // reconnect window has run out is written down first: this answers what a caller
+        // reading at this instant sees.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
 
         // Each of the three identifiers is resolved in turn, and the one that resolves
         // to nothing is the one the 404 names: a session id names a session of ONE

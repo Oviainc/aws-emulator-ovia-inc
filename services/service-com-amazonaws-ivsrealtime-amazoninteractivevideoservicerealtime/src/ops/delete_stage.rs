@@ -151,6 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::store_unavailable(DeleteStageErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
+        // A replication of a publisher that has stayed away for its whole reconnect window
+        // has already ended, so what the clock owes is written down before this delete ends
+        // what is left: a replication this delete reports as ending is one a caller reading
+        // at this instant is told is still running.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         if store.stage_in(&region, &input.arn).is_none() {
             return Err(crate::state::resource_not_found(
                 DeleteStageErrorModeled::ResourceNotFoundException,

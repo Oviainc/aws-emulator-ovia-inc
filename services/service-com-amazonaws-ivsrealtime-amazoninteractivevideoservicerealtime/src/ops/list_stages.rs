@@ -183,7 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // zero can never make pagination loop forever.
             .max(1);
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // A stage summary reports the session that stage has running, which a replica
+        // leaving can end: a replication runs only while the publisher it replicates is
+        // connected, so the end the clock already owes one whose publisher's reconnect
+        // window has run out is written down first and a page carries the stages a caller
+        // reading at this instant sees.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         let remaining: Vec<&crate::state::StageRecord> = store
             .stages_in_order(&region)
             .into_iter()

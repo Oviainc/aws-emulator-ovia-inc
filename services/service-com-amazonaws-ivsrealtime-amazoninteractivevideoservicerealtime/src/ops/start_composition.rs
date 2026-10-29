@@ -298,6 +298,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         let mut store = state.lock();
+        // What the clock owes a replication is written down FIRST of all: a replication
+        // whose publisher stayed away for its whole reconnect window ends with its replica
+        // leaving the destination stage, so whether the stage this start composites holds
+        // anybody is decided over the participants a caller reading at this instant sees.
+        crate::state::materialize_due_replications(&mut store, now);
         // Everything below reads the store, so the transitions the clock has already made
         // due are written down FIRST — including the reclamation of a composition whose
         // stop has finished. Doing it here rather than inside the idempotency branch is

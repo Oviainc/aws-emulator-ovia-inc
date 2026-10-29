@@ -157,6 +157,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::store_unavailable(GetCompositionErrorModeled::InternalServerException)
         })?;
         let mut store = state.lock();
+        // What the clock owes a replication FIRST: a replication whose publisher stayed
+        // away for its whole reconnect window ends with its replica leaving the
+        // destination stage, which is one of the ways the stage a composition composites
+        // comes to hold nobody and so earns that composition its own deadline.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
         store.materialize_due_compositions(::std::time::SystemTime::now());
         let record = store.composition_in(&region, &input.arn).ok_or_else(|| {
             crate::state::resource_not_found(
