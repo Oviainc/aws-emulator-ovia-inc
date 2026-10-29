@@ -55,6 +55,8 @@ mod campaign_state_batch;
 mod campaign_stop;
 #[path = "all/common.rs"]
 mod common;
+#[path = "all/communication_limits_refusal_wording.rs"]
+mod communication_limits_refusal_wording;
 #[path = "all/connect_instance_config_deletion.rs"]
 mod connect_instance_config_deletion;
 #[path = "all/connect_instance_integration_deletion.rs"]

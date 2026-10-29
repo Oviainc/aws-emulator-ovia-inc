@@ -366,7 +366,11 @@ pub const MAX_COMMUNICATION_LIMITS: usize = 2;
 /// (`CreateCampaign`, `UpdateCampaignCommunicationLimits`,
 /// `PutInstanceCommunicationLimits`) refuses an over-long list the same way. `member`
 /// is the request path the refusal names, so the message is built from the request
-/// rather than fixed text.
+/// rather than fixed text, and the sentence itself is built from the framework's own
+/// [`::smithy_server_runtime::Violation`] and rendered by
+/// `aws_smithy_schema_server::constraints::envelope` — the one place that wording
+/// lives — so this handler refusal and a boundary refusal of the same `@length` read
+/// identically.
 pub fn communication_limits_violation(
     member: &str,
     limits: Option<&CommunicationLimits>,
@@ -374,12 +378,17 @@ pub fn communication_limits_violation(
     let count = match limits? {
         CommunicationLimits::communicationLimitsList(list) => list.len(),
     };
-    (count > MAX_COMMUNICATION_LIMITS).then(|| {
-        format!(
-            "Value at '{member}' failed to satisfy constraint: \
-             Member must have length less than or equal to {MAX_COMMUNICATION_LIMITS}"
-        )
-    })
+    if count <= MAX_COMMUNICATION_LIMITS {
+        return None;
+    }
+    let violation = ::smithy_server_runtime::Violation {
+        path: member.to_string(),
+        kind: ::smithy_server_runtime::ViolationKind::MaxLength(MAX_COMMUNICATION_LIMITS as i64),
+        // The `<n> items` form the framework displays a LIST's own length with (a map's
+        // is `<n> entries`, which is what [`tag_count_violation`] shows).
+        value: Some(format!("{count} items")),
+    };
+    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
 }
 
 /// Why the keys of the MAP at `member` are a bad request, or `None` when every one of
