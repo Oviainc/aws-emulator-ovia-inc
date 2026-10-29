@@ -42,15 +42,20 @@
 //! the instance go with it only when the request's campaign deletion policy says so.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimits,
-    CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationSummary,
-    EncryptionConfig, EntryLimitsConfig, InstanceCommunicationLimitsConfig, InstanceConfig,
+    Campaign, CampaignSummary, ChannelSubtypeConfig, ChannelSubtypeParameters, CommunicationLimits,
+    CommunicationLimitsConfig, CommunicationTimeConfig, CustomerProfilesIntegrationConfig,
+    CustomerProfilesIntegrationIdentifier, CustomerProfilesIntegrationSummary,
+    EmailChannelSubtypeParameters, EncryptionConfig, EntryLimitsConfig, EventTrigger,
+    InstanceCommunicationLimitsConfig, InstanceConfig,
     InstanceOnboardingJobStatus, IntegrationConfig, IntegrationIdentifier, IntegrationSummary,
-    LambdaIntegrationSummary,
-    OpenHours, QConnectIntegrationSummary, Schedule, Source, TimeWindow, DAY_OF_WEEK_VALUES,
+    LambdaIntegrationConfig, LambdaIntegrationIdentifier, LambdaIntegrationSummary,
+    OpenHours, QConnectIntegrationConfig, QConnectIntegrationIdentifier, QConnectIntegrationSummary,
+    Schedule, SmsChannelSubtypeParameters, Source, TelephonyChannelSubtypeParameters, TimeWindow,
+    WhatsAppChannelSubtypeParameters, DAY_OF_WEEK_VALUES,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -401,6 +406,231 @@ pub fn communication_time_violation(
         }
     }
     None
+}
+
+// =============================================================================
+// The ARNs this service's unions carry
+// =============================================================================
+//
+// A constrained member reaches a handler already checked — unless a UNION stands
+// between it and the root of the request, because the generated member schemas of a
+// union carry no constraint traits, so the centralized walk has nothing to enforce
+// there and does not descend (the same reason the two checks above exist). The value
+// behind the union member is therefore judged HERE by that very walk, started one
+// level down: `aws_smithy_schema_server::constraints::validate` over a structure
+// behind a union member, whose generated member schemas DO carry the model's
+// `@length`/`@pattern`, and the walk's `ValidatingSerializer` over the one union
+// member that is a bare string. Same rules and same wording as the boundary, so no
+// record can come to hold — and no read project — an ARN the model's own shape
+// forbids.
+
+/// The modelled `Arn` rules, from `smithy_query(query="shape", shape="Arn")`:
+/// `@length(min: 20, max: 500)` with the ARN `@pattern`.
+///
+/// Restated here for `Source$customerProfilesSegmentArn` alone — the one ARN behind a
+/// union that is a BARE STRING, so there is no generated structure schema carrying
+/// those traits to walk instead, and [`SEGMENT_ARN_SCHEMA`] gives them back. Pinned to
+/// the model by
+/// `tests/all/union_member_arn_constraints.rs::the_arn_rules_this_crate_restates_are_the_models`,
+/// which reads these three values out of `smithy-model/` and fails if they drift.
+pub const ARN_MIN_LEN: i64 = 20;
+/// See [`ARN_MIN_LEN`].
+pub const ARN_MAX_LEN: i64 = 500;
+/// See [`ARN_MIN_LEN`].
+pub const ARN_PATTERN: &str =
+    r"^arn:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+:[a-z]{2}-[a-z]+-\d{1,2}:[a-zA-Z0-9-]+:[^:]+(?:/[^:]+)*(?:/[^:]+)?(?:\:[^:]+)?$";
+
+/// `Arn`'s constraints as the trait map the framework's constraint walk reads them
+/// from, built from [`ARN_MIN_LEN`] and its siblings so the rules enforced and the
+/// rules the refusal states are one statement.
+static SEGMENT_ARN_TRAITS: LazyLock<::aws_smithy_schema::TraitMap> = LazyLock::new(|| {
+    let mut traits = ::aws_smithy_schema::TraitMap::new();
+    traits.insert(Box::new(
+        ::aws_smithy_schema_server::constraints::LengthTrait::new(
+            Some(ARN_MIN_LEN),
+            Some(ARN_MAX_LEN),
+        ),
+    ));
+    traits.insert(Box::new(
+        ::aws_smithy_schema_server::constraints::PatternTrait::new(ARN_PATTERN),
+    ));
+    traits
+});
+
+/// The member schema the walk judges `Source$customerProfilesSegmentArn` against: one
+/// string member carrying `Arn`'s own constraints, since the union's generated member
+/// schema carries none.
+static SEGMENT_ARN_SCHEMA: LazyLock<::aws_smithy_schema::Schema> = LazyLock::new(|| {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connectcampaignsv2#Source$customerProfilesSegmentArn",
+            "com.amazonaws.connectcampaignsv2",
+            "customerProfilesSegmentArn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "customerProfilesSegmentArn",
+        0,
+    )
+    .with_traits(&SEGMENT_ARN_TRAITS)
+});
+
+/// `violations` as the refusal message a handler answers with, every path prefixed by
+/// `member` — the request path the walk below was started beneath, so the clause names
+/// the member as the CALLER spelled it rather than as the sub-walk saw it.
+///
+/// Rendered by `aws_smithy_schema_server::constraints::envelope` — the one place that
+/// wording lives — so a refusal from inside a handler reads exactly like one from the
+/// boundary.
+fn union_member_refusal(
+    member: &str,
+    mut violations: Vec<::smithy_server_runtime::Violation>,
+) -> Option<String> {
+    violations.truncate(MAX_REPORTED_VIOLATIONS);
+    for violation in &mut violations {
+        violation.path = format!("{member}.{}", violation.path);
+    }
+    ::aws_smithy_schema_server::constraints::envelope(&violations)
+}
+
+/// The refusal for the bare string `value` that arrived at `member`, judged against
+/// the member `schema` by the framework's own walk, or `None` when the shape admits
+/// it.
+fn string_member_refusal(
+    member: &str,
+    schema: &::aws_smithy_schema::Schema,
+    value: &str,
+) -> Option<String> {
+    use ::aws_smithy_schema::serde::ShapeSerializer as _;
+
+    let mut validator = ::aws_smithy_schema_server::constraints::ValidatingSerializer::new();
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_string(schema, value);
+    union_member_refusal(member, validator.into_violations())
+}
+
+/// The refusal for the structure that arrived at `member`, judged against its own
+/// generated `schema` — whose member schemas carry every constraint the model
+/// declares on them — or `None` when it satisfies all of them.
+fn structure_refusal(
+    member: &str,
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+    schema: &::aws_smithy_schema::Schema,
+) -> Option<String> {
+    union_member_refusal(
+        member,
+        ::aws_smithy_schema_server::constraints::validate(value, schema),
+    )
+}
+
+/// Why the `Source` at `member` is a bad request, or `None` when the value the union
+/// member in force carries satisfies every constraint its shape declares.
+///
+/// The one place a campaign's source is judged, so every operation that sets one
+/// (`CreateCampaign`, `UpdateCampaignSource`) refuses the same value the same way and
+/// no stored campaign projects a source the model forbids. `member` is the request
+/// path the refusal names, so the message is built from the request rather than fixed
+/// text.
+pub fn source_violation(member: &str, source: &Source) -> Option<String> {
+    match source {
+        // A bare string behind the union: judged against the member schema that
+        // carries `Arn`'s own constraints.
+        Source::customerProfilesSegmentArn(arn) => {
+            string_member_refusal(member, &SEGMENT_ARN_SCHEMA, arn)
+        }
+        // A structure behind the union: its generated member schemas carry the
+        // model's constraints, so the walk judges it as the boundary would have —
+        // including the optional domain ARN, absent from a trigger that carries none.
+        Source::eventTrigger(trigger) => structure_refusal(
+            &format!("{member}.eventTrigger"),
+            trigger,
+            &EventTrigger::SCHEMA,
+        ),
+    }
+}
+
+/// Why the `IntegrationConfig` at `member` is a bad request, or `None` when the
+/// structure the union member in force carries satisfies every constraint its shape
+/// declares — `Arn` for the Customer Profiles domain and the Q Connect knowledge
+/// base, `LambdaArn` for the Lambda function.
+pub fn integration_config_violation(member: &str, config: &IntegrationConfig) -> Option<String> {
+    match config {
+        IntegrationConfig::customerProfiles(profiles) => structure_refusal(
+            &format!("{member}.customerProfiles"),
+            profiles,
+            &CustomerProfilesIntegrationConfig::SCHEMA,
+        ),
+        IntegrationConfig::qConnect(q_connect) => structure_refusal(
+            &format!("{member}.qConnect"),
+            q_connect,
+            &QConnectIntegrationConfig::SCHEMA,
+        ),
+        IntegrationConfig::Lambda(lambda) => structure_refusal(
+            &format!("{member}.lambda"),
+            lambda,
+            &LambdaIntegrationConfig::SCHEMA,
+        ),
+    }
+}
+
+/// Why the `IntegrationIdentifier` at `member` is a bad request, or `None` when the
+/// structure the union member in force carries satisfies every constraint its shape
+/// declares.
+///
+/// The same rules the config is judged by, read from the same schemas: an identifier
+/// names the integration a config created, so a value one refuses cannot name an
+/// integration the other could have stored.
+pub fn integration_identifier_violation(
+    member: &str,
+    identifier: &IntegrationIdentifier,
+) -> Option<String> {
+    match identifier {
+        IntegrationIdentifier::customerProfiles(profiles) => structure_refusal(
+            &format!("{member}.customerProfiles"),
+            profiles,
+            &CustomerProfilesIntegrationIdentifier::SCHEMA,
+        ),
+        IntegrationIdentifier::qConnect(q_connect) => structure_refusal(
+            &format!("{member}.qConnect"),
+            q_connect,
+            &QConnectIntegrationIdentifier::SCHEMA,
+        ),
+        IntegrationIdentifier::Lambda(lambda) => structure_refusal(
+            &format!("{member}.lambda"),
+            lambda,
+            &LambdaIntegrationIdentifier::SCHEMA,
+        ),
+    }
+}
+
+/// Why the `ChannelSubtypeParameters` at `member` are a bad request, or `None` when
+/// the parameters of the channel in force satisfy every constraint their shape
+/// declares — the source-number and template ARNs among them.
+pub fn channel_subtype_parameters_violation(
+    member: &str,
+    parameters: &ChannelSubtypeParameters,
+) -> Option<String> {
+    match parameters {
+        ChannelSubtypeParameters::Telephony(telephony) => structure_refusal(
+            &format!("{member}.telephony"),
+            telephony,
+            &TelephonyChannelSubtypeParameters::SCHEMA,
+        ),
+        ChannelSubtypeParameters::Sms(sms) => structure_refusal(
+            &format!("{member}.sms"),
+            sms,
+            &SmsChannelSubtypeParameters::SCHEMA,
+        ),
+        ChannelSubtypeParameters::Email(email) => structure_refusal(
+            &format!("{member}.email"),
+            email,
+            &EmailChannelSubtypeParameters::SCHEMA,
+        ),
+        ChannelSubtypeParameters::whatsApp(whats_app) => structure_refusal(
+            &format!("{member}.whatsApp"),
+            whats_app,
+            &WhatsAppChannelSubtypeParameters::SCHEMA,
+        ),
+    }
 }
 
 /// Encode a cursor-paged list's cursor: the sequence number of the last record on

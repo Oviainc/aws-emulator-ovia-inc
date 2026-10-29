@@ -99,3 +99,5 @@ mod tag_key_refusal;
 mod tag_key_rules;
 #[path = "all/tag_removal.rs"]
 mod tag_removal;
+#[path = "all/union_member_arn_constraints.rs"]
+mod union_member_arn_constraints;

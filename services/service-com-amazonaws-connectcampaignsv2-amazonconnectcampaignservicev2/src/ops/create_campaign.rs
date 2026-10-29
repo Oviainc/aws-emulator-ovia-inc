@@ -215,6 +215,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The ARNs behind the `Source` union sit where the centralized constraint
+        // walk does not reach either, so the shared check holds them to the
+        // `@length` and `@pattern` of the shape they target before the campaign is
+        // stored — exactly as `UpdateCampaignSource` does when it replaces one.
+        if let Some(message) = input
+            .source
+            .as_ref()
+            .and_then(|source| crate::state::source_violation("source", source))
+        {
+            return Err(CreateCampaignErrorModeled::ValidationException(ValidationException {
+                message,
+                x_amz_error_type: None,
+            })
+            .into());
+        }
+
         // A tag map's KEYS are a constrained shape like any other input member, and
         // the centralized walk reaches neither their `@length` (a map key is captured
         // as a path segment, never validated as a leaf) nor their `@pattern` (whose

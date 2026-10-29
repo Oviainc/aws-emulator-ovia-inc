@@ -147,8 +147,12 @@ async fn a_source_is_stored_and_every_read_projects_it() {
         (
             "another partition and a nested resource path with a qualifier",
             None,
+            // `aws-us-gov` with a commercial-style region: `Arn`'s `@pattern` spells
+            // the region field `[a-z]{2}-[a-z]+-\d{1,2}`, which a GovCloud region's
+            // second hyphen group is outside — the same spelling the flow-ARN suite
+            // uses for the partition, where the boundary walk enforces that pattern.
             vec![json!({"customerProfilesSegmentArn":
-                "arn:aws-us-gov:profile:us-gov-west-1:000000000000:domains/d-6/segments/s-6:v2"})],
+                "arn:aws-us-gov:profile:us-west-1:000000000000:domains/d-6/segments/s-6:v2"})],
         ),
         (
             "a China-partition ARN behind the event trigger",

@@ -18,6 +18,12 @@
 //! entry point the sibling configuration updates resolve and refuse through — which is
 //! what this operation's modelled `InvalidCampaignStateException` reports.
 //!
+//! The ARN the source carries is checked first, through the shared
+//! [`crate::state::source_violation`]: it sits behind a union member, where the
+//! centralized constraint walk does not reach, so without that check a campaign could
+//! be stored — and projected by `DescribeCampaign` — holding an ARN the model's own
+//! shape forbids. A violation is this operation's modelled `ValidationException`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -178,6 +184,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The ARNs the `Source` union carries sit behind a union member, which the
+        // centralized constraint walk does not reach, so they are held to the
+        // `@length` and `@pattern` of the shape they target here — as a bad request,
+        // before anything is looked up or stored, so no campaign comes to hold a
+        // source `DescribeCampaign` would project outside the model's own shape.
+        if let Some(message) = crate::state::source_violation("source", &input.source) {
+            return Err(UpdateCampaignSourceErrorModeled::ValidationException(
+                ValidationException {
+                    message,
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateCampaignSourceErrorModeled::InternalServerException(
                 InternalServerException {

@@ -179,6 +179,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The source-number and template ARNs a request carries sit behind the
+        // `channelSubtypeParameters` union, which the centralized constraint walk does
+        // not reach, so the shared check holds each of them to the `@length` and
+        // `@pattern` of the shape it targets. A constraint violation is a bad REQUEST,
+        // not a per-request outcome, so the whole batch is refused before any of it is
+        // taken — the list element is named the way the boundary walk spells one.
+        if let Some(message) = input
+            .outbound_requests
+            .iter()
+            .enumerate()
+            .find_map(|(index, request)| {
+                crate::state::channel_subtype_parameters_violation(
+                    &format!(
+                        "outboundRequests.{}.channelSubtypeParameters",
+                        ::aws_smithy_schema_server::constraints::path::element(index + 1)
+                    ),
+                    &request.channel_subtype_parameters,
+                )
+            })
+        {
+            return Err(PutOutboundRequestBatchErrorModeled::ValidationException(
+                ValidationException {
+                    message,
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutOutboundRequestBatchErrorModeled::InternalServerException(
                 InternalServerException {

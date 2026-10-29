@@ -174,6 +174,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The ARN the identifier carries sits behind a union member, which the
+        // centralized constraint walk does not reach, so the shared check holds it to
+        // the `@length` and `@pattern` of the shape it targets — as a bad request,
+        // before the instance is looked up or anything is removed. An ARN those bounds
+        // refuse is one no put could have stored an integration under.
+        if let Some(message) = crate::state::integration_identifier_violation(
+            "integrationIdentifier",
+            &input.integration_identifier,
+        ) {
+            return Err(
+                DeleteConnectInstanceIntegrationErrorModeled::ValidationException(
+                    ValidationException {
+                        message,
+                        x_amz_error_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteConnectInstanceIntegrationErrorModeled::InternalServerException(
