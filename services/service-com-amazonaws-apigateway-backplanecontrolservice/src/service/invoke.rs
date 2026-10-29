@@ -65,7 +65,11 @@
 //! API's GATEWAY RESPONSE for the matching response type ([`GatewayRefusal`]), so a
 //! developer's `PutGatewayResponse` customization of that type — its status code and its
 //! template — is what the caller sees, and the uncustomized case falls back to the status
-//! code the response type documents ([`crate::state::default_gateway_status_code`]).
+//! code the response type documents ([`crate::state::default_gateway_status_code`]). Such a
+//! refusal also NAMES ITS EXCEPTION CLASS, in the header an SDK reads an error code out of
+//! ([`GatewayRefusal::error_type`]), so a client classifies a refusal instead of reading its
+//! prose — and the class is the endpoint's own, which the control-plane model does not
+//! declare for the data plane any more than it declares the endpoint itself.
 //!
 //! Whatever the outcome, the response NAMES THE REQUEST it answered: every response this
 //! endpoint serves carries a freshly minted per-request id in the header API Gateway
@@ -378,8 +382,18 @@ pub struct GatewayRefusal {
     /// rather than fixed in the binary.
     message: Cow<'static, str>,
     /// The error shape this refusal is the wire form of, reported in
-    /// [`ERROR_TYPE_HEADER`], or `None` for a response type whose exception name this
-    /// service's model does not declare.
+    /// [`ERROR_TYPE_HEADER`], or `None` for a refusal whose exception class nothing in
+    /// reach names.
+    ///
+    /// The class is the one the `execute-api` endpoint itself reports, which is NOT
+    /// confined to the exceptions this service's CONTROL-plane model declares: the data
+    /// plane is not in that model at all (see the module docs), and it answers a refused
+    /// invoke with the exception class of the envelope it sends — the `Forbidden` body
+    /// with `ForbiddenException`, the missing-token body with
+    /// `MissingAuthenticationTokenException`, the IAM-shaped denial with
+    /// `AccessDeniedException`. A client's error handling keys off this header, so
+    /// omitting it on a refusal whose class IS known leaves the caller unable to classify
+    /// a 403 it can otherwise read only as prose.
     error_type: Option<&'static str>,
     /// What a VALIDATION of the request found, as the gateway response's
     /// `$context.error.validationErrorString` reports it; empty for every refusal that is
@@ -408,7 +422,7 @@ impl GatewayRefusal {
 const FORBIDDEN: GatewayRefusal = GatewayRefusal {
     response_type: "ACCESS_DENIED",
     message: Cow::Borrowed("Forbidden"),
-    error_type: None,
+    error_type: Some(FORBIDDEN_EXCEPTION),
     validation_detail: Cow::Borrowed(""),
     message_member: MESSAGE_MEMBER,
 };
@@ -420,7 +434,7 @@ const FORBIDDEN: GatewayRefusal = GatewayRefusal {
 const MISSING_AUTHENTICATION_TOKEN: GatewayRefusal = GatewayRefusal {
     response_type: "MISSING_AUTHENTICATION_TOKEN",
     message: Cow::Borrowed("Missing Authentication Token"),
-    error_type: None,
+    error_type: Some("MissingAuthenticationTokenException"),
     validation_detail: Cow::Borrowed(""),
     message_member: MESSAGE_MEMBER,
 };
@@ -430,7 +444,7 @@ const MISSING_AUTHENTICATION_TOKEN: GatewayRefusal = GatewayRefusal {
 const INVALID_API_KEY: GatewayRefusal = GatewayRefusal {
     response_type: "INVALID_API_KEY",
     message: Cow::Borrowed("Forbidden"),
-    error_type: None,
+    error_type: Some(FORBIDDEN_EXCEPTION),
     validation_detail: Cow::Borrowed(""),
     message_member: MESSAGE_MEMBER,
 };
@@ -440,7 +454,7 @@ const INVALID_API_KEY: GatewayRefusal = GatewayRefusal {
 const UNAUTHORIZED: GatewayRefusal = GatewayRefusal {
     response_type: "UNAUTHORIZED",
     message: Cow::Borrowed("Unauthorized"),
-    error_type: None,
+    error_type: Some("UnauthorizedException"),
     validation_detail: Cow::Borrowed(""),
     message_member: MESSAGE_MEMBER,
 };
@@ -540,7 +554,7 @@ fn access_denied(message: String) -> GatewayRefusal {
     GatewayRefusal {
         response_type: "ACCESS_DENIED",
         message: Cow::Owned(message),
-        error_type: None,
+        error_type: Some("AccessDeniedException"),
         validation_detail: Cow::Borrowed(""),
         message_member: AUTHORIZATION_MESSAGE_MEMBER,
     }
@@ -558,7 +572,7 @@ fn access_denied(message: String) -> GatewayRefusal {
 const WAF_FILTERED: GatewayRefusal = GatewayRefusal {
     response_type: "WAF_FILTERED",
     message: Cow::Borrowed("Forbidden"),
-    error_type: None,
+    error_type: Some(FORBIDDEN_EXCEPTION),
     validation_detail: Cow::Borrowed(""),
     message_member: MESSAGE_MEMBER,
 };
@@ -566,6 +580,15 @@ const WAF_FILTERED: GatewayRefusal = GatewayRefusal {
 /// The header API Gateway names the error shape of a refused request in, which is what an
 /// SDK reads a restJson1 error code out of.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
+/// The exception class every refusal whose body is the `Forbidden` envelope is the wire
+/// form of: the endpoint refusing the call outright, whether because the API, the stage or
+/// the endpoint does not serve it ([`FORBIDDEN`]), because the method requires an API key
+/// the request did not present ([`INVALID_API_KEY`]), or because the web ACL in front of
+/// the stage blocked it ([`WAF_FILTERED`]). One sentence, one status, one class: a caller
+/// that reads the class reads the same one for all three, as the recorded keyless invoke of
+/// a key-required method shows.
+const FORBIDDEN_EXCEPTION: &str = "ForbiddenException";
 
 /// What an invoke addresses, as the wire carries it: the request's host — absent on a
 /// request that carries neither a `Host` header nor an absolute URI — its path, and the api
@@ -2930,8 +2953,9 @@ pub fn carries_sigv4_credential(req: &RtRequest) -> bool {
 /// One gateway-response refusal, rendered as the API serves it on the wire.
 ///
 /// The response NAMES the error shape it is the wire form of, in the header an SDK reads a
-/// restJson1 error code out of, for every refusal whose exception this service's model
-/// declares ([`GatewayRefusal::error_type`]).
+/// restJson1 error code out of, for every refusal whose exception class is known
+/// ([`GatewayRefusal::error_type`]) — the endpoint's own classes, not only the ones this
+/// service's control-plane model declares.
 fn refusal_response(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> RtResponse {
     let error_type = refusal.error_type;
     let (status, body) = refusal_rendering(api, refusal);
