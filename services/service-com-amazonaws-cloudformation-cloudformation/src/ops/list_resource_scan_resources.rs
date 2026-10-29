@@ -159,6 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::resource_scans as scans;
 
+        // A `ResourceScanId` outside the form the member documents addresses no scan that
+        // could exist, so it is an input-constraint violation rather than a lookup failure:
+        // checked AHEAD of the state lookup, so a caller can tell a malformed id from a scan
+        // this account and Region does not hold ([`scans::validate_resource_scan_id`]).
+        if let Err(message) = scans::validate_resource_scan_id(&input.resource_scan_id) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no scan to read, so this answers 501
             // rather than an empty, truthful-looking list.

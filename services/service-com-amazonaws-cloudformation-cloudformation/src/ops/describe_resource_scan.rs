@@ -160,6 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::resource_scans as scans;
 
+        // A `ResourceScanId` outside the form the member documents addresses no scan that
+        // could exist, so it is an input-constraint violation rather than a lookup failure:
+        // checked AHEAD of the state lookup, so a caller can tell a malformed id from a scan
+        // this account and Region does not hold ([`scans::validate_resource_scan_id`]).
+        if let Err(message) = scans::validate_resource_scan_id(&input.resource_scan_id) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no scan to read, so this answers 501
             // rather than a status nothing stands behind.
@@ -195,10 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The time that the resource scan was finished" — absent while it is running.
             end_time: scan.end_time.map(crate::state::timestamp),
             percentage_completed: scan.percentage_completed,
-            resource_types: scan
-                .types_are_available()
-                .then(|| crate::state::non_empty(scan.resource_types()))
-                .flatten(),
+            // "The list of resource types for the specified scan. Resource types are only
+            // available for scans with a `Status` set to `COMPLETE` or `FAILED`" — so the
+            // member is PRESENT, as an empty element, for a scan whose status admits it and
+            // whose rows carry no type, and absent only while the status withholds it. A
+            // client iterating the list sees the same shape either way.
+            resource_types: scan.types_are_available().then(|| scan.resource_types()),
             resources_scanned: counts
                 // The store holds far fewer resources than `i32::MAX`
                 // (`crate::state::MAX_CONCURRENT_RESOURCES` bounds them), so the saturating

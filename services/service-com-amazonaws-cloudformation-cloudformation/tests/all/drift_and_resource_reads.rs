@@ -972,12 +972,13 @@ async fn describe_type(router: &MultiServiceRouter, type_name: &str) -> (u16, St
 ///
 /// Source: AWS's CloudFormation resource providers are open source, one repository per
 /// service named after the type's own service segment —
-/// `aws-cloudformation-resource-providers-<service>`. Derived here the same way the
-/// registry derives it, so the row for a type the issue never cited is covered too.
+/// `aws-cloudformation-resource-providers-<service>` — and `SourceUrl` is that repository's
+/// CLONE url, so it ends in the `.git` a caller hands a git client. Derived here the same
+/// way the registry derives it, so the row for a type the issue never cited is covered too.
 fn expected_source_url(type_name: &str) -> String {
     let service = type_name.split("::").nth(1).unwrap_or_default();
     format!(
-        "https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-{}",
+        "https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-{}.git",
         service.to_ascii_lowercase()
     )
 }

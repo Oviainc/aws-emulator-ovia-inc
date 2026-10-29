@@ -428,15 +428,19 @@ async fn an_unfinished_scan_refuses_the_reads_of_its_result() {
 async fn a_scan_no_record_answers_for_is_refused_without_naming_the_request() {
     let router = router();
 
-    // Two addresses no scan was ever started under: one in the ARN form a scan's id takes and
-    // one that is not an ARN at all. The refusal is the same fixed sentence either way, since
-    // it names nothing of the request.
+    // Addresses no scan was ever started under, each in the ARN form a scan's id takes — the
+    // refusal of a value OUTSIDE that form is an input-constraint violation instead, which
+    // `scan_and_registry_reads.rs` is what pins. The refusal is the same fixed sentence for
+    // each, since it names nothing of the request.
     let unknown = [
         (
             "an id in the ARN form, under which nothing was started",
             scans::resource_scan_arn("us-east-1", "00000000-0000-4000-8000-000000000001"),
         ),
-        ("an id in no form at all", "not-a-resource-scan".to_string()),
+        (
+            "another well-formed id nothing was started under",
+            scans::resource_scan_arn("us-east-1", "11111111-2222-3333-4444-555555555555"),
+        ),
     ];
     for (case, scan_id) in &unknown {
         for action in ["DescribeResourceScan", "ListResourceScanResources"] {

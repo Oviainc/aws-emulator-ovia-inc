@@ -207,9 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // from: the read as a whole succeeds, which is what makes a batch a batch.
                 errors.push(BatchDescribeTypeConfigurationsError2 {
                     error_code: Some(NOT_FOUND_ERROR_CODE.to_string()),
-                    error_message: Some(crate::state::extension_does_not_exist(
-                        &named(identifier),
-                    )),
+                    error_message: Some(NOT_FOUND_ERROR_MESSAGE.to_string()),
                     type_configuration_identifier: Some(identifier.clone()),
                 });
                 continue;
@@ -241,12 +239,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // All three result members are PRESENT in the answer, as empty elements where this
+        // batch filled none of them: the output models the read as three parallel lists over
+        // one request's identifiers, so a client that iterates all three finds all three
+        // whatever the batch resolved.
         Ok(BatchDescribeTypeConfigurationsOutput {
-            type_configurations: crate::state::non_empty(details),
-            errors: crate::state::non_empty(errors),
+            type_configurations: Some(details),
+            errors: Some(errors),
             // What the bound above left out: "a list of any of the specified extension
             // configurations that CloudFormation could not process for any reason".
-            unprocessed_type_configurations: crate::state::non_empty(unprocessed.to_vec()),
+            unprocessed_type_configurations: Some(unprocessed.to_vec()),
         })
     }
 }
@@ -268,17 +270,15 @@ const MAX_DESCRIBED_TYPE_CONFIGURATIONS: usize = 50;
 /// length (exactly three characters) carries.
 const NOT_FOUND_ERROR_CODE: &str = "404";
 
+/// The `ErrorMessage` that entry carries: the sentence CloudFormation's own batch answers
+/// for an identifier whose configuration the registry does not hold.
+///
+/// A per-entry error of this batch states the CLASS of the miss and names nothing of the
+/// identifier it came from — the entry already carries that identifier under
+/// `TypeConfigurationIdentifier` — so it is a fixed sentence, the way
+/// [`crate::state::resource_scans::NOT_FOUND`] is, rather than one built from the request.
+const NOT_FOUND_ERROR_MESSAGE: &str = "TypeConfiguration not found";
+
 /// What `Configuration` reports for an extension no configuration has been set for: "if a
 /// configuration hasn't been set for a specified extension, CloudFormation returns `{}`".
 const NO_CONFIGURATION: &str = "{}";
-
-/// What one identifier named the extension by, for the error entry's message: whichever of
-/// the identifying members it carries.
-fn named(identifier: &TypeConfigurationIdentifier) -> String {
-    identifier
-        .type_configuration_arn
-        .clone()
-        .or_else(|| identifier.type_arn.clone())
-        .or_else(|| identifier.type_name.clone())
-        .unwrap_or_default()
-}

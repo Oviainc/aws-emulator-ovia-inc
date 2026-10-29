@@ -49,15 +49,26 @@
 //! routing failure, a transport failure and a pre-dispatch refusal. Everything else about
 //! those paths — status, `<Type>`, `<Code>`, `<Message>` — stays with the framework.
 //!
-//! `override_refusal` is taken for one class as well: a refusal of the member that names a
+//! `override_refusal` is taken for two classes as well: a refusal of the member that names a
 //! PUBLIC EXTENSION BY ARN, which CloudFormation's registry parses itself, is stated as the
 //! registry states it rather than as a generic request-validation failure — see
-//! [`registry_refusal_of_a_public_extension_arn`].
+//! [`registry_refusal_of_a_public_extension_arn`] — and a value outside an enum whose value
+//! set this service lists in its own order is stated in THAT order, see
+//! [`enum_value_set_in_the_services_own_order`].
+//!
+//! `override_protocol` is taken for one rendering: a floating-point member is written as a
+//! double, with its fractional part, which is how CloudFormation's envelope writes one —
+//! see [`double_members`].
 
+pub mod double_members;
 pub mod query_error_envelope;
 
 use crate::state::registry;
-use aws_smithy_schema_server::{Violation, ViolationKind};
+use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer};
+use aws_smithy_schema::{Schema, ShapeId};
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol, Violation, ViolationKind};
+use double_members::WithDoublesAsDoubles;
 use query_error_envelope::{CloudFormationDefinition, RequestIdEnvelopeOperation};
 use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
@@ -75,6 +86,79 @@ const PUBLIC_EXTENSION_ARN_PATH: &str = "publicTypeArn";
 /// code its `awsQueryError` trait declares, which is what a client activating a third-party
 /// extension branches on.
 const REGISTRY_REFUSAL_CODE: &str = "CFNRegistryException";
+
+/// The wire error code this service refuses a request on input grounds with — the code a
+/// CloudFormation client branches on, and the one the framework's query renderer already
+/// names for a refused value, restated here because a reworded refusal must carry it too
+/// (see [`crate::scaffolded::Scaffolded::ValidationError`]).
+const VALIDATION_REFUSAL_CODE: &str = "ValidationError";
+
+/// `RegistrationStatus`, in the order CloudFormation's OWN input validation lists its value
+/// set: the registration still running first, then the two statuses it concludes in.
+///
+/// That is the order a registration passes through, and it is not the order the model
+/// declares the enum in (`smithy_query(query="shape", shape="RegistrationStatus")` gives
+/// `[COMPLETE, IN_PROGRESS, FAILED]`) — so the refusal is stated from this order rather than
+/// from the declaration.
+const REGISTRATION_STATUS_VALUE_SET: &[&str] = &["IN_PROGRESS", "COMPLETE", "FAILED"];
+
+/// Every enum of this service whose value set its own refusals state in an order other than
+/// the model's declaration order.
+///
+/// Keyed by the SET rather than by an operation or a member, so each entry governs every
+/// member that targets that enum and one refusal cannot drift from another's.
+const SERVICE_ORDERED_ENUM_VALUE_SETS: &[&[&str]] = &[REGISTRATION_STATUS_VALUE_SET];
+
+/// The order this service states `allowed` in, when it is one of the sets
+/// [`SERVICE_ORDERED_ENUM_VALUE_SETS`] names — compared as a SET, so the model's declaration
+/// order is what the entry replaces.
+fn service_ordered_value_set(allowed: &[String]) -> Option<&'static [&'static str]> {
+    SERVICE_ORDERED_ENUM_VALUE_SETS
+        .iter()
+        .copied()
+        .find(|ordered| {
+            ordered.len() == allowed.len()
+                && allowed
+                    .iter()
+                    .all(|value| ordered.contains(&value.as_str()))
+        })
+}
+
+/// This service's wording for a value outside an enum's declared set: the same refusal the
+/// framework states, with the value set listed in the order the SERVICE lists it
+/// ([`SERVICE_ORDERED_ENUM_VALUE_SETS`]).
+///
+/// The message is a requirement of this error class — a client matching the service's
+/// refusal text matches the order too — and only the order changes: the status, the code and
+/// every other word stay the framework's, which is why the sentence is rebuilt through the
+/// framework's own envelope rather than spelled again here. `None` when no violation of this
+/// request names a set this service orders differently, which keeps every other refusal
+/// exactly as the framework worded it.
+fn enum_value_set_in_the_services_own_order(violations: &[Violation]) -> Option<Refused> {
+    let mut restated = violations.to_vec();
+    let mut reordered = false;
+    for violation in &mut restated {
+        let ViolationKind::EnumValue(allowed) = &mut violation.kind else {
+            continue;
+        };
+        let Some(ordered) = service_ordered_value_set(allowed) else {
+            continue;
+        };
+        let in_the_services_order: Vec<String> =
+            ordered.iter().map(|value| (*value).to_string()).collect();
+        if *allowed != in_the_services_order {
+            *allowed = in_the_services_order;
+            reordered = true;
+        }
+    }
+    if !reordered {
+        return None;
+    }
+    Some(Refused {
+        code: VALIDATION_REFUSAL_CODE.to_string(),
+        message: aws_smithy_schema_server::envelope(&restated)?,
+    })
+}
 
 /// The registry's own refusal for a public-extension ARN this service's registry parses and
 /// resolves nothing from, in place of the generic request-validation wording.
@@ -137,12 +221,109 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
+/// The protocol this service answers modelled requests in: the model's own, with every
+/// floating-point member rendered as a double ([`double_members`]).
+///
+/// Implemented on the service itself because the model-derived protocol it delegates to is
+/// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
+/// [`Service::override_protocol`] hands back a borrow of `&self` — so there is one protocol
+/// instance, the generated one, and no second routing table to drift from the model. Reading
+/// and routing a request are the generated protocol's unchanged; so is every byte of the
+/// envelope it writes.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = WireRequest;
+    type Response = WireResponse;
+
+    fn protocol_id(&self) -> &ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a WireRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a WireRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
+        self.entry
+            .protocol()
+            .deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        self.entry.protocol().serialize_output(
+            &WithDoublesAsDoubles::new(output),
+            output_schema,
+            operation_name,
+            success_status,
+        )
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        // A modelled error of this service declares no floating-point member today, so the
+        // wrapper changes nothing here; it is applied anyway so the rule is the protocol's
+        // rather than one path's, and a modelled error that gains one cannot answer
+        // differently from an output.
+        self.entry.protocol().serialize_error(
+            &WithDoublesAsDoubles::new(error),
+            error_schema,
+            error_code,
+            http_status,
+        )
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<WireResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            &WithDoublesAsDoubles::new(event),
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this names the
+/// protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", &self.entry.protocol().protocol_id())
+            .finish()
+    }
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
         &self.entry
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own protocol, with the one rendering correction above. Held on `&self`
+        // (it IS `&self`), so nothing is built per request.
+        Some(self)
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
@@ -172,12 +353,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. The one class reworded here is a refusal of the member that names a
-        // PUBLIC EXTENSION BY ARN, which the registry parses itself: see
-        // [`registry_refusal_of_a_public_extension_arn`].
+        // wording. Two classes are reworded here: a refusal of the member that names a
+        // PUBLIC EXTENSION BY ARN, which the registry parses itself (see
+        // [`registry_refusal_of_a_public_extension_arn`]), and a value outside an enum whose
+        // value set this service lists in its own order (see
+        // [`enum_value_set_in_the_services_own_order`]).
         match refusal {
             Refusal::Invalid(violations) => {
                 registry_refusal_of_a_public_extension_arn(violations)
+                    .or_else(|| enum_value_set_in_the_services_own_order(violations))
             }
             _ => None,
         }

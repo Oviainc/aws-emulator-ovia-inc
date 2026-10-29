@@ -197,6 +197,8 @@ mod resolved_properties;
 mod sam_deployed_resources;
 #[path = "all/sam_transform.rs"]
 mod sam_transform;
+#[path = "all/scan_and_registry_reads.rs"]
+mod scan_and_registry_reads;
 #[path = "all/scratch.rs"]
 mod scratch;
 #[path = "all/section_loop_expansion.rs"]

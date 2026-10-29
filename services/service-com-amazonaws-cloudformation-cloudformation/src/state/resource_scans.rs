@@ -648,6 +648,101 @@ pub fn invalid_type_filter(filter: &str) -> String {
     )
 }
 
+/// The shape a `ResourceScanId` must have, as CloudFormation's own input validation states
+/// it back to the caller.
+///
+/// `ResourceScanId` is "the Amazon Resource Name (ARN) of the resource scan. The format is
+/// `arn:${Partition}:cloudformation:${Region}:${Account}:resourceScan/${Id}`", and the
+/// service holds the member to exactly that form before it looks anything up. The model
+/// carries no `@pattern` for the shape, so the handler is what enforces it — the same
+/// position [`crate::state::STACK_NAME_PATTERN`] is in — and the pattern is reported in the
+/// refusal verbatim, so it is spelled here once and nowhere else.
+pub const RESOURCE_SCAN_ID_PATTERN: &str =
+    "arn:[a-z0-9-]+:cloudformation:[a-z0-9-]+:[0-9]{12}:resourceScan/[a-z0-9-]+";
+
+/// Whether every character of `segment` is one `[a-z0-9-]` admits, and there is at least
+/// one — the character class [`RESOURCE_SCAN_ID_PATTERN`] spells three of its segments with.
+fn is_lower_alphanumeric_or_hyphen(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Whether `resource_scan_id` satisfies [`RESOURCE_SCAN_ID_PATTERN`], matched over the whole
+/// value the way the service's own anchored pattern match is.
+///
+/// Spelled out segment by segment rather than compiled, since the pattern is fixed: the
+/// partition and the Region are `[a-z0-9-]+`, the service segment is this service's own ARN
+/// namespace, the account is twelve digits, and the resource segment is `resourceScan/`
+/// followed by the scan's id.
+pub fn is_resource_scan_id(resource_scan_id: &str) -> bool {
+    let mut segments = resource_scan_id.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(region), Some(account), Some(resource)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let Some(id) = resource.strip_prefix("resourceScan/") else {
+        return false;
+    };
+    is_lower_alphanumeric_or_hyphen(partition)
+        && service == crate::state::ARN_NAMESPACE
+        && is_lower_alphanumeric_or_hyphen(region)
+        && account.len() == 12
+        && account.chars().all(|c| c.is_ascii_digit())
+        && is_lower_alphanumeric_or_hyphen(id)
+}
+
+/// `Err(message)` for a `ResourceScanId` outside [`RESOURCE_SCAN_ID_PATTERN`], in the
+/// sentence CloudFormation's input validation words that refusal with.
+///
+/// A value of the wrong SHAPE is an input-constraint violation, not a missing resource: it
+/// addresses no scan that could ever exist, so every read of a scan checks it ahead of the
+/// state lookup and answers `ValidationError` rather than [`NOT_FOUND`] — which is what
+/// lets a caller tell a typo in the id from a scan that is not there.
+///
+/// The rejected value is echoed so the caller can see what was refused, bounded at
+/// [`MAX_ECHOED_VALUE`]: the member carries no modelled `@length`, so one request could
+/// otherwise make the refusal as long as the value it sent.
+pub fn validate_resource_scan_id(resource_scan_id: &str) -> Result<(), String> {
+    if is_resource_scan_id(resource_scan_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "1 validation error detected: Value '{}' at 'resourceScanId' failed to satisfy \
+         constraint: Member must satisfy regular expression pattern: \
+         {RESOURCE_SCAN_ID_PATTERN}",
+        echoed(resource_scan_id)
+    ))
+}
+
+/// Ceiling on the rejected value as a refusal echoes it, and the elision past it: the
+/// framework's own, so a refusal this module words and one the boundary validator words
+/// quote a caller's value the same way.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// `value` as a refusal may quote it: itself when short, a character-boundary-safe prefix
+/// with the elision when not.
+///
+/// Rendering only — the CHECK above runs on the whole value, since eliding first would
+/// compare text the caller never sent.
+fn echoed(value: &str) -> ::std::borrow::Cow<'_, str> {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return ::std::borrow::Cow::Borrowed(value);
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    ::std::borrow::Cow::Owned(format!("{}... [{} bytes]", &value[..end], value.len()))
+}
+
 /// The `ResourceScanNotFoundException` message CloudFormation answers when a request names a
 /// resource scan this account and Region holds no record of — an ARN no scan was started
 /// under, one another Region holds, or one this store no longer retains.

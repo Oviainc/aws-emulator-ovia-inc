@@ -1032,23 +1032,31 @@ static REGISTRY_GENESIS: ::std::sync::LazyLock<SystemTime> =
 /// The source the extensions Amazon Web Services publishes are built from: AWS's
 /// CloudFormation resource providers are open source, one repository per service, named
 /// `aws-cloudformation-resource-providers-<service>` after the type's own service segment
-/// (`AWS::S3::Bucket` -> `.../aws-cloudformation-resource-providers-s3`). `SourceUrl` is
+/// (`AWS::S3::Bucket` -> `.../aws-cloudformation-resource-providers-s3.git`). `SourceUrl` is
 /// "the URL of the source code for the extension", and that is the URL for one of these,
 /// derived from the type name rather than held as a per-type constant.
 ///
+/// The URL is the repository's CLONE url, so it carries the [`GIT_REPOSITORY_SUFFIX`] a
+/// caller resolving the extension's source hands straight to a client: a source URL without
+/// it names a web page rather than a repository.
+///
 /// It is also the `sourceUrl` of the resource schema this registry derives for the type
 /// ([`crate::state::resource_schema`]): a published resource schema names that same
-/// repository.
+/// repository, in the same form.
 pub fn aws_published_source_url(type_name: &str) -> Option<String> {
     let service = type_name.split("::").nth(1)?;
     if service.is_empty() {
         return None;
     }
     Some(format!(
-        "https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-{}",
+        "https://github.com/aws-cloudformation/aws-cloudformation-resource-providers-{}{GIT_REPOSITORY_SUFFIX}",
         service.to_ascii_lowercase()
     ))
 }
+
+/// What a git repository's clone url ends in, which is what makes
+/// [`aws_published_source_url`] a URL something can be cloned from.
+pub const GIT_REPOSITORY_SUFFIX: &str = ".git";
 
 /// The version row a PUBLICATION writes on a public extension record: the model the
 /// published version of the private extension carries, addressed by the public version
