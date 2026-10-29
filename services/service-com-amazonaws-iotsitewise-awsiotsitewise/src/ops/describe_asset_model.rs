@@ -253,7 +253,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     properties: if input.exclude_properties {
                         None
                     } else {
-                        composite.properties.clone()
+                        // What a composite model contributes comes from the one
+                        // shared resolver, so this view and every other view of the
+                        // same composite model report the same set: its own
+                        // definitions, or, for a component-model-based composite
+                        // model, the properties of the component model it reuses. A
+                        // composite model that contributes none keeps the stored
+                        // member as it arrived — absent stays absent.
+                        let contributed = composite
+                            .id
+                            .as_deref()
+                            .map(|id| store.composite_model_properties(record, id))
+                            .unwrap_or_default();
+                        if contributed.is_empty() {
+                            composite.properties.clone()
+                        } else {
+                            Some(contributed)
+                        }
                     },
                     ..composite.clone()
                 })

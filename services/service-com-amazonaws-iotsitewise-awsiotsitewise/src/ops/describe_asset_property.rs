@@ -240,7 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // information in compositeModel."
         if let Some(model) = model {
             for composite in &model.composite_models {
-                let Some(definition) = composite.properties.iter().flatten().find(|property| {
+                let Some(composite_id) = composite.id.as_deref() else {
+                    continue;
+                };
+                // What a composite model contributes comes from the one shared
+                // resolver, so a property contributed by the component model a
+                // composite model reuses is describable here exactly as the
+                // listings of that composite model report it.
+                let contributed = store.composite_model_properties(model, composite_id);
+                let Some(definition) = contributed.iter().find(|property| {
                     // A definition with no id names no addressable property, so it
                     // is passed over rather than reported with a blank one — and
                     // the scan of this composite model carries on past it. Every

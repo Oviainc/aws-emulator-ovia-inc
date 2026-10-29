@@ -175,8 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `filter` defaults to BASE — "The list includes only base asset model
         // properties for a given asset model ID" — which is the model's own property
         // definitions. ALL also walks the properties each of its composite models
-        // defines. The modelled enum admits no other value, and the runtime refuses
-        // one before this handler runs.
+        // contributes. The modelled enum admits no other value, and the runtime
+        // refuses one before this handler runs.
         let include_composite = input.filter.as_deref().unwrap_or(DEFAULT_FILTER) == FILTER_ALL;
 
         // A pure read: nothing below writes, so two callers reading the same model in
@@ -205,17 +205,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = &*record;
 
         // The enumeration order: the model's own properties in definition order, then
-        // each composite model's properties, composite models in their stored order.
+        // the properties each composite model contributes, composite models in their
+        // stored order.
         // Stable across calls, which is what makes `nextToken` resumable.
         let mut summaries: Vec<AssetModelPropertySummary> = record
             .properties
             .iter()
-            .map(|property| summarize(property, None))
+            .map(|property| summarize(property, None, &[]))
             .collect();
         if include_composite {
+            // `composite_models` is the FLAT list of every composite model this
+            // model holds, at any nesting depth — a nested one is linked to its
+            // parent through `composite_model_links` rather than held inside it —
+            // so walking it once reaches every composite model's properties, and
+            // the path prefix below carries the whole chain each sits in.
             for composite in &record.composite_models {
-                for property in composite.properties.as_deref().unwrap_or(&[]) {
-                    summaries.push(summarize(property, Some(composite)));
+                // A composite model carries an id in every stored record: a create
+                // either takes the caller's id or mints one, and a record without
+                // one would be unaddressable. So this skip only keeps the walk
+                // total; it cannot drop a composite model this store holds.
+                let Some(composite_id) = composite.id.as_deref() else {
+                    continue;
+                };
+                let prefix = record.composite_model_path(composite_id);
+                // What a composite model contributes comes from the one shared
+                // resolver, so this listing, the asset-level listing of the same
+                // composite model and the describes of it cannot disagree: its own
+                // definitions, or, for a component-model-based composite model —
+                // which stores none of its own — the properties of the component
+                // model it reuses.
+                for property in store.composite_model_properties(record, composite_id) {
+                    summaries.push(summarize(&property, Some(composite_id), &prefix));
                 }
             }
         }
@@ -255,23 +275,25 @@ const FILTER_ALL: &str = "ALL";
 
 /// One stored property definition as a `ListAssetModelProperties` summary.
 ///
-/// `composite` is the composite model the property is defined in, or `None` for one
-/// of the model's own (base) properties.
+/// `composite_id` is the composite model the property is contributed by, or `None`
+/// for one of the model's own (base) properties; `prefix` is that composite model's
+/// path from the root of the asset model, empty for a base property.
 fn summarize(
     property: &AssetModelProperty,
-    composite: Option<&AssetModelCompositeModel>,
+    composite_id: Option<&str>,
+    prefix: &[AssetModelCompositeModelPathSegment],
 ) -> AssetModelPropertySummary {
     // `path` is "the structured path to the property from the root of the asset
-    // model": the containing composite model, when there is one, then the property
-    // itself. Derived from the same stored record the summary's other members come
-    // from, so the two cannot disagree.
-    let mut path = Vec::new();
-    if let Some(composite) = composite {
-        path.push(AssetModelPropertyPathSegment {
-            id: composite.id.clone(),
-            name: Some(composite.name.clone()),
-        });
-    }
+    // model": the composite models the property sits inside, outermost first, then
+    // the property itself. Derived from the same stored records the summary's other
+    // members come from, so the two cannot disagree.
+    let mut path: Vec<AssetModelPropertyPathSegment> = prefix
+        .iter()
+        .map(|segment| AssetModelPropertyPathSegment {
+            id: segment.id.clone(),
+            name: segment.name.clone(),
+        })
+        .collect();
     path.push(AssetModelPropertyPathSegment {
         id: property.id.clone(),
         name: Some(property.name.clone()),
@@ -285,7 +307,7 @@ fn summarize(
         data_type_spec: property.data_type_spec.clone(),
         unit: property.unit.clone(),
         r#type: property.r#type.clone(),
-        asset_model_composite_model_id: composite.and_then(|composite| composite.id.clone()),
+        asset_model_composite_model_id: composite_id.map(ToString::to_string),
         path: Some(path),
         // Which interfaces a property belongs to is reported by no member this
         // enumeration derives: the store records an applied interface as a

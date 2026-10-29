@@ -6,9 +6,15 @@
 //! The rule these suites pin: `ListAssetModelProperties` enumerates the property
 //! definitions the named asset model actually holds in the shared engine store —
 //! its own (base) definitions under the default `BASE` filter, and under `ALL`
-//! also every definition its composite models carry — in one stable order, cut
-//! into pages of at most `maxResults` (default 50) joined by a resumable
+//! also every definition its composite models contribute — in one stable order,
+//! cut into pages of at most `maxResults` (default 50) joined by a resumable
 //! `nextToken`, and refuses a label or a token that names nothing stored.
+//!
+//! What a composite model CONTRIBUTES is its own definitions, or, for a
+//! component-model-based composite model (one that carries none of its own), the
+//! definitions of the component model it reuses — one set, so every view of that
+//! composite model reports it: this listing, the describes of the model and of
+//! the composite model, and the asset-level reads of an instance of it.
 
 use std::sync::Arc;
 
@@ -20,7 +26,8 @@ use service_com_amazonaws_iotsitewise_awsiotsitewise::EmulatedService;
 
 // The wait every suite in this crate uses for an owed CREATING/UPDATING ->
 // ACTIVE transition, reused rather than kept a second time here.
-use crate::asset_model_composite_model::PAST_THE_OWED_TRANSITION;
+use crate::asset_lifecycle::create_asset;
+use crate::asset_model_composite_model::{create_composite, describe_composite, PAST_THE_OWED_TRANSITION};
 
 /// The region the test signs for.
 const REGION: &str = "us-west-2";
@@ -623,4 +630,519 @@ async fn the_next_token_names_the_first_property_of_the_next_page() {
         vec![COMPOSITE_NAMES[1].to_string()],
         "resuming from the last property must answer exactly it, got {tail}"
     );
+}
+
+/// The one base property of the contributing fixture's asset model.
+const BASE_PROPERTY: &str = "Uptime";
+
+/// One composite model of the contributing fixture and what it CONTRIBUTES.
+///
+/// The rows span the ways a composite model can come by its property
+/// definitions: inline definitions of its own, the definitions of the component
+/// model it reuses, nesting inside another composite model, a reused component
+/// model that holds no definitions, and no definitions at all.
+struct Contributor {
+    /// What this row varies, named in every assertion it drives.
+    case: &'static str,
+    /// The composite model's id.
+    id: String,
+    /// The chain of composite models from the root of the asset model down to
+    /// this one, as `(id, name)`: one segment for a top-level composite model,
+    /// one per ancestor plus itself for a nested one.
+    path: Vec<(String, &'static str)>,
+    /// The property names, in definition order, this composite model contributes.
+    properties: Vec<&'static str>,
+    /// Whether this composite model is one the asset model holds DIRECTLY, and so
+    /// one `DescribeAssetModel` reports.
+    top_level: bool,
+}
+
+/// Create a `COMPONENT_MODEL` carrying `properties` and return its id — the model
+/// a component-model-based composite model reuses the definitions of.
+async fn component_model(router: &MultiServiceRouter, name: &str, properties: Value) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        "/asset-models",
+        Some(json!({
+            "assetModelName": name,
+            "assetModelType": "COMPONENT_MODEL",
+            "assetModelProperties": properties,
+        })),
+    )
+    .await;
+    assert_eq!(status, 202, "CreateAssetModel({name}): got {status} {created}");
+    created["assetModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateAssetModel({name}): no assetModelId in {created}"))
+        .to_string()
+}
+
+/// Create one composite model of the fixture and return its id.
+async fn composite_id(
+    router: &MultiServiceRouter,
+    case: &str,
+    model_id: &str,
+    body: Value,
+) -> String {
+    let (status, created) = create_composite(router, model_id, body).await;
+    assert_eq!(
+        status, 202,
+        "case {case:?}: CreateAssetModelCompositeModel got {status} {created}"
+    );
+    created["assetModelCompositeModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no composite model id in {created}"))
+        .to_string()
+}
+
+/// An asset model with one base property and one composite model per way of
+/// coming by property definitions, with the names each contributes.
+async fn contributing_fixture(router: &MultiServiceRouter) -> (String, Vec<Contributor>) {
+    // Source for the `type` / `dataType` rows: `smithy_query(query="shape",
+    // shape="PropertyType,PropertyDataType")`.
+    let reusable = component_model(
+        router,
+        "Pump",
+        json!([
+            {"name": "Flow", "dataType": "DOUBLE", "unit": "m3/s", "type": {"measurement": {}}},
+            {
+                "name": "Serial", "dataType": "STRING", "externalId": "pump_serial",
+                "type": {"attribute": {"defaultValue": "unset"}},
+            },
+        ]),
+    )
+    .await;
+    let without_properties = component_model(router, "BareComponent", json!([])).await;
+
+    let (status, created) = call(
+        router,
+        "POST",
+        "/asset-models",
+        Some(json!({
+            "assetModelName": "Plant",
+            "assetModelProperties": [
+                {"name": BASE_PROPERTY, "dataType": "DOUBLE", "type": {"measurement": {}}},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, 202, "CreateAssetModel(Plant): got {status} {created}");
+    let model_id = created["assetModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateAssetModel(Plant): no assetModelId in {created}"))
+        .to_string();
+
+    let inline = composite_id(
+        router,
+        "inline definitions of its own",
+        &model_id,
+        json!({
+            "assetModelCompositeModelName": "Inline",
+            "assetModelCompositeModelType": "CUSTOM",
+            "assetModelCompositeModelProperties": [
+                {"name": "Setpoint", "dataType": "DOUBLE", "type": {"attribute": {"defaultValue": "20"}}},
+            ],
+        }),
+    )
+    .await;
+    let reused = composite_id(
+        router,
+        "a reused component model's definitions",
+        &model_id,
+        json!({
+            "assetModelCompositeModelName": "Reused",
+            "assetModelCompositeModelType": "CUSTOM",
+            "composedAssetModelId": &reusable,
+        }),
+    )
+    .await;
+    let nested = composite_id(
+        router,
+        "a reused component model, nested inside another composite model",
+        &model_id,
+        json!({
+            "assetModelCompositeModelName": "NestedReused",
+            "assetModelCompositeModelType": "CUSTOM",
+            "parentAssetModelCompositeModelId": &inline,
+            "composedAssetModelId": &reusable,
+        }),
+    )
+    .await;
+    let reused_bare = composite_id(
+        router,
+        "a reused component model that holds no definitions",
+        &model_id,
+        json!({
+            "assetModelCompositeModelName": "ReusedBare",
+            "assetModelCompositeModelType": "CUSTOM",
+            "composedAssetModelId": &without_properties,
+        }),
+    )
+    .await;
+    let bare = composite_id(
+        router,
+        "no definitions at all",
+        &model_id,
+        json!({
+            "assetModelCompositeModelName": "Bare",
+            "assetModelCompositeModelType": "AWS/L4E_ANOMALY",
+        }),
+    )
+    .await;
+
+    let contributors = vec![
+        Contributor {
+            case: "inline definitions of its own",
+            id: inline.clone(),
+            path: vec![(inline.clone(), "Inline")],
+            properties: vec!["Setpoint"],
+            top_level: true,
+        },
+        Contributor {
+            case: "a reused component model's definitions",
+            id: reused.clone(),
+            path: vec![(reused, "Reused")],
+            properties: vec!["Flow", "Serial"],
+            top_level: true,
+        },
+        Contributor {
+            case: "a reused component model, nested inside another composite model",
+            id: nested.clone(),
+            path: vec![(inline, "Inline"), (nested, "NestedReused")],
+            properties: vec!["Flow", "Serial"],
+            top_level: false,
+        },
+        Contributor {
+            case: "a reused component model that holds no definitions",
+            id: reused_bare.clone(),
+            path: vec![(reused_bare, "ReusedBare")],
+            properties: Vec::new(),
+            top_level: true,
+        },
+        Contributor {
+            case: "no definitions at all",
+            id: bare.clone(),
+            path: vec![(bare, "Bare")],
+            properties: Vec::new(),
+            top_level: true,
+        },
+    ];
+    (model_id, contributors)
+}
+
+/// The `name` of every entry of a property list in a body, in stored order.
+fn names_of(properties: &Value) -> Vec<&str> {
+    properties
+        .as_array()
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|property| property["name"].as_str().unwrap_or(""))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn the_all_filter_reports_what_every_composite_model_contributes() {
+    let router = router();
+    let (model_id, contributors) = contributing_fixture(&router).await;
+
+    let (status, listed) = call(
+        &router,
+        "GET",
+        &format!("/asset-models/{model_id}/properties?filter=ALL&maxResults=250"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "ListAssetModelProperties: got {status} {listed}");
+    let summaries = listed["assetModelPropertySummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no assetModelPropertySummaries in {listed}"))
+        .clone();
+
+    // BASE is the model's own definitions alone, whatever its composite models
+    // contribute.
+    let (status, base) = call(
+        &router,
+        "GET",
+        &format!("/asset-models/{model_id}/properties?filter=BASE&maxResults=250"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "BASE listing: got {status} {base}");
+    assert_eq!(
+        listed_names(&base),
+        vec![BASE_PROPERTY.to_string()],
+        "case \"BASE\": only the model's own definitions may be listed, got {base}"
+    );
+
+    // The model's own property, plus what each composite model contributes.
+    let mut expected_total = 1;
+    for Contributor {
+        case,
+        id,
+        path,
+        properties,
+        ..
+    } in &contributors
+    {
+        expected_total += properties.len();
+        let contributed: Vec<&Value> = summaries
+            .iter()
+            .filter(|summary| summary["assetModelCompositeModelId"] == json!(id))
+            .collect();
+        let listed_from_composite: Vec<&str> = contributed
+            .iter()
+            .map(|summary| summary["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            &listed_from_composite, properties,
+            "case {case:?}: the ALL listing must report exactly what the composite model \
+             contributes, got {listed}"
+        );
+
+        // The other view of the SAME composite model: the two must agree member for
+        // member, since one set of definitions is what either reports.
+        let (status, described) = describe_composite(&router, &model_id, id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAssetModelCompositeModel got {status} {described}"
+        );
+        let stored = described["assetModelCompositeModelProperties"].clone();
+        assert_eq!(
+            &names_of(&stored), properties,
+            "case {case:?}: the describe must report the same definitions, got {described}"
+        );
+        for (summary, stored) in contributed
+            .iter()
+            .zip(stored.as_array().cloned().unwrap_or_default().iter())
+        {
+            for member in [
+                "id",
+                "externalId",
+                "name",
+                "dataType",
+                "dataTypeSpec",
+                "unit",
+                "type",
+            ] {
+                assert_eq!(
+                    summary.get(member).unwrap_or(&Value::Null),
+                    stored.get(member).unwrap_or(&Value::Null),
+                    "case {case:?}/{member:?}: the summary disagrees with the stored \
+                     definition ({summary} vs {stored})"
+                );
+            }
+            // `path` is "the structured path to the property from the root of the
+            // asset model": the composite models it sits inside, outermost first,
+            // then the property itself.
+            let expected_path: Vec<Value> = path
+                .iter()
+                .map(|(id, name)| json!({"id": id, "name": name}))
+                .chain(std::iter::once(
+                    json!({"id": stored["id"], "name": stored["name"]}),
+                ))
+                .collect();
+            assert_eq!(
+                summary["path"].as_array(),
+                Some(&expected_path),
+                "case {case:?}: path must run from the model root to the property, got {summary}"
+            );
+        }
+    }
+    assert_eq!(
+        summaries.len(),
+        expected_total,
+        "the ALL listing must hold the model's own definitions and every contributed one \
+         exactly once, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn paging_an_all_listing_visits_every_contributed_property_once() {
+    let router = router();
+    let (model_id, contributors) = contributing_fixture(&router).await;
+
+    let mut expected: Vec<String> = vec![BASE_PROPERTY.to_string()];
+    for contributor in &contributors {
+        expected.extend(contributor.properties.iter().map(|name| name.to_string()));
+    }
+
+    // Rows: page sizes from one-per-page to larger than the enumeration, so a
+    // contributed property is the first, a middle and the last row of a page.
+    for max_results in [1_usize, 2, 3, 250] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let resume = token
+                .as_deref()
+                .map(|token| format!("&nextToken={token}"))
+                .unwrap_or_default();
+            let (status, body) = call(
+                &router,
+                "GET",
+                &format!(
+                    "/asset-models/{model_id}/properties?filter=ALL&maxResults={max_results}{resume}"
+                ),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case maxResults={max_results}: page {pages} got {status} {body}"
+            );
+            seen.extend(listed_names(&body));
+            pages += 1;
+            assert!(
+                pages <= expected.len() + 1,
+                "case maxResults={max_results}: paging did not terminate after {pages} pages"
+            );
+            match body.get("nextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, expected,
+            "case maxResults={max_results}: the pages joined must be the whole enumeration once"
+        );
+    }
+}
+
+#[tokio::test]
+async fn describe_asset_model_reports_what_each_composite_model_contributes() {
+    let router = router();
+    let (model_id, contributors) = contributing_fixture(&router).await;
+
+    let (status, described) =
+        call(&router, "GET", &format!("/asset-models/{model_id}"), None).await;
+    assert_eq!(status, 200, "DescribeAssetModel: got {status} {described}");
+    let composites = described["assetModelCompositeModels"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for contributor in contributors.iter().filter(|row| row.top_level) {
+        let case = contributor.case;
+        let entry = composites
+            .iter()
+            .find(|composite| composite["id"] == json!(contributor.id))
+            .unwrap_or_else(|| panic!("case {case:?}: not reported in {described}"));
+        assert_eq!(
+            names_of(&entry["properties"]),
+            contributor.properties,
+            "case {case:?}: the model description must report what the composite model \
+             contributes, got {entry}"
+        );
+    }
+
+    // `excludeProperties` asks for the model without its property definitions, so
+    // it blanks a composite model's contributed ones too.
+    let (status, lean) = call(
+        &router,
+        "GET",
+        &format!("/asset-models/{model_id}?excludeProperties=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeAssetModel(lean): got {status} {lean}");
+    for entry in lean["assetModelCompositeModels"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        assert!(
+            entry.get("properties").is_none_or(Value::is_null),
+            "case \"excludeProperties\": no definitions may be reported, got {entry}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_asset_reads_the_properties_its_models_composite_models_contribute() {
+    let router = router();
+    let (model_id, contributors) = contributing_fixture(&router).await;
+    // The model has to have settled before an asset can instantiate it.
+    tokio::time::sleep(PAST_THE_OWED_TRANSITION).await;
+    let asset_id = create_asset(&router, "Plant1", &model_id).await;
+
+    let (status, listed) = call(
+        &router,
+        "GET",
+        &format!("/assets/{asset_id}/properties?filter=ALL&maxResults=250"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "ListAssetProperties: got {status} {listed}");
+    let summaries = listed["assetPropertySummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    for contributor in &contributors {
+        let case = contributor.case;
+        // The asset-level listing of the instance of this composite model reports
+        // the same set the model-level one does.
+        let instance: Vec<&str> = summaries
+            .iter()
+            .filter(|summary| summary["assetCompositeModelId"] == json!(contributor.id))
+            .map(|summary| summary["id"].as_str().unwrap_or(""))
+            .collect();
+        let (status, described) = describe_composite(&router, &model_id, &contributor.id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAssetModelCompositeModel got {status} {described}"
+        );
+        let definitions = described["assetModelCompositeModelProperties"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let defined: Vec<&str> = definitions
+            .iter()
+            .map(|property| property["id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            instance, defined,
+            "case {case:?}: the asset's instance must carry every contributed property, \
+             got {listed}"
+        );
+
+        // And each of them is describable by id through a composite model that
+        // contributes it. Two composite models may reuse the SAME component
+        // model, so one definition can be contributed by more than one of them:
+        // the describe reports the first that holds it, which is one of them.
+        for property in &definitions {
+            let property_id = property["id"].as_str().unwrap_or_default();
+            let contributing: Vec<&str> = summaries
+                .iter()
+                .filter(|summary| summary["id"] == json!(property_id))
+                .filter_map(|summary| summary["assetCompositeModelId"].as_str())
+                .collect();
+            let (status, body) = call(
+                &router,
+                "GET",
+                &format!("/assets/{asset_id}/properties/{property_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{property_id}: DescribeAssetProperty got {status} {body}"
+            );
+            let reported = body["compositeModel"]["id"].as_str().unwrap_or_default();
+            assert!(
+                contributing.contains(&reported),
+                "case {case:?}/{property_id}: the property must be reported under a composite \
+                 model that contributes it (one of {contributing:?}), got {body}"
+            );
+            assert_eq!(
+                body["compositeModel"]["assetProperty"]["name"],
+                property["name"],
+                "case {case:?}/{property_id}: the described property must be the contributed \
+                 definition, got {body}"
+            );
+        }
+    }
 }
